@@ -1,0 +1,16 @@
+[package]
+name = "tiny"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+glow = "0.16"
+gpui = "0.2.2"
+image = "0.25"
+libmpv2 = { version = "5.0.3", features = ["render"] }
+libmpv2-sys = "4.0.1"
+sdl2 = "0.37"
+
+[dev-dependencies]
+tempfile = "3.13"

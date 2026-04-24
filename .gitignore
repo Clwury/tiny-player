@@ -1,0 +1,6 @@
+/target
+/.worktrees/
+/sample
+/.claude
+Cargo.lock
+CLAUDE.md
