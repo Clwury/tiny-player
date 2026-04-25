@@ -29,6 +29,7 @@ impl VideoPresenter {
     }
 
     pub fn clear_frame(&mut self, window: &mut Window) {
+        self.render_host.reset_readback_pipeline();
         if let Some(frame) = self.current_frame.take() {
             _ = window.drop_image(frame);
         }

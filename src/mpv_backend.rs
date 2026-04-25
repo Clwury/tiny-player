@@ -1,6 +1,6 @@
 use libmpv2::{
-    events::{Event, PropertyData},
     Error as MpvError, Format, Mpv,
+    events::{Event, PropertyData},
 };
 use std::{
     ffi::CString,
@@ -10,6 +10,7 @@ use std::{
 #[derive(Debug)]
 pub enum BackendEvent {
     Pause(bool),
+    PlaybackRestart,
     FileTitle(String),
     PositionChanged(f64),
     DurationChanged(f64),
@@ -82,12 +83,22 @@ impl MpvBackend {
             .to_str()
             .ok_or_else(|| BackendError::NonUtf8Path(path.to_path_buf()))?;
         self.mpv
+            .set_property("pause", true)
+            .map_err(BackendError::from)?;
+        self.mpv.command("stop", &[]).map_err(BackendError::from)?;
+        self.mpv
             .command("loadfile", &[path, "replace"])
             .map_err(BackendError::from)?;
         self.mpv
-            .set_property("pause", true)
+            .set_property("pause", false)
             .map_err(BackendError::from)?;
         Ok(())
+    }
+
+    pub fn pause(&mut self) -> Result<()> {
+        self.mpv
+            .set_property("pause", true)
+            .map_err(BackendError::from)
     }
 
     pub fn toggle_playback(&mut self) -> Result<bool> {
@@ -112,6 +123,7 @@ impl MpvBackend {
                     change: PropertyData::Flag(paused),
                     ..
                 }) => events.push(BackendEvent::Pause(paused)),
+                Ok(Event::PlaybackRestart) => events.push(BackendEvent::PlaybackRestart),
                 Ok(Event::PropertyChange {
                     name: "media-title",
                     change: PropertyData::Str(title) | PropertyData::OsdStr(title),
@@ -220,37 +232,47 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, BackendEvent::Pause(true)))
         });
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, BackendEvent::Pause(true))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::Pause(true)))
+        );
     }
 
     #[test]
-    fn load_file_forces_paused_state_and_reports_title() {
+    fn load_file_runs_until_first_frame_can_be_rendered_then_can_pause() {
         let mut backend = MpvBackend::new().unwrap();
         let path = sample_video_path();
         let expected_title = path.file_name().unwrap().to_string_lossy().into_owned();
 
         backend.poll_events();
-        assert!(backend.toggle_playback().unwrap());
-        assert!(!backend.mpv_mut().get_property::<bool>("pause").unwrap());
-
         backend.load_file(&path).unwrap();
 
-        assert!(backend.mpv_mut().get_property::<bool>("pause").unwrap());
-        let events = wait_for_events_until("pause and title after load", &mut backend, |events| {
-            events.iter().any(|event| matches!(event, BackendEvent::Pause(true)))
+        assert!(!backend.mpv_mut().get_property::<bool>("pause").unwrap());
+        let events = wait_for_events_until(
+            "playback restart and title after load",
+            &mut backend,
+            |events| {
+                events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::PlaybackRestart))
                 && events.iter().any(|event| {
                     matches!(event, BackendEvent::FileTitle(title) if title == &expected_title)
                 })
-        });
+            },
+        );
 
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, BackendEvent::Pause(true))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, BackendEvent::PlaybackRestart))
+        );
         assert!(events.iter().any(|event| {
             matches!(event, BackendEvent::FileTitle(title) if title == &expected_title)
         }));
+
+        backend.pause().unwrap();
+        assert!(backend.mpv_mut().get_property::<bool>("pause").unwrap());
     }
 
     #[test]
@@ -298,7 +320,6 @@ mod tests {
 
         backend.poll_events();
         backend.load_file(&path).unwrap();
-        assert!(backend.toggle_playback().unwrap());
 
         let events = wait_for_events_until("position change", &mut backend, |events| {
             events.iter().any(

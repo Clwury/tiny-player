@@ -1,19 +1,19 @@
-use anyhow::{anyhow, Result};
-use glow::{HasContext as _, PixelPackData};
+use anyhow::{Result, anyhow};
+use glow::{HasContext as _, NativeBuffer, PixelPackData};
 use gpui::RenderImage;
 use image::{Frame, ImageBuffer, RgbaImage};
 use libmpv2::{
-    render::{
-        mpv_render_update, MpvRenderUpdate, OpenGLInitParams, RenderContext, RenderParam,
-        RenderParamApiType,
-    },
     Mpv,
+    render::{
+        MpvRenderUpdate, OpenGLInitParams, RenderContext, RenderParam, RenderParamApiType,
+        mpv_render_update,
+    },
 };
 use std::{
     ffi::c_void,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -29,8 +29,24 @@ fn render_size_changed(previous: Option<(u32, u32)>, next: (u32, u32)) -> bool {
     previous != Some(next)
 }
 
+const READBACK_BUFFER_COUNT: usize = 2;
+
 fn readback_len(width: u32, height: u32) -> usize {
     width as usize * height as usize * 4
+}
+
+fn readback_len_fits_gl_size(width: u32, height: u32) -> bool {
+    u128::from(width) * u128::from(height) * 4 <= i32::MAX as u128
+}
+
+fn readback_len_i32(width: u32, height: u32) -> Result<i32> {
+    if readback_len_fits_gl_size(width, height) {
+        Ok(readback_len(width, height) as i32)
+    } else {
+        Err(anyhow!(
+            "readback buffer too large for OpenGL buffer size: {width}x{height}"
+        ))
+    }
 }
 
 fn prepare_readback_buffer(buffer: &mut Vec<u8>, width: u32, height: u32) {
@@ -38,6 +54,14 @@ fn prepare_readback_buffer(buffer: &mut Vec<u8>, width: u32, height: u32) {
     if buffer.len() != expected_len {
         buffer.resize(expected_len, 0);
     }
+}
+
+fn pbo_next_index(index: usize) -> usize {
+    (index + 1) % READBACK_BUFFER_COUNT
+}
+
+fn pbo_previous_index(write_index: usize) -> usize {
+    (write_index + READBACK_BUFFER_COUNT - 1) % READBACK_BUFFER_COUNT
 }
 
 fn should_render_update(update: MpvRenderUpdate) -> bool {
@@ -52,6 +76,51 @@ fn should_render_frame_if_needed(
     size_changed || (pending_render && should_render_update(update))
 }
 
+struct PboReadback {
+    buffers: [NativeBuffer; READBACK_BUFFER_COUNT],
+    byte_len: usize,
+    write_index: usize,
+    has_previous_frame: bool,
+}
+
+impl PboReadback {
+    fn new(buffers: [NativeBuffer; READBACK_BUFFER_COUNT], byte_len: usize) -> Self {
+        Self {
+            buffers,
+            byte_len,
+            write_index: 0,
+            has_previous_frame: false,
+        }
+    }
+
+    fn write_buffer(&self) -> NativeBuffer {
+        self.buffers[self.write_index]
+    }
+
+    fn previous_buffer(&self) -> NativeBuffer {
+        self.buffers[pbo_previous_index(self.write_index)]
+    }
+
+    fn read_buffer(&self) -> NativeBuffer {
+        if self.has_previous_frame {
+            self.previous_buffer()
+        } else {
+            self.write_buffer()
+        }
+    }
+
+    fn mark_submitted(&mut self) {
+        self.write_index = pbo_next_index(self.write_index);
+        self.has_previous_frame = true;
+    }
+
+    fn reset(&mut self, byte_len: usize) {
+        self.byte_len = byte_len;
+        self.write_index = 0;
+        self.has_previous_frame = false;
+    }
+}
+
 pub struct RenderHost {
     _sdl: sdl2::Sdl,
     _video: sdl2::VideoSubsystem,
@@ -61,6 +130,7 @@ pub struct RenderHost {
     render_context: RenderContext,
     pending_render: Arc<AtomicBool>,
     readback_buffer: Vec<u8>,
+    pbo_readback: Option<PboReadback>,
     last_render_size: Option<(u32, u32)>,
 }
 
@@ -117,6 +187,7 @@ impl RenderHost {
             render_context,
             pending_render,
             readback_buffer: Vec::new(),
+            pbo_readback: None,
             last_render_size: None,
         })
     }
@@ -150,6 +221,12 @@ impl RenderHost {
         self.render_frame_at_size(width, height)
     }
 
+    pub fn reset_readback_pipeline(&mut self) {
+        if let Some(readback) = self.pbo_readback.as_mut() {
+            readback.reset(readback.byte_len);
+        }
+    }
+
     fn sync_render_size(&mut self, width: u32, height: u32) -> Result<bool> {
         let size_changed = render_size_changed(self.last_render_size, (width, height));
         if size_changed {
@@ -167,7 +244,7 @@ impl RenderHost {
             .gl_make_current(&self.gl_context)
             .map_err(|error| anyhow!(error))?;
 
-        prepare_readback_buffer(&mut self.readback_buffer, width, height);
+        self.ensure_pbo_readback(width, height)?;
 
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -178,17 +255,7 @@ impl RenderHost {
             .render::<sdl2::VideoSubsystem>(0, width as i32, height as i32, false)
             .map_err(|error| anyhow!("failed to render mpv frame: {error}"))?;
 
-        unsafe {
-            self.gl.read_pixels(
-                0,
-                0,
-                width as i32,
-                height as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                PixelPackData::Slice(Some(self.readback_buffer.as_mut_slice())),
-            );
-        }
+        self.read_frame_pixels_with_pbo(width, height)?;
 
         // GPUI's RenderImage API still requires owned bytes per frame.
         Ok(Arc::new(render_image_from_rgba(
@@ -196,6 +263,148 @@ impl RenderHost {
             height,
             self.readback_buffer.clone(),
         )))
+    }
+
+    fn ensure_pbo_readback(&mut self, width: u32, height: u32) -> Result<()> {
+        let byte_len_i32 = readback_len_i32(width, height)?;
+        let byte_len = byte_len_i32 as usize;
+        prepare_readback_buffer(&mut self.readback_buffer, width, height);
+
+        if self.pbo_readback.is_none() {
+            self.pbo_readback = Some(self.create_pbo_readback(byte_len, byte_len_i32)?);
+            return Ok(());
+        }
+
+        let needs_reallocate = self
+            .pbo_readback
+            .as_ref()
+            .is_some_and(|readback| readback.byte_len != byte_len);
+        if needs_reallocate {
+            let buffers = self
+                .pbo_readback
+                .as_ref()
+                .expect("PBO readback checked above")
+                .buffers;
+            self.allocate_pbo_buffers(buffers, byte_len_i32)?;
+            self.pbo_readback
+                .as_mut()
+                .expect("PBO readback checked above")
+                .reset(byte_len);
+        }
+
+        Ok(())
+    }
+
+    fn create_pbo_readback(&self, byte_len: usize, byte_len_i32: i32) -> Result<PboReadback> {
+        unsafe {
+            let first = self
+                .gl
+                .create_buffer()
+                .map_err(|error| anyhow!("failed to create pixel pack buffer: {error}"))?;
+            let second = match self.gl.create_buffer() {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    self.gl.delete_buffer(first);
+                    return Err(anyhow!("failed to create pixel pack buffer: {error}"));
+                }
+            };
+            let buffers = [first, second];
+
+            if let Err(error) = self.allocate_pbo_buffers(buffers, byte_len_i32) {
+                for buffer in buffers {
+                    self.gl.delete_buffer(buffer);
+                }
+                return Err(error);
+            }
+
+            Ok(PboReadback::new(buffers, byte_len))
+        }
+    }
+
+    fn allocate_pbo_buffers(
+        &self,
+        buffers: [NativeBuffer; READBACK_BUFFER_COUNT],
+        byte_len: i32,
+    ) -> Result<()> {
+        unsafe {
+            for buffer in buffers {
+                self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer));
+                self.gl
+                    .buffer_data_size(glow::PIXEL_PACK_BUFFER, byte_len, glow::STREAM_READ);
+            }
+            self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+        }
+
+        self.check_gl_error("failed to allocate pixel pack buffers")
+    }
+
+    fn read_frame_pixels_with_pbo(&mut self, width: u32, height: u32) -> Result<()> {
+        let (write_buffer, read_buffer) = {
+            let readback = self
+                .pbo_readback
+                .as_ref()
+                .expect("PBO readback must be initialized before reading pixels");
+            (readback.write_buffer(), readback.read_buffer())
+        };
+
+        unsafe {
+            self.gl
+                .bind_buffer(glow::PIXEL_PACK_BUFFER, Some(write_buffer));
+            self.gl.read_pixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                PixelPackData::BufferOffset(0),
+            );
+        }
+        self.check_gl_error("failed to submit PBO readback")?;
+
+        unsafe {
+            self.gl
+                .bind_buffer(glow::PIXEL_PACK_BUFFER, Some(read_buffer));
+            self.gl.get_buffer_sub_data(
+                glow::PIXEL_PACK_BUFFER,
+                0,
+                self.readback_buffer.as_mut_slice(),
+            );
+            self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+        }
+        self.check_gl_error("failed to read PBO data")?;
+
+        self.pbo_readback
+            .as_mut()
+            .expect("PBO readback must be initialized before reading pixels")
+            .mark_submitted();
+        Ok(())
+    }
+
+    fn check_gl_error(&self, operation: &str) -> Result<()> {
+        let error = unsafe { self.gl.get_error() };
+        if error == glow::NO_ERROR {
+            Ok(())
+        } else {
+            Err(anyhow!("{operation}: GL error 0x{error:04x}"))
+        }
+    }
+}
+
+impl Drop for RenderHost {
+    fn drop(&mut self) {
+        if self.window.gl_make_current(&self.gl_context).is_err() {
+            return;
+        }
+
+        if let Some(readback) = self.pbo_readback.take() {
+            unsafe {
+                self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                for buffer in readback.buffers {
+                    self.gl.delete_buffer(buffer);
+                }
+            }
+        }
     }
 }
 
@@ -210,7 +419,8 @@ pub fn render_image_from_rgba(width: u32, height: u32, pixels: Vec<u8>) -> Rende
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_render_size, readback_len, render_image_from_rgba, render_size_changed,
+        normalize_render_size, pbo_next_index, pbo_previous_index, readback_len,
+        readback_len_fits_gl_size, render_image_from_rgba, render_size_changed,
         should_render_frame_if_needed, should_render_update,
     };
 
@@ -240,9 +450,33 @@ mod tests {
     }
 
     #[test]
+    fn readback_len_fits_gl_size_accepts_normal_frames() {
+        assert!(readback_len_fits_gl_size(3840, 2160));
+    }
+
+    #[test]
+    fn readback_len_fits_gl_size_rejects_oversized_frames() {
+        assert!(!readback_len_fits_gl_size(u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn pbo_next_index_wraps_double_buffer_ring() {
+        assert_eq!(pbo_next_index(0), 1);
+        assert_eq!(pbo_next_index(1), 0);
+    }
+
+    #[test]
+    fn pbo_previous_index_wraps_double_buffer_ring() {
+        assert_eq!(pbo_previous_index(0), 1);
+        assert_eq!(pbo_previous_index(1), 0);
+    }
+
+    #[test]
     fn should_render_update_requires_frame_flag() {
         assert!(!should_render_update(0));
-        assert!(should_render_update(libmpv2::render::mpv_render_update::Frame));
+        assert!(should_render_update(
+            libmpv2::render::mpv_render_update::Frame
+        ));
     }
 
     #[test]

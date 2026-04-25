@@ -6,8 +6,8 @@ use crate::{
     video_presenter::VideoPresenter,
 };
 use gpui::{
-    canvas, App, Application, Bounds, Context, Pixels, Render, StatefulInteractiveElement, Timer,
-    Window, WindowBounds, WindowOptions, div, img, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, Pixels, Render, StatefulInteractiveElement, Timer, Window,
+    WindowBounds, WindowOptions, canvas, div, img, prelude::*, px, rgb, size,
 };
 use std::time::Duration;
 
@@ -162,6 +162,8 @@ struct PlayerApp {
     current_title: String,
     status_message: String,
     polling_started: bool,
+    awaiting_initial_frame: bool,
+    current_file_loaded: bool,
 }
 
 impl PlayerApp {
@@ -203,6 +205,8 @@ impl PlayerApp {
             }
         };
 
+        let awaiting_initial_frame = state.current_entry().is_some() && backend.is_some();
+
         Self {
             state,
             video: ShutdownOrder::new(backend, video_presenter),
@@ -210,6 +214,8 @@ impl PlayerApp {
             current_title,
             status_message,
             polling_started: false,
+            awaiting_initial_frame,
+            current_file_loaded: false,
         }
     }
 
@@ -220,18 +226,19 @@ impl PlayerApp {
 
         self.polling_started = true;
         let view = cx.entity().downgrade();
-        window.spawn(cx, async move |cx| {
-            loop {
-                Timer::after(Duration::from_millis(33)).await;
-                if view
-                    .update_in(&mut *cx, |this, window, cx| this.poll_backend(window, cx))
-                    .is_err()
-                {
-                    break;
+        window
+            .spawn(cx, async move |cx| {
+                loop {
+                    Timer::after(Duration::from_millis(33)).await;
+                    if view
+                        .update_in(&mut *cx, |this, window, cx| this.poll_backend(window, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
     }
 
     fn clear_visible_frame(&mut self, window: &mut Window) {
@@ -256,7 +263,15 @@ impl PlayerApp {
             for event in backend.poll_events() {
                 match event {
                     BackendEvent::Pause(paused) => {
-                        self.state.sync_pause_state(paused);
+                        if self.awaiting_initial_frame {
+                            self.state.is_playing = false;
+                        } else {
+                            self.state.sync_pause_state(paused);
+                        }
+                        should_notify = true;
+                    }
+                    BackendEvent::PlaybackRestart => {
+                        self.current_file_loaded = true;
                         should_notify = true;
                     }
                     BackendEvent::FileTitle(title) => {
@@ -297,7 +312,7 @@ impl PlayerApp {
 
         if should_render_frame(
             self.video.dependent().is_some(),
-            self.state.current_entry().is_some(),
+            self.current_file_loaded,
             self.state.error_message.is_some(),
             viewport.is_some(),
         ) {
@@ -311,6 +326,16 @@ impl PlayerApp {
             match render_result {
                 Ok(true) => {
                     self.status_message.clear();
+                    if self.awaiting_initial_frame {
+                        self.awaiting_initial_frame = false;
+                        if let Some(backend) = self.video.owner_mut() {
+                            if let Err(error) = backend.pause() {
+                                self.clear_visible_frame(window);
+                                handle_backend_failure(&mut self.state, error.to_string());
+                            }
+                        }
+                        self.state.sync_pause_state(true);
+                    }
                     should_notify = true;
                 }
                 Ok(false) => {}
@@ -340,6 +365,8 @@ impl PlayerApp {
 
         self.clear_visible_frame(window);
         reset_progress(&mut self.state);
+        self.awaiting_initial_frame = false;
+        self.current_file_loaded = false;
         self.current_title = self.state.current_title().to_owned();
 
         let Some(entry) = self.state.current_entry() else {
@@ -347,17 +374,31 @@ impl PlayerApp {
         };
 
         if let Some(backend) = self.video.owner_mut() {
-            if let Err(error) = backend.load_file(&entry.path) {
-                self.clear_visible_frame(window);
-                handle_backend_failure(&mut self.state, error.to_string());
+            match backend.load_file(&entry.path) {
+                Ok(()) => {
+                    self.awaiting_initial_frame = true;
+                }
+                Err(error) => {
+                    self.clear_visible_frame(window);
+                    handle_backend_failure(&mut self.state, error.to_string());
+                }
             }
         }
 
         cx.notify();
     }
 
-    fn select_adjacent_item(&mut self, direction: Direction, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = adjacent_index(self.state.selected_index, self.state.playlist.len(), direction) else {
+    fn select_adjacent_item(
+        &mut self,
+        direction: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = adjacent_index(
+            self.state.selected_index,
+            self.state.playlist.len(),
+            direction,
+        ) else {
             return;
         };
 
@@ -411,7 +452,11 @@ impl Render for PlayerApp {
                         .py_2()
                         .rounded_sm()
                         .cursor_pointer()
-                        .bg(if selected { rgb(0x2f3a4a) } else { rgb(0x20242b) })
+                        .bg(if selected {
+                            rgb(0x2f3a4a)
+                        } else {
+                            rgb(0x20242b)
+                        })
                         .text_color(rgb(0xf5f7fa))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.select_playlist_item(index, window, cx);
@@ -421,7 +466,11 @@ impl Render for PlayerApp {
             },
         );
 
-        let play_label = if self.state.is_playing { "Pause" } else { "Play" };
+        let play_label = if self.state.is_playing {
+            "Pause"
+        } else {
+            "Play"
+        };
         let can_go_previous = self.state.has_previous();
         let can_go_next = self.state.has_next();
         let can_toggle_playback = can_toggle_playback(
@@ -453,7 +502,11 @@ impl Render for PlayerApp {
         .size_full();
 
         let video_area = if let Some(frame) = current_frame {
-            div().flex().flex_1().bg(rgb(0x050505)).child(img(frame).size_full())
+            div()
+                .flex()
+                .flex_1()
+                .bg(rgb(0x050505))
+                .child(img(frame).size_full())
         } else {
             div()
                 .flex()
@@ -487,8 +540,20 @@ impl Render for PlayerApp {
             playback_toggle.cursor_default()
         };
 
-        let button_bg = |enabled| if enabled { rgb(0x30363d) } else { rgb(0x1f242d) };
-        let button_text = |enabled| if enabled { rgb(0xe6edf3) } else { rgb(0x6e7681) };
+        let button_bg = |enabled| {
+            if enabled {
+                rgb(0x30363d)
+            } else {
+                rgb(0x1f242d)
+            }
+        };
+        let button_text = |enabled| {
+            if enabled {
+                rgb(0xe6edf3)
+            } else {
+                rgb(0x6e7681)
+            }
+        };
 
         let mut previous_button = div()
             .id("previous-button")
@@ -620,11 +685,11 @@ impl Render for PlayerApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        adjacent_index, bottom_control_labels, can_toggle_playback, handle_backend_failure,
-        handle_file_title_update, handle_render_failure, normalize_video_viewport,
-        overlay_progress_bottom_inset_px, overlay_progress_fill_fraction,
+        Direction, ShutdownOrder, adjacent_index, bottom_control_labels, can_toggle_playback,
+        handle_backend_failure, handle_file_title_update, handle_render_failure,
+        normalize_video_viewport, overlay_progress_bottom_inset_px, overlay_progress_fill_fraction,
         overlay_progress_horizontal_inset_px, reset_progress, selection_changed,
-        should_render_frame, viewport_changed, Direction, ShutdownOrder,
+        should_render_frame, viewport_changed,
     };
     use crate::state::AppState;
     use gpui::{Bounds, point, px, size};
