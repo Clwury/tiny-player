@@ -5,12 +5,21 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+directories = "5"
 glow = "0.16"
 gpui = "0.2.2"
 image = "0.25"
 libmpv2 = { version = "5.0.3", features = ["render"] }
 libmpv2-sys = "4.0.1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 sdl2 = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-segmentation = "1.12"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3.13"

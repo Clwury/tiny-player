@@ -1,48 +1,81 @@
-pub mod media;
-pub mod mpv_backend;
-pub mod player_app;
-pub mod render_host;
-pub mod state;
-pub mod video_presenter;
+mod add_server_dialog;
+mod app;
+mod assets;
+mod emby;
+mod server;
+mod storage;
+mod text_input;
+mod theme;
+mod titlebar;
 
-use std::path::PathBuf;
+use app::TinyApp;
+use assets::ProjectAssets;
+use gpui::{
+    AppContext, Application, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, px, size,
+};
+use storage::ServerCache;
+use text_input::TextInput;
 
-pub fn sample_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sample")
-}
+const DEFAULT_WINDOW_WIDTH: u32 = 1100;
+const DEFAULT_WINDOW_HEIGHT: u32 = 720;
+const MIN_WINDOW_WIDTH: u32 = 900;
+const MIN_WINDOW_HEIGHT: u32 = 600;
 
 pub fn run() {
-    player_app::run();
+    Application::new()
+        .with_assets(ProjectAssets::new())
+        .run(|cx| {
+            theme::init(cx);
+            TextInput::bind_keys(cx);
+
+            let (cache, cache_error) = match storage::load_or_init() {
+                Ok(cache) => (cache, None),
+                Err(error) => (
+                    ServerCache::empty(),
+                    Some(format!("加载服务器缓存失败：{error}").into()),
+                ),
+            };
+            let window_size = restored_window_size(&cache);
+            let bounds = Bounds::centered(
+                None,
+                size(px(window_size.0 as f32), px(window_size.1 as f32)),
+                cx,
+            );
+
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(
+                        px(MIN_WINDOW_WIDTH as f32),
+                        px(MIN_WINDOW_HEIGHT as f32),
+                    )),
+                    window_decorations: Some(WindowDecorations::Client),
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Tiny".into()),
+                        appears_transparent: true,
+                        traffic_light_position: None,
+                    }),
+                    app_id: Some("tiny".to_string()),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| TinyApp::new(cache, cache_error)),
+            )
+            .unwrap();
+
+            cx.activate(true);
+        });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-    use tempfile::tempdir;
-
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
-
-    struct CurrentDirGuard(PathBuf);
-
-    impl Drop for CurrentDirGuard {
-        fn drop(&mut self) {
-            std::env::set_current_dir(&self.0).unwrap();
-        }
-    }
-
-    #[test]
-    fn sample_dir_uses_manifest_dir_instead_of_current_dir() {
-        let _lock = CWD_LOCK.lock().unwrap();
-        let _original_dir = CurrentDirGuard(std::env::current_dir().unwrap());
-        let temp_dir = tempdir().unwrap();
-        std::env::set_current_dir(temp_dir.path()).unwrap();
-
-        let sample_dir = sample_dir();
-
-        assert_eq!(
-            sample_dir,
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sample")
-        );
-    }
+fn restored_window_size(cache: &ServerCache) -> (u32, u32) {
+    cache
+        .window_size()
+        .map(|window| {
+            (
+                window.width.max(MIN_WINDOW_WIDTH),
+                window.height.max(MIN_WINDOW_HEIGHT),
+            )
+        })
+        .unwrap_or((DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT))
 }
