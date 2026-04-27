@@ -178,7 +178,7 @@ fn set_file_permissions(_: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::{Protocol, ServerEndpoint};
+    use crate::server::{CachedItemCounts, Protocol, ServerEndpoint};
 
     fn server(id: &str, token: &str) -> CachedServer {
         CachedServer {
@@ -192,10 +192,10 @@ mod tests {
             username: "luv".to_string(),
             password: "secret".to_string(),
             user_id: Some("user-1".to_string()),
-            user_name: Some("luv".to_string()),
             server_id: Some("server-1".to_string()),
             server_name: Some("Home".to_string()),
             access_token: Some(token.to_string()),
+            item_counts: None,
             added_at_unix: 123,
         }
     }
@@ -258,6 +258,30 @@ mod tests {
             Some(WindowState {
                 width: 1280,
                 height: 800,
+            })
+        );
+    }
+
+    #[test]
+    fn saves_and_loads_item_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut cache = ServerCache::empty();
+        let mut server = server("server-local", "token");
+        server.item_counts = Some(CachedItemCounts {
+            movie_count: 16417,
+            series_count: 16395,
+        });
+        cache.servers.push(server);
+
+        save_to(&cache, &path).unwrap();
+        let loaded = load_or_init_from(&path).unwrap();
+
+        assert_eq!(
+            loaded.servers[0].item_counts,
+            Some(CachedItemCounts {
+                movie_count: 16417,
+                series_count: 16395,
             })
         );
     }

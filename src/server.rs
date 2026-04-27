@@ -95,11 +95,18 @@ pub struct CachedServer {
     pub username: String,
     pub password: String,
     pub user_id: Option<String>,
-    pub user_name: Option<String>,
     pub server_id: Option<String>,
     pub server_name: Option<String>,
     pub access_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_counts: Option<CachedItemCounts>,
     pub added_at_unix: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedItemCounts {
+    pub movie_count: u32,
+    pub series_count: u32,
 }
 
 #[cfg(test)]

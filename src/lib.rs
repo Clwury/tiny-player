@@ -1,8 +1,10 @@
 mod add_server_dialog;
 mod app;
 mod assets;
-mod emby;
-mod server;
+pub mod emby;
+mod home;
+mod image_cache;
+pub mod server;
 mod storage;
 mod text_input;
 mod theme;

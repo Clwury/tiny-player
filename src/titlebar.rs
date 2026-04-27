@@ -9,6 +9,7 @@ use crate::theme;
 pub fn app_titlebar(
     window: &Window,
     cx: &App,
+    title: SharedString,
     on_add_server: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
@@ -59,7 +60,7 @@ pub fn app_titlebar(
                 .text_sm()
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.foreground)
-                .child("Tiny"),
+                .child(title),
         )
         .child(
             div()
