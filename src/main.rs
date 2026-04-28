@@ -11,6 +11,6 @@ fn init_tracing() {
 
     let _ = tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_target(true))
+        .with(fmt::layer().with_target(true).pretty())
         .try_init();
 }

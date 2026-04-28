@@ -14,7 +14,10 @@ pub mod user;
 pub use image::{EmbyImageRequest, EmbyImageType, ImageQuality};
 pub use item::ItemCounts;
 pub use system::PublicSystemInfo;
-pub use user::{AuthSession, AuthSessionInfo, AuthUser, UserView, UserViewImageTags, UserViews};
+pub use user::{
+    AuthSession, AuthSessionInfo, AuthUser, ResumeItem, ResumeItemImageSource, ResumeItems,
+    UserView, UserViewImageTags, UserViews,
+};
 
 pub(super) const CLIENT_NAME: &str = "Lenna";
 pub(super) const DEVICE_NAME: &str = "iPad";

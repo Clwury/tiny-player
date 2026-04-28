@@ -243,6 +243,21 @@ mod tests {
     }
 
     #[test]
+    fn builds_backdrop_image_url() {
+        let client = EmbyClient::new("device-1".to_string()).unwrap();
+        let request = EmbyImageRequest::new("1033990", EmbyImageType::Backdrop)
+            .with_max_width(800)
+            .with_tag(Some("0cc5f0570829e912c9575f11db97744a".to_string()));
+
+        let url = client.image_url(&server(), &request).unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/emby/Items/1033990/Images/Backdrop?maxWidth=800&tag=0cc5f0570829e912c9575f11db97744a&quality=90"
+        );
+    }
+
+    #[test]
     fn builds_image_url_without_max_width() {
         let client = EmbyClient::new("device-1".to_string()).unwrap();
         let request = EmbyImageRequest::primary("36089", Some("abc".to_string()));
