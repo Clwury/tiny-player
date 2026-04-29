@@ -5,7 +5,7 @@ use gpui::{
 
 use crate::{server::CachedServer, theme};
 
-use super::{HomePage, HomeSection};
+use super::{HomePage, HomeSection, carousel::HOME_SIDEBAR_WIDTH_PX};
 
 impl HomePage {
     pub(super) fn render_sidebar(
@@ -23,7 +23,7 @@ impl HomePage {
         div()
             .flex()
             .h_full()
-            .w(px(252.0))
+            .w(px(HOME_SIDEBAR_WIDTH_PX))
             .flex_col()
             .border_r_1()
             .border_color(theme.title_bar_border)

@@ -1,18 +1,108 @@
-use std::path::PathBuf;
+use std::{fs, path::PathBuf, sync::Arc};
 
+use anyhow::{Context as _, Result, anyhow};
 use gpui::{
-    App, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, img, prelude::FluentBuilder, px, svg,
+    App, Asset, ClickEvent, Context, ImageCacheError, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, RenderImage, StatefulInteractiveElement, Styled, Window, div, img,
+    prelude::FluentBuilder, px, svg,
 };
+use image::{Frame, imageops::FilterType};
 
-use crate::{emby::ResumeItem, theme};
+use crate::{
+    emby::{ResumeItem, UserItem},
+    theme,
+};
 
 use super::{
     HomePage,
     carousel::{
+        HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
         USER_VIEW_CARD_IMAGE_HEIGHT_PX, USER_VIEW_CARD_PADDING_PX, USER_VIEW_CARD_WIDTH_PX,
     },
 };
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CoverImageSource {
+    path: PathBuf,
+    width: u32,
+    height: u32,
+}
+
+enum CoverImageAsset {}
+
+impl Asset for CoverImageAsset {
+    type Source = CoverImageSource;
+    type Output = std::result::Result<Arc<RenderImage>, ImageCacheError>;
+
+    #[allow(clippy::manual_async_fn)]
+    fn load(
+        source: Self::Source,
+        _: &mut App,
+    ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
+        async move { load_cover_image(source).map_err(|error| ImageCacheError::Other(Arc::new(error))) }
+    }
+}
+
+fn cover_img(path: PathBuf, width: f32, height: f32) -> impl IntoElement {
+    let source = CoverImageSource {
+        path,
+        width: width as u32,
+        height: height as u32,
+    };
+
+    img(move |window: &mut Window, cx: &mut App| window.use_asset::<CoverImageAsset>(&source, cx))
+        .w(px(width))
+        .h(px(height))
+        .rounded_lg()
+}
+
+fn load_cover_image(source: CoverImageSource) -> Result<Arc<RenderImage>> {
+    let bytes = fs::read(&source.path)
+        .with_context(|| format!("读取图片缓存失败：{}", source.path.display()))?;
+    let image = image::load_from_memory(&bytes)
+        .with_context(|| format!("解析图片缓存失败：{}", source.path.display()))?
+        .to_rgba8();
+    let (source_width, source_height) = image.dimensions();
+    let (x, y, crop_width, crop_height) =
+        cover_crop_bounds(source_width, source_height, source.width, source.height)?;
+    let cropped = image::imageops::crop_imm(&image, x, y, crop_width, crop_height).to_image();
+    let mut resized =
+        image::imageops::resize(&cropped, source.width, source.height, FilterType::Lanczos3);
+
+    for pixel in resized.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+
+    Ok(Arc::new(RenderImage::new([Frame::new(resized)])))
+}
+
+fn cover_crop_bounds(
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> Result<(u32, u32, u32, u32)> {
+    if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
+        return Err(anyhow!("图片裁剪尺寸无效"));
+    }
+
+    let source_ratio = source_width as f64 / source_height as f64;
+    let target_ratio = target_width as f64 / target_height as f64;
+
+    if source_ratio > target_ratio {
+        let crop_width = ((source_height as f64 * target_ratio).round() as u32)
+            .max(1)
+            .min(source_width);
+        let x = (source_width - crop_width) / 2;
+        Ok((x, 0, crop_width, source_height))
+    } else {
+        let crop_height = ((source_width as f64 / target_ratio).round() as u32)
+            .max(1)
+            .min(source_height);
+        let y = (source_height - crop_height) / 2;
+        Ok((0, y, source_width, crop_height))
+    }
+}
 
 pub(super) fn section_placeholder(
     title: &'static str,
@@ -35,13 +125,20 @@ pub(super) fn section_placeholder(
 }
 
 pub(super) fn home_section_title(title: &'static str, cx: &Context<HomePage>) -> gpui::Div {
+    home_section_title_text(title, cx)
+}
+
+pub(super) fn home_section_title_text(
+    title: impl Into<gpui::SharedString>,
+    cx: &Context<HomePage>,
+) -> gpui::Div {
     let theme = theme::get(cx);
 
     div()
         .text_lg()
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(theme.foreground)
-        .child(title)
+        .child(title.into())
 }
 
 pub(super) fn carousel_button(
@@ -107,6 +204,7 @@ pub(super) fn user_view_card(
 
     div()
         .flex()
+        .flex_none()
         .flex_col()
         .gap_2()
         .rounded_lg()
@@ -154,6 +252,7 @@ pub(super) fn resume_item_card(
 
     div()
         .flex()
+        .flex_none()
         .flex_col()
         .gap_2()
         .rounded_lg()
@@ -186,6 +285,148 @@ pub(super) fn resume_item_card(
                     )
                 }),
         )
+}
+
+pub(super) fn user_item_card(
+    item: &UserItem,
+    image_path: Option<PathBuf>,
+    cx: &Context<HomePage>,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+
+    div()
+        .flex()
+        .flex_none()
+        .flex_col()
+        .gap_2()
+        .rounded_lg()
+        .p(px(HOME_ITEM_CARD_PADDING_PX))
+        .hover(move |style| style.bg(theme.secondary_hover))
+        .child(user_item_card_image(item, image_path, cx))
+        .child(
+            div()
+                .w(px(HOME_ITEM_CARD_WIDTH_PX))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .truncate()
+                        .text_center()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(item.name.clone()),
+                )
+                .when_some(item.production_year, |this, year| {
+                    this.child(
+                        div()
+                            .truncate()
+                            .text_center()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(year.to_string()),
+                    )
+                }),
+        )
+}
+
+fn user_item_card_image(
+    item: &UserItem,
+    image_path: Option<PathBuf>,
+    cx: &Context<HomePage>,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+    let has_image = image_path.is_some();
+    let rating = item.community_rating.map(format_community_rating);
+    let unplayed_count = item.unplayed_count();
+    let has_badges = rating.is_some() || unplayed_count.is_some();
+    let is_favorite = item.is_favorite();
+
+    div()
+        .relative()
+        .w(px(HOME_ITEM_CARD_WIDTH_PX))
+        .h(px(HOME_ITEM_CARD_IMAGE_HEIGHT_PX))
+        .overflow_hidden()
+        .rounded_lg()
+        .bg(theme.input_background)
+        .when_some(image_path, |this, path| {
+            this.child(cover_img(
+                path,
+                HOME_ITEM_CARD_WIDTH_PX,
+                HOME_ITEM_CARD_IMAGE_HEIGHT_PX,
+            ))
+        })
+        .when(!has_image, |this| {
+            this.flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("暂无图片")
+        })
+        .when(has_badges, |this| {
+            this.child(
+                div()
+                    .absolute()
+                    .top(px(6.0))
+                    .right(px(6.0))
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .when_some(rating, |this, rating| {
+                        this.child(user_item_badge(rating, cx))
+                    })
+                    .when_some(unplayed_count, |this, count| {
+                        this.child(user_item_badge(count.to_string(), cx))
+                    }),
+            )
+        })
+        .when(is_favorite, |this| {
+            this.child(
+                div()
+                    .absolute()
+                    .left(px(6.0))
+                    .bottom(px(6.0))
+                    .flex()
+                    .size(px(24.0))
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(theme.dialog_background.opacity(0.86))
+                    .child(
+                        svg()
+                            .path("icons/heart.svg")
+                            .size(px(14.0))
+                            .text_color(theme.error),
+                    ),
+            )
+        })
+}
+
+fn user_item_badge(text: String, cx: &Context<HomePage>) -> impl IntoElement {
+    let theme = theme::get(cx);
+
+    div()
+        .flex()
+        .h(px(20.0))
+        .items_center()
+        .rounded_full()
+        .px_2()
+        .bg(theme.dialog_background.opacity(0.86))
+        .text_xs()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme.foreground)
+        .child(text)
+}
+
+fn format_community_rating(rating: f32) -> String {
+    let rating = (rating * 10.0).round() / 10.0;
+    if rating.fract().abs() < f32::EPSILON {
+        format!("{rating:.0}")
+    } else {
+        format!("{rating:.1}")
+    }
 }
 
 fn resume_item_card_text(item: &ResumeItem) -> (String, Option<String>) {
@@ -230,6 +471,29 @@ mod tests {
             parent_backdrop_item_id: None,
             parent_backdrop_image_tags: None,
         }
+    }
+
+    #[test]
+    fn formats_community_rating_badge_text() {
+        assert_eq!(format_community_rating(8.0), "8");
+        assert_eq!(format_community_rating(8.74), "8.7");
+        assert_eq!(format_community_rating(8.75), "8.8");
+    }
+
+    #[test]
+    fn crops_wide_cover_images_horizontally() {
+        assert_eq!(
+            cover_crop_bounds(400, 213, 160, 213).unwrap(),
+            (120, 0, 160, 213)
+        );
+    }
+
+    #[test]
+    fn crops_tall_cover_images_vertically() {
+        assert_eq!(
+            cover_crop_bounds(160, 400, 160, 213).unwrap(),
+            (0, 93, 160, 213)
+        );
     }
 
     #[test]

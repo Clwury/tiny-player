@@ -10,16 +10,37 @@ use std::{
 };
 
 use crate::{
-    emby::{ResumeItems, UserViews},
+    emby::{ResumeItems, UserItems, UserViews},
     image_cache::CachedImageKey,
     server::CachedServer,
 };
-use gpui::{ClickEvent, Context, EventEmitter, Window};
+use gpui::{ClickEvent, Context, EventEmitter, ScrollHandle, Window};
 
 #[derive(Clone, Copy, Debug)]
 pub enum HomeEvent {
     BackToServers,
     SectionChanged,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UserViewItemsRow {
+    items: Option<UserItems>,
+    loading: bool,
+    failed: Option<gpui::SharedString>,
+    scroll_offset: f32,
+    previous_scroll_offset: f32,
+    animation_id: u64,
+    hovered: bool,
+    controls_hovered: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MainScrollbarDragState {
+    cursor_offset_y: f32,
+    track_top: f32,
+    track_height: f32,
+    thumb_height: f32,
+    max_offset: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +65,9 @@ pub struct HomePage {
     resume_items_animation_id: u64,
     resume_items_hovered: bool,
     resume_items_controls_hovered: bool,
+    user_view_items_rows: HashMap<String, UserViewItemsRow>,
+    main_scroll_handle: ScrollHandle,
+    main_scrollbar_drag: Option<MainScrollbarDragState>,
     image_paths: HashMap<CachedImageKey, PathBuf>,
     images_loading: HashSet<CachedImageKey>,
     images_failed: HashSet<CachedImageKey>,
@@ -95,6 +119,9 @@ impl HomePage {
             resume_items_animation_id: 0,
             resume_items_hovered: false,
             resume_items_controls_hovered: false,
+            user_view_items_rows: HashMap::new(),
+            main_scroll_handle: ScrollHandle::new(),
+            main_scrollbar_drag: None,
             image_paths: HashMap::new(),
             images_loading: HashSet::new(),
             images_failed: HashSet::new(),
@@ -113,6 +140,9 @@ impl HomePage {
         if section == HomeSection::Home {
             self.user_views_previous_scroll_offset = self.user_views_scroll_offset;
             self.resume_items_previous_scroll_offset = self.resume_items_scroll_offset;
+            for row in self.user_view_items_rows.values_mut() {
+                row.previous_scroll_offset = row.scroll_offset;
+            }
         }
 
         self.active_section = section;

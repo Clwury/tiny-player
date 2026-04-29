@@ -16,7 +16,7 @@ pub use item::ItemCounts;
 pub use system::PublicSystemInfo;
 pub use user::{
     AuthSession, AuthSessionInfo, AuthUser, ResumeItem, ResumeItemImageSource, ResumeItems,
-    UserView, UserViewImageTags, UserViews,
+    SortOrder, UserItem, UserItemData, UserItems, UserView, UserViewImageTags, UserViews,
 };
 
 pub(super) const CLIENT_NAME: &str = "Lenna";

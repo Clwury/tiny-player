@@ -101,6 +101,26 @@ impl EmbyClient {
 
         serde_json::from_str::<ResumeItems>(&response_body).context("解析 Emby 继续观看响应失败")
     }
+
+    #[instrument(skip(self, server), fields(server = %server.endpoint.display_url(), parent_id = %parent_id))]
+    pub fn user_items(
+        &self,
+        server: &CachedServer,
+        parent_id: &str,
+        start_index: u32,
+        limit: u32,
+        sort_order: SortOrder,
+    ) -> Result<UserItems> {
+        let user_id = server
+            .user_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
+        let mut url = api_url(&server.endpoint, &["Users", user_id, "Items"])?;
+        add_user_items_query(&mut url, parent_id, start_index, limit, sort_order);
+        let response_body = self.send_authenticated_url(server, Method::GET, url)?;
+
+        serde_json::from_str::<UserItems>(&response_body).context("解析 Emby 媒体库项目响应失败")
+    }
 }
 
 fn add_resume_items_query(url: &mut url::Url) {
@@ -113,6 +133,46 @@ fn add_resume_items_query(url: &mut url::Url) {
         .append_pair("Limit", "30")
         .append_pair("MediaTypes", "Video")
         .append_pair("Recursive", "true");
+}
+
+fn add_user_items_query(
+    url: &mut url::Url,
+    parent_id: &str,
+    start_index: u32,
+    limit: u32,
+    sort_order: SortOrder,
+) {
+    let limit = limit.to_string();
+    let start_index = start_index.to_string();
+
+    url.query_pairs_mut()
+        .append_pair("EnableImageTypes", "Primary,Backdrop,Thumb")
+        .append_pair(
+            "Fields",
+            "BasicSyncInfo,CollectionType,PrimaryImageAspectRatio,UserData,CommunityRating,ProviderIds,ProductionYear,ChildCount,Container,CanDelete",
+        )
+        .append_pair("IncludeItemTypes", "Series,Movie,Video,MusicVideo,MusicAlbum")
+        .append_pair("Limit", &limit)
+        .append_pair("ParentId", parent_id)
+        .append_pair("Recursive", "true")
+        .append_pair("SortBy", "DateLastContentAdded,DateCreated,SortName")
+        .append_pair("SortOrder", sort_order.as_str())
+        .append_pair("StartIndex", &start_index);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortOrder {
+    Ascending,
+    Descending,
+}
+
+impl SortOrder {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ascending => "Ascending",
+            Self::Descending => "Descending",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -221,6 +281,60 @@ pub struct UserView {
 #[serde(rename_all = "PascalCase")]
 pub struct UserViewImageTags {
     pub primary: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UserItems {
+    pub items: Vec<UserItem>,
+    pub total_record_count: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UserItem {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "Type")]
+    pub item_type: Option<String>,
+    pub production_year: Option<u32>,
+    pub community_rating: Option<f32>,
+    pub image_tags: Option<HashMap<String, String>>,
+    pub user_data: Option<UserItemData>,
+    pub collection_type: Option<String>,
+    pub primary_image_aspect_ratio: Option<f64>,
+    pub child_count: Option<u32>,
+    pub container: Option<String>,
+    pub can_delete: Option<bool>,
+    pub provider_ids: Option<HashMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UserItemData {
+    pub unplayed_item_count: Option<u32>,
+    #[serde(default)]
+    pub is_favorite: bool,
+}
+
+impl UserItem {
+    pub fn primary_image_tag(&self) -> Option<&str> {
+        self.image_tags
+            .as_ref()
+            .and_then(|tags| tags.get("Primary"))
+            .map(String::as_str)
+    }
+
+    pub fn unplayed_count(&self) -> Option<u32> {
+        self.user_data
+            .as_ref()
+            .and_then(|data| data.unplayed_item_count)
+            .filter(|count| *count > 0)
+    }
+
+    pub fn is_favorite(&self) -> bool {
+        self.user_data.as_ref().is_some_and(|data| data.is_favorite)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -425,6 +539,96 @@ mod tests {
             url.as_str(),
             "https://example.com/emby/Users/user-1/Items/Resume?EnableImageTypes=Primary%2CBackdrop%2CThumb%2CLogo&Fields=BasicSyncInfo%2COverview%2CContainer%2CCanDelete%2CProviderIds%2CProductionYear%2CGenres%2CDateCreated%2CParentId%2CPeople%2CProductionYear%2CMediaSources%2CMediaStreams&Limit=30&MediaTypes=Video&Recursive=true"
         );
+    }
+
+    #[test]
+    fn builds_user_items_url() {
+        let endpoint = ServerEndpoint {
+            protocol: Protocol::Https,
+            address: "example.com".to_string(),
+            port: 443,
+            path: "/emby".to_string(),
+        };
+        let mut url = crate::emby::api_url(&endpoint, &["Users", "user-1", "Items"]).unwrap();
+        add_user_items_query(&mut url, "36089", 0, 30, SortOrder::Descending);
+
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/emby/Users/user-1/Items?EnableImageTypes=Primary%2CBackdrop%2CThumb&Fields=BasicSyncInfo%2CCollectionType%2CPrimaryImageAspectRatio%2CUserData%2CCommunityRating%2CProviderIds%2CProductionYear%2CChildCount%2CContainer%2CCanDelete&IncludeItemTypes=Series%2CMovie%2CVideo%2CMusicVideo%2CMusicAlbum&Limit=30&ParentId=36089&Recursive=true&SortBy=DateLastContentAdded%2CDateCreated%2CSortName&SortOrder=Descending&StartIndex=0"
+        );
+    }
+
+    #[test]
+    fn parses_user_items() {
+        let json = r#"
+        {
+            "Items": [
+                {
+                    "Id": "item-1",
+                    "Name": "示例剧集",
+                    "Type": "Series",
+                    "ProductionYear": 2024,
+                    "CommunityRating": 8.7,
+                    "ImageTags": {
+                        "Primary": "primary-tag-1"
+                    },
+                    "UserData": {
+                        "UnplayedItemCount": 12,
+                        "IsFavorite": true
+                    },
+                    "CollectionType": "tvshows",
+                    "PrimaryImageAspectRatio": 0.75,
+                    "ChildCount": 24,
+                    "Container": "mkv",
+                    "CanDelete": false,
+                    "ProviderIds": {
+                        "Tmdb": "123"
+                    }
+                },
+                {
+                    "Id": "item-2",
+                    "Name": "示例电影",
+                    "Type": "Movie",
+                    "ProductionYear": 2025,
+                    "ImageTags": {
+                        "Primary": "primary-tag-2"
+                    },
+                    "UserData": {
+                        "UnplayedItemCount": 0
+                    }
+                }
+            ],
+            "TotalRecordCount": 2
+        }
+        "#;
+
+        let items: UserItems = serde_json::from_str(json).unwrap();
+
+        assert_eq!(items.total_record_count, 2);
+        assert_eq!(items.items[0].id, "item-1");
+        assert_eq!(items.items[0].name, "示例剧集");
+        assert_eq!(items.items[0].item_type.as_deref(), Some("Series"));
+        assert_eq!(items.items[0].production_year, Some(2024));
+        assert!((items.items[0].community_rating.unwrap() - 8.7).abs() < 0.001);
+        assert_eq!(items.items[0].primary_image_tag(), Some("primary-tag-1"));
+        assert_eq!(items.items[0].unplayed_count(), Some(12));
+        assert!(items.items[0].is_favorite());
+        assert_eq!(items.items[0].collection_type.as_deref(), Some("tvshows"));
+        assert_eq!(items.items[0].primary_image_aspect_ratio, Some(0.75));
+        assert_eq!(items.items[0].child_count, Some(24));
+        assert_eq!(items.items[0].container.as_deref(), Some("mkv"));
+        assert_eq!(items.items[0].can_delete, Some(false));
+        assert_eq!(
+            items.items[0]
+                .provider_ids
+                .as_ref()
+                .and_then(|ids| ids.get("Tmdb"))
+                .map(String::as_str),
+            Some("123")
+        );
+        assert_eq!(items.items[1].primary_image_tag(), Some("primary-tag-2"));
+        assert_eq!(items.items[1].unplayed_count(), None);
+        assert!(!items.items[1].is_favorite());
     }
 
     #[test]

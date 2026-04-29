@@ -7,6 +7,9 @@ use crate::{emby::ItemCounts, server::CachedServer, theme};
 
 use super::TinyApp;
 
+const SERVER_CARD_WIDTH_PX: f32 = 220.0;
+const SERVER_CARD_HEIGHT_PX: f32 = 110.0;
+
 pub(super) struct ServerCardActions<Select, Toggle, Edit, Delete> {
     pub(super) on_select: Select,
     pub(super) on_menu_toggle: Toggle,
@@ -45,28 +48,38 @@ where
 
     div()
         .relative()
-        .w(px(260.0))
+        .w(px(SERVER_CARD_WIDTH_PX))
+        .h(px(SERVER_CARD_HEIGHT_PX))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(theme.input_border)
+                .bg(theme.dialog_background)
+                .hover(move |style| style.bg(theme.secondary_hover))
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    cx.stop_propagation();
+                    on_select(&selected_server, window, cx);
+                }),
+        )
         .child(
             div()
                 .relative()
                 .flex()
                 .flex_col()
-                .w(px(230.0))
-                .h(px(100.0))
-                .gap_2()
-                .rounded(theme.radius_lg)
-                .border_1()
-                .border_color(theme.input_border)
-                .bg(theme.dialog_background)
+                .size_full()
+                .justify_between()
                 .p_4()
-                .hover(move |style| style.bg(theme.secondary_hover))
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    cx.stop_propagation();
-                    on_select(&selected_server, window, cx);
-                })
                 .child(
                     div()
                         .flex()
+                        .w_full()
+                        .min_w_0()
                         .items_center()
                         .gap_2()
                         .text_lg()
@@ -76,26 +89,30 @@ where
                             svg()
                                 .path("icons/emby.svg")
                                 .size(px(32.0))
+                                .flex_none()
                                 .text_color(Hsla::from(rgb(0x53b34c))),
                         )
-                        .child(title),
+                        .child(div().flex_1().min_w_0().text_ellipsis().child(title)),
                 )
                 .child(
                     div()
                         .flex()
-                        .h(px(26.0))
                         .items_center()
                         .justify_between()
                         .gap_2()
                         .child(div().flex().min_w_0().when_some(counts, |this, counts| {
                             this.child(server_counts_row(counts, cx))
                         }))
-                        .child(server_menu_button(menu_server.clone(), cx, on_menu_toggle)),
+                        .child(server_menu_button(
+                            menu_server,
+                            menu_open,
+                            cx,
+                            on_menu_toggle,
+                            on_edit,
+                            on_delete,
+                        )),
                 ),
         )
-        .when(menu_open, |this| {
-            this.child(server_card_menu(menu_server, cx, on_edit, on_delete))
-        })
 }
 
 fn server_counts_row(counts: ItemCounts, cx: &Context<TinyApp>) -> impl IntoElement {
@@ -103,7 +120,6 @@ fn server_counts_row(counts: ItemCounts, cx: &Context<TinyApp>) -> impl IntoElem
 
     div()
         .flex()
-        .h(px(26.0))
         .items_center()
         .gap_3()
         .text_xs()
@@ -129,31 +145,47 @@ fn server_count_item(icon: &'static str, value: u32, color: Hsla) -> impl IntoEl
         .child(format!("{value}"))
 }
 
-fn server_menu_button(
+fn server_menu_button<Toggle, Edit, Delete>(
     server: CachedServer,
+    menu_open: bool,
     cx: &Context<TinyApp>,
-    on_menu_toggle: impl Fn(&CachedServer, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+    on_menu_toggle: Toggle,
+    on_edit: Edit,
+    on_delete: Delete,
+) -> impl IntoElement
+where
+    Toggle: Fn(&CachedServer, &mut Window, &mut App) + 'static,
+    Edit: Fn(&CachedServer, &mut Window, &mut App) + 'static,
+    Delete: Fn(&CachedServer, &mut Window, &mut App) + 'static,
+{
     let theme = theme::get(cx);
+    let toggle_server = server.clone();
 
     div()
-        .flex()
-        .size(px(26.0))
+        .relative()
         .flex_none()
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .text_color(theme.foreground)
-        .hover(move |style| style.bg(theme.secondary_hover))
         .child(
-            svg()
-                .path("icons/ellipsis.svg")
-                .size(px(16.0))
-                .text_color(theme.foreground),
+            div()
+                .flex()
+                .size(px(26.0))
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .text_color(theme.foreground)
+                .hover(move |style| style.bg(theme.secondary_hover))
+                .child(
+                    svg()
+                        .path("icons/ellipsis.svg")
+                        .size(px(16.0))
+                        .text_color(theme.foreground),
+                )
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    cx.stop_propagation();
+                    on_menu_toggle(&toggle_server, window, cx);
+                }),
         )
-        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-            cx.stop_propagation();
-            on_menu_toggle(&server, window, cx);
+        .when(menu_open, |this| {
+            this.child(server_card_menu(server, cx, on_edit, on_delete))
         })
 }
 
@@ -169,8 +201,9 @@ fn server_card_menu(
 
     div()
         .absolute()
-        .right(px(10.0))
-        .bottom(px(-58.0))
+        .occlude()
+        .right_0()
+        .top_full()
         .flex()
         .flex_col()
         .w(px(112.0))

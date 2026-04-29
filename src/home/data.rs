@@ -4,7 +4,8 @@ use gpui::{AppContext, Context};
 
 use crate::{
     emby::{
-        EmbyClient, EmbyImageRequest, ImageQuality, ResumeItemImageSource, ResumeItems, UserViews,
+        EmbyClient, EmbyImageRequest, ImageQuality, ResumeItemImageSource, ResumeItems, SortOrder,
+        UserItem, UserItems, UserViews,
     },
     image_cache::{self, CachedImageKey},
 };
@@ -12,6 +13,8 @@ use crate::{
 use super::HomePage;
 
 const RESUME_CARD_IMAGE_MAX_WIDTH: u32 = 800;
+const HOME_ITEM_CARD_IMAGE_MAX_WIDTH: u32 = 400;
+const HOME_ITEM_PAGE_LIMIT: u32 = 30;
 
 impl HomePage {
     pub(super) fn load_user_views_if_needed(&mut self, cx: &mut Context<Self>) {
@@ -71,6 +74,7 @@ impl HomePage {
             Ok(views) => {
                 self.user_views_failed = None;
                 self.ensure_user_view_images(&views, cx);
+                self.load_user_view_items_for_views(&views, cx);
                 self.user_views = Some(views);
             }
             Err(error) => {
@@ -98,6 +102,67 @@ impl HomePage {
         cx.notify();
     }
 
+    fn load_user_view_items_for_views(&mut self, views: &UserViews, cx: &mut Context<Self>) {
+        for view in &views.items {
+            let row = self
+                .user_view_items_rows
+                .entry(view.id.clone())
+                .or_default();
+            if row.items.is_some() || row.loading || row.failed.is_some() {
+                continue;
+            }
+
+            row.loading = true;
+            let server = self.current_server.clone();
+            let device_id = self.device_id.clone();
+            let view_id = view.id.clone();
+            let task_view_id = view_id.clone();
+            let task = cx.background_spawn(async move {
+                let client = EmbyClient::new(device_id)?;
+                client.user_items(
+                    &server,
+                    &task_view_id,
+                    0,
+                    HOME_ITEM_PAGE_LIMIT,
+                    SortOrder::Descending,
+                )
+            });
+
+            cx.spawn(async move |page, cx| {
+                let result = task.await;
+                page.update(cx, |page, cx| {
+                    page.finish_user_view_items(view_id, result, cx)
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn finish_user_view_items(
+        &mut self,
+        view_id: String,
+        result: anyhow::Result<UserItems>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(items) => {
+                self.ensure_user_items_images(&items, cx);
+                let row = self.user_view_items_rows.entry(view_id).or_default();
+                row.loading = false;
+                row.failed = None;
+                row.items = Some(items);
+            }
+            Err(error) => {
+                let row = self.user_view_items_rows.entry(view_id).or_default();
+                row.loading = false;
+                row.failed = Some(format!("加载媒体库内容失败：{error}").into());
+            }
+        }
+
+        cx.notify();
+    }
+
     fn ensure_user_view_images(&mut self, views: &UserViews, cx: &mut Context<Self>) {
         for view in &views.items {
             let tag = view
@@ -116,6 +181,16 @@ impl HomePage {
         }
     }
 
+    fn ensure_user_items_images(&mut self, items: &UserItems, cx: &mut Context<Self>) {
+        for item in &items.items {
+            self.ensure_user_item_image(
+                item.id.clone(),
+                item.primary_image_tag().map(ToString::to_string),
+                cx,
+            );
+        }
+    }
+
     fn ensure_primary_image(
         &mut self,
         item_id: String,
@@ -124,6 +199,18 @@ impl HomePage {
     ) {
         let request = EmbyImageRequest::primary(item_id, primary_tag)
             .with_max_width(640)
+            .with_quality(ImageQuality::DEFAULT);
+        self.ensure_image(request, cx);
+    }
+
+    fn ensure_user_item_image(
+        &mut self,
+        item_id: String,
+        primary_tag: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let request = EmbyImageRequest::primary(item_id, primary_tag)
+            .with_max_width(HOME_ITEM_CARD_IMAGE_MAX_WIDTH)
             .with_quality(ImageQuality::DEFAULT);
         self.ensure_image(request, cx);
     }
@@ -219,6 +306,16 @@ impl HomePage {
         source: ResumeItemImageSource<'_>,
     ) -> Option<PathBuf> {
         let request = resume_image_request(source);
+        self.image_path_for_request(&request)
+    }
+
+    pub(super) fn image_path_for_user_item(&self, item: &UserItem) -> Option<PathBuf> {
+        let request = EmbyImageRequest::primary(
+            item.id.clone(),
+            item.primary_image_tag().map(ToString::to_string),
+        )
+        .with_max_width(HOME_ITEM_CARD_IMAGE_MAX_WIDTH)
+        .with_quality(ImageQuality::DEFAULT);
         self.image_path_for_request(&request)
     }
 
