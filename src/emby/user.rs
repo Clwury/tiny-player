@@ -251,14 +251,14 @@ pub struct AuthSessionInfo {
     pub user_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserViews {
     pub items: Vec<UserView>,
     pub total_record_count: u32,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserView {
     pub id: String,
@@ -271,20 +271,20 @@ pub struct UserView {
     pub image_tags: Option<UserViewImageTags>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserViewImageTags {
     pub primary: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserItems {
     pub items: Vec<UserItem>,
     pub total_record_count: u32,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserItem {
     pub id: String,
@@ -303,7 +303,7 @@ pub struct UserItem {
     pub provider_ids: Option<HashMap<String, String>>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserItemData {
     pub unplayed_item_count: Option<u32>,
@@ -331,14 +331,14 @@ impl UserItem {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ResumeItems {
     pub items: Vec<ResumeItem>,
     pub total_record_count: u32,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ResumeItem {
     pub id: String,

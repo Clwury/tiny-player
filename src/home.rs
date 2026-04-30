@@ -1,3 +1,4 @@
+mod cache;
 mod carousel;
 mod components;
 mod data;
@@ -85,6 +86,7 @@ struct HomeContent {
     main_scroll_handle: ScrollHandle,
     main_scrollbar_drag: Option<MainScrollbarDragState>,
     image_loader: ImageLoader,
+    snapshot_save_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,7 +110,7 @@ impl HomeSection {
 
 impl HomeContent {
     fn new(current_server: CachedServer, emby_client: EmbyClient) -> Self {
-        Self {
+        let mut content = Self {
             current_server,
             emby_client,
             home_effects: HomeEffects::default(),
@@ -122,10 +124,14 @@ impl HomeContent {
             main_scroll_handle: ScrollHandle::new(),
             main_scrollbar_drag: None,
             image_loader: ImageLoader::new(),
-        }
+            snapshot_save_generation: 0,
+        };
+        content.load_home_snapshot();
+        content
     }
 
     pub(super) fn start_effects(&mut self, cx: &mut Context<Self>) {
+        self.ensure_cached_home_images(cx);
         self.load_user_views_if_needed(cx);
         self.load_resume_items_if_needed(cx);
     }

@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
-use gpui::{AppContext, Context};
+use gpui::{AppContext, Context, Timer};
 
 use crate::{
     emby::{
@@ -13,13 +13,61 @@ use crate::{
     },
 };
 
-use super::HomeContent;
+use super::{HomeContent, cache as home_cache};
 
 const RESUME_CARD_IMAGE_MAX_WIDTH: u32 = 800;
 const HOME_ITEM_CARD_IMAGE_MAX_WIDTH: u32 = 400;
-const HOME_ITEM_PAGE_LIMIT: u32 = 30;
+const HOME_ITEM_PAGE_LIMIT: u32 = 16;
+const HOME_SNAPSHOT_SAVE_DEBOUNCE: Duration = Duration::from_millis(450);
 
 impl HomeContent {
+    pub(super) fn load_home_snapshot(&mut self) {
+        let snapshot = match home_cache::load_snapshot(&self.current_server) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::debug!(%error, "failed to load Home snapshot");
+                return;
+            }
+        };
+
+        if let Some(section) = snapshot.user_views {
+            self.user_views = Some(section.data);
+            self.user_views_failed = None;
+        }
+
+        if let Some(section) = snapshot.resume_items {
+            self.resume_items = Some(section.data);
+            self.resume_items_failed = None;
+        }
+
+        for (view_id, section) in snapshot.user_view_items {
+            let row = self.user_view_items_rows.entry(view_id).or_default();
+            row.items = Some(section.data);
+            row.loading = false;
+            row.failed = None;
+        }
+    }
+
+    pub(super) fn ensure_cached_home_images(&mut self, cx: &mut Context<Self>) {
+        if let Some(views) = self.user_views.clone() {
+            self.ensure_user_view_images(&views, cx);
+        }
+
+        if let Some(items) = self.resume_items.clone() {
+            self.ensure_resume_item_images(&items, cx);
+        }
+
+        let user_view_items = self
+            .user_view_items_rows
+            .values()
+            .filter_map(|row| row.items.clone())
+            .collect::<Vec<_>>();
+        for items in &user_view_items {
+            self.ensure_user_items_images(items, cx);
+        }
+    }
+
     pub(super) fn load_user_views_if_needed(&mut self, cx: &mut Context<Self>) {
         if !self.home_effects.user_views.can_start() {
             return;
@@ -66,6 +114,7 @@ impl HomeContent {
                 self.ensure_user_view_images(&views, cx);
                 self.load_user_view_items_for_views(&views, cx);
                 self.user_views = Some(views);
+                self.schedule_home_snapshot_save(cx);
             }
             Err(error) => {
                 self.home_effects.user_views = super::LoadState::Failed;
@@ -83,6 +132,7 @@ impl HomeContent {
                 self.resume_items_failed = None;
                 self.ensure_resume_item_images(&items, cx);
                 self.resume_items = Some(items);
+                self.schedule_home_snapshot_save(cx);
             }
             Err(error) => {
                 self.home_effects.resume_items = super::LoadState::Failed;
@@ -93,17 +143,22 @@ impl HomeContent {
         cx.notify();
     }
 
-    fn load_user_view_items_for_views(&mut self, views: &UserViews, cx: &mut Context<Self>) {
+    pub(super) fn load_user_view_items_for_views(
+        &mut self,
+        views: &UserViews,
+        cx: &mut Context<Self>,
+    ) {
         for view in &views.items {
             let row = self
                 .user_view_items_rows
                 .entry(view.id.clone())
                 .or_default();
-            if row.items.is_some() || row.loading || row.failed.is_some() {
+            if row.loading {
                 continue;
             }
 
             row.loading = true;
+            row.failed = None;
             let server = self.current_server.clone();
             let client = self.emby_client.clone();
             let view_id = view.id.clone();
@@ -142,6 +197,7 @@ impl HomeContent {
                 row.loading = false;
                 row.failed = None;
                 row.items = Some(items);
+                self.schedule_home_snapshot_save(cx);
             }
             Err(error) => {
                 let row = self.user_view_items_rows.entry(view_id).or_default();
@@ -256,6 +312,59 @@ impl HomeContent {
         self.image_loader.finish_job(key, result);
         self.start_queued_image_loads(cx);
         cx.notify();
+    }
+
+    fn schedule_home_snapshot_save(&mut self, cx: &mut Context<Self>) {
+        self.snapshot_save_generation = self.snapshot_save_generation.wrapping_add(1);
+        let generation = self.snapshot_save_generation;
+
+        cx.spawn(async move |page, cx| {
+            Timer::after(HOME_SNAPSHOT_SAVE_DEBOUNCE).await;
+            page.update(cx, |page, cx| {
+                page.flush_home_snapshot_save(generation, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn flush_home_snapshot_save(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if self.snapshot_save_generation != generation {
+            return;
+        }
+
+        let server = self.current_server.clone();
+        let snapshot = self.home_snapshot();
+        let task =
+            cx.background_spawn(async move { home_cache::save_snapshot(&server, &snapshot) });
+
+        cx.spawn(async move |_, _| {
+            let result = task.await;
+            if let Err(error) = result {
+                tracing::debug!(%error, "failed to save Home snapshot");
+            }
+        })
+        .detach();
+    }
+
+    fn home_snapshot(&self) -> home_cache::HomeSnapshot {
+        let user_view_items = self
+            .user_view_items_rows
+            .iter()
+            .filter_map(|(view_id, row)| {
+                row.items
+                    .as_ref()
+                    .cloned()
+                    .map(|items| (view_id.clone(), items))
+            })
+            .collect::<HashMap<_, _>>();
+
+        home_cache::HomeSnapshot::new(
+            &self.current_server,
+            self.user_views.clone(),
+            self.resume_items.clone(),
+            user_view_items,
+        )
     }
 
     pub(super) fn image_path_for_primary_image(
