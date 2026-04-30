@@ -77,6 +77,8 @@ impl TinyApp {
                         let menu_open =
                             self.open_server_menu.as_deref() == Some(server.id.as_str());
                         let counts = self.item_counts.get(&server.id).cloned();
+                        let loading =
+                            self.selecting_server_id.as_deref() == Some(server.id.as_str());
                         let select_server = cx.listener(Self::select_server);
                         let toggle_menu = cx.listener(Self::toggle_server_menu);
                         let edit_server = cx.listener(Self::open_edit_server_dialog);
@@ -85,6 +87,7 @@ impl TinyApp {
                             server,
                             counts,
                             menu_open,
+                            loading,
                             cx,
                             ServerCardActions {
                                 on_select: select_server,

@@ -19,37 +19,105 @@ const RESUME_CARD_IMAGE_MAX_WIDTH: u32 = 800;
 const HOME_ITEM_CARD_IMAGE_MAX_WIDTH: u32 = 400;
 const HOME_ITEM_PAGE_LIMIT: u32 = 16;
 const HOME_SNAPSHOT_SAVE_DEBOUNCE: Duration = Duration::from_millis(450);
+const HOME_CACHED_IMAGE_ENSURE_DELAY: Duration = Duration::from_millis(16);
 
 impl HomeContent {
-    pub(super) fn load_home_snapshot(&mut self) {
-        let snapshot = match home_cache::load_snapshot(&self.current_server) {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => return,
-            Err(error) => {
-                tracing::debug!(%error, "failed to load Home snapshot");
-                return;
-            }
-        };
+    pub(super) fn load_home_snapshot_if_needed(&mut self, cx: &mut Context<Self>) {
+        if !self.home_effects.home_snapshot.can_start() {
+            return;
+        }
 
-        if let Some(section) = snapshot.user_views {
+        self.home_effects.home_snapshot = super::LoadState::Loading;
+        let server = self.current_server.clone();
+        let task = cx.background_spawn(async move { home_cache::load_snapshot(&server) });
+
+        cx.spawn(async move |page, cx| {
+            let result = task.await;
+            page.update(cx, |page, cx| page.finish_home_snapshot(result, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn finish_home_snapshot(
+        &mut self,
+        result: anyhow::Result<Option<home_cache::HomeSnapshot>>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(Some(snapshot)) => {
+                self.home_effects.home_snapshot = super::LoadState::Loaded;
+                self.hydrate_home_snapshot(snapshot);
+                self.schedule_cached_home_images_ensure(cx);
+                self.schedule_home_network_refresh(cx);
+            }
+            Ok(None) => {
+                self.home_effects.home_snapshot = super::LoadState::Loaded;
+                self.load_home_network_effects(cx);
+            }
+            Err(error) => {
+                self.home_effects.home_snapshot = super::LoadState::Failed;
+                tracing::debug!(%error, "failed to load Home snapshot");
+                self.load_home_network_effects(cx);
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn hydrate_home_snapshot(&mut self, snapshot: home_cache::HomeSnapshot) {
+        if let Some(section) = snapshot.user_views
+            && self.user_views.is_none()
+        {
             self.user_views = Some(section.data);
             self.user_views_failed = None;
         }
 
-        if let Some(section) = snapshot.resume_items {
+        if let Some(section) = snapshot.resume_items
+            && self.resume_items.is_none()
+        {
             self.resume_items = Some(section.data);
             self.resume_items_failed = None;
         }
 
         for (view_id, section) in snapshot.user_view_items {
             let row = self.user_view_items_rows.entry(view_id).or_default();
-            row.items = Some(section.data);
-            row.loading = false;
-            row.failed = None;
+            if row.items.is_none() {
+                row.items = Some(section.data);
+                row.failed = None;
+            }
         }
     }
 
-    pub(super) fn ensure_cached_home_images(&mut self, cx: &mut Context<Self>) {
+    fn schedule_cached_home_images_ensure(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |page, cx| {
+            Timer::after(HOME_CACHED_IMAGE_ENSURE_DELAY).await;
+            page.update(cx, |page, cx| {
+                page.ensure_cached_home_images(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn schedule_home_network_refresh(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |page, cx| {
+            Timer::after(HOME_CACHED_IMAGE_ENSURE_DELAY).await;
+            page.update(cx, |page, cx| {
+                page.load_home_network_effects(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn load_home_network_effects(&mut self, cx: &mut Context<Self>) {
+        self.load_user_views_if_needed(cx);
+        self.load_resume_items_if_needed(cx);
+    }
+
+    fn ensure_cached_home_images(&mut self, cx: &mut Context<Self>) {
         if let Some(views) = self.user_views.clone() {
             self.ensure_user_view_images(&views, cx);
         }

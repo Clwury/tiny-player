@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use gpui::{
-    App, Context, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled,
-    Window, div, prelude::FluentBuilder, px, rgb, svg,
+    Animation, AnimationExt as _, App, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, SharedString, Styled, Transformation, Window, div, percentage,
+    prelude::FluentBuilder, px, rgb, svg,
 };
 
 use crate::{emby::ItemCounts, server::CachedServer, theme};
@@ -9,6 +12,7 @@ use super::TinyApp;
 
 const SERVER_CARD_WIDTH_PX: f32 = 220.0;
 const SERVER_CARD_HEIGHT_PX: f32 = 110.0;
+const SERVER_CARD_LOADER_ANIMATION_MS: u64 = 1800;
 
 pub(super) struct ServerCardActions<Select, Toggle, Edit, Delete> {
     pub(super) on_select: Select,
@@ -21,6 +25,7 @@ pub(super) fn server_card<Select, Toggle, Edit, Delete>(
     server: CachedServer,
     counts: Option<ItemCounts>,
     menu_open: bool,
+    loading: bool,
     cx: &Context<TinyApp>,
     actions: ServerCardActions<Select, Toggle, Edit, Delete>,
 ) -> impl IntoElement
@@ -106,6 +111,7 @@ where
                         .child(server_menu_button(
                             menu_server,
                             menu_open,
+                            loading,
                             cx,
                             on_menu_toggle,
                             on_edit,
@@ -148,6 +154,7 @@ fn server_count_item(icon: &'static str, value: u32, color: Hsla) -> impl IntoEl
 fn server_menu_button<Toggle, Edit, Delete>(
     server: CachedServer,
     menu_open: bool,
+    loading: bool,
     cx: &Context<TinyApp>,
     on_menu_toggle: Toggle,
     on_edit: Edit,
@@ -160,6 +167,7 @@ where
 {
     let theme = theme::get(cx);
     let toggle_server = server.clone();
+    let loader_server_id = server.id.clone();
 
     div()
         .relative()
@@ -173,20 +181,43 @@ where
                 .rounded_md()
                 .text_color(theme.foreground)
                 .hover(move |style| style.bg(theme.secondary_hover))
-                .child(
-                    svg()
-                        .path("icons/ellipsis.svg")
-                        .size(px(16.0))
-                        .text_color(theme.foreground),
-                )
+                .when(loading, |this| {
+                    this.child(loader_icon(loader_server_id, cx))
+                })
+                .when(!loading, |this| {
+                    this.child(
+                        svg()
+                            .path("icons/ellipsis.svg")
+                            .size(px(16.0))
+                            .text_color(theme.foreground),
+                    )
+                })
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     cx.stop_propagation();
-                    on_menu_toggle(&toggle_server, window, cx);
+                    if !loading {
+                        on_menu_toggle(&toggle_server, window, cx);
+                    }
                 }),
         )
-        .when(menu_open, |this| {
+        .when(menu_open && !loading, |this| {
             this.child(server_card_menu(server, cx, on_edit, on_delete))
         })
+}
+
+fn loader_icon(server_id: String, cx: &Context<TinyApp>) -> impl IntoElement {
+    let theme = theme::get(cx);
+    let animation_id = SharedString::from(format!("server-card-loader-{server_id}"));
+
+    svg()
+        .path("icons/loader.svg")
+        .size(px(16.0))
+        .overflow_hidden()
+        .text_color(theme.muted_foreground)
+        .with_animation(
+            animation_id,
+            Animation::new(Duration::from_millis(SERVER_CARD_LOADER_ANIMATION_MS)).repeat(),
+            |svg, delta| svg.with_transformation(Transformation::rotate(percentage(delta))),
+        )
 }
 
 fn server_card_menu(

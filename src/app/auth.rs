@@ -13,6 +13,7 @@ use super::{Page, TinyApp};
 impl TinyApp {
     pub(super) fn show_servers_page_from_home(&mut self, cx: &mut Context<Self>) {
         self.open_server_menu = None;
+        self.selecting_server_id = None;
         self.page = Page::Servers;
         cx.notify();
     }
@@ -24,12 +25,33 @@ impl TinyApp {
         cx: &mut Context<Self>,
     ) {
         self.open_server_menu = None;
+        self.cache_error = None;
+
+        let server_id = server.id.clone();
+        if has_cached_auth(server) {
+            self.selecting_server_id = None;
+            self.open_home_for_server(server.clone(), cx);
+            self.load_item_counts_for_server_id(&server_id, cx);
+            cx.notify();
+            return;
+        }
+
+        if self.is_selecting_server(&server_id) {
+            cx.notify();
+            return;
+        }
+
         let Some(client) = self.emby_client.clone() else {
+            self.selecting_server_id = None;
             self.cache_error = Some("Emby HTTP 客户端不可用".into());
             cx.notify();
             return;
         };
-        let server_id = server.id.clone();
+
+        self.selecting_server_id = Some(server_id.clone());
+        self.page = Page::Servers;
+        cx.notify();
+
         let submission = AddServerSubmission {
             endpoint: server.endpoint.clone(),
             username: server.username.clone(),
@@ -53,11 +75,16 @@ impl TinyApp {
         result: Result<AuthSession>,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_selecting_server(&server_id) {
+            return;
+        }
+
         match result {
             Ok(session) => {
                 self.finish_authenticated_server(server_id.clone(), session, cx);
             }
             Err(error) => {
+                self.selecting_server_id = None;
                 self.cache_error = Some(format!("登录服务器失败：{error}").into());
                 self.page = Page::Servers;
             }
@@ -75,6 +102,7 @@ impl TinyApp {
         let user_id = session.user_id();
         let access_token = session.access_token;
         let mut updated_cache = false;
+        let mut home_server = None;
 
         if let Some(server) = self
             .servers
@@ -83,23 +111,15 @@ impl TinyApp {
         {
             server.user_id = user_id.clone();
             server.access_token = Some(access_token.clone());
+            home_server = Some(server.clone());
         }
 
-        if let Some(server) = self.servers.iter().find(|server| server.id == server_id) {
-            let Some(client) = self.emby_client.clone() else {
-                self.cache_error = Some("Emby HTTP 客户端不可用".into());
-                return;
-            };
-            let server = server.clone();
-            let servers = self.servers.clone();
-            let home_page = cx.new(|cx| HomePage::new(server, servers, client, cx));
-            cx.subscribe(&home_page, |app: &mut TinyApp, _, event, cx| match event {
-                HomeEvent::BackToServers => app.show_servers_page_from_home(cx),
-                HomeEvent::SectionChanged => cx.notify(),
-            })
-            .detach();
-            self.page = Page::Home(home_page);
-        }
+        let Some(home_server) = home_server else {
+            self.selecting_server_id = None;
+            self.cache_error = Some("登录服务器失败：服务器不存在".into());
+            self.page = Page::Servers;
+            return;
+        };
 
         if let Some(server) = self
             .cache
@@ -113,9 +133,13 @@ impl TinyApp {
         }
 
         if !updated_cache {
+            self.selecting_server_id = None;
             self.cache_error = Some("保存登录信息失败：服务器不存在".into());
+            self.page = Page::Servers;
             return;
         }
+
+        self.open_home_for_server(home_server, cx);
 
         self.item_counts_loading.remove(&server_id);
         self.item_counts_failed.remove(&server_id);
@@ -132,4 +156,38 @@ impl TinyApp {
             }
         }
     }
+
+    fn open_home_for_server(&mut self, server: CachedServer, cx: &mut Context<Self>) {
+        let Some(client) = self.emby_client.clone() else {
+            self.selecting_server_id = None;
+            self.cache_error = Some("Emby HTTP 客户端不可用".into());
+            self.page = Page::Servers;
+            return;
+        };
+
+        self.selecting_server_id = None;
+        let servers = self.servers.clone();
+        let home_page = cx.new(|cx| HomePage::new(server, servers, client, cx));
+        cx.subscribe(&home_page, |app: &mut TinyApp, _, event, cx| match event {
+            HomeEvent::BackToServers => app.show_servers_page_from_home(cx),
+            HomeEvent::SectionChanged => cx.notify(),
+        })
+        .detach();
+        self.page = Page::Home(home_page);
+    }
+
+    fn is_selecting_server(&self, server_id: &str) -> bool {
+        self.selecting_server_id.as_deref() == Some(server_id)
+    }
+}
+
+fn has_cached_auth(server: &CachedServer) -> bool {
+    server
+        .user_id
+        .as_deref()
+        .is_some_and(|user_id| !user_id.is_empty())
+        && server
+            .access_token
+            .as_deref()
+            .is_some_and(|access_token| !access_token.is_empty())
 }
