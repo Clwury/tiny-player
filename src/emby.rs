@@ -1,7 +1,11 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::{Method, blocking::Client};
+use reqwest::{
+    Method,
+    blocking::Client,
+    header::{CONTENT_TYPE, HeaderMap},
+};
 use serde::de::DeserializeOwned;
 use tracing::debug;
 
@@ -12,7 +16,7 @@ pub mod item;
 pub mod system;
 pub mod user;
 
-pub use image::{EmbyImageRequest, EmbyImageType, ImageQuality};
+pub use image::{DownloadedImage, EmbyImageRequest, EmbyImageType, ImageQuality};
 pub use item::ItemCounts;
 pub use system::PublicSystemInfo;
 pub use user::{
@@ -181,7 +185,7 @@ impl EmbyClient {
         server: &CachedServer,
         method: Method,
         url: url::Url,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DownloadedImage> {
         let access_token = server
             .access_token
             .as_deref()
@@ -214,6 +218,7 @@ impl EmbyClient {
             .context("连接 Emby 服务器失败")?;
 
         let status = response.status();
+        let content_type = content_type_header(response.headers());
         let response_headers = format!("{:?}", response.headers());
         let response_bytes = response.bytes().context("读取 Emby 图片响应失败")?;
         debug!(status = %status, bytes = response_bytes.len(), "received authenticated Emby image response");
@@ -240,7 +245,10 @@ impl EmbyClient {
             bail!("Emby 图片响应为空");
         }
 
-        Ok(response_bytes.to_vec())
+        Ok(DownloadedImage {
+            bytes: response_bytes.to_vec(),
+            content_type,
+        })
     }
 
     fn authorization_header(&self) -> String {
@@ -256,6 +264,16 @@ impl EmbyClient {
             self.device_id
         )
     }
+}
+
+fn content_type_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let content_type = value.split(';').next()?.trim();
+            (!content_type.is_empty()).then(|| content_type.to_ascii_lowercase())
+        })
 }
 
 fn log_secrets() -> bool {

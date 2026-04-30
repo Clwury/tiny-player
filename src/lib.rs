@@ -4,6 +4,7 @@ mod assets;
 pub mod emby;
 mod home;
 mod image_cache;
+mod image_loader;
 pub mod server;
 mod storage;
 mod text_input;

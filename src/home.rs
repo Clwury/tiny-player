@@ -4,14 +4,11 @@ mod data;
 mod render;
 mod sidebar;
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-};
+use std::collections::HashMap;
 
 use crate::{
     emby::{EmbyClient, ResumeItems, UserItems, UserViews},
-    image_cache::CachedImageKey,
+    image_loader::ImageLoader,
     server::CachedServer,
 };
 use carousel::CarouselState;
@@ -87,9 +84,7 @@ struct HomeContent {
     user_view_items_rows: HashMap<String, UserViewItemsRow>,
     main_scroll_handle: ScrollHandle,
     main_scrollbar_drag: Option<MainScrollbarDragState>,
-    image_paths: HashMap<CachedImageKey, PathBuf>,
-    images_loading: HashSet<CachedImageKey>,
-    images_failed: HashSet<CachedImageKey>,
+    image_loader: ImageLoader,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,9 +121,7 @@ impl HomeContent {
             user_view_items_rows: HashMap::new(),
             main_scroll_handle: ScrollHandle::new(),
             main_scrollbar_drag: None,
-            image_paths: HashMap::new(),
-            images_loading: HashSet::new(),
-            images_failed: HashSet::new(),
+            image_loader: ImageLoader::new(),
         }
     }
 

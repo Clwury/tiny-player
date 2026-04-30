@@ -5,6 +5,12 @@ use crate::server::CachedServer;
 
 use super::{EmbyClient, api_url};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadedImage {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EmbyImageType {
     Primary,
@@ -149,7 +155,11 @@ impl EmbyClient {
         Ok(url)
     }
 
-    pub fn item_image(&self, server: &CachedServer, request: &EmbyImageRequest) -> Result<Vec<u8>> {
+    pub fn item_image(
+        &self,
+        server: &CachedServer,
+        request: &EmbyImageRequest,
+    ) -> Result<DownloadedImage> {
         let url = self.image_url(server, request)?;
         self.send_authenticated_bytes_url(server, Method::GET, url)
     }

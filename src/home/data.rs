@@ -7,7 +7,8 @@ use crate::{
         EmbyImageRequest, ImageQuality, ResumeItemImageSource, ResumeItems, SortOrder, UserItem,
         UserItems, UserViews,
     },
-    image_cache::{self, CachedImageKey},
+    image_cache,
+    image_loader::ImageLoadJob,
 };
 
 use super::HomeContent;
@@ -208,43 +209,32 @@ impl HomeContent {
     }
 
     fn ensure_image(&mut self, request: EmbyImageRequest, cx: &mut Context<Self>) {
-        let Some(key) = CachedImageKey::from_request(&self.current_server, &request) else {
-            return;
-        };
+        self.image_loader
+            .ensure_image(&self.current_server, request);
+        self.start_queued_image_loads(cx);
+    }
 
-        if self.image_paths.contains_key(&key)
-            || self.images_loading.contains(&key)
-            || self.images_failed.contains(&key)
-        {
-            return;
-        }
-
-        match image_cache::cached_image_exists(&key) {
-            Ok(Some(path)) => {
-                self.image_paths.insert(key, path);
-            }
-            Ok(None) => {
-                self.load_item_image(request, key, cx);
-            }
-            Err(_) => {
-                self.images_failed.insert(key);
-            }
+    fn start_queued_image_loads(&mut self, cx: &mut Context<Self>) {
+        for job in self.image_loader.start_queued_jobs() {
+            self.load_item_image(job, cx);
         }
     }
 
-    fn load_item_image(
-        &mut self,
-        request: EmbyImageRequest,
-        key: CachedImageKey,
-        cx: &mut Context<Self>,
-    ) {
-        self.images_loading.insert(key.clone());
+    fn load_item_image(&mut self, job: ImageLoadJob, cx: &mut Context<Self>) {
         let server = self.current_server.clone();
-        let task_key = key.clone();
         let client = self.emby_client.clone();
+        let key = job.key.clone();
+        let task_key = job.key.clone();
+        let request = job.request;
         let task = cx.background_spawn(async move {
-            let bytes = client.item_image(&server, &request)?;
-            image_cache::write_cached_image(&task_key, &bytes)
+            let image = client.item_image(&server, &request)?;
+            let path = image_cache::write_cached_image(
+                &task_key,
+                &image.bytes,
+                image.content_type.as_deref(),
+            )?;
+            let _ = image_cache::prune_cache(image_cache::DEFAULT_MAX_CACHE_BYTES);
+            Ok(path)
         });
 
         cx.spawn(async move |page, cx| {
@@ -257,22 +247,12 @@ impl HomeContent {
 
     fn finish_item_image(
         &mut self,
-        key: CachedImageKey,
-        result: anyhow::Result<PathBuf>,
+        key: crate::image_cache::CachedImageKey,
+        result: anyhow::Result<std::path::PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        self.images_loading.remove(&key);
-
-        match result {
-            Ok(path) => {
-                self.images_failed.remove(&key);
-                self.image_paths.insert(key, path);
-            }
-            Err(_) => {
-                self.images_failed.insert(key);
-            }
-        }
-
+        self.image_loader.finish_job(key, result);
+        self.start_queued_image_loads(cx);
         cx.notify();
     }
 
@@ -305,9 +285,9 @@ impl HomeContent {
         self.image_path_for_request(&request)
     }
 
-    fn image_path_for_request(&self, request: &EmbyImageRequest) -> Option<PathBuf> {
-        let key = CachedImageKey::from_request(&self.current_server, request)?;
-        self.image_paths.get(&key).cloned()
+    fn image_path_for_request(&self, request: &EmbyImageRequest) -> Option<std::path::PathBuf> {
+        self.image_loader
+            .path_for_request(&self.current_server, request)
     }
 }
 
