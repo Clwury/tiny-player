@@ -13,11 +13,11 @@ use std::collections::{HashMap, HashSet};
 use gpui::{Entity, SharedString};
 
 use crate::{
-    add_server_dialog::AddServerDialogState,
     emby::{EmbyClient, ItemCounts},
     home::HomePage,
     server::CachedServer,
     storage::ServerCache,
+    ui::add_server_dialog::AddServerDialogState,
 };
 
 pub struct TinyApp {

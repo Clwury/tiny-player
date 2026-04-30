@@ -7,8 +7,10 @@ use crate::{
         EmbyImageRequest, ImageQuality, ResumeItemImageSource, ResumeItems, SortOrder, UserItem,
         UserItems, UserViews,
     },
-    image_cache,
-    image_loader::ImageLoadJob,
+    images::{
+        cache::{self as image_cache},
+        loader::ImageLoadJob,
+    },
 };
 
 use super::HomeContent;
@@ -247,7 +249,7 @@ impl HomeContent {
 
     fn finish_item_image(
         &mut self,
-        key: crate::image_cache::CachedImageKey,
+        key: crate::images::cache::CachedImageKey,
         result: anyhow::Result<std::path::PathBuf>,
         cx: &mut Context<Self>,
     ) {

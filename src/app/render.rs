@@ -3,7 +3,7 @@ use gpui::{
     div, prelude::FluentBuilder, px,
 };
 
-use crate::{theme, titlebar::app_titlebar};
+use crate::{theme, ui::titlebar::app_titlebar};
 
 use super::{
     Page, TinyApp,

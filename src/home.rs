@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::{
     emby::{EmbyClient, ResumeItems, UserItems, UserViews},
-    image_loader::ImageLoader,
+    images::loader::ImageLoader,
     server::CachedServer,
 };
 use carousel::CarouselState;

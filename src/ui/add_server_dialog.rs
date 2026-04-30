@@ -5,9 +5,10 @@ use gpui::{
 
 use crate::{
     server::{AddServerSubmission, CachedServer, Protocol, ServerEndpoint},
-    text_input::TextInput,
     theme,
 };
+
+use super::text_input::TextInput;
 
 #[derive(Default)]
 struct AddServerErrors {

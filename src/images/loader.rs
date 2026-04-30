@@ -6,11 +6,9 @@ use std::{
 
 use anyhow::Result;
 
-use crate::{
-    emby::EmbyImageRequest,
-    image_cache::{self, CachedImageKey},
-    server::CachedServer,
-};
+use crate::{emby::EmbyImageRequest, server::CachedServer};
+
+use super::cache::{self as image_cache, CachedImageKey};
 
 const DEFAULT_MAX_CONCURRENT_IMAGES: usize = 100;
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(30);

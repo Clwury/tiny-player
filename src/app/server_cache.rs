@@ -5,10 +5,10 @@ use gpui::{Context, Entity, Window};
 use uuid::Uuid;
 
 use crate::{
-    add_server_dialog::AddServerDialogState,
     emby::{EmbyClient, PublicSystemInfo},
     server::{AddServerSubmission, CachedServer},
     storage::{self, ServerCache},
+    ui::add_server_dialog::AddServerDialogState,
 };
 
 use super::{Page, TinyApp};

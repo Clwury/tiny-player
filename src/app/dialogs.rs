@@ -1,6 +1,6 @@
 use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, Window};
 
-use crate::{add_server_dialog::AddServerDialogState, server::CachedServer};
+use crate::{server::CachedServer, ui::add_server_dialog::AddServerDialogState};
 
 use super::{
     TinyApp,

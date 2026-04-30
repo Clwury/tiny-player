@@ -1,15 +1,12 @@
-mod add_server_dialog;
 mod app;
 mod assets;
 pub mod emby;
 mod home;
-mod image_cache;
-mod image_loader;
+mod images;
 pub mod server;
 mod storage;
-mod text_input;
 mod theme;
-mod titlebar;
+mod ui;
 
 use app::TinyApp;
 use assets::ProjectAssets;
@@ -18,7 +15,7 @@ use gpui::{
     WindowDecorations, WindowOptions, px, size,
 };
 use storage::ServerCache;
-use text_input::TextInput;
+use ui::text_input::TextInput;
 
 const DEFAULT_WINDOW_WIDTH: u32 = 1100;
 const DEFAULT_WINDOW_HEIGHT: u32 = 720;
