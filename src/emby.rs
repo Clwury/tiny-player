@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Method, blocking::Client};
+use serde::de::DeserializeOwned;
 use tracing::debug;
 
 use crate::server::{CachedServer, ServerEndpoint};
@@ -23,6 +24,7 @@ pub(super) const CLIENT_NAME: &str = "Lenna";
 pub(super) const DEVICE_NAME: &str = "iPad";
 pub(super) const VERSION: &str = "1.0.13";
 
+#[derive(Clone, Debug)]
 pub struct EmbyClient {
     device_id: String,
     http: Client,
@@ -46,6 +48,74 @@ impl EmbyClient {
     ) -> Result<String> {
         let url = api_url(&server.endpoint, path_segments)?;
         self.send_authenticated_url(server, method, url)
+    }
+
+    fn send_authenticated_json<T>(
+        &self,
+        server: &CachedServer,
+        method: Method,
+        path_segments: &[&str],
+        parse_context: &'static str,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let response_body = self.send_authenticated_request(server, method, path_segments)?;
+        serde_json::from_str::<T>(&response_body).context(parse_context)
+    }
+
+    fn send_authenticated_json_url<T>(
+        &self,
+        server: &CachedServer,
+        method: Method,
+        url: url::Url,
+        parse_context: &'static str,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let response_body = self.send_authenticated_url(server, method, url)?;
+        serde_json::from_str::<T>(&response_body).context(parse_context)
+    }
+
+    fn send_public_json<T>(
+        &self,
+        endpoint: &ServerEndpoint,
+        method: Method,
+        path_segments: &[&str],
+        http_error_prefix: &'static str,
+        parse_context: &'static str,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let url = api_url(endpoint, path_segments)?;
+        debug!(method = %method, url = %url, "sending Emby public request");
+        let response = self
+            .http
+            .request(method, url)
+            .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
+            .send()
+            .context("连接 Emby 服务器失败")?;
+
+        let status = response.status();
+        let response_headers = format!("{:?}", response.headers());
+        let response_body = response.text().context("读取 Emby API 响应失败")?;
+        debug!(status = %status, "received Emby public response");
+        if log_secrets() {
+            debug!(
+                status = %status,
+                headers = %response_headers,
+                body = %response_body,
+                "full Emby public response"
+            );
+        }
+
+        if !status.is_success() {
+            bail!("{http_error_prefix}：HTTP {status} {response_body}");
+        }
+
+        serde_json::from_str::<T>(&response_body).context(parse_context)
     }
 
     fn send_authenticated_url(

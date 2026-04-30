@@ -4,35 +4,29 @@ use gpui::{AppContext, Context};
 
 use crate::{
     emby::{
-        EmbyClient, EmbyImageRequest, ImageQuality, ResumeItemImageSource, ResumeItems, SortOrder,
-        UserItem, UserItems, UserViews,
+        EmbyImageRequest, ImageQuality, ResumeItemImageSource, ResumeItems, SortOrder, UserItem,
+        UserItems, UserViews,
     },
     image_cache::{self, CachedImageKey},
 };
 
-use super::HomePage;
+use super::HomeContent;
 
 const RESUME_CARD_IMAGE_MAX_WIDTH: u32 = 800;
 const HOME_ITEM_CARD_IMAGE_MAX_WIDTH: u32 = 400;
 const HOME_ITEM_PAGE_LIMIT: u32 = 30;
 
-impl HomePage {
+impl HomeContent {
     pub(super) fn load_user_views_if_needed(&mut self, cx: &mut Context<Self>) {
-        if self.active_section != super::HomeSection::Home
-            || self.user_views.is_some()
-            || self.user_views_loading
-            || self.user_views_failed.is_some()
-        {
+        if !self.home_effects.user_views.can_start() {
             return;
         }
 
-        self.user_views_loading = true;
+        self.home_effects.user_views = super::LoadState::Loading;
+        cx.notify();
         let server = self.current_server.clone();
-        let device_id = self.device_id.clone();
-        let task = cx.background_spawn(async move {
-            let client = EmbyClient::new(device_id)?;
-            client.user_views(&server)
-        });
+        let client = self.emby_client.clone();
+        let task = cx.background_spawn(async move { client.user_views(&server) });
 
         cx.spawn(async move |page, cx| {
             let result = task.await;
@@ -43,21 +37,15 @@ impl HomePage {
     }
 
     pub(super) fn load_resume_items_if_needed(&mut self, cx: &mut Context<Self>) {
-        if self.active_section != super::HomeSection::Home
-            || self.resume_items.is_some()
-            || self.resume_items_loading
-            || self.resume_items_failed.is_some()
-        {
+        if !self.home_effects.resume_items.can_start() {
             return;
         }
 
-        self.resume_items_loading = true;
+        self.home_effects.resume_items = super::LoadState::Loading;
+        cx.notify();
         let server = self.current_server.clone();
-        let device_id = self.device_id.clone();
-        let task = cx.background_spawn(async move {
-            let client = EmbyClient::new(device_id)?;
-            client.resume_items(&server)
-        });
+        let client = self.emby_client.clone();
+        let task = cx.background_spawn(async move { client.resume_items(&server) });
 
         cx.spawn(async move |page, cx| {
             let result = task.await;
@@ -68,16 +56,16 @@ impl HomePage {
     }
 
     fn finish_user_views(&mut self, result: anyhow::Result<UserViews>, cx: &mut Context<Self>) {
-        self.user_views_loading = false;
-
         match result {
             Ok(views) => {
+                self.home_effects.user_views = super::LoadState::Loaded;
                 self.user_views_failed = None;
                 self.ensure_user_view_images(&views, cx);
                 self.load_user_view_items_for_views(&views, cx);
                 self.user_views = Some(views);
             }
             Err(error) => {
+                self.home_effects.user_views = super::LoadState::Failed;
                 self.user_views_failed = Some(format!("加载首页失败：{error}").into());
             }
         }
@@ -86,15 +74,15 @@ impl HomePage {
     }
 
     fn finish_resume_items(&mut self, result: anyhow::Result<ResumeItems>, cx: &mut Context<Self>) {
-        self.resume_items_loading = false;
-
         match result {
             Ok(items) => {
+                self.home_effects.resume_items = super::LoadState::Loaded;
                 self.resume_items_failed = None;
                 self.ensure_resume_item_images(&items, cx);
                 self.resume_items = Some(items);
             }
             Err(error) => {
+                self.home_effects.resume_items = super::LoadState::Failed;
                 self.resume_items_failed = Some(format!("加载继续观看失败：{error}").into());
             }
         }
@@ -114,11 +102,10 @@ impl HomePage {
 
             row.loading = true;
             let server = self.current_server.clone();
-            let device_id = self.device_id.clone();
+            let client = self.emby_client.clone();
             let view_id = view.id.clone();
             let task_view_id = view_id.clone();
             let task = cx.background_spawn(async move {
-                let client = EmbyClient::new(device_id)?;
                 client.user_items(
                     &server,
                     &task_view_id,
@@ -254,9 +241,8 @@ impl HomePage {
         self.images_loading.insert(key.clone());
         let server = self.current_server.clone();
         let task_key = key.clone();
-        let device_id = self.device_id.clone();
+        let client = self.emby_client.clone();
         let task = cx.background_spawn(async move {
-            let client = EmbyClient::new(device_id)?;
             let bytes = client.item_image(&server, &request)?;
             image_cache::write_cached_image(&task_key, &bytes)
         });

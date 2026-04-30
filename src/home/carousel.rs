@@ -1,6 +1,6 @@
 use gpui::{ClickEvent, Context, Window};
 
-use super::HomePage;
+use super::HomeContent;
 
 pub(super) const USER_VIEW_CARD_WIDTH_PX: f32 = 240.0;
 pub(super) const USER_VIEW_CARD_PADDING_PX: f32 = 4.0;
@@ -53,6 +53,67 @@ pub(super) fn carousel_content_width_for(
     }
 
     total as f32 * (card_width + card_padding * 2.0) + total.saturating_sub(1) as f32 * gap
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct CarouselState {
+    scroll_offset: f32,
+    previous_scroll_offset: f32,
+    animation_id: u64,
+    hovered: bool,
+    controls_hovered: bool,
+}
+
+impl CarouselState {
+    pub(super) fn scroll_offset(self, max_offset: f32) -> f32 {
+        self.scroll_offset.min(max_offset)
+    }
+
+    pub(super) fn previous_scroll_offset(self, max_offset: f32) -> f32 {
+        self.previous_scroll_offset.min(max_offset)
+    }
+
+    pub(super) fn animation_id(self) -> u64 {
+        self.animation_id
+    }
+
+    pub(super) fn controls_visible(self, has_controls: bool) -> bool {
+        has_controls && (self.hovered || self.controls_hovered)
+    }
+
+    pub(super) fn set_hovered(&mut self, hovered: bool) -> bool {
+        if self.hovered == hovered {
+            return false;
+        }
+
+        self.hovered = hovered;
+        true
+    }
+
+    pub(super) fn set_controls_hovered(&mut self, hovered: bool) -> bool {
+        if self.controls_hovered == hovered {
+            return false;
+        }
+
+        self.controls_hovered = hovered;
+        true
+    }
+
+    pub(super) fn set_scroll_offset(&mut self, offset: f32, max_offset: f32) -> bool {
+        let offset = offset.clamp(0.0, max_offset);
+        if self.scroll_offset == offset {
+            return false;
+        }
+
+        self.previous_scroll_offset = self.scroll_offset.min(max_offset);
+        self.scroll_offset = offset;
+        self.animation_id += 1;
+        true
+    }
+
+    pub(super) fn sync_previous_offset(&mut self) {
+        self.previous_scroll_offset = self.scroll_offset;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -177,10 +238,9 @@ pub(super) fn max_carousel_scroll_offset_for(
     (carousel_content_width_for(total, card_width, card_padding, gap) - viewport_width).max(0.0)
 }
 
-impl HomePage {
+impl HomeContent {
     pub(super) fn set_user_views_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
-        if self.user_views_hovered != hovered {
-            self.user_views_hovered = hovered;
+        if self.user_views_carousel.set_hovered(hovered) {
             cx.notify();
         }
     }
@@ -190,15 +250,13 @@ impl HomePage {
         hovered: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.user_views_controls_hovered != hovered {
-            self.user_views_controls_hovered = hovered;
+        if self.user_views_carousel.set_controls_hovered(hovered) {
             cx.notify();
         }
     }
 
     pub(super) fn set_resume_items_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
-        if self.resume_items_hovered != hovered {
-            self.resume_items_hovered = hovered;
+        if self.resume_items_carousel.set_hovered(hovered) {
             cx.notify();
         }
     }
@@ -208,8 +266,7 @@ impl HomePage {
         hovered: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.resume_items_controls_hovered != hovered {
-            self.resume_items_controls_hovered = hovered;
+        if self.resume_items_carousel.set_controls_hovered(hovered) {
             cx.notify();
         }
     }
@@ -221,7 +278,7 @@ impl HomePage {
         cx: &mut Context<Self>,
     ) {
         self.set_user_views_scroll_offset(
-            self.user_views_scroll_offset - USER_VIEW_SCROLL_STEP_PX,
+            self.user_views_carousel.scroll_offset(f32::INFINITY) - USER_VIEW_SCROLL_STEP_PX,
             window,
             cx,
         );
@@ -234,7 +291,7 @@ impl HomePage {
         cx: &mut Context<Self>,
     ) {
         self.set_user_views_scroll_offset(
-            self.user_views_scroll_offset + USER_VIEW_SCROLL_STEP_PX,
+            self.user_views_carousel.scroll_offset(f32::INFINITY) + USER_VIEW_SCROLL_STEP_PX,
             window,
             cx,
         );
@@ -252,16 +309,12 @@ impl HomePage {
             .as_ref()
             .map(|views| max_carousel_scroll_offset(views.items.len(), viewport_width))
             .unwrap_or(0.0);
-        let offset = offset.clamp(0.0, max_offset);
-
-        if self.user_views_scroll_offset == offset {
-            return;
+        if self
+            .user_views_carousel
+            .set_scroll_offset(offset, max_offset)
+        {
+            cx.notify();
         }
-
-        self.user_views_previous_scroll_offset = self.user_views_scroll_offset.min(max_offset);
-        self.user_views_scroll_offset = offset;
-        self.user_views_animation_id += 1;
-        cx.notify();
     }
 
     pub(super) fn scroll_resume_items_left(
@@ -271,7 +324,7 @@ impl HomePage {
         cx: &mut Context<Self>,
     ) {
         self.set_resume_items_scroll_offset(
-            self.resume_items_scroll_offset - USER_VIEW_SCROLL_STEP_PX,
+            self.resume_items_carousel.scroll_offset(f32::INFINITY) - USER_VIEW_SCROLL_STEP_PX,
             window,
             cx,
         );
@@ -284,7 +337,7 @@ impl HomePage {
         cx: &mut Context<Self>,
     ) {
         self.set_resume_items_scroll_offset(
-            self.resume_items_scroll_offset + USER_VIEW_SCROLL_STEP_PX,
+            self.resume_items_carousel.scroll_offset(f32::INFINITY) + USER_VIEW_SCROLL_STEP_PX,
             window,
             cx,
         );
@@ -302,16 +355,12 @@ impl HomePage {
             .as_ref()
             .map(|items| max_carousel_scroll_offset(items.items.len(), viewport_width))
             .unwrap_or(0.0);
-        let offset = offset.clamp(0.0, max_offset);
-
-        if self.resume_items_scroll_offset == offset {
-            return;
+        if self
+            .resume_items_carousel
+            .set_scroll_offset(offset, max_offset)
+        {
+            cx.notify();
         }
-
-        self.resume_items_previous_scroll_offset = self.resume_items_scroll_offset.min(max_offset);
-        self.resume_items_scroll_offset = offset;
-        self.resume_items_animation_id += 1;
-        cx.notify();
     }
 
     pub(super) fn set_user_view_items_hovered(
@@ -324,8 +373,7 @@ impl HomePage {
             .user_view_items_rows
             .entry(view_id.to_string())
             .or_default();
-        if row.hovered != hovered {
-            row.hovered = hovered;
+        if row.carousel.set_hovered(hovered) {
             cx.notify();
         }
     }
@@ -340,8 +388,7 @@ impl HomePage {
             .user_view_items_rows
             .entry(view_id.to_string())
             .or_default();
-        if row.controls_hovered != hovered {
-            row.controls_hovered = hovered;
+        if row.carousel.set_controls_hovered(hovered) {
             cx.notify();
         }
     }
@@ -355,7 +402,7 @@ impl HomePage {
         let offset = self
             .user_view_items_rows
             .get(view_id)
-            .map(|row| row.scroll_offset - HOME_ITEM_SCROLL_STEP_PX)
+            .map(|row| row.carousel.scroll_offset(f32::INFINITY) - HOME_ITEM_SCROLL_STEP_PX)
             .unwrap_or(0.0);
         self.set_user_view_items_scroll_offset(view_id, offset, window, cx);
     }
@@ -369,7 +416,7 @@ impl HomePage {
         let offset = self
             .user_view_items_rows
             .get(view_id)
-            .map(|row| row.scroll_offset + HOME_ITEM_SCROLL_STEP_PX)
+            .map(|row| row.carousel.scroll_offset(f32::INFINITY) + HOME_ITEM_SCROLL_STEP_PX)
             .unwrap_or(HOME_ITEM_SCROLL_STEP_PX);
         self.set_user_view_items_scroll_offset(view_id, offset, window, cx);
     }
@@ -396,20 +443,14 @@ impl HomePage {
                 )
             })
             .unwrap_or(0.0);
-        let offset = offset.clamp(0.0, max_offset);
         let row = self
             .user_view_items_rows
             .entry(view_id.to_string())
             .or_default();
 
-        if row.scroll_offset == offset {
-            return;
+        if row.carousel.set_scroll_offset(offset, max_offset) {
+            cx.notify();
         }
-
-        row.previous_scroll_offset = row.scroll_offset.min(max_offset);
-        row.scroll_offset = offset;
-        row.animation_id += 1;
-        cx.notify();
     }
 }
 

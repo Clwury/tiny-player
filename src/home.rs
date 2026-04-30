@@ -10,11 +10,12 @@ use std::{
 };
 
 use crate::{
-    emby::{ResumeItems, UserItems, UserViews},
+    emby::{EmbyClient, ResumeItems, UserItems, UserViews},
     image_cache::CachedImageKey,
     server::CachedServer,
 };
-use gpui::{ClickEvent, Context, EventEmitter, ScrollHandle, Window};
+use carousel::CarouselState;
+use gpui::{AppContext as _, ClickEvent, Context, Entity, EventEmitter, ScrollHandle, Window};
 
 #[derive(Clone, Copy, Debug)]
 pub enum HomeEvent {
@@ -22,16 +23,37 @@ pub enum HomeEvent {
     SectionChanged,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LoadState {
+    #[default]
+    Idle,
+    Loading,
+    Loaded,
+    Failed,
+}
+
+impl LoadState {
+    fn can_start(self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    fn is_loading(self) -> bool {
+        matches!(self, Self::Loading)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct HomeEffects {
+    user_views: LoadState,
+    resume_items: LoadState,
+}
+
 #[derive(Clone, Debug, Default)]
 struct UserViewItemsRow {
     items: Option<UserItems>,
     loading: bool,
     failed: Option<gpui::SharedString>,
-    scroll_offset: f32,
-    previous_scroll_offset: f32,
-    animation_id: u64,
-    hovered: bool,
-    controls_hovered: bool,
+    carousel: CarouselState,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -47,24 +69,21 @@ struct MainScrollbarDragState {
 pub struct HomePage {
     current_server: CachedServer,
     servers: Vec<CachedServer>,
-    device_id: String,
     active_section: HomeSection,
+    home_content: Entity<HomeContent>,
+}
+
+#[derive(Clone, Debug)]
+struct HomeContent {
+    current_server: CachedServer,
+    emby_client: EmbyClient,
+    home_effects: HomeEffects,
     user_views: Option<UserViews>,
-    user_views_loading: bool,
     user_views_failed: Option<gpui::SharedString>,
-    user_views_scroll_offset: f32,
-    user_views_previous_scroll_offset: f32,
-    user_views_animation_id: u64,
-    user_views_hovered: bool,
-    user_views_controls_hovered: bool,
+    user_views_carousel: CarouselState,
     resume_items: Option<ResumeItems>,
-    resume_items_loading: bool,
     resume_items_failed: Option<gpui::SharedString>,
-    resume_items_scroll_offset: f32,
-    resume_items_previous_scroll_offset: f32,
-    resume_items_animation_id: u64,
-    resume_items_hovered: bool,
-    resume_items_controls_hovered: bool,
+    resume_items_carousel: CarouselState,
     user_view_items_rows: HashMap<String, UserViewItemsRow>,
     main_scroll_handle: ScrollHandle,
     main_scrollbar_drag: Option<MainScrollbarDragState>,
@@ -92,33 +111,18 @@ impl HomeSection {
     }
 }
 
-impl HomePage {
-    pub fn new(
-        current_server: CachedServer,
-        servers: Vec<CachedServer>,
-        device_id: String,
-    ) -> Self {
+impl HomeContent {
+    fn new(current_server: CachedServer, emby_client: EmbyClient) -> Self {
         Self {
             current_server,
-            servers,
-            device_id,
-            active_section: HomeSection::Home,
+            emby_client,
+            home_effects: HomeEffects::default(),
             user_views: None,
-            user_views_loading: false,
             user_views_failed: None,
-            user_views_scroll_offset: 0.0,
-            user_views_previous_scroll_offset: 0.0,
-            user_views_animation_id: 0,
-            user_views_hovered: false,
-            user_views_controls_hovered: false,
+            user_views_carousel: CarouselState::default(),
             resume_items: None,
-            resume_items_loading: false,
             resume_items_failed: None,
-            resume_items_scroll_offset: 0.0,
-            resume_items_previous_scroll_offset: 0.0,
-            resume_items_animation_id: 0,
-            resume_items_hovered: false,
-            resume_items_controls_hovered: false,
+            resume_items_carousel: CarouselState::default(),
             user_view_items_rows: HashMap::new(),
             main_scroll_handle: ScrollHandle::new(),
             main_scrollbar_drag: None,
@@ -128,8 +132,45 @@ impl HomePage {
         }
     }
 
+    pub(super) fn start_effects(&mut self, cx: &mut Context<Self>) {
+        self.load_user_views_if_needed(cx);
+        self.load_resume_items_if_needed(cx);
+    }
+
+    fn sync_previous_offsets(&mut self) {
+        self.user_views_carousel.sync_previous_offset();
+        self.resume_items_carousel.sync_previous_offset();
+        for row in self.user_view_items_rows.values_mut() {
+            row.carousel.sync_previous_offset();
+        }
+    }
+}
+
+impl HomePage {
+    pub fn new(
+        current_server: CachedServer,
+        servers: Vec<CachedServer>,
+        emby_client: EmbyClient,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let home_content = cx.new(|_| HomeContent::new(current_server.clone(), emby_client));
+        let mut page = Self {
+            current_server,
+            servers,
+            active_section: HomeSection::Home,
+            home_content,
+        };
+        page.start_effects(cx);
+        page
+    }
+
     pub fn title(&self) -> &'static str {
         self.active_section.title()
+    }
+
+    pub(crate) fn start_effects(&mut self, cx: &mut Context<Self>) {
+        self.home_content
+            .update(cx, |content, cx| content.start_effects(cx));
     }
 
     fn set_active_section(&mut self, section: HomeSection, cx: &mut Context<Self>) {
@@ -138,11 +179,9 @@ impl HomePage {
         }
 
         if section == HomeSection::Home {
-            self.user_views_previous_scroll_offset = self.user_views_scroll_offset;
-            self.resume_items_previous_scroll_offset = self.resume_items_scroll_offset;
-            for row in self.user_view_items_rows.values_mut() {
-                row.previous_scroll_offset = row.scroll_offset;
-            }
+            self.home_content
+                .update(cx, |content, _| content.sync_previous_offsets());
+            self.start_effects(cx);
         }
 
         self.active_section = section;

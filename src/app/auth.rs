@@ -2,7 +2,7 @@ use anyhow::Result;
 use gpui::{AppContext as _, Context, Window};
 
 use crate::{
-    emby::{AuthSession, EmbyClient},
+    emby::AuthSession,
     home::{HomeEvent, HomePage},
     server::{AddServerSubmission, CachedServer},
     storage,
@@ -24,17 +24,18 @@ impl TinyApp {
         cx: &mut Context<Self>,
     ) {
         self.open_server_menu = None;
-        let device_id = self.cache.device_id.clone();
+        let Some(client) = self.emby_client.clone() else {
+            self.cache_error = Some("Emby HTTP 客户端不可用".into());
+            cx.notify();
+            return;
+        };
         let server_id = server.id.clone();
         let submission = AddServerSubmission {
             endpoint: server.endpoint.clone(),
             username: server.username.clone(),
             password: server.password.clone(),
         };
-        let task = cx.background_spawn(async move {
-            let client = EmbyClient::new(device_id)?;
-            client.authenticate_by_name(&submission)
-        });
+        let task = cx.background_spawn(async move { client.authenticate_by_name(&submission) });
 
         cx.spawn(async move |app, cx| {
             let result = task.await;
@@ -85,12 +86,13 @@ impl TinyApp {
         }
 
         if let Some(server) = self.servers.iter().find(|server| server.id == server_id) {
-            let home_page = HomePage::new(
-                server.clone(),
-                self.servers.clone(),
-                self.cache.device_id.clone(),
-            );
-            let home_page = cx.new(|_| home_page);
+            let Some(client) = self.emby_client.clone() else {
+                self.cache_error = Some("Emby HTTP 客户端不可用".into());
+                return;
+            };
+            let server = server.clone();
+            let servers = self.servers.clone();
+            let home_page = cx.new(|cx| HomePage::new(server, servers, client, cx));
             cx.subscribe(&home_page, |app: &mut TinyApp, _, event, cx| match event {
                 HomeEvent::BackToServers => app.show_servers_page_from_home(cx),
                 HomeEvent::SectionChanged => cx.notify(),
@@ -123,6 +125,7 @@ impl TinyApp {
             Ok(()) => {
                 self.cache_error = None;
                 self.item_counts_failed.remove(&server_id);
+                self.load_item_counts_for_server_id(&server_id, cx);
             }
             Err(error) => {
                 self.cache_error = Some(format!("保存登录信息失败：{error}").into());

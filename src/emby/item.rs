@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use reqwest::Method;
 use serde::Deserialize;
 use tracing::instrument;
@@ -10,10 +10,12 @@ use super::EmbyClient;
 impl EmbyClient {
     #[instrument(skip(self, server), fields(server = %server.endpoint.display_url()))]
     pub fn item_counts(&self, server: &CachedServer) -> Result<ItemCounts> {
-        let response_body =
-            self.send_authenticated_request(server, Method::GET, &["Items", "Counts"])?;
-
-        serde_json::from_str::<ItemCounts>(&response_body).context("解析 Emby 媒体数量响应失败")
+        self.send_authenticated_json(
+            server,
+            Method::GET,
+            &["Items", "Counts"],
+            "解析 Emby 媒体数量响应失败",
+        )
     }
 }
 

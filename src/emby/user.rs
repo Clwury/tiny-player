@@ -84,9 +84,7 @@ impl EmbyClient {
         let mut url = api_url(&server.endpoint, &["Users", user_id, "Views"])?;
         url.query_pairs_mut()
             .append_pair("IncludeExternalContent", "false");
-        let response_body = self.send_authenticated_url(server, Method::GET, url)?;
-
-        serde_json::from_str::<UserViews>(&response_body).context("解析 Emby 用户视图响应失败")
+        self.send_authenticated_json_url(server, Method::GET, url, "解析 Emby 用户视图响应失败")
     }
 
     #[instrument(skip(self, server), fields(server = %server.endpoint.display_url()))]
@@ -97,9 +95,7 @@ impl EmbyClient {
             .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
         let mut url = api_url(&server.endpoint, &["Users", user_id, "Items", "Resume"])?;
         add_resume_items_query(&mut url);
-        let response_body = self.send_authenticated_url(server, Method::GET, url)?;
-
-        serde_json::from_str::<ResumeItems>(&response_body).context("解析 Emby 继续观看响应失败")
+        self.send_authenticated_json_url(server, Method::GET, url, "解析 Emby 继续观看响应失败")
     }
 
     #[instrument(skip(self, server), fields(server = %server.endpoint.display_url(), parent_id = %parent_id))]
@@ -117,9 +113,7 @@ impl EmbyClient {
             .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
         let mut url = api_url(&server.endpoint, &["Users", user_id, "Items"])?;
         add_user_items_query(&mut url, parent_id, start_index, limit, sort_order);
-        let response_body = self.send_authenticated_url(server, Method::GET, url)?;
-
-        serde_json::from_str::<UserItems>(&response_body).context("解析 Emby 媒体库项目响应失败")
+        self.send_authenticated_json_url(server, Method::GET, url, "解析 Emby 媒体库项目响应失败")
     }
 }
 

@@ -61,11 +61,17 @@ impl TinyApp {
             dialog.set_submitting(true, cx);
         });
 
-        let device_id = self.cache.device_id.clone();
+        let Some(client) = self.emby_client.clone() else {
+            dialog.update(cx, |dialog, cx| {
+                dialog.set_submitting(false, cx);
+                dialog.set_form_error("Emby HTTP 客户端不可用", cx);
+            });
+            return;
+        };
         let cache = self.cache.clone();
         if let Some(server_id) = dialog.read(cx).edit_server_id() {
             let task = cx.background_spawn(async move {
-                fetch_public_info_and_update_cache(device_id, cache, server_id, submission)
+                fetch_public_info_and_update_cache(client, cache, server_id, submission)
             });
 
             cx.spawn(async move |app, cx| {
@@ -76,7 +82,7 @@ impl TinyApp {
             .detach();
         } else {
             let task = cx.background_spawn(async move {
-                fetch_public_info_and_cache(device_id, cache, submission)
+                fetch_public_info_and_cache(client, cache, submission)
             });
 
             cx.spawn(async move |app, cx| {

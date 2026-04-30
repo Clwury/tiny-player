@@ -1,7 +1,5 @@
 use gpui::{Context, SharedString, Window};
 
-use crate::storage;
-
 use super::{Page, TinyApp};
 
 impl TinyApp {
@@ -46,9 +44,6 @@ impl TinyApp {
             return;
         }
 
-        if let Err(error) = storage::save(&self.cache) {
-            self.cache_error = Some(format!("保存窗口大小失败：{error}").into());
-            cx.notify();
-        }
+        self.schedule_cache_save("保存窗口大小失败", cx);
     }
 }

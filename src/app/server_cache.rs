@@ -94,11 +94,10 @@ impl TinyApp {
 }
 
 pub(super) fn fetch_public_info_and_cache(
-    device_id: String,
+    client: EmbyClient,
     mut cache: ServerCache,
     submission: AddServerSubmission,
 ) -> Result<(ServerCache, CachedServer, AddServerSubmission)> {
-    let client = EmbyClient::new(device_id)?;
     let info = client.public_system_info(&submission)?;
     let server = public_info_to_cached_server(
         Uuid::new_v4().to_string(),
@@ -113,7 +112,7 @@ pub(super) fn fetch_public_info_and_cache(
 }
 
 pub(super) fn fetch_public_info_and_update_cache(
-    device_id: String,
+    client: EmbyClient,
     mut cache: ServerCache,
     server_id: String,
     submission: AddServerSubmission,
@@ -124,7 +123,6 @@ pub(super) fn fetch_public_info_and_update_cache(
         .find(|server| server.id == server_id)
         .cloned()
         .ok_or_else(|| anyhow!("服务器不存在"))?;
-    let client = EmbyClient::new(device_id)?;
     let info = client.public_system_info(&submission)?;
     let server =
         public_info_to_cached_server(existing.id, &submission, info, existing.added_at_unix);

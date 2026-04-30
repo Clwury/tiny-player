@@ -13,12 +13,9 @@ use crate::{
     theme,
 };
 
-use super::{
-    HomePage,
-    carousel::{
-        HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
-        USER_VIEW_CARD_IMAGE_HEIGHT_PX, USER_VIEW_CARD_PADDING_PX, USER_VIEW_CARD_WIDTH_PX,
-    },
+use super::carousel::{
+    HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
+    USER_VIEW_CARD_IMAGE_HEIGHT_PX, USER_VIEW_CARD_PADDING_PX, USER_VIEW_CARD_WIDTH_PX,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -104,10 +101,10 @@ fn cover_crop_bounds(
     }
 }
 
-pub(super) fn section_placeholder(
+pub(super) fn section_placeholder<T>(
     title: &'static str,
     message: &'static str,
-    cx: &Context<HomePage>,
+    cx: &Context<T>,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
 
@@ -124,13 +121,13 @@ pub(super) fn section_placeholder(
         )
 }
 
-pub(super) fn home_section_title(title: &'static str, cx: &Context<HomePage>) -> gpui::Div {
+pub(super) fn home_section_title<T>(title: &'static str, cx: &Context<T>) -> gpui::Div {
     home_section_title_text(title, cx)
 }
 
-pub(super) fn home_section_title_text(
+pub(super) fn home_section_title_text<T>(
     title: impl Into<gpui::SharedString>,
-    cx: &Context<HomePage>,
+    cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
 
@@ -195,10 +192,10 @@ pub(super) fn carousel_button(
         )
 }
 
-pub(super) fn user_view_card(
+pub(super) fn user_view_card<T>(
     name: String,
     image_path: Option<PathBuf>,
-    cx: &Context<HomePage>,
+    cx: &Context<T>,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
 
@@ -223,7 +220,7 @@ pub(super) fn user_view_card(
         )
 }
 
-fn user_view_card_image(image_path: Option<PathBuf>, cx: &Context<HomePage>) -> impl IntoElement {
+fn user_view_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl IntoElement {
     let theme = theme::get(cx);
     let has_image = image_path.is_some();
 
@@ -242,10 +239,10 @@ fn user_view_card_image(image_path: Option<PathBuf>, cx: &Context<HomePage>) -> 
         })
 }
 
-pub(super) fn resume_item_card(
+pub(super) fn resume_item_card<T>(
     item: &ResumeItem,
     image_path: Option<PathBuf>,
-    cx: &Context<HomePage>,
+    cx: &Context<T>,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
     let (title, subtitle) = resume_item_card_text(item);
@@ -287,10 +284,10 @@ pub(super) fn resume_item_card(
         )
 }
 
-pub(super) fn user_item_card(
+pub(super) fn user_item_card<T>(
     item: &UserItem,
     image_path: Option<PathBuf>,
-    cx: &Context<HomePage>,
+    cx: &Context<T>,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
 
@@ -331,10 +328,10 @@ pub(super) fn user_item_card(
         )
 }
 
-fn user_item_card_image(
+fn user_item_card_image<T>(
     item: &UserItem,
     image_path: Option<PathBuf>,
-    cx: &Context<HomePage>,
+    cx: &Context<T>,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
     let has_image = image_path.is_some();
@@ -404,7 +401,7 @@ fn user_item_card_image(
         })
 }
 
-fn user_item_badge(text: String, cx: &Context<HomePage>) -> impl IntoElement {
+fn user_item_badge<T>(text: String, cx: &Context<T>) -> impl IntoElement {
     let theme = theme::get(cx);
 
     div()

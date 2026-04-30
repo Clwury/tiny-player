@@ -47,8 +47,6 @@ impl TinyApp {
     }
 
     fn render_servers_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        self.load_item_counts_for_authenticated_servers(cx);
-
         let theme = theme::get(cx);
 
         div()

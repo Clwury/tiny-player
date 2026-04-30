@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AppContext, Context, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Render, StatefulInteractiveElement, Styled, Window, div,
-    ease_in_out, point, prelude::FluentBuilder, px,
+    Animation, AnimationExt as _, AnyView, AppContext, Context, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Render, StatefulInteractiveElement, StyleRefinement, Styled,
+    Window, div, ease_in_out, point, prelude::FluentBuilder, px,
 };
 
 use crate::{
@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::{
-    HomePage, HomeSection,
+    HomeContent, HomePage, HomeSection,
     carousel::{
         HOME_ITEM_CARD_GAP_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
         HOME_MAIN_SCROLLBAR_WIDTH_PX, carousel_content_width, carousel_content_width_for,
@@ -38,24 +38,14 @@ impl Render for MainScrollbarThumbDrag {
     }
 }
 
-impl HomePage {
-    fn render_main_content(
-        &self,
-        window: &Window,
-        cx: &Context<Self>,
-        rounded_window: bool,
-    ) -> impl IntoElement {
+impl HomeContent {
+    fn render_main_content(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let theme = theme::get(cx);
 
         div()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
             .relative()
+            .size_full()
             .bg(theme.background)
-            .when(rounded_window, |this| {
-                this.rounded_br(theme.radius_lg).overflow_hidden()
-            })
             .child(self.render_main_scrollable_content(window, cx))
             .child(self.render_main_scrollbar(cx))
     }
@@ -79,71 +69,87 @@ impl HomePage {
             .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
             .track_scroll(&self.main_scroll_handle)
             .p_6()
-            .when(self.active_section == HomeSection::Home, |this| {
-                this.child(
-                    div()
-                        .mb_3()
-                        .text_lg()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child("我的媒体"),
-                )
-                .when_some(self.user_views_failed.clone(), |this, error| {
-                    this.child(div().text_sm().text_color(theme.error).child(error))
-                })
-                .when_some(self.user_views.as_ref(), |this, views| {
-                    this.child(self.render_user_views_row(views, main_content_width, cx))
-                })
-                .when(
-                    !self.user_views_loading
-                        && self.user_views_failed.is_none()
-                        && self
-                            .user_views
-                            .as_ref()
-                            .is_none_or(|views| views.items.is_empty()),
-                    |this| {
-                        this.child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("暂无媒体库"),
-                        )
-                    },
-                )
-                .child(home_section_title("继续观看", cx).mt_8().mb_3())
-                .when_some(self.resume_items_failed.clone(), |this, error| {
-                    this.child(div().text_sm().text_color(theme.error).child(error))
-                })
-                .when_some(self.resume_items.as_ref(), |this, items| {
-                    this.child(self.render_resume_items_row(items, main_content_width, cx))
-                })
-                .when(
-                    !self.resume_items_loading
-                        && self.resume_items_failed.is_none()
-                        && self
-                            .resume_items
-                            .as_ref()
-                            .is_none_or(|items| items.items.is_empty()),
-                    |this| {
-                        this.child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("暂无继续观看内容"),
-                        )
-                    },
-                )
-                .when_some(self.user_views.as_ref(), |this, views| {
-                    this.children(views.items.iter().map(|view| {
+            .child(
+                div()
+                    .mb_3()
+                    .text_lg()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
+                    .child("我的媒体"),
+            )
+            .when_some(self.user_views_failed.clone(), |this, error| {
+                this.child(div().text_sm().text_color(theme.error).child(error))
+            })
+            .when(
+                self.home_effects.user_views.is_loading() && self.user_views.is_none(),
+                |this| {
+                    this.child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("加载中…"),
+                    )
+                },
+            )
+            .when_some(self.user_views.as_ref(), |this, views| {
+                this.child(self.render_user_views_row(views, main_content_width, cx))
+            })
+            .when(
+                !self.home_effects.user_views.is_loading()
+                    && self.user_views_failed.is_none()
+                    && self
+                        .user_views
+                        .as_ref()
+                        .is_none_or(|views| views.items.is_empty()),
+                |this| {
+                    this.child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("暂无媒体库"),
+                    )
+                },
+            )
+            .child(home_section_title("继续观看", cx).mt_8().mb_3())
+            .when_some(self.resume_items_failed.clone(), |this, error| {
+                this.child(div().text_sm().text_color(theme.error).child(error))
+            })
+            .when(
+                self.home_effects.resume_items.is_loading() && self.resume_items.is_none(),
+                |this| {
+                    this.child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("加载中…"),
+                    )
+                },
+            )
+            .when_some(self.resume_items.as_ref(), |this, items| {
+                this.child(self.render_resume_items_row(items, main_content_width, cx))
+            })
+            .when(
+                !self.home_effects.resume_items.is_loading()
+                    && self.resume_items_failed.is_none()
+                    && self
+                        .resume_items
+                        .as_ref()
+                        .is_none_or(|items| items.items.is_empty()),
+                |this| {
+                    this.child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("暂无继续观看内容"),
+                    )
+                },
+            )
+            .when_some(self.user_views.as_ref(), |this, views| {
+                this.children(
+                    views.items.iter().map(|view| {
                         self.render_user_view_items_section(view, main_content_width, cx)
-                    }))
-                })
-            })
-            .when(self.active_section == HomeSection::Favorites, |this| {
-                this.child(section_placeholder("收藏", "暂无收藏内容", cx))
-            })
-            .when(self.active_section == HomeSection::Search, |this| {
-                this.child(section_placeholder("搜索", "搜索功能暂未实现", cx))
+                    }),
+                )
             })
     }
 
@@ -180,7 +186,7 @@ impl HomePage {
             max_offset,
         };
         let start_drag = cx.listener(
-            move |page: &mut HomePage, event: &gpui::MouseDownEvent, _, cx| {
+            move |page: &mut HomeContent, event: &gpui::MouseDownEvent, _, cx| {
                 let mut drag_state = drag_state;
                 drag_state.cursor_offset_y =
                     (f32::from(event.position.y) - thumb_window_top).clamp(0.0, thumb_height);
@@ -189,17 +195,18 @@ impl HomePage {
             },
         );
         let drag_thumb = cx.listener(
-            |page: &mut HomePage, event: &gpui::DragMoveEvent<MainScrollbarThumbDrag>, _, cx| {
+            |page: &mut HomeContent, event: &gpui::DragMoveEvent<MainScrollbarThumbDrag>, _, cx| {
                 page.drag_main_scrollbar_thumb(event.event.position.y, cx);
             },
         );
-        let finish_drag = cx.listener(|page: &mut HomePage, _: &gpui::MouseUpEvent, _, cx| {
+        let finish_drag = cx.listener(|page: &mut HomeContent, _: &gpui::MouseUpEvent, _, cx| {
             page.main_scrollbar_drag = None;
             cx.stop_propagation();
         });
-        let finish_drag_out = cx.listener(|page: &mut HomePage, _: &gpui::MouseUpEvent, _, _| {
-            page.main_scrollbar_drag = None;
-        });
+        let finish_drag_out =
+            cx.listener(|page: &mut HomeContent, _: &gpui::MouseUpEvent, _, _| {
+                page.main_scrollbar_drag = None;
+            });
 
         div().when(show_scrollbar, |this| {
             this.absolute()
@@ -264,18 +271,18 @@ impl HomePage {
         let theme = theme::get(cx);
         let viewport_width = viewport_width.min(carousel_content_width(views.items.len()));
         let max_offset = max_carousel_scroll_offset(views.items.len(), viewport_width);
-        let offset = self.user_views_scroll_offset.min(max_offset);
-        let previous_offset = self.user_views_previous_scroll_offset.min(max_offset);
+        let carousel = self.user_views_carousel;
+        let offset = carousel.scroll_offset(max_offset);
+        let previous_offset = carousel.previous_scroll_offset(max_offset);
         let has_controls = max_offset > 0.0;
-        let controls_visible =
-            has_controls && (self.user_views_hovered || self.user_views_controls_hovered);
-        let on_hover = cx.listener(|page: &mut HomePage, hovered: &bool, _, cx| {
+        let controls_visible = carousel.controls_visible(has_controls);
+        let on_hover = cx.listener(|page: &mut HomeContent, hovered: &bool, _, cx| {
             page.set_user_views_hovered(*hovered, cx);
         });
-        let left_controls_hover = cx.listener(|page: &mut HomePage, hovered: &bool, _, cx| {
+        let left_controls_hover = cx.listener(|page: &mut HomeContent, hovered: &bool, _, cx| {
             page.set_user_views_controls_hovered(*hovered, cx);
         });
-        let right_controls_hover = cx.listener(|page: &mut HomePage, hovered: &bool, _, cx| {
+        let right_controls_hover = cx.listener(|page: &mut HomeContent, hovered: &bool, _, cx| {
             page.set_user_views_controls_hovered(*hovered, cx);
         });
         let scroll_left = cx.listener(Self::scroll_user_views_left);
@@ -304,7 +311,7 @@ impl HomePage {
                         user_view_card(view.name.clone(), image_path, cx)
                     }))
                     .with_animation(
-                        ("user-views-scroll", self.user_views_animation_id),
+                        ("user-views-scroll", carousel.animation_id()),
                         Animation::new(Duration::from_millis(220)).with_easing(ease_in_out),
                         move |track, delta| {
                             track.ml(px(-(previous_offset + (offset - previous_offset) * delta)))
@@ -344,18 +351,18 @@ impl HomePage {
         let theme = theme::get(cx);
         let viewport_width = viewport_width.min(carousel_content_width(items.items.len()));
         let max_offset = max_carousel_scroll_offset(items.items.len(), viewport_width);
-        let offset = self.resume_items_scroll_offset.min(max_offset);
-        let previous_offset = self.resume_items_previous_scroll_offset.min(max_offset);
+        let carousel = self.resume_items_carousel;
+        let offset = carousel.scroll_offset(max_offset);
+        let previous_offset = carousel.previous_scroll_offset(max_offset);
         let has_controls = max_offset > 0.0;
-        let controls_visible =
-            has_controls && (self.resume_items_hovered || self.resume_items_controls_hovered);
-        let on_hover = cx.listener(|page: &mut HomePage, hovered: &bool, _, cx| {
+        let controls_visible = carousel.controls_visible(has_controls);
+        let on_hover = cx.listener(|page: &mut HomeContent, hovered: &bool, _, cx| {
             page.set_resume_items_hovered(*hovered, cx);
         });
-        let left_controls_hover = cx.listener(|page: &mut HomePage, hovered: &bool, _, cx| {
+        let left_controls_hover = cx.listener(|page: &mut HomeContent, hovered: &bool, _, cx| {
             page.set_resume_items_controls_hovered(*hovered, cx);
         });
-        let right_controls_hover = cx.listener(|page: &mut HomePage, hovered: &bool, _, cx| {
+        let right_controls_hover = cx.listener(|page: &mut HomeContent, hovered: &bool, _, cx| {
             page.set_resume_items_controls_hovered(*hovered, cx);
         });
         let scroll_left = cx.listener(Self::scroll_resume_items_left);
@@ -381,7 +388,7 @@ impl HomePage {
                         resume_item_card(item, image_path, cx)
                     }))
                     .with_animation(
-                        ("resume-items-scroll", self.resume_items_animation_id),
+                        ("resume-items-scroll", carousel.animation_id()),
                         Animation::new(Duration::from_millis(220)).with_easing(ease_in_out),
                         move |track, delta| {
                             track.ml(px(-(previous_offset + (offset - previous_offset) * delta)))
@@ -476,14 +483,9 @@ impl HomePage {
             HOME_ITEM_CARD_PADDING_PX,
             HOME_ITEM_CARD_GAP_PX,
         );
-        let offset = row
-            .map(|row| row.scroll_offset)
-            .unwrap_or(0.0)
-            .min(max_offset);
-        let previous_offset = row
-            .map(|row| row.previous_scroll_offset)
-            .unwrap_or(0.0)
-            .min(max_offset);
+        let carousel = row.map(|row| row.carousel).unwrap_or_default();
+        let offset = carousel.scroll_offset(max_offset);
+        let previous_offset = carousel.previous_scroll_offset(max_offset);
         let visible_range = carousel_visible_range_between_for(
             items.items.len(),
             (previous_offset, offset),
@@ -496,31 +498,29 @@ impl HomePage {
                 HOME_ITEM_RENDER_OVERSCAN_AFTER,
             ),
         );
-        let animation_id = row.map(|row| row.animation_id).unwrap_or(0);
+        let animation_id = carousel.animation_id();
         let has_controls = max_offset > 0.0;
-        let controls_visible = has_controls
-            && row
-                .map(|row| row.hovered || row.controls_hovered)
-                .unwrap_or(false);
+        let controls_visible = carousel.controls_visible(has_controls);
         let hover_view_id = view_id.to_string();
-        let on_hover = cx.listener(move |page: &mut HomePage, hovered: &bool, _, cx| {
+        let on_hover = cx.listener(move |page: &mut HomeContent, hovered: &bool, _, cx| {
             page.set_user_view_items_hovered(&hover_view_id, *hovered, cx);
         });
         let left_hover_view_id = view_id.to_string();
-        let left_controls_hover = cx.listener(move |page: &mut HomePage, hovered: &bool, _, cx| {
-            page.set_user_view_items_controls_hovered(&left_hover_view_id, *hovered, cx);
-        });
+        let left_controls_hover =
+            cx.listener(move |page: &mut HomeContent, hovered: &bool, _, cx| {
+                page.set_user_view_items_controls_hovered(&left_hover_view_id, *hovered, cx);
+            });
         let right_hover_view_id = view_id.to_string();
         let right_controls_hover =
-            cx.listener(move |page: &mut HomePage, hovered: &bool, _, cx| {
+            cx.listener(move |page: &mut HomeContent, hovered: &bool, _, cx| {
                 page.set_user_view_items_controls_hovered(&right_hover_view_id, *hovered, cx);
             });
         let left_scroll_view_id = view_id.to_string();
-        let scroll_left = cx.listener(move |page: &mut HomePage, _, window, cx| {
+        let scroll_left = cx.listener(move |page: &mut HomeContent, _, window, cx| {
             page.scroll_user_view_items_left(&left_scroll_view_id, window, cx);
         });
         let right_scroll_view_id = view_id.to_string();
-        let scroll_right = cx.listener(move |page: &mut HomePage, _, window, cx| {
+        let scroll_right = cx.listener(move |page: &mut HomeContent, _, window, cx| {
             page.scroll_user_view_items_right(&right_scroll_view_id, window, cx);
         });
         let animation_key = gpui::ElementId::from((
@@ -591,10 +591,63 @@ impl HomePage {
     }
 }
 
+impl Render for HomeContent {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_main_content(window, cx)
+    }
+}
+
+impl HomePage {
+    fn render_content_area(&self, cx: &Context<Self>, rounded_window: bool) -> impl IntoElement {
+        let theme = theme::get(cx);
+        let home_content =
+            AnyView::from(self.home_content.clone()).cached(home_content_cache_style());
+
+        div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .relative()
+            .bg(theme.background)
+            .when(rounded_window, |this| {
+                this.rounded_br(theme.radius_lg).overflow_hidden()
+            })
+            .child(home_content)
+            .when(self.active_section == HomeSection::Favorites, |this| {
+                this.child(self.render_section_layer("收藏", "暂无收藏内容", cx))
+            })
+            .when(self.active_section == HomeSection::Search, |this| {
+                this.child(self.render_section_layer("搜索", "搜索功能暂未实现", cx))
+            })
+    }
+
+    fn render_section_layer(
+        &self,
+        title: &'static str,
+        message: &'static str,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = theme::get(cx);
+
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .bg(theme.background)
+            .p_6()
+            .occlude()
+            .child(section_placeholder(title, message, cx))
+    }
+}
+
+fn home_content_cache_style() -> StyleRefinement {
+    StyleRefinement::default().absolute().size_full()
+}
+
 impl Render for HomePage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.load_user_views_if_needed(cx);
-        self.load_resume_items_if_needed(cx);
         let theme = theme::get(cx);
         let rounded_window = !window.is_maximized();
         let on_back = cx.listener(Self::back_to_servers);
@@ -619,6 +672,6 @@ impl Render for HomePage {
                 on_favorites,
                 on_search,
             ))
-            .child(self.render_main_content(window, cx, rounded_window))
+            .child(self.render_content_area(cx, rounded_window))
     }
 }
