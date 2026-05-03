@@ -8,7 +8,7 @@ use crate::{
     theme,
 };
 
-use super::text_input::TextInput;
+use super::text_input::{TextInput, TextInputEvent};
 
 #[derive(Default)]
 struct AddServerErrors {
@@ -62,7 +62,7 @@ impl AddServerDialogState {
                 server_id: server.id.clone(),
             },
             server.endpoint.protocol,
-            server.endpoint.address.clone(),
+            server.endpoint.address_input_value(),
             server.endpoint.port.to_string(),
             server.endpoint.path.clone(),
             server.username.clone(),
@@ -82,27 +82,41 @@ impl AddServerDialogState {
         password: String,
         cx: &mut Context<Self>,
     ) -> Self {
+        let address_input = cx.new(|cx| {
+            TextInput::new("服务器地址", cx)
+                .default_value(address)
+                .borderless()
+        });
+        let port_input = cx.new(|cx| {
+            TextInput::new("端口", cx)
+                .default_value(port)
+                .digits_only()
+                .max_chars(5)
+        });
+        let path_input = cx.new(|cx| TextInput::new("可空", cx).default_value(path));
+        let username_input = cx.new(|cx| TextInput::new("用户名", cx).default_value(username));
+        let password_input = cx.new(|cx| {
+            TextInput::new("密码", cx)
+                .default_value(password)
+                .masked(true)
+        });
+
+        cx.subscribe(
+            &address_input,
+            |dialog: &mut AddServerDialogState, _, event, cx| match event {
+                TextInputEvent::Changed => dialog.auto_format_full_url(cx),
+            },
+        )
+        .detach();
+
         Self {
             mode,
             protocol,
-            address: cx.new(|cx| {
-                TextInput::new("服务器地址", cx)
-                    .default_value(address)
-                    .borderless()
-            }),
-            port: cx.new(|cx| {
-                TextInput::new("端口", cx)
-                    .default_value(port)
-                    .digits_only()
-                    .max_chars(5)
-            }),
-            path: cx.new(|cx| TextInput::new("可空", cx).default_value(path)),
-            username: cx.new(|cx| TextInput::new("用户名", cx).default_value(username)),
-            password: cx.new(|cx| {
-                TextInput::new("密码", cx)
-                    .default_value(password)
-                    .masked(true)
-            }),
+            address: address_input,
+            port: port_input,
+            path: path_input,
+            username: username_input,
+            password: password_input,
             show_password: false,
             is_submitting: false,
             form_error: None,
@@ -125,31 +139,19 @@ impl AddServerDialogState {
         let username = self.username.read(cx).value();
         let password = self.password.read(cx).value();
 
-        let address_trimmed = address.trim();
-        let port_trimmed = port.trim();
         let username_trimmed = username.trim();
         let password_trimmed = password.trim();
 
-        if address_trimmed.is_empty() {
-            self.errors.address = Some("请输入服务器地址".into());
-        } else if address_trimmed.contains("://") {
-            self.errors.address = Some("地址中不需要包含协议".into());
-        }
-
-        let parsed_port = if port_trimmed.is_empty() {
-            self.errors.port = Some("请输入端口".into());
-            None
-        } else {
-            match port_trimmed.parse::<u16>() {
-                Ok(0) => {
-                    self.errors.port = Some("端口必须大于 0".into());
-                    None
+        let endpoint = match ServerEndpoint::parse_user_input(protocol, &address, &port, &path) {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("端口") {
+                    self.errors.port = Some(message.into());
+                } else {
+                    self.errors.address = Some(message.into());
                 }
-                Ok(port) => Some(port),
-                Err(_) => {
-                    self.errors.port = Some("端口必须在 1-65535 之间".into());
-                    None
-                }
+                None
             }
         };
 
@@ -166,21 +168,8 @@ impl AddServerDialogState {
             return None;
         }
 
-        let normalized_path = if path.trim().is_empty() {
-            String::new()
-        } else if path.trim().starts_with('/') {
-            path.trim().to_string()
-        } else {
-            format!("/{}", path.trim())
-        };
-
         Some(AddServerSubmission {
-            endpoint: ServerEndpoint {
-                protocol,
-                address: address_trimmed.to_string(),
-                port: parsed_port.expect("port was validated"),
-                path: normalized_path,
-            },
+            endpoint: endpoint.expect("endpoint was validated"),
             username: username_trimmed.to_string(),
             password: password_trimmed.to_string(),
         })
@@ -205,6 +194,37 @@ impl AddServerDialogState {
 
     pub fn clear_form_error(&mut self, cx: &mut Context<Self>) {
         self.form_error = None;
+        cx.notify();
+    }
+
+    fn auto_format_full_url(&mut self, cx: &mut Context<Self>) {
+        let address = self.address.read(cx).value();
+        let Some(endpoint) = parsed_full_url_endpoint(&address) else {
+            return;
+        };
+
+        self.protocol = endpoint.protocol;
+        self.errors.address = None;
+        self.errors.port = None;
+
+        let formatted_address = endpoint.address_input_value();
+        self.address.update(cx, |address, cx| {
+            if address.value().as_ref() != formatted_address {
+                address.set_value(formatted_address, cx);
+            }
+        });
+        self.port.update(cx, |port, cx| {
+            let formatted_port = endpoint.port.to_string();
+            if port.value().as_ref() != formatted_port {
+                port.set_value(formatted_port, cx);
+            }
+        });
+        self.path.update(cx, |path, cx| {
+            if path.value().as_ref() != endpoint.path {
+                path.set_value(endpoint.path, cx);
+            }
+        });
+
         cx.notify();
     }
 
@@ -386,6 +406,16 @@ impl AddServerDialogState {
             || self.errors.username.is_some()
             || self.errors.password.is_some()
     }
+}
+
+fn parsed_full_url_endpoint(address: &str) -> Option<ServerEndpoint> {
+    let address = address.trim();
+    let lower_address = address.to_ascii_lowercase();
+    if !lower_address.starts_with("http://") && !lower_address.starts_with("https://") {
+        return None;
+    }
+
+    ServerEndpoint::parse_user_input(Protocol::Https, address, "", "").ok()
 }
 
 fn field(
@@ -585,4 +615,34 @@ fn dialog_button(
             }
         })
         .child(label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_full_url_for_auto_formatting() {
+        let endpoint = parsed_full_url_endpoint(" http://example.com:8096/custom ").unwrap();
+
+        assert_eq!(endpoint.protocol, Protocol::Http);
+        assert_eq!(endpoint.address_input_value(), "example.com");
+        assert_eq!(endpoint.port, 8096);
+        assert_eq!(endpoint.path, "/custom");
+    }
+
+    #[test]
+    fn parses_full_url_without_port_using_scheme_default() {
+        let endpoint = parsed_full_url_endpoint("https://example.com").unwrap();
+
+        assert_eq!(endpoint.protocol, Protocol::Https);
+        assert_eq!(endpoint.port, 443);
+        assert_eq!(endpoint.path, "");
+    }
+
+    #[test]
+    fn ignores_non_full_url_for_auto_formatting() {
+        assert!(parsed_full_url_endpoint("example.com:8096").is_none());
+        assert!(parsed_full_url_endpoint("ftp://example.com").is_none());
+    }
 }

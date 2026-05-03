@@ -5,11 +5,11 @@ use std::{
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InteractiveElement,
-    IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, ParentElement, Pixels, Point, Render, ShapedLine, SharedString, Style, Styled,
-    TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, px, relative, rgba,
-    size,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId,
+    InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, ShapedLine,
+    SharedString, Style, Styled, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, px, relative, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -83,6 +83,11 @@ fn selected_range_for_marked_text(
             let cursor = inserted_at + inserted_text.len();
             cursor..cursor
         })
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum TextInputEvent {
+    Changed,
 }
 
 pub struct TextInput {
@@ -181,6 +186,7 @@ impl TextInput {
         self.content = self.filtered(value.into().as_ref()).into();
         self.selected_range = self.content.len()..self.content.len();
         self.marked_range = None;
+        cx.emit(TextInputEvent::Changed);
         cx.notify();
     }
 
@@ -447,6 +453,8 @@ impl TextInput {
     }
 }
 
+impl EventEmitter<TextInputEvent> for TextInput {}
+
 impl EntityInputHandler for TextInput {
     fn text_for_range(
         &mut self,
@@ -506,6 +514,7 @@ impl EntityInputHandler for TextInput {
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
         self.marked_range.take();
+        cx.emit(TextInputEvent::Changed);
         cx.notify();
     }
 
@@ -539,6 +548,7 @@ impl EntityInputHandler for TextInput {
         );
         self.selection_reversed = false;
 
+        cx.emit(TextInputEvent::Changed);
         cx.notify();
     }
 

@@ -294,6 +294,7 @@ pub struct UserItem {
     pub production_year: Option<u32>,
     pub community_rating: Option<f32>,
     pub image_tags: Option<HashMap<String, String>>,
+    pub backdrop_image_tags: Option<Vec<String>>,
     pub user_data: Option<UserItemData>,
     pub collection_type: Option<String>,
     pub primary_image_aspect_ratio: Option<f64>,
@@ -311,12 +312,48 @@ pub struct UserItemData {
     pub is_favorite: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserItemImageSource<'a> {
+    pub item_id: &'a str,
+    pub image_type: EmbyImageType,
+    pub tag: Option<&'a str>,
+}
+
 impl UserItem {
     pub fn primary_image_tag(&self) -> Option<&str> {
         self.image_tags
             .as_ref()
             .and_then(|tags| tags.get("Primary"))
             .map(String::as_str)
+            .filter(|tag| !tag.trim().is_empty())
+    }
+
+    pub fn backdrop_image_tag(&self) -> Option<&str> {
+        first_non_empty_tag(self.backdrop_image_tags.as_deref())
+    }
+
+    pub fn image_source(&self) -> UserItemImageSource<'_> {
+        if let Some(tag) = self.primary_image_tag() {
+            return UserItemImageSource {
+                item_id: self.id.as_str(),
+                image_type: EmbyImageType::Primary,
+                tag: Some(tag),
+            };
+        }
+
+        if let Some(tag) = self.backdrop_image_tag() {
+            return UserItemImageSource {
+                item_id: self.id.as_str(),
+                image_type: EmbyImageType::Backdrop,
+                tag: Some(tag),
+            };
+        }
+
+        UserItemImageSource {
+            item_id: self.id.as_str(),
+            image_type: EmbyImageType::Primary,
+            tag: None,
+        }
     }
 
     pub fn unplayed_count(&self) -> Option<u32> {
@@ -566,6 +603,9 @@ mod tests {
                     "ImageTags": {
                         "Primary": "primary-tag-1"
                     },
+                    "BackdropImageTags": [
+                        "backdrop-tag-1"
+                    ],
                     "UserData": {
                         "UnplayedItemCount": 12,
                         "IsFavorite": true
@@ -590,21 +630,36 @@ mod tests {
                     "UserData": {
                         "UnplayedItemCount": 0
                     }
+                },
+                {
+                    "Id": "item-3",
+                    "Name": "只有背景图的电影",
+                    "Type": "Movie",
+                    "ProductionYear": 2026,
+                    "ImageTags": {},
+                    "BackdropImageTags": [
+                        "backdrop-tag-3"
+                    ]
                 }
             ],
-            "TotalRecordCount": 2
+            "TotalRecordCount": 3
         }
         "#;
 
         let items: UserItems = serde_json::from_str(json).unwrap();
 
-        assert_eq!(items.total_record_count, 2);
+        assert_eq!(items.total_record_count, 3);
         assert_eq!(items.items[0].id, "item-1");
         assert_eq!(items.items[0].name, "示例剧集");
         assert_eq!(items.items[0].item_type.as_deref(), Some("Series"));
         assert_eq!(items.items[0].production_year, Some(2024));
         assert!((items.items[0].community_rating.unwrap() - 8.7).abs() < 0.001);
         assert_eq!(items.items[0].primary_image_tag(), Some("primary-tag-1"));
+        assert_eq!(items.items[0].backdrop_image_tag(), Some("backdrop-tag-1"));
+        let image_source = items.items[0].image_source();
+        assert_eq!(image_source.item_id, "item-1");
+        assert_eq!(image_source.image_type, EmbyImageType::Primary);
+        assert_eq!(image_source.tag, Some("primary-tag-1"));
         assert_eq!(items.items[0].unplayed_count(), Some(12));
         assert!(items.items[0].is_favorite());
         assert_eq!(items.items[0].collection_type.as_deref(), Some("tvshows"));
@@ -623,6 +678,12 @@ mod tests {
         assert_eq!(items.items[1].primary_image_tag(), Some("primary-tag-2"));
         assert_eq!(items.items[1].unplayed_count(), None);
         assert!(!items.items[1].is_favorite());
+        assert_eq!(items.items[2].primary_image_tag(), None);
+        assert_eq!(items.items[2].backdrop_image_tag(), Some("backdrop-tag-3"));
+        let image_source = items.items[2].image_source();
+        assert_eq!(image_source.item_id, "item-3");
+        assert_eq!(image_source.image_type, EmbyImageType::Backdrop);
+        assert_eq!(image_source.tag, Some("backdrop-tag-3"));
     }
 
     #[test]

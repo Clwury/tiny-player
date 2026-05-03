@@ -5,7 +5,7 @@ use gpui::{AppContext, Context, Timer};
 use crate::{
     emby::{
         EmbyImageRequest, ImageQuality, ResumeItemImageSource, ResumeItems, SortOrder, UserItem,
-        UserItems, UserViews,
+        UserItemImageSource, UserItems, UserViews,
     },
     images::{
         cache::{self as image_cache},
@@ -297,11 +297,7 @@ impl HomeContent {
 
     fn ensure_user_items_images(&mut self, items: &UserItems, cx: &mut Context<Self>) {
         for item in &items.items {
-            self.ensure_user_item_image(
-                item.id.clone(),
-                item.primary_image_tag().map(ToString::to_string),
-                cx,
-            );
+            self.ensure_user_item_image(item.image_source(), cx);
         }
     }
 
@@ -317,15 +313,8 @@ impl HomeContent {
         self.ensure_image(request, cx);
     }
 
-    fn ensure_user_item_image(
-        &mut self,
-        item_id: String,
-        primary_tag: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let request = EmbyImageRequest::primary(item_id, primary_tag)
-            .with_max_width(HOME_ITEM_CARD_IMAGE_MAX_WIDTH)
-            .with_quality(ImageQuality::DEFAULT);
+    fn ensure_user_item_image(&mut self, source: UserItemImageSource<'_>, cx: &mut Context<Self>) {
+        let request = user_item_image_request(source);
         self.ensure_image(request, cx);
     }
 
@@ -455,12 +444,7 @@ impl HomeContent {
     }
 
     pub(super) fn image_path_for_user_item(&self, item: &UserItem) -> Option<PathBuf> {
-        let request = EmbyImageRequest::primary(
-            item.id.clone(),
-            item.primary_image_tag().map(ToString::to_string),
-        )
-        .with_max_width(HOME_ITEM_CARD_IMAGE_MAX_WIDTH)
-        .with_quality(ImageQuality::DEFAULT);
+        let request = user_item_image_request(item.image_source());
         self.image_path_for_request(&request)
     }
 
@@ -468,6 +452,13 @@ impl HomeContent {
         self.image_loader
             .path_for_request(&self.current_server, request)
     }
+}
+
+fn user_item_image_request(source: UserItemImageSource<'_>) -> EmbyImageRequest {
+    EmbyImageRequest::new(source.item_id, source.image_type)
+        .with_tag(source.tag.map(ToString::to_string))
+        .with_max_width(HOME_ITEM_CARD_IMAGE_MAX_WIDTH)
+        .with_quality(ImageQuality::DEFAULT)
 }
 
 fn resume_image_request(source: ResumeItemImageSource<'_>) -> EmbyImageRequest {
