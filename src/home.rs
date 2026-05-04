@@ -2,13 +2,14 @@ mod cache;
 mod carousel;
 mod components;
 mod data;
+mod detail;
 mod render;
 mod sidebar;
 
 use std::collections::HashMap;
 
 use crate::{
-    emby::{EmbyClient, ResumeItems, UserItems, UserViews},
+    emby::{EmbyClient, MediaItem, MediaItems, ResumeItems, UserItems, UserViews},
     images::loader::ImageLoader,
     server::CachedServer,
 };
@@ -55,6 +56,43 @@ struct UserViewItemsRow {
     carousel: CarouselState,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SeriesDetailEffects {
+    item: LoadState,
+    seasons: LoadState,
+    next_up: LoadState,
+    episodes: LoadState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeriesDetailSelectKind {
+    MediaSource,
+    Subtitle,
+}
+
+#[derive(Clone, Debug)]
+struct SeriesDetailState {
+    series_id: String,
+    title: String,
+    effects: SeriesDetailEffects,
+    item: Option<MediaItem>,
+    item_failed: Option<gpui::SharedString>,
+    seasons: Option<MediaItems>,
+    seasons_failed: Option<gpui::SharedString>,
+    next_up: Option<MediaItems>,
+    next_up_failed: Option<gpui::SharedString>,
+    episodes: Option<MediaItems>,
+    episodes_failed: Option<gpui::SharedString>,
+    selected_season_id: Option<String>,
+    selected_episode_id: Option<String>,
+    preferred_episode_id: Option<String>,
+    selected_media_source_index: Option<usize>,
+    selected_subtitle_index: Option<usize>,
+    open_select: Option<SeriesDetailSelectKind>,
+    episodes_request_season_id: Option<String>,
+    episodes_carousel: CarouselState,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MainScrollbarDragState {
     cursor_offset_y: f32,
@@ -84,6 +122,7 @@ struct HomeContent {
     resume_items_failed: Option<gpui::SharedString>,
     resume_items_carousel: CarouselState,
     user_view_items_rows: HashMap<String, UserViewItemsRow>,
+    series_detail: Option<SeriesDetailState>,
     main_scroll_handle: ScrollHandle,
     main_scrollbar_drag: Option<MainScrollbarDragState>,
     image_loader: ImageLoader,
@@ -122,6 +161,7 @@ impl HomeContent {
             resume_items_failed: None,
             resume_items_carousel: CarouselState::default(),
             user_view_items_rows: HashMap::new(),
+            series_detail: None,
             main_scroll_handle: ScrollHandle::new(),
             main_scrollbar_drag: None,
             image_loader: ImageLoader::new(),
@@ -138,6 +178,9 @@ impl HomeContent {
         self.resume_items_carousel.sync_previous_offset();
         for row in self.user_view_items_rows.values_mut() {
             row.carousel.sync_previous_offset();
+        }
+        if let Some(detail) = &mut self.series_detail {
+            detail.episodes_carousel.sync_previous_offset();
         }
     }
 }

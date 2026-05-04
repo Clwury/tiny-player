@@ -13,11 +13,13 @@ use crate::server::{CachedServer, ServerEndpoint};
 
 pub mod image;
 pub mod item;
+pub mod show;
 pub mod system;
 pub mod user;
 
 pub use image::{DownloadedImage, EmbyImageRequest, EmbyImageType, ImageQuality};
 pub use item::ItemCounts;
+pub use show::{MediaItem, MediaItems, MediaSource, MediaStream};
 pub use system::PublicSystemInfo;
 pub use user::{
     AuthSession, AuthSessionInfo, AuthUser, ResumeItem, ResumeItemImageSource, ResumeItems,

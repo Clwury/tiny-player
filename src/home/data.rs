@@ -323,7 +323,7 @@ impl HomeContent {
         self.ensure_image(request, cx);
     }
 
-    fn ensure_image(&mut self, request: EmbyImageRequest, cx: &mut Context<Self>) {
+    pub(super) fn ensure_image(&mut self, request: EmbyImageRequest, cx: &mut Context<Self>) {
         self.image_loader
             .ensure_image(&self.current_server, request);
         self.start_queued_image_loads(cx);
@@ -448,7 +448,10 @@ impl HomeContent {
         self.image_path_for_request(&request)
     }
 
-    fn image_path_for_request(&self, request: &EmbyImageRequest) -> Option<std::path::PathBuf> {
+    pub(super) fn image_path_for_request(
+        &self,
+        request: &EmbyImageRequest,
+    ) -> Option<std::path::PathBuf> {
         self.image_loader
             .path_for_request(&self.current_server, request)
     }

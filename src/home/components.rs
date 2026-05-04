@@ -9,13 +9,15 @@ use gpui::{
 use image::{Frame, imageops::FilterType};
 
 use crate::{
-    emby::{ResumeItem, UserItem},
+    emby::{MediaItem, ResumeItem, UserItem},
     theme,
 };
 
 use super::carousel::{
-    HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
-    USER_VIEW_CARD_IMAGE_HEIGHT_PX, USER_VIEW_CARD_PADDING_PX, USER_VIEW_CARD_WIDTH_PX,
+    DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX, DETAIL_EPISODE_CARD_PADDING_PX,
+    DETAIL_EPISODE_CARD_WIDTH_PX, HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX,
+    HOME_ITEM_CARD_WIDTH_PX, USER_VIEW_CARD_IMAGE_HEIGHT_PX, USER_VIEW_CARD_PADDING_PX,
+    USER_VIEW_CARD_WIDTH_PX,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -40,7 +42,7 @@ impl Asset for CoverImageAsset {
     }
 }
 
-fn cover_img(path: PathBuf, width: f32, height: f32) -> impl IntoElement {
+pub(super) fn cover_img(path: PathBuf, width: f32, height: f32) -> impl IntoElement {
     let source = CoverImageSource {
         path,
         width: width as u32,
@@ -288,7 +290,7 @@ pub(super) fn user_item_card<T>(
     item: &UserItem,
     image_path: Option<PathBuf>,
     cx: &Context<T>,
-) -> impl IntoElement {
+) -> gpui::Div {
     let theme = theme::get(cx);
 
     div()
@@ -326,6 +328,100 @@ pub(super) fn user_item_card<T>(
                     )
                 }),
         )
+}
+
+pub(super) fn episode_card<T>(
+    episode: &MediaItem,
+    image_path: Option<PathBuf>,
+    selected: bool,
+    cx: &Context<T>,
+) -> gpui::Div {
+    let theme = theme::get(cx);
+    let has_image = image_path.is_some();
+
+    div()
+        .flex()
+        .flex_none()
+        .flex_col()
+        .gap_2()
+        .w(px(
+            DETAIL_EPISODE_CARD_WIDTH_PX + DETAIL_EPISODE_CARD_PADDING_PX * 2.0
+        ))
+        .rounded_lg()
+        .border_1()
+        .border_color(if selected {
+            theme.input_border_focused
+        } else {
+            theme.input_border.opacity(0.0)
+        })
+        .p(px(DETAIL_EPISODE_CARD_PADDING_PX))
+        .hover(move |style| style.bg(theme.secondary_hover))
+        .child(
+            div()
+                .relative()
+                .w(px(DETAIL_EPISODE_CARD_WIDTH_PX))
+                .h(px(DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX))
+                .overflow_hidden()
+                .rounded_lg()
+                .bg(theme.input_background)
+                .when_some(image_path, |this, path| {
+                    this.child(cover_img(
+                        path,
+                        DETAIL_EPISODE_CARD_WIDTH_PX,
+                        DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX,
+                    ))
+                })
+                .when(!has_image, |this| {
+                    this.flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("暂无图片")
+                }),
+        )
+        .child(
+            div()
+                .w(px(DETAIL_EPISODE_CARD_WIDTH_PX))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(episode_title(episode)),
+                )
+                .when_some(
+                    non_empty_string(episode.overview.as_deref()),
+                    |this, overview| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .text_ellipsis()
+                                .line_clamp(3)
+                                .child(overview),
+                        )
+                    },
+                ),
+        )
+}
+
+fn episode_title(episode: &MediaItem) -> String {
+    match episode.index_number {
+        Some(index) => format!("E{index}: {}", episode.name),
+        None => episode.name.clone(),
+    }
+}
+
+fn non_empty_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn user_item_card_image<T>(
@@ -417,7 +513,7 @@ fn user_item_badge<T>(text: String, cx: &Context<T>) -> impl IntoElement {
         .child(text)
 }
 
-fn format_community_rating(rating: f32) -> String {
+pub(super) fn format_community_rating(rating: f32) -> String {
     let rating = (rating * 10.0).round() / 10.0;
     if rating.fract().abs() < f32::EPSILON {
         format!("{rating:.0}")

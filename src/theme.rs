@@ -20,6 +20,7 @@ pub struct TinyTheme {
     pub muted_foreground: Hsla,
     pub dialog_background: Hsla,
     pub overlay: Hsla,
+    pub warning: Hsla,
     pub error: Hsla,
     pub radius_lg: Pixels,
 }
@@ -115,6 +116,11 @@ impl TinyTheme {
                 fallback.dialog_background,
             )?,
             overlay: color_or_any(config, &["overlay"], fallback.overlay)?,
+            warning: color_or_any(
+                config,
+                &["warning.foreground", "warning.background", "base.yellow"],
+                fallback.warning,
+            )?,
             error: color_or_any(config, &["danger.background", "base.red"], fallback.error)?,
             radius_lg: px(config.radius_lg.unwrap_or(16.0)),
         })
@@ -133,6 +139,7 @@ impl TinyTheme {
             muted_foreground: hex(0x6c7086),
             dialog_background: hex(0x1e1e2e),
             overlay: hsla(0.0, 0.0, 0.0, 0.55),
+            warning: hex(0xf9e2af),
             error: hex(0xf38ba8),
             radius_lg: px(16.0),
         }
@@ -230,6 +237,7 @@ mod tests {
             theme.input_border_focused,
             parse_hex_color("#cba6f7").unwrap()
         );
+        assert_eq!(theme.warning, parse_hex_color("#f9e2af").unwrap());
         assert_eq!(theme.error, parse_hex_color("#f38ba8").unwrap());
     }
 
