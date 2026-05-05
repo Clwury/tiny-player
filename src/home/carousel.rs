@@ -67,7 +67,7 @@ pub(super) fn carousel_content_width_for(
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(super) struct CarouselState {
+pub(crate) struct CarouselState {
     scroll_offset: f32,
     previous_scroll_offset: f32,
     animation_id: u64,

@@ -66,7 +66,11 @@ where
                 .border_1()
                 .border_color(theme.input_border)
                 .bg(theme.dialog_background)
-                .hover(move |style| style.bg(theme.secondary_hover))
+                .hover(move |style| {
+                    style
+                        .bg(theme.secondary_hover.opacity(0.55))
+                        .border_color(theme.input_border_focused)
+                })
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     cx.stop_propagation();
                     on_select(&selected_server, window, cx);
@@ -179,8 +183,14 @@ where
                 .items_center()
                 .justify_center()
                 .rounded_md()
+                .border_1()
+                .border_color(theme.input_border.opacity(0.0))
                 .text_color(theme.foreground)
-                .hover(move |style| style.bg(theme.secondary_hover))
+                .hover(move |style| {
+                    style
+                        .bg(theme.secondary_hover)
+                        .border_color(theme.input_border_focused)
+                })
                 .when(loading, |this| {
                     this.child(loader_icon(loader_server_id, cx))
                 })

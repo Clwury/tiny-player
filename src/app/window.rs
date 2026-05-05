@@ -22,7 +22,7 @@ impl TinyApp {
     pub(super) fn title(&self, cx: &Context<Self>) -> SharedString {
         match &self.page {
             Page::Servers => "Tiny".into(),
-            Page::Home(page) => page.read(cx).title().into(),
+            Page::Home(page) => page.read(cx).title(cx),
         }
     }
 

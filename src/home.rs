@@ -9,21 +9,33 @@ mod sidebar;
 use std::collections::HashMap;
 
 use crate::{
-    emby::{EmbyClient, MediaItem, MediaItems, ResumeItems, UserItems, UserViews},
+    emby::{EmbyClient, ResumeItems, UserItems, UserViews},
     images::loader::ImageLoader,
     server::CachedServer,
 };
 use carousel::CarouselState;
-use gpui::{AppContext as _, ClickEvent, Context, Entity, EventEmitter, ScrollHandle, Window};
+
+pub(crate) use detail::SeriesDetailState;
+
+use gpui::{
+    App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, ScrollHandle, SharedString,
+    Window,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum HomeEvent {
     BackToServers,
     SectionChanged,
+    TitleChanged,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HomeContentEvent {
+    TitleChanged,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum LoadState {
+pub(crate) enum LoadState {
     #[default]
     Idle,
     Loading,
@@ -54,43 +66,6 @@ struct UserViewItemsRow {
     loading: bool,
     failed: Option<gpui::SharedString>,
     carousel: CarouselState,
-}
-
-#[derive(Clone, Debug, Default)]
-struct SeriesDetailEffects {
-    item: LoadState,
-    seasons: LoadState,
-    next_up: LoadState,
-    episodes: LoadState,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SeriesDetailSelectKind {
-    MediaSource,
-    Subtitle,
-}
-
-#[derive(Clone, Debug)]
-struct SeriesDetailState {
-    series_id: String,
-    title: String,
-    effects: SeriesDetailEffects,
-    item: Option<MediaItem>,
-    item_failed: Option<gpui::SharedString>,
-    seasons: Option<MediaItems>,
-    seasons_failed: Option<gpui::SharedString>,
-    next_up: Option<MediaItems>,
-    next_up_failed: Option<gpui::SharedString>,
-    episodes: Option<MediaItems>,
-    episodes_failed: Option<gpui::SharedString>,
-    selected_season_id: Option<String>,
-    selected_episode_id: Option<String>,
-    preferred_episode_id: Option<String>,
-    selected_media_source_index: Option<usize>,
-    selected_subtitle_index: Option<usize>,
-    open_select: Option<SeriesDetailSelectKind>,
-    episodes_request_season_id: Option<String>,
-    episodes_carousel: CarouselState,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,6 +113,8 @@ enum HomeSection {
 
 impl EventEmitter<HomeEvent> for HomePage {}
 
+impl EventEmitter<HomeContentEvent> for HomeContent {}
+
 impl HomeSection {
     fn title(self) -> &'static str {
         match self {
@@ -173,6 +150,13 @@ impl HomeContent {
         self.load_home_snapshot_if_needed(cx);
     }
 
+    fn title(&self, fallback: HomeSection) -> SharedString {
+        self.series_detail
+            .as_ref()
+            .map(|detail| detail.title.clone().into())
+            .unwrap_or_else(|| fallback.title().into())
+    }
+
     fn sync_previous_offsets(&mut self) {
         self.user_views_carousel.sync_previous_offset();
         self.resume_items_carousel.sync_previous_offset();
@@ -193,6 +177,13 @@ impl HomePage {
         cx: &mut Context<Self>,
     ) -> Self {
         let home_content = cx.new(|_| HomeContent::new(current_server.clone(), emby_client));
+        cx.subscribe(
+            &home_content,
+            |_: &mut HomePage, _, event, cx| match event {
+                HomeContentEvent::TitleChanged => cx.emit(HomeEvent::TitleChanged),
+            },
+        )
+        .detach();
         let mut page = Self {
             current_server,
             servers,
@@ -203,8 +194,8 @@ impl HomePage {
         page
     }
 
-    pub fn title(&self) -> &'static str {
-        self.active_section.title()
+    pub fn title(&self, cx: &App) -> SharedString {
+        self.home_content.read(cx).title(self.active_section)
     }
 
     pub(crate) fn start_effects(&mut self, cx: &mut Context<Self>) {

@@ -170,7 +170,7 @@ impl TinyApp {
         let home_page = cx.new(|cx| HomePage::new(server, servers, client, cx));
         cx.subscribe(&home_page, |app: &mut TinyApp, _, event, cx| match event {
             HomeEvent::BackToServers => app.show_servers_page_from_home(cx),
-            HomeEvent::SectionChanged => cx.notify(),
+            HomeEvent::SectionChanged | HomeEvent::TitleChanged => cx.notify(),
         })
         .detach();
         self.page = Page::Home(home_page);
