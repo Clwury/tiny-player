@@ -5,10 +5,13 @@ use libmpv2::{
     events::{Event, PropertyData},
 };
 
+use super::render_host::RenderSize;
+
 #[derive(Debug)]
 pub enum BackendEvent {
     Pause(bool),
     PlaybackRestart,
+    VideoSizeChanged(Option<RenderSize>),
     FileTitle(String),
     PositionChanged(f64),
     DurationChanged(f64),
@@ -103,7 +106,14 @@ impl MpvBackend {
                     change: PropertyData::Flag(paused),
                     ..
                 }) => events.push(BackendEvent::Pause(paused)),
-                Ok(Event::PlaybackRestart) => events.push(BackendEvent::PlaybackRestart),
+                Ok(Event::StartFile) => events.push(BackendEvent::VideoSizeChanged(None)),
+                Ok(Event::PlaybackRestart) => {
+                    events.push(BackendEvent::PlaybackRestart);
+                    events.push(BackendEvent::VideoSizeChanged(self.video_size()));
+                }
+                Ok(Event::VideoReconfig) => {
+                    events.push(BackendEvent::VideoSizeChanged(self.video_size()))
+                }
                 Ok(Event::PropertyChange {
                     name: "media-title",
                     change: PropertyData::Str(title) | PropertyData::OsdStr(title),
@@ -134,6 +144,23 @@ impl MpvBackend {
 
         events
     }
+
+    fn video_size(&self) -> Option<RenderSize> {
+        let width = self.mpv.get_property::<i64>("video-params/w").ok()?;
+        let height = self.mpv.get_property::<i64>("video-params/h").ok()?;
+        render_size_from_mpv_dimensions(width, height)
+    }
+}
+
+fn render_size_from_mpv_dimensions(width: i64, height: i64) -> Option<RenderSize> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    Some(RenderSize {
+        width: width.try_into().ok()?,
+        height: height.try_into().ok()?,
+    })
 }
 
 fn is_load_failure(error: &MpvError) -> bool {
@@ -162,5 +189,22 @@ mod tests {
     #[test]
     fn empty_url_error_has_user_facing_message() {
         assert_eq!(BackendError::EmptyUrl.to_string(), "播放地址为空");
+    }
+
+    #[test]
+    fn render_size_from_mpv_dimensions_rejects_invalid_dimensions() {
+        assert_eq!(render_size_from_mpv_dimensions(0, 1080), None);
+        assert_eq!(render_size_from_mpv_dimensions(1920, -1), None);
+    }
+
+    #[test]
+    fn render_size_from_mpv_dimensions_accepts_source_video_size() {
+        assert_eq!(
+            render_size_from_mpv_dimensions(3840, 2160),
+            Some(RenderSize {
+                width: 3840,
+                height: 2160,
+            })
+        );
     }
 }

@@ -14,9 +14,6 @@ use super::{
     video_presenter::VideoPresenter,
 };
 
-const MAX_VIDEO_RENDER_WIDTH: u32 = 1920;
-const MAX_VIDEO_RENDER_HEIGHT: u32 = 1080;
-
 #[derive(Clone, Debug)]
 pub struct PlaybackRequest {
     pub title: SharedString,
@@ -32,6 +29,7 @@ pub struct PlaybackPage {
     title: SharedString,
     video: ShutdownOrder<MpvBackend, VideoPresenter>,
     video_viewport_bounds: Option<Bounds<Pixels>>,
+    video_source_size: Option<RenderSize>,
     current_frame: Option<Arc<RenderImage>>,
     playback_paused: bool,
     current_file_loaded: bool,
@@ -69,6 +67,7 @@ impl PlaybackPage {
             title: request.title,
             video: ShutdownOrder::new(backend, video_presenter),
             video_viewport_bounds: None,
+            video_source_size: None,
             current_frame: None,
             playback_paused: true,
             current_file_loaded: false,
@@ -90,16 +89,16 @@ impl PlaybackPage {
         &mut self,
         frame: Arc<RenderImage>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
         if let Some(previous) = self.current_frame.replace(frame) {
-            cx.drop_image(previous, Some(window));
+            defer_drop_frame(previous, window);
         }
     }
 
-    fn clear_visible_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn clear_visible_frame(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         if let Some(frame) = self.current_frame.take() {
-            cx.drop_image(frame, Some(window));
+            defer_drop_frame(frame, window);
         }
     }
 
@@ -127,18 +126,26 @@ impl PlaybackPage {
                 }
                 BackendEvent::LoadFailed(message) => {
                     self.current_file_loaded = false;
+                    self.video_source_size = None;
                     self.playback_paused = true;
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("加载视频失败：{message}").into());
                 }
                 BackendEvent::Fatal(message) => {
                     self.current_file_loaded = false;
+                    self.video_source_size = None;
                     self.playback_paused = true;
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("播放后端错误：{message}").into());
                 }
                 BackendEvent::Pause(paused) => {
                     self.playback_paused = paused;
+                }
+                BackendEvent::VideoSizeChanged(size) => {
+                    if self.video_source_size != size {
+                        self.video_source_size = size;
+                        self.clear_visible_frame(window, cx);
+                    }
                 }
                 BackendEvent::FileTitle(title) => {
                     let _ = title;
@@ -152,16 +159,19 @@ impl PlaybackPage {
             }
         }
 
-        let render_size = self.video_viewport_bounds.and_then(|viewport_bounds| {
-            render_size_for_viewport(viewport_bounds, window.scale_factor())
-        });
+        let has_viewport = self
+            .video_viewport_bounds
+            .is_some_and(|viewport_bounds| normalize_video_viewport(viewport_bounds).is_some());
         if should_render_frame(
             self.video.dependent().is_some(),
             self.current_file_loaded,
             self.error_message.is_some(),
-            render_size.is_some(),
+            self.video_source_size.is_some(),
+            has_viewport,
         ) {
-            let size = render_size.expect("render size checked above");
+            let size = self
+                .video_source_size
+                .expect("video source size checked above");
             let render_result = self
                 .video
                 .dependent_mut()
@@ -217,10 +227,7 @@ impl Render for PlaybackPage {
         .size_full();
         let has_viewport = self
             .video_viewport_bounds
-            .and_then(|viewport_bounds| {
-                render_size_for_viewport(viewport_bounds, window.scale_factor())
-            })
-            .is_some();
+            .is_some_and(|viewport_bounds| normalize_video_viewport(viewport_bounds).is_some());
         if should_request_animation_frame(
             self.video.owner().is_some(),
             self.video.dependent().is_some(),
@@ -328,32 +335,14 @@ fn normalize_video_viewport(bounds: Bounds<Pixels>) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
-fn render_size_for_viewport(bounds: Bounds<Pixels>, scale_factor: f32) -> Option<RenderSize> {
-    let (width, height) = normalize_video_viewport(bounds)?;
-    if !scale_factor.is_finite() || scale_factor <= 0.0 {
-        return None;
-    }
-
-    fit_render_size(RenderSize {
-        width: round_to_u32(width as f32 * scale_factor)?,
-        height: round_to_u32(height as f32 * scale_factor)?,
-    })
-}
-
-fn fit_render_size(size: RenderSize) -> Option<RenderSize> {
-    let width_scale = MAX_VIDEO_RENDER_WIDTH as f32 / size.width as f32;
-    let height_scale = MAX_VIDEO_RENDER_HEIGHT as f32 / size.height as f32;
-    let scale = width_scale.min(height_scale).min(1.0);
-
-    Some(RenderSize {
-        width: round_to_u32(size.width as f32 * scale)?,
-        height: round_to_u32(size.height as f32 * scale)?,
-    })
-}
-
-fn round_to_u32(value: f32) -> Option<u32> {
-    let value = value.round();
-    (value.is_finite() && value > 0.0 && value <= u32::MAX as f32).then_some((value as u32).max(1))
+fn defer_drop_frame(frame: Arc<RenderImage>, window: &mut Window) {
+    window.on_next_frame(move |window, _| {
+        window.on_next_frame(move |window, cx| {
+            cx.drop_image(frame, Some(window));
+        });
+        window.refresh();
+    });
+    window.refresh();
 }
 
 fn viewport_changed(previous: Option<Bounds<Pixels>>, next: Bounds<Pixels>) -> bool {
@@ -364,9 +353,10 @@ fn should_render_frame(
     has_video_presenter: bool,
     has_loaded_file: bool,
     has_error: bool,
+    has_video_size: bool,
     has_viewport: bool,
 ) -> bool {
-    has_video_presenter && has_loaded_file && !has_error && has_viewport
+    has_video_presenter && has_loaded_file && !has_error && has_video_size && has_viewport
 }
 
 fn should_request_animation_frame(
@@ -390,10 +380,9 @@ mod tests {
     use gpui::{Bounds, point, px, size};
 
     use super::{
-        ShutdownOrder, fit_render_size, normalize_video_viewport, render_size_for_viewport,
-        should_render_frame, should_request_animation_frame, viewport_changed,
+        ShutdownOrder, normalize_video_viewport, should_render_frame,
+        should_request_animation_frame, viewport_changed,
     };
-    use crate::player::render_host::RenderSize;
 
     struct DropRecorder {
         name: &'static str,
@@ -423,62 +412,6 @@ mod tests {
     }
 
     #[test]
-    fn render_size_for_viewport_applies_scale_factor() {
-        let bounds = Bounds::new(point(px(3.0), px(5.0)), size(px(320.0), px(180.0)));
-
-        assert_eq!(
-            render_size_for_viewport(bounds, 2.0),
-            Some(RenderSize {
-                width: 640,
-                height: 360,
-            })
-        );
-    }
-
-    #[test]
-    fn render_size_for_viewport_rejects_invalid_scale_factor() {
-        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(180.0)));
-
-        assert_eq!(render_size_for_viewport(bounds, 0.0), None);
-        assert_eq!(render_size_for_viewport(bounds, f32::NAN), None);
-    }
-
-    #[test]
-    fn render_size_for_viewport_rejects_zero_sized_bounds() {
-        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(180.0)));
-
-        assert_eq!(render_size_for_viewport(bounds, 1.0), None);
-    }
-
-    #[test]
-    fn fit_render_size_preserves_small_sizes() {
-        assert_eq!(
-            fit_render_size(RenderSize {
-                width: 1280,
-                height: 720,
-            }),
-            Some(RenderSize {
-                width: 1280,
-                height: 720,
-            })
-        );
-    }
-
-    #[test]
-    fn fit_render_size_caps_large_sizes_while_preserving_aspect_ratio() {
-        assert_eq!(
-            fit_render_size(RenderSize {
-                width: 3840,
-                height: 2160,
-            }),
-            Some(RenderSize {
-                width: 1920,
-                height: 1080,
-            })
-        );
-    }
-
-    #[test]
     fn viewport_changed_only_reports_real_differences() {
         let first = Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0)));
         let second = Bounds::new(point(px(0.0), px(0.0)), size(px(400.0), px(240.0)));
@@ -489,12 +422,13 @@ mod tests {
     }
 
     #[test]
-    fn should_render_frame_requires_loaded_file_and_valid_viewport() {
-        assert!(should_render_frame(true, true, false, true));
-        assert!(!should_render_frame(false, true, false, true));
-        assert!(!should_render_frame(true, false, false, true));
-        assert!(!should_render_frame(true, true, true, true));
-        assert!(!should_render_frame(true, true, false, false));
+    fn should_render_frame_requires_loaded_file_video_size_and_valid_viewport() {
+        assert!(should_render_frame(true, true, false, true, true));
+        assert!(!should_render_frame(false, true, false, true, true));
+        assert!(!should_render_frame(true, false, false, true, true));
+        assert!(!should_render_frame(true, true, true, true, true));
+        assert!(!should_render_frame(true, true, false, false, true));
+        assert!(!should_render_frame(true, true, false, true, false));
     }
 
     #[test]
