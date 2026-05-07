@@ -29,6 +29,8 @@ pub(crate) struct SeriesDetailState {
     pub(crate) next_up_failed: Option<gpui::SharedString>,
     pub(crate) episodes: Option<MediaItems>,
     pub(crate) episodes_failed: Option<gpui::SharedString>,
+    pub(crate) playback_loading: bool,
+    pub(crate) playback_failed: Option<gpui::SharedString>,
     pub(crate) selected_season_id: Option<String>,
     pub(crate) selected_episode_id: Option<String>,
     pub(crate) preferred_episode_id: Option<String>,
@@ -53,6 +55,8 @@ impl SeriesDetailState {
             next_up_failed: None,
             episodes: None,
             episodes_failed: None,
+            playback_loading: false,
+            playback_failed: None,
             selected_season_id: None,
             selected_episode_id: None,
             preferred_episode_id: None,
@@ -251,6 +255,7 @@ impl SeriesDetailState {
             self.selected_media_source_index = None;
             self.selected_subtitle_index = None;
             self.open_select = None;
+            self.reset_playback_request();
         }
         self.sync_media_source_selection();
     }
@@ -265,6 +270,12 @@ impl SeriesDetailState {
         self.selected_subtitle_index = None;
         self.open_select = None;
         self.episodes_carousel = Default::default();
+        self.reset_playback_request();
+    }
+
+    pub(crate) fn reset_playback_request(&mut self) {
+        self.playback_loading = false;
+        self.playback_failed = None;
     }
 
     pub(crate) fn sync_media_source_selection(&mut self) {
@@ -385,6 +396,8 @@ mod tests {
                 total_record_count: 2,
             }),
             episodes_failed: None,
+            playback_loading: false,
+            playback_failed: None,
             selected_season_id: None,
             selected_episode_id: None,
             preferred_episode_id: Some("episode-2".to_string()),

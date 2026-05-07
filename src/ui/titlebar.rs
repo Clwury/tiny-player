@@ -10,7 +10,7 @@ pub fn app_titlebar(
     window: &Window,
     cx: &App,
     title: SharedString,
-    on_add_server: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    on_add_server: Option<impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static>,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
 
@@ -71,12 +71,14 @@ pub fn app_titlebar(
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(action_button(
-                    "add-server",
-                    "icons/plus.svg",
-                    cx,
-                    on_add_server,
-                ))
+                .when_some(on_add_server, |this, on_add_server| {
+                    this.child(action_button(
+                        "add-server",
+                        "icons/plus.svg",
+                        cx,
+                        on_add_server,
+                    ))
+                })
                 .child(window_control_button(
                     "minimize",
                     "icons/window-minimize.svg",

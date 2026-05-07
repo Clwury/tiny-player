@@ -1,9 +1,10 @@
 use anyhow::Result;
-use gpui::{AppContext as _, Context, Window};
+use gpui::{AppContext as _, Context, Entity, Window};
 
 use crate::{
     emby::AuthSession,
     home::{HomeEvent, HomePage},
+    player::{PlaybackEvent, PlaybackRequest},
     server::{AddServerSubmission, CachedServer},
     storage,
 };
@@ -168,12 +169,48 @@ impl TinyApp {
         self.selecting_server_id = None;
         let servers = self.servers.clone();
         let home_page = cx.new(|cx| HomePage::new(server, servers, client, cx));
-        cx.subscribe(&home_page, |app: &mut TinyApp, _, event, cx| match event {
-            HomeEvent::BackToServers => app.show_servers_page_from_home(cx),
-            HomeEvent::SectionChanged | HomeEvent::TitleChanged => cx.notify(),
-        })
+        let playback_return_to = home_page.clone();
+        cx.subscribe(
+            &home_page,
+            move |app: &mut TinyApp, _, event, cx| match event {
+                HomeEvent::BackToServers => app.show_servers_page_from_home(cx),
+                HomeEvent::SectionChanged | HomeEvent::TitleChanged => cx.notify(),
+                HomeEvent::OpenPlayback(request) => {
+                    app.open_playback_page(playback_return_to.clone(), request.clone(), cx)
+                }
+            },
+        )
         .detach();
         self.page = Page::Home(home_page);
+    }
+
+    fn open_playback_page(
+        &mut self,
+        return_to: Entity<HomePage>,
+        request: PlaybackRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let playback_page = cx.new(|cx| crate::player::PlaybackPage::new(request, cx));
+        cx.subscribe(
+            &playback_page,
+            |app: &mut TinyApp, _, event, cx| match event {
+                PlaybackEvent::Back => app.return_to_playback_origin(cx),
+            },
+        )
+        .detach();
+        self.page = Page::Playback {
+            page: playback_page,
+            return_to,
+        };
+        cx.notify();
+    }
+
+    fn return_to_playback_origin(&mut self, cx: &mut Context<Self>) {
+        let Page::Playback { return_to, .. } = &self.page else {
+            return;
+        };
+        self.page = Page::Home(return_to.clone());
+        cx.notify();
     }
 
     fn is_selecting_server(&self, server_id: &str) -> bool {

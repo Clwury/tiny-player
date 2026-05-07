@@ -1,7 +1,7 @@
 use gpui::{
     Animation, AnimationExt as _, Context, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, StatefulInteractiveElement, Styled, StyledImage, Window, div, ease_in_out, img,
-    prelude::FluentBuilder, px, svg,
+    ParentElement, StatefulInteractiveElement, Styled, StyledImage, Window, deferred, div,
+    ease_in_out, img, prelude::FluentBuilder, px, svg,
 };
 
 use crate::{
@@ -27,7 +27,7 @@ impl HomeContent {
         window: &Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let hero_height = (f32::from(window.bounds().size.height) * 0.5).max(260.0);
+        let hero_height = (f32::from(window.bounds().size.height) * 0.6).max(260.0);
         let theme = theme::get(cx);
         let main_content_width = home_main_content_width(window);
 
@@ -354,6 +354,7 @@ impl HomeContent {
         let theme = theme::get(cx);
         let video_label = detail.selected_media_source_label();
         let subtitle_label = detail.selected_subtitle_label();
+        let play = cx.listener(Self::play_selected_series_episode);
         let toggle_video = cx.listener(Self::toggle_series_media_source_select);
         let toggle_subtitle = cx.listener(Self::toggle_series_subtitle_select);
         let media_sources = detail
@@ -372,108 +373,152 @@ impl HomeContent {
             detail.open_select == Some(SeriesDetailSelectKind::MediaSource) && source_count > 0;
         let subtitle_select_open =
             detail.open_select == Some(SeriesDetailSelectKind::Subtitle) && subtitle_count > 0;
+        let can_play = !detail.playback_loading
+            && detail.selected_episode().is_some()
+            && detail
+                .selected_media_source()
+                .and_then(|source| source.id.as_deref())
+                .is_some_and(|id| !id.trim().is_empty());
+        let play_label = if detail.playback_loading {
+            "获取播放地址中…"
+        } else {
+            "播放"
+        };
 
         div()
             .flex()
-            .flex_wrap()
+            .flex_col()
             .w_full()
-            .items_center()
-            .justify_between()
-            .gap_3()
+            .gap_2()
             .child(
                 div()
                     .flex()
-                    .h(px(34.0))
-                    .items_center()
-                    .gap_2()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(theme.input_border_focused)
-                    .bg(theme.foreground)
-                    .px_4()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.background)
-                    .child(
-                        svg()
-                            .path("icons/play.svg")
-                            .size(px(16.0))
-                            .text_color(theme.background),
-                    )
-                    .child("播放"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w_0()
                     .flex_wrap()
+                    .w_full()
                     .items_center()
-                    .justify_end()
+                    .justify_between()
                     .gap_3()
                     .child(
                         div()
-                            .relative()
+                            .flex()
+                            .w(px(150.0))
+                            .h(px(42.0))
+                            .justify_center()
+                            .items_center()
+                            .gap_2()
+                            .rounded(px(8.0))
+                            .id("series-detail-play-button")
+                            .border_1()
+                            .border_color(theme.input_border_focused)
+                            .bg(theme.foreground)
+                            .px_4()
+                            .text_base()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.background)
                             .child(
-                                detail_select_box("视频", video_label, source_count > 0, cx)
-                                    .id("series-detail-video-select")
-                                    .on_click(toggle_video),
+                                svg()
+                                    .path("icons/play.svg")
+                                    .size(px(18.0))
+                                    .text_color(theme.background),
                             )
-                            .when(media_source_select_open, |this| {
-                                this.child(detail_select_menu(
-                                    "series-detail-video-menu",
-                                    cx,
-                                    media_sources.iter().enumerate().map(|(index, source)| {
-                                        let label = source.name_label(index);
-                                        let selected = selected_source_index == Some(index);
-                                        let on_click =
-                                            cx.listener(move |page: &mut HomeContent, _, _, cx| {
-                                                page.select_series_media_source(index, cx);
-                                            });
-
-                                        detail_select_option(label, selected, cx)
-                                            .id((
-                                                gpui::ElementId::from("series-detail-video-option"),
-                                                index.to_string(),
-                                            ))
-                                            .on_click(on_click)
-                                    }),
-                                ))
-                            }),
+                            .child(play_label)
+                            .when(can_play, |this| this.cursor_pointer().on_click(play))
+                            .when(!can_play, |this| this.cursor_default().opacity(0.62)),
                     )
                     .child(
                         div()
-                            .relative()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_end()
+                            .gap_3()
                             .child(
-                                detail_select_box("字幕", subtitle_label, subtitle_count > 0, cx)
-                                    .id("series-detail-subtitle-select")
-                                    .on_click(toggle_subtitle),
-                            )
-                            .when(subtitle_select_open, |this| {
-                                this.child(detail_select_menu(
-                                    "series-detail-subtitle-menu",
-                                    cx,
-                                    subtitle_streams.iter().enumerate().map(|(index, stream)| {
-                                        let label = stream.display_title_label(index);
-                                        let selected = selected_subtitle_index == Some(index);
-                                        let on_click =
-                                            cx.listener(move |page: &mut HomeContent, _, _, cx| {
-                                                page.select_series_subtitle(index, cx);
-                                            });
+                                div()
+                                    .relative()
+                                    .child(
+                                        detail_select_box("视频", video_label, source_count > 0, cx)
+                                            .id("series-detail-video-select")
+                                            .on_click(toggle_video),
+                                    )
+                                    .when(media_source_select_open, |this| {
+                                        this.child(
+                                            deferred(detail_select_menu(
+                                                "series-detail-video-menu",
+                                                cx,
+                                                media_sources.iter().enumerate().map(
+                                                    |(index, source)| {
+                                                        let label = source.name_label(index);
+                                                        let selected =
+                                                            selected_source_index == Some(index);
+                                                        let on_click = cx.listener(
+                                                            move |page: &mut HomeContent, _, _, cx| {
+                                                                page.select_series_media_source(
+                                                                    index, cx,
+                                                                );
+                                                            },
+                                                        );
 
-                                        detail_select_option(label, selected, cx)
-                                            .id((
-                                                gpui::ElementId::from(
-                                                    "series-detail-subtitle-option",
+                                                        detail_select_option(label, selected, cx)
+                                                            .id((
+                                                                gpui::ElementId::from(
+                                                                    "series-detail-video-option",
+                                                                ),
+                                                                index.to_string(),
+                                                            ))
+                                                            .on_click(on_click)
+                                                    },
                                                 ),
-                                                index.to_string(),
                                             ))
-                                            .on_click(on_click)
+                                            .with_priority(1),
+                                        )
                                     }),
-                                ))
-                            }),
+                            )
+                            .child(
+                                div()
+                                    .relative()
+                                    .child(
+                                        detail_select_box("字幕", subtitle_label, subtitle_count > 0, cx)
+                                            .id("series-detail-subtitle-select")
+                                            .on_click(toggle_subtitle),
+                                    )
+                                    .when(subtitle_select_open, |this| {
+                                        this.child(
+                                            deferred(detail_select_menu(
+                                                "series-detail-subtitle-menu",
+                                                cx,
+                                                subtitle_streams.iter().enumerate().map(
+                                                    |(index, stream)| {
+                                                        let label = stream.display_title_label(index);
+                                                        let selected =
+                                                            selected_subtitle_index == Some(index);
+                                                        let on_click = cx.listener(
+                                                            move |page: &mut HomeContent, _, _, cx| {
+                                                                page.select_series_subtitle(index, cx);
+                                                            },
+                                                        );
+
+                                                        detail_select_option(label, selected, cx)
+                                                            .id((
+                                                                gpui::ElementId::from(
+                                                                    "series-detail-subtitle-option",
+                                                                ),
+                                                                index.to_string(),
+                                                            ))
+                                                            .on_click(on_click)
+                                                    },
+                                                ),
+                                            ))
+                                            .with_priority(1),
+                                        )
+                                    }),
+                            ),
                     ),
             )
+            .when_some(detail.playback_failed.clone(), |this, error| {
+                this.child(div().text_sm().text_color(theme.error).child(error))
+            })
     }
 
     fn render_series_detail_season_selector(

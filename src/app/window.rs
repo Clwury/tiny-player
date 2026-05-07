@@ -23,6 +23,7 @@ impl TinyApp {
         match &self.page {
             Page::Servers => "Tiny".into(),
             Page::Home(page) => page.read(cx).title(cx),
+            Page::Playback { page, .. } => page.read(cx).title(),
         }
     }
 

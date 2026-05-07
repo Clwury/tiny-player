@@ -6,19 +6,21 @@ use reqwest::{
     blocking::Client,
     header::{CONTENT_TYPE, HeaderMap},
 };
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use tracing::debug;
 
 use crate::server::{CachedServer, ServerEndpoint};
 
 pub mod image;
 pub mod item;
+pub mod playback;
 pub mod show;
 pub mod system;
 pub mod user;
 
 pub use image::{DownloadedImage, EmbyImageRequest, EmbyImageType, ImageQuality};
 pub use item::ItemCounts;
+pub use playback::{PlaybackInfo, PlaybackMediaSource};
 pub use show::{MediaItem, MediaItems, MediaSource, MediaStream};
 pub use system::PublicSystemInfo;
 pub use user::{
@@ -82,6 +84,22 @@ impl EmbyClient {
         T: DeserializeOwned,
     {
         let response_body = self.send_authenticated_url(server, method, url)?;
+        serde_json::from_str::<T>(&response_body).context(parse_context)
+    }
+
+    fn send_authenticated_json_body_url<T, B>(
+        &self,
+        server: &CachedServer,
+        method: Method,
+        url: url::Url,
+        body: &B,
+        parse_context: &'static str,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let response_body = self.send_authenticated_body_url(server, method, url, body)?;
         serde_json::from_str::<T>(&response_body).context(parse_context)
     }
 
@@ -160,6 +178,71 @@ impl EmbyClient {
             .header("X-Emby-Authorization", authorization)
             .header("X-Emby-Token", access_token)
             .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
+            .send()
+            .context("连接 Emby 服务器失败")?;
+
+        let status = response.status();
+        let response_headers = format!("{:?}", response.headers());
+        let response_body = response.text().context("读取 Emby API 响应失败")?;
+        debug!(status = %status, "received authenticated Emby response");
+        if log_secrets() {
+            debug!(
+                status = %status,
+                headers = %response_headers,
+                body = %response_body,
+                "full authenticated Emby response"
+            );
+        }
+
+        if !status.is_success() {
+            bail!("Emby API 请求失败：HTTP {status} {response_body}");
+        }
+
+        Ok(response_body)
+    }
+
+    fn send_authenticated_body_url<B>(
+        &self,
+        server: &CachedServer,
+        method: Method,
+        url: url::Url,
+        body: &B,
+    ) -> Result<String>
+    where
+        B: Serialize + ?Sized,
+    {
+        let access_token = server
+            .access_token
+            .as_deref()
+            .ok_or_else(|| anyhow!("Emby 访问令牌缺失，请重新登录服务器"))?;
+        let user_id = server
+            .user_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
+        let authorization = self.authenticated_authorization_header(access_token, user_id);
+        let request_body = serde_json::to_string(body).context("序列化 Emby API 请求失败")?;
+
+        debug!(method = %method, url = %url, "sending authenticated Emby request with body");
+        if log_secrets() {
+            debug!(
+                method = %method,
+                url = %url,
+                x_emby_authorization = %authorization,
+                x_emby_token = %access_token,
+                body = %request_body,
+                "full authenticated Emby request with body"
+            );
+        }
+
+        let response = self
+            .http
+            .request(method, url)
+            .header("Accept", "*/*")
+            .header("Content-Type", "application/json")
+            .header("X-Emby-Authorization", authorization)
+            .header("X-Emby-Token", access_token)
+            .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
+            .body(request_body)
             .send()
             .context("连接 Emby 服务器失败")?;
 

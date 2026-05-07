@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use crate::{
     emby::{EmbyClient, ResumeItems, UserItems, UserViews},
     images::loader::ImageLoader,
+    player::PlaybackRequest,
     server::CachedServer,
 };
 use carousel::CarouselState;
@@ -22,16 +23,18 @@ use gpui::{
     Window,
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum HomeEvent {
     BackToServers,
     SectionChanged,
     TitleChanged,
+    OpenPlayback(PlaybackRequest),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum HomeContentEvent {
     TitleChanged,
+    OpenPlayback(PlaybackRequest),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -181,6 +184,9 @@ impl HomePage {
             &home_content,
             |_: &mut HomePage, _, event, cx| match event {
                 HomeContentEvent::TitleChanged => cx.emit(HomeEvent::TitleChanged),
+                HomeContentEvent::OpenPlayback(request) => {
+                    cx.emit(HomeEvent::OpenPlayback(request.clone()))
+                }
             },
         )
         .detach();

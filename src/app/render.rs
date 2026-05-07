@@ -21,7 +21,11 @@ impl TinyApp {
         let close_menu = cx.listener(Self::close_server_menu);
         let home_page = match &self.page {
             Page::Home(page) => Some(page.clone()),
-            Page::Servers => None,
+            Page::Servers | Page::Playback { .. } => None,
+        };
+        let playback_page = match &self.page {
+            Page::Playback { page, .. } => Some(page.clone()),
+            Page::Servers | Page::Home(_) => None,
         };
 
         div()
@@ -33,6 +37,7 @@ impl TinyApp {
                 this.child(self.render_servers_page(cx))
             })
             .when_some(home_page, |this, page| this.child(page))
+            .when_some(playback_page, |this, page| this.child(page))
             .when_some(self.cache_error.clone(), |this, error| {
                 this.child(
                     div()
@@ -109,6 +114,7 @@ impl Render for TinyApp {
         let theme = theme::get(cx);
         let title = self.title(cx);
         let add_server = cx.listener(Self::open_add_server_dialog);
+        let show_add_server = !matches!(self.page, Page::Playback { .. });
         let close_dialog = cx.listener(Self::close_add_server_dialog);
         let close_menu = cx.listener(Self::close_server_menu);
         let submit_dialog = cx.listener(Self::submit_add_server_dialog);
@@ -133,7 +139,12 @@ impl Render for TinyApp {
                     .child(
                         div()
                             .on_mouse_down(MouseButton::Left, close_menu)
-                            .child(app_titlebar(window, cx, title, add_server)),
+                            .child(app_titlebar(
+                                window,
+                                cx,
+                                title,
+                                show_add_server.then_some(add_server),
+                            )),
                     )
                     .child(self.render_content(!window.is_maximized(), cx)),
             )

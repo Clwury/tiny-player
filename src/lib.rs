@@ -3,6 +3,7 @@ mod assets;
 pub mod emby;
 mod home;
 mod images;
+pub mod player;
 pub mod server;
 mod storage;
 mod theme;

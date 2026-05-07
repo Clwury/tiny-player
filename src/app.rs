@@ -15,6 +15,7 @@ use gpui::{Entity, SharedString};
 use crate::{
     emby::{EmbyClient, ItemCounts},
     home::HomePage,
+    player::PlaybackPage,
     server::CachedServer,
     storage::ServerCache,
     ui::add_server_dialog::AddServerDialogState,
@@ -43,6 +44,10 @@ pub struct TinyApp {
 enum Page {
     Servers,
     Home(Entity<HomePage>),
+    Playback {
+        page: Entity<PlaybackPage>,
+        return_to: Entity<HomePage>,
+    },
 }
 
 impl TinyApp {

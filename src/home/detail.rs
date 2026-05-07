@@ -4,11 +4,21 @@ mod state;
 
 pub(crate) use state::{SeriesDetailSelectKind, SeriesDetailState};
 
-use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, Window, point, px};
+use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, SharedString, Window, point, px};
 
-use crate::emby::{MediaItem, MediaItems, UserItem};
+use crate::{
+    emby::{MediaItem, MediaItems, UserItem, playback::resolve_direct_stream_url},
+    player::PlaybackRequest,
+};
 
 use super::{HomeContent, HomeContentEvent, LoadState};
+
+struct SelectedPlayback {
+    series_id: String,
+    episode_id: String,
+    media_source_id: String,
+    title: SharedString,
+}
 
 impl HomeContent {
     pub(super) fn open_series_detail(&mut self, item: &UserItem, cx: &mut Context<Self>) {
@@ -49,6 +59,103 @@ impl HomeContent {
         if detail.open_select.take().is_some() {
             cx.notify();
         }
+    }
+
+    pub(super) fn play_selected_series_episode(
+        &mut self,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(detail) = self.series_detail.as_mut() else {
+            return;
+        };
+        if detail.playback_loading {
+            return;
+        }
+
+        let selected = match selected_playback(detail) {
+            Ok(selected) => selected,
+            Err(error) => {
+                detail.playback_failed = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+
+        detail.playback_loading = true;
+        detail.playback_failed = None;
+        detail.open_select = None;
+        cx.notify();
+
+        let server = self.current_server.clone();
+        let client = self.emby_client.clone();
+        let task_server = server.clone();
+        let task_episode_id = selected.episode_id.clone();
+        let task_media_source_id = selected.media_source_id.clone();
+        let task = cx.background_spawn(async move {
+            let playback_info =
+                client.playback_info(&task_server, &task_episode_id, &task_media_source_id)?;
+            let direct_stream_url = playback_info.direct_stream_url_for(&task_media_source_id)?;
+            let playback_url = resolve_direct_stream_url(&task_server, direct_stream_url)?;
+            Ok::<_, anyhow::Error>(playback_url.to_string())
+        });
+
+        cx.spawn(async move |page, cx| {
+            let result = task.await;
+            page.update(cx, |page, cx| {
+                page.finish_play_selected_series_episode(selected, result, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_play_selected_series_episode(
+        &mut self,
+        selected: SelectedPlayback,
+        result: anyhow::Result<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selected_playback_still_current(&selected) {
+            return;
+        }
+
+        let Some(detail) = self.series_detail.as_mut() else {
+            return;
+        };
+        detail.playback_loading = false;
+        match result {
+            Ok(url) => {
+                detail.playback_failed = None;
+                cx.emit(HomeContentEvent::OpenPlayback(PlaybackRequest {
+                    title: selected.title,
+                    url,
+                }));
+            }
+            Err(error) => {
+                detail.playback_failed = Some(format!("获取播放地址失败：{error}").into());
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn selected_playback_still_current(&self, selected: &SelectedPlayback) -> bool {
+        self.series_detail.as_ref().is_some_and(|detail| {
+            if detail.series_id.as_str() != selected.series_id.as_str() {
+                return false;
+            }
+            let episode_matches = detail
+                .selected_episode()
+                .is_some_and(|episode| episode.id.as_str() == selected.episode_id.as_str());
+            let source_matches = detail
+                .selected_media_source()
+                .and_then(|source| source.id.as_deref())
+                .is_some_and(|id| id == selected.media_source_id.as_str());
+
+            episode_matches && source_matches
+        })
     }
 
     fn load_series_detail_effects(&mut self, cx: &mut Context<Self>) {
@@ -436,6 +543,7 @@ impl HomeContent {
         detail.selected_media_source_index = Some(index);
         detail.selected_subtitle_index = None;
         detail.open_select = None;
+        detail.reset_playback_request();
         detail.sync_media_source_selection();
         cx.notify();
     }
@@ -456,4 +564,33 @@ impl HomeContent {
         detail.open_select = None;
         cx.notify();
     }
+}
+
+fn selected_playback(detail: &SeriesDetailState) -> Result<SelectedPlayback, String> {
+    let episode = detail
+        .selected_episode()
+        .ok_or_else(|| "请选择要播放的剧集".to_string())?;
+    let source = detail
+        .selected_media_source()
+        .ok_or_else(|| "请选择视频源".to_string())?;
+    let media_source_id = source
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "所选视频源缺少 ID，无法获取播放地址".to_string())?
+        .to_string();
+    let series_name = detail
+        .item
+        .as_ref()
+        .map(|item| item.name.clone())
+        .unwrap_or_else(|| detail.title.clone());
+    let episode_label = episode.episode_label();
+
+    Ok(SelectedPlayback {
+        series_id: detail.series_id.clone(),
+        episode_id: episode.id.clone(),
+        media_source_id,
+        title: format!("{series_name} {episode_label}").into(),
+    })
 }

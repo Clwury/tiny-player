@@ -337,49 +337,33 @@ pub(super) fn episode_card<T>(
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
-    let has_image = image_path.is_some();
 
     div()
+        .relative()
         .flex()
         .flex_none()
         .flex_col()
         .gap_2()
-        .w(px(
-            DETAIL_EPISODE_CARD_WIDTH_PX + DETAIL_EPISODE_CARD_PADDING_PX * 2.0
-        ))
         .rounded_lg()
-        .border_1()
-        .border_color(if selected {
-            theme.input_border_focused
-        } else {
-            theme.input_border.opacity(0.0)
-        })
         .p(px(DETAIL_EPISODE_CARD_PADDING_PX))
+        .when(selected, |this| {
+            this.bg(theme.secondary_hover.opacity(0.45))
+        })
         .hover(move |style| style.bg(theme.secondary_hover))
-        .child(
-            div()
-                .relative()
-                .w(px(DETAIL_EPISODE_CARD_WIDTH_PX))
-                .h(px(DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX))
-                .overflow_hidden()
-                .rounded_lg()
-                .bg(theme.input_background)
-                .when_some(image_path, |this, path| {
-                    this.child(cover_img(
-                        path,
-                        DETAIL_EPISODE_CARD_WIDTH_PX,
-                        DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX,
-                    ))
-                })
-                .when(!has_image, |this| {
-                    this.flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("暂无图片")
-                }),
-        )
+        .when(selected, |this| {
+            this.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .left_0()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.input_border_focused),
+            )
+        })
+        .child(episode_card_image(image_path, cx))
         .child(
             div()
                 .w(px(DETAIL_EPISODE_CARD_WIDTH_PX))
@@ -392,7 +376,7 @@ pub(super) fn episode_card<T>(
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.foreground)
-                        .child(episode_title(episode)),
+                        .child(episode.episode_card_label()),
                 )
                 .when_some(
                     non_empty_string(episode.overview.as_deref()),
@@ -410,11 +394,32 @@ pub(super) fn episode_card<T>(
         )
 }
 
-fn episode_title(episode: &MediaItem) -> String {
-    match episode.index_number {
-        Some(index) => format!("E{index}: {}", episode.name),
-        None => episode.name.clone(),
-    }
+fn episode_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl IntoElement {
+    let theme = theme::get(cx);
+    let has_image = image_path.is_some();
+
+    div()
+        .relative()
+        .w(px(DETAIL_EPISODE_CARD_WIDTH_PX))
+        .h(px(DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX))
+        .overflow_hidden()
+        .rounded_lg()
+        .bg(theme.input_background)
+        .when_some(image_path, |this, path| {
+            this.child(cover_img(
+                path,
+                DETAIL_EPISODE_CARD_WIDTH_PX,
+                DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX,
+            ))
+        })
+        .when(!has_image, |this| {
+            this.flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("暂无图片")
+        })
 }
 
 fn non_empty_string(value: Option<&str>) -> Option<String> {
