@@ -3,13 +3,13 @@ use std::sync::Arc;
 use gpui::{
     Bounds, ClickEvent, Context, EventEmitter, InteractiveElement, IntoElement, ParentElement,
     Pixels, Render, RenderImage, SharedString, StatefulInteractiveElement, Styled, Window, canvas,
-    div, img, prelude::*, px, rgb, svg,
+    div, prelude::*, px, rgb, svg,
 };
 
 use crate::theme;
 
 use super::{
-    backend::{BackendEvent, MpvBackend},
+    backend::{BackendEvent, GstBackend},
     render_host::RenderSize,
     video_presenter::VideoPresenter,
 };
@@ -27,11 +27,12 @@ pub enum PlaybackEvent {
 
 pub struct PlaybackPage {
     title: SharedString,
-    video: ShutdownOrder<MpvBackend, VideoPresenter>,
+    video: ShutdownOrder<GstBackend, VideoPresenter>,
     video_viewport_bounds: Option<Bounds<Pixels>>,
     video_source_size: Option<RenderSize>,
     current_frame: Option<Arc<RenderImage>>,
     playback_paused: bool,
+    playback_buffering: bool,
     current_file_loaded: bool,
     error_message: Option<SharedString>,
     status_message: SharedString,
@@ -44,8 +45,8 @@ impl PlaybackPage {
         let mut error_message = None;
         let status_message = "正在加载视频…".into();
 
-        let (backend, video_presenter) = match MpvBackend::new() {
-            Ok(mut backend) => match VideoPresenter::new(backend.mpv_mut()) {
+        let (backend, video_presenter) = match GstBackend::new() {
+            Ok(mut backend) => match VideoPresenter::new(backend.frame_slot()) {
                 Ok(video_presenter) => {
                     if let Err(error) = backend.load_url(&request.url) {
                         error_message = Some(format!("加载视频失败：{error}").into());
@@ -58,7 +59,7 @@ impl PlaybackPage {
                 }
             },
             Err(error) => {
-                error_message = Some(format!("创建 mpv 播放后端失败：{error}").into());
+                error_message = Some(format!("创建 GStreamer 播放后端失败：{error}").into());
                 (None, None)
             }
         };
@@ -70,6 +71,7 @@ impl PlaybackPage {
             video_source_size: None,
             current_frame: None,
             playback_paused: true,
+            playback_buffering: false,
             current_file_loaded: false,
             error_message,
             status_message,
@@ -88,12 +90,10 @@ impl PlaybackPage {
     fn replace_visible_frame(
         &mut self,
         frame: Arc<RenderImage>,
-        window: &mut Window,
+        _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        if let Some(previous) = self.current_frame.replace(frame) {
-            defer_drop_frame(previous, window);
-        }
+        self.current_frame = Some(frame);
     }
 
     fn clear_visible_frame(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
@@ -128,6 +128,7 @@ impl PlaybackPage {
                     self.current_file_loaded = false;
                     self.video_source_size = None;
                     self.playback_paused = true;
+                    self.playback_buffering = false;
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("加载视频失败：{message}").into());
                 }
@@ -135,20 +136,23 @@ impl PlaybackPage {
                     self.current_file_loaded = false;
                     self.video_source_size = None;
                     self.playback_paused = true;
+                    self.playback_buffering = false;
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("播放后端错误：{message}").into());
                 }
                 BackendEvent::Pause(paused) => {
                     self.playback_paused = paused;
                 }
+                BackendEvent::Buffering(buffering) => {
+                    self.playback_buffering = buffering;
+                    self.status_message =
+                        playback_status_message(buffering, self.current_frame.is_some());
+                }
                 BackendEvent::VideoSizeChanged(size) => {
                     if self.video_source_size != size {
                         self.video_source_size = size;
                         self.clear_visible_frame(window, cx);
                     }
-                }
-                BackendEvent::FileTitle(title) => {
-                    let _ = title;
                 }
                 BackendEvent::PositionChanged(position) => {
                     let _ = position;
@@ -159,19 +163,20 @@ impl PlaybackPage {
             }
         }
 
-        let has_viewport = self
+        let render_size = self
             .video_viewport_bounds
-            .is_some_and(|viewport_bounds| normalize_video_viewport(viewport_bounds).is_some());
+            .zip(self.video_source_size)
+            .and_then(|(viewport_bounds, source_size)| {
+                render_output_size(viewport_bounds, source_size)
+            });
         if should_render_frame(
             self.video.dependent().is_some(),
             self.current_file_loaded,
             self.error_message.is_some(),
             self.video_source_size.is_some(),
-            has_viewport,
+            render_size.is_some(),
         ) {
-            let size = self
-                .video_source_size
-                .expect("video source size checked above");
+            let size = render_size.expect("render size checked above");
             let render_result = self
                 .video
                 .dependent_mut()
@@ -181,7 +186,9 @@ impl PlaybackPage {
             match render_result {
                 Ok(Some(frame)) => {
                     self.replace_visible_frame(frame, window, cx);
-                    self.status_message = "".into();
+                    if !self.playback_buffering {
+                        self.status_message = "".into();
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -207,7 +214,12 @@ impl Render for PlaybackPage {
         self.poll_backend(window, cx);
 
         let current_frame = self.current_frame.clone();
-        let show_message = self.error_message.is_some() || current_frame.is_none();
+        let current_video_frame = current_frame
+            .clone()
+            .zip(self.video_source_size)
+            .map(|(frame, source_size)| VideoFrameElement { frame, source_size });
+        let show_message =
+            self.error_message.is_some() || current_frame.is_none() || self.playback_buffering;
         let message_text = self.message_text();
         let theme = theme::get(cx);
         let back_to_detail = cx.listener(Self::back_to_detail);
@@ -235,6 +247,7 @@ impl Render for PlaybackPage {
             self.error_message.is_some(),
             has_viewport,
             self.playback_paused,
+            self.playback_buffering,
         ) {
             window.request_animation_frame();
         }
@@ -245,9 +258,7 @@ impl Render for PlaybackPage {
             .overflow_hidden()
             .bg(rgb(0x000000))
             .text_color(rgb(0xe6edf3))
-            .when_some(current_frame, |this, frame| {
-                this.child(img(frame).absolute().size_full())
-            })
+            .when_some(current_video_frame, |this, frame| this.child(frame))
             .when(show_message, |this| {
                 this.child(
                     div()
@@ -294,6 +305,105 @@ impl Render for PlaybackPage {
     }
 }
 
+struct VideoFrameElement {
+    frame: Arc<RenderImage>,
+    source_size: RenderSize,
+}
+
+impl gpui::Element for VideoFrameElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let style = gpui::Style {
+            size: gpui::Size {
+                width: gpui::Length::Definite(gpui::DefiniteLength::Fraction(1.0)),
+                height: gpui::Length::Definite(gpui::DefiniteLength::Fraction(1.0)),
+            },
+            ..Default::default()
+        };
+
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut gpui::App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        let Some(fitted_bounds) = aspect_fit_bounds(bounds, self.source_size) else {
+            return;
+        };
+
+        if window
+            .paint_image(
+                fitted_bounds,
+                gpui::Corners::default(),
+                self.frame.clone(),
+                0,
+                false,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        let last_render_image: gpui::Entity<Option<Arc<RenderImage>>> =
+            window.use_state(cx, |_, _| None);
+        let previous = last_render_image.update(cx, |this, _| {
+            if this
+                .as_ref()
+                .is_some_and(|previous| previous.id == self.frame.id)
+            {
+                None
+            } else {
+                this.replace(self.frame.clone())
+            }
+        });
+        if let Some(previous) = previous {
+            cx.drop_image(previous, Some(window));
+        }
+    }
+}
+
+impl IntoElement for VideoFrameElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
 struct ShutdownOrder<Owner, Dependent> {
     owner: Option<Owner>,
     dependent: Option<Dependent>,
@@ -335,6 +445,36 @@ fn normalize_video_viewport(bounds: Bounds<Pixels>) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
+fn aspect_fit_bounds(bounds: Bounds<Pixels>, source: RenderSize) -> Option<Bounds<Pixels>> {
+    if source.width == 0 || source.height == 0 {
+        return None;
+    }
+
+    let container_width = f32::from(bounds.size.width).max(0.0);
+    let container_height = f32::from(bounds.size.height).max(0.0);
+    if container_width == 0.0 || container_height == 0.0 {
+        return None;
+    }
+
+    let source_width = source.width as f32;
+    let source_height = source.height as f32;
+    let scale = (container_width / source_width).min(container_height / source_height);
+    let fitted_width = source_width * scale;
+    let fitted_height = source_height * scale;
+    let inset_x = (container_width - fitted_width) / 2.0;
+    let inset_y = (container_height - fitted_height) / 2.0;
+
+    Some(Bounds::new(
+        gpui::point(bounds.origin.x + px(inset_x), bounds.origin.y + px(inset_y)),
+        gpui::size(px(fitted_width), px(fitted_height)),
+    ))
+}
+
+fn render_output_size(bounds: Bounds<Pixels>, source: RenderSize) -> Option<RenderSize> {
+    let (width, height) = normalize_video_viewport(aspect_fit_bounds(bounds, source)?)?;
+    Some(RenderSize { width, height })
+}
+
 fn defer_drop_frame(frame: Arc<RenderImage>, window: &mut Window) {
     window.on_next_frame(move |window, _| {
         window.on_next_frame(move |window, cx| {
@@ -347,6 +487,16 @@ fn defer_drop_frame(frame: Arc<RenderImage>, window: &mut Window) {
 
 fn viewport_changed(previous: Option<Bounds<Pixels>>, next: Bounds<Pixels>) -> bool {
     previous != Some(next)
+}
+
+fn playback_status_message(buffering: bool, has_visible_frame: bool) -> SharedString {
+    if buffering {
+        "正在缓冲视频…".into()
+    } else if has_visible_frame {
+        "".into()
+    } else {
+        "正在加载视频…".into()
+    }
 }
 
 fn should_render_frame(
@@ -366,11 +516,12 @@ fn should_request_animation_frame(
     has_error: bool,
     has_viewport: bool,
     playback_paused: bool,
+    playback_buffering: bool,
 ) -> bool {
     has_backend
         && has_video_presenter
         && !has_error
-        && (!has_loaded_file || (has_viewport && !playback_paused))
+        && (!has_loaded_file || playback_buffering || (has_viewport && !playback_paused))
 }
 
 #[cfg(test)]
@@ -380,7 +531,8 @@ mod tests {
     use gpui::{Bounds, point, px, size};
 
     use super::{
-        ShutdownOrder, normalize_video_viewport, should_render_frame,
+        RenderSize, ShutdownOrder, aspect_fit_bounds, normalize_video_viewport,
+        playback_status_message, render_output_size, should_render_frame,
         should_request_animation_frame, viewport_changed,
     };
 
@@ -422,6 +574,106 @@ mod tests {
     }
 
     #[test]
+    fn aspect_fit_bounds_letterboxes_wide_video_in_tall_viewport() {
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
+        let fitted = aspect_fit_bounds(
+            bounds,
+            RenderSize {
+                width: 1920,
+                height: 1080,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fitted.origin, point(px(0.0), px(75.0)));
+        assert_eq!(fitted.size, size(px(800.0), px(450.0)));
+    }
+
+    #[test]
+    fn aspect_fit_bounds_pillarboxes_tall_video_in_wide_viewport() {
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(1280.0), px(720.0)));
+        let fitted = aspect_fit_bounds(
+            bounds,
+            RenderSize {
+                width: 640,
+                height: 480,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fitted.origin, point(px(160.0), px(0.0)));
+        assert_eq!(fitted.size, size(px(960.0), px(720.0)));
+    }
+
+    #[test]
+    fn aspect_fit_bounds_rejects_zero_source_or_viewport() {
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
+        let zero_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(600.0)));
+
+        assert_eq!(
+            aspect_fit_bounds(
+                bounds,
+                RenderSize {
+                    width: 0,
+                    height: 1080,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            aspect_fit_bounds(
+                zero_bounds,
+                RenderSize {
+                    width: 1920,
+                    height: 1080,
+                },
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn aspect_fit_bounds_handles_fractional_viewport_sizes() {
+        let bounds = Bounds::new(point(px(10.0), px(12.0)), size(px(640.8), px(359.9)));
+        let fitted = aspect_fit_bounds(
+            bounds,
+            RenderSize {
+                width: 3840,
+                height: 2160,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(normalize_video_viewport(fitted), Some((639, 359)));
+    }
+
+    #[test]
+    fn render_output_size_uses_aspect_fitted_viewport() {
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(1920.0), px(1080.0)));
+
+        assert_eq!(
+            render_output_size(
+                bounds,
+                RenderSize {
+                    width: 3840,
+                    height: 1600,
+                },
+            ),
+            Some(RenderSize {
+                width: 1920,
+                height: 800,
+            })
+        );
+    }
+
+    #[test]
+    fn playback_status_stays_visible_until_first_frame() {
+        assert_eq!(playback_status_message(true, false), "正在缓冲视频…");
+        assert_eq!(playback_status_message(false, false), "正在加载视频…");
+        assert_eq!(playback_status_message(false, true), "");
+    }
+
+    #[test]
     fn should_render_frame_requires_loaded_file_video_size_and_valid_viewport() {
         assert!(should_render_frame(true, true, false, true, true));
         assert!(!should_render_frame(false, true, false, true, true));
@@ -434,37 +686,44 @@ mod tests {
     #[test]
     fn should_request_animation_frame_drives_initial_load() {
         assert!(should_request_animation_frame(
-            true, true, false, false, false, true
+            true, true, false, false, false, true, false
         ));
     }
 
     #[test]
     fn should_request_animation_frame_requires_backend_and_presenter() {
         assert!(!should_request_animation_frame(
-            false, true, false, false, false, true
+            false, true, false, false, false, true, false
         ));
         assert!(!should_request_animation_frame(
-            true, false, false, false, false, true
+            true, false, false, false, false, true, false
         ));
     }
 
     #[test]
     fn should_request_animation_frame_stops_on_error() {
         assert!(!should_request_animation_frame(
-            true, true, false, true, false, true
+            true, true, false, true, false, true, false
         ));
     }
 
     #[test]
     fn should_request_animation_frame_requires_unpaused_loaded_video_with_viewport() {
         assert!(should_request_animation_frame(
-            true, true, true, false, true, false
+            true, true, true, false, true, false, false
         ));
         assert!(!should_request_animation_frame(
-            true, true, true, false, true, true
+            true, true, true, false, true, true, false
         ));
         assert!(!should_request_animation_frame(
-            true, true, true, false, false, false
+            true, true, true, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn should_request_animation_frame_continues_while_buffering() {
+        assert!(should_request_animation_frame(
+            true, true, true, false, false, true, true
         ));
     }
 

@@ -1,4 +1,6 @@
 mod backend;
+mod dovi;
+mod libplacebo;
 mod page;
 mod profile;
 mod render_host;

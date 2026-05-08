@@ -1,31 +1,10 @@
-use std::{
-    collections::VecDeque,
-    ffi::c_void,
-    slice,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
-use glow::HasContext as _;
 use gpui::RenderImage;
 use image::{Frame, ImageBuffer, RgbaImage};
-use libmpv2::{
-    Mpv,
-    render::{
-        MpvRenderUpdate, OpenGLInitParams, RenderContext, RenderParam, RenderParamApiType,
-        mpv_render_update,
-    },
-};
 
-const PIXEL_PACK_BUFFER_COUNT: usize = 3;
-const MAX_PENDING_PIXEL_PACK_READBACKS: usize = PIXEL_PACK_BUFFER_COUNT - 1;
-
-fn get_proc_address(video: &sdl2::VideoSubsystem, name: &str) -> *mut c_void {
-    video.gl_get_proc_address(name) as *mut c_void
-}
+use super::dovi::DoviFrameMetadata;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderSize {
@@ -33,29 +12,204 @@ pub struct RenderSize {
     pub height: u32,
 }
 
-fn normalize_render_size(mut size: RenderSize) -> RenderSize {
-    size.width = size.width.max(1);
-    size.height = size.height.max(1);
-    size
+#[derive(Clone, Debug)]
+pub struct DecodedFrame {
+    pub size: RenderSize,
+    pub pts: Option<FramePts>,
+    pub pixels: FramePixels,
 }
 
-fn render_size_changed(previous: Option<RenderSize>, next: RenderSize) -> bool {
-    previous != Some(next)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FramePts {
+    pub nsecs: u64,
 }
 
-fn should_render_update(update: MpvRenderUpdate) -> bool {
-    update & mpv_render_update::Frame != 0
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FramePixels {
+    Bgra8(Vec<u8>),
+    RawVideo(RawVideoFrame),
 }
 
-fn should_render_frame_if_needed(
-    pending_render: bool,
-    size_changed: bool,
-    update: MpvRenderUpdate,
-) -> bool {
-    size_changed || (pending_render && should_render_update(update))
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawVideoFrame {
+    pub format: RawVideoFormat,
+    pub color: FrameColor,
+    pub metadata: Option<FrameDynamicMetadata>,
+    pub planes: Vec<RawVideoPlane>,
 }
 
-fn frame_byte_len(size: RenderSize) -> Result<usize> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameDynamicMetadata {
+    pub dolby_vision: Option<DoviFrameMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawVideoPlane {
+    pub data: Vec<u8>,
+    pub stride: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawVideoFormat {
+    P010Le,
+    I42010Le,
+    Nv12,
+    I420,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawVideoPlaneLayout {
+    pub width: u32,
+    pub height: u32,
+    pub row_len: usize,
+    pub pixel_stride: usize,
+    pub components: usize,
+    pub component_map: [i32; 4],
+}
+
+impl RawVideoFormat {
+    pub fn from_gstreamer_name(name: &str) -> Option<Self> {
+        match name {
+            "P010_10LE" => Some(Self::P010Le),
+            "I420_10LE" => Some(Self::I42010Le),
+            "NV12" => Some(Self::Nv12),
+            "I420" => Some(Self::I420),
+            _ => None,
+        }
+    }
+
+    pub fn plane_count(self) -> usize {
+        match self {
+            Self::P010Le | Self::Nv12 => 2,
+            Self::I42010Le | Self::I420 => 3,
+        }
+    }
+
+    pub fn component_size(self) -> i32 {
+        match self {
+            Self::P010Le | Self::I42010Le => 16,
+            Self::Nv12 | Self::I420 => 8,
+        }
+    }
+
+    pub fn sample_depth(self) -> i32 {
+        self.component_size()
+    }
+
+    pub fn color_depth(self) -> i32 {
+        match self {
+            Self::P010Le | Self::I42010Le => 10,
+            Self::Nv12 | Self::I420 => 8,
+        }
+    }
+
+    pub fn bit_shift(self) -> i32 {
+        match self {
+            Self::P010Le => 6,
+            Self::I42010Le | Self::Nv12 | Self::I420 => 0,
+        }
+    }
+
+    pub fn is_ten_bit(self) -> bool {
+        matches!(self, Self::P010Le | Self::I42010Le)
+    }
+
+    pub fn plane_layout(self, size: RenderSize, plane: usize) -> Result<RawVideoPlaneLayout> {
+        if size.width == 0 || size.height == 0 {
+            return Err(anyhow!("invalid video frame dimensions"));
+        }
+
+        let chroma_width = size.width.div_ceil(2);
+        let chroma_height = size.height.div_ceil(2);
+        let (width, height, pixel_stride, components, component_map) = match (self, plane) {
+            (Self::P010Le, 0) => (size.width, size.height, 2, 1, [0, -1, -1, -1]),
+            (Self::P010Le, 1) => (chroma_width, chroma_height, 4, 2, [1, 2, -1, -1]),
+            (Self::I42010Le, 0) => (size.width, size.height, 2, 1, [0, -1, -1, -1]),
+            (Self::I42010Le, 1) => (chroma_width, chroma_height, 2, 1, [1, -1, -1, -1]),
+            (Self::I42010Le, 2) => (chroma_width, chroma_height, 2, 1, [2, -1, -1, -1]),
+            (Self::Nv12, 0) => (size.width, size.height, 1, 1, [0, -1, -1, -1]),
+            (Self::Nv12, 1) => (chroma_width, chroma_height, 2, 2, [1, 2, -1, -1]),
+            (Self::I420, 0) => (size.width, size.height, 1, 1, [0, -1, -1, -1]),
+            (Self::I420, 1) => (chroma_width, chroma_height, 1, 1, [1, -1, -1, -1]),
+            (Self::I420, 2) => (chroma_width, chroma_height, 1, 1, [2, -1, -1, -1]),
+            _ => return Err(anyhow!("invalid raw video plane")),
+        };
+        let row_len = usize::try_from(width)
+            .ok()
+            .and_then(|width| width.checked_mul(pixel_stride))
+            .ok_or_else(|| anyhow!("video frame row is too large"))?;
+
+        Ok(RawVideoPlaneLayout {
+            width,
+            height,
+            row_len,
+            pixel_stride,
+            components,
+            component_map,
+        })
+    }
+
+    pub fn plane_layout_for_color(
+        self,
+        size: RenderSize,
+        plane: usize,
+        _color: FrameColor,
+    ) -> Result<RawVideoPlaneLayout> {
+        self.plane_layout(size, plane)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameColor {
+    Sdr,
+    Hdr10Bt2020,
+    DolbyVisionProfile5,
+}
+
+#[derive(Clone, Default)]
+pub struct FrameSlot {
+    inner: Arc<Mutex<FrameSlotState>>,
+}
+
+#[derive(Default)]
+struct FrameSlotState {
+    latest_frame: Option<DecodedFrame>,
+    current_size: Option<RenderSize>,
+    pending_size_change: Option<RenderSize>,
+}
+
+impl FrameSlot {
+    pub fn push(&self, frame: DecodedFrame) {
+        let mut state = self.inner.lock().expect("video frame slot poisoned");
+        if state.current_size != Some(frame.size) {
+            state.current_size = Some(frame.size);
+            state.pending_size_change = Some(frame.size);
+        }
+        state.latest_frame = Some(frame);
+    }
+
+    pub fn take_frame(&self) -> Option<DecodedFrame> {
+        self.inner
+            .lock()
+            .expect("video frame slot poisoned")
+            .latest_frame
+            .take()
+    }
+
+    pub fn take_size_change(&self) -> Option<RenderSize> {
+        self.inner
+            .lock()
+            .expect("video frame slot poisoned")
+            .pending_size_change
+            .take()
+    }
+
+    pub fn clear(&self) {
+        *self.inner.lock().expect("video frame slot poisoned") = FrameSlotState::default();
+    }
+}
+
+pub fn frame_byte_len(size: RenderSize) -> Result<usize> {
     let pixels = size
         .width
         .checked_mul(size.height)
@@ -64,14 +218,86 @@ fn frame_byte_len(size: RenderSize) -> Result<usize> {
     usize::try_from(pixels).map_err(|_| anyhow!("video frame buffer is too large"))
 }
 
-fn render_size_to_i32(size: RenderSize) -> Result<(i32, i32)> {
-    Ok((
-        i32::try_from(size.width).map_err(|_| anyhow!("video frame width is too large"))?,
-        i32::try_from(size.height).map_err(|_| anyhow!("video frame height is too large"))?,
-    ))
+pub fn packed_bgra_from_stride(data: &[u8], size: RenderSize, stride: usize) -> Result<Vec<u8>> {
+    packed_frame_data_from_stride(data, size, stride, 4)
 }
 
-fn render_image_from_bgra(bgra: Vec<u8>, width: u32, height: u32) -> Result<Arc<RenderImage>> {
+pub fn packed_frame_data_from_stride(
+    data: &[u8],
+    size: RenderSize,
+    stride: usize,
+    bytes_per_pixel: usize,
+) -> Result<Vec<u8>> {
+    if size.width == 0 || size.height == 0 {
+        return Err(anyhow!("invalid video frame dimensions"));
+    }
+
+    let row_len = frame_row_len(size, bytes_per_pixel)?;
+    if stride < row_len {
+        return Err(anyhow!("invalid video frame stride"));
+    }
+
+    let height = usize::try_from(size.height).map_err(|_| anyhow!("video frame is too tall"))?;
+    let required_len = stride
+        .checked_mul(height.saturating_sub(1))
+        .and_then(|prefix| prefix.checked_add(row_len))
+        .ok_or_else(|| anyhow!("video frame buffer is too large"))?;
+    if data.len() < required_len {
+        return Err(anyhow!("invalid video frame buffer size"));
+    }
+
+    let packed_len = row_len
+        .checked_mul(height)
+        .ok_or_else(|| anyhow!("video frame buffer is too large"))?;
+    if stride == row_len {
+        return Ok(data[..packed_len].to_vec());
+    }
+
+    let mut pixels = Vec::with_capacity(packed_len);
+    for row in 0..height {
+        let start = row * stride;
+        pixels.extend_from_slice(&data[start..start + row_len]);
+    }
+    Ok(pixels)
+}
+
+pub fn raw_plane_from_stride(
+    data: &[u8],
+    offset: usize,
+    stride: usize,
+    row_len: usize,
+    height: u32,
+) -> Result<Vec<u8>> {
+    if height == 0 || row_len == 0 {
+        return Err(anyhow!("invalid video frame dimensions"));
+    }
+    if stride < row_len {
+        return Err(anyhow!("invalid video frame stride"));
+    }
+
+    let height = usize::try_from(height).map_err(|_| anyhow!("video frame is too tall"))?;
+    let required_len = stride
+        .checked_mul(height.saturating_sub(1))
+        .and_then(|prefix| prefix.checked_add(row_len))
+        .ok_or_else(|| anyhow!("video frame buffer is too large"))?;
+    let end = offset
+        .checked_add(required_len)
+        .ok_or_else(|| anyhow!("video frame buffer is too large"))?;
+    if data.len() < end {
+        return Err(anyhow!("invalid video frame buffer size"));
+    }
+
+    Ok(data[offset..end].to_vec())
+}
+
+fn frame_row_len(size: RenderSize, bytes_per_pixel: usize) -> Result<usize> {
+    usize::try_from(size.width)
+        .ok()
+        .and_then(|width| width.checked_mul(bytes_per_pixel))
+        .ok_or_else(|| anyhow!("video frame row is too large"))
+}
+
+pub fn render_image_from_bgra(bgra: Vec<u8>, width: u32, height: u32) -> Result<Arc<RenderImage>> {
     if bgra.len() != width as usize * height as usize * 4 {
         return Err(anyhow!("invalid video frame buffer size"));
     }
@@ -83,363 +309,15 @@ fn render_image_from_bgra(bgra: Vec<u8>, width: u32, height: u32) -> Result<Arc<
     ))])))
 }
 
-fn next_pixel_pack_buffer_index(index: usize) -> usize {
-    (index + 1) % PIXEL_PACK_BUFFER_COUNT
-}
-
-fn can_enqueue_readback(pending_count: usize) -> bool {
-    pending_count < MAX_PENDING_PIXEL_PACK_READBACKS
-}
-
-struct PendingPixelPackReadback {
-    index: usize,
-    fence: glow::NativeFence,
-}
-
-struct PixelPackReadback {
-    buffers: [glow::NativeBuffer; PIXEL_PACK_BUFFER_COUNT],
-    size: RenderSize,
-    byte_len: usize,
-    write_index: usize,
-    pending: VecDeque<PendingPixelPackReadback>,
-}
-
-impl PixelPackReadback {
-    unsafe fn new(gl: &glow::Context, size: RenderSize) -> Result<Self> {
-        let byte_len = frame_byte_len(size)?;
-        let byte_len_i32 =
-            i32::try_from(byte_len).map_err(|_| anyhow!("video frame buffer is too large"))?;
-        let buffers = [
-            unsafe { gl.create_buffer().map_err(|error| anyhow!(error))? },
-            unsafe { gl.create_buffer().map_err(|error| anyhow!(error))? },
-            unsafe { gl.create_buffer().map_err(|error| anyhow!(error))? },
-        ];
-
-        for &buffer in &buffers {
-            unsafe {
-                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer));
-                gl.buffer_data_size(glow::PIXEL_PACK_BUFFER, byte_len_i32, glow::STREAM_READ);
-            }
-        }
-        unsafe { gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None) };
-
-        Ok(Self {
-            buffers,
-            size,
-            byte_len,
-            write_index: 0,
-            pending: VecDeque::new(),
-        })
-    }
-
-    fn is_saturated(&self) -> bool {
-        !can_enqueue_readback(self.pending.len())
-    }
-
-    unsafe fn read_pending_frame(&mut self, gl: &glow::Context) -> Result<Option<Vec<u8>>> {
-        let Some(pending) = self.pending.front() else {
-            return Ok(None);
-        };
-
-        let wait_result = unsafe { gl.client_wait_sync(pending.fence, 0, 0) };
-        match wait_result {
-            glow::ALREADY_SIGNALED | glow::CONDITION_SATISFIED => {}
-            glow::TIMEOUT_EXPIRED => return Ok(None),
-            glow::WAIT_FAILED => return Err(anyhow!("failed to wait for video frame readback")),
-            _ => return Err(anyhow!("unexpected video frame readback state")),
-        }
-
-        let pending = self
-            .pending
-            .pop_front()
-            .expect("pending readback checked above");
-        let byte_len_i32 =
-            i32::try_from(self.byte_len).map_err(|_| anyhow!("video frame buffer is too large"))?;
-
-        unsafe {
-            gl.delete_sync(pending.fence);
-            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(self.buffers[pending.index]));
-            let ptr =
-                gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, byte_len_i32, glow::MAP_READ_BIT);
-            if ptr.is_null() {
-                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
-                return Err(anyhow!("failed to map video frame buffer"));
-            }
-
-            let pixels = slice::from_raw_parts(ptr, self.byte_len).to_vec();
-            gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
-            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
-            Ok(Some(pixels))
-        }
-    }
-
-    unsafe fn enqueue_frame_read(&mut self, gl: &glow::Context) -> Result<()> {
-        if self.is_saturated() {
-            return Err(anyhow!("video frame readback queue is full"));
-        }
-
-        let (width, height) = render_size_to_i32(self.size)?;
-        let index = self.write_index;
-
-        unsafe {
-            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(self.buffers[index]));
-            gl.read_pixels(
-                0,
-                0,
-                width,
-                height,
-                glow::BGRA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::BufferOffset(0),
-            );
-            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
-            let fence = gl
-                .fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)
-                .map_err(|error| anyhow!(error))?;
-            gl.flush();
-            self.pending
-                .push_back(PendingPixelPackReadback { index, fence });
-        }
-
-        self.write_index = next_pixel_pack_buffer_index(index);
-        Ok(())
-    }
-
-    unsafe fn delete(&mut self, gl: &glow::Context) {
-        unsafe { gl.finish() };
-        while let Some(pending) = self.pending.pop_front() {
-            unsafe { gl.delete_sync(pending.fence) };
-        }
-        for &buffer in &self.buffers {
-            unsafe { gl.delete_buffer(buffer) };
-        }
-    }
-}
-
-pub struct RenderHost {
-    _sdl: sdl2::Sdl,
-    _video: sdl2::VideoSubsystem,
-    window: sdl2::video::Window,
-    gl_context: sdl2::video::GLContext,
-    gl: glow::Context,
-    render_context: RenderContext,
-    pending_render: Arc<AtomicBool>,
-    last_size: Option<RenderSize>,
-    readback: Option<PixelPackReadback>,
-}
-
-impl RenderHost {
-    pub fn new(mpv: &mut Mpv) -> Result<Self> {
-        let sdl = sdl2::init().map_err(|error| anyhow!(error))?;
-        let video = sdl.video().map_err(|error| anyhow!(error))?;
-
-        let gl_attr = video.gl_attr();
-        gl_attr.set_context_profile(sdl2::video::GLProfile::Core);
-        gl_attr.set_context_version(3, 3);
-        gl_attr.set_context_flags().forward_compatible().set();
-
-        let window = video
-            .window("tiny-video-renderer", 1, 1)
-            .opengl()
-            .hidden()
-            .build()
-            .map_err(|error| anyhow!(error))?;
-        let gl_context = window.gl_create_context().map_err(|error| anyhow!(error))?;
-        window
-            .gl_make_current(&gl_context)
-            .map_err(|error| anyhow!(error))?;
-
-        let gl = unsafe {
-            glow::Context::from_loader_function(|name| video.gl_get_proc_address(name) as *const _)
-        };
-
-        let mut render_context = RenderContext::new(
-            unsafe { mpv.ctx.as_mut() },
-            [
-                RenderParam::ApiType(RenderParamApiType::OpenGl),
-                RenderParam::InitParams(OpenGLInitParams {
-                    get_proc_address,
-                    ctx: video.clone(),
-                }),
-            ],
-        )
-        .map_err(|error| anyhow!("failed to create mpv render context: {error}"))?;
-
-        let pending_render = Arc::new(AtomicBool::new(false));
-        let callback_flag = pending_render.clone();
-        render_context.set_update_callback(move || {
-            callback_flag.store(true, Ordering::SeqCst);
-        });
-        pending_render.store(true, Ordering::SeqCst);
-
-        Ok(Self {
-            _sdl: sdl,
-            _video: video,
-            window,
-            gl_context,
-            gl,
-            render_context,
-            pending_render,
-            last_size: None,
-            readback: None,
-        })
-    }
-
-    pub fn render_if_needed(&mut self, size: RenderSize) -> Result<Option<Arc<RenderImage>>> {
-        let size = normalize_render_size(size);
-        let size_changed = render_size_changed(self.last_size, size);
-        if size_changed {
-            self.sync_size(size)?;
-        }
-
-        let frame = if size_changed {
-            None
-        } else {
-            self.read_pending_frame()?
-        };
-        if self
-            .readback
-            .as_ref()
-            .is_some_and(PixelPackReadback::is_saturated)
-        {
-            return Ok(frame);
-        }
-
-        let pending_render = self.pending_render.swap(false, Ordering::SeqCst);
-        let update = if pending_render {
-            self.render_context
-                .update()
-                .map_err(|error| anyhow!("failed to query mpv render update: {error}"))?
-        } else {
-            0
-        };
-        if should_render_frame_if_needed(pending_render, size_changed, update) {
-            self.render_frame(size)?;
-        }
-
-        Ok(frame)
-    }
-
-    fn sync_size(&mut self, size: RenderSize) -> Result<()> {
-        self.window
-            .set_size(size.width, size.height)
-            .map_err(|error| anyhow!(error))?;
-        self.reset_readback()?;
-        self.last_size = Some(size);
-        Ok(())
-    }
-
-    fn reset_readback(&mut self) -> Result<()> {
-        self.window
-            .gl_make_current(&self.gl_context)
-            .map_err(|error| anyhow!(error))?;
-        if let Some(mut readback) = self.readback.take() {
-            unsafe { readback.delete(&self.gl) };
-        }
-        Ok(())
-    }
-
-    fn ensure_readback(&mut self, size: RenderSize) -> Result<()> {
-        if self.readback.is_none() {
-            self.readback = Some(unsafe { PixelPackReadback::new(&self.gl, size)? });
-        }
-        Ok(())
-    }
-
-    fn read_pending_frame(&mut self) -> Result<Option<Arc<RenderImage>>> {
-        self.window
-            .gl_make_current(&self.gl_context)
-            .map_err(|error| anyhow!(error))?;
-        let Some(readback) = self.readback.as_mut() else {
-            return Ok(None);
-        };
-        let size = readback.size;
-        let Some(pixels) = (unsafe { readback.read_pending_frame(&self.gl)? }) else {
-            return Ok(None);
-        };
-
-        render_image_from_bgra(pixels, size.width, size.height).map(Some)
-    }
-
-    fn render_frame(&mut self, size: RenderSize) -> Result<()> {
-        self.window
-            .gl_make_current(&self.gl_context)
-            .map_err(|error| anyhow!(error))?;
-        self.ensure_readback(size)?;
-        let (width, height) = render_size_to_i32(size)?;
-
-        unsafe {
-            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            self.gl.viewport(0, 0, width, height);
-            self.gl.disable(glow::DEPTH_TEST);
-            self.gl.disable(glow::CULL_FACE);
-            self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            self.gl.clear(glow::COLOR_BUFFER_BIT);
-        }
-
-        self.render_context
-            .render::<sdl2::VideoSubsystem>(0, width, height, false)
-            .map_err(|error| anyhow!("failed to render mpv frame: {error}"))?;
-
-        unsafe {
-            self.readback
-                .as_mut()
-                .expect("readback checked above")
-                .enqueue_frame_read(&self.gl)?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for RenderHost {
-    fn drop(&mut self) {
-        let _ = self.window.gl_make_current(&self.gl_context);
-        if let Some(mut readback) = self.readback.take() {
-            unsafe { readback.delete(&self.gl) };
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        RenderSize, can_enqueue_readback, frame_byte_len, next_pixel_pack_buffer_index,
-        normalize_render_size, render_image_from_bgra, render_size_changed, render_size_to_i32,
-        should_render_frame_if_needed, should_render_update,
+        DecodedFrame, FrameColor, FramePixels, FrameSlot, RawVideoFormat, RenderSize,
+        frame_byte_len, packed_bgra_from_stride, raw_plane_from_stride, render_image_from_bgra,
     };
 
     #[test]
-    fn normalize_render_size_clamps_zero_dimensions() {
-        assert_eq!(
-            normalize_render_size(RenderSize {
-                width: 0,
-                height: 0,
-            }),
-            RenderSize {
-                width: 1,
-                height: 1,
-            }
-        );
-    }
-
-    #[test]
-    fn render_size_changed_only_flags_real_changes() {
-        let first = RenderSize {
-            width: 320,
-            height: 240,
-        };
-        let second = RenderSize {
-            width: 640,
-            height: 240,
-        };
-
-        assert!(render_size_changed(None, first));
-        assert!(!render_size_changed(Some(first), first));
-        assert!(render_size_changed(Some(first), second));
-    }
-
-    #[test]
-    fn frame_byte_len_uses_rgba_stride() {
+    fn frame_byte_len_uses_four_byte_pixels() {
         assert_eq!(
             frame_byte_len(RenderSize {
                 width: 3840,
@@ -451,60 +329,175 @@ mod tests {
     }
 
     #[test]
-    fn render_size_to_i32_preserves_source_video_size() {
+    fn packed_bgra_from_stride_copies_tightly_packed_frame() {
+        let pixels = packed_bgra_from_stride(
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            RenderSize {
+                width: 2,
+                height: 1,
+            },
+            8,
+        )
+        .unwrap();
+
+        assert_eq!(pixels, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn packed_bgra_from_stride_skips_row_padding() {
+        let pixels = packed_bgra_from_stride(
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 9, 10, 11, 12, 13, 14, 15, 16, 88, 88,
+            ],
+            RenderSize {
+                width: 2,
+                height: 2,
+            },
+            10,
+        )
+        .unwrap();
+
         assert_eq!(
-            render_size_to_i32(RenderSize {
-                width: 3840,
-                height: 2160,
-            })
-            .unwrap(),
-            (3840, 2160)
+            pixels,
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
     }
 
     #[test]
-    fn next_pixel_pack_buffer_index_cycles_three_buffers() {
-        assert_eq!(next_pixel_pack_buffer_index(0), 1);
-        assert_eq!(next_pixel_pack_buffer_index(1), 2);
-        assert_eq!(next_pixel_pack_buffer_index(2), 0);
+    fn packed_bgra_from_stride_rejects_short_buffer() {
+        assert!(
+            packed_bgra_from_stride(
+                &[1, 2, 3],
+                RenderSize {
+                    width: 1,
+                    height: 1,
+                },
+                4,
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn can_enqueue_readback_leaves_one_buffer_available_for_writes() {
-        assert!(can_enqueue_readback(0));
-        assert!(can_enqueue_readback(1));
-        assert!(!can_enqueue_readback(2));
+    fn raw_video_format_reports_p010_plane_layouts() {
+        let size = RenderSize {
+            width: 5,
+            height: 3,
+        };
+        let y = RawVideoFormat::P010Le.plane_layout(size, 0).unwrap();
+        let uv = RawVideoFormat::P010Le.plane_layout(size, 1).unwrap();
+
+        assert_eq!(
+            (y.width, y.height, y.row_len, y.pixel_stride),
+            (5, 3, 10, 2)
+        );
+        assert_eq!(
+            (uv.width, uv.height, uv.row_len, uv.pixel_stride),
+            (3, 2, 12, 4)
+        );
+        assert_eq!(uv.component_map, [1, 2, -1, -1]);
+        assert_eq!(RawVideoFormat::P010Le.bit_shift(), 6);
     }
 
     #[test]
-    fn should_render_update_requires_frame_flag() {
-        assert!(!should_render_update(0));
-        assert!(should_render_update(
-            libmpv2::render::mpv_render_update::Frame
-        ));
+    fn raw_video_format_reports_8_bit_yuv_plane_layouts() {
+        let size = RenderSize {
+            width: 5,
+            height: 3,
+        };
+        let nv12_y = RawVideoFormat::Nv12.plane_layout(size, 0).unwrap();
+        let nv12_uv = RawVideoFormat::Nv12.plane_layout(size, 1).unwrap();
+        let i420_u = RawVideoFormat::I420.plane_layout(size, 1).unwrap();
+        let i420_v = RawVideoFormat::I420.plane_layout(size, 2).unwrap();
+
+        assert_eq!(RawVideoFormat::Nv12.plane_count(), 2);
+        assert_eq!(RawVideoFormat::I420.plane_count(), 3);
+        assert_eq!((nv12_y.width, nv12_y.height, nv12_y.row_len), (5, 3, 5));
+        assert_eq!((nv12_uv.width, nv12_uv.height, nv12_uv.row_len), (3, 2, 6));
+        assert_eq!(nv12_uv.component_map, [1, 2, -1, -1]);
+        assert_eq!((i420_u.width, i420_u.height, i420_u.row_len), (3, 2, 3));
+        assert_eq!((i420_v.width, i420_v.height, i420_v.row_len), (3, 2, 3));
+        assert_eq!(RawVideoFormat::Nv12.color_depth(), 8);
+        assert!(!RawVideoFormat::Nv12.is_ten_bit());
     }
 
     #[test]
-    fn should_render_frame_if_needed_renders_on_size_change_or_frame_update() {
-        assert!(should_render_frame_if_needed(false, true, 0));
-        assert!(should_render_frame_if_needed(
-            true,
-            false,
-            libmpv2::render::mpv_render_update::Frame
-        ));
-        assert!(!should_render_frame_if_needed(true, false, 0));
-        assert!(!should_render_frame_if_needed(false, false, 0));
+    fn raw_video_format_preserves_p010_chroma_mapping_for_dolby_vision_profile5() {
+        let layout = RawVideoFormat::P010Le
+            .plane_layout_for_color(
+                RenderSize {
+                    width: 5,
+                    height: 3,
+                },
+                1,
+                FrameColor::DolbyVisionProfile5,
+            )
+            .unwrap();
+
+        assert_eq!(layout.component_map, [1, 2, -1, -1]);
     }
 
     #[test]
-    fn render_image_from_bgra_outputs_gpui_bgra_bytes_without_vertical_flip() {
-        let image = render_image_from_bgra(vec![3, 2, 1, 4, 7, 6, 5, 8], 2, 1).unwrap();
+    fn raw_plane_from_stride_copies_plane_region_with_padding() {
+        let plane =
+            raw_plane_from_stride(&[0, 0, 1, 2, 3, 4, 99, 9, 10, 11, 12, 88, 0], 2, 5, 4, 2)
+                .unwrap();
 
-        assert_eq!(image.as_bytes(0), Some([3, 2, 1, 4, 7, 6, 5, 8].as_slice()));
+        assert_eq!(plane, [1, 2, 3, 4, 99, 9, 10, 11, 12]);
+    }
+
+    #[test]
+    fn raw_plane_from_stride_rejects_short_buffer() {
+        assert!(raw_plane_from_stride(&[1, 2, 3], 0, 4, 4, 1).is_err());
+    }
+
+    #[test]
+    fn render_image_from_bgra_preserves_gpui_bgra_bytes() {
+        let image = render_image_from_bgra(vec![1, 2, 3, 4, 5, 6, 7, 8], 2, 1).unwrap();
+
+        assert_eq!(image.as_bytes(0), Some([1, 2, 3, 4, 5, 6, 7, 8].as_slice()));
     }
 
     #[test]
     fn render_image_from_bgra_rejects_wrong_buffer_size() {
         assert!(render_image_from_bgra(vec![1, 2, 3], 1, 1).is_err());
+    }
+
+    #[test]
+    fn frame_slot_keeps_latest_frame_and_reports_size_changes() {
+        let slot = FrameSlot::default();
+        let first = RenderSize {
+            width: 2,
+            height: 1,
+        };
+        let second = RenderSize {
+            width: 4,
+            height: 1,
+        };
+
+        slot.push(DecodedFrame {
+            size: first,
+            pts: None,
+            pixels: FramePixels::Bgra8(vec![1; 8]),
+        });
+        slot.push(DecodedFrame {
+            size: first,
+            pts: None,
+            pixels: FramePixels::Bgra8(vec![2; 8]),
+        });
+
+        assert_eq!(slot.take_size_change(), Some(first));
+        assert_eq!(
+            slot.take_frame().unwrap().pixels,
+            FramePixels::Bgra8(vec![2; 8])
+        );
+        assert!(slot.take_frame().is_none());
+
+        slot.push(DecodedFrame {
+            size: second,
+            pts: None,
+            pixels: FramePixels::Bgra8(vec![3; 16]),
+        });
+        assert_eq!(slot.take_size_change(), Some(second));
     }
 }
