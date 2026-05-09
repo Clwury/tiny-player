@@ -898,7 +898,7 @@ fn decoded_frame_from_sample(
     };
     let raw_format = RawVideoFormat::from_gstreamer_name(info.name());
     let dovi_metadata = dovi_state.and_then(|state| state.take_rpu_for_frame(pts));
-    let color = decoded_frame_color(&info, raw_format, dovi_state, pts, dovi_metadata.as_ref());
+    let color = decoded_frame_color(&info, dovi_state, pts, dovi_metadata.as_ref());
     trace_negotiated_caps(&info, color);
 
     let pixels = if let Some(format) = raw_format {
@@ -969,13 +969,7 @@ fn decoded_dmabuf_frame_from_sample(
         )
     })?;
     let dovi_metadata = dovi_state.and_then(|state| state.take_rpu_for_frame(pts));
-    let color = decoded_frame_color(
-        &drm_info,
-        Some(raw_format),
-        dovi_state,
-        pts,
-        dovi_metadata.as_ref(),
-    );
+    let color = decoded_frame_color(&drm_info, dovi_state, pts, dovi_metadata.as_ref());
     trace_negotiated_caps(&drm_info, color);
 
     let metadata = dovi_metadata.map(|dolby_vision| FrameDynamicMetadata {
@@ -1001,22 +995,21 @@ fn decoded_dmabuf_frame_from_sample(
 
 fn decoded_frame_color(
     info: &gst_video::VideoInfo,
-    raw_format: Option<RawVideoFormat>,
     dovi_state: Option<&DoviState>,
     pts: Option<FramePts>,
     dovi_metadata: Option<&DoviFrameMetadata>,
 ) -> FrameColor {
     match dovi_metadata.map(|metadata| metadata.profile) {
         Some(5) => FrameColor::DolbyVisionProfile5,
-        Some(_) => frame_color(info, raw_format, dovi_state.is_some()),
+        Some(_) => frame_color(info),
         None if dovi_state.is_some_and(DoviState::profile5_seen) => {
             tracing::debug!(
                 pts = ?pts.map(|pts| pts.nsecs),
                 "Dolby Vision Profile 5 frame is missing RPU metadata; using negotiated color"
             );
-            frame_color(info, raw_format, dovi_state.is_some())
+            frame_color(info)
         }
-        None => frame_color(info, raw_format, dovi_state.is_some()),
+        None => frame_color(info),
     }
 }
 
@@ -1311,25 +1304,13 @@ fn raw_video_chroma_site(site: gst_video::VideoChromaSite) -> RawVideoChromaSite
     }
 }
 
-fn frame_color(
-    info: &gst_video::VideoInfo,
-    raw_format: Option<RawVideoFormat>,
-    hevc_hint: bool,
-) -> FrameColor {
-    frame_color_from_metadata(&info.colorimetry(), raw_format, hevc_hint)
+fn frame_color(info: &gst_video::VideoInfo) -> FrameColor {
+    frame_color_from_metadata(&info.colorimetry())
 }
 
-fn frame_color_from_metadata(
-    colorimetry: &gst_video::VideoColorimetry,
-    raw_format: Option<RawVideoFormat>,
-    hevc_hint: bool,
-) -> FrameColor {
+fn frame_color_from_metadata(colorimetry: &gst_video::VideoColorimetry) -> FrameColor {
     let colorimetry = colorimetry.to_string().to_ascii_lowercase();
     if colorimetry == "bt2100-pq" || colorimetry.contains("2084") {
-        return FrameColor::Hdr10Bt2020;
-    }
-
-    if hevc_hint && raw_format.is_some_and(RawVideoFormat::is_ten_bit) {
         return FrameColor::Hdr10Bt2020;
     }
 
@@ -1525,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_color_treats_hevc_10_bit_raw_with_lost_colorimetry_as_hdr10() {
+    fn frame_color_keeps_bt709_hevc_10_bit_raw_as_sdr() {
         let colorimetry = gst_video::VideoColorimetry::new(
             gst_video::VideoColorRange::Range16_235,
             gst_video::VideoColorMatrix::Bt709,
@@ -1533,22 +1514,7 @@ mod tests {
             gst_video::VideoColorPrimaries::Bt709,
         );
 
-        assert_eq!(
-            frame_color_from_metadata(&colorimetry, Some(RawVideoFormat::P010Le), true),
-            FrameColor::Hdr10Bt2020
-        );
-        assert_eq!(
-            frame_color_from_metadata(&colorimetry, Some(RawVideoFormat::I42010Le), true),
-            FrameColor::Hdr10Bt2020
-        );
-        assert_eq!(
-            frame_color_from_metadata(&colorimetry, Some(RawVideoFormat::Nv12), true),
-            FrameColor::Sdr
-        );
-        assert_eq!(
-            frame_color_from_metadata(&colorimetry, Some(RawVideoFormat::P010Le), false),
-            FrameColor::Sdr
-        );
+        assert_eq!(frame_color_from_metadata(&colorimetry), FrameColor::Sdr);
     }
 
     #[test]

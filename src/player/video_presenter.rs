@@ -11,7 +11,10 @@ use gpui::RenderImage;
 
 use super::{
     libplacebo::LibplaceboToneMapper,
-    render_host::{DecodedFrame, FramePixels, FrameSlot, RenderSize, render_image_from_bgra},
+    render_host::{
+        DecodedFrame, FramePixels, FrameSlot, RenderSize, render_image_from_bgra,
+        sdr_8bit_yuv_to_bgra,
+    },
 };
 
 pub struct VideoPresenter {
@@ -32,6 +35,10 @@ impl VideoPresenter {
     }
 
     pub fn render_if_needed(&mut self, size: RenderSize) -> Result<Option<Arc<RenderImage>>> {
+        let mut ready_frame = self
+            .render_worker
+            .take_ready_frame(self.latest_generation)?;
+
         if let Some(frame) = self.frame_slot.take_frame() {
             self.next_generation = self.next_generation.wrapping_add(1);
             self.latest_generation = self.next_generation;
@@ -42,7 +49,12 @@ impl VideoPresenter {
             });
         }
 
-        self.render_worker.take_ready_frame(self.latest_generation)
+        if ready_frame.is_none() {
+            ready_frame = self
+                .render_worker
+                .take_ready_frame(self.latest_generation)?;
+        }
+        Ok(ready_frame)
     }
 }
 
@@ -59,6 +71,7 @@ struct VideoRenderState {
 #[derive(Default)]
 struct VideoRenderSlot {
     request: Option<VideoRenderRequest>,
+    rendering: bool,
     shutdown: bool,
 }
 
@@ -90,6 +103,7 @@ impl VideoRenderWorker {
                     let generation = request.generation;
                     let result = render_video_frame(&mut tone_mapper, request)
                         .map_err(|error| error.to_string());
+                    worker_state.finish_request();
                     if result_tx
                         .send(VideoRenderResult {
                             generation,
@@ -132,8 +146,11 @@ impl VideoRenderWorker {
         if slot.shutdown {
             return;
         }
+        let should_notify = !slot.rendering && slot.request.is_none();
         slot.request = Some(request);
-        self.state.ready.notify_one();
+        if should_notify {
+            self.state.ready.notify_one();
+        }
     }
 }
 
@@ -158,10 +175,17 @@ impl VideoRenderState {
                 return None;
             }
             if let Some(request) = slot.request.take() {
+                slot.rendering = true;
                 return Some(request);
             }
+            slot.rendering = false;
             slot = self.ready.wait(slot).expect("video render worker poisoned");
         }
+    }
+
+    fn finish_request(&self) {
+        let mut slot = self.slot.lock().expect("video render worker poisoned");
+        slot.rendering = false;
     }
 }
 
@@ -176,10 +200,16 @@ fn render_video_frame(
             render_image_from_bgra(pixels, request.frame.size.width, request.frame.size.height)
         }
         FramePixels::RawVideo(raw) => {
+            let source_size = request.frame.size;
+            if request.output_size == source_size
+                && let Some(pixels) = sdr_8bit_yuv_to_bgra(&raw, source_size)?
+            {
+                return render_image_from_bgra(pixels, source_size.width, source_size.height);
+            }
+
             if tone_mapper.is_none() {
                 *tone_mapper = Some(LibplaceboToneMapper::new()?);
             }
-            let source_size = request.frame.size;
             let pixels = tone_mapper
                 .as_mut()
                 .expect("tone mapper initialized")
