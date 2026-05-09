@@ -16,8 +16,15 @@ pub(crate) enum SeriesDetailSelectKind {
     Subtitle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeriesDetailKind {
+    Series,
+    Movie,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SeriesDetailState {
+    kind: SeriesDetailKind,
     pub(crate) series_id: String,
     pub(crate) title: String,
     pub(crate) effects: SeriesDetailEffects,
@@ -42,8 +49,25 @@ pub(crate) struct SeriesDetailState {
 }
 
 impl SeriesDetailState {
-    pub(crate) fn new(item: &UserItem) -> Self {
+    pub(crate) fn from_user_item(item: &UserItem) -> Option<Self> {
+        match item.item_type.as_deref() {
+            Some("Series") => Some(Self::new_series(item)),
+            Some("Movie") => Some(Self::new_movie(item)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn new_series(item: &UserItem) -> Self {
+        Self::new(item, SeriesDetailKind::Series)
+    }
+
+    pub(crate) fn new_movie(item: &UserItem) -> Self {
+        Self::new(item, SeriesDetailKind::Movie)
+    }
+
+    fn new(item: &UserItem, kind: SeriesDetailKind) -> Self {
         Self {
+            kind,
             series_id: item.id.clone(),
             title: item.name.clone(),
             effects: Default::default(),
@@ -68,12 +92,36 @@ impl SeriesDetailState {
         }
     }
 
+    pub(crate) fn is_series(&self) -> bool {
+        self.kind == SeriesDetailKind::Series
+    }
+
+    pub(crate) fn is_movie(&self) -> bool {
+        self.kind == SeriesDetailKind::Movie
+    }
+
     pub(crate) fn next_up_episode(&self) -> Option<&MediaItem> {
         self.next_up.as_ref().and_then(|items| items.items.first())
     }
 
     pub(crate) fn hero_episode(&self) -> Option<&MediaItem> {
         self.selected_episode().or_else(|| self.next_up_episode())
+    }
+
+    pub(crate) fn hero_line(&self) -> Option<String> {
+        if self.is_movie() {
+            self.item.as_ref().map(|item| item.name.clone())
+        } else {
+            self.hero_episode().map(MediaItem::episode_label)
+        }
+    }
+
+    pub(crate) fn selected_playback_item(&self) -> Option<&MediaItem> {
+        if self.is_movie() {
+            self.item.as_ref()
+        } else {
+            self.selected_episode()
+        }
     }
 
     fn preferred_season_id(&self) -> Option<String> {
@@ -111,16 +159,16 @@ impl SeriesDetailState {
     }
 
     pub(crate) fn selected_media_source(&self) -> Option<&MediaSource> {
-        let episode = self.selected_episode()?;
-        let sources = episode.media_sources.as_deref()?;
+        let item = self.selected_playback_item()?;
+        let sources = item.media_sources.as_deref()?;
         let index = self.selected_media_source_index()?;
         sources.get(index)
     }
 
     pub(crate) fn selected_media_source_index(&self) -> Option<usize> {
         let source_count = self
-            .selected_episode()
-            .and_then(|episode| episode.media_sources.as_ref())
+            .selected_playback_item()
+            .and_then(|item| item.media_sources.as_ref())
             .map(Vec::len)
             .unwrap_or(0);
         if source_count == 0 {
@@ -151,10 +199,10 @@ impl SeriesDetailState {
     }
 
     pub(crate) fn selected_media_source_label(&self) -> String {
-        let Some(episode) = self.selected_episode() else {
+        let Some(item) = self.selected_playback_item() else {
             return "暂无视频源".to_string();
         };
-        let Some(sources) = episode.media_sources.as_deref() else {
+        let Some(sources) = item.media_sources.as_deref() else {
             return "暂无视频源".to_string();
         };
         let Some(index) = self.selected_media_source_index() else {
@@ -280,8 +328,8 @@ impl SeriesDetailState {
 
     pub(crate) fn sync_media_source_selection(&mut self) {
         let source_count = self
-            .selected_episode()
-            .and_then(|episode| episode.media_sources.as_ref())
+            .selected_playback_item()
+            .and_then(|item| item.media_sources.as_ref())
             .map(Vec::len)
             .unwrap_or(0);
         if source_count == 0 {
@@ -376,6 +424,7 @@ mod tests {
     #[test]
     fn chooses_next_up_episode_when_loaded_episodes_include_it() {
         let mut detail = SeriesDetailState {
+            kind: SeriesDetailKind::Series,
             series_id: "series-1".to_string(),
             title: "Series".to_string(),
             effects: Default::default(),
@@ -415,7 +464,7 @@ mod tests {
 
     #[test]
     fn hero_episode_prefers_selected_episode_over_next_up() {
-        let mut detail = SeriesDetailState::new(&user_item("series-1", "Series"));
+        let mut detail = SeriesDetailState::new_series(&user_item("series-1", "Series"));
         detail.next_up = Some(MediaItems {
             items: vec![media_item("episode-2", "第二集")],
             total_record_count: 2,
@@ -433,5 +482,51 @@ mod tests {
             detail.hero_episode().map(|episode| episode.id.as_str()),
             Some("episode-1")
         );
+    }
+
+    fn media_source(id: &str, name: &str) -> MediaSource {
+        MediaSource {
+            id: Some(id.to_string()),
+            name: Some(name.to_string()),
+            path: None,
+            container: None,
+            media_streams: None,
+        }
+    }
+
+    #[test]
+    fn movie_detail_uses_item_as_playback_source() {
+        let mut movie = user_item("movie-1", "电影");
+        movie.item_type = Some("Movie".to_string());
+        let mut detail = SeriesDetailState::new_movie(&movie);
+        let mut item = media_item("movie-1", "电影");
+        item.item_type = Some("Movie".to_string());
+        item.media_sources = Some(vec![media_source("source-1", "4K HDR")]);
+        detail.item = Some(item);
+
+        detail.sync_media_source_selection();
+
+        assert!(detail.is_movie());
+        assert_eq!(detail.hero_line().as_deref(), Some("电影"));
+        assert_eq!(detail.selected_media_source_label(), "4K HDR");
+        assert_eq!(
+            detail.selected_playback_item().map(|item| item.id.as_str()),
+            Some("movie-1")
+        );
+    }
+
+    #[test]
+    fn from_user_item_accepts_series_and_movie_only() {
+        let series = user_item("series-1", "剧集");
+        let mut movie = user_item("movie-1", "电影");
+        movie.item_type = Some("Movie".to_string());
+        let mut folder = user_item("folder-1", "合集");
+        folder.item_type = Some("Folder".to_string());
+
+        assert!(
+            SeriesDetailState::from_user_item(&series).is_some_and(|detail| detail.is_series())
+        );
+        assert!(SeriesDetailState::from_user_item(&movie).is_some_and(|detail| detail.is_movie()));
+        assert!(SeriesDetailState::from_user_item(&folder).is_none());
     }
 }

@@ -14,22 +14,22 @@ use crate::{
 use super::{HomeContent, HomeContentEvent, LoadState};
 
 struct SelectedPlayback {
-    series_id: String,
-    episode_id: String,
+    detail_id: String,
+    item_id: String,
     media_source_id: String,
     title: SharedString,
 }
 
 impl HomeContent {
-    pub(super) fn open_series_detail(&mut self, item: &UserItem, cx: &mut Context<Self>) {
-        if item.item_type.as_deref() != Some("Series") {
+    pub(super) fn open_media_detail(&mut self, item: &UserItem, cx: &mut Context<Self>) {
+        let Some(detail) = SeriesDetailState::from_user_item(item) else {
             return;
-        }
+        };
 
-        self.series_detail = Some(SeriesDetailState::new(item));
+        self.series_detail = Some(detail);
         self.main_scroll_handle.set_offset(point(px(0.0), px(0.0)));
         self.main_scrollbar_drag = None;
-        self.load_series_detail_effects(cx);
+        self.load_media_detail_effects(cx);
         cx.emit(HomeContentEvent::TitleChanged);
         cx.notify();
     }
@@ -61,7 +61,7 @@ impl HomeContent {
         }
     }
 
-    pub(super) fn play_selected_series_episode(
+    pub(super) fn play_selected_media(
         &mut self,
         _: &ClickEvent,
         _: &mut Window,
@@ -91,11 +91,11 @@ impl HomeContent {
         let server = self.current_server.clone();
         let client = self.emby_client.clone();
         let task_server = server.clone();
-        let task_episode_id = selected.episode_id.clone();
+        let task_item_id = selected.item_id.clone();
         let task_media_source_id = selected.media_source_id.clone();
         let task = cx.background_spawn(async move {
             let playback_info =
-                client.playback_info(&task_server, &task_episode_id, &task_media_source_id)?;
+                client.playback_info(&task_server, &task_item_id, &task_media_source_id)?;
             let direct_stream_url = playback_info.direct_stream_url_for(&task_media_source_id)?;
             let playback_url = resolve_direct_stream_url(&task_server, direct_stream_url)?;
             Ok::<_, anyhow::Error>(playback_url.to_string())
@@ -104,14 +104,14 @@ impl HomeContent {
         cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
-                page.finish_play_selected_series_episode(selected, result, cx)
+                page.finish_play_selected_media(selected, result, cx)
             })
             .ok();
         })
         .detach();
     }
 
-    fn finish_play_selected_series_episode(
+    fn finish_play_selected_media(
         &mut self,
         selected: SelectedPlayback,
         result: anyhow::Result<String>,
@@ -143,26 +143,32 @@ impl HomeContent {
 
     fn selected_playback_still_current(&self, selected: &SelectedPlayback) -> bool {
         self.series_detail.as_ref().is_some_and(|detail| {
-            if detail.series_id.as_str() != selected.series_id.as_str() {
+            if detail.series_id.as_str() != selected.detail_id.as_str() {
                 return false;
             }
-            let episode_matches = detail
-                .selected_episode()
-                .is_some_and(|episode| episode.id.as_str() == selected.episode_id.as_str());
+            let item_matches = detail
+                .selected_playback_item()
+                .is_some_and(|item| item.id.as_str() == selected.item_id.as_str());
             let source_matches = detail
                 .selected_media_source()
                 .and_then(|source| source.id.as_deref())
                 .is_some_and(|id| id == selected.media_source_id.as_str());
 
-            episode_matches && source_matches
+            item_matches && source_matches
         })
     }
 
-    fn load_series_detail_effects(&mut self, cx: &mut Context<Self>) {
+    fn load_media_detail_effects(&mut self, cx: &mut Context<Self>) {
         self.load_series_media_item_if_needed(cx);
-        self.load_series_seasons_if_needed(cx);
-        self.load_series_next_up_if_needed(cx);
-        self.load_series_episodes_if_needed(cx);
+        if self
+            .series_detail
+            .as_ref()
+            .is_some_and(SeriesDetailState::is_series)
+        {
+            self.load_series_seasons_if_needed(cx);
+            self.load_series_next_up_if_needed(cx);
+            self.load_series_episodes_if_needed(cx);
+        }
     }
 
     fn load_series_media_item_if_needed(&mut self, cx: &mut Context<Self>) {
@@ -219,6 +225,9 @@ impl HomeContent {
                         cx.emit(HomeContentEvent::TitleChanged);
                     }
                     detail.item = Some(item);
+                    if detail.is_movie() {
+                        detail.sync_media_source_selection();
+                    }
                 }
             }
             Err(error) => {
@@ -240,7 +249,7 @@ impl HomeContent {
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
-        if !detail.effects.seasons.can_start() {
+        if !detail.is_series() || !detail.effects.seasons.can_start() {
             return;
         }
 
@@ -296,7 +305,7 @@ impl HomeContent {
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
-        if !detail.effects.next_up.can_start() {
+        if !detail.is_series() || !detail.effects.next_up.can_start() {
             return;
         }
 
@@ -354,6 +363,9 @@ impl HomeContent {
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
+        if !detail.is_series() {
+            return;
+        }
         let Some(season_id) = detail.selected_season_id.clone() else {
             return;
         };
@@ -486,8 +498,8 @@ impl HomeContent {
             return;
         };
         let source_count = detail
-            .selected_episode()
-            .and_then(|episode| episode.media_sources.as_ref())
+            .selected_playback_item()
+            .and_then(|item| item.media_sources.as_ref())
             .map(Vec::len)
             .unwrap_or(0);
         if source_count == 0 {
@@ -532,8 +544,8 @@ impl HomeContent {
             return;
         };
         let source_count = detail
-            .selected_episode()
-            .and_then(|episode| episode.media_sources.as_ref())
+            .selected_playback_item()
+            .and_then(|item| item.media_sources.as_ref())
             .map(Vec::len)
             .unwrap_or(0);
         if index >= source_count {
@@ -567,9 +579,9 @@ impl HomeContent {
 }
 
 fn selected_playback(detail: &SeriesDetailState) -> Result<SelectedPlayback, String> {
-    let episode = detail
-        .selected_episode()
-        .ok_or_else(|| "请选择要播放的剧集".to_string())?;
+    let item = detail
+        .selected_playback_item()
+        .ok_or_else(|| "请选择要播放的媒体".to_string())?;
     let source = detail
         .selected_media_source()
         .ok_or_else(|| "请选择视频源".to_string())?;
@@ -580,17 +592,21 @@ fn selected_playback(detail: &SeriesDetailState) -> Result<SelectedPlayback, Str
         .filter(|id| !id.is_empty())
         .ok_or_else(|| "所选视频源缺少 ID，无法获取播放地址".to_string())?
         .to_string();
-    let series_name = detail
-        .item
-        .as_ref()
-        .map(|item| item.name.clone())
-        .unwrap_or_else(|| detail.title.clone());
-    let episode_label = episode.episode_label();
+    let title = if detail.is_movie() {
+        item.name.clone()
+    } else {
+        let series_name = detail
+            .item
+            .as_ref()
+            .map(|item| item.name.clone())
+            .unwrap_or_else(|| detail.title.clone());
+        format!("{series_name} {}", item.episode_label())
+    };
 
     Ok(SelectedPlayback {
-        series_id: detail.series_id.clone(),
-        episode_id: episode.id.clone(),
+        detail_id: detail.series_id.clone(),
+        item_id: item.id.clone(),
         media_source_id,
-        title: format!("{series_name} {episode_label}").into(),
+        title: title.into(),
     })
 }

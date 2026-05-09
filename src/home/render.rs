@@ -568,11 +568,11 @@ impl HomeContent {
                                 let card = user_item_card(item, image_path, cx)
                                     .id((gpui::ElementId::from("user-view-item-card"), item_id));
 
-                                if item.item_type.as_deref() == Some("Series") {
+                                if matches!(item.item_type.as_deref(), Some("Series" | "Movie")) {
                                     let item = item.clone();
                                     let on_click =
                                         cx.listener(move |page: &mut HomeContent, _, _, cx| {
-                                            page.open_series_detail(&item, cx);
+                                            page.open_media_detail(&item, cx);
                                         });
                                     card.on_click(on_click)
                                 } else {

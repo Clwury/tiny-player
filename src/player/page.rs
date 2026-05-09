@@ -271,6 +271,9 @@ impl Render for PlaybackPage {
             .overflow_hidden()
             .bg(rgb(0x000000))
             .text_color(rgb(0xe6edf3))
+            .when(!window.is_maximized(), |this| {
+                this.rounded_b(theme.radius_lg).overflow_hidden()
+            })
             .when_some(current_video_frame, |this, frame| this.child(frame))
             .when(show_message, |this| {
                 this.child(

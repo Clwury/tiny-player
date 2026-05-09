@@ -174,7 +174,7 @@ fn button_base(id: &'static str, icon_path: SharedString, cx: &App) -> gpui::Sta
     div()
         .id(id)
         .flex()
-        .size(px(28.0))
+        .size(px(24.0))
         .items_center()
         .justify_center()
         .rounded_full()
@@ -183,7 +183,7 @@ fn button_base(id: &'static str, icon_path: SharedString, cx: &App) -> gpui::Sta
         .child(
             svg()
                 .path(icon_path)
-                .size(px(16.0))
+                .size(px(14.0))
                 .text_color(theme.foreground),
         )
 }

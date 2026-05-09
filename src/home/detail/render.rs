@@ -72,76 +72,84 @@ impl HomeContent {
                                 .when(detail.item.is_some(), |this| {
                                     this.child(self.render_series_detail_controls(detail, cx))
                                 })
-                                .when_some(detail.next_up_failed.clone(), |this, error| {
-                                    this.child(div().text_sm().text_color(theme.error).child(error))
-                                })
-                                .when(
-                                    detail.effects.next_up.is_loading() && detail.next_up.is_none(),
-                                    |this| {
+                                .when(detail.is_series(), |this| {
+                                    this.when_some(detail.next_up_failed.clone(), |this, error| {
                                         this.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(theme.muted_foreground)
-                                                .child("加载下一剧集中…"),
+                                            div().text_sm().text_color(theme.error).child(error),
                                         )
-                                    },
-                                )
-                                .when_some(detail.seasons_failed.clone(), |this, error| {
-                                    this.child(div().text_sm().text_color(theme.error).child(error))
-                                })
-                                .when(
-                                    detail.effects.seasons.is_loading() && detail.seasons.is_none(),
-                                    |this| {
-                                        this.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(theme.muted_foreground)
-                                                .child("加载季数中…"),
-                                        )
-                                    },
-                                )
-                                .when_some(detail.seasons.as_ref(), |this, seasons| {
-                                    this.child(
-                                        self.render_series_detail_season_selector(
-                                            detail, seasons, cx,
-                                        ),
+                                    })
+                                    .when(
+                                        detail.effects.next_up.is_loading()
+                                            && detail.next_up.is_none(),
+                                        |this| {
+                                            this.child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("加载下一剧集中…"),
+                                            )
+                                        },
                                     )
-                                })
-                                .when_some(detail.episodes_failed.clone(), |this, error| {
-                                    this.child(div().text_sm().text_color(theme.error).child(error))
-                                })
-                                .when(
-                                    detail.effects.episodes.is_loading()
-                                        && detail.episodes.is_none(),
-                                    |this| {
+                                    .when_some(detail.seasons_failed.clone(), |this, error| {
                                         this.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(theme.muted_foreground)
-                                                .child("加载剧集列表中…"),
+                                            div().text_sm().text_color(theme.error).child(error),
                                         )
-                                    },
-                                )
-                                .when_some(detail.episodes.as_ref(), |this, episodes| {
-                                    this.child(self.render_series_detail_episodes_row(
-                                        detail,
-                                        episodes,
-                                        main_content_width,
-                                        cx,
-                                    ))
-                                })
-                                .when(
-                                    !detail.effects.episodes.is_loading()
-                                        && detail.episodes.is_none(),
-                                    |this| {
+                                    })
+                                    .when(
+                                        detail.effects.seasons.is_loading()
+                                            && detail.seasons.is_none(),
+                                        |this| {
+                                            this.child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("加载季数中…"),
+                                            )
+                                        },
+                                    )
+                                    .when_some(detail.seasons.as_ref(), |this, seasons| {
+                                        this.child(self.render_series_detail_season_selector(
+                                            detail, seasons, cx,
+                                        ))
+                                    })
+                                    .when_some(detail.episodes_failed.clone(), |this, error| {
                                         this.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(theme.muted_foreground)
-                                                .child("暂无剧集"),
+                                            div().text_sm().text_color(theme.error).child(error),
                                         )
-                                    },
-                                ),
+                                    })
+                                    .when(
+                                        detail.effects.episodes.is_loading()
+                                            && detail.episodes.is_none(),
+                                        |this| {
+                                            this.child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("加载剧集列表中…"),
+                                            )
+                                        },
+                                    )
+                                    .when_some(detail.episodes.as_ref(), |this, episodes| {
+                                        this.child(self.render_series_detail_episodes_row(
+                                            detail,
+                                            episodes,
+                                            main_content_width,
+                                            cx,
+                                        ))
+                                    })
+                                    .when(
+                                        !detail.effects.episodes.is_loading()
+                                            && detail.episodes.is_none(),
+                                        |this| {
+                                            this.child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("暂无剧集"),
+                                            )
+                                        },
+                                    )
+                                }),
                         )
                 },
             ))
@@ -197,7 +205,7 @@ impl HomeContent {
             .as_ref()
             .map(|item| item.name.clone())
             .unwrap_or_else(|| detail.title.clone());
-        let episode_line = detail.hero_episode().map(MediaItem::episode_label);
+        let episode_line = detail.hero_line();
 
         div()
             .relative()
@@ -354,12 +362,12 @@ impl HomeContent {
         let theme = theme::get(cx);
         let video_label = detail.selected_media_source_label();
         let subtitle_label = detail.selected_subtitle_label();
-        let play = cx.listener(Self::play_selected_series_episode);
+        let play = cx.listener(Self::play_selected_media);
         let toggle_video = cx.listener(Self::toggle_series_media_source_select);
         let toggle_subtitle = cx.listener(Self::toggle_series_subtitle_select);
         let media_sources = detail
-            .selected_episode()
-            .and_then(|episode| episode.media_sources.as_deref())
+            .selected_playback_item()
+            .and_then(|item| item.media_sources.as_deref())
             .unwrap_or_default();
         let source_count = media_sources.len();
         let selected_source_index = detail.selected_media_source_index();
@@ -374,7 +382,7 @@ impl HomeContent {
         let subtitle_select_open =
             detail.open_select == Some(SeriesDetailSelectKind::Subtitle) && subtitle_count > 0;
         let can_play = !detail.playback_loading
-            && detail.selected_episode().is_some()
+            && detail.selected_playback_item().is_some()
             && detail
                 .selected_media_source()
                 .and_then(|source| source.id.as_deref())
