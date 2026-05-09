@@ -90,10 +90,22 @@ impl PlaybackPage {
     fn replace_visible_frame(
         &mut self,
         frame: Arc<RenderImage>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        self.current_frame = Some(frame);
+        if self
+            .current_frame
+            .as_ref()
+            .is_some_and(|current| current.id == frame.id)
+        {
+            self.current_frame = Some(frame);
+            return;
+        }
+
+        let previous = self.current_frame.replace(frame);
+        if let Some(previous) = previous {
+            defer_drop_frame(previous, window);
+        }
     }
 
     fn clear_visible_frame(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
@@ -359,40 +371,19 @@ impl gpui::Element for VideoFrameElement {
         _request_layout: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
         window: &mut Window,
-        cx: &mut gpui::App,
+        _cx: &mut gpui::App,
     ) {
         let Some(fitted_bounds) = aspect_fit_bounds(bounds, self.source_size) else {
             return;
         };
 
-        if window
-            .paint_image(
-                fitted_bounds,
-                gpui::Corners::default(),
-                self.frame.clone(),
-                0,
-                false,
-            )
-            .is_err()
-        {
-            return;
-        }
-
-        let last_render_image: gpui::Entity<Option<Arc<RenderImage>>> =
-            window.use_state(cx, |_, _| None);
-        let previous = last_render_image.update(cx, |this, _| {
-            if this
-                .as_ref()
-                .is_some_and(|previous| previous.id == self.frame.id)
-            {
-                None
-            } else {
-                this.replace(self.frame.clone())
-            }
-        });
-        if let Some(previous) = previous {
-            cx.drop_image(previous, Some(window));
-        }
+        _ = window.paint_image(
+            fitted_bounds,
+            gpui::Corners::default(),
+            self.frame.clone(),
+            0,
+            false,
+        );
     }
 }
 
