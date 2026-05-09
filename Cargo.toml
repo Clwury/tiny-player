@@ -8,9 +8,9 @@ anyhow = "1.0"
 directories = "5"
 dolby_vision = { git = "https://github.com/quietvoid/dovi_tool", package = "dolby_vision" }
 gpui = "0.2.2"
-gstreamer = "0.25"
+gstreamer = { version = "0.25", features = ["v1_24"] }
 gstreamer-app = "0.25"
-gstreamer-video = "0.25"
+gstreamer-video = { version = "0.25", features = ["v1_24"] }
 image = "0.25"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }

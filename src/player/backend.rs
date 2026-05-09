@@ -15,16 +15,24 @@ use gstreamer_video as gst_video;
 use super::dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat};
 use super::render_host::{
     DecodedFrame, FrameColor, FrameDynamicMetadata, FramePixels, FramePts, FrameSlot,
-    RawVideoBufferPlane, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlanes,
-    RawVideoRange, RenderSize, packed_bgra_from_stride, validate_raw_plane_from_stride,
+    RawVideoBufferPlane, RawVideoChromaSite, RawVideoDmaBufPlane, RawVideoFormat, RawVideoFrame,
+    RawVideoPlanes, RawVideoRange, RenderSize, packed_bgra_from_stride,
+    validate_raw_plane_from_stride,
 };
 
 const POSITION_QUERY_INTERVAL: Duration = Duration::from_millis(250);
 const RPU_MATCH_TOLERANCE: Duration = Duration::from_millis(60);
 const RPU_SLOT_CAPACITY: usize = 2048;
+const DMABUF_MEMORY_FEATURE: &str = "memory:DMABuf";
 static NEGOTIATED_CAPS_LOGGED: AtomicBool = AtomicBool::new(false);
+static NEGOTIATED_DMABUF_LOGGED: AtomicBool = AtomicBool::new(false);
 static RAW_PREROLL_COUNT: AtomicU64 = AtomicU64::new(0);
 static RAW_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" {
+    fn gst_is_dmabuf_memory(mem: *mut gst::ffi::GstMemory) -> gst::glib::ffi::gboolean;
+    fn gst_dmabuf_memory_get_fd(mem: *mut gst::ffi::GstMemory) -> std::os::raw::c_int;
+}
 
 #[derive(Debug)]
 pub enum BackendEvent {
@@ -301,6 +309,7 @@ impl GstBackend {
         self.last_duration = None;
         self.last_position_query = Instant::now();
         NEGOTIATED_CAPS_LOGGED.store(false, Ordering::Relaxed);
+        NEGOTIATED_DMABUF_LOGGED.store(false, Ordering::Relaxed);
         RAW_PREROLL_COUNT.store(0, Ordering::Relaxed);
         RAW_SAMPLE_COUNT.store(0, Ordering::Relaxed);
 
@@ -742,25 +751,36 @@ fn build_hevc_raw_appsink(
     frame_slot: FrameSlot,
     dovi_state: Option<DoviState>,
 ) -> gst_app::AppSink {
-    build_raw_appsink_with_formats(
-        frame_slot,
-        dovi_state,
-        ["P010_10LE", "I420_10LE", "NV12", "I420"],
-    )
+    build_raw_appsink_with_caps(frame_slot, dovi_state, hevc_raw_caps())
 }
 
 fn build_raw_appsink(frame_slot: FrameSlot, dovi_state: Option<DoviState>) -> gst_app::AppSink {
-    build_raw_appsink_with_formats(frame_slot, dovi_state, ["P010_10LE", "I420_10LE", "BGRA"])
+    build_raw_appsink_with_formats(
+        frame_slot,
+        dovi_state,
+        ["P010_10LE", "I420_10LE", "BGRA"],
+        false,
+    )
 }
 
 fn build_raw_appsink_with_formats<const N: usize>(
     frame_slot: FrameSlot,
     dovi_state: Option<DoviState>,
     formats: [&'static str; N],
+    prefer_dmabuf: bool,
 ) -> gst_app::AppSink {
-    let caps = gst::Caps::builder("video/x-raw")
-        .field("format", gst::List::new(formats))
-        .build();
+    build_raw_appsink_with_caps(
+        frame_slot,
+        dovi_state,
+        raw_caps_with_formats(formats, prefer_dmabuf),
+    )
+}
+
+fn build_raw_appsink_with_caps(
+    frame_slot: FrameSlot,
+    dovi_state: Option<DoviState>,
+    caps: gst::Caps,
+) -> gst_app::AppSink {
     let sample_frame_slot = frame_slot.clone();
     let sample_dovi_state = dovi_state.clone();
     let preroll_frame_slot = frame_slot;
@@ -803,6 +823,35 @@ fn build_raw_appsink_with_formats<const N: usize>(
     appsink
 }
 
+fn hevc_raw_caps() -> gst::Caps {
+    raw_caps_with_formats(["P010_10LE", "I420_10LE", "NV12", "I420"], true)
+}
+
+fn raw_caps_with_formats<const N: usize>(
+    formats: [&'static str; N],
+    prefer_dmabuf: bool,
+) -> gst::Caps {
+    let raw_structure = gst::Structure::builder("video/x-raw")
+        .field("format", gst::List::new(formats))
+        .build();
+
+    if !prefer_dmabuf {
+        return gst::Caps::builder_full().structure(raw_structure).build();
+    }
+
+    let dmabuf_structure = gst::Structure::builder("video/x-raw")
+        .field("format", "DMA_DRM")
+        .build();
+
+    gst::Caps::builder_full()
+        .structure_with_features(
+            dmabuf_structure,
+            gst::CapsFeatures::new([DMABUF_MEMORY_FEATURE]),
+        )
+        .structure(raw_structure)
+        .build()
+}
+
 fn push_decoded_sample(
     sample: gst::Sample,
     frame_slot: &FrameSlot,
@@ -834,6 +883,10 @@ fn decoded_frame_from_sample(
     dovi_state: Option<&DoviState>,
 ) -> std::result::Result<DecodedFrame, String> {
     let caps = sample.caps().ok_or_else(|| "视频帧缺少 caps".to_string())?;
+    if gst_video::is_dma_drm_caps(caps) {
+        return decoded_dmabuf_frame_from_sample(sample, caps, dovi_state);
+    }
+
     let info = gst_video::VideoInfo::from_caps(caps).map_err(|error| error.to_string())?;
     let buffer = sample
         .buffer()
@@ -845,18 +898,7 @@ fn decoded_frame_from_sample(
     };
     let raw_format = RawVideoFormat::from_gstreamer_name(info.name());
     let dovi_metadata = dovi_state.and_then(|state| state.take_rpu_for_frame(pts));
-    let color = match dovi_metadata.as_ref().map(|metadata| metadata.profile) {
-        Some(5) => FrameColor::DolbyVisionProfile5,
-        Some(_) => frame_color(&info, raw_format, dovi_state.is_some()),
-        None if dovi_state.is_some_and(DoviState::profile5_seen) => {
-            tracing::debug!(
-                pts = ?pts.map(|pts| pts.nsecs),
-                "Dolby Vision Profile 5 frame is missing RPU metadata; using negotiated color"
-            );
-            frame_color(&info, raw_format, dovi_state.is_some())
-        }
-        None => frame_color(&info, raw_format, dovi_state.is_some()),
-    };
+    let color = decoded_frame_color(&info, raw_format, dovi_state, pts, dovi_metadata.as_ref());
     trace_negotiated_caps(&info, color);
 
     let pixels = if let Some(format) = raw_format {
@@ -904,6 +946,80 @@ fn decoded_frame_from_sample(
     Ok(DecodedFrame { size, pts, pixels })
 }
 
+fn decoded_dmabuf_frame_from_sample(
+    sample: &gst::Sample,
+    caps: &gst::CapsRef,
+    dovi_state: Option<&DoviState>,
+) -> std::result::Result<DecodedFrame, String> {
+    let drm_info =
+        gst_video::VideoInfoDmaDrm::from_caps(caps).map_err(|error| error.to_string())?;
+    let buffer = sample
+        .buffer()
+        .ok_or_else(|| "视频帧缺少 buffer".to_string())?;
+    let pts = frame_pts_from_buffer(buffer);
+    let size = RenderSize {
+        width: drm_info.width(),
+        height: drm_info.height(),
+    };
+    let raw_format = raw_video_format_from_dma_drm(&drm_info).ok_or_else(|| {
+        format!(
+            "不支持的 DMA_DRM 视频帧格式：fourcc=0x{:08x}, modifier=0x{:016x}",
+            drm_info.fourcc(),
+            drm_info.modifier()
+        )
+    })?;
+    let dovi_metadata = dovi_state.and_then(|state| state.take_rpu_for_frame(pts));
+    let color = decoded_frame_color(
+        &drm_info,
+        Some(raw_format),
+        dovi_state,
+        pts,
+        dovi_metadata.as_ref(),
+    );
+    trace_negotiated_caps(&drm_info, color);
+
+    let metadata = dovi_metadata.map(|dolby_vision| FrameDynamicMetadata {
+        dolby_vision: Some(dolby_vision),
+    });
+    let raw = dmabuf_raw_video_frame_from_sample(
+        &drm_info,
+        size,
+        raw_format,
+        color,
+        metadata,
+        sample
+            .buffer_owned()
+            .ok_or_else(|| "视频帧缺少 buffer".to_string())?,
+    )?;
+
+    Ok(DecodedFrame {
+        size,
+        pts,
+        pixels: FramePixels::RawVideo(raw),
+    })
+}
+
+fn decoded_frame_color(
+    info: &gst_video::VideoInfo,
+    raw_format: Option<RawVideoFormat>,
+    dovi_state: Option<&DoviState>,
+    pts: Option<FramePts>,
+    dovi_metadata: Option<&DoviFrameMetadata>,
+) -> FrameColor {
+    match dovi_metadata.map(|metadata| metadata.profile) {
+        Some(5) => FrameColor::DolbyVisionProfile5,
+        Some(_) => frame_color(info, raw_format, dovi_state.is_some()),
+        None if dovi_state.is_some_and(DoviState::profile5_seen) => {
+            tracing::debug!(
+                pts = ?pts.map(|pts| pts.nsecs),
+                "Dolby Vision Profile 5 frame is missing RPU metadata; using negotiated color"
+            );
+            frame_color(info, raw_format, dovi_state.is_some())
+        }
+        None => frame_color(info, raw_format, dovi_state.is_some()),
+    }
+}
+
 fn frame_pts_from_buffer(buffer: &gst::BufferRef) -> Option<FramePts> {
     buffer.pts().map(|pts| FramePts {
         nsecs: pts.nseconds(),
@@ -949,6 +1065,180 @@ fn raw_video_frame_from_sample(
     })
 }
 
+fn dmabuf_raw_video_frame_from_sample(
+    info: &gst_video::VideoInfoDmaDrm,
+    size: RenderSize,
+    format: RawVideoFormat,
+    color: FrameColor,
+    metadata: Option<FrameDynamicMetadata>,
+    buffer: gst::Buffer,
+) -> std::result::Result<RawVideoFrame, String> {
+    let mut planes = Vec::with_capacity(format.plane_count());
+    {
+        let meta = buffer
+            .meta::<gst_video::VideoMeta>()
+            .ok_or_else(|| "DMA_DRM 视频帧缺少 VideoMeta".to_string())?;
+        if meta.n_planes() as usize != format.plane_count() {
+            return Err("DMA_DRM 视频帧 plane 数量不匹配".to_string());
+        }
+
+        let plane_sizes = meta.plane_size().ok();
+        let plane_heights = meta.plane_height().ok();
+        for plane_index in 0..format.plane_count() {
+            let layout = format
+                .plane_layout(size, plane_index)
+                .map_err(|error| error.to_string())?;
+            let buffer_offset = *meta
+                .offset()
+                .get(plane_index)
+                .ok_or_else(|| "DMA_DRM 视频帧缺少 plane offset".to_string())?;
+            let stride = meta
+                .stride()
+                .get(plane_index)
+                .copied()
+                .ok_or_else(|| "DMA_DRM 视频帧缺少 stride".to_string())?;
+            let stride =
+                usize::try_from(stride).map_err(|_| "DMA_DRM 视频帧 stride 无效".to_string())?;
+            if stride < layout.row_len {
+                return Err("DMA_DRM 视频帧 stride 无效".to_string());
+            }
+
+            let meta_height = plane_heights
+                .as_ref()
+                .and_then(|heights| heights.get(plane_index).copied())
+                .filter(|height| *height > 0)
+                .unwrap_or(layout.height);
+            let computed_span = plane_span_from_stride(stride, layout.row_len, meta_height)?;
+            let plane_span = plane_sizes
+                .as_ref()
+                .and_then(|sizes| sizes.get(plane_index).copied())
+                .filter(|size| *size > 0)
+                .unwrap_or(computed_span)
+                .max(computed_span);
+            let (memory_index, memory, memory_skip) =
+                dmabuf_plane_memory(&buffer, plane_index, buffer_offset, plane_span)?;
+            let fd = dmabuf_memory_fd(memory)
+                .ok_or_else(|| "DMA_DRM 视频帧 memory 不是 DMABuf".to_string())?;
+            let (memory_size, base_offset, max_size) = memory.sizes();
+            let memory_offset = base_offset
+                .checked_add(memory_skip)
+                .ok_or_else(|| "DMA_DRM 视频帧 memory offset 太大".to_string())?;
+            let memory_size = max_size.max(memory_size);
+            let buffer_offset = buffer_memory_prefix(&buffer, memory_index)?
+                .checked_add(memory_skip)
+                .ok_or_else(|| "DMA_DRM 视频帧 buffer offset 太大".to_string())?;
+            let drm_format = format
+                .drm_plane_fourcc(plane_index)
+                .ok_or_else(|| "DMA_DRM 视频帧格式不支持 import".to_string())?;
+
+            planes.push(RawVideoDmaBufPlane {
+                fd,
+                buffer_offset,
+                memory_offset,
+                memory_size,
+                stride,
+                width: layout.width,
+                height: layout.height,
+                drm_format,
+                drm_modifier: info.modifier(),
+            });
+        }
+    }
+
+    trace_negotiated_dmabuf_caps(info, format, &planes, color);
+
+    Ok(RawVideoFrame {
+        format,
+        color,
+        range: raw_video_range(info.colorimetry().range()),
+        chroma_site: raw_video_chroma_site(info.chroma_site()),
+        metadata,
+        planes: RawVideoPlanes::DmaBuf { buffer, planes },
+    })
+}
+
+fn raw_video_format_from_dma_drm(info: &gst_video::VideoInfoDmaDrm) -> Option<RawVideoFormat> {
+    let format = gst_video::dma_drm_fourcc_to_format(info.fourcc()).ok()?;
+    RawVideoFormat::from_gstreamer_name(format.to_str().as_str())
+}
+
+fn dmabuf_plane_memory(
+    buffer: &gst::Buffer,
+    plane_index: usize,
+    buffer_offset: usize,
+    plane_span: usize,
+) -> std::result::Result<(usize, &gst::MemoryRef, usize), String> {
+    let memory_end = buffer_offset
+        .checked_add(plane_span.max(1))
+        .ok_or_else(|| "DMA_DRM 视频帧 plane 太大".to_string())?;
+    let found_memory =
+        buffer
+            .find_memory(buffer_offset..memory_end)
+            .and_then(|(memory_range, memory_skip)| {
+                (memory_range.len() == 1).then_some((memory_range.start, memory_skip))
+            });
+
+    if buffer.n_memory()
+        == buffer
+            .meta::<gst_video::VideoMeta>()
+            .map(|meta| meta.n_planes() as usize)
+            .unwrap_or(0)
+        && plane_index < buffer.n_memory()
+    {
+        let plane_memory = buffer.peek_memory(plane_index);
+        if dmabuf_memory_fd(plane_memory).is_some() {
+            let memory_skip = match found_memory {
+                Some((memory_index, memory_skip)) if memory_index == plane_index => memory_skip,
+                _ => buffer_offset,
+            };
+            return Ok((plane_index, plane_memory, memory_skip));
+        }
+    }
+
+    let (memory_index, memory_skip) =
+        found_memory.ok_or_else(|| "DMA_DRM 视频帧 plane 缺少独立 memory".to_string())?;
+    Ok((memory_index, buffer.peek_memory(memory_index), memory_skip))
+}
+
+fn buffer_memory_prefix(
+    buffer: &gst::Buffer,
+    memory_index: usize,
+) -> std::result::Result<usize, String> {
+    let mut offset = 0usize;
+    for index in 0..memory_index {
+        offset = offset
+            .checked_add(buffer.peek_memory(index).size())
+            .ok_or_else(|| "DMA_DRM 视频帧 buffer offset 太大".to_string())?;
+    }
+    Ok(offset)
+}
+
+fn dmabuf_memory_fd(memory: &gst::MemoryRef) -> Option<i32> {
+    if !memory.is_type("dmabuf")
+        && unsafe { gst_is_dmabuf_memory(memory.as_mut_ptr()) == gst::glib::ffi::GFALSE }
+    {
+        return None;
+    }
+
+    let fd = unsafe { gst_dmabuf_memory_get_fd(memory.as_mut_ptr()) };
+    (fd >= 0).then_some(fd)
+}
+
+fn plane_span_from_stride(
+    stride: usize,
+    row_len: usize,
+    height: u32,
+) -> std::result::Result<usize, String> {
+    if row_len == 0 || height == 0 {
+        return Err("DMA_DRM 视频帧尺寸无效".to_string());
+    }
+    let height = usize::try_from(height).map_err(|_| "DMA_DRM 视频帧太高".to_string())?;
+    stride
+        .checked_mul(height.saturating_sub(1))
+        .and_then(|prefix| prefix.checked_add(row_len))
+        .ok_or_else(|| "DMA_DRM 视频帧 plane 太大".to_string())
+}
+
 fn trace_negotiated_caps(info: &gst_video::VideoInfo, color: FrameColor) {
     if !matches!(
         color,
@@ -969,6 +1259,31 @@ fn trace_negotiated_caps(info: &gst_video::VideoInfo, color: FrameColor) {
         strides = ?info.stride(),
         offsets = ?info.offset(),
         "negotiated GStreamer raw video caps"
+    );
+}
+
+fn trace_negotiated_dmabuf_caps(
+    info: &gst_video::VideoInfoDmaDrm,
+    format: RawVideoFormat,
+    planes: &[RawVideoDmaBufPlane],
+    color: FrameColor,
+) {
+    if NEGOTIATED_DMABUF_LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    tracing::debug!(
+        format = ?format,
+        color = ?color,
+        colorimetry = %info.colorimetry(),
+        range = ?info.colorimetry().range(),
+        chroma_site = %info.chroma_site(),
+        width = info.width(),
+        height = info.height(),
+        drm_fourcc = format!("0x{:08x}", info.fourcc()),
+        drm_modifier = format!("0x{:016x}", info.modifier()),
+        planes = ?planes,
+        "negotiated GStreamer DMA_DRM video caps"
     );
 }
 
@@ -1060,6 +1375,28 @@ mod tests {
         assert!(value_changed(None, 1.0));
         assert!(!value_changed(Some(1.0), 1.01));
         assert!(value_changed(Some(1.0), 1.1));
+    }
+
+    #[test]
+    fn hevc_raw_caps_prefers_dmabuf_and_keeps_cpu_fallback() {
+        gst::init().unwrap();
+
+        let caps = hevc_raw_caps();
+
+        assert_eq!(caps.size(), 2);
+        assert!(
+            caps.features(0)
+                .expect("dmabuf caps have features")
+                .contains(DMABUF_MEMORY_FEATURE)
+        );
+        assert_eq!(
+            caps.structure(0)
+                .expect("dmabuf caps have a structure")
+                .get::<&str>("format")
+                .unwrap(),
+            "DMA_DRM"
+        );
+        assert!(caps.to_string().contains("P010_10LE"));
     }
 
     #[test]

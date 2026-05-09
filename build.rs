@@ -7,6 +7,9 @@ fn main() {
         .atleast_version("7")
         .probe("libplacebo")
         .expect("libplacebo 7 is required for HDR tone mapping");
+    pkg_config::Config::new()
+        .probe("gstreamer-allocators-1.0")
+        .expect("gstreamer-allocators-1.0 is required for DMABuf video import");
 
     let mut builder = bindgen::Builder::default()
         .header_contents(

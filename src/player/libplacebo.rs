@@ -1,4 +1,12 @@
-use std::{ffi::CString, mem, os::raw::c_void, ptr};
+use std::{
+    ffi::CString,
+    mem,
+    os::{
+        fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
+        raw::c_void,
+    },
+    ptr,
+};
 
 use anyhow::{Context, Result, anyhow};
 use dolby_vision::rpu::{
@@ -11,8 +19,8 @@ use dolby_vision::rpu::{
 use super::{
     dovi::DoviFrameMetadata,
     render_host::{
-        FrameColor, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlanes,
-        RawVideoRange, RenderSize, frame_byte_len, raw_plane_slice_from_stride,
+        FrameColor, RawVideoChromaSite, RawVideoDmaBufPlane, RawVideoFormat, RawVideoFrame,
+        RawVideoPlanes, RawVideoRange, RenderSize, frame_byte_len, raw_plane_slice_from_stride,
     },
 };
 
@@ -54,6 +62,42 @@ impl OutputTextureFormat {
 struct UploadedSourceFrame {
     frame: ffi::pl_frame,
     _dovi_metadata: Option<Box<ffi::pl_dovi_metadata>>,
+    _imported_textures: ImportedSourceTextures,
+}
+
+struct ImportedSourceTextures {
+    gpu: ffi::pl_gpu,
+    textures: Vec<ffi::pl_tex>,
+}
+
+impl ImportedSourceTextures {
+    fn new(gpu: ffi::pl_gpu) -> Self {
+        Self {
+            gpu,
+            textures: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, texture: ffi::pl_tex) {
+        self.textures.push(texture);
+    }
+}
+
+impl Drop for ImportedSourceTextures {
+    fn drop(&mut self) {
+        if self.gpu.is_null() {
+            return;
+        }
+
+        unsafe {
+            for texture in self.textures.drain(..) {
+                let mut texture = texture;
+                if !texture.is_null() {
+                    ffi::pl_tex_destroy(self.gpu, &mut texture);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -180,6 +224,7 @@ impl LibplaceboToneMapper {
             frame.repr.dovi = dovi_metadata.as_ref() as *const ffi::pl_dovi_metadata;
         }
         frame.crop = rect_for_size(size);
+        let mut imported_textures = ImportedSourceTextures::new(self.gpu);
 
         match &input.planes {
             RawVideoPlanes::Owned(planes) => {
@@ -196,31 +241,30 @@ impl LibplaceboToneMapper {
                     }
                 }
             }
-            RawVideoPlanes::GStreamer { buffer, planes } => {
-                let map = buffer
-                    .map_readable()
-                    .map_err(|error| anyhow!("map GStreamer video frame failed: {error}"))?;
-                let data = map.as_slice();
-                for (plane_index, plane) in planes.iter().enumerate() {
-                    let layout =
-                        input
-                            .format
-                            .plane_layout_for_color(size, plane_index, input.color)?;
-                    let plane_data = raw_plane_slice_from_stride(
-                        data,
-                        plane.offset,
-                        plane.stride,
-                        layout.row_len,
-                        layout.height,
-                    )?;
+            RawVideoPlanes::GStreamer { buffer, planes } => unsafe {
+                self.upload_gstreamer_buffer_planes(
+                    &mut frame,
+                    input,
+                    size,
+                    buffer,
+                    planes.iter().map(|plane| (plane.offset, plane.stride)),
+                )?;
+            },
+            RawVideoPlanes::DmaBuf { buffer, planes } => {
+                if let Some(textures) =
+                    unsafe { self.import_dmabuf_source_frame(&mut frame, input, size, planes)? }
+                {
+                    imported_textures = textures;
+                } else {
                     unsafe {
-                        self.upload_source_plane(
+                        self.upload_gstreamer_buffer_planes(
                             &mut frame,
                             input,
                             size,
-                            plane_index,
-                            plane_data,
-                            plane.stride,
+                            buffer,
+                            planes
+                                .iter()
+                                .map(|plane| (plane.buffer_offset, plane.stride)),
                         )?;
                     }
                 }
@@ -231,7 +275,130 @@ impl LibplaceboToneMapper {
         Ok(UploadedSourceFrame {
             frame,
             _dovi_metadata: dovi_metadata,
+            _imported_textures: imported_textures,
         })
+    }
+
+    unsafe fn upload_gstreamer_buffer_planes<I>(
+        &mut self,
+        frame: &mut ffi::pl_frame,
+        input: &RawVideoFrame,
+        size: RenderSize,
+        buffer: &gstreamer::Buffer,
+        planes: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (usize, usize)>,
+    {
+        let map = buffer
+            .map_readable()
+            .map_err(|error| anyhow!("map GStreamer video frame failed: {error}"))?;
+        let data = map.as_slice();
+        for (plane_index, (offset, stride)) in planes.into_iter().enumerate() {
+            let layout = input
+                .format
+                .plane_layout_for_color(size, plane_index, input.color)?;
+            let plane_data =
+                raw_plane_slice_from_stride(data, offset, stride, layout.row_len, layout.height)?;
+            unsafe {
+                self.upload_source_plane(frame, input, size, plane_index, plane_data, stride)?;
+            }
+        }
+        Ok(())
+    }
+
+    unsafe fn import_dmabuf_source_frame(
+        &mut self,
+        frame: &mut ffi::pl_frame,
+        input: &RawVideoFrame,
+        size: RenderSize,
+        planes: &[RawVideoDmaBufPlane],
+    ) -> Result<Option<ImportedSourceTextures>> {
+        if unsafe { (*self.gpu).import_caps.tex } & u64::from(ffi::pl_handle_type_PL_HANDLE_DMA_BUF)
+            == 0
+        {
+            tracing::debug!("libplacebo GPU does not support DMABuf texture import");
+            return Ok(None);
+        }
+
+        let mut textures = ImportedSourceTextures::new(self.gpu);
+        for (plane_index, plane) in planes.iter().enumerate() {
+            let layout = input
+                .format
+                .plane_layout_for_color(size, plane_index, input.color)?;
+            if layout.width != plane.width || layout.height != plane.height {
+                tracing::debug!(
+                    plane = plane_index,
+                    expected_width = layout.width,
+                    expected_height = layout.height,
+                    dmabuf_width = plane.width,
+                    dmabuf_height = plane.height,
+                    "DMABuf plane dimensions do not match libplacebo layout"
+                );
+                return Ok(None);
+            }
+            let format = unsafe { ffi::pl_find_fourcc(self.gpu, plane.drm_format) };
+            if format.is_null() {
+                tracing::debug!(
+                    plane = plane_index,
+                    drm_format = format!("0x{:08x}", plane.drm_format),
+                    "libplacebo cannot import DMABuf plane format"
+                );
+                return Ok(None);
+            }
+            if !unsafe { ffi::pl_fmt_has_modifier(format, plane.drm_modifier) } {
+                tracing::debug!(
+                    plane = plane_index,
+                    drm_format = format!("0x{:08x}", plane.drm_format),
+                    drm_modifier = format!("0x{:016x}", plane.drm_modifier),
+                    "libplacebo cannot import DMABuf plane modifier"
+                );
+                return Ok(None);
+            }
+
+            let imported_fd = duplicate_fd(plane.fd)
+                .with_context(|| format!("duplicate DMABuf fd for plane {plane_index} failed"))?;
+            let mut params = unsafe { mem::zeroed::<ffi::pl_tex_params>() };
+            params.w =
+                i32::try_from(plane.width).map_err(|_| anyhow!("video frame is too wide"))?;
+            params.h =
+                i32::try_from(plane.height).map_err(|_| anyhow!("video frame is too tall"))?;
+            params.format = format;
+            params.sampleable = true;
+            params.blit_src =
+                unsafe { (*format).caps & ffi::pl_fmt_caps_PL_FMT_CAP_BLITTABLE } != 0;
+            params.import_handle = ffi::pl_handle_type_PL_HANDLE_DMA_BUF;
+            params.shared_mem.handle.fd = imported_fd;
+            params.shared_mem.size = plane.memory_size;
+            params.shared_mem.offset = plane.memory_offset;
+            params.shared_mem.drm_format_mod = plane.drm_modifier;
+            params.shared_mem.stride_w = plane.stride;
+
+            let texture = unsafe { ffi::pl_tex_create(self.gpu, &params) };
+            if texture.is_null() {
+                close_fd(imported_fd);
+                tracing::debug!(
+                    plane = plane_index,
+                    drm_format = format!("0x{:08x}", plane.drm_format),
+                    drm_modifier = format!("0x{:016x}", plane.drm_modifier),
+                    "libplacebo DMABuf plane import failed"
+                );
+                return Ok(None);
+            }
+
+            let mut out_plane = unsafe { mem::zeroed::<ffi::pl_plane>() };
+            out_plane.texture = texture;
+            out_plane.components = i32::try_from(layout.components)
+                .map_err(|_| anyhow!("invalid plane component count"))?;
+            out_plane.component_mapping = layout.component_map;
+            out_plane.flipped = false;
+            out_plane.shift_x = 0.0;
+            out_plane.shift_y = 0.0;
+            frame.planes[plane_index] = out_plane;
+            textures.push(texture);
+        }
+
+        Ok(Some(textures))
     }
 
     unsafe fn upload_source_plane(
@@ -355,6 +522,17 @@ impl Drop for LibplaceboToneMapper {
                 ffi::pl_vulkan_destroy(&mut self.vulkan);
             }
         }
+    }
+}
+
+fn duplicate_fd(fd: i32) -> Result<i32> {
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    Ok(borrowed.try_clone_to_owned()?.into_raw_fd())
+}
+
+fn close_fd(fd: i32) {
+    unsafe {
+        drop(OwnedFd::from_raw_fd(fd));
     }
 }
 
