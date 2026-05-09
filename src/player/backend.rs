@@ -15,8 +15,8 @@ use gstreamer_video as gst_video;
 use super::dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat};
 use super::render_host::{
     DecodedFrame, FrameColor, FrameDynamicMetadata, FramePixels, FramePts, FrameSlot,
-    RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlane, RawVideoRange, RenderSize,
-    packed_bgra_from_stride, raw_plane_from_stride,
+    RawVideoBufferPlane, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlanes,
+    RawVideoRange, RenderSize, packed_bgra_from_stride, validate_raw_plane_from_stride,
 };
 
 const POSITION_QUERY_INTERVAL: Duration = Duration::from_millis(250);
@@ -745,7 +745,7 @@ fn build_hevc_raw_appsink(
     build_raw_appsink_with_formats(
         frame_slot,
         dovi_state,
-        ["P010_10LE", "I420_10LE", "NV12", "I420", "BGRA"],
+        ["P010_10LE", "I420_10LE", "NV12", "I420"],
     )
 }
 
@@ -839,7 +839,6 @@ fn decoded_frame_from_sample(
         .buffer()
         .ok_or_else(|| "视频帧缺少 buffer".to_string())?;
     let pts = frame_pts_from_buffer(buffer);
-    let map = buffer.map_readable().map_err(|error| error.to_string())?;
     let size = RenderSize {
         width: info.width(),
         height: info.height(),
@@ -865,16 +864,27 @@ fn decoded_frame_from_sample(
             dolby_vision: Some(dolby_vision),
         });
         FramePixels::RawVideo(raw_video_frame_from_sample(
-            map.as_slice(),
             &info,
             size,
             format,
             color,
             metadata,
+            sample
+                .buffer_owned()
+                .ok_or_else(|| "视频帧缺少 buffer".to_string())?,
         )?)
     } else {
         match info.name() {
             "BGRA" => {
+                if matches!(
+                    color,
+                    FrameColor::Hdr10Bt2020 | FrameColor::DolbyVisionProfile5
+                ) {
+                    return Err(format!(
+                        "{color:?} 视频协商到 8-bit BGRA，已拒绝 HDR/Dolby Vision 降级"
+                    ));
+                }
+                let map = buffer.map_readable().map_err(|error| error.to_string())?;
                 let stride = info
                     .stride()
                     .first()
@@ -882,12 +892,6 @@ fn decoded_frame_from_sample(
                     .ok_or_else(|| "视频帧缺少 stride".to_string())?;
                 let stride =
                     usize::try_from(stride).map_err(|_| "视频帧 stride 无效".to_string())?;
-                if color == FrameColor::Hdr10Bt2020 {
-                    tracing::warn!(
-                        colorimetry = %info.colorimetry(),
-                        "HDR video negotiated 8-bit BGRA fallback before libplacebo"
-                    );
-                }
                 FramePixels::Bgra8(
                     packed_bgra_from_stride(map.as_slice(), size, stride)
                         .map_err(|error| error.to_string())?,
@@ -907,13 +911,14 @@ fn frame_pts_from_buffer(buffer: &gst::BufferRef) -> Option<FramePts> {
 }
 
 fn raw_video_frame_from_sample(
-    data: &[u8],
     info: &gst_video::VideoInfo,
     size: RenderSize,
     format: RawVideoFormat,
     color: FrameColor,
     metadata: Option<FrameDynamicMetadata>,
+    buffer: gst::Buffer,
 ) -> std::result::Result<RawVideoFrame, String> {
+    let buffer_size = buffer.size();
     let mut planes = Vec::with_capacity(format.plane_count());
     for plane_index in 0..format.plane_count() {
         let layout = format
@@ -929,9 +934,9 @@ fn raw_video_frame_from_sample(
             .copied()
             .ok_or_else(|| "视频帧缺少 stride".to_string())?;
         let stride = usize::try_from(stride).map_err(|_| "视频帧 stride 无效".to_string())?;
-        let data = raw_plane_from_stride(data, offset, stride, layout.row_len, layout.height)
+        validate_raw_plane_from_stride(buffer_size, offset, stride, layout.row_len, layout.height)
             .map_err(|error| error.to_string())?;
-        planes.push(RawVideoPlane { data, stride });
+        planes.push(RawVideoBufferPlane { offset, stride });
     }
 
     Ok(RawVideoFrame {
@@ -940,7 +945,7 @@ fn raw_video_frame_from_sample(
         range: raw_video_range(info.colorimetry().range()),
         chroma_site: raw_video_chroma_site(info.chroma_site()),
         metadata,
-        planes,
+        planes: RawVideoPlanes::GStreamer { buffer, planes },
     })
 }
 

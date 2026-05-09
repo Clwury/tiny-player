@@ -252,15 +252,16 @@ impl Render for PlaybackPage {
         let has_viewport = self
             .video_viewport_bounds
             .is_some_and(|viewport_bounds| normalize_video_viewport(viewport_bounds).is_some());
-        if should_request_animation_frame(
-            self.video.owner().is_some(),
-            self.video.dependent().is_some(),
-            self.current_file_loaded,
-            self.error_message.is_some(),
+        if should_request_animation_frame(AnimationFrameRequestState {
+            has_backend: self.video.owner().is_some(),
+            has_video_presenter: self.video.dependent().is_some(),
+            has_loaded_file: self.current_file_loaded,
+            has_error: self.error_message.is_some(),
             has_viewport,
-            self.playback_paused,
-            self.playback_buffering,
-        ) {
+            has_visible_frame: current_frame.is_some(),
+            playback_paused: self.playback_paused,
+            playback_buffering: self.playback_buffering,
+        }) {
             window.request_animation_frame();
         }
 
@@ -463,7 +464,10 @@ fn aspect_fit_bounds(bounds: Bounds<Pixels>, source: RenderSize) -> Option<Bound
 
 fn render_output_size(bounds: Bounds<Pixels>, source: RenderSize) -> Option<RenderSize> {
     let (width, height) = normalize_video_viewport(aspect_fit_bounds(bounds, source)?)?;
-    Some(RenderSize { width, height })
+    Some(RenderSize {
+        width: width.min(source.width),
+        height: height.min(source.height),
+    })
 }
 
 fn defer_drop_frame(frame: Arc<RenderImage>, window: &mut Window) {
@@ -500,19 +504,25 @@ fn should_render_frame(
     has_video_presenter && has_loaded_file && !has_error && has_video_size && has_viewport
 }
 
-fn should_request_animation_frame(
+#[derive(Clone, Copy)]
+struct AnimationFrameRequestState {
     has_backend: bool,
     has_video_presenter: bool,
     has_loaded_file: bool,
     has_error: bool,
     has_viewport: bool,
+    has_visible_frame: bool,
     playback_paused: bool,
     playback_buffering: bool,
-) -> bool {
-    has_backend
-        && has_video_presenter
-        && !has_error
-        && (!has_loaded_file || playback_buffering || (has_viewport && !playback_paused))
+}
+
+fn should_request_animation_frame(state: AnimationFrameRequestState) -> bool {
+    state.has_backend
+        && state.has_video_presenter
+        && !state.has_error
+        && (!state.has_loaded_file
+            || state.playback_buffering
+            || (state.has_viewport && (!state.playback_paused || !state.has_visible_frame)))
 }
 
 #[cfg(test)]
@@ -522,8 +532,8 @@ mod tests {
     use gpui::{Bounds, point, px, size};
 
     use super::{
-        RenderSize, ShutdownOrder, aspect_fit_bounds, normalize_video_viewport,
-        playback_status_message, render_output_size, should_render_frame,
+        AnimationFrameRequestState, RenderSize, ShutdownOrder, aspect_fit_bounds,
+        normalize_video_viewport, playback_status_message, render_output_size, should_render_frame,
         should_request_animation_frame, viewport_changed,
     };
 
@@ -658,6 +668,25 @@ mod tests {
     }
 
     #[test]
+    fn render_output_size_does_not_upscale_past_source() {
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(3840.0), px(2160.0)));
+
+        assert_eq!(
+            render_output_size(
+                bounds,
+                RenderSize {
+                    width: 1280,
+                    height: 720,
+                },
+            ),
+            Some(RenderSize {
+                width: 1280,
+                height: 720,
+            })
+        );
+    }
+
+    #[test]
     fn playback_status_stays_visible_until_first_frame() {
         assert_eq!(playback_status_message(true, false), "正在缓冲视频…");
         assert_eq!(playback_status_message(false, false), "正在加载视频…");
@@ -676,46 +705,95 @@ mod tests {
 
     #[test]
     fn should_request_animation_frame_drives_initial_load() {
-        assert!(should_request_animation_frame(
-            true, true, false, false, false, true, false
-        ));
+        assert!(should_request_animation_frame(AnimationFrameRequestState {
+            has_loaded_file: false,
+            has_viewport: false,
+            playback_paused: true,
+            ..animation_frame_request_state()
+        }));
     }
 
     #[test]
     fn should_request_animation_frame_requires_backend_and_presenter() {
         assert!(!should_request_animation_frame(
-            false, true, false, false, false, true, false
+            AnimationFrameRequestState {
+                has_backend: false,
+                has_loaded_file: false,
+                has_viewport: false,
+                playback_paused: true,
+                ..animation_frame_request_state()
+            }
         ));
         assert!(!should_request_animation_frame(
-            true, false, false, false, false, true, false
+            AnimationFrameRequestState {
+                has_video_presenter: false,
+                has_loaded_file: false,
+                has_viewport: false,
+                playback_paused: true,
+                ..animation_frame_request_state()
+            }
         ));
     }
 
     #[test]
     fn should_request_animation_frame_stops_on_error() {
         assert!(!should_request_animation_frame(
-            true, true, false, true, false, true, false
+            AnimationFrameRequestState {
+                has_loaded_file: false,
+                has_error: true,
+                has_viewport: false,
+                playback_paused: true,
+                ..animation_frame_request_state()
+            }
         ));
     }
 
     #[test]
     fn should_request_animation_frame_requires_unpaused_loaded_video_with_viewport() {
-        assert!(should_request_animation_frame(
-            true, true, true, false, true, false, false
+        assert!(should_request_animation_frame(AnimationFrameRequestState {
+            playback_paused: false,
+            ..animation_frame_request_state()
+        }));
+        assert!(!should_request_animation_frame(
+            animation_frame_request_state()
         ));
         assert!(!should_request_animation_frame(
-            true, true, true, false, true, true, false
-        ));
-        assert!(!should_request_animation_frame(
-            true, true, true, false, false, false, false
+            AnimationFrameRequestState {
+                has_viewport: false,
+                playback_paused: false,
+                ..animation_frame_request_state()
+            }
         ));
     }
 
     #[test]
+    fn should_request_animation_frame_continues_until_first_visible_frame() {
+        assert!(should_request_animation_frame(AnimationFrameRequestState {
+            has_visible_frame: false,
+            ..animation_frame_request_state()
+        }));
+    }
+
+    #[test]
     fn should_request_animation_frame_continues_while_buffering() {
-        assert!(should_request_animation_frame(
-            true, true, true, false, false, true, true
-        ));
+        assert!(should_request_animation_frame(AnimationFrameRequestState {
+            has_viewport: false,
+            playback_buffering: true,
+            ..animation_frame_request_state()
+        }));
+    }
+
+    fn animation_frame_request_state() -> AnimationFrameRequestState {
+        AnimationFrameRequestState {
+            has_backend: true,
+            has_video_presenter: true,
+            has_loaded_file: true,
+            has_error: false,
+            has_viewport: true,
+            has_visible_frame: true,
+            playback_paused: true,
+            playback_buffering: false,
+        }
     }
 
     #[test]

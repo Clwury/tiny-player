@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use gpui::RenderImage;
+use gstreamer as gst;
 use image::{Frame, ImageBuffer, RgbaImage};
 
 use super::dovi::DoviFrameMetadata;
@@ -37,7 +38,7 @@ pub struct RawVideoFrame {
     pub range: RawVideoRange,
     pub chroma_site: RawVideoChromaSite,
     pub metadata: Option<FrameDynamicMetadata>,
-    pub planes: Vec<RawVideoPlane>,
+    pub planes: RawVideoPlanes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,8 +47,33 @@ pub struct FrameDynamicMetadata {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RawVideoPlanes {
+    #[cfg_attr(not(test), allow(dead_code))]
+    Owned(Vec<RawVideoPlane>),
+    GStreamer {
+        buffer: gst::Buffer,
+        planes: Vec<RawVideoBufferPlane>,
+    },
+}
+
+impl RawVideoPlanes {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Owned(planes) => planes.len(),
+            Self::GStreamer { planes, .. } => planes.len(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawVideoPlane {
     pub data: Vec<u8>,
+    pub stride: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawVideoBufferPlane {
+    pub offset: usize,
     pub stride: usize,
 }
 
@@ -279,6 +305,7 @@ pub fn packed_frame_data_from_stride(
     Ok(pixels)
 }
 
+#[cfg(test)]
 pub fn raw_plane_from_stride(
     data: &[u8],
     offset: usize,
@@ -286,6 +313,37 @@ pub fn raw_plane_from_stride(
     row_len: usize,
     height: u32,
 ) -> Result<Vec<u8>> {
+    Ok(raw_plane_slice_from_stride(data, offset, stride, row_len, height)?.to_vec())
+}
+
+pub fn raw_plane_slice_from_stride(
+    data: &[u8],
+    offset: usize,
+    stride: usize,
+    row_len: usize,
+    height: u32,
+) -> Result<&[u8]> {
+    let end = raw_plane_end(data.len(), offset, stride, row_len, height)?;
+    Ok(&data[offset..end])
+}
+
+pub fn validate_raw_plane_from_stride(
+    data_len: usize,
+    offset: usize,
+    stride: usize,
+    row_len: usize,
+    height: u32,
+) -> Result<()> {
+    raw_plane_end(data_len, offset, stride, row_len, height).map(|_| ())
+}
+
+fn raw_plane_end(
+    data_len: usize,
+    offset: usize,
+    stride: usize,
+    row_len: usize,
+    height: u32,
+) -> Result<usize> {
     if height == 0 || row_len == 0 {
         return Err(anyhow!("invalid video frame dimensions"));
     }
@@ -301,11 +359,11 @@ pub fn raw_plane_from_stride(
     let end = offset
         .checked_add(required_len)
         .ok_or_else(|| anyhow!("video frame buffer is too large"))?;
-    if data.len() < end {
+    if data_len < end {
         return Err(anyhow!("invalid video frame buffer size"));
     }
 
-    Ok(data[offset..end].to_vec())
+    Ok(end)
 }
 
 fn frame_row_len(size: RenderSize, bytes_per_pixel: usize) -> Result<usize> {

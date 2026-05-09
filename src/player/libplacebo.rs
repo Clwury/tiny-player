@@ -11,8 +11,8 @@ use dolby_vision::rpu::{
 use super::{
     dovi::DoviFrameMetadata,
     render_host::{
-        FrameColor, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoRange, RenderSize,
-        frame_byte_len,
+        FrameColor, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlanes,
+        RawVideoRange, RenderSize, frame_byte_len, raw_plane_slice_from_stride,
     },
 };
 
@@ -60,9 +60,11 @@ struct UploadedSourceFrame {
 struct DoviMetadataCache {
     mapping: Option<RpuDataMapping>,
     color: Option<VdrDmData>,
+    rendered: Option<DoviRenderMetadata>,
     metadata_logged: bool,
 }
 
+#[derive(Clone)]
 struct DoviRenderMetadata {
     placebo: ffi::pl_dovi_metadata,
     rpu_payload: Vec<u8>,
@@ -134,7 +136,8 @@ impl LibplaceboToneMapper {
                 return Err(anyhow!("libplacebo 渲染 HDR 视频帧失败"));
             }
 
-            let mut pixels = vec![0; frame_byte_len(output_size)?];
+            let len = frame_byte_len(output_size)?;
+            let mut pixels = Vec::<u8>::with_capacity(len);
             let mut transfer = mem::zeroed::<ffi::pl_tex_transfer_params>();
             transfer.tex = self.target_texture;
             transfer.row_pitch = usize::try_from(output_size.width)
@@ -146,6 +149,7 @@ impl LibplaceboToneMapper {
             if !ffi::pl_tex_download(self.gpu, &transfer) {
                 return Err(anyhow!("libplacebo 读取视频帧失败"));
             }
+            pixels.set_len(len);
 
             if output_format == OutputTextureFormat::Rgba {
                 swap_red_blue_channels(&mut pixels);
@@ -177,39 +181,50 @@ impl LibplaceboToneMapper {
         }
         frame.crop = rect_for_size(size);
 
-        for (plane_index, plane) in input.planes.iter().enumerate() {
-            let layout = input
-                .format
-                .plane_layout_for_color(size, plane_index, input.color)?;
-            let mut plane_data = unsafe { mem::zeroed::<ffi::pl_plane_data>() };
-            plane_data.type_ = ffi::pl_fmt_type_PL_FMT_UNORM;
-            plane_data.width =
-                i32::try_from(layout.width).map_err(|_| anyhow!("video frame is too wide"))?;
-            plane_data.height =
-                i32::try_from(layout.height).map_err(|_| anyhow!("video frame is too tall"))?;
-            for component in 0..layout.components {
-                plane_data.component_size[component] = input.format.component_size();
+        match &input.planes {
+            RawVideoPlanes::Owned(planes) => {
+                for (plane_index, plane) in planes.iter().enumerate() {
+                    unsafe {
+                        self.upload_source_plane(
+                            &mut frame,
+                            input,
+                            size,
+                            plane_index,
+                            &plane.data,
+                            plane.stride,
+                        )?;
+                    }
+                }
             }
-            plane_data.component_map = layout.component_map;
-            plane_data.pixel_stride = layout.pixel_stride;
-            plane_data.row_stride = plane.stride;
-            plane_data.pixels = plane.data.as_ptr().cast::<c_void>();
-
-            let mut out_plane = unsafe { mem::zeroed::<ffi::pl_plane>() };
-            if !unsafe {
-                ffi::pl_upload_plane(
-                    self.gpu,
-                    &mut out_plane,
-                    &mut self.source_textures[plane_index],
-                    &plane_data,
-                )
-            } {
-                return Err(anyhow!("libplacebo 上传视频帧平面失败"));
+            RawVideoPlanes::GStreamer { buffer, planes } => {
+                let map = buffer
+                    .map_readable()
+                    .map_err(|error| anyhow!("map GStreamer video frame failed: {error}"))?;
+                let data = map.as_slice();
+                for (plane_index, plane) in planes.iter().enumerate() {
+                    let layout =
+                        input
+                            .format
+                            .plane_layout_for_color(size, plane_index, input.color)?;
+                    let plane_data = raw_plane_slice_from_stride(
+                        data,
+                        plane.offset,
+                        plane.stride,
+                        layout.row_len,
+                        layout.height,
+                    )?;
+                    unsafe {
+                        self.upload_source_plane(
+                            &mut frame,
+                            input,
+                            size,
+                            plane_index,
+                            plane_data,
+                            plane.stride,
+                        )?;
+                    }
+                }
             }
-            out_plane.flipped = false;
-            out_plane.shift_x = 0.0;
-            out_plane.shift_y = 0.0;
-            frame.planes[plane_index] = out_plane;
         }
         unsafe { apply_chroma_location(&mut frame, input.format, input.chroma_site) };
 
@@ -219,6 +234,50 @@ impl LibplaceboToneMapper {
         })
     }
 
+    unsafe fn upload_source_plane(
+        &mut self,
+        frame: &mut ffi::pl_frame,
+        input: &RawVideoFrame,
+        size: RenderSize,
+        plane_index: usize,
+        data: &[u8],
+        stride: usize,
+    ) -> Result<()> {
+        let layout = input
+            .format
+            .plane_layout_for_color(size, plane_index, input.color)?;
+        let mut plane_data = unsafe { mem::zeroed::<ffi::pl_plane_data>() };
+        plane_data.type_ = ffi::pl_fmt_type_PL_FMT_UNORM;
+        plane_data.width =
+            i32::try_from(layout.width).map_err(|_| anyhow!("video frame is too wide"))?;
+        plane_data.height =
+            i32::try_from(layout.height).map_err(|_| anyhow!("video frame is too tall"))?;
+        for component in 0..layout.components {
+            plane_data.component_size[component] = input.format.component_size();
+        }
+        plane_data.component_map = layout.component_map;
+        plane_data.pixel_stride = layout.pixel_stride;
+        plane_data.row_stride = stride;
+        plane_data.pixels = data.as_ptr().cast::<c_void>();
+
+        let mut out_plane = unsafe { mem::zeroed::<ffi::pl_plane>() };
+        if !unsafe {
+            ffi::pl_upload_plane(
+                self.gpu,
+                &mut out_plane,
+                &mut self.source_textures[plane_index],
+                &plane_data,
+            )
+        } {
+            return Err(anyhow!("libplacebo 上传视频帧平面失败"));
+        }
+        out_plane.flipped = false;
+        out_plane.shift_x = 0.0;
+        out_plane.shift_y = 0.0;
+        frame.planes[plane_index] = out_plane;
+        Ok(())
+    }
+
     unsafe fn ensure_target_texture(&mut self, size: RenderSize) -> Result<OutputTextureFormat> {
         if let Some(format) = self.target_format
             && unsafe { self.recreate_target_texture(size, format)? }
@@ -226,7 +285,7 @@ impl LibplaceboToneMapper {
             return Ok(format);
         }
 
-        for format in [OutputTextureFormat::Rgba, OutputTextureFormat::Bgra] {
+        for format in [OutputTextureFormat::Bgra, OutputTextureFormat::Rgba] {
             if unsafe { self.recreate_target_texture(size, format)? } {
                 self.target_format = Some(format);
                 return Ok(format);
@@ -349,14 +408,24 @@ impl DoviMetadataCache {
             return Ok(None);
         };
 
+        if let Some(rendered) = self
+            .rendered
+            .as_ref()
+            .filter(|rendered| rendered.rpu_payload == metadata.rpu_payload)
+        {
+            return Ok(Some(rendered.clone()));
+        }
+
         let resolved = self.resolve(metadata)?;
         self.trace_metadata(&resolved, input.range);
-        Ok(Some(DoviRenderMetadata {
+        let rendered = DoviRenderMetadata {
             placebo: map_dovi_metadata(&resolved.rpu, &resolved.mapping, &resolved.color)?,
             rpu_payload: metadata.rpu_payload.clone(),
             source_min_pq: resolved.color.source_min_pq,
             source_max_pq: resolved.color.source_max_pq,
-        }))
+        };
+        self.rendered = Some(rendered.clone());
+        Ok(Some(rendered))
     }
 
     fn resolve(&mut self, metadata: &DoviFrameMetadata) -> Result<ResolvedDoviRpu> {
@@ -776,7 +845,7 @@ fn swap_red_blue_channels(pixels: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::render_host::{RawVideoFrame, RawVideoPlane};
+    use crate::player::render_host::{RawVideoFrame, RawVideoPlane, RawVideoPlanes};
 
     #[test]
     fn swap_red_blue_channels_swaps_red_and_blue_channels() {
@@ -889,7 +958,7 @@ mod tests {
             range: RawVideoRange::Limited,
             chroma_site: RawVideoChromaSite::Left,
             metadata: None,
-            planes: Vec::new(),
+            planes: RawVideoPlanes::Owned(Vec::new()),
         };
 
         let mut cache = DoviMetadataCache::default();
@@ -1158,7 +1227,7 @@ mod tests {
             range: RawVideoRange::Limited,
             chroma_site: RawVideoChromaSite::Left,
             metadata: None,
-            planes: vec![
+            planes: RawVideoPlanes::Owned(vec![
                 RawVideoPlane {
                     data: y.into_iter().flat_map(u16::to_le_bytes).collect(),
                     stride: 4,
@@ -1167,7 +1236,7 @@ mod tests {
                     data: uv.into_iter().flat_map(u16::to_le_bytes).collect(),
                     stride: 4,
                 },
-            ],
+            ]),
         }
     }
 
@@ -1178,7 +1247,7 @@ mod tests {
             range: RawVideoRange::Limited,
             chroma_site: RawVideoChromaSite::Left,
             metadata: None,
-            planes: vec![
+            planes: RawVideoPlanes::Owned(vec![
                 RawVideoPlane {
                     data: y.into_iter().flat_map(u16::to_le_bytes).collect(),
                     stride: 4,
@@ -1191,7 +1260,7 @@ mod tests {
                     data: v.into_iter().flat_map(u16::to_le_bytes).collect(),
                     stride: 2,
                 },
-            ],
+            ]),
         }
     }
 
