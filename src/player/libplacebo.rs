@@ -3,13 +3,17 @@ use std::{ffi::CString, mem, os::raw::c_void, ptr};
 use anyhow::{Context, Result, anyhow};
 use dolby_vision::rpu::{
     dovi_rpu::DoviRpu,
+    profiles::{DoviProfile, profile5::Profile5},
     rpu_data_mapping::{DoviMappingMethod, RpuDataMapping},
     vdr_dm_data::VdrDmData,
 };
 
 use super::{
     dovi::DoviFrameMetadata,
-    render_host::{FrameColor, RawVideoFormat, RawVideoFrame, RenderSize, frame_byte_len},
+    render_host::{
+        FrameColor, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoRange, RenderSize,
+        frame_byte_len,
+    },
 };
 
 #[allow(
@@ -64,13 +68,6 @@ struct DoviRenderMetadata {
     rpu_payload: Vec<u8>,
     source_min_pq: u16,
     source_max_pq: u16,
-    levels: DoviSourceLevels,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DoviSourceLevels {
-    Full,
-    Limited,
 }
 
 struct ResolvedDoviRpu {
@@ -167,10 +164,9 @@ impl LibplaceboToneMapper {
         }
 
         let prepared_dovi = self.dovi_cache.prepare_raw_video(input)?;
-        let dovi_levels = prepared_dovi.as_ref().map(|metadata| metadata.levels);
         let mut frame = unsafe { mem::zeroed::<ffi::pl_frame>() };
         frame.num_planes = input.planes.len() as i32;
-        frame.repr = unsafe { source_color_repr(input.format, input.color, dovi_levels) };
+        frame.repr = unsafe { source_color_repr(input.format, input.color, input.range) };
         frame.color = unsafe { source_color_space(input.color) };
         let dovi_metadata = prepared_dovi.map(|prepared| {
             apply_dovi_hdr_metadata(&mut frame.color, &prepared);
@@ -215,6 +211,7 @@ impl LibplaceboToneMapper {
             out_plane.shift_y = 0.0;
             frame.planes[plane_index] = out_plane;
         }
+        unsafe { apply_chroma_location(&mut frame, input.format, input.chroma_site) };
 
         Ok(UploadedSourceFrame {
             frame,
@@ -305,7 +302,7 @@ impl Drop for LibplaceboToneMapper {
 unsafe fn source_color_repr(
     format: RawVideoFormat,
     color: FrameColor,
-    dovi_levels: Option<DoviSourceLevels>,
+    range: RawVideoRange,
 ) -> ffi::pl_color_repr {
     let mut repr = unsafe { mem::zeroed::<ffi::pl_color_repr>() };
     repr.sys = match color {
@@ -313,12 +310,7 @@ unsafe fn source_color_repr(
         FrameColor::Hdr10Bt2020 => ffi::pl_color_system_PL_COLOR_SYSTEM_BT_2020_NC,
         FrameColor::DolbyVisionProfile5 => ffi::pl_color_system_PL_COLOR_SYSTEM_DOLBYVISION,
     };
-    repr.levels = match color {
-        FrameColor::DolbyVisionProfile5 => {
-            dovi_color_levels(dovi_levels.unwrap_or(DoviSourceLevels::Full))
-        }
-        FrameColor::Sdr | FrameColor::Hdr10Bt2020 => ffi::pl_color_levels_PL_COLOR_LEVELS_LIMITED,
-    };
+    repr.levels = source_color_levels(range);
     repr.alpha = ffi::pl_alpha_mode_PL_ALPHA_NONE;
     repr.bits = ffi::pl_bit_encoding {
         sample_depth: format.sample_depth(),
@@ -358,14 +350,12 @@ impl DoviMetadataCache {
         };
 
         let resolved = self.resolve(metadata)?;
-        let levels = dovi_source_levels(&resolved.rpu, &resolved.color);
-        self.trace_metadata(&resolved, levels);
+        self.trace_metadata(&resolved, input.range);
         Ok(Some(DoviRenderMetadata {
             placebo: map_dovi_metadata(&resolved.rpu, &resolved.mapping, &resolved.color)?,
             rpu_payload: metadata.rpu_payload.clone(),
             source_min_pq: resolved.color.source_min_pq,
             source_max_pq: resolved.color.source_max_pq,
-            levels,
         }))
     }
 
@@ -411,13 +401,13 @@ impl DoviMetadataCache {
             return color;
         }
 
-        tracing::debug!("using FFmpeg default Dolby Vision Profile 5 color metadata");
-        let color = ffmpeg_default_dovi_color();
+        tracing::debug!("using default Dolby Vision Profile 5 color metadata");
+        let color = profile5_default_dovi_color();
         self.color = Some(color.clone());
         color
     }
 
-    fn trace_metadata(&mut self, resolved: &ResolvedDoviRpu, levels: DoviSourceLevels) {
+    fn trace_metadata(&mut self, resolved: &ResolvedDoviRpu, range: RawVideoRange) {
         if self.metadata_logged {
             return;
         }
@@ -427,7 +417,7 @@ impl DoviMetadataCache {
             vdr_profile = resolved.rpu.header.vdr_rpu_profile,
             bl_full_range = resolved.rpu.header.bl_video_full_range_flag,
             signal_full_range = resolved.color.signal_full_range_flag,
-            levels = ?levels,
+            raw_range = ?range,
             compressed_color = resolved.color.compressed,
             dovi_tool_profile5_default_color = resolved.rpu.dovi_profile == 5
                 && is_dovi_tool_profile5_default_color(&resolved.color),
@@ -467,42 +457,8 @@ impl DoviMetadataCache {
     }
 }
 
-fn ffmpeg_default_dovi_color() -> VdrDmData {
-    VdrDmData {
-        ycc_to_rgb_coef0: 9575,
-        ycc_to_rgb_coef1: 0,
-        ycc_to_rgb_coef2: 14742,
-        ycc_to_rgb_coef3: 9575,
-        ycc_to_rgb_coef4: 1754,
-        ycc_to_rgb_coef5: 4383,
-        ycc_to_rgb_coef6: 9575,
-        ycc_to_rgb_coef7: 17372,
-        ycc_to_rgb_coef8: 0,
-        ycc_to_rgb_offset0: 67_108_864,
-        ycc_to_rgb_offset1: 536_870_912,
-        ycc_to_rgb_offset2: 536_870_912,
-        rgb_to_lms_coef0: 5845,
-        rgb_to_lms_coef1: 9702,
-        rgb_to_lms_coef2: 837,
-        rgb_to_lms_coef3: 2568,
-        rgb_to_lms_coef4: 12256,
-        rgb_to_lms_coef5: 1561,
-        rgb_to_lms_coef6: 0,
-        rgb_to_lms_coef7: 679,
-        rgb_to_lms_coef8: 15705,
-        signal_eotf: 39322,
-        signal_eotf_param0: 15867,
-        signal_eotf_param1: 228,
-        signal_eotf_param2: 1_383_604,
-        signal_bit_depth: 14,
-        signal_color_space: 0,
-        signal_chroma_format: 0,
-        signal_full_range_flag: 1,
-        source_min_pq: 62,
-        source_max_pq: 3696,
-        source_diagonal: 42,
-        ..Default::default()
-    }
+fn profile5_default_dovi_color() -> VdrDmData {
+    Profile5::dm_data()
 }
 
 fn is_dovi_tool_profile5_default_color(color: &VdrDmData) -> bool {
@@ -535,18 +491,37 @@ fn is_dovi_tool_profile5_default_color(color: &VdrDmData) -> bool {
         ] == [17081, -349, -349, -349, 17081, -349, -349, -349, 17081]
 }
 
-fn dovi_color_levels(levels: DoviSourceLevels) -> ffi::pl_color_levels {
-    match levels {
-        DoviSourceLevels::Full => ffi::pl_color_levels_PL_COLOR_LEVELS_FULL,
-        DoviSourceLevels::Limited => ffi::pl_color_levels_PL_COLOR_LEVELS_LIMITED,
+fn source_color_levels(range: RawVideoRange) -> ffi::pl_color_levels {
+    match range {
+        RawVideoRange::Unknown => ffi::pl_color_levels_PL_COLOR_LEVELS_UNKNOWN,
+        RawVideoRange::Limited => ffi::pl_color_levels_PL_COLOR_LEVELS_LIMITED,
+        RawVideoRange::Full => ffi::pl_color_levels_PL_COLOR_LEVELS_FULL,
     }
 }
 
-fn dovi_source_levels(rpu: &DoviRpu, color: &VdrDmData) -> DoviSourceLevels {
-    if rpu.header.bl_video_full_range_flag || color.signal_full_range_flag == 1 {
-        DoviSourceLevels::Full
-    } else {
-        DoviSourceLevels::Limited
+unsafe fn apply_chroma_location(
+    frame: &mut ffi::pl_frame,
+    format: RawVideoFormat,
+    chroma_site: RawVideoChromaSite,
+) {
+    if matches!(
+        format,
+        RawVideoFormat::P010Le
+            | RawVideoFormat::I42010Le
+            | RawVideoFormat::Nv12
+            | RawVideoFormat::I420
+    ) {
+        unsafe { ffi::pl_frame_set_chroma_location(frame, chroma_location(chroma_site)) };
+    }
+}
+
+fn chroma_location(chroma_site: RawVideoChromaSite) -> ffi::pl_chroma_location {
+    match chroma_site {
+        RawVideoChromaSite::Unknown => ffi::pl_chroma_location_PL_CHROMA_UNKNOWN,
+        RawVideoChromaSite::Left => ffi::pl_chroma_location_PL_CHROMA_LEFT,
+        RawVideoChromaSite::Center => ffi::pl_chroma_location_PL_CHROMA_CENTER,
+        RawVideoChromaSite::TopLeft => ffi::pl_chroma_location_PL_CHROMA_TOP_LEFT,
+        RawVideoChromaSite::TopCenter => ffi::pl_chroma_location_PL_CHROMA_TOP_CENTER,
     }
 }
 
@@ -600,8 +575,10 @@ fn map_dovi_metadata(
         let out = &mut dovi.comp[component];
         let pivot_count = curve.pivots.len().min(out.pivots.len());
         out.num_pivots = pivot_count as u8;
+        let mut pivot = 0u32;
         for (target, source) in out.pivots.iter_mut().zip(curve.pivots.iter()) {
-            *target = f32::from(*source) * pivot_scale;
+            pivot = pivot.saturating_add(u32::from(*source));
+            *target = pivot as f32 * pivot_scale;
         }
 
         let piece_count = pivot_count.saturating_sub(1).min(out.method.len());
@@ -811,24 +788,32 @@ mod tests {
     }
 
     #[test]
-    fn dolby_vision_profile5_uses_metadata_range_input() {
+    fn dolby_vision_profile5_uses_raw_frame_range_input() {
         let full = unsafe {
             source_color_repr(
                 RawVideoFormat::P010Le,
                 FrameColor::DolbyVisionProfile5,
-                Some(DoviSourceLevels::Full),
+                RawVideoRange::Full,
             )
         };
         let limited = unsafe {
             source_color_repr(
                 RawVideoFormat::P010Le,
                 FrameColor::DolbyVisionProfile5,
-                Some(DoviSourceLevels::Limited),
+                RawVideoRange::Limited,
+            )
+        };
+        let unknown = unsafe {
+            source_color_repr(
+                RawVideoFormat::P010Le,
+                FrameColor::DolbyVisionProfile5,
+                RawVideoRange::Unknown,
             )
         };
 
         assert_eq!(full.levels, ffi::pl_color_levels_PL_COLOR_LEVELS_FULL);
         assert_eq!(limited.levels, ffi::pl_color_levels_PL_COLOR_LEVELS_LIMITED);
+        assert_eq!(unknown.levels, ffi::pl_color_levels_PL_COLOR_LEVELS_UNKNOWN);
         assert_eq!(full.sys, ffi::pl_color_system_PL_COLOR_SYSTEM_DOLBYVISION);
     }
 
@@ -859,6 +844,26 @@ mod tests {
     }
 
     #[test]
+    fn dolby_vision_mapping_accumulates_rpu_pivot_deltas() {
+        let mut rpu = DoviRpu::default();
+        rpu.header = dolby_vision::rpu::rpu_data_header::RpuDataHeader {
+            bl_bit_depth_minus8: 2,
+            coefficient_data_type: 0,
+            coefficient_log2_denom: 23,
+            ..Default::default()
+        };
+        let mut mapping = RpuDataMapping::default();
+        mapping.curves[0].pivots = vec![100, 200, 300];
+        mapping.curves[0].mapping_idc = DoviMappingMethod::Polynomial;
+
+        let dovi = map_dovi_metadata(&rpu, &mapping, &profile5_default_dovi_color()).unwrap();
+
+        assert_approx_eq(dovi.comp[0].pivots[0], 100.0 / 1023.0);
+        assert_approx_eq(dovi.comp[0].pivots[1], 300.0 / 1023.0);
+        assert_approx_eq(dovi.comp[0].pivots[2], 600.0 / 1023.0);
+    }
+
+    #[test]
     fn dolby_vision_hdr_metadata_preserves_default_when_source_luminance_is_unknown() {
         let mut color = unsafe { source_color_space(FrameColor::DolbyVisionProfile5) };
         let min_luma = color.hdr.min_luma;
@@ -868,7 +873,6 @@ mod tests {
             rpu_payload: Vec::new(),
             source_min_pq: 0,
             source_max_pq: 0,
-            levels: DoviSourceLevels::Full,
         };
 
         apply_dovi_hdr_metadata(&mut color, &metadata);
@@ -882,6 +886,8 @@ mod tests {
         let frame = RawVideoFrame {
             format: RawVideoFormat::P010Le,
             color: FrameColor::DolbyVisionProfile5,
+            range: RawVideoRange::Limited,
+            chroma_site: RawVideoChromaSite::Left,
             metadata: None,
             planes: Vec::new(),
         };
@@ -1009,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn dolby_vision_profile5_uses_ffmpeg_default_color_for_initial_compressed_metadata() {
+    fn dolby_vision_profile5_uses_profile_default_color_for_initial_compressed_metadata() {
         let mut cache = DoviMetadataCache::default();
 
         let color = cache
@@ -1022,13 +1028,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(color.ycc_to_rgb_coef0, 9575);
-        assert_eq!(color.ycc_to_rgb_coef2, 14742);
-        assert_eq!(color.ycc_to_rgb_offset0, 67_108_864);
-        assert_eq!(color.ycc_to_rgb_offset1, 536_870_912);
-        assert_eq!(color.rgb_to_lms_coef4, 12256);
-        assert_eq!(color.source_min_pq, 62);
-        assert_eq!(color.source_max_pq, 3696);
+        assert!(is_dovi_tool_profile5_default_color(&color));
+        assert_eq!(color.signal_color_space, 2);
+        assert_eq!(color.signal_bit_depth, 12);
+        assert_eq!(color.signal_full_range_flag, 1);
     }
 
     #[test]
@@ -1141,10 +1144,19 @@ mod tests {
         );
     }
 
+    fn assert_approx_eq(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "expected {expected}, got {actual}"
+        );
+    }
+
     fn p010_frame(color: FrameColor, y: [u16; 4], uv: [u16; 2]) -> RawVideoFrame {
         RawVideoFrame {
             format: RawVideoFormat::P010Le,
             color,
+            range: RawVideoRange::Limited,
+            chroma_site: RawVideoChromaSite::Left,
             metadata: None,
             planes: vec![
                 RawVideoPlane {
@@ -1163,6 +1175,8 @@ mod tests {
         RawVideoFrame {
             format: RawVideoFormat::I42010Le,
             color,
+            range: RawVideoRange::Limited,
+            chroma_site: RawVideoChromaSite::Left,
             metadata: None,
             planes: vec![
                 RawVideoPlane {

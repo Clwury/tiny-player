@@ -15,8 +15,8 @@ use gstreamer_video as gst_video;
 use super::dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat};
 use super::render_host::{
     DecodedFrame, FrameColor, FrameDynamicMetadata, FramePixels, FramePts, FrameSlot,
-    RawVideoFormat, RawVideoFrame, RawVideoPlane, RenderSize, packed_bgra_from_stride,
-    raw_plane_from_stride,
+    RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlane, RawVideoRange, RenderSize,
+    packed_bgra_from_stride, raw_plane_from_stride,
 };
 
 const POSITION_QUERY_INTERVAL: Duration = Duration::from_millis(250);
@@ -937,6 +937,8 @@ fn raw_video_frame_from_sample(
     Ok(RawVideoFrame {
         format,
         color,
+        range: raw_video_range(info.colorimetry().range()),
+        chroma_site: raw_video_chroma_site(info.chroma_site()),
         metadata,
         planes,
     })
@@ -955,12 +957,38 @@ fn trace_negotiated_caps(info: &gst_video::VideoInfo, color: FrameColor) {
         format = %info.name(),
         color = ?color,
         colorimetry = %info.colorimetry(),
+        range = ?info.colorimetry().range(),
+        chroma_site = %info.chroma_site(),
         width = info.width(),
         height = info.height(),
         strides = ?info.stride(),
         offsets = ?info.offset(),
         "negotiated GStreamer raw video caps"
     );
+}
+
+fn raw_video_range(range: gst_video::VideoColorRange) -> RawVideoRange {
+    match range {
+        gst_video::VideoColorRange::Range0_255 => RawVideoRange::Full,
+        gst_video::VideoColorRange::Range16_235 => RawVideoRange::Limited,
+        _ => RawVideoRange::Unknown,
+    }
+}
+
+fn raw_video_chroma_site(site: gst_video::VideoChromaSite) -> RawVideoChromaSite {
+    if site.contains(gst_video::VideoChromaSite::H_COSITED)
+        && site.contains(gst_video::VideoChromaSite::V_COSITED)
+    {
+        RawVideoChromaSite::TopLeft
+    } else if site.contains(gst_video::VideoChromaSite::H_COSITED) {
+        RawVideoChromaSite::Left
+    } else if site.contains(gst_video::VideoChromaSite::V_COSITED) {
+        RawVideoChromaSite::TopCenter
+    } else if site == gst_video::VideoChromaSite::JPEG {
+        RawVideoChromaSite::Center
+    } else {
+        RawVideoChromaSite::Unknown
+    }
 }
 
 fn frame_color(
@@ -1200,6 +1228,42 @@ mod tests {
             Some(RawVideoFormat::I420)
         );
         assert_eq!(RawVideoFormat::from_gstreamer_name("BGRA"), None);
+    }
+
+    #[test]
+    fn raw_video_range_maps_gstreamer_color_range() {
+        assert_eq!(
+            raw_video_range(gst_video::VideoColorRange::Range0_255),
+            RawVideoRange::Full
+        );
+        assert_eq!(
+            raw_video_range(gst_video::VideoColorRange::Range16_235),
+            RawVideoRange::Limited
+        );
+        assert_eq!(
+            raw_video_range(gst_video::VideoColorRange::Unknown),
+            RawVideoRange::Unknown
+        );
+    }
+
+    #[test]
+    fn raw_video_chroma_site_maps_gstreamer_chroma_site() {
+        assert_eq!(
+            raw_video_chroma_site(gst_video::VideoChromaSite::MPEG2),
+            RawVideoChromaSite::Left
+        );
+        assert_eq!(
+            raw_video_chroma_site(gst_video::VideoChromaSite::COSITED),
+            RawVideoChromaSite::TopLeft
+        );
+        assert_eq!(
+            raw_video_chroma_site(gst_video::VideoChromaSite::JPEG),
+            RawVideoChromaSite::Center
+        );
+        assert_eq!(
+            raw_video_chroma_site(gst_video::VideoChromaSite::empty()),
+            RawVideoChromaSite::Unknown
+        );
     }
 
     fn frame_pts(nsecs: u64) -> FramePts {

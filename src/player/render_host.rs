@@ -34,6 +34,8 @@ pub enum FramePixels {
 pub struct RawVideoFrame {
     pub format: RawVideoFormat,
     pub color: FrameColor,
+    pub range: RawVideoRange,
+    pub chroma_site: RawVideoChromaSite,
     pub metadata: Option<FrameDynamicMetadata>,
     pub planes: Vec<RawVideoPlane>,
 }
@@ -164,6 +166,22 @@ pub enum FrameColor {
     Sdr,
     Hdr10Bt2020,
     DolbyVisionProfile5,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawVideoRange {
+    Unknown,
+    Limited,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawVideoChromaSite {
+    Unknown,
+    Left,
+    Center,
+    TopLeft,
+    TopCenter,
 }
 
 #[derive(Clone, Default)]
