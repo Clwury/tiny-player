@@ -9,7 +9,8 @@ use gpui::{
 use crate::theme;
 
 use super::{
-    backend::{BackendEvent, GstBackend},
+    backend::{BackendEvent, GstBackend, is_gstreamer_matroska_large_block_error},
+    ffmpeg_backend::FfmpegBackend,
     render_host::RenderSize,
     video_presenter::VideoPresenter,
 };
@@ -27,13 +28,15 @@ pub enum PlaybackEvent {
 
 pub struct PlaybackPage {
     title: SharedString,
-    video: ShutdownOrder<GstBackend, VideoPresenter>,
+    current_url: String,
+    video: ShutdownOrder<PlaybackBackend, VideoPresenter>,
     video_viewport_bounds: Option<Bounds<Pixels>>,
     video_source_size: Option<RenderSize>,
     current_frame: Option<Arc<RenderImage>>,
     playback_paused: bool,
     playback_buffering: bool,
     current_file_loaded: bool,
+    ffmpeg_fallback_attempted: bool,
     error_message: Option<SharedString>,
     status_message: SharedString,
 }
@@ -51,11 +54,14 @@ impl PlaybackPage {
                     if let Err(error) = backend.load_url(&request.url) {
                         error_message = Some(format!("加载视频失败：{error}").into());
                     }
-                    (Some(backend), Some(video_presenter))
+                    (
+                        Some(PlaybackBackend::Gstreamer(backend)),
+                        Some(video_presenter),
+                    )
                 }
                 Err(error) => {
                     error_message = Some(format!("创建视频渲染器失败：{error}").into());
-                    (Some(backend), None)
+                    (Some(PlaybackBackend::Gstreamer(backend)), None)
                 }
             },
             Err(error) => {
@@ -66,6 +72,7 @@ impl PlaybackPage {
 
         Self {
             title: request.title,
+            current_url: request.url,
             video: ShutdownOrder::new(backend, video_presenter),
             video_viewport_bounds: None,
             video_source_size: None,
@@ -73,6 +80,7 @@ impl PlaybackPage {
             playback_paused: true,
             playback_buffering: false,
             current_file_loaded: false,
+            ffmpeg_fallback_attempted: false,
             error_message,
             status_message,
         }
@@ -137,6 +145,10 @@ impl PlaybackPage {
                     self.error_message = None;
                 }
                 BackendEvent::LoadFailed(message) => {
+                    if self.should_fallback_to_ffmpeg(&message) {
+                        self.start_ffmpeg_fallback(&message, window, cx);
+                        continue;
+                    }
                     self.current_file_loaded = false;
                     self.video_source_size = None;
                     self.playback_paused = true;
@@ -218,6 +230,56 @@ impl PlaybackPage {
         self.error_message
             .clone()
             .unwrap_or_else(|| self.status_message.clone())
+    }
+
+    fn should_fallback_to_ffmpeg(&self, message: &str) -> bool {
+        !self.ffmpeg_fallback_attempted
+            && self
+                .video
+                .owner()
+                .is_some_and(PlaybackBackend::is_gstreamer)
+            && is_gstreamer_matroska_large_block_error(message)
+    }
+
+    fn start_ffmpeg_fallback(&mut self, reason: &str, window: &mut Window, cx: &mut Context<Self>) {
+        tracing::warn!(
+            reason,
+            "GStreamer Matroska demux failed on a large block; switching to FFmpeg backend"
+        );
+        self.ffmpeg_fallback_attempted = true;
+        self.current_file_loaded = false;
+        self.video_source_size = None;
+        self.playback_paused = true;
+        self.playback_buffering = false;
+        self.error_message = None;
+        self.status_message = "正在切换 FFmpeg 播放后端…".into();
+        self.clear_visible_frame(window, cx);
+        self.video = ShutdownOrder::new(None, None);
+
+        let mut backend = match FfmpegBackend::new() {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.error_message = Some(format!("创建 FFmpeg 播放后端失败：{error}").into());
+                return;
+            }
+        };
+        let video_presenter = match VideoPresenter::new(backend.frame_slot()) {
+            Ok(video_presenter) => video_presenter,
+            Err(error) => {
+                self.error_message = Some(format!("创建视频渲染器失败：{error}").into());
+                return;
+            }
+        };
+        if let Err(error) = backend.load_url(&self.current_url) {
+            self.error_message = Some(format!("加载视频失败：{error}").into());
+            return;
+        }
+
+        self.video = ShutdownOrder::new(
+            Some(PlaybackBackend::Ffmpeg(backend)),
+            Some(video_presenter),
+        );
+        cx.notify();
     }
 }
 
@@ -396,6 +458,24 @@ impl IntoElement for VideoFrameElement {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+enum PlaybackBackend {
+    Gstreamer(GstBackend),
+    Ffmpeg(FfmpegBackend),
+}
+
+impl PlaybackBackend {
+    fn poll_events(&mut self) -> Vec<BackendEvent> {
+        match self {
+            Self::Gstreamer(backend) => backend.poll_events(),
+            Self::Ffmpeg(backend) => backend.poll_events(),
+        }
+    }
+
+    fn is_gstreamer(&self) -> bool {
+        matches!(self, Self::Gstreamer(_))
     }
 }
 

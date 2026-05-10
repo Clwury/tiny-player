@@ -49,6 +49,7 @@ pub enum BackendEvent {
 #[derive(Debug)]
 pub enum BackendError {
     EmptyUrl,
+    Ffmpeg(String),
     GStreamer(String),
 }
 
@@ -58,6 +59,7 @@ impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyUrl => write!(f, "播放地址为空"),
+            Self::Ffmpeg(error) => error.fmt(f),
             Self::GStreamer(error) => error.fmt(f),
         }
     }
@@ -334,12 +336,16 @@ impl GstBackend {
         for message in messages {
             match message.view() {
                 gst::MessageView::Error(error) => {
+                    trace_gstreamer_error(error);
                     let message = gstreamer_message_error(error);
                     if self.loaded {
                         events.push(BackendEvent::Fatal(message));
                     } else {
                         events.push(BackendEvent::LoadFailed(message));
                     }
+                }
+                gst::MessageView::Warning(warning) => {
+                    trace_gstreamer_warning(warning);
                 }
                 gst::MessageView::DurationChanged(_) => {
                     self.push_duration_event(&mut events);
@@ -1331,11 +1337,49 @@ fn gstreamer_error(error: impl std::fmt::Display) -> BackendError {
     BackendError::GStreamer(error.to_string())
 }
 
+pub fn is_gstreamer_matroska_large_block_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("reading large block")
+        && (message.contains("matroska") || message.contains("matroskademux"))
+}
+
 fn gstreamer_message_error(error: &gst::message::Error) -> String {
     match error.debug() {
         Some(debug) => format!("{}（{debug}）", error.error()),
         None => error.error().to_string(),
     }
+}
+
+fn trace_gstreamer_error(error: &gst::message::Error) {
+    tracing::error!(
+        source = %gstreamer_error_source_path(error),
+        error = %error.error(),
+        debug = error.debug().as_deref().unwrap_or(""),
+        "GStreamer bus error"
+    );
+}
+
+fn trace_gstreamer_warning(warning: &gst::message::Warning) {
+    tracing::warn!(
+        source = %gstreamer_warning_source_path(warning),
+        warning = %warning.error(),
+        debug = warning.debug().as_deref().unwrap_or(""),
+        "GStreamer bus warning"
+    );
+}
+
+fn gstreamer_error_source_path(error: &gst::message::Error) -> String {
+    error
+        .src()
+        .map(|source| source.path_string().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn gstreamer_warning_source_path(warning: &gst::message::Warning) -> String {
+    warning
+        .src()
+        .map(|source| source.path_string().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn value_changed(previous: Option<f64>, next: f64) -> bool {
@@ -1349,6 +1393,20 @@ mod tests {
     #[test]
     fn empty_url_error_has_user_facing_message() {
         assert_eq!(BackendError::EmptyUrl.to_string(), "播放地址为空");
+    }
+
+    #[test]
+    fn matroska_large_block_error_matches_demux_debug_message() {
+        let message = "Could not demultiplex stream.（../gst/matroska/matroska-demux.c: reading large block of size 47548764 not supported）";
+
+        assert!(is_gstreamer_matroska_large_block_error(message));
+    }
+
+    #[test]
+    fn matroska_large_block_error_ignores_unrelated_stream_errors() {
+        let message = "Internal data stream error: streaming stopped, reason error (-5)";
+
+        assert!(!is_gstreamer_matroska_large_block_error(message));
     }
 
     #[test]
