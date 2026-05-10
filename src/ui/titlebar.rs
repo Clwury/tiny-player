@@ -84,7 +84,7 @@ pub fn app_titlebar(
                     "icons/window-minimize.svg",
                     WindowControlArea::Min,
                     cx,
-                    |_, window, _| window.minimize_window(),
+                    |window, _| window.minimize_window(),
                 ))
                 .child(window_control_button(
                     "maximize",
@@ -95,14 +95,14 @@ pub fn app_titlebar(
                     },
                     WindowControlArea::Max,
                     cx,
-                    |_, window, _| window.zoom_window(),
+                    |window, _| window.zoom_window(),
                 ))
                 .child(window_control_button(
                     "close",
                     "icons/window-close.svg",
                     WindowControlArea::Close,
                     cx,
-                    |_, window, _| window.remove_window(),
+                    |window, _| window.remove_window(),
                 )),
         )
 }
@@ -129,17 +129,14 @@ fn window_control_button(
     icon_path: &'static str,
     control_area: WindowControlArea,
     cx: &App,
-    action: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    action: impl Fn(&mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     button_base(id, icon_path.into(), cx)
         .window_control_area(control_area)
-        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             window.prevent_default();
             cx.stop_propagation();
-        })
-        .on_click(move |event, window, cx| {
-            cx.stop_propagation();
-            action(event, window, cx);
+            action(window, cx);
         })
 }
 

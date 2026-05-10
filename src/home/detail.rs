@@ -20,6 +20,10 @@ struct SelectedPlayback {
     title: SharedString,
 }
 
+struct ResolvedPlayback {
+    url: String,
+}
+
 impl HomeContent {
     pub(super) fn open_media_detail(&mut self, item: &UserItem, cx: &mut Context<Self>) {
         let Some(detail) = SeriesDetailState::from_user_item(item) else {
@@ -96,9 +100,12 @@ impl HomeContent {
         let task = cx.background_spawn(async move {
             let playback_info =
                 client.playback_info(&task_server, &task_item_id, &task_media_source_id)?;
-            let direct_stream_url = playback_info.direct_stream_url_for(&task_media_source_id)?;
+            let source = playback_info.direct_stream_source_for(&task_media_source_id)?;
+            let direct_stream_url = source.direct_stream_url()?;
             let playback_url = resolve_direct_stream_url(&task_server, direct_stream_url)?;
-            Ok::<_, anyhow::Error>(playback_url.to_string())
+            Ok::<_, anyhow::Error>(ResolvedPlayback {
+                url: playback_url.to_string(),
+            })
         });
 
         cx.spawn(async move |page, cx| {
@@ -114,7 +121,7 @@ impl HomeContent {
     fn finish_play_selected_media(
         &mut self,
         selected: SelectedPlayback,
-        result: anyhow::Result<String>,
+        result: anyhow::Result<ResolvedPlayback>,
         cx: &mut Context<Self>,
     ) {
         if !self.selected_playback_still_current(&selected) {
@@ -126,11 +133,11 @@ impl HomeContent {
         };
         detail.playback_loading = false;
         match result {
-            Ok(url) => {
+            Ok(playback) => {
                 detail.playback_failed = None;
                 cx.emit(HomeContentEvent::OpenPlayback(PlaybackRequest {
                     title: selected.title,
-                    url,
+                    url: playback.url,
                 }));
             }
             Err(error) => {

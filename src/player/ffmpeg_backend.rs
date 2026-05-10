@@ -26,6 +26,7 @@ use super::{
 
 const AUDIO_OUTPUT_CHANNELS: c_int = 2;
 const POSITION_QUERY_INTERVAL: Duration = Duration::from_millis(250);
+const DEFAULT_VIDEO_FRAME_DURATION_NSECS: u64 = 1_000_000_000 / 24;
 
 static FFMPEG_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -34,6 +35,7 @@ pub struct FfmpegBackend {
     event_tx: Sender<BackendEvent>,
     event_rx: Receiver<BackendEvent>,
     worker: Option<FfmpegWorker>,
+    current_url: Option<String>,
     loaded: bool,
     paused: bool,
 }
@@ -51,6 +53,7 @@ impl FfmpegBackend {
             event_tx,
             event_rx,
             worker: None,
+            current_url: None,
             loaded: false,
             paused: true,
         })
@@ -68,16 +71,43 @@ impl FfmpegBackend {
 
         self.stop_worker();
         self.frame_slot.clear();
+        self.current_url = Some(url.to_string());
         self.loaded = false;
         self.paused = true;
         FFMPEG_FRAME_COUNT.store(0, Ordering::Relaxed);
         while self.event_rx.try_recv().is_ok() {}
 
         self.worker = Some(FfmpegWorker::spawn(
-            url.to_string(),
+            FfmpegPlaybackInput {
+                url: url.to_string(),
+                start_position_seconds: 0.0,
+            },
             self.frame_slot.clone(),
             self.event_tx.clone(),
         )?);
+        Ok(())
+    }
+
+    pub fn seek_to(&mut self, position_seconds: f64) -> Result<()> {
+        let Some(worker) = self.worker.as_ref() else {
+            return Err(BackendError::Ffmpeg(
+                "FFmpeg 尚未加载可跳转的媒体".to_string(),
+            ));
+        };
+        let position_seconds = position_seconds.max(0.0);
+
+        self.frame_slot.clear();
+        self.loaded = false;
+        self.paused = true;
+        FFMPEG_FRAME_COUNT.store(0, Ordering::Relaxed);
+        while self.event_rx.try_recv().is_ok() {}
+        worker.seek(position_seconds)?;
+        let _ = self
+            .event_tx
+            .send(BackendEvent::PositionChanged(position_seconds));
+        let _ = self
+            .event_tx
+            .send(BackendEvent::BufferedChanged(Some(position_seconds)));
         Ok(())
     }
 
@@ -112,23 +142,75 @@ impl FfmpegBackend {
 
 impl Drop for FfmpegBackend {
     fn drop(&mut self) {
-        self.stop_worker();
+        if let Some(worker) = self.worker.take() {
+            worker.stop_async();
+        }
         self.frame_slot.clear();
     }
 }
 
 struct FfmpegWorker {
-    shutdown: Arc<AtomicBool>,
+    control: Arc<FfmpegControl>,
+    command_tx: Sender<FfmpegCommand>,
     pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     handle: JoinHandle<()>,
 }
 
+#[derive(Debug)]
+struct FfmpegControl {
+    shutdown: AtomicBool,
+    seek_pending: AtomicBool,
+}
+
+impl FfmpegControl {
+    fn new() -> Self {
+        Self {
+            shutdown: AtomicBool::new(false),
+            seek_pending: AtomicBool::new(false),
+        }
+    }
+
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    fn should_stop(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    fn request_seek(&self) {
+        self.seek_pending.store(true, Ordering::Relaxed);
+    }
+
+    fn finish_seek(&self) {
+        self.seek_pending.store(false, Ordering::Relaxed);
+    }
+
+    fn has_pending_seek(&self) -> bool {
+        self.seek_pending.load(Ordering::Relaxed)
+    }
+}
+
+struct FfmpegPlaybackInput {
+    url: String,
+    start_position_seconds: f64,
+}
+
+enum FfmpegCommand {
+    Seek(f64),
+}
+
 impl FfmpegWorker {
-    fn spawn(url: String, frame_slot: FrameSlot, event_tx: Sender<BackendEvent>) -> Result<Self> {
-        let shutdown = Arc::new(AtomicBool::new(false));
+    fn spawn(
+        input: FfmpegPlaybackInput,
+        frame_slot: FrameSlot,
+        event_tx: Sender<BackendEvent>,
+    ) -> Result<Self> {
+        let control = Arc::new(FfmpegControl::new());
+        let (command_tx, command_rx) = mpsc::channel();
         let pipeline = Arc::new(Mutex::new(None));
         let frame_presented = Arc::new(AtomicBool::new(false));
-        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_control = Arc::clone(&control);
         let worker_pipeline = Arc::clone(&pipeline);
         let worker_presented = Arc::clone(&frame_presented);
 
@@ -136,15 +218,16 @@ impl FfmpegWorker {
             .name("tiny-ffmpeg-backend".to_string())
             .spawn(move || {
                 let result = run_ffmpeg_playback(
-                    &url,
+                    input,
                     frame_slot,
                     event_tx.clone(),
-                    worker_shutdown.clone(),
+                    worker_control.clone(),
+                    command_rx,
                     worker_pipeline,
                     worker_presented.clone(),
                 );
 
-                if worker_shutdown.load(Ordering::Relaxed) {
+                if worker_control.should_stop() {
                     return;
                 }
 
@@ -165,24 +248,86 @@ impl FfmpegWorker {
             .map_err(|error| BackendError::Ffmpeg(format!("创建 FFmpeg 解码线程失败：{error}")))?;
 
         Ok(Self {
-            shutdown,
+            control,
+            command_tx,
             pipeline,
             handle,
         })
     }
 
-    fn stop(self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        if let Some(pipeline) = self
-            .pipeline
-            .lock()
-            .expect("FFmpeg pipeline handle poisoned")
-            .as_ref()
-        {
-            let _ = pipeline.set_state(gst::State::Null);
-        }
-        let _ = self.handle.join();
+    fn seek(&self, position_seconds: f64) -> Result<()> {
+        self.control.request_seek();
+        self.command_tx
+            .send(FfmpegCommand::Seek(position_seconds))
+            .map_err(|_| {
+                self.control.finish_seek();
+                BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string())
+            })?;
+        stop_ffmpeg_pipeline_async(Arc::clone(&self.pipeline));
+        Ok(())
     }
+
+    fn stop(self) {
+        let Self {
+            control,
+            command_tx: _,
+            pipeline,
+            handle,
+        } = self;
+        stop_ffmpeg_worker(control, pipeline);
+        let _ = handle.join();
+    }
+
+    fn stop_async(self) {
+        let Self {
+            control,
+            command_tx: _,
+            pipeline,
+            handle,
+        } = self;
+        control.shutdown();
+        let _ = thread::Builder::new()
+            .name("tiny-ffmpeg-stop".to_string())
+            .spawn(move || {
+                stop_ffmpeg_pipeline(pipeline);
+                let _ = handle.join();
+            });
+    }
+}
+
+fn stop_ffmpeg_worker(control: Arc<FfmpegControl>, pipeline: Arc<Mutex<Option<gst::Pipeline>>>) {
+    control.shutdown();
+    stop_ffmpeg_pipeline(pipeline);
+}
+
+fn stop_ffmpeg_pipeline(pipeline: Arc<Mutex<Option<gst::Pipeline>>>) {
+    if let Some(pipeline) = pipeline
+        .lock()
+        .expect("FFmpeg pipeline handle poisoned")
+        .as_ref()
+        .cloned()
+    {
+        let _ = pipeline.set_state(gst::State::Null);
+    }
+}
+
+fn stop_ffmpeg_pipeline_async(pipeline: Arc<Mutex<Option<gst::Pipeline>>>) {
+    let pipeline = pipeline
+        .lock()
+        .expect("FFmpeg pipeline handle poisoned")
+        .as_ref()
+        .cloned();
+    if let Some(pipeline) = pipeline {
+        stop_pipeline_instance_async(pipeline);
+    }
+}
+
+fn stop_pipeline_instance_async(pipeline: gst::Pipeline) {
+    let _ = thread::Builder::new()
+        .name("tiny-ffmpeg-pipeline-stop".to_string())
+        .spawn(move || {
+            let _ = pipeline.set_state(gst::State::Null);
+        });
 }
 
 fn init_ffmpeg_network() -> Result<()> {
@@ -203,23 +348,35 @@ fn init_ffmpeg_network() -> Result<()> {
 }
 
 fn run_ffmpeg_playback(
-    url: &str,
+    source: FfmpegPlaybackInput,
     frame_slot: FrameSlot,
     event_tx: Sender<BackendEvent>,
-    shutdown: Arc<AtomicBool>,
+    control: Arc<FfmpegControl>,
+    command_rx: Receiver<FfmpegCommand>,
     pipeline_handle: Arc<Mutex<Option<gst::Pipeline>>>,
     frame_presented: Arc<AtomicBool>,
 ) -> std::result::Result<(), String> {
-    let mut input = FormatContext::open(url, Arc::clone(&shutdown))?;
+    let mut input = FormatContext::open(&source.url, Arc::clone(&control))?;
     input.find_stream_info()?;
 
     let video_stream = input
         .best_stream(ffi::AVMediaType::AVMEDIA_TYPE_VIDEO)?
         .ok_or_else(|| "FFmpeg 未找到可解码视频流".to_string())?;
+    if source.start_position_seconds > 0.0 {
+        input.seek_stream(video_stream, source.start_position_seconds)?;
+    }
     let video_decoder = Decoder::open(video_stream)?;
     let mut video_frame = AvFrame::new()?;
     let mut video_scaler = VideoScaler::new(&video_decoder)?;
-    let mut video_clock = TimestampMapper::new(video_stream.start_nsecs);
+    let mut current_start_position_nsecs = seconds_to_nsecs(source.start_position_seconds);
+    let video_frame_duration_nsecs = video_stream
+        .frame_duration_nsecs
+        .unwrap_or(DEFAULT_VIDEO_FRAME_DURATION_NSECS);
+    let mut video_clock = TimestampMapper::new(
+        video_stream.start_nsecs,
+        current_start_position_nsecs,
+        Some(video_frame_duration_nsecs),
+    );
 
     let audio_stream = input
         .best_stream(ffi::AVMediaType::AVMEDIA_TYPE_AUDIO)
@@ -254,25 +411,80 @@ fn run_ffmpeg_playback(
         },
         None => None,
     };
-    let mut audio_clock = TimestampMapper::new(audio_stream.and_then(|stream| stream.start_nsecs));
+    let mut audio_clock = TimestampMapper::new(
+        audio_stream.and_then(|stream| stream.start_nsecs),
+        current_start_position_nsecs,
+        None,
+    );
 
     let mut sinks = FfmpegPlaybackSinks::new(
         video_decoder.size()?,
         audio_resampler.as_ref().map(AudioResampler::output_rate),
-        frame_slot,
+        frame_slot.clone(),
         event_tx.clone(),
-        frame_presented,
-        pipeline_handle,
+        Arc::clone(&frame_presented),
+        Arc::clone(&pipeline_handle),
     )?;
 
     if let Some(duration) = input.duration_seconds() {
         let _ = event_tx.send(BackendEvent::DurationChanged(duration));
     }
+    let duration_seconds = input.duration_seconds();
 
     let mut packet = AvPacket::new()?;
-    let mut position_reporter = PositionReporter::default();
+    let mut buffered_reporter = BufferedReporter::new(audio_resampler.is_some());
+    let mut seek_preview_pending = source.start_position_seconds > 0.0;
+    buffered_reporter.reset_to(source.start_position_seconds.max(0.0), &event_tx);
 
-    while !shutdown.load(Ordering::Relaxed) {
+    while !control.should_stop() {
+        if let Some(position_seconds) = drain_seek_command(&command_rx) {
+            let seek_result: std::result::Result<(), String> = (|| {
+                let position_seconds = position_seconds.max(0.0);
+                current_start_position_nsecs = seconds_to_nsecs(position_seconds);
+                input.seek_stream(video_stream, position_seconds)?;
+                video_decoder.flush_buffers();
+                if let Some(decoder) = &audio_decoder {
+                    decoder.flush_buffers();
+                }
+                video_frame.unref();
+                if let Some(frame) = audio_frame.as_mut() {
+                    frame.unref();
+                }
+                packet.unref();
+                video_clock = TimestampMapper::new(
+                    video_stream.start_nsecs,
+                    current_start_position_nsecs,
+                    Some(video_frame_duration_nsecs),
+                );
+                audio_clock = TimestampMapper::new(
+                    audio_stream.and_then(|stream| stream.start_nsecs),
+                    current_start_position_nsecs,
+                    None,
+                );
+                buffered_reporter = BufferedReporter::new(audio_resampler.is_some());
+                seek_preview_pending = true;
+                sinks = FfmpegPlaybackSinks::new(
+                    video_decoder.size()?,
+                    audio_resampler.as_ref().map(AudioResampler::output_rate),
+                    frame_slot.clone(),
+                    event_tx.clone(),
+                    Arc::clone(&frame_presented),
+                    Arc::clone(&pipeline_handle),
+                )?;
+                buffered_reporter.reset_to(position_seconds, &event_tx);
+                let _ = event_tx.send(BackendEvent::PositionChanged(position_seconds));
+                Ok(())
+            })();
+            control.finish_seek();
+            seek_result?;
+            continue;
+        }
+
+        if control.has_pending_seek() {
+            thread::yield_now();
+            continue;
+        }
+
         let read = unsafe { ffi::av_read_frame(input.as_mut_ptr(), packet.as_mut_ptr()) };
         if read == ffi::AVERROR_EOF {
             break;
@@ -284,12 +496,37 @@ fn run_ffmpeg_playback(
         let process_result = match packet.stream_index() {
             index if index == video_decoder.stream_index => {
                 video_decoder.decode_packet(packet.as_ptr(), &mut video_frame, |frame| {
+                    if control.has_pending_seek() {
+                        return Ok(());
+                    }
                     let timestamp = video_clock
-                        .map(frame_best_effort_timestamp(frame), video_decoder.time_base)
-                        .unwrap_or(0);
+                        .map(frame_best_effort_timestamp(frame), video_decoder.time_base);
+                    if timestamp.timeline_nsecs < current_start_position_nsecs {
+                        if seek_preview_pending {
+                            let pixels = video_scaler.convert(frame)?;
+                            frame_slot.push(DecodedFrame {
+                                size: video_scaler.size,
+                                pts: Some(FramePts {
+                                    nsecs: current_start_position_nsecs,
+                                }),
+                                pixels: FramePixels::Bgra8(pixels),
+                            });
+                            frame_presented.store(true, Ordering::Relaxed);
+                            seek_preview_pending = false;
+                        }
+                        return Ok(());
+                    }
                     let pixels = video_scaler.convert(frame)?;
-                    sinks.push_video(pixels, timestamp)?;
-                    position_reporter.report(timestamp, &event_tx);
+                    if control.has_pending_seek() {
+                        return Ok(());
+                    }
+                    sinks.push_video(pixels, timestamp.sink_nsecs, timestamp.timeline_nsecs)?;
+                    buffered_reporter.report_video_timeline_nsecs(
+                        timestamp
+                            .timeline_nsecs
+                            .saturating_add(video_frame_duration_nsecs),
+                        &event_tx,
+                    );
                     Ok(())
                 })
             }
@@ -306,11 +543,24 @@ fn run_ffmpeg_playback(
                     .as_mut()
                     .expect("audio resampler exists with audio decoder");
                 decoder.decode_packet(packet.as_ptr(), frame, |frame| {
-                    let timestamp = audio_clock
-                        .map(frame_best_effort_timestamp(frame), decoder.time_base)
-                        .unwrap_or(0);
+                    if control.has_pending_seek() {
+                        return Ok(());
+                    }
+                    let timestamp =
+                        audio_clock.map(frame_best_effort_timestamp(frame), decoder.time_base);
+                    if timestamp.timeline_nsecs < current_start_position_nsecs {
+                        return Ok(());
+                    }
                     if let Some(audio) = resampler.convert(frame)? {
-                        sinks.push_audio(audio, timestamp)?;
+                        if control.has_pending_seek() {
+                            return Ok(());
+                        }
+                        let buffered_until_nsecs = timestamp
+                            .timeline_nsecs
+                            .saturating_add(audio.duration_nsecs);
+                        sinks.push_audio(audio, timestamp.sink_nsecs)?;
+                        buffered_reporter
+                            .report_audio_timeline_nsecs(buffered_until_nsecs, &event_tx);
                     }
                     Ok(())
                 })
@@ -318,20 +568,35 @@ fn run_ffmpeg_playback(
             _ => Ok(()),
         };
         packet.unref();
-        process_result?;
+        if let Err(error) = process_result {
+            if control.has_pending_seek() {
+                continue;
+            }
+            return Err(error);
+        }
+        if control.has_pending_seek() {
+            continue;
+        }
     }
 
-    if shutdown.load(Ordering::Relaxed) {
+    if control.should_stop() {
         return Ok(());
     }
 
     video_decoder.flush(&mut video_frame, |frame| {
-        let timestamp = video_clock
-            .map(frame_best_effort_timestamp(frame), video_decoder.time_base)
-            .unwrap_or(0);
+        let timestamp =
+            video_clock.map(frame_best_effort_timestamp(frame), video_decoder.time_base);
+        if timestamp.timeline_nsecs < current_start_position_nsecs {
+            return Ok(());
+        }
         let pixels = video_scaler.convert(frame)?;
-        sinks.push_video(pixels, timestamp)?;
-        position_reporter.report(timestamp, &event_tx);
+        sinks.push_video(pixels, timestamp.sink_nsecs, timestamp.timeline_nsecs)?;
+        buffered_reporter.report_video_timeline_nsecs(
+            timestamp
+                .timeline_nsecs
+                .saturating_add(video_frame_duration_nsecs),
+            &event_tx,
+        );
         Ok(())
     })?;
 
@@ -341,18 +606,36 @@ fn run_ffmpeg_playback(
         audio_resampler.as_mut(),
     ) {
         decoder.flush(frame, |frame| {
-            let timestamp = audio_clock
-                .map(frame_best_effort_timestamp(frame), decoder.time_base)
-                .unwrap_or(0);
+            let timestamp = audio_clock.map(frame_best_effort_timestamp(frame), decoder.time_base);
+            if timestamp.timeline_nsecs < current_start_position_nsecs {
+                return Ok(());
+            }
             if let Some(audio) = resampler.convert(frame)? {
-                sinks.push_audio(audio, timestamp)?;
+                let buffered_until_nsecs = timestamp
+                    .timeline_nsecs
+                    .saturating_add(audio.duration_nsecs);
+                sinks.push_audio(audio, timestamp.sink_nsecs)?;
+                buffered_reporter.report_audio_timeline_nsecs(buffered_until_nsecs, &event_tx);
             }
             Ok(())
         })?;
     }
 
+    buffered_reporter.report_value(duration_seconds, &event_tx);
     sinks.end_of_stream();
     Ok(())
+}
+
+fn drain_seek_command(command_rx: &Receiver<FfmpegCommand>) -> Option<f64> {
+    let mut pending_seek = None;
+    while let Ok(command) = command_rx.try_recv() {
+        match command {
+            FfmpegCommand::Seek(position_seconds) => {
+                pending_seek = Some(position_seconds.max(0.0));
+            }
+        }
+    }
+    pending_seek
 }
 
 struct FfmpegPlaybackSinks {
@@ -387,7 +670,7 @@ impl FfmpegPlaybackSinks {
             .caps(&video_caps)
             .format(gst::Format::Time)
             .is_live(false)
-            .block(true)
+            .block(false)
             .max_bytes(video_frame_len(video_size)?.saturating_mul(3) as u64)
             .build();
         let video_queue = make_element("queue")?;
@@ -421,7 +704,7 @@ impl FfmpegPlaybackSinks {
                 .caps(&audio_caps)
                 .format(gst::Format::Time)
                 .is_live(false)
-                .block(true)
+                .block(false)
                 .max_bytes((rate as u64).saturating_mul(AUDIO_OUTPUT_CHANNELS as u64 * 4))
                 .build();
             let audio_queue = make_element("queue")?;
@@ -464,12 +747,18 @@ impl FfmpegPlaybackSinks {
         })
     }
 
-    fn push_video(&mut self, pixels: Vec<u8>, pts_nsecs: u64) -> std::result::Result<(), String> {
+    fn push_video(
+        &mut self,
+        pixels: Vec<u8>,
+        sink_pts_nsecs: u64,
+        timeline_pts_nsecs: u64,
+    ) -> std::result::Result<(), String> {
         let mut buffer = gst::Buffer::from_mut_slice(pixels);
         let buffer_ref = buffer
             .get_mut()
             .ok_or_else(|| "FFmpeg 视频 buffer 不可写".to_string())?;
-        buffer_ref.set_pts(gst::ClockTime::from_nseconds(pts_nsecs));
+        buffer_ref.set_pts(gst::ClockTime::from_nseconds(sink_pts_nsecs));
+        buffer_ref.set_offset(timeline_pts_nsecs);
         self.video_src
             .push_buffer(buffer)
             .map(|_| ())
@@ -507,7 +796,7 @@ impl FfmpegPlaybackSinks {
 
 impl Drop for FfmpegPlaybackSinks {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        stop_pipeline_instance_async(self.pipeline.clone());
     }
 }
 
@@ -517,6 +806,8 @@ fn build_video_appsink(
     event_tx: Sender<BackendEvent>,
     frame_presented: Arc<AtomicBool>,
 ) -> gst_app::AppSink {
+    let position_reporter = Arc::new(Mutex::new(PositionReporter::default()));
+
     gst_app::AppSink::builder()
         .caps(&caps)
         .sync(true)
@@ -530,6 +821,12 @@ fn build_video_appsink(
                     let sample = appsink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     match decoded_bgra_frame_from_sample(&sample) {
                         Ok(frame) => {
+                            if let Some(pts) = frame.pts {
+                                position_reporter
+                                    .lock()
+                                    .expect("FFmpeg position reporter poisoned")
+                                    .report(pts.nsecs, &event_tx);
+                            }
                             let count = FFMPEG_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                             if count == 1 || count.is_multiple_of(60) {
                                 tracing::debug!(
@@ -583,9 +880,15 @@ fn decoded_bgra_frame_from_sample(
         .copied()
         .ok_or_else(|| "视频帧缺少 stride".to_string())?;
     let stride = usize::try_from(stride).map_err(|_| "视频帧 stride 无效".to_string())?;
-    let pts = buffer.pts().map(|pts| FramePts {
-        nsecs: pts.nseconds(),
-    });
+    let pts = if buffer.offset() != gst::format::Buffers::OFFSET_NONE {
+        Some(FramePts {
+            nsecs: buffer.offset(),
+        })
+    } else {
+        buffer.pts().map(|pts| FramePts {
+            nsecs: pts.nseconds(),
+        })
+    };
     let pixels =
         packed_bgra_from_stride(map.as_slice(), size, stride).map_err(|error| error.to_string())?;
 
@@ -619,7 +922,7 @@ struct FormatContext {
 }
 
 impl FormatContext {
-    fn open(url: &str, shutdown: Arc<AtomicBool>) -> std::result::Result<Self, String> {
+    fn open(url: &str, control: Arc<FfmpegControl>) -> std::result::Result<Self, String> {
         let url = CString::new(url).map_err(|_| "播放地址包含无效字符".to_string())?;
         let mut context = unsafe { ffi::avformat_alloc_context() };
         if context.is_null() {
@@ -628,7 +931,7 @@ impl FormatContext {
 
         unsafe {
             (*context).interrupt_callback.callback = Some(ffmpeg_interrupt_callback);
-            (*context).interrupt_callback.opaque = Arc::as_ptr(&shutdown) as *mut c_void;
+            (*context).interrupt_callback.opaque = Arc::as_ptr(&control) as *mut c_void;
         }
 
         let result = unsafe {
@@ -669,12 +972,14 @@ impl FormatContext {
         let stream = self.stream(index)?;
         let time_base = unsafe { (*stream).time_base };
         let start_nsecs = unsafe { timestamp_to_nsecs((*stream).start_time, time_base) };
+        let frame_duration_nsecs = unsafe { stream_frame_duration_nsecs(stream) };
         Ok(Some(StreamInfo {
             index,
             stream,
             decoder,
             time_base,
             start_nsecs,
+            frame_duration_nsecs,
         }))
     }
 
@@ -699,6 +1004,23 @@ impl FormatContext {
         Some(duration as f64 / ffi::AV_TIME_BASE as f64)
     }
 
+    fn seek_stream(
+        &mut self,
+        stream: StreamInfo,
+        position_seconds: f64,
+    ) -> std::result::Result<(), String> {
+        let target_nsecs =
+            seconds_to_nsecs(position_seconds).saturating_add(stream.start_nsecs.unwrap_or(0));
+        let timestamp = nsecs_to_timestamp(target_nsecs, stream.time_base);
+        let result = unsafe {
+            ffi::av_seek_frame(self.ptr, stream.index, timestamp, ffi::AVSEEK_FLAG_BACKWARD)
+        };
+        if result < 0 {
+            return Err(format!("FFmpeg 跳转媒体位置失败：{}", ffmpeg_error(result)));
+        }
+        Ok(())
+    }
+
     fn as_mut_ptr(&mut self) -> *mut ffi::AVFormatContext {
         self.ptr
     }
@@ -719,6 +1041,7 @@ struct StreamInfo {
     decoder: *const ffi::AVCodec,
     time_base: ffi::AVRational,
     start_nsecs: Option<u64>,
+    frame_duration_nsecs: Option<u64>,
 }
 
 struct Decoder {
@@ -807,6 +1130,10 @@ impl Decoder {
             return Err(format!("FFmpeg 刷新解码器失败：{}", ffmpeg_error(result)));
         }
         self.receive_frames(frame, on_frame)
+    }
+
+    fn flush_buffers(&self) {
+        unsafe { ffi::avcodec_flush_buffers(self.ptr) };
     }
 
     fn receive_frames<F>(
@@ -1164,19 +1491,157 @@ impl PositionReporter {
     }
 }
 
+struct BufferedReporter {
+    last_report: Option<Instant>,
+    last_buffered_until: Option<f64>,
+    video_buffered_until: Option<f64>,
+    audio_buffered_until: Option<f64>,
+    needs_audio: bool,
+}
+
+impl BufferedReporter {
+    fn new(needs_audio: bool) -> Self {
+        Self {
+            last_report: None,
+            last_buffered_until: None,
+            video_buffered_until: None,
+            audio_buffered_until: None,
+            needs_audio,
+        }
+    }
+
+    fn reset_to(&mut self, position_seconds: f64, event_tx: &Sender<BackendEvent>) {
+        let position_seconds = position_seconds.max(0.0);
+        self.last_report = None;
+        self.last_buffered_until = None;
+        self.video_buffered_until = Some(position_seconds);
+        self.audio_buffered_until = self.needs_audio.then_some(position_seconds);
+        self.report_value(Some(position_seconds), event_tx);
+    }
+
+    fn report_video_timeline_nsecs(
+        &mut self,
+        timeline_nsecs: u64,
+        event_tx: &Sender<BackendEvent>,
+    ) {
+        self.video_buffered_until = Some(max_optional_seconds(
+            self.video_buffered_until,
+            timeline_nsecs,
+        ));
+        self.report_combined(event_tx);
+    }
+
+    fn report_audio_timeline_nsecs(
+        &mut self,
+        timeline_nsecs: u64,
+        event_tx: &Sender<BackendEvent>,
+    ) {
+        self.audio_buffered_until = Some(max_optional_seconds(
+            self.audio_buffered_until,
+            timeline_nsecs,
+        ));
+        self.report_combined(event_tx);
+    }
+
+    fn report_combined(&mut self, event_tx: &Sender<BackendEvent>) {
+        if self
+            .last_report
+            .is_some_and(|last| last.elapsed() < POSITION_QUERY_INTERVAL)
+        {
+            return;
+        }
+
+        let Some(buffered_until) = (if self.needs_audio {
+            self.video_buffered_until
+                .zip(self.audio_buffered_until)
+                .map(|(video, audio)| video.min(audio))
+        } else {
+            self.video_buffered_until
+        }) else {
+            return;
+        };
+        let buffered_until = self
+            .last_buffered_until
+            .map(|last| last.max(buffered_until))
+            .unwrap_or(buffered_until);
+        self.report_value(Some(buffered_until), event_tx);
+    }
+
+    fn report_value(&mut self, buffered_until: Option<f64>, event_tx: &Sender<BackendEvent>) {
+        if !optional_buffered_value_changed(self.last_buffered_until, buffered_until) {
+            return;
+        }
+
+        self.last_report = Some(Instant::now());
+        self.last_buffered_until = buffered_until;
+        let _ = event_tx.send(BackendEvent::BufferedChanged(buffered_until));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MappedTimestamp {
+    timeline_nsecs: u64,
+    sink_nsecs: u64,
+}
+
 struct TimestampMapper {
     start_nsecs: Option<u64>,
+    fallback_first_nsecs: Option<u64>,
+    start_position_nsecs: u64,
+    fallback_step_nsecs: u64,
+    last_timeline_nsecs: Option<u64>,
 }
 
 impl TimestampMapper {
-    fn new(start_nsecs: Option<u64>) -> Self {
-        Self { start_nsecs }
+    fn new(
+        start_nsecs: Option<u64>,
+        start_position_nsecs: u64,
+        fallback_step_nsecs: Option<u64>,
+    ) -> Self {
+        Self {
+            start_nsecs,
+            fallback_first_nsecs: None,
+            start_position_nsecs,
+            fallback_step_nsecs: fallback_step_nsecs.unwrap_or(1),
+            last_timeline_nsecs: None,
+        }
     }
 
-    fn map(&mut self, timestamp: i64, time_base: ffi::AVRational) -> Option<u64> {
-        let nsecs = timestamp_to_nsecs(timestamp, time_base)?;
-        let start = *self.start_nsecs.get_or_insert(nsecs);
-        Some(nsecs.saturating_sub(start))
+    fn map(&mut self, timestamp: i64, time_base: ffi::AVRational) -> MappedTimestamp {
+        let mut timeline_nsecs = timestamp_to_nsecs(timestamp, time_base)
+            .map(|nsecs| self.timeline_from_timestamp(nsecs))
+            .unwrap_or_else(|| self.next_synthetic_timeline());
+
+        if self.start_position_nsecs > 0 && timeline_nsecs == 0 {
+            timeline_nsecs = self.next_synthetic_timeline();
+        }
+        if let Some(last_timeline_nsecs) = self.last_timeline_nsecs
+            && timeline_nsecs <= last_timeline_nsecs
+        {
+            timeline_nsecs = last_timeline_nsecs.saturating_add(self.fallback_step_nsecs);
+        }
+
+        self.last_timeline_nsecs = Some(timeline_nsecs);
+        MappedTimestamp {
+            timeline_nsecs,
+            sink_nsecs: timeline_nsecs.saturating_sub(self.start_position_nsecs),
+        }
+    }
+
+    fn timeline_from_timestamp(&mut self, nsecs: u64) -> u64 {
+        if let Some(start_nsecs) = self.start_nsecs {
+            nsecs.saturating_sub(start_nsecs)
+        } else {
+            let first_nsecs = *self.fallback_first_nsecs.get_or_insert(nsecs);
+            self.start_position_nsecs
+                .saturating_add(nsecs.saturating_sub(first_nsecs))
+        }
+    }
+
+    fn next_synthetic_timeline(&self) -> u64 {
+        self.last_timeline_nsecs
+            .map(|last| last.saturating_add(self.fallback_step_nsecs))
+            .unwrap_or(self.start_position_nsecs)
     }
 }
 
@@ -1211,6 +1676,59 @@ fn timestamp_to_nsecs(timestamp: i64, time_base: ffi::AVRational) -> Option<u64>
     };
     let nsecs = unsafe { ffi::av_rescale_q(timestamp, time_base, nsecs_time_base) };
     u64::try_from(nsecs).ok()
+}
+
+unsafe fn stream_frame_duration_nsecs(stream: *mut ffi::AVStream) -> Option<u64> {
+    if stream.is_null() {
+        return None;
+    }
+
+    unsafe {
+        rational_frame_duration_nsecs((*stream).avg_frame_rate)
+            .or_else(|| rational_frame_duration_nsecs((*stream).r_frame_rate))
+    }
+}
+
+fn rational_frame_duration_nsecs(rate: ffi::AVRational) -> Option<u64> {
+    if rate.num <= 0 || rate.den <= 0 {
+        return None;
+    }
+
+    Some(((rate.den as u64).saturating_mul(1_000_000_000) / rate.num as u64).max(1))
+}
+
+fn seconds_to_nsecs(seconds: f64) -> u64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+
+    (seconds * 1_000_000_000.0).round().min(u64::MAX as f64) as u64
+}
+
+fn nsecs_to_timestamp(nsecs: u64, time_base: ffi::AVRational) -> i64 {
+    let nsecs_time_base = ffi::AVRational {
+        num: 1,
+        den: 1_000_000_000,
+    };
+    let nsecs = i64::try_from(nsecs).unwrap_or(i64::MAX);
+    unsafe { ffi::av_rescale_q(nsecs, nsecs_time_base, time_base) }
+}
+
+fn nsecs_to_seconds(nsecs: u64) -> f64 {
+    nsecs as f64 / 1_000_000_000.0
+}
+
+fn max_optional_seconds(current: Option<f64>, timeline_nsecs: u64) -> f64 {
+    let next = nsecs_to_seconds(timeline_nsecs);
+    current.map(|current| current.max(next)).unwrap_or(next)
+}
+
+fn optional_buffered_value_changed(previous: Option<f64>, next: Option<f64>) -> bool {
+    match (previous, next) {
+        (None, None) => false,
+        (Some(previous), Some(next)) => (previous - next).abs() >= 0.05,
+        _ => true,
+    }
 }
 
 fn video_frame_len(size: RenderSize) -> std::result::Result<usize, String> {
@@ -1252,8 +1770,8 @@ unsafe extern "C" fn ffmpeg_interrupt_callback(opaque: *mut c_void) -> c_int {
     if opaque.is_null() {
         return 0;
     }
-    let shutdown = unsafe { &*(opaque as *const AtomicBool) };
-    shutdown.load(Ordering::Relaxed) as c_int
+    let control = unsafe { &*(opaque as *const FfmpegControl) };
+    control.should_stop() as c_int
 }
 
 #[cfg(test)]
@@ -1262,19 +1780,102 @@ mod tests {
 
     #[test]
     fn timestamp_mapper_uses_stream_start_when_available() {
-        let mut mapper = TimestampMapper::new(Some(1_000_000_000));
+        let mut mapper = TimestampMapper::new(Some(1_000_000_000), 0, None);
         let time_base = ffi::AVRational { num: 1, den: 1_000 };
 
-        assert_eq!(mapper.map(1_250, time_base), Some(250_000_000));
+        assert_eq!(
+            mapper.map(1_250, time_base),
+            MappedTimestamp {
+                timeline_nsecs: 250_000_000,
+                sink_nsecs: 250_000_000,
+            }
+        );
     }
 
     #[test]
     fn timestamp_mapper_uses_first_timestamp_without_stream_start() {
-        let mut mapper = TimestampMapper::new(None);
+        let mut mapper = TimestampMapper::new(None, 0, None);
         let time_base = ffi::AVRational { num: 1, den: 1_000 };
 
-        assert_eq!(mapper.map(500, time_base), Some(0));
-        assert_eq!(mapper.map(750, time_base), Some(250_000_000));
+        assert_eq!(
+            mapper.map(500, time_base),
+            MappedTimestamp {
+                timeline_nsecs: 0,
+                sink_nsecs: 0,
+            }
+        );
+        assert_eq!(
+            mapper.map(750, time_base),
+            MappedTimestamp {
+                timeline_nsecs: 250_000_000,
+                sink_nsecs: 250_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn timestamp_mapper_offsets_sink_timestamps_after_seek() {
+        let mut mapper = TimestampMapper::new(Some(0), 10_000_000_000, None);
+        let time_base = ffi::AVRational { num: 1, den: 1_000 };
+
+        assert_eq!(
+            mapper.map(10_250, time_base),
+            MappedTimestamp {
+                timeline_nsecs: 10_250_000_000,
+                sink_nsecs: 250_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn timestamp_mapper_synthesizes_repeated_video_timestamps() {
+        let mut mapper = TimestampMapper::new(Some(0), 0, Some(40_000_000));
+        let time_base = ffi::AVRational { num: 1, den: 1_000 };
+
+        assert_eq!(
+            mapper.map(0, time_base),
+            MappedTimestamp {
+                timeline_nsecs: 0,
+                sink_nsecs: 0,
+            }
+        );
+        assert_eq!(
+            mapper.map(0, time_base),
+            MappedTimestamp {
+                timeline_nsecs: 40_000_000,
+                sink_nsecs: 40_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn timestamp_mapper_keeps_missing_timestamps_at_seek_target() {
+        let mut mapper = TimestampMapper::new(Some(0), 10_000_000_000, Some(40_000_000));
+        let time_base = ffi::AVRational { num: 1, den: 1_000 };
+
+        assert_eq!(
+            mapper.map(ffi::AV_NOPTS_VALUE, time_base),
+            MappedTimestamp {
+                timeline_nsecs: 10_000_000_000,
+                sink_nsecs: 0,
+            }
+        );
+        assert_eq!(
+            mapper.map(0, time_base),
+            MappedTimestamp {
+                timeline_nsecs: 10_040_000_000,
+                sink_nsecs: 40_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn optional_buffered_value_changed_uses_small_threshold() {
+        assert!(!optional_buffered_value_changed(None, None));
+        assert!(optional_buffered_value_changed(None, Some(1.0)));
+        assert!(optional_buffered_value_changed(Some(1.0), None));
+        assert!(!optional_buffered_value_changed(Some(1.0), Some(1.03)));
+        assert!(optional_buffered_value_changed(Some(1.0), Some(1.05)));
     }
 
     #[test]

@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, ClickEvent, Context, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Render, RenderImage, SharedString, StatefulInteractiveElement, Styled, Window, canvas,
-    div, prelude::*, px, rgb, svg,
+    Bounds, Context, DragMoveEvent, EventEmitter, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, SharedString,
+    StatefulInteractiveElement, Styled, Window, canvas, div, prelude::*, px, relative, rgb, rgba,
+    svg,
 };
 
 use crate::theme;
@@ -35,6 +36,11 @@ pub struct PlaybackPage {
     current_frame: Option<Arc<RenderImage>>,
     playback_paused: bool,
     playback_buffering: bool,
+    playback_position: Option<f64>,
+    playback_duration: Option<f64>,
+    playback_buffered_until: Option<f64>,
+    progress_track_bounds: Option<Bounds<Pixels>>,
+    progress_drag_position: Option<f64>,
     current_file_loaded: bool,
     ffmpeg_fallback_attempted: bool,
     error_message: Option<SharedString>,
@@ -79,6 +85,11 @@ impl PlaybackPage {
             current_frame: None,
             playback_paused: true,
             playback_buffering: false,
+            playback_position: None,
+            playback_duration: None,
+            playback_buffered_until: None,
+            progress_track_bounds: None,
+            progress_drag_position: None,
             current_file_loaded: false,
             ffmpeg_fallback_attempted: false,
             error_message,
@@ -90,9 +101,19 @@ impl PlaybackPage {
         self.title.clone()
     }
 
-    fn back_to_detail(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn back_to_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_visible_frame(window, cx);
         cx.emit(PlaybackEvent::Back);
+    }
+
+    fn press_back_button(
+        &mut self,
+        _: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.back_to_detail(window, cx);
     }
 
     fn replace_visible_frame(
@@ -131,6 +152,95 @@ impl PlaybackPage {
         cx.notify();
     }
 
+    fn update_progress_track_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if !viewport_changed(self.progress_track_bounds, bounds) {
+            return;
+        }
+
+        self.progress_track_bounds = Some(bounds);
+        cx.notify();
+    }
+
+    fn begin_progress_drag(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_progress_drag(event.position.x, cx);
+        cx.stop_propagation();
+    }
+
+    fn drag_progress(
+        &mut self,
+        event: &DragMoveEvent<ProgressBarDrag>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_progress_drag(event.event.position.x, cx);
+        cx.stop_propagation();
+    }
+
+    fn finish_progress_drag(
+        &mut self,
+        _event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_progress_drag(window, cx);
+        cx.stop_propagation();
+    }
+
+    fn update_progress_drag(&mut self, cursor_x: Pixels, cx: &mut Context<Self>) {
+        let Some(position) = self.position_for_progress_cursor(cursor_x) else {
+            return;
+        };
+        if self
+            .progress_drag_position
+            .is_none_or(|current| (current - position).abs() >= 0.02)
+        {
+            self.progress_drag_position = Some(position);
+            cx.notify();
+        }
+    }
+
+    fn commit_progress_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(position) = self.progress_drag_position.take() else {
+            return;
+        };
+        let uses_playable_cache_progress = self
+            .video
+            .owner()
+            .is_some_and(PlaybackBackend::uses_playable_cache_progress);
+        self.playback_position = Some(position);
+        self.playback_buffered_until = if uses_playable_cache_progress {
+            Some(position)
+        } else {
+            self.playback_buffered_until
+                .map(|buffered_until| buffered_until.max(position))
+        };
+        self.playback_buffering = true;
+        self.status_message = "正在跳转…".into();
+        self.clear_visible_frame(window, cx);
+
+        if let Some(backend) = self.video.owner_mut()
+            && let Err(error) = backend.seek_to(position)
+        {
+            self.error_message = Some(format!("跳转播放位置失败：{error}").into());
+        }
+        cx.notify();
+    }
+
+    fn position_for_progress_cursor(&self, cursor_x: Pixels) -> Option<f64> {
+        let duration = self.playback_duration?;
+        let bounds = self.progress_track_bounds?;
+        let fraction = progress_fraction_for_cursor(cursor_x, bounds)?;
+        Some(clamp_playback_position(
+            duration * fraction as f64,
+            duration,
+        ))
+    }
+
     fn poll_backend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let events = self
             .video
@@ -142,6 +252,8 @@ impl PlaybackPage {
                 BackendEvent::PlaybackRestart => {
                     self.current_file_loaded = true;
                     self.playback_paused = false;
+                    self.playback_buffering = false;
+                    self.status_message = "".into();
                     self.error_message = None;
                 }
                 BackendEvent::LoadFailed(message) => {
@@ -153,6 +265,8 @@ impl PlaybackPage {
                     self.video_source_size = None;
                     self.playback_paused = true;
                     self.playback_buffering = false;
+                    self.playback_buffered_until = None;
+                    self.progress_drag_position = None;
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("加载视频失败：{message}").into());
                 }
@@ -161,6 +275,8 @@ impl PlaybackPage {
                     self.video_source_size = None;
                     self.playback_paused = true;
                     self.playback_buffering = false;
+                    self.playback_buffered_until = None;
+                    self.progress_drag_position = None;
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("播放后端错误：{message}").into());
                 }
@@ -179,10 +295,21 @@ impl PlaybackPage {
                     }
                 }
                 BackendEvent::PositionChanged(position) => {
-                    let _ = position;
+                    if self.progress_drag_position.is_none() {
+                        self.playback_position = valid_playback_time(position);
+                    }
                 }
                 BackendEvent::DurationChanged(duration) => {
-                    let _ = duration;
+                    self.playback_duration = valid_playback_duration(duration);
+                    if let (Some(drag_position), Some(duration)) =
+                        (self.progress_drag_position, self.playback_duration)
+                    {
+                        self.progress_drag_position =
+                            Some(clamp_playback_position(drag_position, duration));
+                    }
+                }
+                BackendEvent::BufferedChanged(buffered_until) => {
+                    self.playback_buffered_until = buffered_until.and_then(valid_playback_time);
                 }
             }
         }
@@ -251,6 +378,8 @@ impl PlaybackPage {
         self.video_source_size = None;
         self.playback_paused = true;
         self.playback_buffering = false;
+        self.playback_buffered_until = None;
+        self.progress_drag_position = None;
         self.error_message = None;
         self.status_message = "正在切换 FFmpeg 播放后端…".into();
         self.clear_visible_frame(window, cx);
@@ -281,6 +410,126 @@ impl PlaybackPage {
         );
         cx.notify();
     }
+
+    fn render_progress_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+        let Some(duration) = self.playback_duration else {
+            return div().id("playback-progress-empty").into_any_element();
+        };
+
+        let theme = theme::get(cx);
+        let position = self
+            .progress_drag_position
+            .or(self.playback_position)
+            .unwrap_or(0.0);
+        let played_fraction = progress_fraction(position, duration);
+        let buffered_fraction =
+            buffered_progress_fraction(self.playback_buffered_until, position, duration);
+        let current_time = format_playback_time(position);
+        let duration_time = format_playback_time(duration);
+        let view = cx.entity().downgrade();
+        let track_observer = canvas(
+            |bounds, _, _| bounds,
+            move |_bounds, observed_bounds, window, _app| {
+                let view = view.clone();
+                window.on_next_frame(move |_, app| {
+                    let _ = view.update(app, |this, cx| {
+                        this.update_progress_track_bounds(observed_bounds, cx);
+                    });
+                });
+            },
+        )
+        .absolute()
+        .size_full();
+
+        div()
+            .id("playback-progress")
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .flex()
+            .h(px(64.0))
+            .items_center()
+            .gap_3()
+            .px_6()
+            .pt_5()
+            .pb_4()
+            .bg(rgba(0x0000006b))
+            .text_xs()
+            .text_color(theme.foreground.opacity(0.86))
+            .child(
+                div()
+                    .w(px(56.0))
+                    .text_align(gpui::TextAlign::Left)
+                    .child(current_time),
+            )
+            .child(
+                div()
+                    .id("playback-progress-track")
+                    .relative()
+                    .flex_1()
+                    .h(px(28.0))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_progress_drag))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_progress_drag))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_progress_drag))
+                    .on_drag(ProgressBarDrag, |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| ProgressBarDrag)
+                    })
+                    .on_drag_move(cx.listener(Self::drag_progress))
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .top(px(11.0))
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(theme.input_border.opacity(0.48)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(px(11.0))
+                            .h(px(6.0))
+                            .w(relative(buffered_fraction))
+                            .rounded_full()
+                            .bg(theme.muted_foreground.opacity(0.54)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(px(11.0))
+                            .h(px(6.0))
+                            .w(relative(played_fraction))
+                            .rounded_full()
+                            .bg(theme.input_border_focused),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(7.0))
+                            .left(relative(played_fraction))
+                            .ml(-px(6.0))
+                            .size(px(14.0))
+                            .rounded_full()
+                            .bg(theme.foreground)
+                            .border_1()
+                            .border_color(theme.input_border_focused.opacity(0.7)),
+                    )
+                    .child(track_observer),
+            )
+            .child(
+                div()
+                    .w(px(56.0))
+                    .text_align(gpui::TextAlign::Right)
+                    .child(duration_time),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for PlaybackPage {
@@ -296,7 +545,6 @@ impl Render for PlaybackPage {
             self.error_message.is_some() || current_frame.is_none() || self.playback_buffering;
         let message_text = self.message_text();
         let theme = theme::get(cx);
-        let back_to_detail = cx.listener(Self::back_to_detail);
         let view = cx.entity().downgrade();
         let viewport_observer = canvas(
             |bounds, _, _| bounds,
@@ -354,6 +602,7 @@ impl Render for PlaybackPage {
                 )
             })
             .child(viewport_observer)
+            .child(self.render_progress_bar(cx))
             .child(
                 div()
                     .id("playback-back-button")
@@ -370,6 +619,7 @@ impl Render for PlaybackPage {
                     .bg(theme.dialog_background.opacity(0.72))
                     .shadow_lg()
                     .occlude()
+                    .cursor_pointer()
                     .text_color(theme.foreground)
                     .hover(move |style| style.bg(theme.secondary_hover))
                     .child(
@@ -378,8 +628,20 @@ impl Render for PlaybackPage {
                             .size(px(20.0))
                             .text_color(theme.foreground),
                     )
-                    .on_click(back_to_detail),
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::press_back_button))
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    }),
             )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProgressBarDrag;
+
+impl Render for ProgressBarDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().hidden()
     }
 }
 
@@ -474,8 +736,19 @@ impl PlaybackBackend {
         }
     }
 
+    fn seek_to(&mut self, position_seconds: f64) -> super::backend::Result<()> {
+        match self {
+            Self::Gstreamer(backend) => backend.seek_to(position_seconds),
+            Self::Ffmpeg(backend) => backend.seek_to(position_seconds),
+        }
+    }
+
     fn is_gstreamer(&self) -> bool {
         matches!(self, Self::Gstreamer(_))
+    }
+
+    fn uses_playable_cache_progress(&self) -> bool {
+        matches!(self, Self::Gstreamer(_) | Self::Ffmpeg(_))
     }
 }
 
@@ -577,6 +850,54 @@ fn playback_status_message(buffering: bool, has_visible_frame: bool) -> SharedSt
     }
 }
 
+fn valid_playback_time(time: f64) -> Option<f64> {
+    (time.is_finite() && time >= 0.0).then_some(time)
+}
+
+fn valid_playback_duration(duration: f64) -> Option<f64> {
+    (duration.is_finite() && duration > 0.0).then_some(duration)
+}
+
+fn clamp_playback_position(position: f64, duration: f64) -> f64 {
+    if !position.is_finite() {
+        return 0.0;
+    }
+    position.clamp(0.0, duration.max(0.0))
+}
+
+fn progress_fraction(position: f64, duration: f64) -> f32 {
+    let Some(duration) = valid_playback_duration(duration) else {
+        return 0.0;
+    };
+    (clamp_playback_position(position, duration) / duration) as f32
+}
+
+fn buffered_progress_fraction(buffered_until: Option<f64>, position: f64, duration: f64) -> f32 {
+    let buffered_until = buffered_until.unwrap_or(position).max(position);
+    progress_fraction(buffered_until, duration)
+}
+
+fn progress_fraction_for_cursor(cursor_x: Pixels, bounds: Bounds<Pixels>) -> Option<f32> {
+    let width = f32::from(bounds.size.width);
+    if width <= 0.0 {
+        return None;
+    }
+
+    Some(((f32::from(cursor_x) - f32::from(bounds.origin.x)) / width).clamp(0.0, 1.0))
+}
+
+fn format_playback_time(seconds: f64) -> String {
+    let seconds = valid_playback_time(seconds).unwrap_or(0.0).round() as u64;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 fn should_render_frame(
     has_video_presenter: bool,
     has_loaded_file: bool,
@@ -616,8 +937,11 @@ mod tests {
 
     use super::{
         AnimationFrameRequestState, RenderSize, ShutdownOrder, aspect_fit_bounds,
-        normalize_video_viewport, playback_status_message, render_output_size, should_render_frame,
-        should_request_animation_frame, viewport_changed,
+        buffered_progress_fraction, clamp_playback_position, format_playback_time,
+        normalize_video_viewport, playback_status_message, progress_fraction,
+        progress_fraction_for_cursor, render_output_size, should_render_frame,
+        should_request_animation_frame, valid_playback_duration, valid_playback_time,
+        viewport_changed,
     };
 
     struct DropRecorder {
@@ -774,6 +1098,55 @@ mod tests {
         assert_eq!(playback_status_message(true, false), "正在缓冲视频…");
         assert_eq!(playback_status_message(false, false), "正在加载视频…");
         assert_eq!(playback_status_message(false, true), "");
+    }
+
+    #[test]
+    fn playback_time_helpers_reject_invalid_values() {
+        assert_eq!(valid_playback_time(12.0), Some(12.0));
+        assert_eq!(valid_playback_time(-1.0), None);
+        assert_eq!(valid_playback_time(f64::NAN), None);
+        assert_eq!(valid_playback_duration(12.0), Some(12.0));
+        assert_eq!(valid_playback_duration(0.0), None);
+    }
+
+    #[test]
+    fn progress_fraction_clamps_position_to_duration() {
+        assert_eq!(clamp_playback_position(-5.0, 100.0), 0.0);
+        assert_eq!(clamp_playback_position(25.0, 100.0), 25.0);
+        assert_eq!(clamp_playback_position(125.0, 100.0), 100.0);
+        assert_eq!(progress_fraction(25.0, 100.0), 0.25);
+        assert_eq!(progress_fraction(125.0, 100.0), 1.0);
+        assert_eq!(progress_fraction(25.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn buffered_progress_never_falls_behind_played_progress() {
+        assert_eq!(buffered_progress_fraction(Some(20.0), 40.0, 100.0), 0.4);
+        assert_eq!(buffered_progress_fraction(Some(80.0), 40.0, 100.0), 0.8);
+        assert_eq!(buffered_progress_fraction(None, 40.0, 100.0), 0.4);
+    }
+
+    #[test]
+    fn progress_cursor_fraction_uses_track_bounds_and_clamps_edges() {
+        let bounds = Bounds::new(point(px(100.0), px(0.0)), size(px(400.0), px(28.0)));
+
+        assert_eq!(progress_fraction_for_cursor(px(100.0), bounds), Some(0.0));
+        assert_eq!(progress_fraction_for_cursor(px(300.0), bounds), Some(0.5));
+        assert_eq!(progress_fraction_for_cursor(px(700.0), bounds), Some(1.0));
+        assert_eq!(
+            progress_fraction_for_cursor(
+                px(100.0),
+                Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(28.0))),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn format_playback_time_switches_to_hours_when_needed() {
+        assert_eq!(format_playback_time(65.0), "1:05");
+        assert_eq!(format_playback_time(3661.0), "1:01:01");
+        assert_eq!(format_playback_time(f64::NAN), "0:00");
     }
 
     #[test]

@@ -47,7 +47,7 @@ pub struct PlaybackMediaSource {
 }
 
 impl PlaybackInfo {
-    pub fn direct_stream_url_for(&self, media_source_id: &str) -> Result<&str> {
+    pub fn direct_stream_source_for(&self, media_source_id: &str) -> Result<&PlaybackMediaSource> {
         validate_media_source_id(media_source_id)?;
         if self.media_sources.is_empty() {
             bail!("播放信息中没有可用视频源");
@@ -58,19 +58,26 @@ impl PlaybackInfo {
             .iter()
             .find(|source| source.id.as_deref() == Some(media_source_id))
         {
-            return source.direct_stream_url();
+            source.direct_stream_url()?;
+            return Ok(source);
         }
 
         if self.media_sources.len() == 1 {
-            return self.media_sources[0].direct_stream_url();
+            self.media_sources[0].direct_stream_url()?;
+            return Ok(&self.media_sources[0]);
         }
 
         bail!("播放信息中未找到所选视频源");
     }
+
+    pub fn direct_stream_url_for(&self, media_source_id: &str) -> Result<&str> {
+        self.direct_stream_source_for(media_source_id)?
+            .direct_stream_url()
+    }
 }
 
 impl PlaybackMediaSource {
-    fn direct_stream_url(&self) -> Result<&str> {
+    pub fn direct_stream_url(&self) -> Result<&str> {
         self.direct_stream_url
             .as_deref()
             .map(str::trim)
@@ -205,6 +212,7 @@ mod tests {
             "MediaSources": [
                 {
                     "Id": "mediasource_795341",
+                    "Size": 2034264644,
                     "DirectStreamUrl": "/videos/795341/original.mp4?MediaSourceId=mediasource_795341"
                 }
             ],

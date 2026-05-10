@@ -24,6 +24,7 @@ const POSITION_QUERY_INTERVAL: Duration = Duration::from_millis(250);
 const RPU_MATCH_TOLERANCE: Duration = Duration::from_millis(60);
 const RPU_SLOT_CAPACITY: usize = 2048;
 const DMABUF_MEMORY_FEATURE: &str = "memory:DMABuf";
+const FALLBACK_VIDEO_FRAME_DURATION_NSECS: u64 = 1_000_000_000 / 24;
 static NEGOTIATED_CAPS_LOGGED: AtomicBool = AtomicBool::new(false);
 static NEGOTIATED_DMABUF_LOGGED: AtomicBool = AtomicBool::new(false);
 static RAW_PREROLL_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -42,6 +43,7 @@ pub enum BackendEvent {
     Buffering(bool),
     PositionChanged(f64),
     DurationChanged(f64),
+    BufferedChanged(Option<f64>),
     LoadFailed(String),
     Fatal(String),
 }
@@ -242,15 +244,103 @@ fn duration_nsecs(duration: Duration) -> u64 {
 
 enum PipelineKind {
     Playbin(gst::Element),
-    Custom(gst::Pipeline),
+    Custom {
+        pipeline: gst::Pipeline,
+        source: gst::Element,
+    },
 }
 
 impl PipelineKind {
     fn root(&self) -> &gst::Element {
         match self {
             Self::Playbin(playbin) => playbin,
-            Self::Custom(pipeline) => pipeline.upcast_ref(),
+            Self::Custom { pipeline, .. } => pipeline.upcast_ref(),
         }
+    }
+
+    fn source(&self) -> Option<&gst::Element> {
+        match self {
+            Self::Playbin(_) => None,
+            Self::Custom { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CacheStream {
+    Video,
+    Audio,
+}
+
+#[derive(Debug, Default)]
+struct PlayableCacheProgress {
+    base_position: AtomicU64,
+    video_buffered_until: AtomicU64,
+    audio_buffered_until: AtomicU64,
+    video_seen: AtomicBool,
+    audio_seen: AtomicBool,
+    needs_audio: AtomicBool,
+}
+
+impl PlayableCacheProgress {
+    fn reset_to_seconds(&self, position_seconds: f64) {
+        let position_nsecs = seconds_to_timeline_nsecs(position_seconds);
+        let needs_audio = self.needs_audio.load(Ordering::Relaxed);
+
+        self.base_position.store(position_nsecs, Ordering::Relaxed);
+        self.video_buffered_until
+            .store(position_nsecs, Ordering::Relaxed);
+        self.audio_buffered_until
+            .store(position_nsecs, Ordering::Relaxed);
+        self.video_seen.store(true, Ordering::Relaxed);
+        self.audio_seen.store(needs_audio, Ordering::Relaxed);
+    }
+
+    fn mark_audio_present(&self) {
+        self.needs_audio.store(true, Ordering::Relaxed);
+        self.audio_buffered_until.fetch_max(
+            self.base_position.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.audio_seen.store(true, Ordering::Relaxed);
+    }
+
+    fn observe_buffer(&self, stream: CacheStream, buffer: &gst::BufferRef) {
+        let fallback_duration = match stream {
+            CacheStream::Video => FALLBACK_VIDEO_FRAME_DURATION_NSECS,
+            CacheStream::Audio => 0,
+        };
+        let Some(buffered_until) = buffer_timeline_end_nsecs(buffer, fallback_duration) else {
+            return;
+        };
+
+        match stream {
+            CacheStream::Video => self.observe_video_until_nsecs(buffered_until),
+            CacheStream::Audio => self.observe_audio_until_nsecs(buffered_until),
+        }
+    }
+
+    fn observe_video_until_nsecs(&self, buffered_until: u64) {
+        self.video_buffered_until
+            .fetch_max(buffered_until, Ordering::Relaxed);
+        self.video_seen.store(true, Ordering::Relaxed);
+    }
+
+    fn observe_audio_until_nsecs(&self, buffered_until: u64) {
+        self.audio_buffered_until
+            .fetch_max(buffered_until, Ordering::Relaxed);
+        self.audio_seen.store(true, Ordering::Relaxed);
+    }
+
+    fn buffered_until_seconds(&self) -> Option<f64> {
+        combined_playable_cache_nsecs(
+            self.video_seen.load(Ordering::Relaxed),
+            self.video_buffered_until.load(Ordering::Relaxed),
+            self.needs_audio.load(Ordering::Relaxed),
+            self.audio_seen.load(Ordering::Relaxed),
+            self.audio_buffered_until.load(Ordering::Relaxed),
+        )
+        .map(timeline_nsecs_to_seconds)
     }
 }
 
@@ -264,7 +354,9 @@ pub struct GstBackend {
     ended: bool,
     last_position: Option<f64>,
     last_duration: Option<f64>,
+    last_buffered_until: Option<f64>,
     last_position_query: Instant,
+    cache_progress: Arc<PlayableCacheProgress>,
 }
 
 impl GstBackend {
@@ -273,6 +365,7 @@ impl GstBackend {
 
         let frame_slot = FrameSlot::default();
         let (pipeline, bus) = build_playbin_pipeline(None, frame_slot.clone())?;
+        let cache_progress = Arc::new(PlayableCacheProgress::default());
 
         Ok(Self {
             pipeline,
@@ -284,7 +377,9 @@ impl GstBackend {
             ended: false,
             last_position: None,
             last_duration: None,
+            last_buffered_until: None,
             last_position_query: Instant::now(),
+            cache_progress,
         })
     }
 
@@ -309,19 +404,50 @@ impl GstBackend {
         self.ended = false;
         self.last_position = None;
         self.last_duration = None;
+        self.last_buffered_until = None;
         self.last_position_query = Instant::now();
+        self.cache_progress = Arc::new(PlayableCacheProgress::default());
+        self.cache_progress.reset_to_seconds(0.0);
         NEGOTIATED_CAPS_LOGGED.store(false, Ordering::Relaxed);
         NEGOTIATED_DMABUF_LOGGED.store(false, Ordering::Relaxed);
         RAW_PREROLL_COUNT.store(0, Ordering::Relaxed);
         RAW_SAMPLE_COUNT.store(0, Ordering::Relaxed);
 
+        let cache_progress = Arc::clone(&self.cache_progress);
         let (pipeline, bus) =
-            build_custom_pipeline(url, self.frame_slot.clone()).or_else(|error| {
-                tracing::warn!(%error, "falling back to GStreamer playbin pipeline");
-                build_playbin_pipeline(Some(url), self.frame_slot.clone())
-            })?;
+            match build_custom_pipeline(url, self.frame_slot.clone(), cache_progress) {
+                Ok(pipeline) => Ok(pipeline),
+                Err(error) => {
+                    tracing::warn!(%error, "falling back to GStreamer playbin pipeline");
+                    build_playbin_pipeline(Some(url), self.frame_slot.clone())
+                }
+            }?;
         self.pipeline = pipeline;
         self.bus = bus;
+        self.pipeline
+            .root()
+            .set_state(gst::State::Playing)
+            .map_err(gstreamer_error)?;
+        Ok(())
+    }
+
+    pub fn seek_to(&mut self, position_seconds: f64) -> Result<()> {
+        let position_seconds = position_seconds.max(0.0);
+        let seek_position =
+            gst::ClockTime::try_from_seconds_f64(position_seconds).map_err(gstreamer_error)?;
+
+        self.pipeline
+            .root()
+            .seek_simple(
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                seek_position,
+            )
+            .map_err(gstreamer_error)?;
+        self.ended = false;
+        self.paused = false;
+        self.last_position = Some(position_seconds);
+        self.last_buffered_until = None;
+        self.cache_progress.reset_to_seconds(position_seconds);
         self.pipeline
             .root()
             .set_state(gst::State::Playing)
@@ -408,6 +534,8 @@ impl GstBackend {
             let _ = self.pipeline.root().set_state(gst::State::Playing);
             self.paused = false;
         }
+
+        self.push_buffered_event(events);
     }
 
     fn push_position_events(&mut self, events: &mut Vec<BackendEvent>) {
@@ -423,6 +551,7 @@ impl GstBackend {
             events.push(BackendEvent::PositionChanged(position));
         }
         self.push_duration_event(events);
+        self.push_buffered_event(events);
     }
 
     fn push_duration_event(&mut self, events: &mut Vec<BackendEvent>) {
@@ -431,6 +560,14 @@ impl GstBackend {
         {
             self.last_duration = Some(duration);
             events.push(BackendEvent::DurationChanged(duration));
+        }
+    }
+
+    fn push_buffered_event(&mut self, events: &mut Vec<BackendEvent>) {
+        let buffered_until = self.query_buffered_until_seconds();
+        if optional_value_changed(self.last_buffered_until, buffered_until) {
+            self.last_buffered_until = buffered_until;
+            events.push(BackendEvent::BufferedChanged(buffered_until));
         }
     }
 
@@ -447,11 +584,29 @@ impl GstBackend {
             .query_duration::<gst::ClockTime>()
             .map(gst::ClockTime::seconds_f64)
     }
+
+    fn query_buffered_until_seconds(&self) -> Option<f64> {
+        let position = self.last_position.or_else(|| self.query_position_seconds());
+        max_optional_playback_time(
+            query_gstreamer_buffered_until_seconds(self.pipeline.root(), position),
+            max_optional_playback_time(
+                self.pipeline
+                    .source()
+                    .and_then(|source| source_statistics_buffered_until_seconds(source, position)),
+                self.cache_progress.buffered_until_seconds(),
+            ),
+        )
+    }
 }
 
 impl Drop for GstBackend {
     fn drop(&mut self) {
-        let _ = self.pipeline.root().set_state(gst::State::Null);
+        let root = self.pipeline.root().clone();
+        let _ = std::thread::Builder::new()
+            .name("tiny-gst-stop".to_string())
+            .spawn(move || {
+                let _ = root.set_state(gst::State::Null);
+            });
         self.frame_slot.clear();
     }
 }
@@ -481,22 +636,33 @@ fn make_element(factory: &str) -> Result<gst::Element> {
         .map_err(gstreamer_error)
 }
 
-fn build_custom_pipeline(uri: &str, frame_slot: FrameSlot) -> Result<(PipelineKind, gst::Bus)> {
+fn build_custom_pipeline(
+    uri: &str,
+    frame_slot: FrameSlot,
+    cache_progress: Arc<PlayableCacheProgress>,
+) -> Result<(PipelineKind, gst::Bus)> {
     let pipeline = gst::Pipeline::new();
     let source = make_element("urisourcebin")?;
     let parsebin = make_element("parsebin")?;
     source.set_property("uri", uri);
+    set_bool_property_if_exists(&source, "use-buffering", true);
 
     pipeline
         .add_many([&source, &parsebin])
         .map_err(gstreamer_error)?;
     connect_source_to_parsebin(&source, &parsebin)?;
-    connect_parsebin_pads(&parsebin, &pipeline, frame_slot, DoviState::default());
+    connect_parsebin_pads(
+        &parsebin,
+        &pipeline,
+        frame_slot,
+        DoviState::default(),
+        cache_progress,
+    );
 
     let bus = pipeline.bus().ok_or_else(|| {
         BackendError::GStreamer("GStreamer 自定义 pipeline 缺少消息总线".to_string())
     })?;
-    Ok((PipelineKind::Custom(pipeline), bus))
+    Ok((PipelineKind::Custom { pipeline, source }, bus))
 }
 
 fn connect_source_to_parsebin(source: &gst::Element, parsebin: &gst::Element) -> Result<()> {
@@ -519,12 +685,17 @@ fn connect_parsebin_pads(
     pipeline: &gst::Pipeline,
     frame_slot: FrameSlot,
     dovi_state: DoviState,
+    cache_progress: Arc<PlayableCacheProgress>,
 ) {
     let pipeline = pipeline.clone();
     parsebin.connect_pad_added(move |_, src_pad| {
-        if let Err(error) =
-            link_parsebin_pad(&pipeline, src_pad, frame_slot.clone(), dovi_state.clone())
-        {
+        if let Err(error) = link_parsebin_pad(
+            &pipeline,
+            src_pad,
+            frame_slot.clone(),
+            dovi_state.clone(),
+            Arc::clone(&cache_progress),
+        ) {
             tracing::warn!(%error, "failed to link GStreamer parsed stream");
         }
     });
@@ -535,6 +706,7 @@ fn link_parsebin_pad(
     src_pad: &gst::Pad,
     frame_slot: FrameSlot,
     dovi_state: DoviState,
+    cache_progress: Arc<PlayableCacheProgress>,
 ) -> Result<()> {
     if src_pad.is_linked() {
         return Ok(());
@@ -544,11 +716,11 @@ fn link_parsebin_pad(
         return Ok(());
     };
     if caps_name == "video/x-h265" {
-        link_h265_branch(pipeline, src_pad, frame_slot, dovi_state)
+        link_h265_branch(pipeline, src_pad, frame_slot, dovi_state, cache_progress)
     } else if caps_name.starts_with("video/") {
-        link_video_decode_branch(pipeline, src_pad, frame_slot)
+        link_video_decode_branch(pipeline, src_pad, frame_slot, cache_progress)
     } else if caps_name.starts_with("audio/") {
-        link_audio_decode_branch(pipeline, src_pad)
+        link_audio_decode_branch(pipeline, src_pad, cache_progress)
     } else {
         tracing::debug!(caps = %caps_name, "ignoring unsupported parsed GStreamer stream");
         Ok(())
@@ -560,6 +732,7 @@ fn link_h265_branch(
     src_pad: &gst::Pad,
     frame_slot: FrameSlot,
     dovi_state: DoviState,
+    cache_progress: Arc<PlayableCacheProgress>,
 ) -> Result<()> {
     let input_queue = make_element("queue")?;
     let parser = make_element("h265parse")?;
@@ -576,6 +749,7 @@ fn link_h265_branch(
     gst::Element::link_many([&input_queue, &parser, &capsfilter, &decodebin])
         .map_err(gstreamer_error)?;
     install_rpu_probe(&capsfilter, dovi_state)?;
+    install_playable_cache_probe(src_pad, CacheStream::Video, cache_progress);
     connect_decodebin_to_sink(&decodebin, &raw_appsink, "video/")?;
     link_pad_to_element(src_pad, &input_queue)?;
     sync_elements([&input_queue, &parser, &capsfilter, &decodebin, &raw_appsink])?;
@@ -586,6 +760,7 @@ fn link_video_decode_branch(
     pipeline: &gst::Pipeline,
     src_pad: &gst::Pad,
     frame_slot: FrameSlot,
+    cache_progress: Arc<PlayableCacheProgress>,
 ) -> Result<()> {
     let input_queue = make_element("queue")?;
     let decodebin = make_element("decodebin")?;
@@ -598,13 +773,18 @@ fn link_video_decode_branch(
         .map_err(gstreamer_error)?;
     gst::Element::link_many([&input_queue, &decodebin]).map_err(gstreamer_error)?;
     gst::Element::link_many([&convert, &scale, &appsink]).map_err(gstreamer_error)?;
+    install_playable_cache_probe(src_pad, CacheStream::Video, cache_progress);
     connect_decodebin_to_sink(&decodebin, &convert, "video/")?;
     link_pad_to_element(src_pad, &input_queue)?;
     sync_elements([&input_queue, &decodebin, &convert, &scale, &appsink])?;
     Ok(())
 }
 
-fn link_audio_decode_branch(pipeline: &gst::Pipeline, src_pad: &gst::Pad) -> Result<()> {
+fn link_audio_decode_branch(
+    pipeline: &gst::Pipeline,
+    src_pad: &gst::Pad,
+    cache_progress: Arc<PlayableCacheProgress>,
+) -> Result<()> {
     let input_queue = make_element("queue")?;
     let decodebin = make_element("decodebin")?;
     let convert = make_element("audioconvert")?;
@@ -616,10 +796,33 @@ fn link_audio_decode_branch(pipeline: &gst::Pipeline, src_pad: &gst::Pad) -> Res
         .map_err(gstreamer_error)?;
     gst::Element::link_many([&input_queue, &decodebin]).map_err(gstreamer_error)?;
     gst::Element::link_many([&convert, &resample, &sink]).map_err(gstreamer_error)?;
+    cache_progress.mark_audio_present();
+    install_playable_cache_probe(src_pad, CacheStream::Audio, cache_progress);
     connect_decodebin_to_sink(&decodebin, &convert, "audio/")?;
     link_pad_to_element(src_pad, &input_queue)?;
     sync_elements([&input_queue, &decodebin, &convert, &resample, &sink])?;
     Ok(())
+}
+
+fn install_playable_cache_probe(
+    src_pad: &gst::Pad,
+    stream: CacheStream,
+    cache_progress: Arc<PlayableCacheProgress>,
+) {
+    src_pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+        move |_, info| {
+            if let Some(buffer) = info.buffer() {
+                cache_progress.observe_buffer(stream, buffer);
+            }
+            if let Some(buffer_list) = info.buffer_list() {
+                for buffer in buffer_list.iter() {
+                    cache_progress.observe_buffer(stream, buffer);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
 }
 
 fn install_rpu_probe(element: &gst::Element, dovi_state: DoviState) -> Result<()> {
@@ -1386,6 +1589,151 @@ fn value_changed(previous: Option<f64>, next: f64) -> bool {
     previous.is_none_or(|previous| (previous - next).abs() >= 0.05)
 }
 
+fn optional_value_changed(previous: Option<f64>, next: Option<f64>) -> bool {
+    match (previous, next) {
+        (None, None) => false,
+        (Some(previous), Some(next)) => value_changed(Some(previous), next),
+        _ => true,
+    }
+}
+
+fn query_gstreamer_buffered_until_seconds(
+    root: &gst::Element,
+    position_seconds: Option<f64>,
+) -> Option<f64> {
+    let mut query = gst::query::Buffering::new(gst::Format::Time);
+    if !root.query(query.query_mut()) {
+        return None;
+    }
+
+    buffering_query_until_nsecs(&query, position_seconds.map(seconds_to_timeline_nsecs))
+        .map(timeline_nsecs_to_seconds)
+}
+
+fn source_statistics_buffered_until_seconds(
+    source: &gst::Element,
+    position_seconds: Option<f64>,
+) -> Option<f64> {
+    source.find_property("statistics")?;
+
+    let statistics = source.property::<Option<gst::Structure>>("statistics")?;
+    let time_level = statistics
+        .get::<u64>("maximum-time-level")
+        .or_else(|_| statistics.get::<u64>("average-time-level"))
+        .ok()?;
+    buffered_until_from_queue_level(position_seconds, time_level)
+}
+
+fn buffering_query_until_nsecs(
+    query: &gst::query::Buffering,
+    position_nsecs: Option<u64>,
+) -> Option<u64> {
+    let mut containing_range_stop = None;
+    let mut max_range_stop = None;
+
+    for (start, stop) in query.ranges() {
+        let Some((start, stop)) = buffering_range_nsecs(start, stop) else {
+            continue;
+        };
+        max_range_stop = Some(max_optional_u64(max_range_stop, stop));
+
+        if position_nsecs.is_none_or(|position| start <= position && position <= stop) {
+            containing_range_stop = Some(max_optional_u64(containing_range_stop, stop));
+        }
+    }
+
+    containing_range_stop.or(max_range_stop).or_else(|| {
+        let (start, stop, _) = query.range();
+        let (start, stop) = buffering_range_nsecs(start, stop)?;
+        position_nsecs
+            .is_none_or(|position| start <= position && position <= stop)
+            .then_some(stop)
+    })
+}
+
+fn buffering_range_nsecs(
+    start: gst::GenericFormattedValue,
+    stop: gst::GenericFormattedValue,
+) -> Option<(u64, u64)> {
+    match (start, stop) {
+        (
+            gst::GenericFormattedValue::Time(Some(start)),
+            gst::GenericFormattedValue::Time(Some(stop)),
+        ) => Some((start.nseconds(), stop.nseconds())),
+        _ => None,
+    }
+}
+
+fn buffered_until_from_queue_level(
+    position_seconds: Option<f64>,
+    time_level_nsecs: u64,
+) -> Option<f64> {
+    if time_level_nsecs == 0 {
+        return None;
+    }
+
+    Some(position_seconds.unwrap_or(0.0) + timeline_nsecs_to_seconds(time_level_nsecs))
+}
+
+fn max_optional_playback_time(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn max_optional_u64(current: Option<u64>, next: u64) -> u64 {
+    current.map(|current| current.max(next)).unwrap_or(next)
+}
+
+fn buffer_timeline_end_nsecs(buffer: &gst::BufferRef, fallback_duration_nsecs: u64) -> Option<u64> {
+    let timestamp = buffer.pts().or_else(|| buffer.dts())?.nseconds();
+    let duration = buffer
+        .duration()
+        .map(|duration| duration.nseconds())
+        .unwrap_or(fallback_duration_nsecs);
+    Some(timestamp.saturating_add(duration))
+}
+
+fn combined_playable_cache_nsecs(
+    video_seen: bool,
+    video_buffered_until: u64,
+    needs_audio: bool,
+    audio_seen: bool,
+    audio_buffered_until: u64,
+) -> Option<u64> {
+    if !video_seen {
+        return None;
+    }
+    if needs_audio {
+        if !audio_seen {
+            return None;
+        }
+        return Some(video_buffered_until.min(audio_buffered_until));
+    }
+
+    Some(video_buffered_until)
+}
+
+fn seconds_to_timeline_nsecs(seconds: f64) -> u64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+
+    let nsecs = seconds * 1_000_000_000.0;
+    if nsecs >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        nsecs.round() as u64
+    }
+}
+
+fn timeline_nsecs_to_seconds(nsecs: u64) -> f64 {
+    nsecs as f64 / 1_000_000_000.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1414,6 +1762,126 @@ mod tests {
         assert!(value_changed(None, 1.0));
         assert!(!value_changed(Some(1.0), 1.01));
         assert!(value_changed(Some(1.0), 1.1));
+    }
+
+    #[test]
+    fn optional_value_changed_tracks_presence_and_meaningful_changes() {
+        assert!(!optional_value_changed(None, None));
+        assert!(optional_value_changed(None, Some(1.0)));
+        assert!(optional_value_changed(Some(1.0), None));
+        assert!(!optional_value_changed(Some(1.0), Some(1.01)));
+        assert!(optional_value_changed(Some(1.0), Some(1.1)));
+    }
+
+    #[test]
+    fn playable_cache_progress_reports_video_only_until_audio_is_present() {
+        let progress = PlayableCacheProgress::default();
+
+        progress.reset_to_seconds(10.0);
+        progress.observe_video_until_nsecs(12_000_000_000);
+
+        assert_eq!(progress.buffered_until_seconds(), Some(12.0));
+    }
+
+    #[test]
+    fn playable_cache_progress_uses_audio_video_minimum_when_audio_is_present() {
+        let progress = PlayableCacheProgress::default();
+
+        progress.reset_to_seconds(10.0);
+        progress.observe_video_until_nsecs(16_000_000_000);
+        progress.mark_audio_present();
+        progress.observe_audio_until_nsecs(14_000_000_000);
+
+        assert_eq!(progress.buffered_until_seconds(), Some(14.0));
+    }
+
+    #[test]
+    fn playable_cache_progress_resets_to_seek_position() {
+        let progress = PlayableCacheProgress::default();
+
+        progress.reset_to_seconds(10.0);
+        progress.mark_audio_present();
+        progress.observe_video_until_nsecs(30_000_000_000);
+        progress.observe_audio_until_nsecs(28_000_000_000);
+        progress.reset_to_seconds(20.0);
+
+        assert_eq!(progress.buffered_until_seconds(), Some(20.0));
+    }
+
+    #[test]
+    fn combined_playable_cache_waits_for_audio_when_required() {
+        assert_eq!(
+            combined_playable_cache_nsecs(true, 12, true, false, 0),
+            None
+        );
+        assert_eq!(
+            combined_playable_cache_nsecs(true, 12, true, true, 10),
+            Some(10)
+        );
+        assert_eq!(
+            combined_playable_cache_nsecs(true, 12, false, false, 0),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn buffering_query_uses_range_covering_position() {
+        gst::init().unwrap();
+        let mut query = gst::query::Buffering::new(gst::Format::Time);
+        query.set_range(
+            gst::ClockTime::from_seconds(0),
+            gst::ClockTime::from_seconds(30),
+            -1,
+        );
+        query.add_buffering_ranges([
+            (
+                gst::ClockTime::from_seconds(0),
+                gst::ClockTime::from_seconds(10),
+            ),
+            (
+                gst::ClockTime::from_seconds(20),
+                gst::ClockTime::from_seconds(30),
+            ),
+        ]);
+
+        assert_eq!(
+            buffering_query_until_nsecs(&query, Some(5_000_000_000)),
+            Some(10_000_000_000)
+        );
+        assert_eq!(
+            buffering_query_until_nsecs(&query, Some(25_000_000_000)),
+            Some(30_000_000_000)
+        );
+    }
+
+    #[test]
+    fn buffering_query_falls_back_to_max_range_without_position() {
+        gst::init().unwrap();
+        let mut query = gst::query::Buffering::new(gst::Format::Time);
+        query.add_buffering_ranges([
+            (
+                gst::ClockTime::from_seconds(0),
+                gst::ClockTime::from_seconds(10),
+            ),
+            (
+                gst::ClockTime::from_seconds(20),
+                gst::ClockTime::from_seconds(30),
+            ),
+        ]);
+
+        assert_eq!(
+            buffering_query_until_nsecs(&query, None),
+            Some(30_000_000_000)
+        );
+    }
+
+    #[test]
+    fn queue_time_level_extends_current_position() {
+        assert_eq!(
+            buffered_until_from_queue_level(Some(12.0), 3_500_000_000),
+            Some(15.5)
+        );
+        assert_eq!(buffered_until_from_queue_level(Some(12.0), 0), None);
     }
 
     #[test]
