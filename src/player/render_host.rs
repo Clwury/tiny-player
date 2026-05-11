@@ -303,6 +303,7 @@ pub fn raw_plane_slice_from_stride(
     Ok(&data[offset..end])
 }
 
+#[cfg(test)]
 fn raw_plane_end(
     data_len: usize,
     offset: usize,
@@ -332,167 +333,6 @@ fn raw_plane_end(
     Ok(end)
 }
 
-pub fn sdr_8bit_yuv_to_bgra(raw: &RawVideoFrame, size: RenderSize) -> Result<Option<Vec<u8>>> {
-    if raw.color != FrameColor::Sdr
-        || !matches!(raw.format, RawVideoFormat::Nv12 | RawVideoFormat::I420)
-    {
-        return Ok(None);
-    }
-
-    match &raw.planes {
-        RawVideoPlanes::Owned(planes) => convert_owned_sdr_yuv_to_bgra(raw, size, planes),
-    }
-}
-
-fn convert_owned_sdr_yuv_to_bgra(
-    raw: &RawVideoFrame,
-    size: RenderSize,
-    planes: &[RawVideoPlane],
-) -> Result<Option<Vec<u8>>> {
-    let plane = |index: usize| -> Result<PlaneView<'_>> {
-        let layout = raw.format.plane_layout(size, index)?;
-        let plane = planes
-            .get(index)
-            .ok_or_else(|| anyhow!("video frame is missing a raw plane"))?;
-        plane_view_from_slice(&plane.data, 0, plane.stride, layout.row_len, layout.height)
-    };
-    convert_sdr_yuv_planes_to_bgra(raw.format, raw.range, size, plane)
-}
-
-fn convert_sdr_yuv_planes_to_bgra<'a>(
-    format: RawVideoFormat,
-    range: RawVideoRange,
-    size: RenderSize,
-    plane: impl Fn(usize) -> Result<PlaneView<'a>>,
-) -> Result<Option<Vec<u8>>> {
-    let y = plane(0)?;
-    let pixels = match format {
-        RawVideoFormat::Nv12 => {
-            let uv = plane(1)?;
-            convert_nv12_to_bgra(size, range, y, uv)?
-        }
-        RawVideoFormat::I420 => {
-            let u = plane(1)?;
-            let v = plane(2)?;
-            convert_i420_to_bgra(size, range, y, u, v)?
-        }
-        _ => return Ok(None),
-    };
-    Ok(Some(pixels))
-}
-
-#[derive(Clone, Copy)]
-struct PlaneView<'a> {
-    data: &'a [u8],
-    stride: usize,
-}
-
-fn plane_view_from_slice(
-    data: &[u8],
-    offset: usize,
-    stride: usize,
-    row_len: usize,
-    height: u32,
-) -> Result<PlaneView<'_>> {
-    let end = raw_plane_end(data.len(), offset, stride, row_len, height)?;
-    Ok(PlaneView {
-        data: &data[offset..end],
-        stride,
-    })
-}
-
-fn convert_nv12_to_bgra(
-    size: RenderSize,
-    range: RawVideoRange,
-    y: PlaneView<'_>,
-    uv: PlaneView<'_>,
-) -> Result<Vec<u8>> {
-    let width = usize::try_from(size.width).map_err(|_| anyhow!("video frame is too wide"))?;
-    let height = usize::try_from(size.height).map_err(|_| anyhow!("video frame is too tall"))?;
-    let mut pixels = vec![0; frame_byte_len(size)?];
-
-    for row in 0..height {
-        let y_row = row * y.stride;
-        let uv_row = (row / 2) * uv.stride;
-        let out_row = row * width * 4;
-        for col in 0..width {
-            let y_value = y.data[y_row + col];
-            let uv_index = uv_row + (col / 2) * 2;
-            write_yuv_pixel(
-                &mut pixels[out_row + col * 4..out_row + col * 4 + 4],
-                y_value,
-                uv.data[uv_index],
-                uv.data[uv_index + 1],
-                range,
-            );
-        }
-    }
-
-    Ok(pixels)
-}
-
-fn convert_i420_to_bgra(
-    size: RenderSize,
-    range: RawVideoRange,
-    y: PlaneView<'_>,
-    u: PlaneView<'_>,
-    v: PlaneView<'_>,
-) -> Result<Vec<u8>> {
-    let width = usize::try_from(size.width).map_err(|_| anyhow!("video frame is too wide"))?;
-    let height = usize::try_from(size.height).map_err(|_| anyhow!("video frame is too tall"))?;
-    let mut pixels = vec![0; frame_byte_len(size)?];
-
-    for row in 0..height {
-        let y_row = row * y.stride;
-        let uv_row = (row / 2) * u.stride;
-        let out_row = row * width * 4;
-        for col in 0..width {
-            let uv_col = col / 2;
-            write_yuv_pixel(
-                &mut pixels[out_row + col * 4..out_row + col * 4 + 4],
-                y.data[y_row + col],
-                u.data[uv_row + uv_col],
-                v.data[(row / 2) * v.stride + uv_col],
-                range,
-            );
-        }
-    }
-
-    Ok(pixels)
-}
-
-fn write_yuv_pixel(pixel: &mut [u8], y: u8, u: u8, v: u8, range: RawVideoRange) {
-    let (r, g, b) = yuv_to_rgb_bt709(y, u, v, range);
-    pixel[0] = b;
-    pixel[1] = g;
-    pixel[2] = r;
-    pixel[3] = 255;
-}
-
-fn yuv_to_rgb_bt709(y: u8, u: u8, v: u8, range: RawVideoRange) -> (u8, u8, u8) {
-    let y = i32::from(y);
-    let u = i32::from(u) - 128;
-    let v = i32::from(v) - 128;
-    if range == RawVideoRange::Full {
-        return (
-            clamp_u8(y + ((403 * v + 128) >> 8)),
-            clamp_u8(y - ((48 * u + 120 * v + 128) >> 8)),
-            clamp_u8(y + ((475 * u + 128) >> 8)),
-        );
-    }
-
-    let y = (y - 16).max(0);
-    (
-        clamp_u8((298 * y + 459 * v + 128) >> 8),
-        clamp_u8((298 * y - 55 * u - 136 * v + 128) >> 8),
-        clamp_u8((298 * y + 541 * u + 128) >> 8),
-    )
-}
-
-fn clamp_u8(value: i32) -> u8 {
-    value.clamp(0, 255) as u8
-}
-
 #[cfg(test)]
 fn frame_row_len(size: RenderSize, bytes_per_pixel: usize) -> Result<usize> {
     usize::try_from(size.width)
@@ -516,10 +356,8 @@ pub fn render_image_from_bgra(bgra: Vec<u8>, width: u32, height: u32) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodedFrame, FrameColor, FramePixels, FrameSlot, RawVideoChromaSite, RawVideoFormat,
-        RawVideoFrame, RawVideoPlane, RawVideoPlanes, RawVideoRange, RenderSize, frame_byte_len,
-        packed_bgra_from_stride, raw_plane_from_stride, render_image_from_bgra,
-        sdr_8bit_yuv_to_bgra,
+        DecodedFrame, FrameColor, FramePixels, FrameSlot, RawVideoFormat, RenderSize,
+        frame_byte_len, packed_bgra_from_stride, raw_plane_from_stride, render_image_from_bgra,
     };
 
     #[test]
@@ -624,78 +462,6 @@ mod tests {
         assert_eq!((i420_u.width, i420_u.height, i420_u.row_len), (3, 2, 3));
         assert_eq!((i420_v.width, i420_v.height, i420_v.row_len), (3, 2, 3));
         assert_eq!(RawVideoFormat::Nv12.color_depth(), 8);
-    }
-
-    #[test]
-    fn sdr_nv12_to_bgra_converts_full_range_neutral_gray() {
-        let size = RenderSize {
-            width: 2,
-            height: 2,
-        };
-        let raw = RawVideoFrame {
-            format: RawVideoFormat::Nv12,
-            color: FrameColor::Sdr,
-            range: RawVideoRange::Full,
-            chroma_site: RawVideoChromaSite::Unknown,
-            metadata: None,
-            planes: RawVideoPlanes::Owned(vec![
-                RawVideoPlane {
-                    data: vec![128, 128, 128, 128],
-                    stride: 2,
-                },
-                RawVideoPlane {
-                    data: vec![128, 128],
-                    stride: 2,
-                },
-            ]),
-        };
-
-        let pixels = sdr_8bit_yuv_to_bgra(&raw, size).unwrap().unwrap();
-
-        assert_eq!(
-            pixels,
-            vec![
-                128, 128, 128, 255, 128, 128, 128, 255, 128, 128, 128, 255, 128, 128, 128, 255,
-            ]
-        );
-    }
-
-    #[test]
-    fn sdr_i420_to_bgra_converts_limited_range_luma() {
-        let size = RenderSize {
-            width: 2,
-            height: 2,
-        };
-        let raw = RawVideoFrame {
-            format: RawVideoFormat::I420,
-            color: FrameColor::Sdr,
-            range: RawVideoRange::Limited,
-            chroma_site: RawVideoChromaSite::Unknown,
-            metadata: None,
-            planes: RawVideoPlanes::Owned(vec![
-                RawVideoPlane {
-                    data: vec![16, 235, 16, 235],
-                    stride: 2,
-                },
-                RawVideoPlane {
-                    data: vec![128],
-                    stride: 1,
-                },
-                RawVideoPlane {
-                    data: vec![128],
-                    stride: 1,
-                },
-            ]),
-        };
-
-        let pixels = sdr_8bit_yuv_to_bgra(&raw, size).unwrap().unwrap();
-
-        assert_eq!(
-            pixels,
-            vec![
-                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
-            ]
-        );
     }
 
     #[test]

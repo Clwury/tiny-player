@@ -23,6 +23,7 @@ struct SelectedPlayback {
 struct ResolvedPlayback {
     url: String,
     http_headers: Vec<(String, String)>,
+    content_length: Option<u64>,
 }
 
 impl HomeContent {
@@ -108,6 +109,7 @@ impl HomeContent {
             Ok::<_, anyhow::Error>(ResolvedPlayback {
                 url: playback_url.to_string(),
                 http_headers,
+                content_length: source.size,
             })
         });
 
@@ -142,6 +144,7 @@ impl HomeContent {
                     title: selected.title,
                     url: playback.url,
                     http_headers: playback.http_headers,
+                    content_length: playback.content_length,
                 }));
             }
             Err(error) => {

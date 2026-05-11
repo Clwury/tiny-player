@@ -43,6 +43,8 @@ pub struct PlaybackInfo {
 #[serde(rename_all = "PascalCase")]
 pub struct PlaybackMediaSource {
     pub id: Option<String>,
+    #[serde(alias = "ContentLength")]
+    pub size: Option<u64>,
     pub direct_stream_url: Option<String>,
 }
 
@@ -232,6 +234,38 @@ mod tests {
                 .unwrap(),
             "/videos/795341/original.mp4?MediaSourceId=mediasource_795341"
         );
+        assert_eq!(
+            playback_info
+                .direct_stream_source_for("mediasource_795341")
+                .unwrap()
+                .size,
+            Some(2034264644)
+        );
+    }
+
+    #[test]
+    fn parses_playback_info_content_length_alias() {
+        let json = r#"
+        {
+            "MediaSources": [
+                {
+                    "Id": "mediasource_795341",
+                    "ContentLength": 2034264644,
+                    "DirectStreamUrl": "/videos/795341/original.mp4?MediaSourceId=mediasource_795341"
+                }
+            ]
+        }
+        "#;
+
+        let playback_info: PlaybackInfo = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            playback_info
+                .direct_stream_source_for("mediasource_795341")
+                .unwrap()
+                .size,
+            Some(2034264644)
+        );
     }
 
     #[test]
@@ -239,6 +273,7 @@ mod tests {
         let playback_info = PlaybackInfo {
             media_sources: vec![PlaybackMediaSource {
                 id: Some("source-1".to_string()),
+                size: None,
                 direct_stream_url: None,
             }],
             play_session_id: None,

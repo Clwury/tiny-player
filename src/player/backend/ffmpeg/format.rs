@@ -10,15 +10,24 @@ impl FormatContext {
     pub(super) fn open(
         url: &str,
         http_headers: &[(String, String)],
+        content_len_hint: Option<u64>,
+        probe_profile: InputProbeProfile,
         control: Arc<FfmpegControl>,
+        event_tx: Sender<BackendEvent>,
     ) -> std::result::Result<Self, String> {
         let mut cached_io = if should_cache_http_url(url) {
-            Some(CachedAvio::new(url, http_headers, Arc::clone(&control))?)
+            Some(CachedAvio::new(
+                url,
+                http_headers,
+                content_len_hint,
+                Arc::clone(&control),
+                event_tx,
+            )?)
         } else {
             None
         };
         let url = CString::new(url).map_err(|_| "播放地址包含无效字符".to_string())?;
-        let mut options = input_format_options(http_headers)?;
+        let mut options = input_format_options(http_headers, probe_profile)?;
         let mut context = unsafe { ffi::avformat_alloc_context() };
         if context.is_null() {
             unsafe { ffi::av_dict_free(&mut options) };

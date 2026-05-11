@@ -1,5 +1,11 @@
 use crate::player::render_host::RenderSize;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HttpStreamBufferProgress {
+    pub start_fraction: f64,
+    pub end_fraction: f64,
+}
+
 #[derive(Debug)]
 pub enum BackendEvent {
     Pause(bool),
@@ -9,6 +15,7 @@ pub enum BackendEvent {
     PositionChanged(f64),
     DurationChanged(f64),
     BufferedChanged(Option<f64>),
+    HttpStreamBufferedChanged(Option<HttpStreamBufferProgress>),
     LoadFailed(String),
     Fatal(String),
 }

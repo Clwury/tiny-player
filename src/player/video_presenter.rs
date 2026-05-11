@@ -11,10 +11,7 @@ use gpui::RenderImage;
 
 use super::{
     libplacebo::LibplaceboToneMapper,
-    render_host::{
-        DecodedFrame, FramePixels, FrameSlot, RenderSize, render_image_from_bgra,
-        sdr_8bit_yuv_to_bgra,
-    },
+    render_host::{DecodedFrame, FramePixels, FrameSlot, RenderSize, render_image_from_bgra},
 };
 
 pub struct VideoPresenter {
@@ -55,6 +52,13 @@ impl VideoPresenter {
                 .take_ready_frame(self.latest_generation)?;
         }
         Ok(ready_frame)
+    }
+
+    pub fn discard_pending_frames(&mut self) {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.latest_generation = self.next_generation;
+        self.render_worker.discard_pending_request();
+        let _ = self.render_worker.take_ready_frame(self.latest_generation);
     }
 }
 
@@ -152,6 +156,15 @@ impl VideoRenderWorker {
             self.state.ready.notify_one();
         }
     }
+
+    fn discard_pending_request(&self) {
+        let mut slot = self
+            .state
+            .slot
+            .lock()
+            .expect("video render worker poisoned");
+        slot.request = None;
+    }
 }
 
 impl Drop for VideoRenderWorker {
@@ -201,12 +214,6 @@ fn render_video_frame(
         }
         FramePixels::RawVideo(raw) => {
             let source_size = request.frame.size;
-            if request.output_size == source_size
-                && let Some(pixels) = sdr_8bit_yuv_to_bgra(&raw, source_size)?
-            {
-                return render_image_from_bgra(pixels, source_size.width, source_size.height);
-            }
-
             if tone_mapper.is_none() {
                 *tone_mapper = Some(LibplaceboToneMapper::new()?);
             }

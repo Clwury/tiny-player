@@ -17,7 +17,7 @@ use super::{HomeContent, cache as home_cache};
 
 const RESUME_CARD_IMAGE_MAX_WIDTH: u32 = 800;
 const HOME_ITEM_CARD_IMAGE_MAX_WIDTH: u32 = 400;
-const HOME_ITEM_PAGE_LIMIT: u32 = 16;
+const HOME_ITEM_PAGE_LIMIT: u32 = 30;
 const HOME_SNAPSHOT_SAVE_DEBOUNCE: Duration = Duration::from_millis(450);
 const HOME_CACHED_IMAGE_ENSURE_DELAY: Duration = Duration::from_millis(16);
 

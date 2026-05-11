@@ -2,24 +2,48 @@ use super::*;
 
 pub(super) fn input_format_options(
     http_headers: &[(String, String)],
+    probe_profile: InputProbeProfile,
 ) -> std::result::Result<*mut ffi::AVDictionary, String> {
     let mut options = ptr::null_mut();
-    if http_headers.is_empty() {
-        return Ok(options);
+    if let InputProbeProfile::Fast = probe_profile {
+        if let Err(error) = set_input_format_option(
+            &mut options,
+            "probesize",
+            &FFMPEG_FAST_PROBE_SIZE.to_string(),
+        ) {
+            unsafe { ffi::av_dict_free(&mut options) };
+            return Err(error);
+        }
+        if let Err(error) = set_input_format_option(
+            &mut options,
+            "analyzeduration",
+            &FFMPEG_FAST_ANALYZE_DURATION_US.to_string(),
+        ) {
+            unsafe { ffi::av_dict_free(&mut options) };
+            return Err(error);
+        }
     }
 
-    let headers = ffmpeg_http_headers(http_headers)?;
-    if let Err(error) = set_input_format_option(&mut options, "headers", &headers) {
-        unsafe { ffi::av_dict_free(&mut options) };
-        return Err(error);
-    }
-    if let Some((_, user_agent)) = http_headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("User-Agent"))
-        && let Err(error) = set_input_format_option(&mut options, "user_agent", user_agent)
-    {
-        unsafe { ffi::av_dict_free(&mut options) };
-        return Err(error);
+    if !http_headers.is_empty() {
+        let headers = match ffmpeg_http_headers(http_headers) {
+            Ok(headers) => headers,
+            Err(error) => {
+                unsafe { ffi::av_dict_free(&mut options) };
+                return Err(error);
+            }
+        };
+        if let Err(error) = set_input_format_option(&mut options, "headers", &headers) {
+            unsafe { ffi::av_dict_free(&mut options) };
+            return Err(error);
+        }
+        if let Some((_, user_agent)) = http_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("User-Agent"))
+            && let Err(error) = set_input_format_option(&mut options, "user_agent", user_agent)
+        {
+            unsafe { ffi::av_dict_free(&mut options) };
+            return Err(error);
+        }
     }
 
     Ok(options)
@@ -82,9 +106,17 @@ impl CachedAvio {
     pub(super) fn new(
         url: &str,
         http_headers: &[(String, String)],
+        content_len_hint: Option<u64>,
         control: Arc<FfmpegControl>,
+        event_tx: Sender<BackendEvent>,
     ) -> std::result::Result<Self, String> {
-        let cache = HttpRingCache::spawn(url.to_string(), http_headers, control)?;
+        let cache = HttpRingCache::spawn(
+            url.to_string(),
+            http_headers,
+            content_len_hint,
+            control,
+            event_tx,
+        )?;
         let reader = Box::into_raw(Box::new(CachedAvioReader {
             cache: cache.clone(),
             read_pos: 0,
@@ -154,10 +186,11 @@ struct HttpRingCacheShared {
     state: Mutex<HttpRingCacheState>,
     ready: Condvar,
     control: Arc<FfmpegControl>,
+    event_tx: Sender<BackendEvent>,
 }
 
 pub(super) struct HttpRingCacheState {
-    buffer: VecDeque<u8>,
+    buffer: ByteRingBuffer,
     pub(super) base_offset: u64,
     pub(super) next_offset: u64,
     reader_offset: u64,
@@ -166,6 +199,7 @@ pub(super) struct HttpRingCacheState {
     shutdown: bool,
     restart_offset: Option<u64>,
     error: Option<String>,
+    last_reported_stream_buffer: Option<HttpStreamBufferProgress>,
 }
 
 enum CacheReadResult {
@@ -194,17 +228,145 @@ enum HttpDownloadOutcome {
     Stopped,
 }
 
+struct ByteRingBuffer {
+    storage: Vec<u8>,
+    head: usize,
+    len: usize,
+    max_capacity: usize,
+}
+
+impl ByteRingBuffer {
+    fn new(max_capacity: usize) -> Self {
+        Self {
+            storage: Vec::new(),
+            head: 0,
+            len: 0,
+            max_capacity,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn max_capacity(&self) -> usize {
+        self.max_capacity
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn append(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+
+        let required_len = self
+            .len
+            .checked_add(data.len())
+            .expect("HTTP stream cache buffer length overflowed");
+        debug_assert!(required_len <= self.max_capacity);
+        self.ensure_storage_len(required_len);
+
+        let write_offset = (self.head + self.len) % self.storage.len();
+        copy_into_wrapped(&mut self.storage, write_offset, data);
+        self.len = required_len;
+    }
+
+    fn discard_front(&mut self, len: usize) {
+        let len = len.min(self.len);
+        if len == 0 {
+            return;
+        }
+        if len == self.len {
+            self.clear();
+            return;
+        }
+
+        self.head = (self.head + len) % self.storage.len();
+        self.len -= len;
+    }
+
+    fn copy_at(&self, offset: usize, output: &mut [u8]) -> usize {
+        if output.is_empty() || offset >= self.len || self.storage.is_empty() {
+            return 0;
+        }
+
+        let read = (self.len - offset).min(output.len());
+        let read_offset = (self.head + offset) % self.storage.len();
+        copy_from_wrapped(&self.storage, read_offset, &mut output[..read]);
+        read
+    }
+
+    fn ensure_storage_len(&mut self, required_len: usize) {
+        if required_len <= self.storage.len() {
+            return;
+        }
+
+        let new_len = self.grown_storage_len(required_len);
+        if self.head == 0 {
+            self.storage.resize(new_len, 0);
+            return;
+        }
+
+        let mut storage = vec![0; new_len];
+        self.copy_at(0, &mut storage[..self.len]);
+        self.storage = storage;
+        self.head = 0;
+    }
+
+    fn grown_storage_len(&self, required_len: usize) -> usize {
+        let mut len = if self.storage.is_empty() {
+            HTTP_CACHE_CHUNK_SIZE
+                .min(self.max_capacity)
+                .max(required_len)
+        } else {
+            self.storage.len()
+        };
+        while len < required_len {
+            let next = len.saturating_mul(2).min(self.max_capacity);
+            if next == len {
+                break;
+            }
+            len = next;
+        }
+        len.max(required_len).min(self.max_capacity)
+    }
+}
+
+fn copy_into_wrapped(storage: &mut [u8], offset: usize, data: &[u8]) {
+    let front_len = data.len().min(storage.len() - offset);
+    storage[offset..offset + front_len].copy_from_slice(&data[..front_len]);
+    if front_len < data.len() {
+        storage[..data.len() - front_len].copy_from_slice(&data[front_len..]);
+    }
+}
+
+fn copy_from_wrapped(storage: &[u8], offset: usize, output: &mut [u8]) {
+    let output_len = output.len();
+    let front_len = output_len.min(storage.len() - offset);
+    output[..front_len].copy_from_slice(&storage[offset..offset + front_len]);
+    if front_len < output_len {
+        output[front_len..].copy_from_slice(&storage[..output_len - front_len]);
+    }
+}
+
 impl HttpRingCache {
     fn spawn(
         url: String,
         http_headers: &[(String, String)],
+        content_len_hint: Option<u64>,
         control: Arc<FfmpegControl>,
+        event_tx: Sender<BackendEvent>,
     ) -> std::result::Result<Self, String> {
         let headers = reqwest_header_pairs(http_headers)?;
         let shared = Arc::new(HttpRingCacheShared {
-            state: Mutex::new(HttpRingCacheState::new(0)),
+            state: Mutex::new(HttpRingCacheState::new(0).with_content_len_hint(content_len_hint)),
             ready: Condvar::new(),
             control,
+            event_tx,
         });
         let worker_shared = Arc::clone(&shared);
         thread::Builder::new()
@@ -231,7 +393,7 @@ impl HttpRingCache {
             .lock()
             .expect("HTTP stream cache poisoned");
         loop {
-            if guard.shutdown || self.shared.control.should_stop() {
+            if guard.shutdown || self.shared.control.should_interrupt() {
                 return CacheReadResult::Interrupted;
             }
             if let Some(error) = guard.error.clone() {
@@ -283,7 +445,11 @@ impl HttpRingCache {
             .lock()
             .expect("HTTP stream cache poisoned");
         loop {
-            if guard.content_len.is_some() || guard.shutdown || guard.error.is_some() {
+            if guard.content_len.is_some()
+                || guard.shutdown
+                || guard.error.is_some()
+                || self.shared.control.should_interrupt()
+            {
                 return guard.content_len;
             }
             let now = Instant::now();
@@ -313,8 +479,17 @@ impl HttpRingCache {
 
 impl HttpRingCacheState {
     pub(super) fn new(start_offset: u64) -> Self {
+        Self::with_cache_capacity(start_offset, HTTP_RING_CACHE_CAPACITY)
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_with_cache_capacity(start_offset: u64, capacity: usize) -> Self {
+        Self::with_cache_capacity(start_offset, capacity)
+    }
+
+    fn with_cache_capacity(start_offset: u64, capacity: usize) -> Self {
         Self {
-            buffer: VecDeque::new(),
+            buffer: ByteRingBuffer::new(capacity),
             base_offset: start_offset,
             next_offset: start_offset,
             reader_offset: start_offset,
@@ -323,7 +498,13 @@ impl HttpRingCacheState {
             shutdown: false,
             restart_offset: None,
             error: None,
+            last_reported_stream_buffer: None,
         }
+    }
+
+    pub(super) fn with_content_len_hint(mut self, content_len_hint: Option<u64>) -> Self {
+        self.content_len = content_len_hint.filter(|content_len| *content_len > 0);
+        self
     }
 
     pub(super) fn restart_at(&mut self, offset: u64) {
@@ -333,6 +514,7 @@ impl HttpRingCacheState {
         self.reader_offset = offset;
         self.eof = false;
         self.error = None;
+        self.last_reported_stream_buffer = None;
     }
 
     fn request_restart_at(&mut self, offset: u64) {
@@ -340,16 +522,32 @@ impl HttpRingCacheState {
         self.restart_offset = Some(offset);
     }
 
-    pub(super) fn append_at(&mut self, offset: u64, data: &[u8]) {
+    pub(super) fn append_at(&mut self, offset: u64, data: &[u8]) -> bool {
         if data.is_empty() {
-            return;
+            return true;
         }
+        let mut offset = offset;
+        let mut data = data;
         if offset != self.next_offset {
             self.restart_at(offset);
         }
-        self.buffer.extend(data.iter().copied());
+
+        let max_capacity = self.buffer.max_capacity();
+        if data.len() > max_capacity {
+            let trim = data.len() - max_capacity;
+            offset = offset.saturating_add(trim as u64);
+            data = &data[trim..];
+            self.restart_at(offset);
+        }
+
+        self.trim_to_capacity(max_capacity.saturating_sub(data.len()));
+        if self.buffer.len().saturating_add(data.len()) > max_capacity {
+            return false;
+        }
+        self.buffer.append(data);
         self.next_offset = offset.saturating_add(data.len() as u64);
         self.trim_to_capacity(HTTP_RING_CACHE_CAPACITY);
+        true
     }
 
     pub(super) fn trim_to_capacity(&mut self, capacity: usize) {
@@ -365,7 +563,7 @@ impl HttpRingCacheState {
         if trim == 0 {
             return;
         }
-        self.buffer.drain(..trim);
+        self.buffer.discard_front(trim);
         self.base_offset = self.base_offset.saturating_add(trim as u64);
     }
 
@@ -374,24 +572,11 @@ impl HttpRingCacheState {
             return None;
         }
         let start = usize::try_from(offset - self.base_offset).ok()?;
-        let available = self.buffer.len().saturating_sub(start);
-        if available == 0 {
+        if start >= self.buffer.len() {
             return None;
         }
-        let read = available.min(output.len());
-        let (front, back) = self.buffer.as_slices();
-        let mut written = 0;
-        if start < front.len() {
-            let front_read = (front.len() - start).min(read);
-            output[..front_read].copy_from_slice(&front[start..start + front_read]);
-            written = front_read;
-        }
-        if written < read {
-            let back_start = start.saturating_sub(front.len());
-            let back_read = read - written;
-            output[written..read].copy_from_slice(&back[back_start..back_start + back_read]);
-        }
-        Some(read)
+        let read = self.buffer.copy_at(start, output);
+        (read > 0).then_some(read)
     }
 
     pub(super) fn set_reader_offset(&mut self, offset: u64) {
@@ -410,6 +595,31 @@ impl HttpRingCacheState {
         let buffered_ahead = offset.saturating_sub(self.reader_offset);
         let buffered_ahead = usize::try_from(buffered_ahead).unwrap_or(usize::MAX);
         HTTP_RING_CACHE_CAPACITY.saturating_sub(buffered_ahead)
+    }
+
+    pub(super) fn stream_buffer_progress(&self) -> Option<HttpStreamBufferProgress> {
+        let content_len = self.content_len?;
+        if content_len == 0 {
+            return None;
+        }
+
+        let start_offset = self.base_offset.min(content_len);
+        let end_offset = self.next_offset.min(content_len).max(start_offset);
+        let content_len = content_len as f64;
+        Some(HttpStreamBufferProgress {
+            start_fraction: start_offset as f64 / content_len,
+            end_fraction: end_offset as f64 / content_len,
+        })
+    }
+
+    fn take_stream_buffer_progress_report(&mut self) -> Option<HttpStreamBufferProgress> {
+        let progress = self.stream_buffer_progress()?;
+        if !http_stream_buffer_progress_changed(self.last_reported_stream_buffer, progress) {
+            return None;
+        }
+
+        self.last_reported_stream_buffer = Some(progress);
+        Some(progress)
     }
 }
 
@@ -578,19 +788,44 @@ impl HttpRingCacheShared {
     }
 
     fn append_or_restart(&self, offset: u64, data: &[u8]) -> CacheAppendResult {
-        let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
-        if guard.shutdown || self.control.should_stop() {
-            return CacheAppendResult::Stopped;
-        }
-        if let Some(next_offset) = guard.restart_offset.take() {
-            guard.restart_at(next_offset);
-            self.ready.notify_all();
-            return CacheAppendResult::Restart(next_offset);
-        }
-        guard.append_at(offset, data);
+        let (result, progress) = {
+            let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+            if guard.shutdown || self.control.should_stop() {
+                return CacheAppendResult::Stopped;
+            }
+            if let Some(next_offset) = guard.restart_offset.take() {
+                guard.restart_at(next_offset);
+                self.ready.notify_all();
+                return CacheAppendResult::Restart(next_offset);
+            }
+            if !guard.append_at(offset, data) {
+                return CacheAppendResult::Restart(offset);
+            }
+            (
+                CacheAppendResult::Appended,
+                guard.take_stream_buffer_progress_report(),
+            )
+        };
         self.ready.notify_all();
-        CacheAppendResult::Appended
+        if let Some(progress) = progress {
+            let _ = self
+                .event_tx
+                .send(BackendEvent::HttpStreamBufferedChanged(Some(progress)));
+        }
+        result
     }
+}
+
+fn http_stream_buffer_progress_changed(
+    previous: Option<HttpStreamBufferProgress>,
+    next: HttpStreamBufferProgress,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    (previous.start_fraction - next.start_fraction).abs() >= HTTP_CACHE_PROGRESS_REPORT_THRESHOLD
+        || (previous.end_fraction - next.end_fraction).abs() >= HTTP_CACHE_PROGRESS_REPORT_THRESHOLD
+        || (next.end_fraction >= 1.0 && previous.end_fraction < 1.0)
 }
 
 fn download_http_cache_range(

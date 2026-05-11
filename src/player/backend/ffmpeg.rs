@@ -20,7 +20,7 @@ use cpal::{
 };
 use ffmpeg_sys_next as ffi;
 
-use super::{BackendError, BackendEvent, Result};
+use super::{BackendError, BackendEvent, HttpStreamBufferProgress, Result};
 use crate::player::{
     dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat},
     render_host::{
@@ -60,9 +60,18 @@ const HTTP_CACHE_RANGE_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
 const HTTP_CACHE_WAIT_INTERVAL: Duration = Duration::from_millis(50);
 const HTTP_CACHE_CONTENT_LEN_WAIT: Duration = Duration::from_secs(1);
 const HTTP_CACHE_RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_CACHE_PROGRESS_REPORT_THRESHOLD: f64 = 0.001;
 const FFMPEG_AVIO_BUFFER_SIZE: c_int = 256 * 1024;
+const FFMPEG_FAST_PROBE_SIZE: usize = 1024 * 1024;
+const FFMPEG_FAST_ANALYZE_DURATION_US: u64 = 1_000_000;
 
 static FFMPEG_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputProbeProfile {
+    Fast,
+    Full,
+}
 
 pub struct FfmpegBackend {
     frame_slot: FrameSlot,
@@ -96,7 +105,12 @@ impl FfmpegBackend {
         self.frame_slot.clone()
     }
 
-    pub fn load_url(&mut self, url: &str, http_headers: Vec<(String, String)>) -> Result<()> {
+    pub fn load_url(
+        &mut self,
+        url: &str,
+        http_headers: Vec<(String, String)>,
+        content_length: Option<u64>,
+    ) -> Result<()> {
         let url = url.trim();
         if url.is_empty() {
             return Err(BackendError::EmptyUrl);
@@ -109,11 +123,15 @@ impl FfmpegBackend {
         self.paused = true;
         FFMPEG_FRAME_COUNT.store(0, Ordering::Relaxed);
         while self.event_rx.try_recv().is_ok() {}
+        let _ = self
+            .event_tx
+            .send(BackendEvent::HttpStreamBufferedChanged(None));
 
         self.worker = Some(FfmpegWorker::spawn(
             FfmpegPlaybackInput {
                 url: url.to_string(),
                 http_headers,
+                content_length,
                 start_position_seconds: 0.0,
             },
             self.frame_slot.clone(),
@@ -193,14 +211,16 @@ struct FfmpegWorker {
 #[derive(Debug)]
 struct FfmpegControl {
     shutdown: AtomicBool,
-    seek_pending: AtomicBool,
+    seek_generation: AtomicU64,
+    handled_seek_generation: AtomicU64,
 }
 
 impl FfmpegControl {
     fn new() -> Self {
         Self {
             shutdown: AtomicBool::new(false),
-            seek_pending: AtomicBool::new(false),
+            seek_generation: AtomicU64::new(0),
+            handled_seek_generation: AtomicU64::new(0),
         }
     }
 
@@ -216,27 +236,49 @@ impl FfmpegControl {
         self.should_stop() || self.has_pending_seek()
     }
 
-    fn request_seek(&self) {
-        self.seek_pending.store(true, Ordering::Relaxed);
+    fn request_seek(&self) -> u64 {
+        self.seek_generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    fn finish_seek(&self) {
-        self.seek_pending.store(false, Ordering::Relaxed);
+    fn finish_seek(&self, generation: u64) {
+        let mut current = self.handled_seek_generation.load(Ordering::Acquire);
+        while generation > current {
+            match self.handled_seek_generation.compare_exchange_weak(
+                current,
+                generation,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
     }
 
     fn has_pending_seek(&self) -> bool {
-        self.seek_pending.load(Ordering::Relaxed)
+        self.seek_generation.load(Ordering::Acquire)
+            > self.handled_seek_generation.load(Ordering::Acquire)
     }
 }
 
 struct FfmpegPlaybackInput {
     url: String,
     http_headers: Vec<(String, String)>,
+    content_length: Option<u64>,
     start_position_seconds: f64,
 }
 
 enum FfmpegCommand {
-    Seek(f64),
+    Seek {
+        position_seconds: f64,
+        generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingSeek {
+    position_seconds: f64,
+    generation: u64,
 }
 
 impl FfmpegWorker {
@@ -291,11 +333,14 @@ impl FfmpegWorker {
     }
 
     fn seek(&self, position_seconds: f64) -> Result<()> {
-        self.control.request_seek();
+        let generation = self.control.request_seek();
         self.command_tx
-            .send(FfmpegCommand::Seek(position_seconds))
+            .send(FfmpegCommand::Seek {
+                position_seconds,
+                generation,
+            })
             .map_err(|_| {
-                self.control.finish_seek();
+                self.control.finish_seek(generation);
                 BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string())
             })?;
         Ok(())
@@ -343,6 +388,110 @@ fn init_ffmpeg_network() -> Result<()> {
     Ok(())
 }
 
+struct OpenedPlaybackInput {
+    input: FormatContext,
+    video_stream: StreamInfo,
+    video_decoder: Decoder,
+    audio_stream: Option<StreamInfo>,
+    audio_decoder: Option<Decoder>,
+}
+
+fn open_playback_input_with_fallback(
+    source: &FfmpegPlaybackInput,
+    control: Arc<FfmpegControl>,
+    event_tx: &Sender<BackendEvent>,
+) -> std::result::Result<OpenedPlaybackInput, String> {
+    match open_playback_input(
+        source,
+        Arc::clone(&control),
+        event_tx,
+        InputProbeProfile::Fast,
+        false,
+    ) {
+        Ok(opened) if opened.audio_stream.is_some() => Ok(opened),
+        Ok(opened) => {
+            tracing::debug!("FFmpeg fast probe did not find audio stream; retrying full probe");
+            match open_playback_input(source, control, event_tx, InputProbeProfile::Full, true) {
+                Ok(opened) => Ok(opened),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "FFmpeg full probe fallback failed; continuing with fast probe result"
+                    );
+                    Ok(opened)
+                }
+            }
+        }
+        Err(fast_error) => {
+            tracing::debug!(%fast_error, "FFmpeg fast probe failed; retrying full probe");
+            open_playback_input(source, control, event_tx, InputProbeProfile::Full, true).map_err(
+                |full_error| {
+                    format!("FFmpeg 快速探测失败：{fast_error}；完整探测也失败：{full_error}")
+                },
+            )
+        }
+    }
+}
+
+fn open_playback_input(
+    source: &FfmpegPlaybackInput,
+    control: Arc<FfmpegControl>,
+    event_tx: &Sender<BackendEvent>,
+    probe_profile: InputProbeProfile,
+    allow_audio_decoder_failure: bool,
+) -> std::result::Result<OpenedPlaybackInput, String> {
+    let mut input = FormatContext::open(
+        &source.url,
+        source.http_headers.as_slice(),
+        source.content_length,
+        probe_profile,
+        Arc::clone(&control),
+        event_tx.clone(),
+    )?;
+    input.find_stream_info()?;
+
+    let video_stream = input
+        .best_stream(ffi::AVMediaType::AVMEDIA_TYPE_VIDEO)?
+        .ok_or_else(|| "FFmpeg 未找到可解码视频流".to_string())?;
+    let video_decoder = Decoder::open(video_stream)
+        .map_err(|error| format!("FFmpeg 打开视频解码器失败：{error}"))?;
+    let (audio_stream, audio_decoder) = open_audio_decoder(&input, allow_audio_decoder_failure)?;
+
+    Ok(OpenedPlaybackInput {
+        input,
+        video_stream,
+        video_decoder,
+        audio_stream,
+        audio_decoder,
+    })
+}
+
+fn open_audio_decoder(
+    input: &FormatContext,
+    allow_audio_decoder_failure: bool,
+) -> std::result::Result<(Option<StreamInfo>, Option<Decoder>), String> {
+    let audio_stream = match input.best_stream(ffi::AVMediaType::AVMEDIA_TYPE_AUDIO) {
+        Ok(stream) => stream,
+        Err(error) if allow_audio_decoder_failure => {
+            tracing::warn!(%error, "FFmpeg audio stream selection failed");
+            None
+        }
+        Err(error) => return Err(format!("FFmpeg 选择音频流失败：{error}")),
+    };
+    let Some(stream) = audio_stream else {
+        return Ok((None, None));
+    };
+
+    match Decoder::open(stream) {
+        Ok(decoder) => Ok((Some(stream), Some(decoder))),
+        Err(error) if allow_audio_decoder_failure => {
+            tracing::warn!(%error, "FFmpeg audio decoder initialization failed");
+            Ok((Some(stream), None))
+        }
+        Err(error) => Err(format!("FFmpeg 打开音频解码器失败：{error}")),
+    }
+}
+
 fn run_ffmpeg_playback(
     source: FfmpegPlaybackInput,
     frame_slot: FrameSlot,
@@ -351,22 +500,18 @@ fn run_ffmpeg_playback(
     command_rx: Receiver<FfmpegCommand>,
     frame_presented: Arc<AtomicBool>,
 ) -> std::result::Result<(), String> {
-    let mut input = FormatContext::open(
-        &source.url,
-        source.http_headers.as_slice(),
-        Arc::clone(&control),
-    )?;
-    input.find_stream_info()?;
-
-    let video_stream = input
-        .best_stream(ffi::AVMediaType::AVMEDIA_TYPE_VIDEO)?
-        .ok_or_else(|| "FFmpeg 未找到可解码视频流".to_string())?;
+    let OpenedPlaybackInput {
+        mut input,
+        video_stream,
+        video_decoder,
+        audio_stream,
+        audio_decoder: opened_audio_decoder,
+    } = open_playback_input_with_fallback(&source, Arc::clone(&control), &event_tx)?;
     if source.start_position_seconds > 0.0 {
         input.seek_stream(video_stream, source.start_position_seconds)?;
     }
-    let video_decoder = Decoder::open(video_stream)?;
     let mut video_frame = AvFrame::new()?;
-    let mut video_converter = VideoFrameConverter::new(&video_decoder)?;
+    let mut video_converter = VideoFrameConverter::new();
     let mut current_start_position_nsecs = seconds_to_nsecs(source.start_position_seconds);
     let video_frame_duration_nsecs = video_stream
         .frame_duration_nsecs
@@ -380,41 +525,30 @@ fn run_ffmpeg_playback(
     let mut position_reporter = PositionReporter::default();
     let mut dovi_queue = DoviMetadataQueue::default();
 
-    let audio_stream = input
-        .best_stream(ffi::AVMediaType::AVMEDIA_TYPE_AUDIO)
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, "FFmpeg audio stream selection failed");
-            None
-        });
     let mut audio_output = None;
     let mut audio_decoder = None;
     let mut audio_frame = None;
     let mut audio_resampler = None;
-    if let Some(stream) = audio_stream {
-        match Decoder::open(stream) {
-            Ok(decoder) => match AudioOutput::new() {
-                Ok(output) => match AudioResampler::new(output.sample_rate(), output.channels()) {
-                    Ok(resampler) => {
-                        tracing::debug!(
-                            sample_rate = output.sample_rate(),
-                            channels = output.channels(),
-                            "initialized native FFmpeg audio output"
-                        );
-                        audio_frame = Some(AvFrame::new()?);
-                        audio_resampler = Some(resampler);
-                        audio_output = Some(output);
-                        audio_decoder = Some(decoder);
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "FFmpeg audio resampler initialization failed");
-                    }
-                },
+    if let Some(decoder) = opened_audio_decoder {
+        match AudioOutput::new() {
+            Ok(output) => match AudioResampler::new(output.sample_rate(), output.channels()) {
+                Ok(resampler) => {
+                    tracing::debug!(
+                        sample_rate = output.sample_rate(),
+                        channels = output.channels(),
+                        "initialized native FFmpeg audio output"
+                    );
+                    audio_frame = Some(AvFrame::new()?);
+                    audio_resampler = Some(resampler);
+                    audio_output = Some(output);
+                    audio_decoder = Some(decoder);
+                }
                 Err(error) => {
-                    tracing::warn!(%error, "native audio output initialization failed; playing video without audio");
+                    tracing::warn!(%error, "FFmpeg audio resampler initialization failed");
                 }
             },
             Err(error) => {
-                tracing::warn!(%error, "FFmpeg audio decoder initialization failed");
+                tracing::warn!(%error, "native audio output initialization failed; playing video without audio");
             }
         }
     }
@@ -436,14 +570,14 @@ fn run_ffmpeg_playback(
     let mut buffered_reporter = BufferedReporter::new(audio_output.is_some());
     let mut queued_video_frames = VecDeque::new();
     let mut first_video_frame_pending = true;
-    let mut seek_preview_pending = source.start_position_seconds > 0.0;
     buffered_reporter.reset_to(source.start_position_seconds.max(0.0), &event_tx);
     let _ = event_tx.send(BackendEvent::Buffering(true));
 
     while !control.should_stop() {
-        if let Some(position_seconds) = drain_seek_command(&command_rx) {
+        if let Some(pending_seek) = drain_seek_command(&command_rx) {
+            control.finish_seek(pending_seek.generation);
             let seek_result: std::result::Result<(), String> = (|| {
-                let position_seconds = position_seconds.max(0.0);
+                let position_seconds = pending_seek.position_seconds.max(0.0);
                 current_start_position_nsecs = seconds_to_nsecs(position_seconds);
                 input.seek_stream(video_stream, position_seconds)?;
                 video_decoder.flush_buffers();
@@ -473,13 +607,15 @@ fn run_ffmpeg_playback(
                 first_video_frame_pending = true;
                 dovi_queue.clear();
                 buffered_reporter = BufferedReporter::new(audio_output.is_some());
-                seek_preview_pending = true;
                 buffered_reporter.reset_to(position_seconds, &event_tx);
                 let _ = event_tx.send(BackendEvent::PositionChanged(position_seconds));
                 let _ = event_tx.send(BackendEvent::Buffering(true));
                 Ok(())
             })();
-            control.finish_seek();
+            if control.has_pending_seek() {
+                packet.unref();
+                continue;
+            }
             seek_result?;
             continue;
         }
@@ -514,24 +650,7 @@ fn run_ffmpeg_playback(
                         nsecs: timestamp.timeline_nsecs,
                     };
                     if timestamp.timeline_nsecs < current_start_position_nsecs {
-                        if seek_preview_pending {
-                            let dovi_metadata = dovi_metadata_from_frame(frame)
-                                .or_else(|| dovi_queue.take_for_frame(frame_pts));
-                            let mut decoded_frame =
-                                video_converter.convert(frame, dovi_metadata)?;
-                            decoded_frame.pts = Some(frame_pts);
-                            present_decoded_video_frame(
-                                decoded_frame,
-                                timestamp.timeline_nsecs,
-                                &frame_slot,
-                                &frame_presented,
-                                &mut position_reporter,
-                                &event_tx,
-                            );
-                            seek_preview_pending = false;
-                        } else {
-                            let _ = dovi_queue.take_for_frame(frame_pts);
-                        }
+                        let _ = dovi_queue.take_for_frame(frame_pts);
                         return Ok(());
                     }
 
@@ -549,7 +668,8 @@ fn run_ffmpeg_playback(
 
                         let dovi_metadata = dovi_metadata_from_frame(frame)
                             .or_else(|| dovi_queue.take_for_frame(frame_pts));
-                        let mut decoded_frame = video_converter.convert(frame, dovi_metadata)?;
+                        let mut decoded_frame =
+                            video_converter.convert(&video_decoder, frame, dovi_metadata)?;
                         decoded_frame.pts = Some(frame_pts);
 
                         if first_video_frame_pending {
@@ -604,7 +724,8 @@ fn run_ffmpeg_playback(
                     } else {
                         let dovi_metadata = dovi_metadata_from_frame(frame)
                             .or_else(|| dovi_queue.take_for_frame(frame_pts));
-                        let mut decoded_frame = video_converter.convert(frame, dovi_metadata)?;
+                        let mut decoded_frame =
+                            video_converter.convert(&video_decoder, frame, dovi_metadata)?;
                         decoded_frame.pts = Some(frame_pts);
 
                         first_video_frame_pending = false;
@@ -724,7 +845,8 @@ fn run_ffmpeg_playback(
 
             let dovi_metadata =
                 dovi_metadata_from_frame(frame).or_else(|| dovi_queue.take_for_frame(frame_pts));
-            let mut decoded_frame = video_converter.convert(frame, dovi_metadata)?;
+            let mut decoded_frame =
+                video_converter.convert(&video_decoder, frame, dovi_metadata)?;
             decoded_frame.pts = Some(frame_pts);
 
             if first_video_frame_pending {
@@ -766,7 +888,8 @@ fn run_ffmpeg_playback(
         } else {
             let dovi_metadata =
                 dovi_metadata_from_frame(frame).or_else(|| dovi_queue.take_for_frame(frame_pts));
-            let mut decoded_frame = video_converter.convert(frame, dovi_metadata)?;
+            let mut decoded_frame =
+                video_converter.convert(&video_decoder, frame, dovi_metadata)?;
             decoded_frame.pts = Some(frame_pts);
 
             first_video_frame_pending = false;
@@ -842,12 +965,18 @@ fn run_ffmpeg_playback(
     Ok(())
 }
 
-fn drain_seek_command(command_rx: &Receiver<FfmpegCommand>) -> Option<f64> {
+fn drain_seek_command(command_rx: &Receiver<FfmpegCommand>) -> Option<PendingSeek> {
     let mut pending_seek = None;
     while let Ok(command) = command_rx.try_recv() {
         match command {
-            FfmpegCommand::Seek(position_seconds) => {
-                pending_seek = Some(position_seconds.max(0.0));
+            FfmpegCommand::Seek {
+                position_seconds,
+                generation,
+            } => {
+                pending_seek = Some(PendingSeek {
+                    position_seconds: position_seconds.max(0.0),
+                    generation,
+                });
             }
         }
     }
@@ -1038,22 +1167,24 @@ impl PlaybackScheduler {
 }
 
 struct VideoFrameConverter {
-    scaler: VideoScaler,
+    scaler: Option<VideoScaler>,
 }
 
 impl VideoFrameConverter {
-    fn new(decoder: &Decoder) -> std::result::Result<Self, String> {
-        Ok(Self {
-            scaler: VideoScaler::new(decoder)?,
-        })
+    fn new() -> Self {
+        Self { scaler: None }
     }
 
     fn convert(
         &mut self,
+        decoder: &Decoder,
         frame: *mut ffi::AVFrame,
         dovi_metadata: Option<DoviFrameMetadata>,
     ) -> std::result::Result<DecodedFrame, String> {
-        let size = frame_size(frame).unwrap_or(self.scaler.size);
+        let size = frame_size(frame)
+            .or_else(|| self.scaler.as_ref().map(|scaler| scaler.size))
+            .or_else(|| decoder.size().ok())
+            .ok_or_else(|| "FFmpeg 视频帧缺少有效尺寸".to_string())?;
         if let Some(raw) = raw_video_frame_from_av_frame(frame, size, dovi_metadata)? {
             return Ok(DecodedFrame {
                 size,
@@ -1062,9 +1193,13 @@ impl VideoFrameConverter {
             });
         }
 
-        let pixels = self.scaler.convert(frame)?;
+        let scaler = match self.scaler.as_mut() {
+            Some(scaler) => scaler,
+            None => self.scaler.insert(VideoScaler::new(decoder)?),
+        };
+        let pixels = scaler.convert(frame)?;
         Ok(DecodedFrame {
-            size: self.scaler.size,
+            size: scaler.size,
             pts: None,
             pixels: FramePixels::Bgra8(pixels),
         })
@@ -2171,7 +2306,7 @@ unsafe extern "C" fn ffmpeg_interrupt_callback(opaque: *mut c_void) -> c_int {
         return 0;
     }
     let control = unsafe { &*(opaque as *const FfmpegControl) };
-    control.should_stop() as c_int
+    control.should_interrupt() as c_int
 }
 
 #[cfg(test)]
@@ -2190,6 +2325,23 @@ mod tests {
                 sink_nsecs: 250_000_000,
             }
         );
+    }
+
+    #[test]
+    fn ffmpeg_control_tracks_seek_generations() {
+        let control = FfmpegControl::new();
+
+        let first = control.request_seek();
+        assert!(control.has_pending_seek());
+        control.finish_seek(first);
+        assert!(!control.has_pending_seek());
+
+        let second = control.request_seek();
+        assert!(control.has_pending_seek());
+        control.finish_seek(first);
+        assert!(control.has_pending_seek());
+        control.finish_seek(second);
+        assert!(!control.has_pending_seek());
     }
 
     #[test]
@@ -2543,6 +2695,21 @@ mod tests {
     }
 
     #[test]
+    fn http_ring_cache_state_uses_content_length_hint_for_progress() {
+        let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(100));
+
+        state.append_at(0, b"abcde");
+
+        assert_eq!(
+            state.stream_buffer_progress(),
+            Some(HttpStreamBufferProgress {
+                start_fraction: 0.0,
+                end_fraction: 0.05,
+            })
+        );
+    }
+
+    #[test]
     fn http_ring_cache_state_trims_oldest_bytes() {
         let mut state = HttpRingCacheState::new(100);
         state.append_at(100, b"abcdef");
@@ -2559,6 +2726,21 @@ mod tests {
     }
 
     #[test]
+    fn http_ring_cache_state_copies_wrapped_bytes() {
+        let mut state = HttpRingCacheState::new_with_cache_capacity(0, 6);
+        state.append_at(0, b"abcdef");
+
+        state.set_reader_offset(4);
+        state.append_at(6, b"ghij");
+
+        assert_eq!(state.base_offset, 4);
+        assert_eq!(state.next_offset, 10);
+        let mut output = [0; 6];
+        assert_eq!(state.copy_available(4, &mut output), Some(6));
+        assert_eq!(&output, b"efghij");
+    }
+
+    #[test]
     fn http_ring_cache_state_preserves_unread_bytes_when_over_capacity() {
         let mut state = HttpRingCacheState::new(100);
         state.append_at(100, b"abcdef");
@@ -2570,6 +2752,20 @@ mod tests {
         let mut output = [0; 6];
         assert_eq!(state.copy_available(100, &mut output), Some(6));
         assert_eq!(&output, b"abcdef");
+    }
+
+    #[test]
+    fn http_ring_cache_state_refuses_append_when_capacity_is_unread() {
+        let mut state = HttpRingCacheState::new_with_cache_capacity(0, 4);
+        assert!(state.append_at(0, b"abcd"));
+
+        assert!(!state.append_at(4, b"ef"));
+
+        assert_eq!(state.base_offset, 0);
+        assert_eq!(state.next_offset, 4);
+        let mut output = [0; 4];
+        assert_eq!(state.copy_available(0, &mut output), Some(4));
+        assert_eq!(&output, b"abcd");
     }
 
     #[test]

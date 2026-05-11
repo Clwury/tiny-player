@@ -10,7 +10,7 @@ use gpui::{
 use crate::theme;
 
 use super::{
-    backend::{BackendEvent, FfmpegBackend},
+    backend::{BackendEvent, FfmpegBackend, HttpStreamBufferProgress},
     render_host::RenderSize,
     video_presenter::VideoPresenter,
 };
@@ -20,6 +20,7 @@ pub struct PlaybackRequest {
     pub title: SharedString,
     pub url: String,
     pub http_headers: Vec<(String, String)>,
+    pub content_length: Option<u64>,
 }
 
 impl fmt::Debug for PlaybackRequest {
@@ -29,6 +30,7 @@ impl fmt::Debug for PlaybackRequest {
             .field("title", &self.title)
             .field("url", &"<redacted>")
             .field("http_headers", &self.http_headers.len())
+            .field("content_length", &self.content_length)
             .finish()
     }
 }
@@ -37,6 +39,9 @@ impl fmt::Debug for PlaybackRequest {
 pub enum PlaybackEvent {
     Back,
 }
+
+const HTTP_STREAM_BUFFER_POSITION_TOLERANCE: f64 = 0.02;
+const PLAYBACK_BUFFER_POSITION_TOLERANCE_SECONDS: f64 = 0.05;
 
 pub struct PlaybackPage {
     title: SharedString,
@@ -49,6 +54,9 @@ pub struct PlaybackPage {
     playback_position: Option<f64>,
     playback_duration: Option<f64>,
     playback_buffered_until: Option<f64>,
+    http_stream_buffered_range: Option<HttpStreamBufferProgress>,
+    pending_seek_position: Option<f64>,
+    pending_seek_keeps_frame: bool,
     progress_track_bounds: Option<Bounds<Pixels>>,
     progress_drag_position: Option<f64>,
     current_file_loaded: bool,
@@ -66,8 +74,11 @@ impl PlaybackPage {
         let (backend, video_presenter) = match FfmpegBackend::new() {
             Ok(mut backend) => match VideoPresenter::new(backend.frame_slot()) {
                 Ok(video_presenter) => {
-                    if let Err(error) = backend.load_url(&request.url, request.http_headers.clone())
-                    {
+                    if let Err(error) = backend.load_url(
+                        &request.url,
+                        request.http_headers.clone(),
+                        request.content_length,
+                    ) {
                         error_message = Some(format!("加载视频失败：{error}").into());
                     }
                     (
@@ -97,6 +108,9 @@ impl PlaybackPage {
             playback_position: None,
             playback_duration: None,
             playback_buffered_until: None,
+            http_stream_buffered_range: None,
+            pending_seek_position: None,
+            pending_seek_keeps_frame: false,
             progress_track_bounds: None,
             progress_drag_position: None,
             current_file_loaded: false,
@@ -217,6 +231,14 @@ impl PlaybackPage {
             return;
         };
         let uses_playable_cache_progress = self.video.owner().is_some();
+        let keep_current_frame = self.current_frame.is_some()
+            && is_seek_position_buffered(
+                position,
+                self.playback_position,
+                self.playback_buffered_until,
+                self.http_stream_buffered_range,
+                self.playback_duration,
+            );
         self.playback_position = Some(position);
         self.playback_buffered_until = if uses_playable_cache_progress {
             Some(position)
@@ -224,13 +246,30 @@ impl PlaybackPage {
             self.playback_buffered_until
                 .map(|buffered_until| buffered_until.max(position))
         };
-        self.playback_buffering = true;
-        self.status_message = "正在跳转…".into();
-        self.clear_visible_frame(window, cx);
+        if !keep_current_frame {
+            self.http_stream_buffered_range = None;
+        }
+        self.pending_seek_position = Some(position);
+        self.pending_seek_keeps_frame = keep_current_frame;
+        self.playback_buffering = !keep_current_frame;
+        self.status_message = if keep_current_frame {
+            "".into()
+        } else {
+            "正在跳转…".into()
+        };
+        if !keep_current_frame {
+            self.clear_visible_frame(window, cx);
+        }
+        if let Some(presenter) = self.video.dependent_mut() {
+            presenter.discard_pending_frames();
+        }
 
         if let Some(backend) = self.video.owner_mut()
             && let Err(error) = backend.seek_to(position)
         {
+            self.pending_seek_position = None;
+            self.pending_seek_keeps_frame = false;
+            self.playback_buffering = false;
             self.error_message = Some(format!("跳转播放位置失败：{error}").into());
         }
         cx.notify();
@@ -258,6 +297,8 @@ impl PlaybackPage {
                     self.current_file_loaded = true;
                     self.playback_paused = false;
                     self.playback_buffering = false;
+                    self.pending_seek_position = None;
+                    self.pending_seek_keeps_frame = false;
                     self.status_message = "".into();
                     self.error_message = None;
                 }
@@ -267,6 +308,9 @@ impl PlaybackPage {
                     self.playback_paused = true;
                     self.playback_buffering = false;
                     self.playback_buffered_until = None;
+                    self.http_stream_buffered_range = None;
+                    self.pending_seek_position = None;
+                    self.pending_seek_keeps_frame = false;
                     self.progress_drag_position = None;
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("加载视频失败：{message}").into());
@@ -277,6 +321,9 @@ impl PlaybackPage {
                     self.playback_paused = true;
                     self.playback_buffering = false;
                     self.playback_buffered_until = None;
+                    self.http_stream_buffered_range = None;
+                    self.pending_seek_position = None;
+                    self.pending_seek_keeps_frame = false;
                     self.progress_drag_position = None;
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("播放后端错误：{message}").into());
@@ -285,9 +332,13 @@ impl PlaybackPage {
                     self.playback_paused = paused;
                 }
                 BackendEvent::Buffering(buffering) => {
-                    self.playback_buffering = buffering;
-                    self.status_message =
-                        playback_status_message(buffering, self.current_frame.is_some());
+                    let hidden_by_soft_seek =
+                        buffering && self.pending_seek_keeps_frame && self.current_frame.is_some();
+                    self.playback_buffering = buffering && !hidden_by_soft_seek;
+                    if !hidden_by_soft_seek {
+                        self.status_message =
+                            playback_status_message(buffering, self.current_frame.is_some());
+                    }
                 }
                 BackendEvent::VideoSizeChanged(size) => {
                     if self.video_source_size != size {
@@ -296,7 +347,10 @@ impl PlaybackPage {
                     }
                 }
                 BackendEvent::PositionChanged(position) => {
-                    if self.progress_drag_position.is_none() {
+                    if should_apply_backend_position(
+                        self.progress_drag_position,
+                        self.pending_seek_position,
+                    ) {
                         self.playback_position = valid_playback_time(position);
                     }
                 }
@@ -311,6 +365,10 @@ impl PlaybackPage {
                 }
                 BackendEvent::BufferedChanged(buffered_until) => {
                     self.playback_buffered_until = buffered_until.and_then(valid_playback_time);
+                }
+                BackendEvent::HttpStreamBufferedChanged(progress) => {
+                    self.http_stream_buffered_range =
+                        progress.and_then(valid_http_stream_buffer_progress);
                 }
             }
         }
@@ -371,8 +429,13 @@ impl PlaybackPage {
             .or(self.playback_position)
             .unwrap_or(0.0);
         let played_fraction = progress_fraction(position, duration);
-        let buffered_fraction =
-            buffered_progress_fraction(self.playback_buffered_until, position, duration);
+        let buffered_until = combined_buffered_until(
+            self.playback_buffered_until,
+            self.http_stream_buffered_range,
+            position,
+            duration,
+        );
+        let buffered_fraction = buffered_progress_fraction(buffered_until, position, duration);
         let current_time = format_playback_time(position);
         let duration_time = format_playback_time(duration);
         let view = cx.entity().downgrade();
@@ -520,6 +583,7 @@ impl Render for PlaybackPage {
             has_visible_frame: current_frame.is_some(),
             playback_paused: self.playback_paused,
             playback_buffering: self.playback_buffering,
+            pending_seek: self.pending_seek_position.is_some(),
         }) {
             window.request_animation_frame();
         }
@@ -796,6 +860,21 @@ fn valid_playback_duration(duration: f64) -> Option<f64> {
     (duration.is_finite() && duration > 0.0).then_some(duration)
 }
 
+fn valid_http_stream_buffer_progress(
+    progress: HttpStreamBufferProgress,
+) -> Option<HttpStreamBufferProgress> {
+    if !progress.start_fraction.is_finite() || !progress.end_fraction.is_finite() {
+        return None;
+    }
+
+    let start_fraction = progress.start_fraction.clamp(0.0, 1.0);
+    let end_fraction = progress.end_fraction.clamp(0.0, 1.0);
+    (end_fraction >= start_fraction).then_some(HttpStreamBufferProgress {
+        start_fraction,
+        end_fraction,
+    })
+}
+
 fn clamp_playback_position(position: f64, duration: f64) -> f64 {
     if !position.is_finite() {
         return 0.0;
@@ -813,6 +892,82 @@ fn progress_fraction(position: f64, duration: f64) -> f32 {
 fn buffered_progress_fraction(buffered_until: Option<f64>, position: f64, duration: f64) -> f32 {
     let buffered_until = buffered_until.unwrap_or(position).max(position);
     progress_fraction(buffered_until, duration)
+}
+
+fn should_apply_backend_position(
+    progress_drag_position: Option<f64>,
+    pending_seek_position: Option<f64>,
+) -> bool {
+    progress_drag_position.is_none() && pending_seek_position.is_none()
+}
+
+fn is_seek_position_buffered(
+    position: f64,
+    playback_position: Option<f64>,
+    playback_buffered_until: Option<f64>,
+    http_stream_buffered_range: Option<HttpStreamBufferProgress>,
+    duration: Option<f64>,
+) -> bool {
+    let Some(duration) = duration.and_then(valid_playback_duration) else {
+        return false;
+    };
+    let position = clamp_playback_position(position, duration);
+    let playback_position = playback_position
+        .and_then(valid_playback_time)
+        .map(|position| clamp_playback_position(position, duration))
+        .unwrap_or(position);
+
+    let playback_buffered = playback_buffered_until
+        .and_then(valid_playback_time)
+        .is_some_and(|buffered_until| {
+            let buffered_until = clamp_playback_position(buffered_until, duration);
+            position + PLAYBACK_BUFFER_POSITION_TOLERANCE_SECONDS >= playback_position
+                && position <= buffered_until + PLAYBACK_BUFFER_POSITION_TOLERANCE_SECONDS
+        });
+    let http_stream_buffered =
+        http_stream_buffered_until(http_stream_buffered_range, position, duration).is_some_and(
+            |buffered_until| {
+                position <= buffered_until + PLAYBACK_BUFFER_POSITION_TOLERANCE_SECONDS
+            },
+        );
+
+    playback_buffered || http_stream_buffered
+}
+
+fn combined_buffered_until(
+    playback_buffered_until: Option<f64>,
+    http_stream_buffered_range: Option<HttpStreamBufferProgress>,
+    position: f64,
+    duration: f64,
+) -> Option<f64> {
+    let http_stream_buffered_until =
+        http_stream_buffered_until(http_stream_buffered_range, position, duration);
+    match (
+        playback_buffered_until.and_then(valid_playback_time),
+        http_stream_buffered_until,
+    ) {
+        (Some(playback), Some(http_stream)) => Some(playback.max(http_stream)),
+        (Some(playback), None) => Some(playback),
+        (None, Some(http_stream)) => Some(http_stream),
+        (None, None) => None,
+    }
+}
+
+fn http_stream_buffered_until(
+    progress: Option<HttpStreamBufferProgress>,
+    position: f64,
+    duration: f64,
+) -> Option<f64> {
+    let duration = valid_playback_duration(duration)?;
+    let progress = progress.and_then(valid_http_stream_buffer_progress)?;
+    let position_fraction = progress_fraction(position, duration) as f64;
+    if position_fraction + HTTP_STREAM_BUFFER_POSITION_TOLERANCE < progress.start_fraction
+        || position_fraction > progress.end_fraction + HTTP_STREAM_BUFFER_POSITION_TOLERANCE
+    {
+        return None;
+    }
+
+    Some(duration * progress.end_fraction)
 }
 
 fn progress_fraction_for_cursor(cursor_x: Pixels, bounds: Bounds<Pixels>) -> Option<f32> {
@@ -856,6 +1011,7 @@ struct AnimationFrameRequestState {
     has_visible_frame: bool,
     playback_paused: bool,
     playback_buffering: bool,
+    pending_seek: bool,
 }
 
 fn should_request_animation_frame(state: AnimationFrameRequestState) -> bool {
@@ -864,6 +1020,7 @@ fn should_request_animation_frame(state: AnimationFrameRequestState) -> bool {
         && !state.has_error
         && (!state.has_loaded_file
             || state.playback_buffering
+            || state.pending_seek
             || (state.has_viewport && (!state.playback_paused || !state.has_visible_frame)))
 }
 
@@ -874,11 +1031,13 @@ mod tests {
     use gpui::{Bounds, point, px, size};
 
     use super::{
-        AnimationFrameRequestState, RenderSize, ShutdownOrder, aspect_fit_bounds,
-        buffered_progress_fraction, clamp_playback_position, format_playback_time,
-        normalize_video_viewport, playback_status_message, progress_fraction,
-        progress_fraction_for_cursor, render_output_size, should_render_frame,
-        should_request_animation_frame, valid_playback_duration, valid_playback_time,
+        AnimationFrameRequestState, HttpStreamBufferProgress, RenderSize, ShutdownOrder,
+        aspect_fit_bounds, buffered_progress_fraction, clamp_playback_position,
+        combined_buffered_until, format_playback_time, http_stream_buffered_until,
+        is_seek_position_buffered, normalize_video_viewport, playback_status_message,
+        progress_fraction, progress_fraction_for_cursor, render_output_size,
+        should_apply_backend_position, should_render_frame, should_request_animation_frame,
+        valid_http_stream_buffer_progress, valid_playback_duration, valid_playback_time,
         viewport_changed,
     };
 
@@ -1065,6 +1224,111 @@ mod tests {
     }
 
     #[test]
+    fn backend_position_updates_wait_until_seek_finishes() {
+        assert!(should_apply_backend_position(None, None));
+        assert!(!should_apply_backend_position(Some(40.0), None));
+        assert!(!should_apply_backend_position(None, Some(80.0)));
+    }
+
+    #[test]
+    fn cached_seek_detects_playback_and_http_buffered_ranges() {
+        assert!(is_seek_position_buffered(
+            60.0,
+            Some(40.0),
+            Some(80.0),
+            None,
+            Some(100.0),
+        ));
+        assert!(!is_seek_position_buffered(
+            20.0,
+            Some(40.0),
+            Some(80.0),
+            None,
+            Some(100.0),
+        ));
+
+        let http_range = Some(HttpStreamBufferProgress {
+            start_fraction: 0.2,
+            end_fraction: 0.8,
+        });
+        assert!(is_seek_position_buffered(
+            30.0,
+            Some(90.0),
+            None,
+            http_range,
+            Some(100.0),
+        ));
+        assert!(!is_seek_position_buffered(
+            90.0,
+            Some(10.0),
+            None,
+            http_range,
+            Some(100.0),
+        ));
+    }
+
+    #[test]
+    fn http_stream_buffer_progress_validates_and_clamps_fraction_range() {
+        assert_eq!(
+            valid_http_stream_buffer_progress(HttpStreamBufferProgress {
+                start_fraction: -0.5,
+                end_fraction: 1.5,
+            }),
+            Some(HttpStreamBufferProgress {
+                start_fraction: 0.0,
+                end_fraction: 1.0,
+            })
+        );
+        assert_eq!(
+            valid_http_stream_buffer_progress(HttpStreamBufferProgress {
+                start_fraction: 0.8,
+                end_fraction: 0.2,
+            }),
+            None
+        );
+        assert_eq!(
+            valid_http_stream_buffer_progress(HttpStreamBufferProgress {
+                start_fraction: f64::NAN,
+                end_fraction: 0.2,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn http_stream_buffer_progress_only_applies_to_current_playback_range() {
+        let range = Some(HttpStreamBufferProgress {
+            start_fraction: 0.4,
+            end_fraction: 0.7,
+        });
+
+        assert_eq!(http_stream_buffered_until(range, 50.0, 100.0), Some(70.0));
+        assert_eq!(http_stream_buffered_until(range, 10.0, 100.0), None);
+        assert_eq!(http_stream_buffered_until(range, 90.0, 100.0), None);
+    }
+
+    #[test]
+    fn combined_buffered_progress_uses_furthest_playable_buffer() {
+        let range = Some(HttpStreamBufferProgress {
+            start_fraction: 0.2,
+            end_fraction: 0.8,
+        });
+
+        assert_eq!(
+            combined_buffered_until(Some(30.0), range, 40.0, 100.0),
+            Some(80.0)
+        );
+        assert_eq!(
+            combined_buffered_until(Some(90.0), range, 40.0, 100.0),
+            Some(90.0)
+        );
+        assert_eq!(
+            combined_buffered_until(None, range, 40.0, 100.0),
+            Some(80.0)
+        );
+    }
+
+    #[test]
     fn progress_cursor_fraction_uses_track_bounds_and_clamps_edges() {
         let bounds = Bounds::new(point(px(100.0), px(0.0)), size(px(400.0), px(28.0)));
 
@@ -1177,6 +1441,15 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn should_request_animation_frame_continues_during_soft_seek() {
+        assert!(should_request_animation_frame(AnimationFrameRequestState {
+            has_viewport: false,
+            pending_seek: true,
+            ..animation_frame_request_state()
+        }));
+    }
+
     fn animation_frame_request_state() -> AnimationFrameRequestState {
         AnimationFrameRequestState {
             has_backend: true,
@@ -1187,6 +1460,7 @@ mod tests {
             has_visible_frame: true,
             playback_paused: true,
             playback_buffering: false,
+            pending_seek: false,
         }
     }
 
