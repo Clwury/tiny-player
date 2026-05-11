@@ -337,6 +337,25 @@ impl EmbyClient {
         })
     }
 
+    pub fn playback_http_headers(&self, server: &CachedServer) -> Result<Vec<(String, String)>> {
+        let access_token = server
+            .access_token
+            .as_deref()
+            .ok_or_else(|| anyhow!("Emby 访问令牌缺失，请重新登录服务器"))?;
+        let user_id = server
+            .user_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
+        let authorization = self.authenticated_authorization_header(access_token, user_id);
+
+        Ok(vec![
+            ("Accept".to_string(), "*/*".to_string()),
+            ("X-Emby-Authorization".to_string(), authorization),
+            ("X-Emby-Token".to_string(), access_token.to_string()),
+            ("User-Agent".to_string(), format!("{CLIENT_NAME}/{VERSION}")),
+        ])
+    }
+
     fn authorization_header(&self) -> String {
         format!(
             "Emby UserId=\"\", Client=\"{CLIENT_NAME}\", Device=\"{DEVICE_NAME}\", DeviceId=\"{}\", Version=\"{VERSION}\", Token=\"\"",

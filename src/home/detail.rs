@@ -22,6 +22,7 @@ struct SelectedPlayback {
 
 struct ResolvedPlayback {
     url: String,
+    http_headers: Vec<(String, String)>,
 }
 
 impl HomeContent {
@@ -103,8 +104,10 @@ impl HomeContent {
             let source = playback_info.direct_stream_source_for(&task_media_source_id)?;
             let direct_stream_url = source.direct_stream_url()?;
             let playback_url = resolve_direct_stream_url(&task_server, direct_stream_url)?;
+            let http_headers = client.playback_http_headers(&task_server)?;
             Ok::<_, anyhow::Error>(ResolvedPlayback {
                 url: playback_url.to_string(),
+                http_headers,
             })
         });
 
@@ -138,6 +141,7 @@ impl HomeContent {
                 cx.emit(HomeContentEvent::OpenPlayback(PlaybackRequest {
                     title: selected.title,
                     url: playback.url,
+                    http_headers: playback.http_headers,
                 }));
             }
             Err(error) => {

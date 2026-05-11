@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use gpui::RenderImage;
-use gstreamer as gst;
 use image::{Frame, ImageBuffer, RgbaImage};
 
 use super::dovi::DoviFrameMetadata;
@@ -48,24 +47,13 @@ pub struct FrameDynamicMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RawVideoPlanes {
-    #[cfg_attr(not(test), allow(dead_code))]
     Owned(Vec<RawVideoPlane>),
-    GStreamer {
-        buffer: gst::Buffer,
-        planes: Vec<RawVideoBufferPlane>,
-    },
-    DmaBuf {
-        buffer: gst::Buffer,
-        planes: Vec<RawVideoDmaBufPlane>,
-    },
 }
 
 impl RawVideoPlanes {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Owned(planes) => planes.len(),
-            Self::GStreamer { planes, .. } => planes.len(),
-            Self::DmaBuf { planes, .. } => planes.len(),
         }
     }
 }
@@ -74,25 +62,6 @@ impl RawVideoPlanes {
 pub struct RawVideoPlane {
     pub data: Vec<u8>,
     pub stride: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RawVideoBufferPlane {
-    pub offset: usize,
-    pub stride: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RawVideoDmaBufPlane {
-    pub fd: i32,
-    pub buffer_offset: usize,
-    pub memory_offset: usize,
-    pub memory_size: usize,
-    pub stride: usize,
-    pub width: u32,
-    pub height: u32,
-    pub drm_format: u32,
-    pub drm_modifier: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,16 +83,6 @@ pub struct RawVideoPlaneLayout {
 }
 
 impl RawVideoFormat {
-    pub fn from_gstreamer_name(name: &str) -> Option<Self> {
-        match name {
-            "P010_10LE" => Some(Self::P010Le),
-            "I420_10LE" => Some(Self::I42010Le),
-            "NV12" => Some(Self::Nv12),
-            "I420" => Some(Self::I420),
-            _ => None,
-        }
-    }
-
     pub fn plane_count(self) -> usize {
         match self {
             Self::P010Le | Self::Nv12 => 2,
@@ -153,18 +112,6 @@ impl RawVideoFormat {
         match self {
             Self::P010Le => 6,
             Self::I42010Le | Self::Nv12 | Self::I420 => 0,
-        }
-    }
-
-    pub fn drm_plane_fourcc(self, plane: usize) -> Option<u32> {
-        match (self, plane) {
-            (Self::P010Le, 0) => Some(DRM_FORMAT_R16),
-            (Self::P010Le, 1) => Some(DRM_FORMAT_GR1616),
-            (Self::I42010Le, 0..=2) => Some(DRM_FORMAT_R16),
-            (Self::Nv12, 0) => Some(DRM_FORMAT_R8),
-            (Self::Nv12, 1) => Some(DRM_FORMAT_GR88),
-            (Self::I420, 0..=2) => Some(DRM_FORMAT_R8),
-            _ => None,
         }
     }
 
@@ -212,15 +159,6 @@ impl RawVideoFormat {
         self.plane_layout(size, plane)
     }
 }
-
-const fn drm_fourcc_code(a: u8, b: u8, c: u8, d: u8) -> u32 {
-    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
-}
-
-const DRM_FORMAT_R8: u32 = drm_fourcc_code(b'R', b'8', b' ', b' ');
-const DRM_FORMAT_R16: u32 = drm_fourcc_code(b'R', b'1', b'6', b' ');
-const DRM_FORMAT_GR88: u32 = drm_fourcc_code(b'G', b'R', b'8', b'8');
-const DRM_FORMAT_GR1616: u32 = drm_fourcc_code(b'G', b'R', b'3', b'2');
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameColor {
@@ -297,10 +235,12 @@ pub fn frame_byte_len(size: RenderSize) -> Result<usize> {
     usize::try_from(pixels).map_err(|_| anyhow!("video frame buffer is too large"))
 }
 
+#[cfg(test)]
 pub fn packed_bgra_from_stride(data: &[u8], size: RenderSize, stride: usize) -> Result<Vec<u8>> {
     packed_frame_data_from_stride(data, size, stride, 4)
 }
 
+#[cfg(test)]
 pub fn packed_frame_data_from_stride(
     data: &[u8],
     size: RenderSize,
@@ -351,6 +291,7 @@ pub fn raw_plane_from_stride(
     Ok(raw_plane_slice_from_stride(data, offset, stride, row_len, height)?.to_vec())
 }
 
+#[cfg(test)]
 pub fn raw_plane_slice_from_stride(
     data: &[u8],
     offset: usize,
@@ -360,16 +301,6 @@ pub fn raw_plane_slice_from_stride(
 ) -> Result<&[u8]> {
     let end = raw_plane_end(data.len(), offset, stride, row_len, height)?;
     Ok(&data[offset..end])
-}
-
-pub fn validate_raw_plane_from_stride(
-    data_len: usize,
-    offset: usize,
-    stride: usize,
-    row_len: usize,
-    height: u32,
-) -> Result<()> {
-    raw_plane_end(data_len, offset, stride, row_len, height).map(|_| ())
 }
 
 fn raw_plane_end(
@@ -410,13 +341,6 @@ pub fn sdr_8bit_yuv_to_bgra(raw: &RawVideoFrame, size: RenderSize) -> Result<Opt
 
     match &raw.planes {
         RawVideoPlanes::Owned(planes) => convert_owned_sdr_yuv_to_bgra(raw, size, planes),
-        RawVideoPlanes::GStreamer { buffer, planes } => {
-            let map = buffer
-                .map_readable()
-                .map_err(|error| anyhow!("map GStreamer video frame failed: {error}"))?;
-            convert_buffer_sdr_yuv_to_bgra(raw, size, map.as_slice(), planes)
-        }
-        RawVideoPlanes::DmaBuf { .. } => Ok(None),
     }
 }
 
@@ -431,28 +355,6 @@ fn convert_owned_sdr_yuv_to_bgra(
             .get(index)
             .ok_or_else(|| anyhow!("video frame is missing a raw plane"))?;
         plane_view_from_slice(&plane.data, 0, plane.stride, layout.row_len, layout.height)
-    };
-    convert_sdr_yuv_planes_to_bgra(raw.format, raw.range, size, plane)
-}
-
-fn convert_buffer_sdr_yuv_to_bgra(
-    raw: &RawVideoFrame,
-    size: RenderSize,
-    data: &[u8],
-    planes: &[RawVideoBufferPlane],
-) -> Result<Option<Vec<u8>>> {
-    let plane = |index: usize| -> Result<PlaneView<'_>> {
-        let layout = raw.format.plane_layout(size, index)?;
-        let plane = planes
-            .get(index)
-            .ok_or_else(|| anyhow!("video frame is missing a raw plane"))?;
-        plane_view_from_slice(
-            data,
-            plane.offset,
-            plane.stride,
-            layout.row_len,
-            layout.height,
-        )
     };
     convert_sdr_yuv_planes_to_bgra(raw.format, raw.range, size, plane)
 }
@@ -591,6 +493,7 @@ fn clamp_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
+#[cfg(test)]
 fn frame_row_len(size: RenderSize, bytes_per_pixel: usize) -> Result<usize> {
     usize::try_from(size.width)
         .ok()
@@ -613,9 +516,8 @@ pub fn render_image_from_bgra(bgra: Vec<u8>, width: u32, height: u32) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        DRM_FORMAT_GR88, DRM_FORMAT_GR1616, DRM_FORMAT_R8, DRM_FORMAT_R16, DecodedFrame,
-        FrameColor, FramePixels, FrameSlot, RawVideoChromaSite, RawVideoFormat, RawVideoFrame,
-        RawVideoPlane, RawVideoPlanes, RawVideoRange, RenderSize, frame_byte_len,
+        DecodedFrame, FrameColor, FramePixels, FrameSlot, RawVideoChromaSite, RawVideoFormat,
+        RawVideoFrame, RawVideoPlane, RawVideoPlanes, RawVideoRange, RenderSize, frame_byte_len,
         packed_bgra_from_stride, raw_plane_from_stride, render_image_from_bgra,
         sdr_8bit_yuv_to_bgra,
     };
@@ -810,31 +712,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(layout.component_map, [1, 2, -1, -1]);
-    }
-
-    #[test]
-    fn raw_video_format_reports_dmabuf_plane_fourccs() {
-        assert_eq!(
-            RawVideoFormat::P010Le.drm_plane_fourcc(0),
-            Some(DRM_FORMAT_R16)
-        );
-        assert_eq!(
-            RawVideoFormat::P010Le.drm_plane_fourcc(1),
-            Some(DRM_FORMAT_GR1616)
-        );
-        assert_eq!(
-            RawVideoFormat::Nv12.drm_plane_fourcc(0),
-            Some(DRM_FORMAT_R8)
-        );
-        assert_eq!(
-            RawVideoFormat::Nv12.drm_plane_fourcc(1),
-            Some(DRM_FORMAT_GR88)
-        );
-        assert_eq!(
-            RawVideoFormat::I420.drm_plane_fourcc(2),
-            Some(DRM_FORMAT_R8)
-        );
-        assert_eq!(RawVideoFormat::Nv12.drm_plane_fourcc(2), None);
     }
 
     #[test]

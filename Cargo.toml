@@ -6,11 +6,9 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 directories = "5"
+cpal = "0.17.3"
 dolby_vision = { git = "https://github.com/quietvoid/dovi_tool", package = "dolby_vision" }
 gpui = "0.2.2"
-gstreamer = { version = "0.25", features = ["v1_24"] }
-gstreamer-app = "0.25"
-gstreamer-video = { version = "0.25", features = ["v1_24"] }
 ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avformat", "swscale", "swresample"] }
 image = "0.25"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }

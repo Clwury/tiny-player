@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use gpui::{
     Bounds, Context, DragMoveEvent, EventEmitter, InteractiveElement, IntoElement, MouseButton,
@@ -10,16 +10,27 @@ use gpui::{
 use crate::theme;
 
 use super::{
-    backend::{BackendEvent, GstBackend, is_gstreamer_matroska_large_block_error},
-    ffmpeg_backend::FfmpegBackend,
+    backend::{BackendEvent, FfmpegBackend},
     render_host::RenderSize,
     video_presenter::VideoPresenter,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PlaybackRequest {
     pub title: SharedString,
     pub url: String,
+    pub http_headers: Vec<(String, String)>,
+}
+
+impl fmt::Debug for PlaybackRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlaybackRequest")
+            .field("title", &self.title)
+            .field("url", &"<redacted>")
+            .field("http_headers", &self.http_headers.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -29,7 +40,6 @@ pub enum PlaybackEvent {
 
 pub struct PlaybackPage {
     title: SharedString,
-    current_url: String,
     video: ShutdownOrder<PlaybackBackend, VideoPresenter>,
     video_viewport_bounds: Option<Bounds<Pixels>>,
     video_source_size: Option<RenderSize>,
@@ -42,7 +52,6 @@ pub struct PlaybackPage {
     progress_track_bounds: Option<Bounds<Pixels>>,
     progress_drag_position: Option<f64>,
     current_file_loaded: bool,
-    ffmpeg_fallback_attempted: bool,
     error_message: Option<SharedString>,
     status_message: SharedString,
 }
@@ -54,31 +63,31 @@ impl PlaybackPage {
         let mut error_message = None;
         let status_message = "正在加载视频…".into();
 
-        let (backend, video_presenter) = match GstBackend::new() {
+        let (backend, video_presenter) = match FfmpegBackend::new() {
             Ok(mut backend) => match VideoPresenter::new(backend.frame_slot()) {
                 Ok(video_presenter) => {
-                    if let Err(error) = backend.load_url(&request.url) {
+                    if let Err(error) = backend.load_url(&request.url, request.http_headers.clone())
+                    {
                         error_message = Some(format!("加载视频失败：{error}").into());
                     }
                     (
-                        Some(PlaybackBackend::Gstreamer(backend)),
+                        Some(PlaybackBackend::Ffmpeg(backend)),
                         Some(video_presenter),
                     )
                 }
                 Err(error) => {
                     error_message = Some(format!("创建视频渲染器失败：{error}").into());
-                    (Some(PlaybackBackend::Gstreamer(backend)), None)
+                    (Some(PlaybackBackend::Ffmpeg(backend)), None)
                 }
             },
             Err(error) => {
-                error_message = Some(format!("创建 GStreamer 播放后端失败：{error}").into());
+                error_message = Some(format!("创建 FFmpeg 播放后端失败：{error}").into());
                 (None, None)
             }
         };
 
         Self {
             title: request.title,
-            current_url: request.url,
             video: ShutdownOrder::new(backend, video_presenter),
             video_viewport_bounds: None,
             video_source_size: None,
@@ -91,7 +100,6 @@ impl PlaybackPage {
             progress_track_bounds: None,
             progress_drag_position: None,
             current_file_loaded: false,
-            ffmpeg_fallback_attempted: false,
             error_message,
             status_message,
         }
@@ -208,10 +216,7 @@ impl PlaybackPage {
         let Some(position) = self.progress_drag_position.take() else {
             return;
         };
-        let uses_playable_cache_progress = self
-            .video
-            .owner()
-            .is_some_and(PlaybackBackend::uses_playable_cache_progress);
+        let uses_playable_cache_progress = self.video.owner().is_some();
         self.playback_position = Some(position);
         self.playback_buffered_until = if uses_playable_cache_progress {
             Some(position)
@@ -257,10 +262,6 @@ impl PlaybackPage {
                     self.error_message = None;
                 }
                 BackendEvent::LoadFailed(message) => {
-                    if self.should_fallback_to_ffmpeg(&message) {
-                        self.start_ffmpeg_fallback(&message, window, cx);
-                        continue;
-                    }
                     self.current_file_loaded = false;
                     self.video_source_size = None;
                     self.playback_paused = true;
@@ -357,58 +358,6 @@ impl PlaybackPage {
         self.error_message
             .clone()
             .unwrap_or_else(|| self.status_message.clone())
-    }
-
-    fn should_fallback_to_ffmpeg(&self, message: &str) -> bool {
-        !self.ffmpeg_fallback_attempted
-            && self
-                .video
-                .owner()
-                .is_some_and(PlaybackBackend::is_gstreamer)
-            && is_gstreamer_matroska_large_block_error(message)
-    }
-
-    fn start_ffmpeg_fallback(&mut self, reason: &str, window: &mut Window, cx: &mut Context<Self>) {
-        tracing::warn!(
-            reason,
-            "GStreamer Matroska demux failed on a large block; switching to FFmpeg backend"
-        );
-        self.ffmpeg_fallback_attempted = true;
-        self.current_file_loaded = false;
-        self.video_source_size = None;
-        self.playback_paused = true;
-        self.playback_buffering = false;
-        self.playback_buffered_until = None;
-        self.progress_drag_position = None;
-        self.error_message = None;
-        self.status_message = "正在切换 FFmpeg 播放后端…".into();
-        self.clear_visible_frame(window, cx);
-        self.video = ShutdownOrder::new(None, None);
-
-        let mut backend = match FfmpegBackend::new() {
-            Ok(backend) => backend,
-            Err(error) => {
-                self.error_message = Some(format!("创建 FFmpeg 播放后端失败：{error}").into());
-                return;
-            }
-        };
-        let video_presenter = match VideoPresenter::new(backend.frame_slot()) {
-            Ok(video_presenter) => video_presenter,
-            Err(error) => {
-                self.error_message = Some(format!("创建视频渲染器失败：{error}").into());
-                return;
-            }
-        };
-        if let Err(error) = backend.load_url(&self.current_url) {
-            self.error_message = Some(format!("加载视频失败：{error}").into());
-            return;
-        }
-
-        self.video = ShutdownOrder::new(
-            Some(PlaybackBackend::Ffmpeg(backend)),
-            Some(video_presenter),
-        );
-        cx.notify();
     }
 
     fn render_progress_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -724,31 +673,20 @@ impl IntoElement for VideoFrameElement {
 }
 
 enum PlaybackBackend {
-    Gstreamer(GstBackend),
     Ffmpeg(FfmpegBackend),
 }
 
 impl PlaybackBackend {
     fn poll_events(&mut self) -> Vec<BackendEvent> {
         match self {
-            Self::Gstreamer(backend) => backend.poll_events(),
             Self::Ffmpeg(backend) => backend.poll_events(),
         }
     }
 
     fn seek_to(&mut self, position_seconds: f64) -> super::backend::Result<()> {
         match self {
-            Self::Gstreamer(backend) => backend.seek_to(position_seconds),
             Self::Ffmpeg(backend) => backend.seek_to(position_seconds),
         }
-    }
-
-    fn is_gstreamer(&self) -> bool {
-        matches!(self, Self::Gstreamer(_))
-    }
-
-    fn uses_playable_cache_progress(&self) -> bool {
-        matches!(self, Self::Gstreamer(_) | Self::Ffmpeg(_))
     }
 }
 

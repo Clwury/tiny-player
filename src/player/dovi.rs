@@ -18,6 +18,29 @@ pub struct DoviFrameMetadata {
 }
 
 impl DoviFrameMetadata {
+    pub fn from_rpu_payload(rpu_payload: &[u8]) -> Result<Self> {
+        let rpu = DoviRpu::parse_rpu(rpu_payload).context("解析 Dolby Vision RPU payload 失败")?;
+        Ok(Self {
+            profile: rpu.dovi_profile,
+            rpu_nalu: Vec::new(),
+            rpu_payload: rpu_payload.to_vec(),
+        })
+    }
+
+    pub fn from_unspec62_nalu(nalu: &[u8]) -> Result<Self> {
+        let rpu =
+            DoviRpu::parse_unspec62_nalu(nalu).context("解析 Dolby Vision UNSPEC62 NALU 失败")?;
+        let rpu_payload = rpu
+            .write_rpu()
+            .context("写出 Dolby Vision RPU payload 失败")?;
+
+        Ok(Self {
+            profile: rpu.dovi_profile,
+            rpu_nalu: nalu.to_vec(),
+            rpu_payload,
+        })
+    }
+
     pub fn parse_rpu(&self) -> Result<DoviRpu> {
         DoviRpu::parse_rpu(&self.rpu_payload).context("解析 Dolby Vision RPU 失败")
     }
@@ -100,16 +123,7 @@ fn metadata_from_nalu(nalu: &[u8]) -> Result<Option<DoviFrameMetadata>> {
         return Ok(None);
     }
 
-    let rpu = DoviRpu::parse_unspec62_nalu(nalu).context("解析 Dolby Vision UNSPEC62 NALU 失败")?;
-    let rpu_payload = rpu
-        .write_rpu()
-        .context("写出 Dolby Vision RPU payload 失败")?;
-
-    Ok(Some(DoviFrameMetadata {
-        profile: rpu.dovi_profile,
-        rpu_nalu: nalu.to_vec(),
-        rpu_payload,
-    }))
+    DoviFrameMetadata::from_unspec62_nalu(nalu).map(Some)
 }
 
 fn nalu_type(nalu: &[u8]) -> Option<u8> {
