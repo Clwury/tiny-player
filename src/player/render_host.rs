@@ -12,6 +12,15 @@ pub struct RenderSize {
     pub height: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PlaybackSessionId(pub u64);
+
+impl PlaybackSessionId {
+    pub fn next(self) -> Self {
+        Self(self.0.wrapping_add(1).max(1))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DecodedFrame {
     pub size: RenderSize,
@@ -190,19 +199,33 @@ pub struct FrameSlot {
 
 #[derive(Default)]
 struct FrameSlotState {
+    active_session_id: PlaybackSessionId,
     latest_frame: Option<DecodedFrame>,
     current_size: Option<RenderSize>,
     pending_size_change: Option<RenderSize>,
 }
 
 impl FrameSlot {
-    pub fn push(&self, frame: DecodedFrame) {
+    pub fn begin_session(&self, session_id: PlaybackSessionId) {
+        *self.inner.lock().expect("video frame slot poisoned") = FrameSlotState {
+            active_session_id: session_id,
+            latest_frame: None,
+            current_size: None,
+            pending_size_change: None,
+        };
+    }
+
+    pub fn push(&self, session_id: PlaybackSessionId, frame: DecodedFrame) -> bool {
         let mut state = self.inner.lock().expect("video frame slot poisoned");
+        if state.active_session_id != session_id {
+            return false;
+        }
         if state.current_size != Some(frame.size) {
             state.current_size = Some(frame.size);
             state.pending_size_change = Some(frame.size);
         }
         state.latest_frame = Some(frame);
+        true
     }
 
     pub fn take_frame(&self) -> Option<DecodedFrame> {
@@ -213,12 +236,10 @@ impl FrameSlot {
             .take()
     }
 
-    pub fn take_size_change(&self) -> Option<RenderSize> {
-        self.inner
-            .lock()
-            .expect("video frame slot poisoned")
-            .pending_size_change
-            .take()
+    pub fn take_size_change(&self) -> Option<(PlaybackSessionId, RenderSize)> {
+        let mut state = self.inner.lock().expect("video frame slot poisoned");
+        let size = state.pending_size_change.take()?;
+        Some((state.active_session_id, size))
     }
 
     pub fn clear(&self) {
@@ -356,8 +377,9 @@ pub fn render_image_from_bgra(bgra: Vec<u8>, width: u32, height: u32) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodedFrame, FrameColor, FramePixels, FrameSlot, RawVideoFormat, RenderSize,
-        frame_byte_len, packed_bgra_from_stride, raw_plane_from_stride, render_image_from_bgra,
+        DecodedFrame, FrameColor, FramePixels, FrameSlot, PlaybackSessionId, RawVideoFormat,
+        RenderSize, frame_byte_len, packed_bgra_from_stride, raw_plane_from_stride,
+        render_image_from_bgra,
     };
 
     #[test]
@@ -509,6 +531,8 @@ mod tests {
     #[test]
     fn frame_slot_keeps_latest_frame_and_reports_size_changes() {
         let slot = FrameSlot::default();
+        let session_id = PlaybackSessionId(1);
+        slot.begin_session(session_id);
         let first = RenderSize {
             width: 2,
             height: 1,
@@ -518,29 +542,62 @@ mod tests {
             height: 1,
         };
 
-        slot.push(DecodedFrame {
-            size: first,
-            pts: None,
-            pixels: FramePixels::Bgra8(vec![1; 8]),
-        });
-        slot.push(DecodedFrame {
-            size: first,
-            pts: None,
-            pixels: FramePixels::Bgra8(vec![2; 8]),
-        });
+        assert!(slot.push(
+            session_id,
+            DecodedFrame {
+                size: first,
+                pts: None,
+                pixels: FramePixels::Bgra8(vec![1; 8]),
+            }
+        ));
+        assert!(slot.push(
+            session_id,
+            DecodedFrame {
+                size: first,
+                pts: None,
+                pixels: FramePixels::Bgra8(vec![2; 8]),
+            }
+        ));
 
-        assert_eq!(slot.take_size_change(), Some(first));
+        assert_eq!(slot.take_size_change(), Some((session_id, first)));
         assert_eq!(
             slot.take_frame().unwrap().pixels,
             FramePixels::Bgra8(vec![2; 8])
         );
         assert!(slot.take_frame().is_none());
 
-        slot.push(DecodedFrame {
-            size: second,
-            pts: None,
-            pixels: FramePixels::Bgra8(vec![3; 16]),
-        });
-        assert_eq!(slot.take_size_change(), Some(second));
+        assert!(slot.push(
+            session_id,
+            DecodedFrame {
+                size: second,
+                pts: None,
+                pixels: FramePixels::Bgra8(vec![3; 16]),
+            }
+        ));
+        assert_eq!(slot.take_size_change(), Some((session_id, second)));
+    }
+
+    #[test]
+    fn frame_slot_rejects_stale_session_frames() {
+        let slot = FrameSlot::default();
+        let current = PlaybackSessionId(2);
+        let stale = PlaybackSessionId(1);
+        let size = RenderSize {
+            width: 2,
+            height: 1,
+        };
+        slot.begin_session(current);
+
+        assert!(!slot.push(
+            stale,
+            DecodedFrame {
+                size,
+                pts: None,
+                pixels: FramePixels::Bgra8(vec![1; 8]),
+            }
+        ));
+
+        assert!(slot.take_frame().is_none());
+        assert_eq!(slot.take_size_change(), None);
     }
 }

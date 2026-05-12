@@ -1,4 +1,4 @@
-use crate::player::render_host::RenderSize;
+use crate::player::render_host::{PlaybackSessionId, RenderSize};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HttpStreamBufferProgress {
@@ -7,7 +7,19 @@ pub struct HttpStreamBufferProgress {
 }
 
 #[derive(Debug)]
-pub enum BackendEvent {
+pub struct BackendEvent {
+    pub session_id: PlaybackSessionId,
+    pub kind: BackendEventKind,
+}
+
+impl BackendEvent {
+    pub fn new(session_id: PlaybackSessionId, kind: BackendEventKind) -> Self {
+        Self { session_id, kind }
+    }
+}
+
+#[derive(Debug)]
+pub enum BackendEventKind {
     Pause(bool),
     PlaybackRestart,
     VideoSizeChanged(Option<RenderSize>),

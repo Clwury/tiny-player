@@ -16,7 +16,7 @@ fn timestamp_mapper_uses_stream_start_when_available() {
 
 #[test]
 fn ffmpeg_control_tracks_seek_generations() {
-    let control = FfmpegControl::new();
+    let control = FfmpegControl::new(PlaybackSessionId::default());
 
     let first = control.request_seek();
     assert!(control.has_pending_seek());
@@ -29,6 +29,33 @@ fn ffmpeg_control_tracks_seek_generations() {
     assert!(control.has_pending_seek());
     control.finish_seek(second);
     assert!(!control.has_pending_seek());
+}
+
+#[test]
+fn ffmpeg_backend_discards_stale_session_events() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(2);
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::Pause(true),
+        ))
+        .unwrap();
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(2),
+            BackendEventKind::Buffering(true),
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].session_id, PlaybackSessionId(2));
+    assert!(matches!(events[0].kind, BackendEventKind::Buffering(true)));
 }
 
 #[test]
@@ -121,34 +148,44 @@ fn optional_buffered_value_changed_uses_small_threshold() {
 fn buffered_reporter_reports_first_video_update_after_reset() {
     let (tx, rx) = mpsc::channel();
     let mut reporter = BufferedReporter::new(false);
+    let session_id = PlaybackSessionId(7);
 
-    reporter.reset_to(0.0, &tx);
-    assert_buffered_event(&rx, Some(0.0));
+    reporter.reset_to(0.0, session_id, &tx);
+    assert_buffered_event(&rx, session_id, Some(0.0));
 
-    reporter.report_video_timeline_nsecs(1_000_000_000, &tx);
+    reporter.report_video_timeline_nsecs(1_000_000_000, session_id, &tx);
 
-    assert_buffered_event(&rx, Some(1.0));
+    assert_buffered_event(&rx, session_id, Some(1.0));
 }
 
 #[test]
 fn buffered_reporter_reports_first_audio_video_update_after_reset() {
     let (tx, rx) = mpsc::channel();
     let mut reporter = BufferedReporter::new(true);
+    let session_id = PlaybackSessionId(8);
 
-    reporter.reset_to(12.0, &tx);
-    assert_buffered_event(&rx, Some(12.0));
+    reporter.reset_to(12.0, session_id, &tx);
+    assert_buffered_event(&rx, session_id, Some(12.0));
 
-    reporter.report_video_timeline_nsecs(13_000_000_000, &tx);
+    reporter.report_video_timeline_nsecs(13_000_000_000, session_id, &tx);
     assert!(rx.try_recv().is_err());
 
-    reporter.report_audio_timeline_nsecs(13_000_000_000, &tx);
+    reporter.report_audio_timeline_nsecs(13_000_000_000, session_id, &tx);
 
-    assert_buffered_event(&rx, Some(13.0));
+    assert_buffered_event(&rx, session_id, Some(13.0));
 }
 
-fn assert_buffered_event(rx: &Receiver<BackendEvent>, expected: Option<f64>) {
+fn assert_buffered_event(
+    rx: &Receiver<BackendEvent>,
+    expected_session_id: PlaybackSessionId,
+    expected: Option<f64>,
+) {
     match rx.try_recv().expect("expected buffered event") {
-        BackendEvent::BufferedChanged(buffered_until) => {
+        BackendEvent {
+            session_id,
+            kind: BackendEventKind::BufferedChanged(buffered_until),
+        } => {
+            assert_eq!(session_id, expected_session_id);
             assert_eq!(buffered_until, expected);
         }
         event => panic!("expected buffered event, got {event:?}"),
@@ -540,7 +577,7 @@ fn content_range_parser_reads_total_size() {
 #[test]
 fn playback_scheduler_reports_ready_for_past_frames() {
     let scheduler = PlaybackScheduler::new(1_000_000_000);
-    let control = FfmpegControl::new();
+    let control = FfmpegControl::new(PlaybackSessionId::default());
 
     assert_eq!(
         scheduler.wait_until(500_000_000, &control),

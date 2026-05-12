@@ -20,6 +20,7 @@ pub(super) struct QueuedVideoFrame {
 pub(super) fn present_due_audio_clocked_video_frames(
     queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
     audio_output: &AudioOutput,
+    session_id: PlaybackSessionId,
     frame_slot: &FrameSlot,
     frame_presented: &AtomicBool,
     position_reporter: &mut PositionReporter,
@@ -40,6 +41,7 @@ pub(super) fn present_due_audio_clocked_video_frames(
     if let Some(frame) = due_frame {
         present_decoded_video_frame(
             frame.frame,
+            session_id,
             frame.timeline_nsecs,
             frame_slot,
             frame_presented,
@@ -69,10 +71,12 @@ pub(super) fn should_drop_late_video_frame(
     late_cutoff <= played_until_nsecs
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn wait_for_audio_clocked_video_queue(
     queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
     audio_output: &AudioOutput,
     control: &FfmpegControl,
+    session_id: PlaybackSessionId,
     frame_slot: &FrameSlot,
     frame_presented: &AtomicBool,
     position_reporter: &mut PositionReporter,
@@ -84,6 +88,7 @@ pub(super) fn wait_for_audio_clocked_video_queue(
         present_due_audio_clocked_video_frames(
             queued_video_frames,
             audio_output,
+            session_id,
             frame_slot,
             frame_presented,
             position_reporter,
@@ -99,10 +104,12 @@ pub(super) fn wait_for_audio_clocked_video_queue(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn drain_audio_clocked_video_queue(
     queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
     audio_output: &AudioOutput,
     control: &FfmpegControl,
+    session_id: PlaybackSessionId,
     frame_slot: &FrameSlot,
     frame_presented: &AtomicBool,
     position_reporter: &mut PositionReporter,
@@ -112,6 +119,7 @@ pub(super) fn drain_audio_clocked_video_queue(
         present_due_audio_clocked_video_frames(
             queued_video_frames,
             audio_output,
+            session_id,
             frame_slot,
             frame_presented,
             position_reporter,
@@ -127,13 +135,16 @@ pub(super) fn drain_audio_clocked_video_queue(
 
 pub(super) fn present_decoded_video_frame(
     frame: DecodedFrame,
+    session_id: PlaybackSessionId,
     timeline_nsecs: u64,
     frame_slot: &FrameSlot,
     frame_presented: &AtomicBool,
     position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
 ) {
-    frame_slot.push(frame);
+    if !frame_slot.push(session_id, frame) {
+        return;
+    }
     let count = FFMPEG_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 1 || count.is_multiple_of(60) {
         tracing::debug!(
@@ -143,7 +154,7 @@ pub(super) fn present_decoded_video_frame(
         );
     }
     frame_presented.store(true, Ordering::Relaxed);
-    position_reporter.report(timeline_nsecs, event_tx);
+    position_reporter.report(timeline_nsecs, session_id, event_tx);
 }
 
 pub(super) struct PlaybackScheduler {

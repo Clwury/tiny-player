@@ -9,14 +9,16 @@ pub(super) struct FfmpegWorker {
 #[derive(Debug)]
 pub(super) struct FfmpegControl {
     shutdown: AtomicBool,
+    session_id: AtomicU64,
     seek_generation: AtomicU64,
     handled_seek_generation: AtomicU64,
 }
 
 impl FfmpegControl {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(session_id: PlaybackSessionId) -> Self {
         Self {
             shutdown: AtomicBool::new(false),
+            session_id: AtomicU64::new(session_id.0),
             seek_generation: AtomicU64::new(0),
             handled_seek_generation: AtomicU64::new(0),
         }
@@ -32,6 +34,14 @@ impl FfmpegControl {
 
     pub(super) fn should_interrupt(&self) -> bool {
         self.should_stop() || self.has_pending_seek()
+    }
+
+    pub(super) fn session_id(&self) -> PlaybackSessionId {
+        PlaybackSessionId(self.session_id.load(Ordering::Acquire))
+    }
+
+    pub(super) fn set_session_id(&self, session_id: PlaybackSessionId) {
+        self.session_id.store(session_id.0, Ordering::Release);
     }
 
     pub(super) fn request_seek(&self) -> u64 {
@@ -60,6 +70,7 @@ impl FfmpegControl {
 }
 
 pub(super) struct FfmpegPlaybackInput {
+    pub(super) session_id: PlaybackSessionId,
     pub(super) url: String,
     pub(super) http_headers: Vec<(String, String)>,
     pub(super) content_length: Option<u64>,
@@ -68,6 +79,7 @@ pub(super) struct FfmpegPlaybackInput {
 
 pub(super) enum FfmpegCommand {
     Seek {
+        session_id: PlaybackSessionId,
         position_seconds: f64,
         generation: u64,
     },
@@ -75,6 +87,7 @@ pub(super) enum FfmpegCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct PendingSeek {
+    pub(super) session_id: PlaybackSessionId,
     pub(super) position_seconds: f64,
     pub(super) generation: u64,
 }
@@ -85,7 +98,8 @@ impl FfmpegWorker {
         frame_slot: FrameSlot,
         event_tx: Sender<BackendEvent>,
     ) -> Result<Self> {
-        let control = Arc::new(FfmpegControl::new());
+        let session_id = input.session_id;
+        let control = Arc::new(FfmpegControl::new(session_id));
         let (command_tx, command_rx) = mpsc::channel();
         let frame_presented = Arc::new(AtomicBool::new(false));
         let worker_control = Arc::clone(&control);
@@ -107,17 +121,27 @@ impl FfmpegWorker {
                     return;
                 }
 
+                let event_session_id = worker_control.session_id();
                 match result {
                     Ok(()) => {
-                        let _ = event_tx.send(BackendEvent::Pause(true));
+                        let _ = event_tx.send(BackendEvent::new(
+                            event_session_id,
+                            BackendEventKind::Pause(true),
+                        ));
                     }
                     Err(error) if worker_presented.load(Ordering::Relaxed) => {
                         tracing::error!(%error, "FFmpeg playback worker failed");
-                        let _ = event_tx.send(BackendEvent::Fatal(error));
+                        let _ = event_tx.send(BackendEvent::new(
+                            event_session_id,
+                            BackendEventKind::Fatal(error),
+                        ));
                     }
                     Err(error) => {
                         tracing::error!(%error, "FFmpeg playback load failed");
-                        let _ = event_tx.send(BackendEvent::LoadFailed(error));
+                        let _ = event_tx.send(BackendEvent::new(
+                            event_session_id,
+                            BackendEventKind::LoadFailed(error),
+                        ));
                     }
                 }
             })
@@ -130,10 +154,11 @@ impl FfmpegWorker {
         })
     }
 
-    pub(super) fn seek(&self, position_seconds: f64) -> Result<()> {
+    pub(super) fn seek(&self, position_seconds: f64, session_id: PlaybackSessionId) -> Result<()> {
         let generation = self.control.request_seek();
         self.command_tx
             .send(FfmpegCommand::Seek {
+                session_id,
                 position_seconds,
                 generation,
             })
@@ -174,10 +199,12 @@ pub(super) fn drain_seek_command(command_rx: &Receiver<FfmpegCommand>) -> Option
     while let Ok(command) = command_rx.try_recv() {
         match command {
             FfmpegCommand::Seek {
+                session_id,
                 position_seconds,
                 generation,
             } => {
                 pending_seek = Some(PendingSeek {
+                    session_id,
                     position_seconds: position_seconds.max(0.0),
                     generation,
                 });

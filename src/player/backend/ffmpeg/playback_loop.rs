@@ -112,6 +112,8 @@ pub(super) fn run_ffmpeg_playback(
     command_rx: Receiver<FfmpegCommand>,
     frame_presented: Arc<AtomicBool>,
 ) -> std::result::Result<(), String> {
+    let mut current_session_id = source.session_id;
+    control.set_session_id(current_session_id);
     let OpenedPlaybackInput {
         mut input,
         video_stream,
@@ -174,7 +176,10 @@ pub(super) fn run_ffmpeg_playback(
     }
 
     if let Some(duration) = input.duration_seconds() {
-        let _ = event_tx.send(BackendEvent::DurationChanged(duration));
+        let _ = event_tx.send(BackendEvent::new(
+            current_session_id,
+            BackendEventKind::DurationChanged(duration),
+        ));
     }
     let duration_seconds = input.duration_seconds();
 
@@ -182,11 +187,20 @@ pub(super) fn run_ffmpeg_playback(
     let mut buffered_reporter = BufferedReporter::new(audio_output.is_some());
     let mut queued_video_frames = VecDeque::new();
     let mut first_video_frame_pending = true;
-    buffered_reporter.reset_to(source.start_position_seconds.max(0.0), &event_tx);
-    let _ = event_tx.send(BackendEvent::Buffering(true));
+    buffered_reporter.reset_to(
+        source.start_position_seconds.max(0.0),
+        current_session_id,
+        &event_tx,
+    );
+    let _ = event_tx.send(BackendEvent::new(
+        current_session_id,
+        BackendEventKind::Buffering(true),
+    ));
 
     while !control.should_stop() {
         if let Some(pending_seek) = drain_seek_command(&command_rx) {
+            current_session_id = pending_seek.session_id;
+            control.set_session_id(current_session_id);
             control.finish_seek(pending_seek.generation);
             let seek_result: std::result::Result<(), String> = (|| {
                 let position_seconds = pending_seek.position_seconds.max(0.0);
@@ -219,9 +233,15 @@ pub(super) fn run_ffmpeg_playback(
                 first_video_frame_pending = true;
                 dovi_queue.clear();
                 buffered_reporter = BufferedReporter::new(audio_output.is_some());
-                buffered_reporter.reset_to(position_seconds, &event_tx);
-                let _ = event_tx.send(BackendEvent::PositionChanged(position_seconds));
-                let _ = event_tx.send(BackendEvent::Buffering(true));
+                buffered_reporter.reset_to(position_seconds, current_session_id, &event_tx);
+                let _ = event_tx.send(BackendEvent::new(
+                    current_session_id,
+                    BackendEventKind::PositionChanged(position_seconds),
+                ));
+                let _ = event_tx.send(BackendEvent::new(
+                    current_session_id,
+                    BackendEventKind::Buffering(true),
+                ));
                 Ok(())
             })();
             if control.has_pending_seek() {
@@ -287,6 +307,7 @@ pub(super) fn run_ffmpeg_playback(
                         if first_video_frame_pending {
                             present_decoded_video_frame(
                                 decoded_frame,
+                                current_session_id,
                                 timestamp.timeline_nsecs,
                                 &frame_slot,
                                 &frame_presented,
@@ -297,6 +318,7 @@ pub(super) fn run_ffmpeg_playback(
                                 timestamp
                                     .timeline_nsecs
                                     .saturating_add(video_frame_duration_nsecs),
+                                current_session_id,
                                 &event_tx,
                             );
                             first_video_frame_pending = false;
@@ -310,11 +332,13 @@ pub(super) fn run_ffmpeg_playback(
                             timestamp
                                 .timeline_nsecs
                                 .saturating_add(video_frame_duration_nsecs),
+                            current_session_id,
                             &event_tx,
                         );
                         present_due_audio_clocked_video_frames(
                             &mut queued_video_frames,
                             output,
+                            current_session_id,
                             &frame_slot,
                             &frame_presented,
                             &mut position_reporter,
@@ -327,6 +351,7 @@ pub(super) fn run_ffmpeg_playback(
                                 &mut queued_video_frames,
                                 output,
                                 &control,
+                                current_session_id,
                                 &frame_slot,
                                 &frame_presented,
                                 &mut position_reporter,
@@ -352,6 +377,7 @@ pub(super) fn run_ffmpeg_playback(
                         }
                         present_decoded_video_frame(
                             decoded_frame,
+                            current_session_id,
                             timestamp.timeline_nsecs,
                             &frame_slot,
                             &frame_presented,
@@ -362,6 +388,7 @@ pub(super) fn run_ffmpeg_playback(
                             timestamp
                                 .timeline_nsecs
                                 .saturating_add(video_frame_duration_nsecs),
+                            current_session_id,
                             &event_tx,
                         );
                     }
@@ -403,6 +430,7 @@ pub(super) fn run_ffmpeg_playback(
                             present_due_audio_clocked_video_frames(
                                 &mut queued_video_frames,
                                 output,
+                                current_session_id,
                                 &frame_slot,
                                 &frame_presented,
                                 &mut position_reporter,
@@ -410,8 +438,11 @@ pub(super) fn run_ffmpeg_playback(
                             );
                             Ok(())
                         })?;
-                        buffered_reporter
-                            .report_audio_timeline_nsecs(buffered_until_nsecs, &event_tx);
+                        buffered_reporter.report_audio_timeline_nsecs(
+                            buffered_until_nsecs,
+                            current_session_id,
+                            &event_tx,
+                        );
                     }
                     Ok(())
                 })
@@ -464,6 +495,7 @@ pub(super) fn run_ffmpeg_playback(
             if first_video_frame_pending {
                 present_decoded_video_frame(
                     decoded_frame,
+                    current_session_id,
                     timestamp.timeline_nsecs,
                     &frame_slot,
                     &frame_presented,
@@ -474,6 +506,7 @@ pub(super) fn run_ffmpeg_playback(
                     timestamp
                         .timeline_nsecs
                         .saturating_add(video_frame_duration_nsecs),
+                    current_session_id,
                     &event_tx,
                 );
                 first_video_frame_pending = false;
@@ -487,11 +520,13 @@ pub(super) fn run_ffmpeg_playback(
                 timestamp
                     .timeline_nsecs
                     .saturating_add(video_frame_duration_nsecs),
+                current_session_id,
                 &event_tx,
             );
             present_due_audio_clocked_video_frames(
                 &mut queued_video_frames,
                 output,
+                current_session_id,
                 &frame_slot,
                 &frame_presented,
                 &mut position_reporter,
@@ -513,6 +548,7 @@ pub(super) fn run_ffmpeg_playback(
             }
             present_decoded_video_frame(
                 decoded_frame,
+                current_session_id,
                 timestamp.timeline_nsecs,
                 &frame_slot,
                 &frame_presented,
@@ -523,6 +559,7 @@ pub(super) fn run_ffmpeg_playback(
                 timestamp
                     .timeline_nsecs
                     .saturating_add(video_frame_duration_nsecs),
+                current_session_id,
                 &event_tx,
             );
         }
@@ -548,6 +585,7 @@ pub(super) fn run_ffmpeg_playback(
                     present_due_audio_clocked_video_frames(
                         &mut queued_video_frames,
                         output,
+                        current_session_id,
                         &frame_slot,
                         &frame_presented,
                         &mut position_reporter,
@@ -555,18 +593,23 @@ pub(super) fn run_ffmpeg_playback(
                     );
                     Ok(())
                 })?;
-                buffered_reporter.report_audio_timeline_nsecs(buffered_until_nsecs, &event_tx);
+                buffered_reporter.report_audio_timeline_nsecs(
+                    buffered_until_nsecs,
+                    current_session_id,
+                    &event_tx,
+                );
             }
             Ok(())
         })?;
     }
 
-    buffered_reporter.report_value(duration_seconds, &event_tx);
+    buffered_reporter.report_value(duration_seconds, current_session_id, &event_tx);
     if let Some(output) = &audio_output {
         drain_audio_clocked_video_queue(
             &mut queued_video_frames,
             output,
             &control,
+            current_session_id,
             &frame_slot,
             &frame_presented,
             &mut position_reporter,

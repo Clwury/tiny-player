@@ -10,7 +10,7 @@ use gpui::{
 use crate::theme;
 
 use super::{
-    backend::{BackendEvent, FfmpegBackend, HttpStreamBufferProgress},
+    backend::{BackendEvent, BackendEventKind, FfmpegBackend, HttpStreamBufferProgress},
     render_host::RenderSize,
     video_presenter::VideoPresenter,
 };
@@ -309,8 +309,8 @@ impl PlaybackPage {
             .map(|backend| backend.poll_events())
             .unwrap_or_default();
         for event in events {
-            match event {
-                BackendEvent::PlaybackRestart => {
+            match event.kind {
+                BackendEventKind::PlaybackRestart => {
                     self.current_file_loaded = true;
                     self.playback_paused = false;
                     self.playback_buffering = false;
@@ -319,7 +319,7 @@ impl PlaybackPage {
                     self.status_message = "".into();
                     self.error_message = None;
                 }
-                BackendEvent::LoadFailed(message) => {
+                BackendEventKind::LoadFailed(message) => {
                     self.current_file_loaded = false;
                     self.video_source_size = None;
                     self.playback_paused = true;
@@ -332,7 +332,7 @@ impl PlaybackPage {
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("加载视频失败：{message}").into());
                 }
-                BackendEvent::Fatal(message) => {
+                BackendEventKind::Fatal(message) => {
                     self.current_file_loaded = false;
                     self.video_source_size = None;
                     self.playback_paused = true;
@@ -345,10 +345,10 @@ impl PlaybackPage {
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("播放后端错误：{message}").into());
                 }
-                BackendEvent::Pause(paused) => {
+                BackendEventKind::Pause(paused) => {
                     self.playback_paused = paused;
                 }
-                BackendEvent::Buffering(buffering) => {
+                BackendEventKind::Buffering(buffering) => {
                     let hidden_by_soft_seek =
                         buffering && self.pending_seek_keeps_frame && self.current_frame.is_some();
                     self.playback_buffering = buffering && !hidden_by_soft_seek;
@@ -357,13 +357,13 @@ impl PlaybackPage {
                             playback_status_message(buffering, self.current_frame.is_some());
                     }
                 }
-                BackendEvent::VideoSizeChanged(size) => {
+                BackendEventKind::VideoSizeChanged(size) => {
                     if self.video_source_size != size {
                         self.video_source_size = size;
                         self.clear_visible_frame(window, cx);
                     }
                 }
-                BackendEvent::PositionChanged(position) => {
+                BackendEventKind::PositionChanged(position) => {
                     if should_apply_backend_position(
                         self.progress_drag_position,
                         self.pending_seek_position,
@@ -371,7 +371,7 @@ impl PlaybackPage {
                         self.playback_position = valid_playback_time(position);
                     }
                 }
-                BackendEvent::DurationChanged(duration) => {
+                BackendEventKind::DurationChanged(duration) => {
                     self.playback_duration = valid_playback_duration(duration);
                     if let (Some(drag_position), Some(duration)) =
                         (self.progress_drag_position, self.playback_duration)
@@ -380,10 +380,10 @@ impl PlaybackPage {
                             Some(clamp_playback_position(drag_position, duration));
                     }
                 }
-                BackendEvent::BufferedChanged(buffered_until) => {
+                BackendEventKind::BufferedChanged(buffered_until) => {
                     self.playback_buffered_until = buffered_until.and_then(valid_playback_time);
                 }
-                BackendEvent::HttpStreamBufferedChanged(progress) => {
+                BackendEventKind::HttpStreamBufferedChanged(progress) => {
                     self.http_stream_buffered_range =
                         progress.and_then(valid_http_stream_buffer_progress);
                 }

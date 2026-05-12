@@ -20,13 +20,13 @@ use cpal::{
 };
 use ffmpeg_sys_next as ffi;
 
-use super::{BackendError, BackendEvent, HttpStreamBufferProgress, Result};
+use super::{BackendError, BackendEvent, BackendEventKind, HttpStreamBufferProgress, Result};
 use crate::player::{
     dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat},
     render_host::{
         DecodedFrame, FrameColor, FrameDynamicMetadata, FramePixels, FramePts, FrameSlot,
-        RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlane, RawVideoPlanes,
-        RawVideoRange, RenderSize,
+        PlaybackSessionId, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlane,
+        RawVideoPlanes, RawVideoRange, RenderSize,
     },
 };
 
@@ -116,6 +116,7 @@ pub struct FfmpegBackend {
     event_rx: Receiver<BackendEvent>,
     worker: Option<FfmpegWorker>,
     current_url: Option<String>,
+    current_session_id: PlaybackSessionId,
     loaded: bool,
     paused: bool,
 }
@@ -133,6 +134,7 @@ impl FfmpegBackend {
             event_rx,
             worker: None,
             current_url: None,
+            current_session_id: PlaybackSessionId::default(),
             loaded: false,
             paused: true,
         })
@@ -153,19 +155,22 @@ impl FfmpegBackend {
             return Err(BackendError::EmptyUrl);
         }
 
+        let session_id = self.advance_session();
+        self.frame_slot.begin_session(session_id);
         self.stop_worker();
-        self.frame_slot.clear();
         self.current_url = Some(url.to_string());
         self.loaded = false;
         self.paused = true;
         FFMPEG_FRAME_COUNT.store(0, Ordering::Relaxed);
         while self.event_rx.try_recv().is_ok() {}
-        let _ = self
-            .event_tx
-            .send(BackendEvent::HttpStreamBufferedChanged(None));
+        let _ = self.event_tx.send(BackendEvent::new(
+            session_id,
+            BackendEventKind::HttpStreamBufferedChanged(None),
+        ));
 
         self.worker = Some(FfmpegWorker::spawn(
             FfmpegPlaybackInput {
+                session_id,
                 url: url.to_string(),
                 http_headers,
                 content_length,
@@ -178,49 +183,79 @@ impl FfmpegBackend {
     }
 
     pub fn seek_to(&mut self, position_seconds: f64) -> Result<()> {
-        let Some(worker) = self.worker.as_ref() else {
+        if self.worker.is_none() {
             return Err(BackendError::Ffmpeg(
                 "FFmpeg 尚未加载可跳转的媒体".to_string(),
             ));
-        };
+        }
         let position_seconds = position_seconds.max(0.0);
 
-        self.frame_slot.clear();
+        let session_id = self.advance_session();
+        self.frame_slot.begin_session(session_id);
         self.loaded = false;
         self.paused = true;
         FFMPEG_FRAME_COUNT.store(0, Ordering::Relaxed);
         while self.event_rx.try_recv().is_ok() {}
-        worker.seek(position_seconds)?;
-        let _ = self
-            .event_tx
-            .send(BackendEvent::PositionChanged(position_seconds));
-        let _ = self
-            .event_tx
-            .send(BackendEvent::BufferedChanged(Some(position_seconds)));
+        let worker = self
+            .worker
+            .as_ref()
+            .expect("worker exists after early return");
+        worker.seek(position_seconds, session_id)?;
+        let _ = self.event_tx.send(BackendEvent::new(
+            session_id,
+            BackendEventKind::PositionChanged(position_seconds),
+        ));
+        let _ = self.event_tx.send(BackendEvent::new(
+            session_id,
+            BackendEventKind::BufferedChanged(Some(position_seconds)),
+        ));
         Ok(())
     }
 
     pub fn poll_events(&mut self) -> Vec<BackendEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
-            if matches!(event, BackendEvent::Pause(true)) {
+            if event.session_id != self.current_session_id {
+                continue;
+            }
+            if matches!(event.kind, BackendEventKind::Pause(true)) {
                 self.paused = true;
             }
             events.push(event);
         }
 
-        if let Some(size) = self.frame_slot.take_size_change() {
+        if let Some((session_id, size)) = self.frame_slot.take_size_change() {
+            if session_id != self.current_session_id {
+                return events;
+            }
             if !self.loaded {
                 self.loaded = true;
                 self.paused = false;
-                events.push(BackendEvent::PlaybackRestart);
-                events.push(BackendEvent::Pause(false));
-                events.push(BackendEvent::Buffering(false));
+                events.push(BackendEvent::new(
+                    session_id,
+                    BackendEventKind::PlaybackRestart,
+                ));
+                events.push(BackendEvent::new(
+                    session_id,
+                    BackendEventKind::Pause(false),
+                ));
+                events.push(BackendEvent::new(
+                    session_id,
+                    BackendEventKind::Buffering(false),
+                ));
             }
-            events.push(BackendEvent::VideoSizeChanged(Some(size)));
+            events.push(BackendEvent::new(
+                session_id,
+                BackendEventKind::VideoSizeChanged(Some(size)),
+            ));
         }
 
         events
+    }
+
+    fn advance_session(&mut self) -> PlaybackSessionId {
+        self.current_session_id = self.current_session_id.next();
+        self.current_session_id
     }
 
     fn stop_worker(&mut self) {

@@ -806,9 +806,10 @@ impl HttpRingCacheShared {
         };
         self.ready.notify_all();
         if let Some(progress) = progress {
-            let _ = self
-                .event_tx
-                .send(BackendEvent::HttpStreamBufferedChanged(Some(progress)));
+            let _ = self.event_tx.send(BackendEvent::new(
+                self.control.session_id(),
+                BackendEventKind::HttpStreamBufferedChanged(Some(progress)),
+            ));
         }
         result
     }
