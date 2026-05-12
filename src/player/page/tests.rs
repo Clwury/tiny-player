@@ -1,0 +1,456 @@
+use std::{cell::RefCell, rc::Rc};
+
+use gpui::{Bounds, point, px, size};
+
+use super::{
+    AnimationFrameRequestState, HttpStreamBufferProgress, RenderSize, ShutdownOrder,
+    aspect_fit_bounds, buffered_progress_fraction, clamp_playback_position,
+    combined_buffered_until, format_playback_time, http_stream_buffered_until,
+    is_seek_position_buffered, normalize_video_viewport, playback_status_message,
+    progress_fraction, progress_fraction_for_cursor, render_output_size,
+    should_apply_backend_position, should_render_frame, should_request_animation_frame,
+    valid_http_stream_buffer_progress, valid_playback_duration, valid_playback_time,
+    viewport_changed,
+};
+
+struct DropRecorder {
+    name: &'static str,
+    drops: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl Drop for DropRecorder {
+    fn drop(&mut self) {
+        self.drops.borrow_mut().push(self.name);
+    }
+}
+
+#[test]
+fn normalize_video_viewport_rejects_zero_sized_bounds() {
+    let zero_width = Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(180.0)));
+    let zero_height = Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(0.0)));
+
+    assert_eq!(normalize_video_viewport(zero_width), None);
+    assert_eq!(normalize_video_viewport(zero_height), None);
+}
+
+#[test]
+fn normalize_video_viewport_floors_fractional_pixel_sizes() {
+    let bounds = Bounds::new(point(px(10.0), px(12.0)), size(px(640.8), px(359.9)));
+
+    assert_eq!(normalize_video_viewport(bounds), Some((640, 359)));
+}
+
+#[test]
+fn viewport_changed_only_reports_real_differences() {
+    let first = Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(240.0)));
+    let second = Bounds::new(point(px(0.0), px(0.0)), size(px(400.0), px(240.0)));
+
+    assert!(viewport_changed(None, first));
+    assert!(!viewport_changed(Some(first), first));
+    assert!(viewport_changed(Some(first), second));
+}
+
+#[test]
+fn aspect_fit_bounds_letterboxes_wide_video_in_tall_viewport() {
+    let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
+    let fitted = aspect_fit_bounds(
+        bounds,
+        RenderSize {
+            width: 1920,
+            height: 1080,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(fitted.origin, point(px(0.0), px(75.0)));
+    assert_eq!(fitted.size, size(px(800.0), px(450.0)));
+}
+
+#[test]
+fn aspect_fit_bounds_pillarboxes_tall_video_in_wide_viewport() {
+    let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(1280.0), px(720.0)));
+    let fitted = aspect_fit_bounds(
+        bounds,
+        RenderSize {
+            width: 640,
+            height: 480,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(fitted.origin, point(px(160.0), px(0.0)));
+    assert_eq!(fitted.size, size(px(960.0), px(720.0)));
+}
+
+#[test]
+fn aspect_fit_bounds_rejects_zero_source_or_viewport() {
+    let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
+    let zero_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(600.0)));
+
+    assert_eq!(
+        aspect_fit_bounds(
+            bounds,
+            RenderSize {
+                width: 0,
+                height: 1080,
+            },
+        ),
+        None
+    );
+    assert_eq!(
+        aspect_fit_bounds(
+            zero_bounds,
+            RenderSize {
+                width: 1920,
+                height: 1080,
+            },
+        ),
+        None
+    );
+}
+
+#[test]
+fn aspect_fit_bounds_handles_fractional_viewport_sizes() {
+    let bounds = Bounds::new(point(px(10.0), px(12.0)), size(px(640.8), px(359.9)));
+    let fitted = aspect_fit_bounds(
+        bounds,
+        RenderSize {
+            width: 3840,
+            height: 2160,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(normalize_video_viewport(fitted), Some((639, 359)));
+}
+
+#[test]
+fn render_output_size_uses_aspect_fitted_viewport() {
+    let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(1920.0), px(1080.0)));
+
+    assert_eq!(
+        render_output_size(
+            bounds,
+            RenderSize {
+                width: 3840,
+                height: 1600,
+            },
+        ),
+        Some(RenderSize {
+            width: 1920,
+            height: 800,
+        })
+    );
+}
+
+#[test]
+fn render_output_size_does_not_upscale_past_source() {
+    let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(3840.0), px(2160.0)));
+
+    assert_eq!(
+        render_output_size(
+            bounds,
+            RenderSize {
+                width: 1280,
+                height: 720,
+            },
+        ),
+        Some(RenderSize {
+            width: 1280,
+            height: 720,
+        })
+    );
+}
+
+#[test]
+fn playback_status_stays_visible_until_first_frame() {
+    assert_eq!(playback_status_message(true, false), "正在缓冲视频…");
+    assert_eq!(playback_status_message(false, false), "正在加载视频…");
+    assert_eq!(playback_status_message(false, true), "");
+}
+
+#[test]
+fn playback_time_helpers_reject_invalid_values() {
+    assert_eq!(valid_playback_time(12.0), Some(12.0));
+    assert_eq!(valid_playback_time(-1.0), None);
+    assert_eq!(valid_playback_time(f64::NAN), None);
+    assert_eq!(valid_playback_duration(12.0), Some(12.0));
+    assert_eq!(valid_playback_duration(0.0), None);
+}
+
+#[test]
+fn progress_fraction_clamps_position_to_duration() {
+    assert_eq!(clamp_playback_position(-5.0, 100.0), 0.0);
+    assert_eq!(clamp_playback_position(25.0, 100.0), 25.0);
+    assert_eq!(clamp_playback_position(125.0, 100.0), 100.0);
+    assert_eq!(progress_fraction(25.0, 100.0), 0.25);
+    assert_eq!(progress_fraction(125.0, 100.0), 1.0);
+    assert_eq!(progress_fraction(25.0, 0.0), 0.0);
+}
+
+#[test]
+fn buffered_progress_never_falls_behind_played_progress() {
+    assert_eq!(buffered_progress_fraction(Some(20.0), 40.0, 100.0), 0.4);
+    assert_eq!(buffered_progress_fraction(Some(80.0), 40.0, 100.0), 0.8);
+    assert_eq!(buffered_progress_fraction(None, 40.0, 100.0), 0.4);
+}
+
+#[test]
+fn backend_position_updates_wait_until_seek_finishes() {
+    assert!(should_apply_backend_position(None, None));
+    assert!(!should_apply_backend_position(Some(40.0), None));
+    assert!(!should_apply_backend_position(None, Some(80.0)));
+}
+
+#[test]
+fn cached_seek_detects_playback_and_http_buffered_ranges() {
+    assert!(is_seek_position_buffered(
+        60.0,
+        Some(40.0),
+        Some(80.0),
+        None,
+        Some(100.0),
+    ));
+    assert!(!is_seek_position_buffered(
+        20.0,
+        Some(40.0),
+        Some(80.0),
+        None,
+        Some(100.0),
+    ));
+
+    let http_range = Some(HttpStreamBufferProgress {
+        start_fraction: 0.2,
+        end_fraction: 0.8,
+    });
+    assert!(is_seek_position_buffered(
+        30.0,
+        Some(90.0),
+        None,
+        http_range,
+        Some(100.0),
+    ));
+    assert!(!is_seek_position_buffered(
+        90.0,
+        Some(10.0),
+        None,
+        http_range,
+        Some(100.0),
+    ));
+}
+
+#[test]
+fn http_stream_buffer_progress_validates_and_clamps_fraction_range() {
+    assert_eq!(
+        valid_http_stream_buffer_progress(HttpStreamBufferProgress {
+            start_fraction: -0.5,
+            end_fraction: 1.5,
+        }),
+        Some(HttpStreamBufferProgress {
+            start_fraction: 0.0,
+            end_fraction: 1.0,
+        })
+    );
+    assert_eq!(
+        valid_http_stream_buffer_progress(HttpStreamBufferProgress {
+            start_fraction: 0.8,
+            end_fraction: 0.2,
+        }),
+        None
+    );
+    assert_eq!(
+        valid_http_stream_buffer_progress(HttpStreamBufferProgress {
+            start_fraction: f64::NAN,
+            end_fraction: 0.2,
+        }),
+        None
+    );
+}
+
+#[test]
+fn http_stream_buffer_progress_only_applies_to_current_playback_range() {
+    let range = Some(HttpStreamBufferProgress {
+        start_fraction: 0.4,
+        end_fraction: 0.7,
+    });
+
+    assert_eq!(http_stream_buffered_until(range, 50.0, 100.0), Some(70.0));
+    assert_eq!(http_stream_buffered_until(range, 10.0, 100.0), None);
+    assert_eq!(http_stream_buffered_until(range, 90.0, 100.0), None);
+}
+
+#[test]
+fn combined_buffered_progress_uses_furthest_playable_buffer() {
+    let range = Some(HttpStreamBufferProgress {
+        start_fraction: 0.2,
+        end_fraction: 0.8,
+    });
+
+    assert_eq!(
+        combined_buffered_until(Some(30.0), range, 40.0, 100.0),
+        Some(80.0)
+    );
+    assert_eq!(
+        combined_buffered_until(Some(90.0), range, 40.0, 100.0),
+        Some(90.0)
+    );
+    assert_eq!(
+        combined_buffered_until(None, range, 40.0, 100.0),
+        Some(80.0)
+    );
+}
+
+#[test]
+fn progress_cursor_fraction_uses_track_bounds_and_clamps_edges() {
+    let bounds = Bounds::new(point(px(100.0), px(0.0)), size(px(400.0), px(28.0)));
+
+    assert_eq!(progress_fraction_for_cursor(px(100.0), bounds), Some(0.0));
+    assert_eq!(progress_fraction_for_cursor(px(300.0), bounds), Some(0.5));
+    assert_eq!(progress_fraction_for_cursor(px(700.0), bounds), Some(1.0));
+    assert_eq!(
+        progress_fraction_for_cursor(
+            px(100.0),
+            Bounds::new(point(px(0.0), px(0.0)), size(px(0.0), px(28.0))),
+        ),
+        None
+    );
+}
+
+#[test]
+fn format_playback_time_switches_to_hours_when_needed() {
+    assert_eq!(format_playback_time(65.0), "1:05");
+    assert_eq!(format_playback_time(3661.0), "1:01:01");
+    assert_eq!(format_playback_time(f64::NAN), "0:00");
+}
+
+#[test]
+fn should_render_frame_requires_loaded_file_video_size_and_valid_viewport() {
+    assert!(should_render_frame(true, true, false, true, true));
+    assert!(!should_render_frame(false, true, false, true, true));
+    assert!(!should_render_frame(true, false, false, true, true));
+    assert!(!should_render_frame(true, true, true, true, true));
+    assert!(!should_render_frame(true, true, false, false, true));
+    assert!(!should_render_frame(true, true, false, true, false));
+}
+
+#[test]
+fn should_request_animation_frame_drives_initial_load() {
+    assert!(should_request_animation_frame(AnimationFrameRequestState {
+        has_loaded_file: false,
+        has_viewport: false,
+        playback_paused: true,
+        ..animation_frame_request_state()
+    }));
+}
+
+#[test]
+fn should_request_animation_frame_requires_backend_and_presenter() {
+    assert!(!should_request_animation_frame(
+        AnimationFrameRequestState {
+            has_backend: false,
+            has_loaded_file: false,
+            has_viewport: false,
+            playback_paused: true,
+            ..animation_frame_request_state()
+        }
+    ));
+    assert!(!should_request_animation_frame(
+        AnimationFrameRequestState {
+            has_video_presenter: false,
+            has_loaded_file: false,
+            has_viewport: false,
+            playback_paused: true,
+            ..animation_frame_request_state()
+        }
+    ));
+}
+
+#[test]
+fn should_request_animation_frame_stops_on_error() {
+    assert!(!should_request_animation_frame(
+        AnimationFrameRequestState {
+            has_loaded_file: false,
+            has_error: true,
+            has_viewport: false,
+            playback_paused: true,
+            ..animation_frame_request_state()
+        }
+    ));
+}
+
+#[test]
+fn should_request_animation_frame_requires_unpaused_loaded_video_with_viewport() {
+    assert!(should_request_animation_frame(AnimationFrameRequestState {
+        playback_paused: false,
+        ..animation_frame_request_state()
+    }));
+    assert!(!should_request_animation_frame(
+        animation_frame_request_state()
+    ));
+    assert!(!should_request_animation_frame(
+        AnimationFrameRequestState {
+            has_viewport: false,
+            playback_paused: false,
+            ..animation_frame_request_state()
+        }
+    ));
+}
+
+#[test]
+fn should_request_animation_frame_continues_until_first_visible_frame() {
+    assert!(should_request_animation_frame(AnimationFrameRequestState {
+        has_visible_frame: false,
+        ..animation_frame_request_state()
+    }));
+}
+
+#[test]
+fn should_request_animation_frame_continues_while_buffering() {
+    assert!(should_request_animation_frame(AnimationFrameRequestState {
+        has_viewport: false,
+        playback_buffering: true,
+        ..animation_frame_request_state()
+    }));
+}
+
+#[test]
+fn should_request_animation_frame_continues_during_soft_seek() {
+    assert!(should_request_animation_frame(AnimationFrameRequestState {
+        has_viewport: false,
+        pending_seek: true,
+        ..animation_frame_request_state()
+    }));
+}
+
+fn animation_frame_request_state() -> AnimationFrameRequestState {
+    AnimationFrameRequestState {
+        has_backend: true,
+        has_video_presenter: true,
+        has_loaded_file: true,
+        has_error: false,
+        has_viewport: true,
+        has_visible_frame: true,
+        playback_paused: true,
+        playback_buffering: false,
+        pending_seek: false,
+    }
+}
+
+#[test]
+fn shutdown_order_drops_dependent_before_owner() {
+    let drops = Rc::new(RefCell::new(Vec::new()));
+    let recorded_drops = Rc::clone(&drops);
+
+    let presenter = DropRecorder {
+        name: "presenter",
+        drops: Rc::clone(&drops),
+    };
+    let backend = DropRecorder {
+        name: "backend",
+        drops,
+    };
+
+    drop(ShutdownOrder::new(Some(backend), Some(presenter)));
+
+    assert_eq!(&*recorded_drops.borrow(), &["presenter", "backend"]);
+}
