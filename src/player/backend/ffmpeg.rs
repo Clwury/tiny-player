@@ -40,8 +40,9 @@ use format::{FormatContext, StreamInfo};
 #[cfg(test)]
 use avio::{
     HttpRingCacheState, content_len_from_content_range, ffmpeg_http_headers,
-    http_cache_range_header, http_cache_request_headers_for_log,
-    http_cache_response_headers_for_log, reqwest_header_pairs, should_cache_http_url,
+    http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
+    http_cache_request_headers_for_log, http_cache_response_headers_for_log, reqwest_header_pairs,
+    should_cache_http_url,
 };
 
 const FALLBACK_AUDIO_OUTPUT_CHANNELS: c_int = 2;
@@ -60,6 +61,8 @@ const HTTP_CACHE_RANGE_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
 const HTTP_CACHE_WAIT_INTERVAL: Duration = Duration::from_millis(50);
 const HTTP_CACHE_CONTENT_LEN_WAIT: Duration = Duration::from_secs(1);
 const HTTP_CACHE_RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
+const HTTP_CACHE_SMALL_RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const HTTP_CACHE_PROGRESS_REPORT_THRESHOLD: f64 = 0.001;
 const FFMPEG_AVIO_BUFFER_SIZE: c_int = 256 * 1024;
 const FFMPEG_FAST_PROBE_SIZE: usize = 1024 * 1024;
@@ -2658,8 +2661,32 @@ mod tests {
 
     #[test]
     fn http_cache_range_header_limits_request_size() {
-        assert_eq!(http_cache_range_header(0), "bytes=0-33554431");
-        assert_eq!(http_cache_range_header(128), "bytes=128-33554559");
+        assert_eq!(http_cache_range_header(0, None), "bytes=0-33554431");
+        assert_eq!(http_cache_range_header(128, None), "bytes=128-33554559");
+        assert_eq!(
+            http_cache_range_header(595_453_649, Some(596_486_439)),
+            "bytes=595453649-596486438"
+        );
+        assert_eq!(
+            http_cache_range_header(10_675_366_349, Some(10_675_368_645)),
+            "bytes=10675366349-10675368644"
+        );
+    }
+
+    #[test]
+    fn http_cache_range_request_timeout_is_short_for_small_tail_ranges() {
+        assert_eq!(
+            http_cache_range_request_len(10_675_366_349, Some(10_675_368_645)),
+            2_296
+        );
+        assert_eq!(
+            http_cache_range_request_timeout(2_296),
+            HTTP_CACHE_SMALL_RANGE_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            http_cache_range_request_timeout(HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES + 1),
+            HTTP_CACHE_RANGE_REQUEST_TIMEOUT
+        );
     }
 
     #[test]

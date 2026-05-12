@@ -374,11 +374,6 @@ impl HttpRingCache {
             .spawn(move || http_ring_cache_download_loop(worker_shared, url, headers))
             .map_err(|error| format!("启动 HTTP 视频缓存线程失败：{error}"))?;
 
-        tracing::debug!(
-            capacity_bytes = HTTP_RING_CACHE_CAPACITY,
-            avio_buffer_bytes = FFMPEG_AVIO_BUFFER_SIZE,
-            "initialized FFmpeg HTTP ring cache"
-        );
         Ok(Self { shared })
     }
 
@@ -660,10 +655,6 @@ fn http_ring_cache_download_loop(
         match download_http_cache_range(&client, &url, &headers, Arc::clone(&shared), offset) {
             Ok(HttpDownloadOutcome::Eof) => {
                 shared.mark_eof();
-                tracing::debug!(
-                    offset,
-                    "HTTP video stream cache reached range EOF; waiting for restart"
-                );
                 match shared.wait_for_restart_after_eof() {
                     Some(next_offset) => offset = next_offset,
                     None => return,
@@ -744,6 +735,13 @@ impl HttpRingCacheShared {
             guard.content_len = Some(content_len);
             self.ready.notify_all();
         }
+    }
+
+    fn content_len_now(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .expect("HTTP stream cache poisoned")
+            .content_len
     }
 
     fn wait_for_append_capacity(&self, offset: u64) -> CacheAppendPermit {
@@ -835,45 +833,32 @@ fn download_http_cache_range(
     shared: Arc<HttpRingCacheShared>,
     mut offset: u64,
 ) -> std::result::Result<HttpDownloadOutcome, String> {
-    let range = http_cache_range_header(offset);
+    let known_content_len = shared.content_len_now();
+    if known_content_len.is_some_and(|content_len| offset >= content_len) {
+        return Ok(HttpDownloadOutcome::Eof);
+    }
+
+    let range = http_cache_range_header(offset, known_content_len);
+    let range_len = http_cache_range_request_len(offset, known_content_len);
+    let request_timeout = http_cache_range_request_timeout(range_len);
     let mut request = client
         .get(url)
-        .timeout(HTTP_CACHE_RANGE_REQUEST_TIMEOUT)
+        .timeout(request_timeout)
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .header(reqwest::header::CONNECTION, "keep-alive")
         .header(reqwest::header::RANGE, range.as_str());
     for (name, value) in headers {
         request = request.header(name, value);
     }
-    let request_headers = http_cache_request_headers_for_log(headers, &range);
-    tracing::debug!(
-        url,
-        offset,
-        headers = ?request_headers,
-        "requesting HTTP video stream cache range"
-    );
 
     let mut response = match request.send() {
         Ok(response) => response,
         Err(error) if error.is_timeout() => {
-            tracing::debug!(
-                offset,
-                error = %error,
-                "HTTP video stream cache request timed out; reopening range"
-            );
             return Ok(HttpDownloadOutcome::Restart(offset));
         }
         Err(error) => return Err(format!("HTTP 视频缓存请求失败：{error}")),
     };
     let status = response.status();
-    let response_headers = http_cache_response_headers_for_log(response.headers());
-    tracing::debug!(
-        url,
-        offset,
-        %status,
-        headers = ?response_headers,
-        "received HTTP video stream cache response"
-    );
     if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
         shared.set_content_len(content_len_from_content_range(response.headers()));
         return Ok(HttpDownloadOutcome::Eof);
@@ -910,14 +895,11 @@ fn download_http_cache_range(
                 if let Some(next_offset) = shared.take_restart_offset() {
                     return Ok(HttpDownloadOutcome::Restart(next_offset));
                 }
-                tracing::debug!(
-                    offset,
-                    error = %error,
-                    "HTTP video stream cache read timed out; reopening range"
-                );
                 return Ok(HttpDownloadOutcome::Restart(offset));
             }
-            Err(error) => return Err(format!("读取 HTTP 视频缓存失败：{error}")),
+            Err(error) => {
+                return Err(format!("读取 HTTP 视频缓存失败：{error}"));
+            }
         };
         if read == 0 {
             if content_len.is_some_and(|content_len| offset < content_len) {
@@ -952,6 +934,7 @@ pub(super) fn reqwest_header_pairs(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn http_cache_request_headers_for_log(
     headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
     range: &str,
@@ -968,6 +951,7 @@ pub(super) fn http_cache_request_headers_for_log(
     output
 }
 
+#[cfg(test)]
 pub(super) fn http_cache_response_headers_for_log(
     headers: &reqwest::header::HeaderMap,
 ) -> Vec<String> {
@@ -991,9 +975,30 @@ pub(super) fn http_cache_response_headers_for_log(
     output
 }
 
-pub(super) fn http_cache_range_header(offset: u64) -> String {
-    let end = offset.saturating_add(HTTP_CACHE_RANGE_REQUEST_BYTES.saturating_sub(1));
+pub(super) fn http_cache_range_header(offset: u64, content_len: Option<u64>) -> String {
+    let end = http_cache_range_end(offset, content_len);
     format!("bytes={offset}-{end}")
+}
+
+fn http_cache_range_end(offset: u64, content_len: Option<u64>) -> u64 {
+    let requested_end = offset.saturating_add(HTTP_CACHE_RANGE_REQUEST_BYTES.saturating_sub(1));
+    content_len
+        .and_then(|content_len| content_len.checked_sub(1))
+        .map_or(requested_end, |content_end| requested_end.min(content_end))
+}
+
+pub(super) fn http_cache_range_request_len(offset: u64, content_len: Option<u64>) -> u64 {
+    http_cache_range_end(offset, content_len)
+        .saturating_sub(offset)
+        .saturating_add(1)
+}
+
+pub(super) fn http_cache_range_request_timeout(request_len: u64) -> Duration {
+    if request_len <= HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES {
+        HTTP_CACHE_SMALL_RANGE_REQUEST_TIMEOUT
+    } else {
+        HTTP_CACHE_RANGE_REQUEST_TIMEOUT
+    }
 }
 
 fn http_cache_read_timed_out(error: &std::io::Error) -> bool {
