@@ -31,4 +31,22 @@ fn main() {
     bindings
         .write_to_file(out_path.join("libplacebo_bindings.rs"))
         .expect("failed to write libplacebo bindings");
+
+    let ffmpeg_vulkan_bindings = bindgen::Builder::default()
+        .header_contents(
+            "ffmpeg_vulkan_wrapper.h",
+            "#include <libavutil/hwcontext_vulkan.h>\n",
+        )
+        .allowlist_type("AVVkFrame")
+        .allowlist_type("AVVulkan.*")
+        .allowlist_type("Vk.*")
+        .generate_comments(false)
+        .derive_debug(false)
+        .layout_tests(false)
+        .generate()
+        .expect("failed to generate FFmpeg Vulkan bindings");
+
+    ffmpeg_vulkan_bindings
+        .write_to_file(out_path.join("ffmpeg_vulkan_bindings.rs"))
+        .expect("failed to write FFmpeg Vulkan bindings");
 }

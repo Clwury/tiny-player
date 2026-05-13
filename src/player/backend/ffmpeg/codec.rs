@@ -4,22 +4,68 @@ pub(super) struct Decoder {
     ptr: *mut ffi::AVCodecContext,
     pub(super) stream_index: c_int,
     pub(super) time_base: ffi::AVRational,
+    video_hw: Option<VideoHwDecodeContext>,
+    hw_format_selection: Option<Box<VideoHwFormatSelection>>,
 }
 
 impl Decoder {
     pub(super) fn open(stream: StreamInfo) -> std::result::Result<Self, String> {
+        let decoder = find_decoder(stream)?;
+        Self::open_with_decoder(stream, decoder, None)
+    }
+
+    pub(super) fn open_audio(stream: StreamInfo) -> std::result::Result<Self, String> {
+        Self::open(stream)
+    }
+
+    pub(super) fn open_video(
+        stream: StreamInfo,
+        hw_mode: HardwareDecodeMode,
+    ) -> std::result::Result<Self, String> {
+        let decoder = find_decoder(stream)?;
+        if !hw_mode.should_try_vulkan() {
+            return Self::open_with_decoder(stream, decoder, None);
+        }
+
+        match VideoHwDecodeContext::try_create(decoder) {
+            Ok(video_hw) => match Self::open_with_decoder(stream, decoder, Some(video_hw)) {
+                Ok(decoder_context) => {
+                    tracing::info!(
+                        decoder = %decoder_name(decoder),
+                        "enabled FFmpeg Vulkan hardware video decoder"
+                    );
+                    Ok(decoder_context)
+                }
+                Err(error) if hw_mode.allows_fallback() => {
+                    tracing::warn!(
+                        %error,
+                        decoder = %decoder_name(decoder),
+                        "FFmpeg Vulkan decoder open failed; falling back to software"
+                    );
+                    Self::open_with_decoder(stream, decoder, None)
+                }
+                Err(error) => Err(format!("FFmpeg Vulkan 硬解打开失败：{error}")),
+            },
+            Err(error) if hw_mode.allows_fallback() => {
+                tracing::warn!(
+                    %error,
+                    decoder = %decoder_name(decoder),
+                    "FFmpeg Vulkan hardware decode unavailable; falling back to software"
+                );
+                Self::open_with_decoder(stream, decoder, None)
+            }
+            Err(error) => Err(format!("FFmpeg Vulkan 硬解不可用：{error}")),
+        }
+    }
+
+    fn open_with_decoder(
+        stream: StreamInfo,
+        decoder: *const ffi::AVCodec,
+        video_hw: Option<VideoHwDecodeContext>,
+    ) -> std::result::Result<Self, String> {
         let codecpar = unsafe { (*stream.stream).codecpar };
         if codecpar.is_null() {
             return Err("FFmpeg 媒体流缺少 codec 参数".to_string());
-        }
-
-        let decoder = if stream.decoder.is_null() {
-            unsafe { ffi::avcodec_find_decoder((*codecpar).codec_id) }
-        } else {
-            stream.decoder
-        };
-        if decoder.is_null() {
-            return Err("FFmpeg 未找到可用解码器".to_string());
         }
 
         let context = unsafe { ffi::avcodec_alloc_context3(decoder) };
@@ -31,6 +77,12 @@ impl Decoder {
             ptr: context,
             stream_index: stream.index,
             time_base: stream.time_base,
+            hw_format_selection: video_hw.as_ref().map(|hw| {
+                Box::new(VideoHwFormatSelection {
+                    pixel_format: hw.pixel_format(),
+                })
+            }),
+            video_hw,
         };
         let result = unsafe { ffi::avcodec_parameters_to_context(context, codecpar) };
         if result < 0 {
@@ -44,6 +96,15 @@ impl Decoder {
             (*context).thread_count = 0;
             (*context).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
         }
+        if let Some(selection) = decoder_context.hw_format_selection.as_ref() {
+            unsafe {
+                (*context).opaque = selection.as_ref() as *const VideoHwFormatSelection as *mut _;
+                (*context).get_format = Some(select_video_hw_format);
+            }
+        }
+        if let Some(video_hw) = decoder_context.video_hw.as_ref() {
+            video_hw.attach_to_decoder(context)?;
+        }
         let result = unsafe { ffi::avcodec_open2(context, decoder, ptr::null_mut()) };
         if result < 0 {
             return Err(format!("FFmpeg 打开解码器失败：{}", ffmpeg_error(result)));
@@ -52,6 +113,7 @@ impl Decoder {
             decoder = %decoder_name(decoder),
             thread_count = unsafe { (*context).thread_count },
             active_thread_type = unsafe { (*context).active_thread_type },
+            hw_pixel_format = ?decoder_context.video_hw.as_ref().map(|hw| hw.pixel_format()),
             "opened FFmpeg decoder"
         );
 
@@ -111,6 +173,10 @@ impl Decoder {
         unsafe { ffi::avcodec_flush_buffers(self.ptr) };
     }
 
+    pub(super) fn vulkan_device(&self) -> Option<Arc<VulkanDecodeDevice>> {
+        self.video_hw.as_ref().map(VideoHwDecodeContext::device)
+    }
+
     fn receive_frames<F>(
         &self,
         frame: &mut AvFrame,
@@ -138,9 +204,57 @@ impl Decoder {
 impl Drop for Decoder {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            unsafe { (*self.ptr).opaque = ptr::null_mut() };
             unsafe { ffi::avcodec_free_context(&mut self.ptr) };
         }
     }
+}
+
+struct VideoHwFormatSelection {
+    pixel_format: ffi::AVPixelFormat,
+}
+
+unsafe extern "C" fn select_video_hw_format(
+    context: *mut ffi::AVCodecContext,
+    formats: *const ffi::AVPixelFormat,
+) -> ffi::AVPixelFormat {
+    let selection = unsafe { (*context).opaque as *const VideoHwFormatSelection };
+    let Some(pixel_format) =
+        (unsafe { selection.as_ref().map(|selection| selection.pixel_format) })
+    else {
+        return unsafe { ffi::avcodec_default_get_format(context, formats) };
+    };
+
+    let mut current = formats;
+    while !current.is_null() {
+        let candidate = unsafe { *current };
+        if candidate == ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+            break;
+        }
+        if candidate == pixel_format {
+            return candidate;
+        }
+        current = unsafe { current.add(1) };
+    }
+
+    unsafe { ffi::avcodec_default_get_format(context, formats) }
+}
+
+fn find_decoder(stream: StreamInfo) -> std::result::Result<*const ffi::AVCodec, String> {
+    let codecpar = unsafe { (*stream.stream).codecpar };
+    if codecpar.is_null() {
+        return Err("FFmpeg 媒体流缺少 codec 参数".to_string());
+    }
+
+    let decoder = if stream.decoder.is_null() {
+        unsafe { ffi::avcodec_find_decoder((*codecpar).codec_id) }
+    } else {
+        stream.decoder
+    };
+    if decoder.is_null() {
+        return Err("FFmpeg 未找到可用解码器".to_string());
+    }
+    Ok(decoder)
 }
 
 fn decoder_name(decoder: *const ffi::AVCodec) -> String {

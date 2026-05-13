@@ -280,6 +280,28 @@ fn render_video_frame(
                 request.output_size.height,
             )
         }
+        FramePixels::VulkanVideo(vulkan) => {
+            let source_size = request.frame.size;
+            if tone_mapper
+                .as_ref()
+                .is_none_or(|mapper| !mapper.matches_vulkan_decode_device(&vulkan.device))
+            {
+                *tone_mapper = Some(LibplaceboToneMapper::new_for_vulkan_decode(&vulkan.device)?);
+            }
+            let pixels = tone_mapper
+                .as_mut()
+                .expect("tone mapper initialized")
+                .tone_map_vulkan_to_bgra8(&vulkan, source_size, request.output_size)
+                .with_context(|| match frame_pts {
+                    Some(pts) => format!("渲染 Vulkan 视频帧失败（PTS {}ns）", pts.nsecs),
+                    None => "渲染 Vulkan 视频帧失败".to_string(),
+                })?;
+            render_image_from_bgra(
+                pixels,
+                request.output_size.width,
+                request.output_size.height,
+            )
+        }
     }
 }
 

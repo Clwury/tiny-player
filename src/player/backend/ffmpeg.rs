@@ -27,9 +27,11 @@ use super::{
 use crate::player::{
     dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat},
     render_host::{
-        DecodedFrame, FrameBufferPool, FrameColor, FrameDynamicMetadata, FramePixels, FramePts,
-        FrameSlot, PlaybackSessionId, PooledBytes, RawVideoChromaSite, RawVideoFormat,
-        RawVideoFrame, RawVideoPlane, RawVideoPlanes, RawVideoRange, RenderSize,
+        DecodedFrame, FfmpegAvBufferRef, FfmpegFrameRef, FrameBufferPool, FrameColor,
+        FrameDynamicMetadata, FramePixels, FramePts, FrameSlot, PlaybackSessionId, PooledBytes,
+        RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlane, RawVideoPlanes,
+        RawVideoRange, RenderSize, VulkanDecodeDevice, VulkanDecodeQueue, VulkanDecodeQueues,
+        VulkanVideoFrame, VulkanVideoPlane,
     },
 };
 
@@ -39,6 +41,7 @@ mod clock;
 mod codec;
 mod dovi;
 mod format;
+mod hw;
 mod playback_loop;
 mod reporting;
 mod util;
@@ -63,7 +66,8 @@ use clock::{
     PlaybackScheduler, QueuedVideoFrame, TimestampMapper, drain_audio_clocked_video_queue,
     duration_nsecs, frame_best_effort_timestamp, max_optional_seconds, nsecs_to_timestamp,
     optional_buffered_value_changed, present_decoded_video_frame,
-    present_due_audio_clocked_video_frames, pts_distance, queued_video_duration, seconds_to_nsecs,
+    present_due_audio_clocked_video_frames, pts_distance, queued_video_duration,
+    queued_video_limit_duration, queued_video_target_duration, seconds_to_nsecs,
     should_drop_late_video_frame, stream_frame_duration_nsecs, timestamp_to_nsecs,
     wait_for_audio_clocked_video_queue,
 };
@@ -72,6 +76,10 @@ use dovi::{DoviMetadataQueue, dovi_metadata_from_frame};
 #[cfg(test)]
 use dovi::{dovi_packet_timeline_nsecs, has_annex_b_start_code};
 use format::{FormatContext, StreamInfo};
+use hw::{
+    HardwareDecodeMode, VideoHwDecodeContext, is_vulkan_frame, vulkan_frame_planes,
+    vulkan_sw_format,
+};
 use reporting::{BufferedReporter, PositionReporter};
 use util::ffmpeg_error;
 #[cfg(test)]
@@ -91,6 +99,8 @@ const RPU_QUEUE_CAPACITY: usize = 2048;
 const AUDIO_BUFFER_SECONDS: usize = 4;
 const AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(300);
 const AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(120);
+const VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(90);
+const VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(40);
 const LATE_VIDEO_DROP_TOLERANCE: Duration = Duration::from_millis(75);
 const HTTP_RING_CACHE_CAPACITY: usize = 500 * 1024 * 1024;
 const HTTP_CACHE_CHUNK_SIZE: usize = 256 * 1024;

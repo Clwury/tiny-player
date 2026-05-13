@@ -60,6 +60,32 @@ pub(super) fn queued_video_duration(queued_video_frames: &VecDeque<QueuedVideoFr
     }
 }
 
+pub(super) fn queued_video_limit_duration(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+) -> Duration {
+    if queued_video_frames_have_vulkan(queued_video_frames) {
+        VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION
+    } else {
+        AUDIO_VIDEO_QUEUE_LIMIT_DURATION
+    }
+}
+
+pub(super) fn queued_video_target_duration(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+) -> Duration {
+    if queued_video_frames_have_vulkan(queued_video_frames) {
+        VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION
+    } else {
+        AUDIO_VIDEO_QUEUE_TARGET_DURATION
+    }
+}
+
+fn queued_video_frames_have_vulkan(queued_video_frames: &VecDeque<QueuedVideoFrame>) -> bool {
+    queued_video_frames
+        .iter()
+        .any(|frame| matches!(&frame.frame.pixels, FramePixels::VulkanVideo(_)))
+}
+
 pub(super) fn should_drop_late_video_frame(
     frame_timeline_nsecs: u64,
     frame_duration_nsecs: u64,
@@ -81,8 +107,9 @@ pub(super) fn wait_for_audio_clocked_video_queue(
     frame_presented: &AtomicBool,
     position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
+    target_duration: Duration,
 ) -> std::result::Result<(), String> {
-    while queued_video_duration(queued_video_frames) >= AUDIO_VIDEO_QUEUE_TARGET_DURATION
+    while queued_video_duration(queued_video_frames) >= target_duration
         && !control.should_interrupt()
     {
         present_due_audio_clocked_video_frames(
@@ -94,7 +121,7 @@ pub(super) fn wait_for_audio_clocked_video_queue(
             position_reporter,
             event_tx,
         );
-        if queued_video_duration(queued_video_frames) < AUDIO_VIDEO_QUEUE_TARGET_DURATION
+        if queued_video_duration(queued_video_frames) < target_duration
             || audio_output.queued_duration()? == Duration::ZERO
         {
             break;

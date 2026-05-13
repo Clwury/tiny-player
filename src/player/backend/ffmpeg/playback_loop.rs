@@ -65,7 +65,7 @@ fn open_playback_input(
     let video_stream = input
         .best_stream(ffi::AVMediaType::AVMEDIA_TYPE_VIDEO)?
         .ok_or_else(|| "FFmpeg 未找到可解码视频流".to_string())?;
-    let video_decoder = Decoder::open(video_stream)
+    let video_decoder = Decoder::open_video(video_stream, HardwareDecodeMode::from_env())
         .map_err(|error| format!("FFmpeg 打开视频解码器失败：{error}"))?;
     let (audio_stream, audio_decoder) = open_audio_decoder(&input, allow_audio_decoder_failure)?;
 
@@ -94,7 +94,7 @@ fn open_audio_decoder(
         return Ok((None, None));
     };
 
-    match Decoder::open(stream) {
+    match Decoder::open_audio(stream) {
         Ok(decoder) => Ok((Some(stream), Some(decoder))),
         Err(error) if allow_audio_decoder_failure => {
             tracing::warn!(%error, "FFmpeg audio decoder initialization failed");
@@ -307,6 +307,14 @@ pub(super) fn run_ffmpeg_playback(
                             let _ = dovi_queue.take_for_frame(frame_pts);
                             return Ok(());
                         }
+                        if should_drop_backlogged_vulkan_frame(
+                            frame,
+                            first_video_frame_pending,
+                            &frame_slot,
+                        ) {
+                            let _ = dovi_queue.take_for_frame(frame_pts);
+                            return Ok(());
+                        }
 
                         let dovi_metadata = dovi_metadata_from_frame(frame)
                             .or_else(|| dovi_queue.take_for_frame(frame_pts));
@@ -355,8 +363,10 @@ pub(super) fn run_ffmpeg_playback(
                             &event_tx,
                         );
                         if queued_video_duration(&queued_video_frames)
-                            >= AUDIO_VIDEO_QUEUE_LIMIT_DURATION
+                            >= queued_video_limit_duration(&queued_video_frames)
                         {
+                            let target_duration =
+                                queued_video_target_duration(&queued_video_frames);
                             wait_for_audio_clocked_video_queue(
                                 &mut queued_video_frames,
                                 output,
@@ -366,9 +376,18 @@ pub(super) fn run_ffmpeg_playback(
                                 &frame_presented,
                                 &mut position_reporter,
                                 &event_tx,
+                                target_duration,
                             )?;
                         }
                     } else {
+                        if should_drop_backlogged_vulkan_frame(
+                            frame,
+                            first_video_frame_pending,
+                            &frame_slot,
+                        ) {
+                            let _ = dovi_queue.take_for_frame(frame_pts);
+                            return Ok(());
+                        }
                         let dovi_metadata = dovi_metadata_from_frame(frame)
                             .or_else(|| dovi_queue.take_for_frame(frame_pts));
                         let mut decoded_frame =
@@ -495,6 +514,10 @@ pub(super) fn run_ffmpeg_playback(
                 let _ = dovi_queue.take_for_frame(frame_pts);
                 return Ok(());
             }
+            if should_drop_backlogged_vulkan_frame(frame, first_video_frame_pending, &frame_slot) {
+                let _ = dovi_queue.take_for_frame(frame_pts);
+                return Ok(());
+            }
 
             let dovi_metadata =
                 dovi_metadata_from_frame(frame).or_else(|| dovi_queue.take_for_frame(frame_pts));
@@ -543,6 +566,10 @@ pub(super) fn run_ffmpeg_playback(
                 &event_tx,
             );
         } else {
+            if should_drop_backlogged_vulkan_frame(frame, first_video_frame_pending, &frame_slot) {
+                let _ = dovi_queue.take_for_frame(frame_pts);
+                return Ok(());
+            }
             let dovi_metadata =
                 dovi_metadata_from_frame(frame).or_else(|| dovi_queue.take_for_frame(frame_pts));
             let mut decoded_frame =
@@ -628,4 +655,16 @@ pub(super) fn run_ffmpeg_playback(
         output.drain(&control)?;
     }
     Ok(())
+}
+
+fn should_drop_backlogged_vulkan_frame(
+    frame: *const ffi::AVFrame,
+    first_video_frame_pending: bool,
+    frame_slot: &FrameSlot,
+) -> bool {
+    if first_video_frame_pending || !is_vulkan_frame(frame) {
+        return false;
+    }
+    let key_frame = unsafe { (*frame).flags & ffi::AV_FRAME_FLAG_KEY != 0 };
+    !key_frame && frame_slot.render_backpressure().should_drop_non_key_frame()
 }
