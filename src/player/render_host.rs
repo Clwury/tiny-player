@@ -1,4 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    mem,
+    ops::Deref,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Result, anyhow};
 use gpui::RenderImage;
@@ -21,10 +25,111 @@ impl PlaybackSessionId {
     }
 }
 
+#[derive(Clone, Default, Debug)]
+pub struct FrameBufferPool {
+    inner: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl FrameBufferPool {
+    const MAX_RETAINED_BUFFERS: usize = 12;
+
+    pub fn rent(&self, min_capacity: usize) -> PooledBytes {
+        let mut buffers = self.inner.lock().expect("frame buffer pool poisoned");
+        let index = buffers
+            .iter()
+            .position(|buffer| buffer.capacity() >= min_capacity)
+            .unwrap_or_else(|| buffers.len());
+        let mut bytes = if index < buffers.len() {
+            buffers.swap_remove(index)
+        } else {
+            Vec::with_capacity(min_capacity)
+        };
+        bytes.clear();
+        PooledBytes {
+            bytes,
+            pool: Some(self.clone()),
+        }
+    }
+
+    fn recycle(&self, mut bytes: Vec<u8>) {
+        bytes.clear();
+        let mut buffers = self.inner.lock().expect("frame buffer pool poisoned");
+        if buffers.len() < Self::MAX_RETAINED_BUFFERS {
+            buffers.push(bytes);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PooledBytes {
+    bytes: Vec<u8>,
+    pool: Option<FrameBufferPool>,
+}
+
+impl PooledBytes {
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        Self { bytes, pool: None }
+    }
+
+    pub fn extend_from_slice(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+
+    pub fn resize(&mut self, len: usize, value: u8) {
+        self.bytes.resize(len, value);
+    }
+
+    pub fn into_vec(mut self) -> Vec<u8> {
+        self.pool = None;
+        mem::take(&mut self.bytes)
+    }
+}
+
+impl Clone for PooledBytes {
+    fn clone(&self) -> Self {
+        Self::from_vec(self.bytes.clone())
+    }
+}
+
+impl Deref for PooledBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl Drop for PooledBytes {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            pool.recycle(mem::take(&mut self.bytes));
+        }
+    }
+}
+
+impl From<Vec<u8>> for PooledBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_vec(bytes)
+    }
+}
+
+impl PartialEq for PooledBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for PooledBytes {}
+
 #[derive(Clone, Debug)]
 pub struct DecodedFrame {
     pub size: RenderSize,
     pub pts: Option<FramePts>,
+    pub key_frame: bool,
     pub pixels: FramePixels,
 }
 
@@ -35,7 +140,7 @@ pub struct FramePts {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FramePixels {
-    Bgra8(Vec<u8>),
+    Bgra8(PooledBytes),
     RawVideo(RawVideoFrame),
 }
 
@@ -69,7 +174,7 @@ impl RawVideoPlanes {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawVideoPlane {
-    pub data: Vec<u8>,
+    pub data: PooledBytes,
     pub stride: usize,
 }
 
@@ -197,21 +302,56 @@ pub struct FrameSlot {
     inner: Arc<Mutex<FrameSlotState>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderBackpressure {
+    pub rendering: bool,
+    pub pending_requests: usize,
+    pub last_render_nsecs: u64,
+    pub average_render_nsecs: u64,
+}
+
+impl RenderBackpressure {
+    pub fn should_drop_non_key_frame(self) -> bool {
+        self.is_backlogged()
+    }
+
+    pub fn is_backlogged(self) -> bool {
+        self.rendering
+            && self.pending_requests > 0
+            && (self.average_render_nsecs >= 33_000_000 || self.last_render_nsecs >= 50_000_000)
+    }
+}
+
 #[derive(Default)]
 struct FrameSlotState {
     active_session_id: PlaybackSessionId,
     latest_frame: Option<DecodedFrame>,
     current_size: Option<RenderSize>,
     pending_size_change: Option<RenderSize>,
+    buffer_pool: FrameBufferPool,
+    render_backpressure: RenderBackpressure,
 }
 
 impl FrameSlot {
+    pub fn buffer_pool(&self) -> FrameBufferPool {
+        self.inner
+            .lock()
+            .expect("video frame slot poisoned")
+            .buffer_pool
+            .clone()
+    }
+
     pub fn begin_session(&self, session_id: PlaybackSessionId) {
-        *self.inner.lock().expect("video frame slot poisoned") = FrameSlotState {
+        let mut state = self.inner.lock().expect("video frame slot poisoned");
+        let buffer_pool = state.buffer_pool.clone();
+        let render_backpressure = state.render_backpressure;
+        *state = FrameSlotState {
             active_session_id: session_id,
             latest_frame: None,
             current_size: None,
             pending_size_change: None,
+            buffer_pool,
+            render_backpressure,
         };
     }
 
@@ -242,8 +382,27 @@ impl FrameSlot {
         Some((state.active_session_id, size))
     }
 
+    pub fn render_backpressure(&self) -> RenderBackpressure {
+        self.inner
+            .lock()
+            .expect("video frame slot poisoned")
+            .render_backpressure
+    }
+
+    pub fn update_render_backpressure(&self, backpressure: RenderBackpressure) {
+        self.inner
+            .lock()
+            .expect("video frame slot poisoned")
+            .render_backpressure = backpressure;
+    }
+
     pub fn clear(&self) {
-        *self.inner.lock().expect("video frame slot poisoned") = FrameSlotState::default();
+        let mut state = self.inner.lock().expect("video frame slot poisoned");
+        let buffer_pool = state.buffer_pool.clone();
+        *state = FrameSlotState {
+            buffer_pool,
+            ..FrameSlotState::default()
+        };
     }
 }
 
@@ -378,8 +537,8 @@ pub fn render_image_from_bgra(bgra: Vec<u8>, width: u32, height: u32) -> Result<
 mod tests {
     use super::{
         DecodedFrame, FrameColor, FramePixels, FrameSlot, PlaybackSessionId, RawVideoFormat,
-        RenderSize, frame_byte_len, packed_bgra_from_stride, raw_plane_from_stride,
-        render_image_from_bgra,
+        RenderBackpressure, RenderSize, frame_byte_len, packed_bgra_from_stride,
+        raw_plane_from_stride, render_image_from_bgra,
     };
 
     #[test]
@@ -547,7 +706,8 @@ mod tests {
             DecodedFrame {
                 size: first,
                 pts: None,
-                pixels: FramePixels::Bgra8(vec![1; 8]),
+                key_frame: false,
+                pixels: FramePixels::Bgra8(vec![1; 8].into()),
             }
         ));
         assert!(slot.push(
@@ -555,14 +715,15 @@ mod tests {
             DecodedFrame {
                 size: first,
                 pts: None,
-                pixels: FramePixels::Bgra8(vec![2; 8]),
+                key_frame: false,
+                pixels: FramePixels::Bgra8(vec![2; 8].into()),
             }
         ));
 
         assert_eq!(slot.take_size_change(), Some((session_id, first)));
         assert_eq!(
             slot.take_frame().unwrap().pixels,
-            FramePixels::Bgra8(vec![2; 8])
+            FramePixels::Bgra8(vec![2; 8].into())
         );
         assert!(slot.take_frame().is_none());
 
@@ -571,7 +732,8 @@ mod tests {
             DecodedFrame {
                 size: second,
                 pts: None,
-                pixels: FramePixels::Bgra8(vec![3; 16]),
+                key_frame: false,
+                pixels: FramePixels::Bgra8(vec![3; 16].into()),
             }
         ));
         assert_eq!(slot.take_size_change(), Some((session_id, second)));
@@ -593,11 +755,26 @@ mod tests {
             DecodedFrame {
                 size,
                 pts: None,
-                pixels: FramePixels::Bgra8(vec![1; 8]),
+                key_frame: false,
+                pixels: FramePixels::Bgra8(vec![1; 8].into()),
             }
         ));
 
         assert!(slot.take_frame().is_none());
         assert_eq!(slot.take_size_change(), None);
+    }
+
+    #[test]
+    fn render_backpressure_only_drops_non_key_frames_when_backlogged() {
+        assert!(!RenderBackpressure::default().should_drop_non_key_frame());
+        assert!(
+            RenderBackpressure {
+                rendering: true,
+                pending_requests: 1,
+                last_render_nsecs: 55_000_000,
+                average_render_nsecs: 20_000_000,
+            }
+            .should_drop_non_key_frame()
+        );
     }
 }

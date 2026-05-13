@@ -125,7 +125,7 @@ pub(super) fn run_ffmpeg_playback(
         input.seek_stream(video_stream, source.start_position_seconds)?;
     }
     let mut video_frame = AvFrame::new()?;
-    let mut video_converter = VideoFrameConverter::new();
+    let mut video_converter = VideoFrameConverter::new(frame_slot.buffer_pool());
     let mut current_start_position_nsecs = seconds_to_nsecs(source.start_position_seconds);
     let video_frame_duration_nsecs = video_stream
         .frame_duration_nsecs

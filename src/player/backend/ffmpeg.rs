@@ -27,9 +27,9 @@ use super::{
 use crate::player::{
     dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat},
     render_host::{
-        DecodedFrame, FrameColor, FrameDynamicMetadata, FramePixels, FramePts, FrameSlot,
-        PlaybackSessionId, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlane,
-        RawVideoPlanes, RawVideoRange, RenderSize,
+        DecodedFrame, FrameBufferPool, FrameColor, FrameDynamicMetadata, FramePixels, FramePts,
+        FrameSlot, PlaybackSessionId, PooledBytes, RawVideoChromaSite, RawVideoFormat,
+        RawVideoFrame, RawVideoPlane, RawVideoPlanes, RawVideoRange, RenderSize,
     },
 };
 

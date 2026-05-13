@@ -23,14 +23,14 @@ mod render;
 mod runtime;
 mod video_element;
 
-#[cfg(test)]
-use progress::http_stream_buffered_until;
 use progress::{
-    ProgressBarDrag, buffered_progress_fraction, clamp_playback_position, combined_buffered_until,
-    format_playback_time, is_seek_position_buffered, playback_status_message, progress_fraction,
-    progress_fraction_for_cursor, should_apply_backend_position, valid_http_stream_buffer_progress,
-    valid_playback_duration, valid_playback_time,
+    ProgressBarDrag, buffered_progress_fraction, clamp_playback_position, format_playback_time,
+    http_stream_buffered_range_fractions, is_seek_position_buffered, playback_status_message,
+    progress_fraction, progress_fraction_for_cursor, should_apply_backend_position,
+    valid_http_stream_buffer_progress, valid_playback_duration, valid_playback_time,
 };
+#[cfg(test)]
+use progress::{combined_buffered_until, http_stream_buffered_until};
 use render::{
     AnimationFrameRequestState, aspect_fit_bounds, defer_drop_frame, normalize_video_viewport,
     render_output_size, should_render_frame, should_request_animation_frame, viewport_changed,
@@ -520,13 +520,12 @@ impl PlaybackPage {
             .or(self.playback_position)
             .unwrap_or(0.0);
         let played_fraction = progress_fraction(position, duration);
-        let buffered_until = combined_buffered_until(
-            self.playback_buffered_until,
+        let playback_buffered_fraction =
+            buffered_progress_fraction(self.playback_buffered_until, position, duration);
+        let http_stream_buffered_range = http_stream_buffered_range_fractions(
             self.http_stream_buffered_range,
-            position,
-            duration,
+            playback_buffered_fraction,
         );
-        let buffered_fraction = buffered_progress_fraction(buffered_until, position, duration);
         let current_time = format_playback_time(position);
         let duration_time = format_playback_time(duration);
         let view = cx.entity().downgrade();
@@ -697,9 +696,24 @@ impl PlaybackPage {
                                     .left_0()
                                     .top(px(11.0))
                                     .h(px(6.0))
-                                    .w(relative(buffered_fraction))
+                                    .w(relative(playback_buffered_fraction))
                                     .rounded_full()
                                     .bg(theme.muted_foreground.opacity(0.54)),
+                            )
+                            .when_some(
+                                http_stream_buffered_range,
+                                |this, (start_fraction, end_fraction)| {
+                                    this.child(
+                                        div()
+                                            .absolute()
+                                            .left(relative(start_fraction))
+                                            .top(px(11.0))
+                                            .h(px(6.0))
+                                            .w(relative(end_fraction - start_fraction))
+                                            .rounded_full()
+                                            .bg(theme.muted_foreground.opacity(0.54)),
+                                    )
+                                },
                             )
                             .child(
                                 div()

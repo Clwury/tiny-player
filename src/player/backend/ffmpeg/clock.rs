@@ -142,6 +142,18 @@ pub(super) fn present_decoded_video_frame(
     position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
 ) {
+    let backpressure = frame_slot.render_backpressure();
+    if !frame.key_frame && backpressure.should_drop_non_key_frame() {
+        tracing::debug!(
+            pts = timeline_nsecs,
+            pending_render_requests = backpressure.pending_requests,
+            render_avg_ms = backpressure.average_render_nsecs as f64 / 1_000_000.0,
+            render_last_ms = backpressure.last_render_nsecs as f64 / 1_000_000.0,
+            "dropped non-key video frame because rendering is backlogged"
+        );
+        return;
+    }
+
     if !frame_slot.push(session_id, frame) {
         return;
     }

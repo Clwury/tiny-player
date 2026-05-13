@@ -5,9 +5,9 @@ use gpui::{Bounds, point, px, size};
 use super::{
     AnimationFrameRequestState, HttpStreamBufferProgress, RenderSize, ShutdownOrder,
     aspect_fit_bounds, buffered_progress_fraction, clamp_playback_position,
-    combined_buffered_until, format_playback_time, http_stream_buffered_until,
-    is_seek_position_buffered, normalize_video_viewport, playback_status_message,
-    progress_fraction, progress_fraction_for_cursor, render_output_size,
+    combined_buffered_until, format_playback_time, http_stream_buffered_range_fractions,
+    http_stream_buffered_until, is_seek_position_buffered, normalize_video_viewport,
+    playback_status_message, progress_fraction, progress_fraction_for_cursor, render_output_size,
     should_apply_backend_position, should_render_frame, should_request_animation_frame,
     valid_http_stream_buffer_progress, valid_playback_duration, valid_playback_time,
     viewport_changed,
@@ -277,6 +277,25 @@ fn http_stream_buffer_progress_only_applies_to_current_playback_range() {
     assert_eq!(http_stream_buffered_until(range, 50.0, 100.0), Some(70.0));
     assert_eq!(http_stream_buffered_until(range, 10.0, 100.0), None);
     assert_eq!(http_stream_buffered_until(range, 90.0, 100.0), None);
+}
+
+#[test]
+fn http_stream_buffer_progress_range_fills_gap_from_continuous_cache() {
+    let range = Some(HttpStreamBufferProgress {
+        start_fraction: 0.4,
+        end_fraction: 0.7,
+    });
+
+    assert_eq!(
+        http_stream_buffered_range_fractions(range, 0.1),
+        Some((0.1, 0.7))
+    );
+    assert_eq!(
+        http_stream_buffered_range_fractions(range, 0.5),
+        Some((0.4, 0.7))
+    );
+    assert_eq!(http_stream_buffered_range_fractions(range, 0.8), None);
+    assert_eq!(http_stream_buffered_until(range, 10.0, 100.0), None);
 }
 
 #[test]

@@ -15,8 +15,70 @@ pub(super) struct AudioShared {
 }
 
 pub(super) struct AudioBuffer {
-    pub(super) samples: VecDeque<f32>,
-    pub(super) max_samples: usize,
+    samples: Vec<f32>,
+    read_pos: usize,
+    write_pos: usize,
+    len: usize,
+}
+
+impl AudioBuffer {
+    pub(super) fn with_capacity(max_samples: usize) -> Self {
+        Self {
+            samples: vec![0.0; max_samples],
+            read_pos: 0,
+            write_pos: 0,
+            len: 0,
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub(super) fn available_capacity(&self) -> usize {
+        self.samples.len().saturating_sub(self.len)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.read_pos = 0;
+        self.write_pos = 0;
+        self.len = 0;
+    }
+
+    pub(super) fn push_slice(&mut self, samples: &[f32]) -> usize {
+        let writable = samples.len().min(self.available_capacity());
+        if writable == 0 || self.samples.is_empty() {
+            return 0;
+        }
+
+        let first = writable.min(self.samples.len() - self.write_pos);
+        self.samples[self.write_pos..self.write_pos + first].copy_from_slice(&samples[..first]);
+        self.write_pos = (self.write_pos + first) % self.samples.len();
+        self.len += first;
+
+        let remaining = writable - first;
+        if remaining > 0 {
+            self.samples[..remaining].copy_from_slice(&samples[first..first + remaining]);
+            self.write_pos = remaining;
+            self.len += remaining;
+        }
+
+        writable
+    }
+
+    pub(super) fn pop_sample(&mut self) -> Option<f32> {
+        if self.len == 0 || self.samples.is_empty() {
+            return None;
+        }
+        let sample = self.samples[self.read_pos];
+        self.read_pos = (self.read_pos + 1) % self.samples.len();
+        self.len -= 1;
+        Some(sample)
+    }
 }
 
 impl AudioOutput {
@@ -62,10 +124,7 @@ impl AudioOutput {
             .and_then(|samples| samples.checked_mul(AUDIO_BUFFER_SECONDS))
             .ok_or_else(|| "系统音频缓冲区过大".to_string())?;
         let shared = Arc::new(AudioShared {
-            buffer: Mutex::new(AudioBuffer {
-                samples: VecDeque::with_capacity(max_samples),
-                max_samples,
-            }),
+            buffer: Mutex::new(AudioBuffer::with_capacity(max_samples)),
             ready: Condvar::new(),
             played_samples: AtomicU64::new(0),
             control,
@@ -154,7 +213,7 @@ impl AudioOutput {
                 .buffer
                 .lock()
                 .map_err(|_| "系统音频缓冲区已损坏".to_string())?;
-            while guard.samples.len() >= guard.max_samples && !control.should_interrupt() {
+            while guard.available_capacity() == 0 && !control.should_interrupt() {
                 let (next_guard, _) = self
                     .shared
                     .ready
@@ -172,13 +231,13 @@ impl AudioOutput {
             if control.should_interrupt() {
                 return Ok(());
             }
-            let capacity = guard.max_samples.saturating_sub(guard.samples.len());
+            let capacity = guard.available_capacity();
             if capacity == 0 {
                 continue;
             }
             let end = (offset + capacity).min(samples.len());
-            guard.samples.extend(samples[offset..end].iter().copied());
-            offset = end;
+            let written = guard.push_slice(&samples[offset..end]);
+            offset += written;
             self.shared.ready.notify_all();
             drop(guard);
             on_wait()?;
@@ -188,7 +247,7 @@ impl AudioOutput {
 
     pub(super) fn reset_clock(&self, timeline_nsecs: u64) {
         if let Ok(mut guard) = self.shared.buffer.lock() {
-            guard.samples.clear();
+            guard.clear();
             self.shared.played_samples.store(0, Ordering::Relaxed);
             self.shared.ready.notify_all();
         }
@@ -221,7 +280,7 @@ impl AudioOutput {
             .lock()
             .map_err(|_| "系统音频缓冲区已损坏".to_string())?;
         while self.shared.played_samples.load(Ordering::Relaxed) == previous
-            && !guard.samples.is_empty()
+            && !guard.is_empty()
             && !control.should_interrupt()
         {
             let (next_guard, _) = self
@@ -247,11 +306,11 @@ impl AudioOutput {
             .buffer
             .lock()
             .map_err(|_| "系统音频缓冲区已损坏".to_string())?;
-        while !guard.samples.is_empty() && !control.should_interrupt() {
+        while !guard.is_empty() && !control.should_interrupt() {
             let now = Instant::now();
             if now >= deadline {
                 tracing::debug!(
-                    remaining_samples = guard.samples.len(),
+                    remaining_samples = guard.len(),
                     "timed out waiting for native audio output to drain"
                 );
                 break;
@@ -273,7 +332,6 @@ impl AudioOutput {
             .buffer
             .lock()
             .map_err(|_| "系统音频缓冲区已损坏".to_string())?
-            .samples
             .len();
         Ok(audio_samples_duration(
             queued_samples,
@@ -442,7 +500,7 @@ where
 
     let mut played = 0u64;
     for sample in data {
-        let value = match guard.samples.pop_front() {
+        let value = match guard.pop_sample() {
             Some(value) => {
                 played = played.saturating_add(1);
                 value

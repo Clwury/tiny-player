@@ -2,11 +2,15 @@ use super::*;
 
 pub(super) struct VideoFrameConverter {
     scaler: Option<VideoScaler>,
+    buffer_pool: FrameBufferPool,
 }
 
 impl VideoFrameConverter {
-    pub(super) fn new() -> Self {
-        Self { scaler: None }
+    pub(super) fn new(buffer_pool: FrameBufferPool) -> Self {
+        Self {
+            scaler: None,
+            buffer_pool,
+        }
     }
 
     pub(super) fn convert(
@@ -19,10 +23,14 @@ impl VideoFrameConverter {
             .or_else(|| self.scaler.as_ref().map(|scaler| scaler.size))
             .or_else(|| decoder.size().ok())
             .ok_or_else(|| "FFmpeg 视频帧缺少有效尺寸".to_string())?;
-        if let Some(raw) = raw_video_frame_from_av_frame(frame, size, dovi_metadata)? {
+        let key_frame = unsafe { (*frame).flags & ffi::AV_FRAME_FLAG_KEY != 0 };
+        if let Some(raw) =
+            raw_video_frame_from_av_frame(frame, size, dovi_metadata, &self.buffer_pool)?
+        {
             return Ok(DecodedFrame {
                 size,
                 pts: None,
+                key_frame,
                 pixels: FramePixels::RawVideo(raw),
             });
         }
@@ -31,10 +39,11 @@ impl VideoFrameConverter {
             Some(scaler) => scaler,
             None => self.scaler.insert(VideoScaler::new(decoder)?),
         };
-        let pixels = scaler.convert(frame)?;
+        let pixels = scaler.convert(frame, &self.buffer_pool)?;
         Ok(DecodedFrame {
             size: scaler.size,
             pts: None,
+            key_frame,
             pixels: FramePixels::Bgra8(pixels),
         })
     }
@@ -44,6 +53,7 @@ pub(super) fn raw_video_frame_from_av_frame(
     frame: *mut ffi::AVFrame,
     size: RenderSize,
     dovi_metadata: Option<DoviFrameMetadata>,
+    buffer_pool: &FrameBufferPool,
 ) -> std::result::Result<Option<RawVideoFrame>, String> {
     let Some(format) = ffmpeg_raw_video_format(unsafe { (*frame).format }) else {
         return Ok(None);
@@ -51,7 +61,7 @@ pub(super) fn raw_video_frame_from_av_frame(
     let color = frame_color(frame, dovi_metadata.as_ref());
     let range = frame_range(frame);
     let chroma_site = frame_chroma_site(frame);
-    let planes = copy_raw_video_planes(frame, format, size)?;
+    let planes = copy_raw_video_planes(frame, format, size, buffer_pool)?;
     let metadata = dovi_metadata.map(|dolby_vision| FrameDynamicMetadata {
         dolby_vision: Some(dolby_vision),
     });
@@ -84,6 +94,7 @@ pub(super) fn copy_raw_video_planes(
     frame: *mut ffi::AVFrame,
     format: RawVideoFormat,
     size: RenderSize,
+    buffer_pool: &FrameBufferPool,
 ) -> std::result::Result<Vec<RawVideoPlane>, String> {
     let mut planes = Vec::with_capacity(format.plane_count());
     for plane_index in 0..format.plane_count() {
@@ -108,7 +119,7 @@ pub(super) fn copy_raw_video_planes(
             .row_len
             .checked_mul(height)
             .ok_or_else(|| "视频帧平面过大".to_string())?;
-        let mut plane = Vec::with_capacity(len);
+        let mut plane = buffer_pool.rent(len);
         for row in 0..height {
             let row_start = row
                 .checked_mul(stride)

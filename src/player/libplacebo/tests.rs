@@ -383,11 +383,19 @@ fn p010_frame(color: FrameColor, y: [u16; 4], uv: [u16; 2]) -> RawVideoFrame {
         metadata: None,
         planes: RawVideoPlanes::Owned(vec![
             RawVideoPlane {
-                data: y.into_iter().flat_map(u16::to_le_bytes).collect(),
+                data: y
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+                    .into(),
                 stride: 4,
             },
             RawVideoPlane {
-                data: uv.into_iter().flat_map(u16::to_le_bytes).collect(),
+                data: uv
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+                    .into(),
                 stride: 4,
             },
         ]),
@@ -403,15 +411,27 @@ fn i42010_frame(color: FrameColor, y: [u16; 4], u: [u16; 1], v: [u16; 1]) -> Raw
         metadata: None,
         planes: RawVideoPlanes::Owned(vec![
             RawVideoPlane {
-                data: y.into_iter().flat_map(u16::to_le_bytes).collect(),
+                data: y
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+                    .into(),
                 stride: 4,
             },
             RawVideoPlane {
-                data: u.into_iter().flat_map(u16::to_le_bytes).collect(),
+                data: u
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+                    .into(),
                 stride: 2,
             },
             RawVideoPlane {
-                data: v.into_iter().flat_map(u16::to_le_bytes).collect(),
+                data: v
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+                    .into(),
                 stride: 2,
             },
         ]),

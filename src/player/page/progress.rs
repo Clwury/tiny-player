@@ -44,6 +44,17 @@ pub(super) fn valid_http_stream_buffer_progress(
     })
 }
 
+pub(super) fn http_stream_buffered_range_fractions(
+    progress: Option<HttpStreamBufferProgress>,
+    continuous_until_fraction: f32,
+) -> Option<(f32, f32)> {
+    let progress = progress.and_then(valid_http_stream_buffer_progress)?;
+    let continuous_until_fraction = continuous_until_fraction.clamp(0.0, 1.0);
+    let start_fraction = (progress.start_fraction as f32).min(continuous_until_fraction);
+    let end_fraction = progress.end_fraction as f32;
+    (end_fraction > continuous_until_fraction).then_some((start_fraction, end_fraction))
+}
+
 pub(super) fn clamp_playback_position(position: f64, duration: f64) -> f64 {
     if !position.is_finite() {
         return 0.0;
@@ -107,6 +118,7 @@ pub(super) fn is_seek_position_buffered(
     playback_buffered || http_stream_buffered
 }
 
+#[cfg(test)]
 pub(super) fn combined_buffered_until(
     playback_buffered_until: Option<f64>,
     http_stream_buffered_range: Option<HttpStreamBufferProgress>,

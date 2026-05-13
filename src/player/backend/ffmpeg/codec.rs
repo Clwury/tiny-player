@@ -275,13 +275,16 @@ impl VideoScaler {
     pub(super) fn convert(
         &mut self,
         frame: *mut ffi::AVFrame,
-    ) -> std::result::Result<Vec<u8>, String> {
+        buffer_pool: &FrameBufferPool,
+    ) -> std::result::Result<PooledBytes, String> {
         let size = frame_size(frame).unwrap_or(self.size);
         if size != self.size {
             return Err("FFmpeg 暂不支持播放中切换视频尺寸".to_string());
         }
 
-        let mut pixels = vec![0; video_frame_len(size)?];
+        let len = video_frame_len(size)?;
+        let mut pixels = buffer_pool.rent(len);
+        pixels.resize(len, 0);
         let mut dst_data = [ptr::null_mut(); 4];
         let mut dst_linesize = [0; 4];
         dst_data[0] = pixels.as_mut_ptr();

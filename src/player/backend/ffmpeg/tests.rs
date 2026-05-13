@@ -273,7 +273,8 @@ fn test_queued_video_frame(timeline_nsecs: u64) -> QueuedVideoFrame {
             pts: Some(FramePts {
                 nsecs: timeline_nsecs,
             }),
-            pixels: FramePixels::Bgra8(vec![0, 0, 0, 255]),
+            key_frame: false,
+            pixels: FramePixels::Bgra8(vec![0, 0, 0, 255].into()),
         },
         timeline_nsecs,
     }
@@ -287,6 +288,23 @@ fn audio_sample_len_rejects_invalid_sizes() {
         audio_sample_len(1024, FALLBACK_AUDIO_OUTPUT_CHANNELS).unwrap(),
         1024 * FALLBACK_AUDIO_OUTPUT_CHANNELS as usize
     );
+}
+
+#[test]
+fn audio_ring_buffer_reuses_fixed_capacity_and_wraps() {
+    let mut buffer = AudioBuffer::with_capacity(4);
+
+    assert_eq!(buffer.push_slice(&[1.0, 2.0, 3.0]), 3);
+    assert_eq!(buffer.pop_sample(), Some(1.0));
+    assert_eq!(buffer.pop_sample(), Some(2.0));
+    assert_eq!(buffer.push_slice(&[4.0, 5.0, 6.0]), 3);
+    assert_eq!(buffer.push_slice(&[7.0]), 0);
+
+    assert_eq!(buffer.pop_sample(), Some(3.0));
+    assert_eq!(buffer.pop_sample(), Some(4.0));
+    assert_eq!(buffer.pop_sample(), Some(5.0));
+    assert_eq!(buffer.pop_sample(), Some(6.0));
+    assert_eq!(buffer.pop_sample(), None);
 }
 
 #[test]
@@ -348,11 +366,10 @@ fn dovi_packet_timeline_uses_first_packet_when_stream_start_is_missing() {
 
 #[test]
 fn fill_audio_output_converts_samples_and_outputs_silence_on_underrun() {
+    let mut buffer = AudioBuffer::with_capacity(8);
+    assert_eq!(buffer.push_slice(&[-1.0, 0.0, 1.0]), 3);
     let shared = AudioShared {
-        buffer: Mutex::new(AudioBuffer {
-            samples: [-1.0, 0.0, 1.0].into_iter().collect(),
-            max_samples: 8,
-        }),
+        buffer: Mutex::new(buffer),
         ready: Condvar::new(),
         played_samples: AtomicU64::new(0),
         control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
@@ -367,7 +384,6 @@ fn fill_audio_output_converts_samples_and_outputs_silence_on_underrun() {
             .buffer
             .lock()
             .expect("audio output buffer poisoned")
-            .samples
             .is_empty()
     );
     assert_eq!(shared.played_samples.load(Ordering::Relaxed), 3);
@@ -377,11 +393,10 @@ fn fill_audio_output_converts_samples_and_outputs_silence_on_underrun() {
 fn fill_audio_output_preserves_buffer_while_paused() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     control.set_paused(true);
+    let mut buffer = AudioBuffer::with_capacity(8);
+    assert_eq!(buffer.push_slice(&[-1.0, 0.0, 1.0]), 3);
     let shared = AudioShared {
-        buffer: Mutex::new(AudioBuffer {
-            samples: [-1.0, 0.0, 1.0].into_iter().collect(),
-            max_samples: 8,
-        }),
+        buffer: Mutex::new(buffer),
         ready: Condvar::new(),
         played_samples: AtomicU64::new(0),
         control,
@@ -396,7 +411,6 @@ fn fill_audio_output_preserves_buffer_while_paused() {
             .buffer
             .lock()
             .expect("audio output buffer poisoned")
-            .samples
             .len(),
         3
     );
