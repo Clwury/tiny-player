@@ -175,16 +175,33 @@ impl PlaybackScheduler {
         self.start_position_nsecs = start_position_nsecs;
     }
 
-    pub(super) fn wait_until(&self, timeline_nsecs: u64, control: &FfmpegControl) -> WaitStatus {
+    pub(super) fn wait_until(
+        &mut self,
+        timeline_nsecs: u64,
+        control: &FfmpegControl,
+    ) -> WaitStatus {
         let target_offset = timeline_nsecs.saturating_sub(self.start_position_nsecs);
-        let target = self
-            .start_instant
-            .checked_add(Duration::from_nanos(target_offset))
-            .unwrap_or(self.start_instant);
         loop {
             if control.should_interrupt() {
                 return WaitStatus::Interrupted;
             }
+            if control.is_paused() {
+                let paused_at = Instant::now();
+                if control.wait_while_paused() || control.has_pending_seek() {
+                    return WaitStatus::Interrupted;
+                }
+                let paused_for = paused_at.elapsed();
+                self.start_instant = self
+                    .start_instant
+                    .checked_add(paused_for)
+                    .unwrap_or(self.start_instant);
+                continue;
+            }
+
+            let target = self
+                .start_instant
+                .checked_add(Duration::from_nanos(target_offset))
+                .unwrap_or(self.start_instant);
             let now = Instant::now();
             if now >= target {
                 return WaitStatus::Ready;

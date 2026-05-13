@@ -35,6 +35,7 @@ pub enum BackendEventKind {
 #[derive(Debug)]
 pub enum BackendError {
     EmptyUrl,
+    UnsupportedCommand(&'static str),
     Ffmpeg(String),
 }
 
@@ -44,6 +45,7 @@ impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyUrl => write!(f, "播放地址为空"),
+            Self::UnsupportedCommand(command) => write!(f, "当前播放后端不支持{command}"),
             Self::Ffmpeg(error) => error.fmt(f),
         }
     }
@@ -58,6 +60,10 @@ mod tests {
     #[test]
     fn backend_error_displays_user_facing_messages() {
         assert_eq!(BackendError::EmptyUrl.to_string(), "播放地址为空");
+        assert_eq!(
+            BackendError::UnsupportedCommand("切换音轨").to_string(),
+            "当前播放后端不支持切换音轨"
+        );
         assert_eq!(
             BackendError::Ffmpeg("解码失败".to_string()).to_string(),
             "解码失败"

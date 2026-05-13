@@ -11,6 +11,7 @@ pub(super) struct AudioShared {
     pub(super) buffer: Mutex<AudioBuffer>,
     pub(super) ready: Condvar,
     pub(super) played_samples: AtomicU64,
+    pub(super) control: Arc<FfmpegControl>,
 }
 
 pub(super) struct AudioBuffer {
@@ -19,11 +20,15 @@ pub(super) struct AudioBuffer {
 }
 
 impl AudioOutput {
-    pub(super) fn new() -> std::result::Result<Self, String> {
+    pub(super) fn new(control: Arc<FfmpegControl>) -> std::result::Result<Self, String> {
         let host = cpal::default_host();
         let mut last_error = None;
         for candidate in output_device_candidates(&host)? {
-            match Self::from_device(candidate.device, candidate.name.clone()) {
+            match Self::from_device(
+                candidate.device,
+                candidate.name.clone(),
+                Arc::clone(&control),
+            ) {
                 Ok(output) => return Ok(output),
                 Err(error) => {
                     tracing::warn!(
@@ -40,7 +45,11 @@ impl AudioOutput {
         Err(last_error.unwrap_or_else(|| "未找到系统音频输出设备".to_string()))
     }
 
-    fn from_device(device: cpal::Device, device_name: String) -> std::result::Result<Self, String> {
+    fn from_device(
+        device: cpal::Device,
+        device_name: String,
+        control: Arc<FfmpegControl>,
+    ) -> std::result::Result<Self, String> {
         let supported_config = device
             .default_output_config()
             .map_err(|error| format!("读取系统音频输出配置失败：{error}"))?;
@@ -59,6 +68,7 @@ impl AudioOutput {
             }),
             ready: Condvar::new(),
             played_samples: AtomicU64::new(0),
+            control,
         });
         let config: cpal::StreamConfig = supported_config.clone().into();
         let sample_format = supported_config.sample_format();
@@ -422,6 +432,14 @@ where
     T: Sample + FromSample<f32>,
 {
     let mut guard = shared.buffer.lock().expect("audio output buffer poisoned");
+    if shared.control.is_paused() {
+        for sample in data {
+            *sample = T::from_sample(0.0);
+        }
+        shared.ready.notify_all();
+        return;
+    }
+
     let mut played = 0u64;
     for sample in data {
         let value = match guard.samples.pop_front() {

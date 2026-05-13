@@ -144,7 +144,7 @@ pub(super) fn run_ffmpeg_playback(
     let mut audio_frame = None;
     let mut audio_resampler = None;
     if let Some(decoder) = opened_audio_decoder {
-        match AudioOutput::new() {
+        match AudioOutput::new(Arc::clone(&control)) {
             Ok(output) => match AudioResampler::new(output.sample_rate(), output.channels()) {
                 Ok(resampler) => {
                     tracing::debug!(
@@ -198,9 +198,19 @@ pub(super) fn run_ffmpeg_playback(
     ));
 
     while !control.should_stop() {
-        if let Some(pending_seek) = drain_seek_command(&command_rx) {
+        if control.wait_while_paused() {
+            continue;
+        }
+
+        let drained_commands = drain_playback_commands(&command_rx, &control);
+        if control.should_stop() {
+            break;
+        }
+
+        if let Some(pending_seek) = drained_commands.pending_seek {
             current_session_id = pending_seek.session_id;
             control.set_session_id(current_session_id);
+            control.set_paused(false);
             control.finish_seek(pending_seek.generation);
             let seek_result: std::result::Result<(), String> = (|| {
                 let position_seconds = pending_seek.position_seconds.max(0.0);

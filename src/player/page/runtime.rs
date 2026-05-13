@@ -1,19 +1,52 @@
-use super::*;
+use super::super::{
+    backend::{BackendControl, BackendEvent, BackendLoadRequest, FfmpegBackend, Result},
+    render_host::FrameSlot,
+};
 
 pub(super) enum PlaybackBackend {
     Ffmpeg(FfmpegBackend),
 }
 
-impl PlaybackBackend {
-    pub(super) fn poll_events(&mut self) -> Vec<BackendEvent> {
+impl BackendControl for PlaybackBackend {
+    fn load(&mut self, request: BackendLoadRequest) -> Result<()> {
+        match self {
+            Self::Ffmpeg(backend) => backend.load(request),
+        }
+    }
+
+    fn seek(&mut self, position_seconds: f64) -> Result<()> {
+        match self {
+            Self::Ffmpeg(backend) => backend.seek(position_seconds),
+        }
+    }
+
+    fn pause(&mut self) -> Result<()> {
+        match self {
+            Self::Ffmpeg(backend) => backend.pause(),
+        }
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        match self {
+            Self::Ffmpeg(backend) => backend.resume(),
+        }
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        match self {
+            Self::Ffmpeg(backend) => backend.stop(),
+        }
+    }
+
+    fn poll_events(&mut self) -> Vec<BackendEvent> {
         match self {
             Self::Ffmpeg(backend) => backend.poll_events(),
         }
     }
 
-    pub(super) fn seek_to(&mut self, position_seconds: f64) -> super::super::backend::Result<()> {
+    fn frame_slot(&self) -> FrameSlot {
         match self {
-            Self::Ffmpeg(backend) => backend.seek_to(position_seconds),
+            Self::Ffmpeg(backend) => backend.frame_slot(),
         }
     }
 }

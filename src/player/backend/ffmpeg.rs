@@ -20,7 +20,10 @@ use cpal::{
 };
 use ffmpeg_sys_next as ffi;
 
-use super::{BackendError, BackendEvent, BackendEventKind, HttpStreamBufferProgress, Result};
+use super::{
+    BackendControl, BackendError, BackendEvent, BackendEventKind, BackendLoadRequest,
+    HttpStreamBufferProgress, Result,
+};
 use crate::player::{
     dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat},
     render_host::{
@@ -75,7 +78,7 @@ use util::ffmpeg_error;
 use video::ffmpeg_raw_video_format;
 use video::{VideoFrameConverter, frame_size, video_frame_len};
 use worker::{
-    FfmpegCommand, FfmpegControl, FfmpegPlaybackInput, FfmpegWorker, drain_seek_command,
+    FfmpegCommand, FfmpegControl, FfmpegPlaybackInput, FfmpegWorker, drain_playback_commands,
     ffmpeg_interrupt_callback,
 };
 
@@ -212,14 +215,51 @@ impl FfmpegBackend {
         Ok(())
     }
 
+    pub fn set_paused(&mut self, paused: bool) -> Result<()> {
+        let Some(worker) = self.worker.as_ref() else {
+            return Err(BackendError::Ffmpeg(
+                "FFmpeg 尚未加载可控制的媒体".to_string(),
+            ));
+        };
+        worker.set_paused(paused, self.current_session_id)?;
+        self.paused = paused;
+        let _ = self.event_tx.send(BackendEvent::new(
+            self.current_session_id,
+            BackendEventKind::Pause(paused),
+        ));
+        Ok(())
+    }
+
+    pub fn pause(&mut self) -> Result<()> {
+        self.set_paused(true)
+    }
+
+    pub fn resume(&mut self) -> Result<()> {
+        self.set_paused(false)
+    }
+
+    pub fn stop(&mut self) -> Result<()> {
+        let session_id = self.advance_session();
+        self.frame_slot.begin_session(session_id);
+        self.stop_worker();
+        self.current_url = None;
+        self.loaded = false;
+        self.paused = true;
+        while self.event_rx.try_recv().is_ok() {}
+        let _ = self
+            .event_tx
+            .send(BackendEvent::new(session_id, BackendEventKind::Pause(true)));
+        Ok(())
+    }
+
     pub fn poll_events(&mut self) -> Vec<BackendEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
             if event.session_id != self.current_session_id {
                 continue;
             }
-            if matches!(event.kind, BackendEventKind::Pause(true)) {
-                self.paused = true;
+            if let BackendEventKind::Pause(paused) = &event.kind {
+                self.paused = *paused;
             }
             events.push(event);
         }
@@ -262,6 +302,41 @@ impl FfmpegBackend {
         if let Some(worker) = self.worker.take() {
             worker.stop();
         }
+    }
+}
+
+impl BackendControl for FfmpegBackend {
+    fn load(&mut self, request: BackendLoadRequest) -> Result<()> {
+        let BackendLoadRequest {
+            url,
+            http_headers,
+            content_length,
+        } = request;
+        self.load_url(&url, http_headers, content_length)
+    }
+
+    fn seek(&mut self, position_seconds: f64) -> Result<()> {
+        FfmpegBackend::seek_to(self, position_seconds)
+    }
+
+    fn pause(&mut self) -> Result<()> {
+        FfmpegBackend::pause(self)
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        FfmpegBackend::resume(self)
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        FfmpegBackend::stop(self)
+    }
+
+    fn poll_events(&mut self) -> Vec<BackendEvent> {
+        FfmpegBackend::poll_events(self)
+    }
+
+    fn frame_slot(&self) -> FrameSlot {
+        FfmpegBackend::frame_slot(self)
     }
 }
 

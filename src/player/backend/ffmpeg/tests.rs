@@ -1,3 +1,4 @@
+use super::worker::PendingSeek;
 use super::*;
 
 #[test]
@@ -29,6 +30,48 @@ fn ffmpeg_control_tracks_seek_generations() {
     assert!(control.has_pending_seek());
     control.finish_seek(second);
     assert!(!control.has_pending_seek());
+}
+
+#[test]
+fn ffmpeg_command_drain_applies_pause_resume_and_keeps_latest_seek() {
+    let control = FfmpegControl::new(PlaybackSessionId(1));
+    let (tx, rx) = mpsc::channel();
+    let first_generation = control.request_seek();
+    let second_generation = control.request_seek();
+
+    tx.send(FfmpegCommand::Pause {
+        session_id: PlaybackSessionId(2),
+    })
+    .unwrap();
+    tx.send(FfmpegCommand::Seek {
+        session_id: PlaybackSessionId(3),
+        position_seconds: 12.0,
+        generation: first_generation,
+    })
+    .unwrap();
+    tx.send(FfmpegCommand::Resume {
+        session_id: PlaybackSessionId(4),
+    })
+    .unwrap();
+    tx.send(FfmpegCommand::Seek {
+        session_id: PlaybackSessionId(5),
+        position_seconds: 24.0,
+        generation: second_generation,
+    })
+    .unwrap();
+
+    let drained = drain_playback_commands(&rx, &control);
+
+    assert!(!control.is_paused());
+    assert_eq!(control.session_id(), PlaybackSessionId(4));
+    assert_eq!(
+        drained.pending_seek,
+        Some(PendingSeek {
+            session_id: PlaybackSessionId(5),
+            position_seconds: 24.0,
+            generation: second_generation,
+        })
+    );
 }
 
 #[test]
@@ -312,6 +355,7 @@ fn fill_audio_output_converts_samples_and_outputs_silence_on_underrun() {
         }),
         ready: Condvar::new(),
         played_samples: AtomicU64::new(0),
+        control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
     };
     let mut output = [0.0f64; 4];
 
@@ -327,6 +371,36 @@ fn fill_audio_output_converts_samples_and_outputs_silence_on_underrun() {
             .is_empty()
     );
     assert_eq!(shared.played_samples.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn fill_audio_output_preserves_buffer_while_paused() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    control.set_paused(true);
+    let shared = AudioShared {
+        buffer: Mutex::new(AudioBuffer {
+            samples: [-1.0, 0.0, 1.0].into_iter().collect(),
+            max_samples: 8,
+        }),
+        ready: Condvar::new(),
+        played_samples: AtomicU64::new(0),
+        control,
+    };
+    let mut output = [0.5f64; 4];
+
+    fill_audio_output(&mut output, &shared);
+
+    assert_eq!(output, [0.0, 0.0, 0.0, 0.0]);
+    assert_eq!(
+        shared
+            .buffer
+            .lock()
+            .expect("audio output buffer poisoned")
+            .samples
+            .len(),
+        3
+    );
+    assert_eq!(shared.played_samples.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -576,13 +650,42 @@ fn content_range_parser_reads_total_size() {
 
 #[test]
 fn playback_scheduler_reports_ready_for_past_frames() {
-    let scheduler = PlaybackScheduler::new(1_000_000_000);
+    let mut scheduler = PlaybackScheduler::new(1_000_000_000);
     let control = FfmpegControl::new(PlaybackSessionId::default());
 
     assert_eq!(
         scheduler.wait_until(500_000_000, &control),
         WaitStatus::Ready
     );
+}
+
+#[test]
+fn playback_scheduler_holds_target_while_paused() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let waiting_control = Arc::clone(&control);
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let mut scheduler = PlaybackScheduler::new(0);
+        let status = scheduler.wait_until(40_000_000, &waiting_control);
+        done_tx
+            .send(status)
+            .expect("scheduler result receiver open");
+    });
+
+    thread::sleep(Duration::from_millis(10));
+    control.set_paused(true);
+    thread::sleep(Duration::from_millis(70));
+    assert!(done_rx.try_recv().is_err());
+
+    control.set_paused(false);
+    assert_eq!(
+        done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("scheduler should resume after unpause"),
+        WaitStatus::Ready
+    );
+    handle.join().expect("scheduler thread should finish");
 }
 
 #[test]

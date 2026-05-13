@@ -10,7 +10,10 @@ use gpui::{
 use crate::theme;
 
 use super::{
-    backend::{BackendEvent, BackendEventKind, FfmpegBackend, HttpStreamBufferProgress},
+    backend::{
+        BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest, FfmpegBackend,
+        HttpStreamBufferProgress,
+    },
     render_host::RenderSize,
     video_presenter::VideoPresenter,
 };
@@ -89,13 +92,14 @@ impl PlaybackPage {
         let status_message = "正在加载视频…".into();
 
         let (backend, video_presenter) = match FfmpegBackend::new() {
-            Ok(mut backend) => match VideoPresenter::new(backend.frame_slot()) {
+            Ok(mut backend) => match VideoPresenter::new(BackendControl::frame_slot(&backend)) {
                 Ok(video_presenter) => {
-                    if let Err(error) = backend.load_url(
-                        &request.url,
-                        request.http_headers.clone(),
-                        request.content_length,
-                    ) {
+                    let load_request = BackendLoadRequest {
+                        url: request.url.clone(),
+                        http_headers: request.http_headers.clone(),
+                        content_length: request.content_length,
+                    };
+                    if let Err(error) = backend.command(BackendCommand::Load(load_request)) {
                         error_message = Some(format!("加载视频失败：{error}").into());
                     }
                     (
@@ -140,6 +144,10 @@ impl PlaybackPage {
         self.title.clone()
     }
 
+    fn can_toggle_playback(&self) -> bool {
+        self.current_file_loaded && self.error_message.is_none()
+    }
+
     fn back_to_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_visible_frame(window, cx);
         cx.emit(PlaybackEvent::Back);
@@ -153,6 +161,39 @@ impl PlaybackPage {
     ) {
         cx.stop_propagation();
         self.back_to_detail(window, cx);
+    }
+
+    fn toggle_playback_pause(
+        &mut self,
+        _: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        if !self.can_toggle_playback() {
+            return;
+        }
+
+        let paused = !self.playback_paused;
+        let Some(backend) = self.video.owner_mut() else {
+            return;
+        };
+        let command = if paused {
+            BackendCommand::Pause
+        } else {
+            BackendCommand::Resume
+        };
+        if let Err(error) = backend.command(command) {
+            self.playback_paused = true;
+            self.playback_buffering = false;
+            self.error_message = Some(format!("控制播放失败：{error}").into());
+        } else {
+            self.playback_paused = paused;
+            if paused {
+                self.playback_buffering = false;
+            }
+        }
+        cx.notify();
     }
 
     fn replace_visible_frame(
@@ -282,7 +323,9 @@ impl PlaybackPage {
         }
 
         if let Some(backend) = self.video.owner_mut()
-            && let Err(error) = backend.seek_to(position)
+            && let Err(error) = backend.command(BackendCommand::Seek {
+                position_seconds: position,
+            })
         {
             self.pending_seek_position = None;
             self.pending_seek_keeps_frame = false;
@@ -435,6 +478,37 @@ impl PlaybackPage {
             .unwrap_or_else(|| self.status_message.clone())
     }
 
+    fn playback_control_button(
+        id: &'static str,
+        icon_path: &'static str,
+        button_size: Pixels,
+        icon_size: Pixels,
+        enabled: bool,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = theme::get(cx);
+        let color = if enabled {
+            theme.foreground.opacity(0.92)
+        } else {
+            theme.foreground.opacity(0.52)
+        };
+
+        div()
+            .id(id)
+            .flex()
+            .size(button_size)
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .text_color(color)
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .hover(move |style| style.bg(theme.foreground.opacity(0.14)))
+            })
+            .when(!enabled, |this| this.cursor_default().opacity(0.62))
+            .child(svg().path(icon_path).size(icon_size).text_color(color))
+    }
+
     fn render_progress_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let Some(duration) = self.playback_duration else {
             return div().id("playback-progress-empty").into_any_element();
@@ -469,93 +543,194 @@ impl PlaybackPage {
         )
         .absolute()
         .size_full();
+        let can_toggle_playback = self.can_toggle_playback();
+        let play_pause_icon = if self.playback_paused {
+            "icons/play.svg"
+        } else {
+            "icons/pause.svg"
+        };
 
         div()
             .id("playback-progress")
             .absolute()
-            .left_0()
-            .right_0()
-            .bottom_0()
+            .left(relative(0.3))
+            .bottom_6()
             .flex()
-            .h(px(64.0))
-            .items_center()
-            .gap_3()
-            .px_6()
-            .pt_5()
-            .pb_4()
-            .bg(rgba(0x0000006b))
+            .flex_col()
+            .w(relative(0.4))
+            .h(px(94.0))
+            .justify_center()
+            .gap_2()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.input_border.opacity(0.42))
+            .bg(rgba(0x00000099))
+            .px_4()
+            .shadow_lg()
+            .occlude()
             .text_xs()
             .text_color(theme.foreground.opacity(0.86))
             .child(
                 div()
-                    .w(px(56.0))
-                    .text_align(gpui::TextAlign::Left)
-                    .child(current_time),
-            )
-            .child(
-                div()
-                    .id("playback-progress-track")
+                    .id("playback-controls")
                     .relative()
-                    .flex_1()
-                    .h(px(28.0))
-                    .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_progress_drag))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_progress_drag))
-                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_progress_drag))
-                    .on_drag(ProgressBarDrag, |_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.new(|_| ProgressBarDrag)
-                    })
-                    .on_drag_move(cx.listener(Self::drag_progress))
+                    .w_full()
+                    .h(px(34.0))
                     .child(
                         div()
                             .absolute()
                             .left_0()
                             .right_0()
-                            .top(px(11.0))
-                            .h(px(6.0))
-                            .rounded_full()
-                            .bg(theme.input_border.opacity(0.48)),
+                            .top_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_3()
+                            .child(Self::playback_control_button(
+                                "playback-previous-button",
+                                "icons/previous.svg",
+                                px(30.0),
+                                px(16.0),
+                                false,
+                                cx,
+                            ))
+                            .child(
+                                Self::playback_control_button(
+                                    "playback-play-pause-button",
+                                    play_pause_icon,
+                                    px(34.0),
+                                    px(18.0),
+                                    can_toggle_playback,
+                                    cx,
+                                )
+                                .when(
+                                    can_toggle_playback,
+                                    |this| {
+                                        this.on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(Self::toggle_playback_pause),
+                                        )
+                                    },
+                                ),
+                            )
+                            .child(Self::playback_control_button(
+                                "playback-next-button",
+                                "icons/next.svg",
+                                px(30.0),
+                                px(16.0),
+                                false,
+                                cx,
+                            )),
                     )
                     .child(
                         div()
                             .absolute()
-                            .left_0()
-                            .top(px(11.0))
-                            .h(px(6.0))
-                            .w(relative(buffered_fraction))
-                            .rounded_full()
-                            .bg(theme.muted_foreground.opacity(0.54)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top(px(11.0))
-                            .h(px(6.0))
-                            .w(relative(played_fraction))
-                            .rounded_full()
-                            .bg(theme.input_border_focused),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(7.0))
-                            .left(relative(played_fraction))
-                            .ml(-px(6.0))
-                            .size(px(14.0))
-                            .rounded_full()
-                            .bg(theme.foreground)
-                            .border_1()
-                            .border_color(theme.input_border_focused.opacity(0.7)),
-                    )
-                    .child(track_observer),
+                            .right_0()
+                            .top_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Self::playback_control_button(
+                                "playback-audio-button",
+                                "icons/audio.svg",
+                                px(30.0),
+                                px(16.0),
+                                false,
+                                cx,
+                            ))
+                            .child(Self::playback_control_button(
+                                "playback-caption-button",
+                                "icons/caption.svg",
+                                px(30.0),
+                                px(16.0),
+                                false,
+                                cx,
+                            )),
+                    ),
             )
             .child(
                 div()
-                    .w(px(56.0))
-                    .text_align(gpui::TextAlign::Right)
-                    .child(duration_time),
+                    .flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(48.0))
+                            .text_align(gpui::TextAlign::Left)
+                            .child(current_time),
+                    )
+                    .child(
+                        div()
+                            .id("playback-progress-track")
+                            .relative()
+                            .flex_1()
+                            .h(px(28.0))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::begin_progress_drag),
+                            )
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_progress_drag))
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(Self::finish_progress_drag),
+                            )
+                            .on_drag(ProgressBarDrag, |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.new(|_| ProgressBarDrag)
+                            })
+                            .on_drag_move(cx.listener(Self::drag_progress))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .top(px(11.0))
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .bg(theme.input_border.opacity(0.48)),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top(px(11.0))
+                                    .h(px(6.0))
+                                    .w(relative(buffered_fraction))
+                                    .rounded_full()
+                                    .bg(theme.muted_foreground.opacity(0.54)),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top(px(11.0))
+                                    .h(px(6.0))
+                                    .w(relative(played_fraction))
+                                    .rounded_full()
+                                    .bg(theme.input_border_focused),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(7.0))
+                                    .left(relative(played_fraction))
+                                    .ml(-px(6.0))
+                                    .size(px(14.0))
+                                    .rounded_full()
+                                    .bg(theme.foreground)
+                                    .border_1()
+                                    .border_color(theme.input_border_focused.opacity(0.7)),
+                            )
+                            .child(track_observer),
+                    )
+                    .child(
+                        div()
+                            .w(px(48.0))
+                            .text_align(gpui::TextAlign::Right)
+                            .child(duration_time),
+                    ),
             )
             .into_any_element()
     }
