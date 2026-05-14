@@ -13,9 +13,9 @@ use super::{
     dovi::DoviFrameMetadata,
     ffmpeg_vulkan,
     render_host::{
-        FrameColor, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlanes,
-        RawVideoRange, RenderSize, VulkanDecodeDevice, VulkanDecodeQueue, VulkanDecodeQueues,
-        VulkanVideoFrame, frame_byte_len,
+        FfmpegAvBufferRef, FrameColor, RawVideoChromaSite, RawVideoFormat, RawVideoFrame,
+        RawVideoPlanes, RawVideoRange, RenderSize, VulkanDecodeDevice, VulkanDecodeQueue,
+        VulkanDecodeQueues, VulkanVideoFrame, frame_byte_len,
     },
 };
 
@@ -43,6 +43,8 @@ pub struct LibplaceboToneMapper {
     target_texture: ffi::pl_tex,
     target_format: Option<OutputTextureFormat>,
     dovi_cache: DoviMetadataCache,
+    vulkan_texture_cache: Vec<VulkanTextureCacheEntry>,
+    vulkan_texture_generation: u64,
     _vulkan_device: Option<Arc<VulkanDecodeDevice>>,
     vulkan_device_key: Option<usize>,
 }
@@ -53,6 +55,23 @@ struct VulkanImportQueues {
     compute: VulkanDecodeQueue,
     transfer: VulkanDecodeQueue,
     no_compute: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VulkanTextureKey {
+    image: usize,
+    format: u32,
+    usage: u32,
+    width: i32,
+    height: i32,
+}
+
+struct VulkanTextureCacheEntry {
+    key: VulkanTextureKey,
+    texture: ffi::pl_tex,
+    gpu: ffi::pl_gpu,
+    last_used: u64,
+    _hw_frames_ref: FfmpegAvBufferRef,
 }
 
 impl LibplaceboToneMapper {
@@ -134,6 +153,8 @@ impl LibplaceboToneMapper {
                 target_texture: ptr::null(),
                 target_format: None,
                 dovi_cache: DoviMetadataCache::default(),
+                vulkan_texture_cache: Vec::new(),
+                vulkan_texture_generation: 0,
                 vulkan_device_key: vulkan_device
                     .as_ref()
                     .map(|device| vulkan_device_key(device)),
@@ -242,6 +263,16 @@ impl LibplaceboToneMapper {
     }
 }
 
+impl Drop for VulkanTextureCacheEntry {
+    fn drop(&mut self) {
+        if !self.gpu.is_null() && !self.texture.is_null() {
+            unsafe {
+                ffi::pl_tex_destroy(self.gpu, &mut self.texture);
+            }
+        }
+    }
+}
+
 fn vulkan_import_queues(queues: VulkanDecodeQueues) -> VulkanImportQueues {
     VulkanImportQueues {
         graphics: queues.graphics,
@@ -324,6 +355,7 @@ impl Drop for LibplaceboToneMapper {
             if !self.target_texture.is_null() {
                 ffi::pl_tex_destroy(self.gpu, &mut self.target_texture);
             }
+            self.vulkan_texture_cache.clear();
             if !self.vulkan.is_null() {
                 ffi::pl_vulkan_destroy(&mut self.vulkan);
             }

@@ -11,6 +11,7 @@ struct WrappedVulkanPlane {
     texture: ffi::pl_tex,
     plane_index: usize,
     held_by_user: bool,
+    cached: bool,
 }
 
 pub(super) struct AvVulkanFrameAccess {
@@ -34,10 +35,6 @@ impl WrappedVulkanTextureGuard {
         Ok(Self { gpu, texture })
     }
 
-    fn texture(&self) -> ffi::pl_tex {
-        self.texture
-    }
-
     fn into_texture(mut self) -> ffi::pl_tex {
         let texture = self.texture;
         self.texture = ptr::null();
@@ -56,6 +53,7 @@ impl Drop for WrappedVulkanTextureGuard {
 }
 
 const VK_QUEUE_FAMILY_IGNORED: u32 = u32::MAX;
+const MAX_CACHED_VULKAN_TEXTURES: usize = 64;
 
 fn vulkan_image_usage(usage: u32) -> ffi::VkImageUsageFlags {
     usage as ffi::VkImageUsageFlags
@@ -163,8 +161,15 @@ impl LibplaceboToneMapper {
             wrap_params.format = plane.format as ffi::VkFormat;
             wrap_params.usage = vulkan_image_usage(input.usage);
 
-            let texture = unsafe { WrappedVulkanTextureGuard::new(self.gpu, &wrap_params)? };
-            let format = unsafe { (*texture.texture()).params.format };
+            let key = VulkanTextureKey {
+                image: plane.image,
+                format: plane.format,
+                usage: input.usage,
+                width: wrap_params.width,
+                height: wrap_params.height,
+            };
+            let texture = unsafe { self.cached_vulkan_texture(input, key, &wrap_params)? };
+            let format = unsafe { (*texture).params.format };
             let texture_plane_count = if format.is_null() {
                 0
             } else {
@@ -175,7 +180,7 @@ impl LibplaceboToneMapper {
             }
 
             for plane_index in 0..expected_plane_count {
-                let plane_texture = unsafe { (*texture.texture()).planes[plane_index] };
+                let plane_texture = unsafe { (*texture).planes[plane_index] };
                 if plane_texture.is_null() {
                     return Err(anyhow!("libplacebo Vulkan 多平面纹理子平面为空"));
                 }
@@ -193,9 +198,10 @@ impl LibplaceboToneMapper {
                 frame.planes[plane_index] = out_plane;
             }
             wrapped_vulkan_planes.push(WrappedVulkanPlane {
-                texture: texture.into_texture(),
+                texture,
                 plane_index: 0,
                 held_by_user: true,
+                cached: true,
             });
         } else {
             for (plane_index, plane) in input.planes.iter().enumerate() {
@@ -215,9 +221,16 @@ impl LibplaceboToneMapper {
                 wrap_params.format = plane.format as ffi::VkFormat;
                 wrap_params.usage = vulkan_image_usage(input.usage);
 
-                let texture = unsafe { WrappedVulkanTextureGuard::new(self.gpu, &wrap_params)? };
+                let key = VulkanTextureKey {
+                    image: plane.image,
+                    format: plane.format,
+                    usage: input.usage,
+                    width: wrap_params.width,
+                    height: wrap_params.height,
+                };
+                let texture = unsafe { self.cached_vulkan_texture(input, key, &wrap_params)? };
                 let mut out_plane = unsafe { mem::zeroed::<ffi::pl_plane>() };
-                out_plane.texture = texture.texture();
+                out_plane.texture = texture;
                 out_plane.flipped = false;
                 out_plane.shift_x = 0.0;
                 out_plane.shift_y = 0.0;
@@ -226,9 +239,10 @@ impl LibplaceboToneMapper {
                 out_plane.component_mapping = layout.component_map;
                 frame.planes[plane_index] = out_plane;
                 wrapped_vulkan_planes.push(WrappedVulkanPlane {
-                    texture: texture.into_texture(),
+                    texture,
                     plane_index,
                     held_by_user: true,
+                    cached: true,
                 });
             }
         }
@@ -284,6 +298,59 @@ impl LibplaceboToneMapper {
         out_plane.shift_y = 0.0;
         frame.planes[plane_index] = out_plane;
         Ok(())
+    }
+
+    unsafe fn cached_vulkan_texture(
+        &mut self,
+        input: &VulkanVideoFrame,
+        key: VulkanTextureKey,
+        params: &ffi::pl_vulkan_wrap_params,
+    ) -> Result<ffi::pl_tex> {
+        self.vulkan_texture_generation = self.vulkan_texture_generation.wrapping_add(1).max(1);
+        let generation = self.vulkan_texture_generation;
+        if let Some(entry) = self
+            .vulkan_texture_cache
+            .iter_mut()
+            .find(|entry| entry.key == key)
+        {
+            entry.last_used = generation;
+            return Ok(entry.texture);
+        }
+
+        if let Some(index) = self
+            .vulkan_texture_cache
+            .iter()
+            .position(|entry| entry.key.image == key.image)
+        {
+            self.vulkan_texture_cache.swap_remove(index);
+        }
+
+        let hw_frames_ref = unsafe { vulkan_hw_frames_ref(input)? };
+        let texture = unsafe { WrappedVulkanTextureGuard::new(self.gpu, params)? }.into_texture();
+        self.vulkan_texture_cache.push(VulkanTextureCacheEntry {
+            key,
+            texture,
+            gpu: self.gpu,
+            last_used: generation,
+            _hw_frames_ref: hw_frames_ref,
+        });
+        self.prune_vulkan_texture_cache();
+        Ok(texture)
+    }
+
+    fn prune_vulkan_texture_cache(&mut self) {
+        while self.vulkan_texture_cache.len() > MAX_CACHED_VULKAN_TEXTURES {
+            let Some(index) = self
+                .vulkan_texture_cache
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+            else {
+                return;
+            };
+            self.vulkan_texture_cache.swap_remove(index);
+        }
     }
 
     pub(super) unsafe fn ensure_target_texture(
@@ -414,7 +481,11 @@ impl Drop for UploadedSourceFrame {
     fn drop(&mut self) {
         unsafe {
             for plane in &mut self.wrapped_vulkan_planes {
-                if !plane.texture.is_null() && !self.gpu.is_null() && plane.held_by_user {
+                if !plane.cached
+                    && !plane.texture.is_null()
+                    && !self.gpu.is_null()
+                    && plane.held_by_user
+                {
                     let mut texture = plane.texture;
                     ffi::pl_tex_destroy(self.gpu, &mut texture);
                     plane.texture = ptr::null();
@@ -422,6 +493,15 @@ impl Drop for UploadedSourceFrame {
             }
         }
     }
+}
+
+unsafe fn vulkan_hw_frames_ref(input: &VulkanVideoFrame) -> Result<FfmpegAvBufferRef> {
+    let frame = input.frame.as_ptr() as *mut ffmpeg_ffi::AVFrame;
+    if frame.is_null() {
+        return Err(anyhow!("Vulkan video frame reference is null"));
+    }
+    let hw_frames_ctx = unsafe { (*frame).hw_frames_ctx };
+    FfmpegAvBufferRef::new_ref(hw_frames_ctx).context("Vulkan video frame is missing hw_frames_ctx")
 }
 
 impl AvVulkanFrameAccess {

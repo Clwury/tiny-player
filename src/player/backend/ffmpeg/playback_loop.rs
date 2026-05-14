@@ -8,50 +8,58 @@ struct OpenedPlaybackInput {
     audio_decoder: Option<Decoder>,
 }
 
+struct ProbedPlaybackInput {
+    input: FormatContext,
+    video_stream: StreamInfo,
+    audio_stream: Option<StreamInfo>,
+    allow_audio_decoder_failure: bool,
+}
+
 fn open_playback_input_with_fallback(
     source: &FfmpegPlaybackInput,
     control: Arc<FfmpegControl>,
     event_tx: &Sender<BackendEvent>,
 ) -> std::result::Result<OpenedPlaybackInput, String> {
-    match open_playback_input(
+    let probed = match probe_playback_input(
         source,
         Arc::clone(&control),
         event_tx,
         InputProbeProfile::Fast,
         false,
     ) {
-        Ok(opened) if opened.audio_stream.is_some() => Ok(opened),
-        Ok(opened) => {
+        Ok(probed) if probed.audio_stream.is_some() => probed,
+        Ok(probed) => {
             tracing::debug!("FFmpeg fast probe did not find audio stream; retrying full probe");
-            match open_playback_input(source, control, event_tx, InputProbeProfile::Full, true) {
-                Ok(opened) => Ok(opened),
+            match probe_playback_input(source, control, event_tx, InputProbeProfile::Full, true) {
+                Ok(probed) => probed,
                 Err(error) => {
                     tracing::warn!(
                         %error,
                         "FFmpeg full probe fallback failed; continuing with fast probe result"
                     );
-                    Ok(opened)
+                    probed
                 }
             }
         }
         Err(fast_error) => {
             tracing::debug!(%fast_error, "FFmpeg fast probe failed; retrying full probe");
-            open_playback_input(source, control, event_tx, InputProbeProfile::Full, true).map_err(
+            probe_playback_input(source, control, event_tx, InputProbeProfile::Full, true).map_err(
                 |full_error| {
                     format!("FFmpeg 快速探测失败：{fast_error}；完整探测也失败：{full_error}")
                 },
-            )
+            )?
         }
-    }
+    };
+    open_decoders_for_probed_input(probed)
 }
 
-fn open_playback_input(
+fn probe_playback_input(
     source: &FfmpegPlaybackInput,
     control: Arc<FfmpegControl>,
     event_tx: &Sender<BackendEvent>,
     probe_profile: InputProbeProfile,
     allow_audio_decoder_failure: bool,
-) -> std::result::Result<OpenedPlaybackInput, String> {
+) -> std::result::Result<ProbedPlaybackInput, String> {
     let mut input = FormatContext::open(
         &source.url,
         source.http_headers.as_slice(),
@@ -65,9 +73,28 @@ fn open_playback_input(
     let video_stream = input
         .best_stream(ffi::AVMediaType::AVMEDIA_TYPE_VIDEO)?
         .ok_or_else(|| "FFmpeg 未找到可解码视频流".to_string())?;
+    let audio_stream = select_audio_stream(&input, allow_audio_decoder_failure)?;
+
+    Ok(ProbedPlaybackInput {
+        input,
+        video_stream,
+        audio_stream,
+        allow_audio_decoder_failure,
+    })
+}
+
+fn open_decoders_for_probed_input(
+    probed: ProbedPlaybackInput,
+) -> std::result::Result<OpenedPlaybackInput, String> {
+    let ProbedPlaybackInput {
+        input,
+        video_stream,
+        audio_stream,
+        allow_audio_decoder_failure,
+    } = probed;
     let video_decoder = Decoder::open_video(video_stream, HardwareDecodeMode::from_env())
         .map_err(|error| format!("FFmpeg 打开视频解码器失败：{error}"))?;
-    let (audio_stream, audio_decoder) = open_audio_decoder(&input, allow_audio_decoder_failure)?;
+    let audio_decoder = open_audio_decoder(audio_stream, allow_audio_decoder_failure)?;
 
     Ok(OpenedPlaybackInput {
         input,
@@ -78,27 +105,32 @@ fn open_playback_input(
     })
 }
 
-fn open_audio_decoder(
+fn select_audio_stream(
     input: &FormatContext,
     allow_audio_decoder_failure: bool,
-) -> std::result::Result<(Option<StreamInfo>, Option<Decoder>), String> {
-    let audio_stream = match input.best_stream(ffi::AVMediaType::AVMEDIA_TYPE_AUDIO) {
-        Ok(stream) => stream,
+) -> std::result::Result<Option<StreamInfo>, String> {
+    match input.best_stream(ffi::AVMediaType::AVMEDIA_TYPE_AUDIO) {
+        Ok(stream) => Ok(stream),
         Err(error) if allow_audio_decoder_failure => {
             tracing::warn!(%error, "FFmpeg audio stream selection failed");
-            None
+            Ok(None)
         }
-        Err(error) => return Err(format!("FFmpeg 选择音频流失败：{error}")),
-    };
-    let Some(stream) = audio_stream else {
-        return Ok((None, None));
-    };
+        Err(error) => Err(format!("FFmpeg 选择音频流失败：{error}")),
+    }
+}
 
+fn open_audio_decoder(
+    audio_stream: Option<StreamInfo>,
+    allow_audio_decoder_failure: bool,
+) -> std::result::Result<Option<Decoder>, String> {
+    let Some(stream) = audio_stream else {
+        return Ok(None);
+    };
     match Decoder::open_audio(stream) {
-        Ok(decoder) => Ok((Some(stream), Some(decoder))),
+        Ok(decoder) => Ok(Some(decoder)),
         Err(error) if allow_audio_decoder_failure => {
             tracing::warn!(%error, "FFmpeg audio decoder initialization failed");
-            Ok((Some(stream), None))
+            Ok(None)
         }
         Err(error) => Err(format!("FFmpeg 打开音频解码器失败：{error}")),
     }
