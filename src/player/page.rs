@@ -464,6 +464,9 @@ impl PlaybackPage {
                 }
             }
         }
+        if let Some(presenter) = self.video.dependent_mut() {
+            presenter.prewarm_if_needed();
+        }
 
         let render_size = self
             .video_viewport_bounds

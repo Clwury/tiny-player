@@ -141,6 +141,9 @@ pub(super) fn run_ffmpeg_playback(
         audio_stream,
         audio_decoder: opened_audio_decoder,
     } = open_playback_input_with_fallback(&source, Arc::clone(&control), &event_tx)?;
+    if let Some(device) = video_decoder.vulkan_device() {
+        frame_slot.request_vulkan_prewarm(current_session_id, device);
+    }
     if source.start_position_seconds > 0.0 {
         input.seek_stream(video_stream, source.start_position_seconds)?;
     }

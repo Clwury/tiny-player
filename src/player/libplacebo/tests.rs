@@ -11,6 +11,38 @@ fn swap_red_blue_channels_swaps_red_and_blue_channels() {
 }
 
 #[test]
+fn vulkan_import_queues_use_dedicated_queues_when_available() {
+    let queues = VulkanDecodeQueues {
+        graphics: VulkanDecodeQueue { index: 0, count: 1 },
+        compute: Some(VulkanDecodeQueue { index: 1, count: 2 }),
+        transfer: Some(VulkanDecodeQueue { index: 2, count: 1 }),
+    };
+
+    let import = vulkan_import_queues(queues);
+
+    assert_eq!(import.graphics, queues.graphics);
+    assert_eq!(import.compute, queues.compute.unwrap());
+    assert_eq!(import.transfer, queues.transfer.unwrap());
+    assert!(!import.no_compute);
+}
+
+#[test]
+fn vulkan_import_queues_fall_back_to_graphics_without_compute() {
+    let queues = VulkanDecodeQueues {
+        graphics: VulkanDecodeQueue { index: 3, count: 1 },
+        compute: None,
+        transfer: None,
+    };
+
+    let import = vulkan_import_queues(queues);
+
+    assert_eq!(import.graphics, queues.graphics);
+    assert_eq!(import.compute, queues.graphics);
+    assert_eq!(import.transfer, queues.graphics);
+    assert!(import.no_compute);
+}
+
+#[test]
 fn dolby_vision_profile5_uses_raw_frame_range_input() {
     let full = unsafe {
         source_color_repr(

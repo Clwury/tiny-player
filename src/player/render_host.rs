@@ -526,6 +526,7 @@ struct FrameSlotState {
     latest_frame: Option<DecodedFrame>,
     current_size: Option<RenderSize>,
     pending_size_change: Option<RenderSize>,
+    pending_vulkan_prewarm: Option<Arc<VulkanDecodeDevice>>,
     buffer_pool: FrameBufferPool,
     render_backpressure: RenderBackpressure,
 }
@@ -548,6 +549,7 @@ impl FrameSlot {
             latest_frame: None,
             current_size: None,
             pending_size_change: None,
+            pending_vulkan_prewarm: None,
             buffer_pool,
             render_backpressure,
         };
@@ -578,6 +580,23 @@ impl FrameSlot {
         let mut state = self.inner.lock().expect("video frame slot poisoned");
         let size = state.pending_size_change.take()?;
         Some((state.active_session_id, size))
+    }
+
+    pub fn request_vulkan_prewarm(
+        &self,
+        session_id: PlaybackSessionId,
+        device: Arc<VulkanDecodeDevice>,
+    ) {
+        let mut state = self.inner.lock().expect("video frame slot poisoned");
+        if state.active_session_id == session_id {
+            state.pending_vulkan_prewarm = Some(device);
+        }
+    }
+
+    pub fn take_vulkan_prewarm(&self) -> Option<(PlaybackSessionId, Arc<VulkanDecodeDevice>)> {
+        let mut state = self.inner.lock().expect("video frame slot poisoned");
+        let device = state.pending_vulkan_prewarm.take()?;
+        Some((state.active_session_id, device))
     }
 
     pub fn render_backpressure(&self) -> RenderBackpressure {
@@ -734,10 +753,12 @@ pub fn render_image_from_bgra(bgra: Vec<u8>, width: u32, height: u32) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodedFrame, FrameColor, FramePixels, FrameSlot, PlaybackSessionId, RawVideoFormat,
-        RenderBackpressure, RenderSize, frame_byte_len, packed_bgra_from_stride,
-        raw_plane_from_stride, render_image_from_bgra,
+        DecodedFrame, FfmpegAvBufferRef, FrameColor, FramePixels, FrameSlot, PlaybackSessionId,
+        RawVideoFormat, RenderBackpressure, RenderSize, VulkanDecodeDevice, VulkanDecodeQueue,
+        VulkanDecodeQueues, frame_byte_len, packed_bgra_from_stride, raw_plane_from_stride,
+        render_image_from_bgra,
     };
+    use std::ptr;
 
     #[test]
     fn frame_byte_len_uses_four_byte_pixels() {
@@ -963,6 +984,24 @@ mod tests {
     }
 
     #[test]
+    fn frame_slot_scopes_vulkan_prewarm_to_active_session() {
+        let slot = FrameSlot::default();
+        let current = PlaybackSessionId(2);
+        let stale = PlaybackSessionId(1);
+        slot.begin_session(current);
+        slot.request_vulkan_prewarm(stale, dummy_vulkan_device(1));
+        assert!(slot.take_vulkan_prewarm().is_none());
+
+        let device = dummy_vulkan_device(2);
+        slot.request_vulkan_prewarm(current, device.clone());
+
+        let (session_id, requested) = slot.take_vulkan_prewarm().unwrap();
+        assert_eq!(session_id, current);
+        assert_eq!(requested.key(), device.key());
+        assert!(slot.take_vulkan_prewarm().is_none());
+    }
+
+    #[test]
     fn render_backpressure_only_drops_non_key_frames_when_backlogged() {
         assert!(!RenderBackpressure::default().should_drop_non_key_frame());
         assert!(
@@ -974,5 +1013,25 @@ mod tests {
             }
             .should_drop_non_key_frame()
         );
+    }
+
+    fn dummy_vulkan_device(device: usize) -> std::sync::Arc<VulkanDecodeDevice> {
+        std::sync::Arc::new(VulkanDecodeDevice {
+            device_ref: FfmpegAvBufferRef {
+                ptr: ptr::null_mut(),
+            },
+            instance: 0,
+            get_proc_addr: 0,
+            physical_device: 0,
+            device,
+            extensions: 0,
+            num_extensions: 0,
+            features: 0,
+            queues: VulkanDecodeQueues {
+                graphics: VulkanDecodeQueue { index: 0, count: 1 },
+                compute: None,
+                transfer: None,
+            },
+        })
     }
 }

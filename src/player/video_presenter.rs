@@ -19,8 +19,8 @@ use super::{
     libplacebo::LibplaceboToneMapper,
     render_host::{
         DecodedFrame, FramePixels, FramePts, FrameSlot, PooledBytes, RawVideoFormat, RawVideoFrame,
-        RawVideoPlane, RawVideoPlanes, RenderBackpressure, RenderSize, VulkanVideoFrame,
-        render_image_from_bgra,
+        RawVideoPlane, RawVideoPlanes, RenderBackpressure, RenderSize, VulkanDecodeDevice,
+        VulkanVideoFrame, render_image_from_bgra,
     },
 };
 
@@ -39,6 +39,12 @@ impl VideoPresenter {
             next_generation: 0,
             latest_generation: 0,
         })
+    }
+
+    pub fn prewarm_if_needed(&mut self) {
+        while let Some((_session_id, device)) = self.frame_slot.take_vulkan_prewarm() {
+            self.render_worker.prewarm_vulkan(device);
+        }
     }
 
     pub fn render_if_needed(&mut self, size: RenderSize) -> Result<Option<Arc<RenderImage>>> {
@@ -93,6 +99,7 @@ struct VideoRenderState {
 #[derive(Default)]
 struct VideoRenderSlot {
     request: Option<VideoRenderRequest>,
+    prewarm_device: Option<Arc<VulkanDecodeDevice>>,
     rendering: bool,
     shutdown: bool,
     last_render_duration: Duration,
@@ -109,6 +116,11 @@ struct VideoRenderRequest {
 struct VideoRenderResult {
     generation: u64,
     frame: std::result::Result<Arc<RenderImage>, String>,
+}
+
+enum VideoRenderWork {
+    Render(VideoRenderRequest),
+    Prewarm(Arc<VulkanDecodeDevice>),
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -140,21 +152,39 @@ impl VideoRenderWorker {
             .spawn(move || {
                 let mut tone_mapper = None;
                 let mut vulkan_direct_fallback = HashSet::new();
-                while let Some(request) = worker_state.take_request() {
-                    let generation = request.generation;
-                    let started = Instant::now();
-                    let result =
-                        render_video_frame(&mut tone_mapper, &mut vulkan_direct_fallback, request)
+                while let Some(work) = worker_state.take_work() {
+                    match work {
+                        VideoRenderWork::Render(request) => {
+                            let generation = request.generation;
+                            let started = Instant::now();
+                            let result = render_video_frame(
+                                &mut tone_mapper,
+                                &mut vulkan_direct_fallback,
+                                request,
+                            )
                             .map_err(|error| error.to_string());
-                    worker_state.finish_request(started.elapsed());
-                    if result_tx
-                        .send(VideoRenderResult {
-                            generation,
-                            frame: result,
-                        })
-                        .is_err()
-                    {
-                        break;
+                            worker_state.finish_render(started.elapsed());
+                            if result_tx
+                                .send(VideoRenderResult {
+                                    generation,
+                                    frame: result,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        VideoRenderWork::Prewarm(device) => {
+                            let started = Instant::now();
+                            if let Err(error) = prewarm_vulkan_tone_mapper(&mut tone_mapper, device)
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    "failed to prewarm Vulkan video renderer"
+                                );
+                            }
+                            worker_state.finish_prewarm(started.elapsed());
+                        }
                     }
                 }
             })
@@ -196,6 +226,22 @@ impl VideoRenderWorker {
         }
     }
 
+    fn prewarm_vulkan(&self, device: Arc<VulkanDecodeDevice>) {
+        let mut slot = self
+            .state
+            .slot
+            .lock()
+            .expect("video render worker poisoned");
+        if slot.shutdown || slot.request.is_some() {
+            return;
+        }
+        let should_notify = !slot.rendering && slot.prewarm_device.is_none();
+        slot.prewarm_device = Some(device);
+        if should_notify {
+            self.state.ready.notify_one();
+        }
+    }
+
     fn discard_pending_request(&self) {
         let mut slot = self
             .state
@@ -203,6 +249,7 @@ impl VideoRenderWorker {
             .lock()
             .expect("video render worker poisoned");
         slot.request = None;
+        slot.prewarm_device = None;
     }
 
     fn backpressure(&self) -> RenderBackpressure {
@@ -234,7 +281,7 @@ impl Drop for VideoRenderWorker {
 }
 
 impl VideoRenderState {
-    fn take_request(&self) -> Option<VideoRenderRequest> {
+    fn take_work(&self) -> Option<VideoRenderWork> {
         let mut slot = self.slot.lock().expect("video render worker poisoned");
         loop {
             if slot.shutdown {
@@ -242,14 +289,18 @@ impl VideoRenderState {
             }
             if let Some(request) = slot.request.take() {
                 slot.rendering = true;
-                return Some(request);
+                return Some(VideoRenderWork::Render(request));
+            }
+            if let Some(device) = slot.prewarm_device.take() {
+                slot.rendering = true;
+                return Some(VideoRenderWork::Prewarm(device));
             }
             slot.rendering = false;
             slot = self.ready.wait(slot).expect("video render worker poisoned");
         }
     }
 
-    fn finish_request(&self, render_duration: Duration) {
+    fn finish_render(&self, render_duration: Duration) {
         let mut slot = self.slot.lock().expect("video render worker poisoned");
         slot.rendering = false;
         slot.completed_frames = slot.completed_frames.saturating_add(1);
@@ -270,6 +321,28 @@ impl VideoRenderState {
             );
         }
     }
+
+    fn finish_prewarm(&self, duration: Duration) {
+        let mut slot = self.slot.lock().expect("video render worker poisoned");
+        slot.rendering = false;
+        tracing::debug!(
+            prewarm_ms = duration.as_secs_f64() * 1000.0,
+            "prewarmed Vulkan video renderer"
+        );
+    }
+}
+
+fn prewarm_vulkan_tone_mapper(
+    tone_mapper: &mut Option<LibplaceboToneMapper>,
+    device: Arc<VulkanDecodeDevice>,
+) -> Result<()> {
+    if tone_mapper
+        .as_ref()
+        .is_none_or(|mapper| !mapper.matches_vulkan_decode_device(&device))
+    {
+        *tone_mapper = Some(LibplaceboToneMapper::new_for_vulkan_decode(device)?);
+    }
+    Ok(())
 }
 
 fn render_video_frame(

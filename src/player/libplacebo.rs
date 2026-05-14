@@ -14,8 +14,8 @@ use super::{
     ffmpeg_vulkan,
     render_host::{
         FrameColor, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlanes,
-        RawVideoRange, RenderSize, VulkanDecodeDevice, VulkanDecodeQueue, VulkanVideoFrame,
-        frame_byte_len,
+        RawVideoRange, RenderSize, VulkanDecodeDevice, VulkanDecodeQueue, VulkanDecodeQueues,
+        VulkanVideoFrame, frame_byte_len,
     },
 };
 
@@ -47,6 +47,14 @@ pub struct LibplaceboToneMapper {
     vulkan_device_key: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VulkanImportQueues {
+    graphics: VulkanDecodeQueue,
+    compute: VulkanDecodeQueue,
+    transfer: VulkanDecodeQueue,
+    no_compute: bool,
+}
+
 impl LibplaceboToneMapper {
     pub fn new() -> Result<Self> {
         unsafe {
@@ -76,10 +84,11 @@ impl LibplaceboToneMapper {
             params.extensions = device.extensions as *const *const i8;
             params.num_extensions = device.num_extensions;
             params.features = device.features as *const ffi::VkPhysicalDeviceFeatures2;
-            params.queue_graphics = pl_queue(device.queues.graphics);
-            params.queue_compute = pl_queue(device.queues.graphics);
-            params.queue_transfer = pl_queue(device.queues.graphics);
-            params.no_compute = true;
+            let import_queues = vulkan_import_queues(device.queues);
+            params.queue_graphics = pl_queue(import_queues.graphics);
+            params.queue_compute = pl_queue(import_queues.compute);
+            params.queue_transfer = pl_queue(import_queues.transfer);
+            params.no_compute = import_queues.no_compute;
             params.lock_queue = Some(lock_ffmpeg_vulkan_queue);
             params.unlock_queue = Some(unlock_ffmpeg_vulkan_queue);
             params.queue_ctx = vulkan_device_context_from_ref(device.device_ref()).cast();
@@ -230,6 +239,15 @@ impl LibplaceboToneMapper {
             }
             Ok(pixels)
         }
+    }
+}
+
+fn vulkan_import_queues(queues: VulkanDecodeQueues) -> VulkanImportQueues {
+    VulkanImportQueues {
+        graphics: queues.graphics,
+        compute: queues.compute.unwrap_or(queues.graphics),
+        transfer: queues.transfer.unwrap_or(queues.graphics),
+        no_compute: queues.compute.is_none(),
     }
 }
 
