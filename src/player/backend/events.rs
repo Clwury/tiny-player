@@ -1,5 +1,13 @@
 use crate::player::render_host::{PlaybackSessionId, RenderSize};
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlaybackVideoInfo {
+    pub decoder: String,
+    pub size: RenderSize,
+    pub frame_rate: Option<f64>,
+    pub hardware_accelerated: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HttpStreamBufferProgress {
     pub start_fraction: f64,
@@ -22,6 +30,7 @@ impl BackendEvent {
 pub enum BackendEventKind {
     Pause(bool),
     PlaybackRestart,
+    PlaybackInfoChanged(Option<PlaybackVideoInfo>),
     VideoSizeChanged(Option<RenderSize>),
     Buffering(bool),
     PositionChanged(f64),

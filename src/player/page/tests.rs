@@ -3,12 +3,13 @@ use std::{cell::RefCell, rc::Rc};
 use gpui::{Bounds, point, px, size};
 
 use super::{
-    AnimationFrameRequestState, HttpStreamBufferProgress, RenderSize, ShutdownOrder,
-    aspect_fit_bounds, buffered_progress_fraction, clamp_playback_position,
+    AnimationFrameRequestState, HttpStreamBufferProgress, PlaybackVideoInfo, RenderSize,
+    ShutdownOrder, aspect_fit_bounds, buffered_progress_fraction, clamp_playback_position,
     combined_buffered_until, format_playback_time, http_stream_buffered_range_fractions,
     http_stream_buffered_until, is_seek_position_buffered, normalize_video_viewport,
-    playback_status_message, progress_fraction, progress_fraction_for_cursor, render_output_size,
-    should_apply_backend_position, should_render_frame, should_request_animation_frame,
+    playback_info_segments, playback_status_message, progress_fraction,
+    progress_fraction_for_cursor, render_output_size, should_apply_backend_position,
+    should_render_frame, should_request_animation_frame, valid_frame_rate,
     valid_http_stream_buffer_progress, valid_playback_duration, valid_playback_time,
     viewport_changed,
 };
@@ -340,6 +341,54 @@ fn format_playback_time_switches_to_hours_when_needed() {
     assert_eq!(format_playback_time(65.0), "1:05");
     assert_eq!(format_playback_time(3661.0), "1:01:01");
     assert_eq!(format_playback_time(f64::NAN), "0:00");
+}
+
+#[test]
+fn playback_info_segments_include_hw_badge_and_frame_rate() {
+    let info = PlaybackVideoInfo {
+        decoder: "hevc".to_string(),
+        size: RenderSize {
+            width: 3840,
+            height: 2160,
+        },
+        frame_rate: Some(23.976),
+        hardware_accelerated: true,
+    };
+
+    assert_eq!(
+        playback_info_segments(&info),
+        vec![
+            "hevc".to_string(),
+            "3840x2160".to_string(),
+            "23.98 FPS".to_string(),
+            "HW".to_string()
+        ]
+    );
+}
+
+#[test]
+fn playback_info_segments_mark_software_and_skip_invalid_rate() {
+    let info = PlaybackVideoInfo {
+        decoder: "h264".to_string(),
+        size: RenderSize {
+            width: 1920,
+            height: 1080,
+        },
+        frame_rate: Some(f64::NAN),
+        hardware_accelerated: false,
+    };
+
+    assert_eq!(
+        playback_info_segments(&info),
+        vec![
+            "h264".to_string(),
+            "1920x1080".to_string(),
+            "SW".to_string()
+        ]
+    );
+    assert_eq!(valid_frame_rate(0.0), None);
+    assert_eq!(valid_frame_rate(f64::INFINITY), None);
+    assert_eq!(valid_frame_rate(60.0), Some(60.0));
 }
 
 #[test]

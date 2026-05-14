@@ -1,4 +1,8 @@
 use std::{
+    collections::HashSet,
+    ffi::CStr,
+    os::raw::c_int,
+    slice,
     sync::{
         Arc, Condvar, Mutex,
         mpsc::{self, Receiver},
@@ -8,12 +12,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use ffmpeg_sys_next as ffi;
 use gpui::RenderImage;
 
 use super::{
     libplacebo::LibplaceboToneMapper,
     render_host::{
-        DecodedFrame, FramePixels, FrameSlot, RenderBackpressure, RenderSize,
+        DecodedFrame, FramePixels, FramePts, FrameSlot, PooledBytes, RawVideoFormat, RawVideoFrame,
+        RawVideoPlane, RawVideoPlanes, RenderBackpressure, RenderSize, VulkanVideoFrame,
         render_image_from_bgra,
     },
 };
@@ -105,6 +111,21 @@ struct VideoRenderResult {
     frame: std::result::Result<Arc<RenderImage>, String>,
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct VulkanDirectFallbackKey {
+    device: usize,
+    format: RawVideoFormat,
+}
+
+impl VulkanDirectFallbackKey {
+    fn new(frame: &VulkanVideoFrame) -> Self {
+        Self {
+            device: frame.device.key(),
+            format: frame.format,
+        }
+    }
+}
+
 impl VideoRenderWorker {
     fn spawn() -> Self {
         let (result_tx, result_rx) = mpsc::channel();
@@ -118,11 +139,13 @@ impl VideoRenderWorker {
             .name("tiny-video-render".to_string())
             .spawn(move || {
                 let mut tone_mapper = None;
+                let mut vulkan_direct_fallback = HashSet::new();
                 while let Some(request) = worker_state.take_request() {
                     let generation = request.generation;
                     let started = Instant::now();
-                    let result = render_video_frame(&mut tone_mapper, request)
-                        .map_err(|error| error.to_string());
+                    let result =
+                        render_video_frame(&mut tone_mapper, &mut vulkan_direct_fallback, request)
+                            .map_err(|error| error.to_string());
                     worker_state.finish_request(started.elapsed());
                     if result_tx
                         .send(VideoRenderResult {
@@ -251,6 +274,7 @@ impl VideoRenderState {
 
 fn render_video_frame(
     tone_mapper: &mut Option<LibplaceboToneMapper>,
+    vulkan_direct_fallback: &mut HashSet<VulkanDirectFallbackKey>,
     request: VideoRenderRequest,
 ) -> Result<Arc<RenderImage>> {
     let frame_pts = request.frame.pts;
@@ -282,27 +306,198 @@ fn render_video_frame(
         }
         FramePixels::VulkanVideo(vulkan) => {
             let source_size = request.frame.size;
+            render_vulkan_video_frame(
+                tone_mapper,
+                vulkan_direct_fallback,
+                vulkan,
+                source_size,
+                request.output_size,
+                frame_pts,
+            )
+        }
+    }
+}
+
+fn render_vulkan_video_frame(
+    tone_mapper: &mut Option<LibplaceboToneMapper>,
+    vulkan_direct_fallback: &mut HashSet<VulkanDirectFallbackKey>,
+    vulkan: VulkanVideoFrame,
+    source_size: RenderSize,
+    output_size: RenderSize,
+    frame_pts: Option<FramePts>,
+) -> Result<Arc<RenderImage>> {
+    let fallback_key = VulkanDirectFallbackKey::new(&vulkan);
+    if !vulkan_direct_fallback.contains(&fallback_key) {
+        let direct_result = (|| {
             if tone_mapper
                 .as_ref()
                 .is_none_or(|mapper| !mapper.matches_vulkan_decode_device(&vulkan.device))
             {
-                *tone_mapper = Some(LibplaceboToneMapper::new_for_vulkan_decode(&vulkan.device)?);
+                *tone_mapper = Some(LibplaceboToneMapper::new_for_vulkan_decode(
+                    vulkan.device.clone(),
+                )?);
             }
-            let pixels = tone_mapper
+            tone_mapper
                 .as_mut()
                 .expect("tone mapper initialized")
-                .tone_map_vulkan_to_bgra8(&vulkan, source_size, request.output_size)
-                .with_context(|| match frame_pts {
-                    Some(pts) => format!("渲染 Vulkan 视频帧失败（PTS {}ns）", pts.nsecs),
-                    None => "渲染 Vulkan 视频帧失败".to_string(),
-                })?;
-            render_image_from_bgra(
-                pixels,
-                request.output_size.width,
-                request.output_size.height,
-            )
+                .tone_map_vulkan_to_bgra8(&vulkan, source_size, output_size)
+        })();
+
+        match direct_result {
+            Ok(pixels) => {
+                return render_image_from_bgra(pixels, output_size.width, output_size.height);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    format = ?vulkan.format,
+                    device = vulkan.device.key(),
+                    "Vulkan direct video render failed; using software-download fallback"
+                );
+                vulkan_direct_fallback.insert(fallback_key);
+                *tone_mapper = None;
+            }
         }
     }
+
+    render_vulkan_download_fallback(tone_mapper, &vulkan, source_size, output_size).with_context(
+        || match frame_pts {
+            Some(pts) => format!("Vulkan 视频帧降级渲染失败（PTS {}ns）", pts.nsecs),
+            None => "Vulkan 视频帧降级渲染失败".to_string(),
+        },
+    )
+}
+
+fn render_vulkan_download_fallback(
+    tone_mapper: &mut Option<LibplaceboToneMapper>,
+    vulkan: &VulkanVideoFrame,
+    source_size: RenderSize,
+    output_size: RenderSize,
+) -> Result<Arc<RenderImage>> {
+    let raw = download_vulkan_frame_to_raw(vulkan, source_size)?;
+    if tone_mapper.is_none() {
+        *tone_mapper = Some(LibplaceboToneMapper::new()?);
+    }
+    let pixels = tone_mapper
+        .as_mut()
+        .expect("tone mapper initialized")
+        .tone_map_to_bgra8(&raw, source_size, output_size)?;
+    render_image_from_bgra(pixels, output_size.width, output_size.height)
+}
+
+fn download_vulkan_frame_to_raw(
+    vulkan: &VulkanVideoFrame,
+    size: RenderSize,
+) -> Result<RawVideoFrame> {
+    let mut software_frame = SoftwareFrame::new()?;
+    let result = unsafe {
+        ffi::av_hwframe_transfer_data(software_frame.as_mut_ptr(), vulkan.frame.as_ptr(), 0)
+    };
+    if result < 0 {
+        return Err(anyhow!(
+            "FFmpeg 下载 Vulkan 视频帧失败：{}",
+            ffmpeg_error(result)
+        ));
+    }
+    unsafe {
+        let _ = ffi::av_frame_copy_props(software_frame.as_mut_ptr(), vulkan.frame.as_ptr());
+    }
+
+    Ok(RawVideoFrame {
+        format: vulkan.format,
+        color: vulkan.color,
+        range: vulkan.range,
+        chroma_site: vulkan.chroma_site,
+        metadata: vulkan.metadata.clone(),
+        planes: RawVideoPlanes::Owned(copy_raw_video_planes(
+            software_frame.as_ptr(),
+            vulkan.format,
+            size,
+        )?),
+    })
+}
+
+fn copy_raw_video_planes(
+    frame: *const ffi::AVFrame,
+    format: RawVideoFormat,
+    size: RenderSize,
+) -> Result<Vec<RawVideoPlane>> {
+    let mut planes = Vec::with_capacity(format.plane_count());
+    for plane_index in 0..format.plane_count() {
+        let layout = format.plane_layout(size, plane_index)?;
+        let data = unsafe { (*frame).data[plane_index] };
+        if data.is_null() {
+            return Err(anyhow!("FFmpeg raw 视频帧缺少平面数据"));
+        }
+        let stride = unsafe { (*frame).linesize[plane_index] };
+        if stride <= 0 {
+            return Err(anyhow!("FFmpeg raw 视频帧 stride 无效"));
+        }
+        let stride =
+            usize::try_from(stride).map_err(|_| anyhow!("FFmpeg raw 视频帧 stride 无效"))?;
+        if stride < layout.row_len {
+            return Err(anyhow!("FFmpeg raw 视频帧 stride 小于行宽"));
+        }
+        let height = usize::try_from(layout.height).map_err(|_| anyhow!("视频帧过高"))?;
+        let len = layout
+            .row_len
+            .checked_mul(height)
+            .ok_or_else(|| anyhow!("视频帧平面过大"))?;
+        let mut bytes = Vec::with_capacity(len);
+        for row in 0..height {
+            let row_start = row
+                .checked_mul(stride)
+                .ok_or_else(|| anyhow!("视频帧平面过大"))?;
+            let row_data = unsafe { slice::from_raw_parts(data.add(row_start), layout.row_len) };
+            bytes.extend_from_slice(row_data);
+        }
+        planes.push(RawVideoPlane {
+            data: PooledBytes::from_vec(bytes),
+            stride: layout.row_len,
+        });
+    }
+    Ok(planes)
+}
+
+struct SoftwareFrame {
+    ptr: *mut ffi::AVFrame,
+}
+
+impl SoftwareFrame {
+    fn new() -> Result<Self> {
+        let ptr = unsafe { ffi::av_frame_alloc() };
+        if ptr.is_null() {
+            return Err(anyhow!("FFmpeg 分配 Vulkan 降级 frame 失败"));
+        }
+        Ok(Self { ptr })
+    }
+
+    fn as_ptr(&self) -> *const ffi::AVFrame {
+        self.ptr
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut ffi::AVFrame {
+        self.ptr
+    }
+}
+
+impl Drop for SoftwareFrame {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { ffi::av_frame_free(&mut self.ptr) };
+        }
+    }
+}
+
+fn ffmpeg_error(result: c_int) -> String {
+    let mut buffer = [0; 128];
+    let status = unsafe { ffi::av_strerror(result, buffer.as_mut_ptr(), buffer.len()) };
+    if status < 0 {
+        return format!("FFmpeg error {result}");
+    }
+    unsafe { CStr::from_ptr(buffer.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn duration_to_nsecs(duration: Duration) -> u64 {

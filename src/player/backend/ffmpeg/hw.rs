@@ -281,7 +281,7 @@ pub(super) fn vulkan_frame_planes(
         planes.truncate(raw_format.plane_count());
     }
     Ok(VulkanFrameImages {
-        usage: vk_frames.usage as u32,
+        usage: vk_frames.usage,
         planes,
     })
 }

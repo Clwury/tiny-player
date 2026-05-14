@@ -104,6 +104,26 @@ fn open_audio_decoder(
     }
 }
 
+fn frame_rate_from_duration(frame_duration_nsecs: Option<u64>) -> Option<f64> {
+    let duration = frame_duration_nsecs?;
+    if duration == 0 {
+        return None;
+    }
+    Some(1_000_000_000.0 / duration as f64)
+}
+
+fn playback_video_info(
+    video_stream: StreamInfo,
+    video_decoder: &Decoder,
+) -> Option<PlaybackVideoInfo> {
+    Some(PlaybackVideoInfo {
+        decoder: video_decoder.decoder_name(),
+        size: video_decoder.size().ok()?,
+        frame_rate: frame_rate_from_duration(video_stream.frame_duration_nsecs),
+        hardware_accelerated: video_decoder.is_hardware_accelerated(),
+    })
+}
+
 pub(super) fn run_ffmpeg_playback(
     source: FfmpegPlaybackInput,
     frame_slot: FrameSlot,
@@ -181,6 +201,10 @@ pub(super) fn run_ffmpeg_playback(
             BackendEventKind::DurationChanged(duration),
         ));
     }
+    let _ = event_tx.send(BackendEvent::new(
+        current_session_id,
+        BackendEventKind::PlaybackInfoChanged(playback_video_info(video_stream, &video_decoder)),
+    ));
     let duration_seconds = input.duration_seconds();
 
     let mut packet = AvPacket::new()?;

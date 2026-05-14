@@ -10,21 +10,55 @@ pub(super) struct UploadedSourceFrame {
 struct WrappedVulkanPlane {
     texture: ffi::pl_tex,
     plane_index: usize,
-    queue_family: u32,
-    semaphore: ffi::VkSemaphore,
-    next_semaphore_value: u64,
     held_by_user: bool,
 }
 
-const VK_IMAGE_USAGE_SAMPLED_BIT: ffi::VkImageUsageFlags = 0x0000_0004;
-const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: ffi::VkImageUsageFlags = 0x0000_0001;
+pub(super) struct AvVulkanFrameAccess {
+    frames: *mut ffmpeg_vulkan::AVHWFramesContext,
+    vulkan_frames: *mut ffmpeg_vulkan::AVVulkanFramesContext,
+    vulkan_frame: *mut ffmpeg_vulkan::AVVkFrame,
+    locked: bool,
+}
+
+struct WrappedVulkanTextureGuard {
+    gpu: ffi::pl_gpu,
+    texture: ffi::pl_tex,
+}
+
+impl WrappedVulkanTextureGuard {
+    unsafe fn new(gpu: ffi::pl_gpu, params: &ffi::pl_vulkan_wrap_params) -> Result<Self> {
+        let texture = unsafe { ffi::pl_vulkan_wrap(gpu, params) };
+        if texture.is_null() {
+            return Err(anyhow!("libplacebo 包装 Vulkan 视频帧失败"));
+        }
+        Ok(Self { gpu, texture })
+    }
+
+    fn texture(&self) -> ffi::pl_tex {
+        self.texture
+    }
+
+    fn into_texture(mut self) -> ffi::pl_tex {
+        let texture = self.texture;
+        self.texture = ptr::null();
+        texture
+    }
+}
+
+impl Drop for WrappedVulkanTextureGuard {
+    fn drop(&mut self) {
+        if !self.gpu.is_null() && !self.texture.is_null() {
+            unsafe {
+                ffi::pl_tex_destroy(self.gpu, &mut self.texture);
+            }
+        }
+    }
+}
+
+const VK_QUEUE_FAMILY_IGNORED: u32 = u32::MAX;
 
 fn vulkan_image_usage(usage: u32) -> ffi::VkImageUsageFlags {
-    if usage == 0 {
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-    } else {
-        usage as ffi::VkImageUsageFlags
-    }
+    usage as ffi::VkImageUsageFlags
 }
 
 impl LibplaceboToneMapper {
@@ -95,13 +129,13 @@ impl LibplaceboToneMapper {
         let mut frame = unsafe { mem::zeroed::<ffi::pl_frame>() };
         let expected_plane_count = input.format.plane_count();
         let single_multiplane_image = input.planes.len() == 1 && expected_plane_count > 1;
-        let frame_plane_count = if single_multiplane_image {
-            expected_plane_count
-        } else {
-            input.planes.len()
-        };
+        if !single_multiplane_image && input.planes.len() != expected_plane_count {
+            return Err(anyhow!(
+                "Vulkan video frame plane count does not match decoded format"
+            ));
+        }
         frame.num_planes =
-            i32::try_from(frame_plane_count).map_err(|_| anyhow!("too many Vulkan planes"))?;
+            i32::try_from(expected_plane_count).map_err(|_| anyhow!("too many Vulkan planes"))?;
         frame.repr = unsafe { source_color_repr(input.format, input.color, input.range) };
         frame.color = unsafe { source_color_space(input.color) };
         let dovi_metadata = prepared_dovi.map(|prepared| {
@@ -119,9 +153,6 @@ impl LibplaceboToneMapper {
             if plane.image == 0 {
                 return Err(anyhow!("Vulkan video plane has a null VkImage"));
             }
-            if plane.semaphore == 0 {
-                return Err(anyhow!("Vulkan video plane has a null semaphore"));
-            }
 
             let mut wrap_params = unsafe { mem::zeroed::<ffi::pl_vulkan_wrap_params>() };
             wrap_params.image = plane.image as ffi::VkImage;
@@ -132,23 +163,8 @@ impl LibplaceboToneMapper {
             wrap_params.format = plane.format as ffi::VkFormat;
             wrap_params.usage = vulkan_image_usage(input.usage);
 
-            let texture = unsafe { ffi::pl_vulkan_wrap(self.gpu, &wrap_params) };
-            if texture.is_null() {
-                return Err(anyhow!("libplacebo 包装 Vulkan 视频帧失败"));
-            }
-
-            let release = ffi::pl_vulkan_release_params {
-                tex: texture,
-                layout: plane.layout as ffi::VkImageLayout,
-                qf: plane.queue_family,
-                semaphore: ffi::pl_vulkan_sem {
-                    sem: plane.semaphore as ffi::VkSemaphore,
-                    value: plane.semaphore_value,
-                },
-            };
-            unsafe { ffi::pl_vulkan_release_ex(self.gpu, &release) };
-
-            let format = unsafe { (*texture).params.format };
+            let texture = unsafe { WrappedVulkanTextureGuard::new(self.gpu, &wrap_params)? };
+            let format = unsafe { (*texture.texture()).params.format };
             let texture_plane_count = if format.is_null() {
                 0
             } else {
@@ -159,7 +175,7 @@ impl LibplaceboToneMapper {
             }
 
             for plane_index in 0..expected_plane_count {
-                let plane_texture = unsafe { (*texture).planes[plane_index] };
+                let plane_texture = unsafe { (*texture.texture()).planes[plane_index] };
                 if plane_texture.is_null() {
                     return Err(anyhow!("libplacebo Vulkan 多平面纹理子平面为空"));
                 }
@@ -177,20 +193,14 @@ impl LibplaceboToneMapper {
                 frame.planes[plane_index] = out_plane;
             }
             wrapped_vulkan_planes.push(WrappedVulkanPlane {
-                texture,
+                texture: texture.into_texture(),
                 plane_index: 0,
-                queue_family: plane.queue_family,
-                semaphore: plane.semaphore as ffi::VkSemaphore,
-                next_semaphore_value: plane.semaphore_value.saturating_add(1),
-                held_by_user: false,
+                held_by_user: true,
             });
         } else {
             for (plane_index, plane) in input.planes.iter().enumerate() {
                 if plane.image == 0 {
                     return Err(anyhow!("Vulkan video plane has a null VkImage"));
-                }
-                if plane.semaphore == 0 {
-                    return Err(anyhow!("Vulkan video plane has a null semaphore"));
                 }
 
                 let layout = input
@@ -205,24 +215,9 @@ impl LibplaceboToneMapper {
                 wrap_params.format = plane.format as ffi::VkFormat;
                 wrap_params.usage = vulkan_image_usage(input.usage);
 
-                let texture = unsafe { ffi::pl_vulkan_wrap(self.gpu, &wrap_params) };
-                if texture.is_null() {
-                    return Err(anyhow!("libplacebo 包装 Vulkan 视频帧失败"));
-                }
-
-                let release = ffi::pl_vulkan_release_params {
-                    tex: texture,
-                    layout: plane.layout as ffi::VkImageLayout,
-                    qf: plane.queue_family,
-                    semaphore: ffi::pl_vulkan_sem {
-                        sem: plane.semaphore as ffi::VkSemaphore,
-                        value: plane.semaphore_value,
-                    },
-                };
-                unsafe { ffi::pl_vulkan_release_ex(self.gpu, &release) };
-
+                let texture = unsafe { WrappedVulkanTextureGuard::new(self.gpu, &wrap_params)? };
                 let mut out_plane = unsafe { mem::zeroed::<ffi::pl_plane>() };
-                out_plane.texture = texture;
+                out_plane.texture = texture.texture();
                 out_plane.flipped = false;
                 out_plane.shift_x = 0.0;
                 out_plane.shift_y = 0.0;
@@ -231,12 +226,9 @@ impl LibplaceboToneMapper {
                 out_plane.component_mapping = layout.component_map;
                 frame.planes[plane_index] = out_plane;
                 wrapped_vulkan_planes.push(WrappedVulkanPlane {
-                    texture,
+                    texture: texture.into_texture(),
                     plane_index,
-                    queue_family: plane.queue_family,
-                    semaphore: plane.semaphore as ffi::VkSemaphore,
-                    next_semaphore_value: plane.semaphore_value.saturating_add(1),
-                    held_by_user: false,
+                    held_by_user: true,
                 });
             }
         }
@@ -357,37 +349,64 @@ impl LibplaceboToneMapper {
 }
 
 impl UploadedSourceFrame {
+    pub(super) unsafe fn release_vulkan_images_for_render(
+        &mut self,
+        input: &VulkanVideoFrame,
+    ) -> Result<AvVulkanFrameAccess> {
+        let access = unsafe { AvVulkanFrameAccess::lock(input)? };
+        for plane in &mut self.wrapped_vulkan_planes {
+            let plane_index = plane.plane_index;
+            let release = ffi::pl_vulkan_release_params {
+                tex: plane.texture,
+                layout: unsafe { access.layout(plane_index)? },
+                qf: VK_QUEUE_FAMILY_IGNORED,
+                semaphore: unsafe { access.semaphore(plane_index)? },
+            };
+            unsafe { ffi::pl_vulkan_release_ex(self.gpu, &release) };
+            plane.held_by_user = false;
+        }
+        Ok(access)
+    }
+
     pub(super) unsafe fn hold_vulkan_images_after_render(
         &mut self,
         gpu: ffi::pl_gpu,
-        input: &VulkanVideoFrame,
+        access: &mut AvVulkanFrameAccess,
     ) -> Result<()> {
+        let mut hold_error = None;
         for plane in &mut self.wrapped_vulkan_planes {
+            let plane_index = plane.plane_index;
+            let next_semaphore_value = unsafe { access.next_semaphore_value(plane_index)? };
             let mut out_layout = 0;
             let hold = ffi::pl_vulkan_hold_params {
                 tex: plane.texture,
                 layout: 0,
                 out_layout: &mut out_layout,
-                qf: plane.queue_family,
+                qf: VK_QUEUE_FAMILY_IGNORED,
                 semaphore: ffi::pl_vulkan_sem {
-                    sem: plane.semaphore,
-                    value: plane.next_semaphore_value,
+                    sem: unsafe { access.semaphore_handle(plane_index)? },
+                    value: next_semaphore_value,
                 },
             };
-            if !unsafe { ffi::pl_vulkan_hold_ex(gpu, &hold) } {
-                return Err(anyhow!("libplacebo 释放 Vulkan 视频帧控制权失败"));
+            if unsafe { ffi::pl_vulkan_hold_ex(gpu, &hold) } {
+                unsafe {
+                    access.update_plane_after_hold(
+                        plane_index,
+                        out_layout,
+                        next_semaphore_value,
+                    )?;
+                }
+                plane.held_by_user = true;
+            } else {
+                hold_error
+                    .get_or_insert_with(|| anyhow!("libplacebo 释放 Vulkan 视频帧控制权失败"));
             }
-            unsafe {
-                update_vulkan_frame_plane_state(
-                    input,
-                    plane.plane_index,
-                    out_layout,
-                    plane.next_semaphore_value,
-                )?;
-            }
-            plane.held_by_user = true;
         }
-        Ok(())
+        unsafe { access.unlock() };
+        match hold_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -405,26 +424,110 @@ impl Drop for UploadedSourceFrame {
     }
 }
 
-unsafe fn update_vulkan_frame_plane_state(
-    input: &VulkanVideoFrame,
-    plane_index: usize,
-    layout: ffi::VkImageLayout,
-    semaphore_value: u64,
-) -> Result<()> {
-    let frame = input.frame.as_ptr() as *mut ffmpeg_ffi::AVFrame;
-    if frame.is_null() {
-        return Err(anyhow!("Vulkan video frame reference is null"));
+impl AvVulkanFrameAccess {
+    unsafe fn lock(input: &VulkanVideoFrame) -> Result<Self> {
+        let frame = input.frame.as_ptr() as *mut ffmpeg_ffi::AVFrame;
+        if frame.is_null() {
+            return Err(anyhow!("Vulkan video frame reference is null"));
+        }
+        let hw_frames_ref = unsafe { (*frame).hw_frames_ctx };
+        if hw_frames_ref.is_null() {
+            return Err(anyhow!("Vulkan video frame is missing hw_frames_ctx"));
+        }
+        let frames = unsafe { (*hw_frames_ref).data as *mut ffmpeg_vulkan::AVHWFramesContext };
+        if frames.is_null() {
+            return Err(anyhow!("Vulkan video frame is missing AVHWFramesContext"));
+        }
+        let vulkan_frames = unsafe { (*frames).hwctx as *mut ffmpeg_vulkan::AVVulkanFramesContext };
+        if vulkan_frames.is_null() {
+            return Err(anyhow!(
+                "Vulkan video frame is missing AVVulkanFramesContext"
+            ));
+        }
+        let vulkan_frame = unsafe { (*frame).data[0] as *mut ffmpeg_vulkan::AVVkFrame };
+        if vulkan_frame.is_null() {
+            return Err(anyhow!("Vulkan video frame is missing AVVkFrame"));
+        }
+
+        let mut access = Self {
+            frames,
+            vulkan_frames,
+            vulkan_frame,
+            locked: false,
+        };
+        if let Some(lock_frame) = unsafe { (*vulkan_frames).lock_frame } {
+            unsafe { lock_frame(frames, vulkan_frame) };
+            access.locked = true;
+        }
+        Ok(access)
     }
-    let vk_frame = unsafe { (*frame).data[0] as *mut ffmpeg_vulkan::AVVkFrame };
-    if vk_frame.is_null() {
-        return Err(anyhow!("Vulkan video frame is missing AVVkFrame"));
+
+    unsafe fn layout(&self, plane_index: usize) -> Result<ffi::VkImageLayout> {
+        if plane_index >= unsafe { (*self.vulkan_frame).layout.len() } {
+            return Err(anyhow!("invalid Vulkan video plane index"));
+        }
+        Ok(unsafe { (*self.vulkan_frame).layout[plane_index] as ffi::VkImageLayout })
     }
-    if plane_index >= unsafe { (*vk_frame).layout.len() } {
-        return Err(anyhow!("invalid Vulkan video plane index"));
+
+    unsafe fn semaphore(&self, plane_index: usize) -> Result<ffi::pl_vulkan_sem> {
+        Ok(ffi::pl_vulkan_sem {
+            sem: unsafe { self.semaphore_handle(plane_index)? },
+            value: unsafe { self.semaphore_value(plane_index)? },
+        })
     }
-    unsafe {
-        (*vk_frame).layout[plane_index] = layout as ffmpeg_vulkan::VkImageLayout;
-        (*vk_frame).sem_value[plane_index] = semaphore_value;
+
+    unsafe fn semaphore_handle(&self, plane_index: usize) -> Result<ffi::VkSemaphore> {
+        if plane_index >= unsafe { (*self.vulkan_frame).sem.len() } {
+            return Err(anyhow!("invalid Vulkan video plane index"));
+        }
+        let semaphore = unsafe { (*self.vulkan_frame).sem[plane_index] as ffi::VkSemaphore };
+        if semaphore.is_null() {
+            return Err(anyhow!("Vulkan video plane has a null semaphore"));
+        }
+        Ok(semaphore)
     }
-    Ok(())
+
+    unsafe fn semaphore_value(&self, plane_index: usize) -> Result<u64> {
+        if plane_index >= unsafe { (*self.vulkan_frame).sem_value.len() } {
+            return Err(anyhow!("invalid Vulkan video plane index"));
+        }
+        Ok(unsafe { (*self.vulkan_frame).sem_value[plane_index] })
+    }
+
+    unsafe fn next_semaphore_value(&self, plane_index: usize) -> Result<u64> {
+        Ok(unsafe { self.semaphore_value(plane_index)? }.saturating_add(1))
+    }
+
+    unsafe fn update_plane_after_hold(
+        &mut self,
+        plane_index: usize,
+        layout: ffi::VkImageLayout,
+        semaphore_value: u64,
+    ) -> Result<()> {
+        if plane_index >= unsafe { (*self.vulkan_frame).layout.len() } {
+            return Err(anyhow!("invalid Vulkan video plane index"));
+        }
+        unsafe {
+            (*self.vulkan_frame).layout[plane_index] = layout as ffmpeg_vulkan::VkImageLayout;
+            (*self.vulkan_frame).access[plane_index] = 0 as ffmpeg_vulkan::VkAccessFlagBits;
+            (*self.vulkan_frame).sem_value[plane_index] = semaphore_value;
+        }
+        Ok(())
+    }
+
+    unsafe fn unlock(&mut self) {
+        if !self.locked {
+            return;
+        }
+        if let Some(unlock_frame) = unsafe { (*self.vulkan_frames).unlock_frame } {
+            unsafe { unlock_frame(self.frames, self.vulkan_frame) };
+        }
+        self.locked = false;
+    }
+}
+
+impl Drop for AvVulkanFrameAccess {
+    fn drop(&mut self) {
+        unsafe { self.unlock() };
+    }
 }

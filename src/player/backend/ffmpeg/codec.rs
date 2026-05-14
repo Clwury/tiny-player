@@ -177,6 +177,15 @@ impl Decoder {
         self.video_hw.as_ref().map(VideoHwDecodeContext::device)
     }
 
+    pub(super) fn decoder_name(&self) -> String {
+        let decoder = unsafe { (*self.ptr).codec };
+        decoder_name(decoder)
+    }
+
+    pub(super) fn is_hardware_accelerated(&self) -> bool {
+        self.video_hw.is_some()
+    }
+
     fn receive_frames<F>(
         &self,
         frame: &mut AvFrame,

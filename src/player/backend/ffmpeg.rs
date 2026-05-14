@@ -22,7 +22,7 @@ use ffmpeg_sys_next as ffi;
 
 use super::{
     BackendControl, BackendError, BackendEvent, BackendEventKind, BackendLoadRequest,
-    HttpStreamBufferProgress, Result,
+    HttpStreamBufferProgress, PlaybackVideoInfo, Result,
 };
 use crate::player::{
     dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat},

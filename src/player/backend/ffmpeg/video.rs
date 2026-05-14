@@ -28,21 +28,6 @@ impl VideoFrameConverter {
             let sw_format = vulkan_sw_format(frame)
                 .and_then(ffmpeg_raw_video_format)
                 .ok_or_else(|| "FFmpeg Vulkan 帧缺少可识别的软件像素格式".to_string())?;
-            if should_download_vulkan_frame(sw_format) {
-                let raw = download_vulkan_frame_to_raw(
-                    frame,
-                    sw_format,
-                    size,
-                    dovi_metadata,
-                    &self.buffer_pool,
-                )?;
-                return Ok(DecodedFrame {
-                    size,
-                    pts: None,
-                    key_frame,
-                    pixels: FramePixels::RawVideo(raw),
-                });
-            }
             let vulkan =
                 vulkan_video_frame_from_av_frame(decoder, frame, sw_format, dovi_metadata)?;
             return Ok(DecodedFrame {
@@ -77,10 +62,6 @@ impl VideoFrameConverter {
     }
 }
 
-fn should_download_vulkan_frame(format: RawVideoFormat) -> bool {
-    format == RawVideoFormat::Nv12
-}
-
 pub(super) fn vulkan_video_frame_from_av_frame(
     decoder: &Decoder,
     frame: *mut ffi::AVFrame,
@@ -110,39 +91,6 @@ pub(super) fn vulkan_video_frame_from_av_frame(
         metadata,
         planes: frame_images.planes,
     })
-}
-
-fn download_vulkan_frame_to_raw(
-    frame: *mut ffi::AVFrame,
-    format: RawVideoFormat,
-    size: RenderSize,
-    dovi_metadata: Option<DoviFrameMetadata>,
-    buffer_pool: &FrameBufferPool,
-) -> std::result::Result<RawVideoFrame, String> {
-    let mut software_frame = AvFrame::new()?;
-    let result = unsafe { ffi::av_hwframe_transfer_data(software_frame.as_mut_ptr(), frame, 0) };
-    if result < 0 {
-        return Err(format!(
-            "FFmpeg 下载 Vulkan 视频帧失败：{}",
-            ffmpeg_error(result)
-        ));
-    }
-    unsafe {
-        let _ = ffi::av_frame_copy_props(software_frame.as_mut_ptr(), frame);
-        (*software_frame.as_mut_ptr()).format = match format {
-            RawVideoFormat::P010Le => ffi::AVPixelFormat::AV_PIX_FMT_P010LE as c_int,
-            RawVideoFormat::I42010Le => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P10LE as c_int,
-            RawVideoFormat::Nv12 => ffi::AVPixelFormat::AV_PIX_FMT_NV12 as c_int,
-            RawVideoFormat::I420 => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as c_int,
-        };
-    }
-    raw_video_frame_from_av_frame(
-        software_frame.as_mut_ptr(),
-        size,
-        dovi_metadata,
-        buffer_pool,
-    )?
-    .ok_or_else(|| "FFmpeg 下载后的 Vulkan 视频帧格式不可识别".to_string())
 }
 
 pub(super) fn raw_video_frame_from_av_frame(

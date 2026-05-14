@@ -3,7 +3,10 @@ mod ffmpeg;
 
 use crate::player::render_host::FrameSlot;
 
-pub use events::{BackendError, BackendEvent, BackendEventKind, HttpStreamBufferProgress, Result};
+pub use events::{
+    BackendError, BackendEvent, BackendEventKind, HttpStreamBufferProgress, PlaybackVideoInfo,
+    Result,
+};
 pub use ffmpeg::FfmpegBackend;
 
 #[derive(Clone, Debug, PartialEq)]

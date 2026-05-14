@@ -1,10 +1,10 @@
 use std::{fmt, sync::Arc};
 
 use gpui::{
-    Bounds, Context, DragMoveEvent, EventEmitter, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, SharedString,
-    StatefulInteractiveElement, Styled, Window, canvas, div, prelude::*, px, relative, rgb, rgba,
-    svg,
+    Bounds, Context, DragMoveEvent, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, Pixels, Render,
+    RenderImage, SharedString, StatefulInteractiveElement, Styled, Window, canvas, div, prelude::*,
+    px, relative, rgb, rgba, svg,
 };
 
 use crate::theme;
@@ -12,7 +12,7 @@ use crate::theme;
 use super::{
     backend::{
         BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest, FfmpegBackend,
-        HttpStreamBufferProgress,
+        HttpStreamBufferProgress, PlaybackVideoInfo,
     },
     render_host::RenderSize,
     video_presenter::VideoPresenter,
@@ -64,6 +64,7 @@ pub enum PlaybackEvent {
 }
 
 pub struct PlaybackPage {
+    focus_handle: FocusHandle,
     title: SharedString,
     video: ShutdownOrder<PlaybackBackend, VideoPresenter>,
     video_viewport_bounds: Option<Bounds<Pixels>>,
@@ -80,6 +81,8 @@ pub struct PlaybackPage {
     progress_track_bounds: Option<Bounds<Pixels>>,
     progress_drag_position: Option<f64>,
     current_file_loaded: bool,
+    playback_info_overlay_visible: bool,
+    playback_info: Option<PlaybackVideoInfo>,
     error_message: Option<SharedString>,
     status_message: SharedString,
 }
@@ -87,7 +90,7 @@ pub struct PlaybackPage {
 impl EventEmitter<PlaybackEvent> for PlaybackPage {}
 
 impl PlaybackPage {
-    pub fn new(request: PlaybackRequest, _cx: &mut Context<Self>) -> Self {
+    pub fn new(request: PlaybackRequest, cx: &mut Context<Self>) -> Self {
         let mut error_message = None;
         let status_message = "正在加载视频…".into();
 
@@ -119,6 +122,7 @@ impl PlaybackPage {
         };
 
         Self {
+            focus_handle: cx.focus_handle(),
             title: request.title,
             video: ShutdownOrder::new(backend, video_presenter),
             video_viewport_bounds: None,
@@ -135,6 +139,8 @@ impl PlaybackPage {
             progress_track_bounds: None,
             progress_drag_position: None,
             current_file_loaded: false,
+            playback_info_overlay_visible: false,
+            playback_info: None,
             error_message,
             status_message,
         }
@@ -193,6 +199,24 @@ impl PlaybackPage {
                 self.playback_buffering = false;
             }
         }
+        cx.notify();
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.is_held
+            || event.keystroke.modifiers.modified()
+            || !event.keystroke.key.eq_ignore_ascii_case("i")
+        {
+            return;
+        }
+
+        self.playback_info_overlay_visible = !self.playback_info_overlay_visible;
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -365,6 +389,7 @@ impl PlaybackPage {
                 BackendEventKind::LoadFailed(message) => {
                     self.current_file_loaded = false;
                     self.video_source_size = None;
+                    self.playback_info = None;
                     self.playback_paused = true;
                     self.playback_buffering = false;
                     self.playback_buffered_until = None;
@@ -378,6 +403,7 @@ impl PlaybackPage {
                 BackendEventKind::Fatal(message) => {
                     self.current_file_loaded = false;
                     self.video_source_size = None;
+                    self.playback_info = None;
                     self.playback_paused = true;
                     self.playback_buffering = false;
                     self.playback_buffered_until = None;
@@ -400,10 +426,16 @@ impl PlaybackPage {
                             playback_status_message(buffering, self.current_frame.is_some());
                     }
                 }
+                BackendEventKind::PlaybackInfoChanged(info) => {
+                    self.playback_info = info;
+                }
                 BackendEventKind::VideoSizeChanged(size) => {
                     if self.video_source_size != size {
                         self.video_source_size = size;
                         self.clear_visible_frame(window, cx);
+                    }
+                    if let (Some(info), Some(size)) = (self.playback_info.as_mut(), size) {
+                        info.size = size;
                     }
                 }
                 BackendEventKind::PositionChanged(position) => {
@@ -507,6 +539,49 @@ impl PlaybackPage {
             })
             .when(!enabled, |this| this.cursor_default().opacity(0.62))
             .child(svg().path(icon_path).size(icon_size).text_color(color))
+    }
+
+    fn render_playback_info_overlay(&self, cx: &Context<Self>) -> impl IntoElement {
+        let Some(info) = self.playback_info.as_ref() else {
+            return div().id("playback-info-overlay-empty").into_any_element();
+        };
+
+        let theme = theme::get(cx);
+        playback_info_segments(info)
+            .into_iter()
+            .fold(
+                div()
+                    .id("playback-info-overlay")
+                    .absolute()
+                    .right_4()
+                    .top_4()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme.input_border.opacity(0.42))
+                    .bg(rgba(0x000000a8))
+                    .px_3()
+                    .py_2()
+                    .shadow_lg()
+                    .occlude()
+                    .text_xs()
+                    .text_color(theme.foreground.opacity(0.9)),
+                |this, segment| {
+                    this.child(
+                        div()
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.0))
+                            .bg(theme.foreground.opacity(0.08))
+                            .px_2()
+                            .child(segment),
+                    )
+                },
+            )
+            .into_any_element()
     }
 
     fn render_progress_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -750,9 +825,35 @@ impl PlaybackPage {
     }
 }
 
+fn playback_info_segments(info: &PlaybackVideoInfo) -> Vec<String> {
+    let mut segments = vec![
+        info.decoder.clone(),
+        format!("{}x{}", info.size.width, info.size.height),
+    ];
+    if let Some(frame_rate) = info.frame_rate.and_then(valid_frame_rate) {
+        segments.push(format!("{frame_rate:.2} FPS"));
+    }
+    segments.push(if info.hardware_accelerated {
+        "HW".to_string()
+    } else {
+        "SW".to_string()
+    });
+    segments
+}
+
+fn valid_frame_rate(frame_rate: f64) -> Option<f64> {
+    frame_rate
+        .is_finite()
+        .then_some(frame_rate)
+        .filter(|rate| *rate > 0.0)
+}
+
 impl Render for PlaybackPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.poll_backend(window, cx);
+        if !self.focus_handle.is_focused(window) {
+            window.focus(&self.focus_handle);
+        }
 
         let current_frame = self.current_frame.clone();
         let current_video_frame = current_frame
@@ -795,11 +896,14 @@ impl Render for PlaybackPage {
         }
 
         div()
+            .key_context("PlaybackPage")
+            .track_focus(&self.focus_handle)
             .relative()
             .size_full()
             .overflow_hidden()
             .bg(rgb(0x000000))
             .text_color(rgb(0xe6edf3))
+            .on_key_down(cx.listener(Self::handle_key_down))
             .when(!window.is_maximized(), |this| {
                 this.rounded_b(theme.radius_lg).overflow_hidden()
             })
@@ -821,6 +925,9 @@ impl Render for PlaybackPage {
                 )
             })
             .child(viewport_observer)
+            .when(self.playback_info_overlay_visible, |this| {
+                this.child(self.render_playback_info_overlay(cx))
+            })
             .child(self.render_progress_bar(cx))
             .child(
                 div()

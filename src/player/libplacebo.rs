@@ -1,4 +1,4 @@
-use std::{ffi::CString, mem, os::raw::c_void, ptr};
+use std::{ffi::CString, mem, os::raw::c_void, ptr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use dolby_vision::rpu::{
@@ -43,6 +43,7 @@ pub struct LibplaceboToneMapper {
     target_texture: ffi::pl_tex,
     target_format: Option<OutputTextureFormat>,
     dovi_cache: DoviMetadataCache,
+    _vulkan_device: Option<Arc<VulkanDecodeDevice>>,
     vulkan_device_key: Option<usize>,
 }
 
@@ -65,7 +66,7 @@ impl LibplaceboToneMapper {
         }
     }
 
-    pub fn new_for_vulkan_decode(device: &VulkanDecodeDevice) -> Result<Self> {
+    pub fn new_for_vulkan_decode(device: Arc<VulkanDecodeDevice>) -> Result<Self> {
         unsafe {
             let mut params = mem::zeroed::<ffi::pl_vulkan_import_params>();
             params.instance = device.instance as ffi::VkInstance;
@@ -79,6 +80,9 @@ impl LibplaceboToneMapper {
             params.queue_compute = pl_queue(device.queues.graphics);
             params.queue_transfer = pl_queue(device.queues.graphics);
             params.no_compute = true;
+            params.lock_queue = Some(lock_ffmpeg_vulkan_queue);
+            params.unlock_queue = Some(unlock_ffmpeg_vulkan_queue);
+            params.queue_ctx = vulkan_device_context_from_ref(device.device_ref()).cast();
 
             let vulkan = ffi::pl_vulkan_import(ptr::null(), &params);
             if vulkan.is_null() {
@@ -90,13 +94,13 @@ impl LibplaceboToneMapper {
                 return Err(anyhow!("libplacebo 导入的 Vulkan 设备缺少 GPU"));
             }
 
-            Self::from_vulkan(vulkan, Some(device.key()))
+            Self::from_vulkan(vulkan, Some(device))
         }
     }
 
     unsafe fn from_vulkan(
         vulkan: ffi::pl_vulkan,
-        vulkan_device_key: Option<usize>,
+        vulkan_device: Option<Arc<VulkanDecodeDevice>>,
     ) -> Result<Self> {
         unsafe {
             let gpu = (*vulkan).gpu;
@@ -121,13 +125,16 @@ impl LibplaceboToneMapper {
                 target_texture: ptr::null(),
                 target_format: None,
                 dovi_cache: DoviMetadataCache::default(),
-                vulkan_device_key,
+                vulkan_device_key: vulkan_device
+                    .as_ref()
+                    .map(|device| vulkan_device_key(device)),
+                _vulkan_device: vulkan_device,
             })
         }
     }
 
     pub fn matches_vulkan_decode_device(&self, device: &VulkanDecodeDevice) -> bool {
-        self.vulkan_device_key == Some(device.key())
+        self.vulkan_device_key == Some(vulkan_device_key(device))
     }
 
     pub fn tone_map_to_bgra8(
@@ -191,13 +198,14 @@ impl LibplaceboToneMapper {
             let output_format = self.ensure_target_texture(output_size)?;
             let target = self.target_frame(output_size);
 
+            let mut vulkan_access = source.release_vulkan_images_for_render(input)?;
             let rendered = ffi::pl_render_image(
                 self.renderer,
                 &source.frame,
                 &target,
                 &ffi::pl_render_default_params,
             );
-            source.hold_vulkan_images_after_render(self.gpu, input)?;
+            source.hold_vulkan_images_after_render(self.gpu, &mut vulkan_access)?;
             if !rendered {
                 return Err(anyhow!("libplacebo 渲染 Vulkan 视频帧失败"));
             }
@@ -232,6 +240,10 @@ fn pl_queue(queue: VulkanDecodeQueue) -> ffi::pl_vulkan_queue {
     }
 }
 
+fn vulkan_device_key(device: &VulkanDecodeDevice) -> usize {
+    device.device_ref() as usize
+}
+
 fn get_proc_addr_from_usize(address: usize) -> ffi::PFN_vkGetInstanceProcAddr {
     if address == 0 {
         None
@@ -242,6 +254,41 @@ fn get_proc_addr_from_usize(address: usize) -> ffi::PFN_vkGetInstanceProcAddr {
                 unsafe extern "C" fn(ffi::VkInstance, *const i8) -> ffi::PFN_vkVoidFunction,
             >(address)
         })
+    }
+}
+
+unsafe fn vulkan_device_context_from_ref(
+    device_ref: *mut ffmpeg_ffi::AVBufferRef,
+) -> *mut ffmpeg_vulkan::AVHWDeviceContext {
+    if device_ref.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { (*device_ref).data as *mut ffmpeg_vulkan::AVHWDeviceContext }
+}
+
+unsafe extern "C" fn lock_ffmpeg_vulkan_queue(ctx: *mut c_void, qf: u32, qidx: u32) {
+    unsafe {
+        let device = ctx as *mut ffmpeg_vulkan::AVHWDeviceContext;
+        if device.is_null() {
+            return;
+        }
+        let vulkan = (*device).hwctx as *mut ffmpeg_vulkan::AVVulkanDeviceContext;
+        if let Some(lock_queue) = vulkan.as_ref().and_then(|vulkan| vulkan.lock_queue) {
+            lock_queue(device, qf, qidx);
+        }
+    }
+}
+
+unsafe extern "C" fn unlock_ffmpeg_vulkan_queue(ctx: *mut c_void, qf: u32, qidx: u32) {
+    unsafe {
+        let device = ctx as *mut ffmpeg_vulkan::AVHWDeviceContext;
+        if device.is_null() {
+            return;
+        }
+        let vulkan = (*device).hwctx as *mut ffmpeg_vulkan::AVVulkanDeviceContext;
+        if let Some(unlock_queue) = vulkan.as_ref().and_then(|vulkan| vulkan.unlock_queue) {
+            unlock_queue(device, qf, qidx);
+        }
     }
 }
 

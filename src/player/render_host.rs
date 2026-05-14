@@ -376,7 +376,7 @@ pub struct RawVideoPlane {
     pub stride: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RawVideoFormat {
     P010Le,
     I42010Le,
