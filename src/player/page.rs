@@ -1,10 +1,11 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use gpui::{
-    Bounds, Context, DragMoveEvent, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, Pixels, Render,
-    RenderImage, SharedString, StatefulInteractiveElement, Styled, Window, canvas, deferred, div,
-    prelude::*, px, relative, rgb, rgba, svg,
+    AppContext as _, Bounds, Context, CursorStyle, DragMoveEvent, EventEmitter, FocusHandle,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, RenderImage, SharedString,
+    StatefulInteractiveElement, Styled, Timer, Window, canvas, deferred, div, prelude::*, px,
+    relative, rgb, rgba, svg,
 };
 
 use crate::theme;
@@ -40,6 +41,12 @@ use render::{
 use runtime::{PlaybackBackend, ShutdownOrder};
 use video_element::VideoFrameElement;
 
+const KEYBOARD_SEEK_STEP_SECONDS: f64 = 5.0;
+const PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX: f32 = 24.0;
+const PLAYBACK_PROGRESS_BAR_HEIGHT_PX: f32 = 94.0;
+const FULLSCREEN_CONTROLS_HIDE_DELAY: Duration = Duration::from_secs(1);
+const FULLSCREEN_CONTROLS_HOT_ZONE_FRACTION: f32 = 0.5;
+
 #[derive(Clone)]
 pub struct PlaybackRequest {
     pub title: SharedString,
@@ -71,6 +78,16 @@ pub enum PlaybackEvent {
     Back,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaybackShortcut {
+    TogglePlayback,
+    ToggleFullscreen,
+    ExitFullscreen,
+    SeekBackward,
+    SeekForward,
+    ToggleInfoOverlay,
+}
+
 pub struct PlaybackPage {
     focus_handle: FocusHandle,
     title: SharedString,
@@ -90,6 +107,10 @@ pub struct PlaybackPage {
     progress_drag_position: Option<f64>,
     current_file_loaded: bool,
     playback_info_overlay_visible: bool,
+    fullscreen_cursor_visible: bool,
+    fullscreen_controls_visible: bool,
+    fullscreen_mouse_in_controls: bool,
+    fullscreen_controls_hide_generation: u64,
     playback_info: Option<PlaybackVideoInfo>,
     audio_tracks: Vec<PlaybackTrack>,
     subtitle_tracks: Vec<PlaybackTrack>,
@@ -102,6 +123,28 @@ pub struct PlaybackPage {
 }
 
 impl EventEmitter<PlaybackEvent> for PlaybackPage {}
+
+fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
+    if key == " " || key.eq_ignore_ascii_case("space") {
+        return Some(PlaybackShortcut::TogglePlayback);
+    }
+
+    if key.eq_ignore_ascii_case("p") {
+        Some(PlaybackShortcut::TogglePlayback)
+    } else if key.eq_ignore_ascii_case("f") {
+        Some(PlaybackShortcut::ToggleFullscreen)
+    } else if key.eq_ignore_ascii_case("escape") {
+        Some(PlaybackShortcut::ExitFullscreen)
+    } else if key.eq_ignore_ascii_case("left") {
+        Some(PlaybackShortcut::SeekBackward)
+    } else if key.eq_ignore_ascii_case("right") {
+        Some(PlaybackShortcut::SeekForward)
+    } else if key.eq_ignore_ascii_case("i") {
+        Some(PlaybackShortcut::ToggleInfoOverlay)
+    } else {
+        None
+    }
+}
 
 impl PlaybackPage {
     pub fn new(request: PlaybackRequest, cx: &mut Context<Self>) -> Self {
@@ -155,6 +198,10 @@ impl PlaybackPage {
             progress_drag_position: None,
             current_file_loaded: false,
             playback_info_overlay_visible: false,
+            fullscreen_cursor_visible: false,
+            fullscreen_controls_visible: false,
+            fullscreen_mouse_in_controls: false,
+            fullscreen_controls_hide_generation: 0,
             playback_info: None,
             audio_tracks: request.audio_tracks,
             subtitle_tracks: request.subtitle_tracks,
@@ -173,6 +220,58 @@ impl PlaybackPage {
 
     fn can_toggle_playback(&self) -> bool {
         self.current_file_loaded && self.error_message.is_none()
+    }
+
+    fn can_seek_playback(&self) -> bool {
+        self.current_file_loaded && self.error_message.is_none() && self.playback_duration.is_some()
+    }
+
+    fn progress_bar_visible(&self, is_fullscreen: bool) -> bool {
+        self.playback_duration.is_some()
+            && playback_progress_bar_visible(is_fullscreen, self.fullscreen_controls_visible)
+    }
+
+    fn reset_fullscreen_controls(&mut self) {
+        self.fullscreen_cursor_visible = false;
+        self.fullscreen_controls_visible = false;
+        self.fullscreen_mouse_in_controls = false;
+        self.fullscreen_controls_hide_generation =
+            self.fullscreen_controls_hide_generation.wrapping_add(1);
+        self.open_track_select = None;
+    }
+
+    fn schedule_fullscreen_controls_hide(&mut self, cx: &mut Context<Self>) {
+        self.fullscreen_controls_hide_generation =
+            self.fullscreen_controls_hide_generation.wrapping_add(1);
+        let generation = self.fullscreen_controls_hide_generation;
+
+        cx.spawn(async move |page, cx| {
+            Timer::after(FULLSCREEN_CONTROLS_HIDE_DELAY).await;
+            page.update(cx, |page, cx| {
+                page.hide_idle_fullscreen_controls(generation, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn hide_idle_fullscreen_controls(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if self.fullscreen_controls_hide_generation != generation
+            || self.fullscreen_mouse_in_controls
+            || self.progress_drag_position.is_some()
+        {
+            return;
+        }
+
+        let changed = self.fullscreen_cursor_visible
+            || self.fullscreen_controls_visible
+            || self.open_track_select.is_some();
+        self.fullscreen_cursor_visible = false;
+        self.fullscreen_controls_visible = false;
+        self.open_track_select = None;
+        if changed {
+            cx.notify();
+        }
     }
 
     fn back_to_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -197,6 +296,10 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
+        self.toggle_playback_pause_command(cx);
+    }
+
+    fn toggle_playback_pause_command(&mut self, cx: &mut Context<Self>) {
         if !self.can_toggle_playback() {
             return;
         }
@@ -367,19 +470,73 @@ impl PlaybackPage {
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.is_held
-            || event.keystroke.modifiers.modified()
-            || !event.keystroke.key.eq_ignore_ascii_case("i")
-        {
+        if event.is_held || event.keystroke.modifiers.modified() {
             return;
         }
 
-        self.playback_info_overlay_visible = !self.playback_info_overlay_visible;
+        let Some(shortcut) = playback_shortcut_for_key(&event.keystroke.key) else {
+            return;
+        };
+        if shortcut == PlaybackShortcut::ExitFullscreen && !window.is_fullscreen() {
+            return;
+        }
+
         cx.stop_propagation();
-        cx.notify();
+        match shortcut {
+            PlaybackShortcut::TogglePlayback => self.toggle_playback_pause_command(cx),
+            PlaybackShortcut::ToggleFullscreen => {
+                self.reset_fullscreen_controls();
+                window.toggle_fullscreen();
+                cx.notify();
+            }
+            PlaybackShortcut::ExitFullscreen => {
+                self.reset_fullscreen_controls();
+                window.toggle_fullscreen();
+                cx.notify();
+            }
+            PlaybackShortcut::SeekBackward => {
+                self.seek_relative(-KEYBOARD_SEEK_STEP_SECONDS, window, cx);
+            }
+            PlaybackShortcut::SeekForward => {
+                self.seek_relative(KEYBOARD_SEEK_STEP_SECONDS, window, cx);
+            }
+            PlaybackShortcut::ToggleInfoOverlay => {
+                self.playback_info_overlay_visible = !self.playback_info_overlay_visible;
+                cx.notify();
+            }
+        }
+    }
+
+    fn handle_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !window.is_fullscreen() {
+            return;
+        }
+
+        let bounds = window_viewport_bounds(window);
+        let in_controls = fullscreen_progress_controls_contains(event.position, bounds);
+        let in_hot_zone = fullscreen_controls_hot_zone_contains(event.position, bounds);
+
+        let controls_visible = self.fullscreen_controls_visible || in_controls || in_hot_zone;
+        let changed = !self.fullscreen_cursor_visible
+            || self.fullscreen_controls_visible != controls_visible
+            || self.fullscreen_mouse_in_controls != in_controls;
+
+        self.fullscreen_cursor_visible = true;
+        self.fullscreen_controls_visible = controls_visible;
+        self.fullscreen_mouse_in_controls = in_controls;
+        self.schedule_fullscreen_controls_hide(cx);
+
+        if changed {
+            cx.notify();
+        }
     }
 
     fn replace_visible_frame(
@@ -471,9 +628,32 @@ impl PlaybackPage {
     }
 
     fn commit_progress_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(position) = self.progress_drag_position.take() else {
+        let Some(position) = self.progress_drag_position else {
             return;
         };
+        self.seek_to_position(position, window, cx);
+    }
+
+    fn seek_relative(&mut self, delta_seconds: f64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_seek_playback() {
+            return;
+        }
+
+        let position = self
+            .progress_drag_position
+            .or(self.pending_seek_position)
+            .or(self.playback_position)
+            .unwrap_or(0.0)
+            + delta_seconds;
+        self.seek_to_position(position, window, cx);
+    }
+
+    fn seek_to_position(&mut self, position: f64, window: &mut Window, cx: &mut Context<Self>) {
+        let position = self
+            .playback_duration
+            .map(|duration| clamp_playback_position(position, duration))
+            .unwrap_or(position);
+        self.progress_drag_position = None;
         let uses_playable_cache_progress = self.video.owner().is_some();
         let keep_current_frame = self.current_frame.is_some()
             && is_seek_position_buffered(
@@ -757,7 +937,11 @@ impl PlaybackPage {
             .into_any_element()
     }
 
-    fn render_subtitle_overlay(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_subtitle_overlay(
+        &self,
+        progress_bar_visible: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let Some(cue) = self.active_subtitle.as_ref() else {
             return div()
                 .id("playback-subtitle-overlay-empty")
@@ -793,12 +977,16 @@ impl PlaybackPage {
             aspect_fit_bounds(video_bounds, bitmap_canvas_size).unwrap_or(video_fitted_bounds);
         let scale_x = bitmap_bounds.size.width / px(bitmap_canvas_size.width as f32);
         let scale_y = bitmap_bounds.size.height / px(bitmap_canvas_size.height as f32);
+        let subtitle_bottom =
+            subtitle_overlay_bottom(video_fitted_bounds, video_bounds, progress_bar_visible);
+        let bitmap_bottom_offset =
+            subtitle_bitmap_bottom_offset(cue, bitmap_bounds, scale_y, subtitle_bottom);
         let bitmap_overlay = cue.bitmaps.iter().fold(
             div()
                 .id("playback-subtitle-bitmap-overlay")
                 .absolute()
                 .left(bitmap_bounds.origin.x)
-                .top(bitmap_bounds.origin.y)
+                .top(bitmap_bounds.origin.y - bitmap_bottom_offset)
                 .w(bitmap_bounds.size.width)
                 .h(bitmap_bounds.size.height),
             |this, bitmap| this.child(render_subtitle_bitmap(bitmap, scale_x, scale_y)),
@@ -817,28 +1005,28 @@ impl PlaybackPage {
         }
 
         let theme = theme::get(cx);
+        let text_overlay_height =
+            subtitle_text_overlay_height_for_bottom(video_fitted_bounds, subtitle_bottom);
         overlay
             .child(
                 div()
                     .id("playback-subtitle-text-overlay")
                     .absolute()
                     .left(video_fitted_bounds.origin.x)
-                    .top(video_fitted_bounds.origin.y + video_fitted_bounds.size.height * 0.78)
+                    .top(video_fitted_bounds.origin.y)
                     .w(video_fitted_bounds.size.width)
+                    .h(text_overlay_height)
                     .flex()
                     .justify_center()
+                    .items_end()
                     .px_6()
-                    .occlude()
                     .child(
                         div()
                             .max_w(relative(0.86))
-                            .rounded(px(6.0))
-                            .bg(rgba(0x0000009c))
                             .px_3()
-                            .py_2()
                             .text_center()
-                            .text_lg()
-                            .line_height(px(28.0))
+                            .text_3xl()
+                            .line_height(px(36.0))
                             .text_color(theme.foreground)
                             .child(cue.text.clone()),
                     ),
@@ -955,8 +1143,8 @@ impl PlaybackPage {
         let current_time = format_playback_time(position);
         let duration_time = format_playback_time(duration);
         let view = cx.entity().downgrade();
-        let track_observer = canvas(
-            |bounds, _, _| bounds,
+        let track_observer = canvas(|bounds, _, _| bounds, {
+            let view = view.clone();
             move |_bounds, observed_bounds, window, _app| {
                 let view = view.clone();
                 window.on_next_frame(move |_, app| {
@@ -964,8 +1152,8 @@ impl PlaybackPage {
                         this.update_progress_track_bounds(observed_bounds, cx);
                     });
                 });
-            },
-        )
+            }
+        })
         .absolute()
         .size_full();
         let can_toggle_playback = self.can_toggle_playback();
@@ -985,11 +1173,11 @@ impl PlaybackPage {
             .id("playback-progress")
             .absolute()
             .left(relative(0.3))
-            .bottom_6()
+            .bottom(px(PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX))
             .flex()
             .flex_col()
             .w(relative(0.4))
-            .h(px(94.0))
+            .h(px(PLAYBACK_PROGRESS_BAR_HEIGHT_PX))
             .justify_center()
             .gap_2()
             .rounded(px(8.0))
@@ -999,6 +1187,7 @@ impl PlaybackPage {
             .px_4()
             .shadow_lg()
             .occlude()
+            .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .text_xs()
             .text_color(theme.foreground.opacity(0.86))
             .child(
@@ -1291,6 +1480,96 @@ fn local_video_viewport_bounds(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
     Bounds::new(gpui::point(px(0.0), px(0.0)), bounds.size)
 }
 
+fn window_viewport_bounds(window: &Window) -> Bounds<Pixels> {
+    Bounds::new(gpui::point(px(0.0), px(0.0)), window.viewport_size())
+}
+
+fn playback_progress_bar_visible(is_fullscreen: bool, fullscreen_controls_visible: bool) -> bool {
+    !is_fullscreen || fullscreen_controls_visible
+}
+
+fn fullscreen_controls_hot_zone_contains(
+    position: Point<Pixels>,
+    viewport_bounds: Bounds<Pixels>,
+) -> bool {
+    position.y
+        >= viewport_bounds.origin.y
+            + viewport_bounds.size.height * FULLSCREEN_CONTROLS_HOT_ZONE_FRACTION
+}
+
+fn fullscreen_progress_controls_contains(
+    position: Point<Pixels>,
+    viewport_bounds: Bounds<Pixels>,
+) -> bool {
+    playback_progress_bar_bounds(viewport_bounds).contains(&position)
+}
+
+fn playback_progress_bar_bounds(viewport_bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    Bounds::new(
+        gpui::point(
+            viewport_bounds.origin.x + viewport_bounds.size.width * 0.3,
+            viewport_bounds.origin.y + viewport_bounds.size.height
+                - px(PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX + PLAYBACK_PROGRESS_BAR_HEIGHT_PX),
+        ),
+        gpui::size(
+            viewport_bounds.size.width * 0.4,
+            px(PLAYBACK_PROGRESS_BAR_HEIGHT_PX),
+        ),
+    )
+}
+
+fn subtitle_overlay_bottom(
+    video_fitted_bounds: Bounds<Pixels>,
+    video_bounds: Bounds<Pixels>,
+    progress_bar_visible: bool,
+) -> Pixels {
+    let video_bottom = video_fitted_bounds.origin.y + video_fitted_bounds.size.height;
+    if progress_bar_visible {
+        let progress_top = video_bounds.size.height
+            - px(PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX + PLAYBACK_PROGRESS_BAR_HEIGHT_PX);
+        video_bottom.min(progress_top)
+    } else {
+        video_bottom
+    }
+}
+
+#[cfg(test)]
+fn subtitle_text_overlay_height(
+    video_fitted_bounds: Bounds<Pixels>,
+    video_bounds: Bounds<Pixels>,
+    progress_bar_visible: bool,
+) -> Pixels {
+    let bottom = subtitle_overlay_bottom(video_fitted_bounds, video_bounds, progress_bar_visible);
+    subtitle_text_overlay_height_for_bottom(video_fitted_bounds, bottom)
+}
+
+fn subtitle_text_overlay_height_for_bottom(
+    video_fitted_bounds: Bounds<Pixels>,
+    bottom: Pixels,
+) -> Pixels {
+    let top = video_fitted_bounds.origin.y;
+
+    if bottom > top { bottom - top } else { px(0.0) }
+}
+
+fn subtitle_bitmap_bottom_offset(
+    cue: &BackendSubtitleCue,
+    bitmap_bounds: Bounds<Pixels>,
+    scale_y: f32,
+    subtitle_bottom: Pixels,
+) -> Pixels {
+    let content_bottom = cue.bitmaps.iter().fold(None, |bottom, bitmap| {
+        let bitmap_bottom =
+            bitmap_bounds.origin.y + px(bitmap.y.saturating_add(bitmap.height) as f32) * scale_y;
+        Some(bottom.map_or(bitmap_bottom, |bottom: Pixels| bottom.max(bitmap_bottom)))
+    });
+
+    content_bottom
+        .filter(|content_bottom| *content_bottom > subtitle_bottom)
+        .map(|content_bottom| content_bottom - subtitle_bottom)
+        .unwrap_or(px(0.0))
+}
+
 fn subtitle_bitmap_canvas_size(cue: &BackendSubtitleCue) -> Option<RenderSize> {
     cue.bitmaps
         .iter()
@@ -1413,6 +1692,8 @@ impl Render for PlaybackPage {
             self.error_message.is_some() || current_frame.is_none() || self.playback_buffering;
         let message_text = self.message_text();
         let theme = theme::get(cx);
+        let is_fullscreen = window.is_fullscreen();
+        let progress_bar_visible = self.progress_bar_visible(is_fullscreen);
         let view = cx.entity().downgrade();
         let viewport_observer = canvas(
             |bounds, _, _| bounds,
@@ -1453,7 +1734,11 @@ impl Render for PlaybackPage {
             .bg(rgb(0x000000))
             .text_color(rgb(0xe6edf3))
             .on_key_down(cx.listener(Self::handle_key_down))
-            .when(!window.is_maximized(), |this| {
+            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+            .when(is_fullscreen && !self.fullscreen_cursor_visible, |this| {
+                this.cursor(CursorStyle::None)
+            })
+            .when(!window.is_maximized() && !is_fullscreen, |this| {
                 this.rounded_b(theme.radius_lg).overflow_hidden()
             })
             .when_some(current_video_frame, |this, frame| this.child(frame))
@@ -1477,38 +1762,50 @@ impl Render for PlaybackPage {
             .when(self.playback_info_overlay_visible, |this| {
                 this.child(self.render_playback_info_overlay(cx))
             })
-            .child(self.render_subtitle_overlay(cx))
-            .child(self.render_progress_bar(cx))
-            .child(
-                div()
-                    .id("playback-back-button")
-                    .absolute()
-                    .left_4()
-                    .top_4()
-                    .flex()
-                    .size(px(36.0))
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(theme.input_border.opacity(0.7))
-                    .bg(theme.dialog_background.opacity(0.72))
-                    .shadow_lg()
-                    .occlude()
-                    .cursor_pointer()
-                    .text_color(theme.foreground)
-                    .hover(move |style| style.bg(theme.secondary_hover))
-                    .child(
-                        svg()
-                            .path("icons/chevron-left.svg")
-                            .size(px(20.0))
-                            .text_color(theme.foreground),
-                    )
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::press_back_button))
-                    .on_mouse_up(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    }),
-            )
+            .when(is_fullscreen, |this| {
+                this.child(
+                    div()
+                        .id("playback-fullscreen-mouse-capture")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .on_mouse_move(cx.listener(Self::handle_mouse_move))
+                        .when(!self.fullscreen_cursor_visible, |this| {
+                            this.cursor(CursorStyle::None)
+                        }),
+                )
+            })
+            .child(self.render_subtitle_overlay(progress_bar_visible, cx))
+            .when(progress_bar_visible, |this| {
+                this.child(self.render_progress_bar(cx))
+            })
+            .when(!is_fullscreen, |this| {
+                this.child(
+                    div()
+                        .id("playback-back-button")
+                        .absolute()
+                        .left_4()
+                        .top_4()
+                        .flex()
+                        .size(px(32.0))
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .hover(move |style| style.bg(theme.secondary_hover))
+                        .child(
+                            svg()
+                                .path("icons/chevron-left.svg")
+                                .size(px(18.0))
+                                .text_color(theme.foreground),
+                        )
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::press_back_button))
+                        .on_mouse_up(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        }),
+                )
+            })
     }
 }
 

@@ -30,14 +30,18 @@ pub(super) fn load_external_subtitle_cues(
         .timeout(EXTERNAL_SUBTITLE_TIMEOUT)
         .build()
         .map_err(|error| format!("创建外挂字幕 HTTP 客户端失败：{error}"))?;
-    let mut request = client.get(url).header(
-        reqwest::header::ACCEPT,
-        "text/vtt,application/x-subrip,text/plain,*/*;q=0.7",
-    );
+    let mut request = client.get(url);
     for (name, value) in headers {
+        if name.as_str().eq_ignore_ascii_case("accept") {
+            continue;
+        }
         request = request.header(name, value);
     }
     let response = request
+        .header(
+            reqwest::header::ACCEPT,
+            "text/x-ass,text/ass,text/ssa,application/x-ass,text/vtt,application/x-subrip,text/plain,*/*;q=0.7",
+        )
         .send()
         .map_err(|error| format!("下载外挂字幕失败：{error}"))?
         .error_for_status()
@@ -48,13 +52,18 @@ pub(super) fn load_external_subtitle_cues(
     {
         return Err("外挂字幕文件过大".to_string());
     }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
     let bytes = response
         .bytes()
         .map_err(|error| format!("读取外挂字幕失败：{error}"))?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > EXTERNAL_SUBTITLE_MAX_BYTES {
         return Err("外挂字幕文件过大".to_string());
     }
-    let text = String::from_utf8_lossy(bytes.as_ref());
+    let text = decode_external_subtitle_text(bytes.as_ref(), content_type.as_deref());
     let cues = parse_external_subtitle_text(&text, codec, url);
     if cues.is_empty() {
         return Err("外挂字幕中没有可用文本 cue".to_string());
@@ -129,6 +138,26 @@ pub(super) fn decoded_subtitle_cues(
         end_offset_nsecs,
         pts_nsecs,
     }])
+}
+
+pub(super) fn decoded_subrip_packet_cue(
+    data: &[u8],
+    duration_nsecs: Option<u64>,
+) -> Option<DecodedSubtitleCue> {
+    let text = subrip_packet_text(data);
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    Some(DecodedSubtitleCue {
+        text,
+        bitmaps: Vec::new(),
+        start_offset_nsecs: 0,
+        end_offset_nsecs: duration_nsecs
+            .filter(|duration| *duration > 0)
+            .unwrap_or(FALLBACK_SUBTITLE_DURATION_NSECS),
+        pts_nsecs: None,
+    })
 }
 
 fn empty_decoded_subtitle_cues(
@@ -282,9 +311,7 @@ fn c_string(ptr: *const c_char) -> Option<String> {
 
 fn ass_dialogue_text(line: &str) -> String {
     let trimmed = line.trim();
-    let payload = trimmed
-        .strip_prefix("Dialogue:")
-        .or_else(|| trimmed.strip_prefix("Dialogue: "))
+    let payload = strip_ass_line_prefix(trimmed, "Dialogue:")
         .unwrap_or(trimmed)
         .trim_start();
     let mut fields = payload.splitn(10, ',');
@@ -331,6 +358,100 @@ fn normalize_subtitle_text(text: &str) -> String {
         .join("\n")
 }
 
+fn decode_external_subtitle_text(bytes: &[u8], content_type: Option<&str>) -> String {
+    let charset = content_type.and_then(content_type_charset);
+    match charset.as_deref() {
+        Some("utf-16") if bytes.starts_with(&[0xfe, 0xff]) => {
+            return decode_utf16_units(strip_utf16be_bom(bytes), false);
+        }
+        Some("utf-16") | Some("utf-16le") => {
+            return decode_utf16_units(strip_utf16le_bom(bytes), true);
+        }
+        Some("utf-16be") => return decode_utf16_units(strip_utf16be_bom(bytes), false),
+        Some("utf-8") | Some("utf8") => {
+            return String::from_utf8_lossy(strip_utf8_bom(bytes)).into_owned();
+        }
+        _ => {}
+    }
+
+    if let Some(bytes) = bytes.strip_prefix(&[0xff, 0xfe]) {
+        return decode_utf16_units(bytes, true);
+    }
+    if let Some(bytes) = bytes.strip_prefix(&[0xfe, 0xff]) {
+        return decode_utf16_units(bytes, false);
+    }
+    if looks_like_utf16(bytes, true) {
+        return decode_utf16_units(bytes, true);
+    }
+    if looks_like_utf16(bytes, false) {
+        return decode_utf16_units(bytes, false);
+    }
+
+    String::from_utf8_lossy(strip_utf8_bom(bytes)).into_owned()
+}
+
+fn content_type_charset(content_type: &str) -> Option<String> {
+    content_type.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        name.trim().eq_ignore_ascii_case("charset").then(|| {
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_ascii_lowercase()
+        })
+    })
+}
+
+fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes)
+}
+
+fn strip_utf16le_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(&[0xff, 0xfe]).unwrap_or(bytes)
+}
+
+fn strip_utf16be_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(&[0xfe, 0xff]).unwrap_or(bytes)
+}
+
+fn decode_utf16_units(bytes: &[u8], little_endian: bool) -> String {
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16_lossy(&units)
+}
+
+fn looks_like_utf16(bytes: &[u8], little_endian: bool) -> bool {
+    let sample_len = bytes.len().min(256);
+    if sample_len < 8 {
+        return false;
+    }
+    let mut nul_count = 0;
+    let mut paired_count = 0;
+    for (index, byte) in bytes.iter().take(sample_len).copied().enumerate() {
+        let expected_nul_position = if little_endian {
+            index % 2 == 1
+        } else {
+            index % 2 == 0
+        };
+        if expected_nul_position {
+            paired_count += 1;
+            if byte == 0 {
+                nul_count += 1;
+            }
+        }
+    }
+    nul_count > paired_count / 3
+}
+
 fn parse_external_subtitle_text(
     text: &str,
     codec: Option<&str>,
@@ -346,11 +467,14 @@ fn parse_external_subtitle_text(
 fn looks_like_ass(codec: Option<&str>, url: &str, text: &str) -> bool {
     codec
         .is_some_and(|codec| codec.eq_ignore_ascii_case("ass") || codec.eq_ignore_ascii_case("ssa"))
-        || url
-            .split('?')
-            .next()
-            .is_some_and(|path| path.ends_with(".ass") || path.ends_with(".ssa"))
-        || text.contains("[Events]") && text.contains("Dialogue:")
+        || url.split('?').next().is_some_and(|path| {
+            let path = path.to_ascii_lowercase();
+            path.ends_with(".ass") || path.ends_with(".ssa")
+        })
+        || {
+            let text = text.to_ascii_lowercase();
+            text.contains("[events]") && text.contains("dialogue:")
+        }
 }
 
 fn parse_srt_or_vtt_cues(text: &str) -> Vec<BackendSubtitleCue> {
@@ -412,15 +536,29 @@ fn parse_ass_cues(text: &str) -> Vec<BackendSubtitleCue> {
         "text".to_string(),
     ];
     let mut cues = Vec::new();
-    for line in normalized.lines().map(str::trim) {
-        if let Some(format) = line.strip_prefix("Format:") {
+    let mut saw_section = false;
+    let mut in_events_section = true;
+    for line in normalized
+        .lines()
+        .map(|line| line.trim().trim_start_matches('\u{feff}'))
+    {
+        if line.starts_with('[') && line.ends_with(']') {
+            saw_section = true;
+            in_events_section = line.eq_ignore_ascii_case("[Events]");
+            continue;
+        }
+        if saw_section && !in_events_section {
+            continue;
+        }
+
+        if let Some(format) = strip_ass_line_prefix(line, "Format:") {
             fields = format
                 .split(',')
                 .map(|field| field.trim().to_ascii_lowercase())
                 .collect();
             continue;
         }
-        let Some(dialogue) = line.strip_prefix("Dialogue:") else {
+        let Some(dialogue) = strip_ass_line_prefix(line, "Dialogue:") else {
             continue;
         };
         let field_count = fields.len().max(1);
@@ -438,6 +576,29 @@ fn parse_ass_cues(text: &str) -> Vec<BackendSubtitleCue> {
         }
     }
     cues
+}
+
+fn strip_ass_line_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = line.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    line.get(prefix.len()..)
+}
+
+fn subrip_packet_text(data: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(data).replace('\0', "");
+    let normalized = normalize_newlines(&raw);
+    let parsed_cues = parse_srt_or_vtt_cues(&normalized);
+    if !parsed_cues.is_empty() {
+        return parsed_cues
+            .into_iter()
+            .map(|cue| cue.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    normalize_subtitle_text(&normalized)
 }
 
 fn field_value<'a>(fields: &[String], parts: &'a [&'a str], name: &str) -> Option<&'a str> {
@@ -714,6 +875,33 @@ mod tests {
     }
 
     #[test]
+    fn decodes_embedded_subrip_packet_text() {
+        let cue =
+            decoded_subrip_packet_cue(b"<i>Hello</i>\\Nworld\0", Some(1_500_000_000)).unwrap();
+
+        assert_eq!(cue.text, "Hello\nworld");
+        assert_eq!(cue.start_offset_nsecs, 0);
+        assert_eq!(cue.end_offset_nsecs, 1_500_000_000);
+        assert_eq!(cue.pts_nsecs, None);
+        assert!(cue.bitmaps.is_empty());
+    }
+
+    #[test]
+    fn decodes_embedded_subrip_block_text() {
+        let cue = decoded_subrip_packet_cue(
+            b"1\r\n00:00:01,500 --> 00:00:03,000\r\n<i>Hello</i>\\Nworld\0",
+            Some(1_500_000_000),
+        )
+        .unwrap();
+
+        assert_eq!(cue.text, "Hello\nworld");
+        assert_eq!(cue.start_offset_nsecs, 0);
+        assert_eq!(cue.end_offset_nsecs, 1_500_000_000);
+        assert_eq!(cue.pts_nsecs, None);
+        assert!(cue.bitmaps.is_empty());
+    }
+
+    #[test]
     fn parses_ass_external_cues() {
         let cues = parse_external_subtitle_text(
             "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:02.00,0:00:04.50,Default,,0,0,0,,{\\an8}你好\\N世界\n",
@@ -727,6 +915,46 @@ mod tests {
                 "你好\n世界".to_string(),
                 2_000_000_000,
                 4_500_000_000,
+            )]
+        );
+    }
+
+    #[test]
+    fn parses_external_ass_cues_with_bom_lowercase_prefixes_and_style_format() {
+        let cues = parse_external_subtitle_text(
+            "\u{feff}[Script Info]\nTitle: chs&eng\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,Arial,48\n[Events]\nformat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\ndialogue: 0,0:00:05.25,0:00:06.75,Default,,0,0,0,,{\\an8}Hello\\N世界\n",
+            Some("ASS"),
+            "https://example.com/Stream.ASS?api_key=token",
+        );
+
+        assert_eq!(
+            cues,
+            vec![text_subtitle_cue(
+                "Hello\n世界".to_string(),
+                5_250_000_000,
+                6_750_000_000,
+            )]
+        );
+    }
+
+    #[test]
+    fn decodes_utf16_external_ass_text() {
+        let text = "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好\n";
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        let decoded = decode_external_subtitle_text(&bytes, Some("text/x-ass; charset=utf-16le"));
+        let cues =
+            parse_external_subtitle_text(&decoded, Some("ass"), "https://example.com/sub.ass");
+
+        assert_eq!(
+            cues,
+            vec![text_subtitle_cue(
+                "你好".to_string(),
+                1_000_000_000,
+                2_000_000_000,
             )]
         );
     }

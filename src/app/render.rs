@@ -115,6 +115,9 @@ impl Render for TinyApp {
         let title = self.title(cx);
         let add_server = cx.listener(Self::open_add_server_dialog);
         let show_add_server = !matches!(self.page, Page::Playback { .. });
+        let playback_fullscreen =
+            window.is_fullscreen() && matches!(self.page, Page::Playback { .. });
+        let rounded_window = !window.is_maximized() && !window.is_fullscreen();
         let close_dialog = cx.listener(Self::close_add_server_dialog);
         let close_menu = cx.listener(Self::close_server_menu);
         let submit_dialog = cx.listener(Self::submit_add_server_dialog);
@@ -124,7 +127,7 @@ impl Render for TinyApp {
         div()
             .relative()
             .size_full()
-            .when(!window.is_maximized(), |this| {
+            .when(rounded_window, |this| {
                 this.rounded(theme.radius_lg).overflow_hidden()
             })
             .child(
@@ -133,31 +136,26 @@ impl Render for TinyApp {
                     .flex_col()
                     .size_full()
                     .bg(theme.background)
-                    .when(!window.is_maximized(), |this| {
+                    .when(rounded_window, |this| {
                         this.rounded(theme.radius_lg).overflow_hidden()
                     })
-                    .child(
-                        div()
-                            .on_mouse_down(MouseButton::Left, close_menu)
-                            .child(app_titlebar(
-                                window,
-                                cx,
-                                title,
-                                show_add_server.then_some(add_server),
-                            )),
-                    )
-                    .child(self.render_content(!window.is_maximized(), cx)),
+                    .when(!playback_fullscreen, |this| {
+                        this.child(div().on_mouse_down(MouseButton::Left, close_menu).child(
+                            app_titlebar(window, cx, title, show_add_server.then_some(add_server)),
+                        ))
+                    })
+                    .child(self.render_content(rounded_window, cx)),
             )
             .when_some(dialog, |this, dialog| {
                 this.child(dialog.read(cx).render_layer(
                     dialog.clone(),
-                    !window.is_maximized(),
+                    rounded_window,
                     close_dialog,
                     submit_dialog,
                     cx,
                 ))
             })
-            .when(!window.is_maximized() && !modal_open, |this| {
+            .when(rounded_window && !modal_open, |this| {
                 this.children(resize_handles())
             })
     }

@@ -4,13 +4,16 @@ use gpui::{Bounds, point, px, size};
 
 use super::{
     AnimationFrameRequestState, BackendSubtitleBitmap, BackendSubtitleCue,
-    HttpStreamBufferProgress, PlaybackVideoInfo, RenderSize, ShutdownOrder, aspect_fit_bounds,
-    buffered_progress_fraction, clamp_playback_position, combined_buffered_until,
-    format_playback_time, http_stream_buffered_range_fractions, http_stream_buffered_until,
-    is_seek_position_buffered, local_video_viewport_bounds, normalize_video_viewport,
-    playback_info_segments, playback_status_message, progress_fraction,
-    progress_fraction_for_cursor, render_output_size, should_apply_backend_position,
-    should_render_frame, should_request_animation_frame, subtitle_bitmap_canvas_size,
+    HttpStreamBufferProgress, PlaybackShortcut, PlaybackVideoInfo, RenderSize, ShutdownOrder,
+    aspect_fit_bounds, buffered_progress_fraction, clamp_playback_position,
+    combined_buffered_until, format_playback_time, fullscreen_controls_hot_zone_contains,
+    fullscreen_progress_controls_contains, http_stream_buffered_range_fractions,
+    http_stream_buffered_until, is_seek_position_buffered, local_video_viewport_bounds,
+    normalize_video_viewport, playback_info_segments, playback_progress_bar_bounds,
+    playback_progress_bar_visible, playback_shortcut_for_key, playback_status_message,
+    progress_fraction, progress_fraction_for_cursor, render_output_size,
+    should_apply_backend_position, should_render_frame, should_request_animation_frame,
+    subtitle_bitmap_bottom_offset, subtitle_bitmap_canvas_size, subtitle_text_overlay_height,
     valid_frame_rate, valid_http_stream_buffer_progress, valid_playback_duration,
     valid_playback_time, viewport_changed,
 };
@@ -156,6 +159,105 @@ fn local_video_viewport_bounds_strips_window_origin_for_overlay_layout() {
     assert_eq!(
         local_video_viewport_bounds(observed),
         Bounds::new(point(px(0.0), px(0.0)), observed.size)
+    );
+}
+
+#[test]
+fn playback_progress_bar_is_gated_by_fullscreen_controls_visibility() {
+    assert!(playback_progress_bar_visible(false, false));
+    assert!(playback_progress_bar_visible(false, true));
+    assert!(!playback_progress_bar_visible(true, false));
+    assert!(playback_progress_bar_visible(true, true));
+}
+
+#[test]
+fn fullscreen_controls_hot_zone_starts_at_viewport_lower_half() {
+    let viewport = Bounds::new(point(px(0.0), px(100.0)), size(px(800.0), px(600.0)));
+
+    assert!(!fullscreen_controls_hot_zone_contains(
+        point(px(400.0), px(399.0)),
+        viewport
+    ));
+    assert!(fullscreen_controls_hot_zone_contains(
+        point(px(400.0), px(400.0)),
+        viewport
+    ));
+}
+
+#[test]
+fn fullscreen_progress_controls_hit_area_matches_progress_bar_layout() {
+    let viewport = Bounds::new(point(px(0.0), px(0.0)), size(px(1000.0), px(1000.0)));
+
+    assert_eq!(
+        playback_progress_bar_bounds(viewport),
+        Bounds::new(point(px(300.0), px(882.0)), size(px(400.0), px(94.0)))
+    );
+    assert!(fullscreen_progress_controls_contains(
+        point(px(500.0), px(900.0)),
+        viewport
+    ));
+    assert!(!fullscreen_progress_controls_contains(
+        point(px(500.0), px(800.0)),
+        viewport
+    ));
+    assert!(!fullscreen_progress_controls_contains(
+        point(px(750.0), px(900.0)),
+        viewport
+    ));
+}
+
+#[test]
+fn subtitle_text_overlay_height_stops_at_progress_bar_top() {
+    let video_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
+    let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+
+    assert_eq!(
+        subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true),
+        px(407.0)
+    );
+}
+
+#[test]
+fn subtitle_text_overlay_height_uses_video_bottom_without_visible_progress_bar() {
+    let video_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(700.0)));
+    let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+
+    assert_eq!(
+        subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true),
+        px(450.0)
+    );
+    assert_eq!(
+        subtitle_text_overlay_height(video_fitted_bounds, video_bounds, false),
+        px(450.0)
+    );
+}
+
+#[test]
+fn subtitle_bitmap_bottom_offset_lifts_only_overlapping_bitmap_content() {
+    let image = render_image_from_bgra(vec![0, 0, 0, 0], 1, 1).unwrap();
+    let cue = BackendSubtitleCue {
+        text: String::new(),
+        bitmaps: vec![BackendSubtitleBitmap {
+            image,
+            x: 0,
+            y: 900,
+            width: 100,
+            height: 100,
+            canvas_width: 1920,
+            canvas_height: 1080,
+        }],
+        start_nsecs: 0,
+        end_nsecs: 1_000_000_000,
+    };
+    let bitmap_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(1920.0), px(1080.0)));
+
+    assert_eq!(
+        subtitle_bitmap_bottom_offset(&cue, bitmap_bounds, 1.0, px(960.0)),
+        px(40.0)
+    );
+    assert_eq!(
+        subtitle_bitmap_bottom_offset(&cue, bitmap_bounds, 1.0, px(1000.0)),
+        px(0.0)
     );
 }
 
@@ -387,6 +489,43 @@ fn progress_cursor_fraction_uses_track_bounds_and_clamps_edges() {
         ),
         None
     );
+}
+
+#[test]
+fn playback_shortcut_keys_map_to_player_actions() {
+    assert_eq!(
+        playback_shortcut_for_key("space"),
+        Some(PlaybackShortcut::TogglePlayback)
+    );
+    assert_eq!(
+        playback_shortcut_for_key(" "),
+        Some(PlaybackShortcut::TogglePlayback)
+    );
+    assert_eq!(
+        playback_shortcut_for_key("p"),
+        Some(PlaybackShortcut::TogglePlayback)
+    );
+    assert_eq!(
+        playback_shortcut_for_key("f"),
+        Some(PlaybackShortcut::ToggleFullscreen)
+    );
+    assert_eq!(
+        playback_shortcut_for_key("escape"),
+        Some(PlaybackShortcut::ExitFullscreen)
+    );
+    assert_eq!(
+        playback_shortcut_for_key("left"),
+        Some(PlaybackShortcut::SeekBackward)
+    );
+    assert_eq!(
+        playback_shortcut_for_key("right"),
+        Some(PlaybackShortcut::SeekForward)
+    );
+    assert_eq!(
+        playback_shortcut_for_key("i"),
+        Some(PlaybackShortcut::ToggleInfoOverlay)
+    );
+    assert_eq!(playback_shortcut_for_key("enter"), None);
 }
 
 #[test]

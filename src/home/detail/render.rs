@@ -165,23 +165,20 @@ impl HomeContent {
             .left_4()
             .top_4()
             .flex()
-            .size(px(36.0))
+            .size(px(32.0))
             .items_center()
             .justify_center()
-            .rounded_full()
-            .border_1()
-            .border_color(theme.input_border.opacity(0.7))
-            .bg(theme.dialog_background.opacity(0.72))
-            .shadow_lg()
-            .occlude()
-            .text_color(theme.foreground)
+            .rounded_md()
             .hover(move |style| style.bg(theme.secondary_hover))
             .child(
                 svg()
                     .path("icons/chevron-left.svg")
-                    .size(px(20.0))
+                    .size(px(18.0))
                     .text_color(theme.foreground),
             )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
             .on_click(close_detail)
     }
 

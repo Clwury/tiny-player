@@ -25,7 +25,7 @@ pub fn app_titlebar(
         .border_b_1()
         .border_color(theme.title_bar_border)
         .bg(theme.title_bar)
-        .when(!window.is_maximized(), |this| {
+        .when(!window.is_maximized() && !window.is_fullscreen(), |this| {
             this.rounded_tl(theme.radius_lg).rounded_tr(theme.radius_lg)
         })
         .on_mouse_down(MouseButton::Left, |event, window, _| {

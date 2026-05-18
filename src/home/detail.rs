@@ -628,7 +628,7 @@ fn selected_playback(
     };
 
     let audio_tracks = playback_audio_tracks(source);
-    let subtitle_tracks = playback_subtitle_tracks(source, server);
+    let subtitle_tracks = playback_subtitle_tracks(source, server, &item.id, &media_source_id);
     let selected_tracks = playback_track_selection(detail, source, &subtitle_tracks);
 
     Ok(SelectedPlayback {
@@ -661,6 +661,8 @@ fn playback_audio_tracks(source: &crate::emby::MediaSource) -> Vec<PlaybackTrack
 fn playback_subtitle_tracks(
     source: &crate::emby::MediaSource,
     server: &CachedServer,
+    item_id: &str,
+    media_source_id: &str,
 ) -> Vec<PlaybackTrack> {
     source
         .subtitle_streams()
@@ -668,11 +670,8 @@ fn playback_subtitle_tracks(
         .enumerate()
         .filter_map(|(index, stream)| {
             let stream_index = usize::try_from(stream.index?).ok()?;
-            let external_url = stream.delivery_url.as_deref().and_then(|delivery_url| {
-                resolve_direct_stream_url(server, delivery_url)
-                    .map(|url| url.to_string())
-                    .ok()
-            });
+            let external_url =
+                playback_subtitle_external_url(stream, server, item_id, media_source_id);
             Some(
                 PlaybackTrack::new(
                     stream_index,
@@ -684,6 +683,66 @@ fn playback_subtitle_tracks(
             )
         })
         .collect()
+}
+
+fn playback_subtitle_external_url(
+    stream: &crate::emby::MediaStream,
+    server: &CachedServer,
+    item_id: &str,
+    media_source_id: &str,
+) -> Option<String> {
+    let delivery_url = stream
+        .delivery_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            is_external_subtitle_stream(stream)
+                .then(|| fallback_external_subtitle_delivery_url(stream, item_id, media_source_id))
+                .flatten()
+        })?;
+    let mut url = resolve_direct_stream_url(server, &delivery_url).ok()?;
+    if !url.query_pairs().any(|(name, _)| name == "api_key")
+        && let Some(access_token) = server
+            .access_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+    {
+        url.query_pairs_mut().append_pair("api_key", access_token);
+    }
+    Some(url.to_string())
+}
+
+fn is_external_subtitle_stream(stream: &crate::emby::MediaStream) -> bool {
+    stream.is_external.unwrap_or(false)
+        || stream
+            .delivery_method
+            .as_deref()
+            .is_some_and(|method| method.eq_ignore_ascii_case("External"))
+}
+
+fn fallback_external_subtitle_delivery_url(
+    stream: &crate::emby::MediaStream,
+    item_id: &str,
+    media_source_id: &str,
+) -> Option<String> {
+    let stream_index = stream.index?;
+    let extension = external_subtitle_extension(stream.codec.as_deref())?;
+    Some(format!(
+        "/Videos/{item_id}/{media_source_id}/Subtitles/{stream_index}/0/Stream.{extension}"
+    ))
+}
+
+fn external_subtitle_extension(codec: Option<&str>) -> Option<&'static str> {
+    match codec?.trim().to_ascii_lowercase().as_str() {
+        "ass" => Some("ass"),
+        "ssa" => Some("ssa"),
+        "subrip" | "srt" => Some("srt"),
+        "vtt" | "webvtt" => Some("vtt"),
+        "sub" => Some("sub"),
+        _ => None,
+    }
 }
 
 fn playback_track_selection(
@@ -716,4 +775,105 @@ fn playback_track_selection(
     };
     selection.set_subtitle_track(selected_subtitle);
     selection
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        emby::{MediaSource, MediaStream},
+        server::{Protocol, ServerEndpoint},
+    };
+
+    use super::*;
+
+    fn server() -> CachedServer {
+        CachedServer {
+            id: "server-detail-test".to_string(),
+            endpoint: ServerEndpoint {
+                protocol: Protocol::Https,
+                address: "example.com".to_string(),
+                port: 443,
+                path: "/emby".to_string(),
+            },
+            username: "luv".to_string(),
+            password: "secret".to_string(),
+            user_id: Some("user-1".to_string()),
+            server_id: Some("server-1".to_string()),
+            server_name: Some("Home".to_string()),
+            access_token: Some("token".to_string()),
+            item_counts: None,
+            added_at_unix: 123,
+        }
+    }
+
+    #[test]
+    fn playback_subtitle_tracks_resolve_external_ass_delivery_url() {
+        let source = MediaSource {
+            id: Some("mediasource_1126227".to_string()),
+            name: None,
+            path: None,
+            container: None,
+            media_streams: Some(vec![MediaStream {
+                index: Some(3),
+                stream_type: Some("Subtitle".to_string()),
+                display_title: Some("(ASS)".to_string()),
+                title: Some("chs&eng".to_string()),
+                language: None,
+                codec: Some("ass".to_string()),
+                delivery_url: Some(
+                    "/Videos/1126227/mediasource_1126227/Subtitles/3/0/Stream.ass?api_key=token"
+                        .to_string(),
+                ),
+                delivery_method: Some("External".to_string()),
+                is_external: Some(true),
+                is_default: Some(false),
+            }]),
+        };
+
+        let tracks = playback_subtitle_tracks(&source, &server(), "1126227", "mediasource_1126227");
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].stream_index, 3);
+        assert!(tracks[0].is_external);
+        assert_eq!(tracks[0].codec.as_deref(), Some("ass"));
+        assert_eq!(
+            tracks[0].external_url.as_deref(),
+            Some(
+                "https://example.com/emby/Videos/1126227/mediasource_1126227/Subtitles/3/0/Stream.ass?api_key=token"
+            )
+        );
+    }
+
+    #[test]
+    fn playback_subtitle_tracks_build_external_ass_url_when_delivery_url_missing() {
+        let source = MediaSource {
+            id: Some("mediasource_1126227".to_string()),
+            name: None,
+            path: None,
+            container: None,
+            media_streams: Some(vec![MediaStream {
+                index: Some(3),
+                stream_type: Some("Subtitle".to_string()),
+                display_title: Some("(ASS)".to_string()),
+                title: Some("chs&eng".to_string()),
+                language: None,
+                codec: Some("ass".to_string()),
+                delivery_url: None,
+                delivery_method: Some("External".to_string()),
+                is_external: Some(true),
+                is_default: Some(false),
+            }]),
+        };
+
+        let tracks = playback_subtitle_tracks(&source, &server(), "1126227", "mediasource_1126227");
+
+        assert_eq!(tracks.len(), 1);
+        assert!(tracks[0].is_external);
+        assert_eq!(
+            tracks[0].external_url.as_deref(),
+            Some(
+                "https://example.com/emby/Videos/1126227/mediasource_1126227/Subtitles/3/0/Stream.ass?api_key=token"
+            )
+        );
+    }
 }

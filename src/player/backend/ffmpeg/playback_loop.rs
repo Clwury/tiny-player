@@ -111,8 +111,9 @@ fn probe_result_satisfies_selection(
 ) -> bool {
     let audio_satisfied =
         source.selected_tracks.audio_stream_index.is_none() || probed.audio_stream.is_some();
-    let subtitle_satisfied =
-        source.selected_tracks.subtitle_stream_index.is_none() || probed.subtitle_stream.is_some();
+    let subtitle_satisfied = source.selected_tracks.subtitle_stream_index.is_none()
+        || source.selected_tracks.subtitle_external_url.is_some()
+        || probed.subtitle_stream.is_some();
     audio_satisfied && subtitle_satisfied
 }
 
@@ -1146,45 +1147,87 @@ fn decode_subtitle_packet_into_queue(
     control: &FfmpegControl,
 ) -> std::result::Result<(), String> {
     let packet_timestamp = packet.best_timestamp();
+    if stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_SUBRIP
+        && let Some(cue) = packet.data().and_then(|data| {
+            decoded_subrip_packet_cue(
+                data,
+                packet
+                    .duration()
+                    .and_then(|duration| timestamp_to_nsecs(duration, stream.time_base)),
+            )
+        })
+    {
+        if control.has_pending_seek() {
+            return Ok(());
+        }
+        queue_decoded_subtitle_cue(
+            cue,
+            packet_timestamp,
+            stream,
+            current_start_position_nsecs,
+            playback_timeline_origin_nsecs,
+            subtitle_cues,
+        );
+        return Ok(());
+    }
+
     decoder.decode_subtitle_packet(packet.as_ptr(), |cue| {
         if control.has_pending_seek() {
             return Ok(());
         }
-        let Some(base_timeline_nsecs) = subtitle_cue_timeline_nsecs(
-            cue.pts_nsecs,
+        queue_decoded_subtitle_cue(
+            cue,
             packet_timestamp,
             stream,
+            current_start_position_nsecs,
             playback_timeline_origin_nsecs,
-        ) else {
-            tracing::debug!(
-                stream_index = stream.index,
-                ?packet_timestamp,
-                cue_pts_nsecs = ?cue.pts_nsecs,
-                "dropping decoded subtitle cue without timestamp"
-            );
-            return Ok(());
-        };
-        let cue_has_content = cue.has_content();
-        let subtitle_cue = BackendSubtitleCue {
-            text: cue.text,
-            bitmaps: cue.bitmaps,
-            start_nsecs: base_timeline_nsecs.saturating_add(cue.start_offset_nsecs),
-            end_nsecs: base_timeline_nsecs.saturating_add(cue.end_offset_nsecs),
-        };
-        if !cue_has_content {
-            if stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE {
-                trim_overlapping_subtitle_cues_at(subtitle_cues, subtitle_cue.start_nsecs);
-            }
-            return Ok(());
-        }
-        if subtitle_cue.end_nsecs >= current_start_position_nsecs {
-            if stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE {
-                trim_overlapping_subtitle_cues_at(subtitle_cues, subtitle_cue.start_nsecs);
-            }
-            push_subtitle_cue(subtitle_cues, subtitle_cue);
-        }
+            subtitle_cues,
+        );
         Ok(())
     })
+}
+
+fn queue_decoded_subtitle_cue(
+    cue: DecodedSubtitleCue,
+    packet_timestamp: Option<i64>,
+    stream: StreamInfo,
+    current_start_position_nsecs: u64,
+    playback_timeline_origin_nsecs: Option<u64>,
+    subtitle_cues: &mut VecDeque<BackendSubtitleCue>,
+) {
+    let Some(base_timeline_nsecs) = subtitle_cue_timeline_nsecs(
+        cue.pts_nsecs,
+        packet_timestamp,
+        stream,
+        playback_timeline_origin_nsecs,
+    ) else {
+        tracing::debug!(
+            stream_index = stream.index,
+            ?packet_timestamp,
+            cue_pts_nsecs = ?cue.pts_nsecs,
+            "dropping decoded subtitle cue without timestamp"
+        );
+        return;
+    };
+    let cue_has_content = cue.has_content();
+    let subtitle_cue = BackendSubtitleCue {
+        text: cue.text,
+        bitmaps: cue.bitmaps,
+        start_nsecs: base_timeline_nsecs.saturating_add(cue.start_offset_nsecs),
+        end_nsecs: base_timeline_nsecs.saturating_add(cue.end_offset_nsecs),
+    };
+    if !cue_has_content {
+        if stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE {
+            trim_overlapping_subtitle_cues_at(subtitle_cues, subtitle_cue.start_nsecs);
+        }
+        return;
+    }
+    if subtitle_cue.end_nsecs >= current_start_position_nsecs {
+        if stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE {
+            trim_overlapping_subtitle_cues_at(subtitle_cues, subtitle_cue.start_nsecs);
+        }
+        push_subtitle_cue(subtitle_cues, subtitle_cue);
+    }
 }
 
 fn subtitle_cue_queue_from_external(

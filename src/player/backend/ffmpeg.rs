@@ -86,7 +86,10 @@ use hw::{
     vulkan_sw_format,
 };
 use reporting::{BufferedReporter, PositionReporter};
-use subtitle::{DecodedSubtitleCue, decoded_subtitle_cues, load_external_subtitle_cues};
+use subtitle::{
+    DecodedSubtitleCue, decoded_subrip_packet_cue, decoded_subtitle_cues,
+    load_external_subtitle_cues,
+};
 use util::ffmpeg_error;
 #[cfg(test)]
 use video::ffmpeg_raw_video_format;

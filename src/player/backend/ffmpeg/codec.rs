@@ -376,6 +376,11 @@ impl AvPacket {
         }
     }
 
+    pub(super) fn duration(&self) -> Option<i64> {
+        let duration = unsafe { (*self.ptr).duration };
+        (duration > 0).then_some(duration)
+    }
+
     pub(super) fn data(&self) -> Option<&[u8]> {
         let (data, size) = unsafe { ((*self.ptr).data, (*self.ptr).size) };
         if data.is_null() || size <= 0 {
