@@ -8,7 +8,8 @@ use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, SharedString, W
 
 use crate::{
     emby::{MediaItem, MediaItems, UserItem, playback::resolve_direct_stream_url},
-    player::PlaybackRequest,
+    player::{PlaybackRequest, PlaybackTrack, PlaybackTrackSelection},
+    server::CachedServer,
 };
 
 use super::{HomeContent, HomeContentEvent, LoadState};
@@ -18,6 +19,9 @@ struct SelectedPlayback {
     item_id: String,
     media_source_id: String,
     title: SharedString,
+    audio_tracks: Vec<PlaybackTrack>,
+    subtitle_tracks: Vec<PlaybackTrack>,
+    selected_tracks: PlaybackTrackSelection,
 }
 
 struct ResolvedPlayback {
@@ -80,7 +84,7 @@ impl HomeContent {
             return;
         }
 
-        let selected = match selected_playback(detail) {
+        let selected = match selected_playback(detail, &self.current_server) {
             Ok(selected) => selected,
             Err(error) => {
                 detail.playback_failed = Some(error.into());
@@ -140,12 +144,15 @@ impl HomeContent {
         match result {
             Ok(playback) => {
                 detail.playback_failed = None;
-                cx.emit(HomeContentEvent::OpenPlayback(PlaybackRequest {
+                cx.emit(HomeContentEvent::OpenPlayback(Box::new(PlaybackRequest {
                     title: selected.title,
                     url: playback.url,
                     http_headers: playback.http_headers,
                     content_length: playback.content_length,
-                }));
+                    audio_tracks: selected.audio_tracks,
+                    subtitle_tracks: selected.subtitle_tracks,
+                    selected_tracks: selected.selected_tracks,
+                })));
             }
             Err(error) => {
                 detail.playback_failed = Some(format!("获取播放地址失败：{error}").into());
@@ -592,7 +599,10 @@ impl HomeContent {
     }
 }
 
-fn selected_playback(detail: &SeriesDetailState) -> Result<SelectedPlayback, String> {
+fn selected_playback(
+    detail: &SeriesDetailState,
+    server: &CachedServer,
+) -> Result<SelectedPlayback, String> {
     let item = detail
         .selected_playback_item()
         .ok_or_else(|| "请选择要播放的媒体".to_string())?;
@@ -617,10 +627,93 @@ fn selected_playback(detail: &SeriesDetailState) -> Result<SelectedPlayback, Str
         format!("{series_name} {}", item.episode_label())
     };
 
+    let audio_tracks = playback_audio_tracks(source);
+    let subtitle_tracks = playback_subtitle_tracks(source, server);
+    let selected_tracks = playback_track_selection(detail, source, &subtitle_tracks);
+
     Ok(SelectedPlayback {
         detail_id: detail.series_id.clone(),
         item_id: item.id.clone(),
         media_source_id,
         title: title.into(),
+        audio_tracks,
+        subtitle_tracks,
+        selected_tracks,
     })
+}
+
+fn playback_audio_tracks(source: &crate::emby::MediaSource) -> Vec<PlaybackTrack> {
+    source
+        .audio_streams()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, stream)| {
+            let stream_index = usize::try_from(stream.index?).ok()?;
+            Some(PlaybackTrack::new(
+                stream_index,
+                stream.audio_label(index),
+                stream.is_external.unwrap_or(false),
+            ))
+        })
+        .collect()
+}
+
+fn playback_subtitle_tracks(
+    source: &crate::emby::MediaSource,
+    server: &CachedServer,
+) -> Vec<PlaybackTrack> {
+    source
+        .subtitle_streams()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, stream)| {
+            let stream_index = usize::try_from(stream.index?).ok()?;
+            let external_url = stream.delivery_url.as_deref().and_then(|delivery_url| {
+                resolve_direct_stream_url(server, delivery_url)
+                    .map(|url| url.to_string())
+                    .ok()
+            });
+            Some(
+                PlaybackTrack::new(
+                    stream_index,
+                    stream.display_title_label(index),
+                    stream.is_external.unwrap_or(false),
+                )
+                .with_external_url(external_url)
+                .with_codec(stream.codec.clone()),
+            )
+        })
+        .collect()
+}
+
+fn playback_track_selection(
+    detail: &SeriesDetailState,
+    source: &crate::emby::MediaSource,
+    subtitle_tracks: &[PlaybackTrack],
+) -> PlaybackTrackSelection {
+    let audio_stream_index = source
+        .audio_streams()
+        .into_iter()
+        .find_map(|stream| {
+            stream
+                .index
+                .and_then(|index| usize::try_from(index).ok())
+                .filter(|_| stream.is_default.unwrap_or(false))
+        })
+        .or_else(|| {
+            source
+                .audio_streams()
+                .into_iter()
+                .find_map(|stream| stream.index.and_then(|index| usize::try_from(index).ok()))
+        });
+    let selected_subtitle = detail
+        .selected_subtitle_index()
+        .and_then(|index| subtitle_tracks.get(index));
+
+    let mut selection = PlaybackTrackSelection {
+        audio_stream_index,
+        ..Default::default()
+    };
+    selection.set_subtitle_track(selected_subtitle);
+    selection
 }

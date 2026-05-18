@@ -25,7 +25,7 @@ pub(super) fn present_due_audio_clocked_video_frames(
     frame_presented: &AtomicBool,
     position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
-) {
+) -> u64 {
     let played_until = audio_output.played_timeline_nsecs();
     let mut due_frame = None;
     while queued_video_frames
@@ -49,6 +49,7 @@ pub(super) fn present_due_audio_clocked_video_frames(
             event_tx,
         );
     }
+    played_until
 }
 
 pub(super) fn queued_video_duration(queued_video_frames: &VecDeque<QueuedVideoFrame>) -> Duration {
@@ -62,8 +63,11 @@ pub(super) fn queued_video_duration(queued_video_frames: &VecDeque<QueuedVideoFr
 
 pub(super) fn queued_video_limit_duration(
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    needs_subtitle_prefetch: bool,
 ) -> Duration {
-    if queued_video_frames_have_vulkan(queued_video_frames) {
+    if needs_subtitle_prefetch {
+        PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION
+    } else if queued_video_frames_have_vulkan(queued_video_frames) {
         VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION
     } else {
         AUDIO_VIDEO_QUEUE_LIMIT_DURATION
@@ -72,8 +76,11 @@ pub(super) fn queued_video_limit_duration(
 
 pub(super) fn queued_video_target_duration(
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    needs_subtitle_prefetch: bool,
 ) -> Duration {
-    if queued_video_frames_have_vulkan(queued_video_frames) {
+    if needs_subtitle_prefetch {
+        PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION
+    } else if queued_video_frames_have_vulkan(queued_video_frames) {
         VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION
     } else {
         AUDIO_VIDEO_QUEUE_TARGET_DURATION
@@ -98,7 +105,7 @@ pub(super) fn should_drop_late_video_frame(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn wait_for_audio_clocked_video_queue(
+pub(super) fn wait_for_audio_clocked_video_queue<F>(
     queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
     audio_output: &AudioOutput,
     control: &FfmpegControl,
@@ -108,11 +115,15 @@ pub(super) fn wait_for_audio_clocked_video_queue(
     position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
     target_duration: Duration,
-) -> std::result::Result<(), String> {
+    mut on_audio_progress: F,
+) -> std::result::Result<(), String>
+where
+    F: FnMut(u64),
+{
     while queued_video_duration(queued_video_frames) >= target_duration
         && !control.should_interrupt()
     {
-        present_due_audio_clocked_video_frames(
+        let played_until = present_due_audio_clocked_video_frames(
             queued_video_frames,
             audio_output,
             session_id,
@@ -121,18 +132,20 @@ pub(super) fn wait_for_audio_clocked_video_queue(
             position_reporter,
             event_tx,
         );
+        on_audio_progress(played_until);
         if queued_video_duration(queued_video_frames) < target_duration
             || audio_output.queued_duration()? == Duration::ZERO
         {
             break;
         }
         audio_output.wait_for_progress(control)?;
+        on_audio_progress(audio_output.played_timeline_nsecs());
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn drain_audio_clocked_video_queue(
+pub(super) fn drain_audio_clocked_video_queue<F>(
     queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
     audio_output: &AudioOutput,
     control: &FfmpegControl,
@@ -141,9 +154,13 @@ pub(super) fn drain_audio_clocked_video_queue(
     frame_presented: &AtomicBool,
     position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
-) -> std::result::Result<(), String> {
+    mut on_audio_progress: F,
+) -> std::result::Result<(), String>
+where
+    F: FnMut(u64),
+{
     while !queued_video_frames.is_empty() && !control.should_interrupt() {
-        present_due_audio_clocked_video_frames(
+        let played_until = present_due_audio_clocked_video_frames(
             queued_video_frames,
             audio_output,
             session_id,
@@ -152,10 +169,12 @@ pub(super) fn drain_audio_clocked_video_queue(
             position_reporter,
             event_tx,
         );
+        on_audio_progress(played_until);
         if queued_video_frames.is_empty() || audio_output.queued_duration()? == Duration::ZERO {
             break;
         }
         audio_output.wait_for_progress(control)?;
+        on_audio_progress(audio_output.played_timeline_nsecs());
     }
     Ok(())
 }
@@ -298,6 +317,13 @@ impl TimestampMapper {
             timeline_nsecs,
             sink_nsecs: timeline_nsecs.saturating_sub(self.start_position_nsecs),
         }
+    }
+
+    pub(super) fn timeline_origin_nsecs(&self) -> Option<u64> {
+        self.start_nsecs.or_else(|| {
+            self.fallback_first_nsecs
+                .map(|first| first.saturating_sub(self.start_position_nsecs))
+        })
     }
 
     fn timeline_from_timestamp(&mut self, nsecs: u64) -> u64 {

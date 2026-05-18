@@ -218,6 +218,15 @@ impl MediaSource {
             .filter(|stream| stream.is_subtitle())
             .collect()
     }
+
+    pub fn audio_streams(&self) -> Vec<&MediaStream> {
+        self.media_streams
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|stream| stream.is_audio())
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -229,7 +238,11 @@ pub struct MediaStream {
     pub display_title: Option<String>,
     pub title: Option<String>,
     pub language: Option<String>,
+    pub codec: Option<String>,
+    pub delivery_url: Option<String>,
+    pub delivery_method: Option<String>,
     pub is_external: Option<bool>,
+    pub is_default: Option<bool>,
 }
 
 impl MediaStream {
@@ -237,6 +250,12 @@ impl MediaStream {
         self.stream_type
             .as_deref()
             .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+    }
+
+    pub fn is_audio(&self) -> bool {
+        self.stream_type
+            .as_deref()
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Audio"))
     }
 
     pub fn display_label(&self, index: usize) -> String {
@@ -255,6 +274,17 @@ impl MediaStream {
             .filter(|title| !title.trim().is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("字幕 {}", index + 1))
+    }
+
+    pub fn audio_label(&self, index: usize) -> String {
+        self.display_title
+            .as_deref()
+            .or(self.title.as_deref())
+            .or(self.language.as_deref())
+            .or(self.codec.as_deref())
+            .filter(|title| !title.trim().is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("音轨 {}", index + 1))
     }
 }
 

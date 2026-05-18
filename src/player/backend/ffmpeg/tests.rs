@@ -1,5 +1,9 @@
 use super::worker::PendingSeek;
 use super::*;
+use playback_loop::{
+    initial_probe_profile, rebase_subtitle_cues_to_timeline_origin, subtitle_cue_timeline_nsecs,
+    subtitle_timestamp_to_timeline_nsecs, trim_overlapping_subtitle_cues_at,
+};
 
 #[test]
 fn timestamp_mapper_uses_stream_start_when_available() {
@@ -75,6 +79,154 @@ fn ffmpeg_command_drain_applies_pause_resume_and_keeps_latest_seek() {
 }
 
 #[test]
+fn pgs_subtitle_selection_uses_subtitle_probe_profile() {
+    let mut selected_tracks = crate::player::PlaybackTrackSelection {
+        subtitle_stream_index: Some(2),
+        subtitle_codec: Some("PGSSUB".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        initial_probe_profile(&playback_input_with_selection(selected_tracks.clone())),
+        InputProbeProfile::Subtitle
+    );
+
+    selected_tracks.subtitle_codec = Some("ass".to_string());
+    assert_eq!(
+        initial_probe_profile(&playback_input_with_selection(selected_tracks)),
+        InputProbeProfile::Fast
+    );
+}
+
+#[test]
+fn external_subtitles_keep_fast_probe_profile() {
+    let selected_tracks = crate::player::PlaybackTrackSelection {
+        subtitle_stream_index: Some(2),
+        subtitle_external_url: Some("https://example.test/sub.sup".to_string()),
+        subtitle_codec: Some("PGSSUB".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        initial_probe_profile(&playback_input_with_selection(selected_tracks)),
+        InputProbeProfile::Fast
+    );
+}
+
+#[test]
+fn subtitle_timestamps_do_not_rebase_to_first_sparse_packet() {
+    assert_eq!(
+        subtitle_timestamp_to_timeline_nsecs(60_000_000_000, None),
+        60_000_000_000
+    );
+    assert_eq!(
+        subtitle_timestamp_to_timeline_nsecs(65_000_000_000, Some(5_000_000_000)),
+        60_000_000_000
+    );
+}
+
+#[test]
+fn subtitle_packet_timestamp_takes_precedence_over_zero_decoded_pts() {
+    let stream = StreamInfo {
+        index: 2,
+        stream: ptr::null_mut(),
+        decoder: ptr::null(),
+        codec_id: ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE,
+        time_base: ffi::AVRational { num: 1, den: 1_000 },
+        start_nsecs: None,
+        frame_duration_nsecs: None,
+    };
+
+    assert_eq!(
+        subtitle_cue_timeline_nsecs(Some(0), Some(60_000), stream, None),
+        Some(60_000_000_000)
+    );
+}
+
+#[test]
+fn pgs_subtitle_timestamps_fall_back_to_playback_origin() {
+    let stream = StreamInfo {
+        index: 2,
+        stream: ptr::null_mut(),
+        decoder: ptr::null(),
+        codec_id: ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE,
+        time_base: ffi::AVRational { num: 1, den: 1_000 },
+        start_nsecs: None,
+        frame_duration_nsecs: None,
+    };
+
+    assert_eq!(
+        subtitle_cue_timeline_nsecs(
+            Some(180_305_000_000),
+            Some(180_305),
+            stream,
+            Some(1_168_000_000),
+        ),
+        Some(179_137_000_000)
+    );
+}
+
+#[test]
+fn pgs_subtitle_timestamps_do_not_use_sparse_stream_start_over_playback_origin() {
+    let stream = StreamInfo {
+        index: 2,
+        stream: ptr::null_mut(),
+        decoder: ptr::null(),
+        codec_id: ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE,
+        time_base: ffi::AVRational { num: 1, den: 1_000 },
+        start_nsecs: Some(136_470_000_000),
+        frame_duration_nsecs: None,
+    };
+
+    assert_eq!(
+        subtitle_cue_timeline_nsecs(
+            Some(180_305_000_000),
+            Some(180_305),
+            stream,
+            Some(1_168_000_000),
+        ),
+        Some(179_137_000_000)
+    );
+}
+
+#[test]
+fn pgs_frame_merge_bitstream_filter_initializes_when_available() {
+    let mut codecpar = unsafe { ffi::avcodec_parameters_alloc() };
+    assert!(!codecpar.is_null());
+    unsafe {
+        (*codecpar).codec_type = ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE;
+        (*codecpar).codec_id = ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE;
+    }
+    let mut stream = unsafe { mem::zeroed::<ffi::AVStream>() };
+    stream.codecpar = codecpar;
+    let stream_info = StreamInfo {
+        index: 2,
+        stream: &mut stream,
+        decoder: ptr::null(),
+        codec_id: ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE,
+        time_base: ffi::AVRational { num: 1, den: 1_000 },
+        start_nsecs: None,
+        frame_duration_nsecs: None,
+    };
+
+    let filter = PgsFrameMergeBitstreamFilter::new(stream_info).unwrap();
+    drop(filter);
+    unsafe { ffi::avcodec_parameters_free(&mut codecpar) };
+}
+
+fn playback_input_with_selection(
+    selected_tracks: crate::player::PlaybackTrackSelection,
+) -> FfmpegPlaybackInput {
+    FfmpegPlaybackInput {
+        session_id: PlaybackSessionId::default(),
+        url: "file:///tmp/video.mkv".to_string(),
+        http_headers: Vec::new(),
+        content_length: None,
+        start_position_seconds: 0.0,
+        selected_tracks,
+    }
+}
+
+#[test]
 fn ffmpeg_backend_discards_stale_session_events() {
     let mut backend = FfmpegBackend::new().unwrap();
     backend.current_session_id = PlaybackSessionId(2);
@@ -120,6 +272,22 @@ fn timestamp_mapper_uses_first_timestamp_without_stream_start() {
             sink_nsecs: 250_000_000,
         }
     );
+}
+
+#[test]
+fn timestamp_mapper_reports_dynamic_timeline_origin() {
+    let mut mapper = TimestampMapper::new(None, 10_000_000_000, None);
+    let time_base = ffi::AVRational { num: 1, den: 1_000 };
+
+    assert_eq!(mapper.timeline_origin_nsecs(), None);
+    assert_eq!(
+        mapper.map(11_168, time_base),
+        MappedTimestamp {
+            timeline_nsecs: 10_000_000_000,
+            sink_nsecs: 0,
+        }
+    );
+    assert_eq!(mapper.timeline_origin_nsecs(), Some(1_168_000_000));
 }
 
 #[test]
@@ -247,6 +415,96 @@ fn queued_video_duration_uses_first_and_last_frame_pts() {
     queue.push_back(test_queued_video_frame(1_300_000_000));
 
     assert_eq!(queued_video_duration(&queue), Duration::from_millis(300));
+}
+
+#[test]
+fn queued_video_window_expands_for_pgs_subtitle_prefetch() {
+    let mut queue = VecDeque::new();
+    queue.push_back(test_queued_video_frame(1_000_000_000));
+    queue.push_back(test_queued_video_frame(1_300_000_000));
+
+    assert_eq!(
+        queued_video_limit_duration(&queue, false),
+        AUDIO_VIDEO_QUEUE_LIMIT_DURATION
+    );
+    assert_eq!(
+        queued_video_target_duration(&queue, false),
+        AUDIO_VIDEO_QUEUE_TARGET_DURATION
+    );
+    assert_eq!(
+        queued_video_limit_duration(&queue, true),
+        PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION
+    );
+    assert_eq!(
+        queued_video_target_duration(&queue, true),
+        PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION
+    );
+}
+
+#[test]
+fn pgs_subtitle_cues_rebase_when_dynamic_playback_origin_appears() {
+    let mut cues = VecDeque::from([BackendSubtitleCue {
+        text: "subtitle".to_string(),
+        bitmaps: Vec::new(),
+        start_nsecs: 180_305_000_000,
+        end_nsecs: 184_305_000_000,
+    }]);
+
+    rebase_subtitle_cues_to_timeline_origin(&mut cues, None, Some(1_168_000_000));
+
+    assert_eq!(cues[0].start_nsecs, 179_137_000_000);
+    assert_eq!(cues[0].end_nsecs, 183_137_000_000);
+}
+
+#[test]
+fn pgs_subtitle_clear_marker_trims_previous_bitmap_cue() {
+    let mut cues = VecDeque::from([
+        BackendSubtitleCue {
+            text: "first".to_string(),
+            bitmaps: Vec::new(),
+            start_nsecs: 10_000_000_000,
+            end_nsecs: 14_000_000_000,
+        },
+        BackendSubtitleCue {
+            text: "second".to_string(),
+            bitmaps: Vec::new(),
+            start_nsecs: 15_000_000_000,
+            end_nsecs: 17_000_000_000,
+        },
+    ]);
+
+    trim_overlapping_subtitle_cues_at(&mut cues, 12_000_000_000);
+
+    assert_eq!(cues.len(), 2);
+    assert_eq!(cues[0].start_nsecs, 10_000_000_000);
+    assert_eq!(cues[0].end_nsecs, 12_000_000_000);
+    assert_eq!(cues[1].start_nsecs, 15_000_000_000);
+    assert_eq!(cues[1].end_nsecs, 17_000_000_000);
+}
+
+#[test]
+fn pgs_subtitle_replacement_trims_previous_cue_at_next_start() {
+    let mut cues = VecDeque::from([BackendSubtitleCue {
+        text: "first".to_string(),
+        bitmaps: Vec::new(),
+        start_nsecs: 10_000_000_000,
+        end_nsecs: 14_000_000_000,
+    }]);
+    let next_cue_start = 11_500_000_000;
+
+    trim_overlapping_subtitle_cues_at(&mut cues, next_cue_start);
+
+    cues.push_back(BackendSubtitleCue {
+        text: "second".to_string(),
+        bitmaps: Vec::new(),
+        start_nsecs: next_cue_start,
+        end_nsecs: 13_000_000_000,
+    });
+
+    assert_eq!(cues[0].start_nsecs, 10_000_000_000);
+    assert_eq!(cues[0].end_nsecs, next_cue_start);
+    assert_eq!(cues[1].start_nsecs, next_cue_start);
+    assert_eq!(cues[1].end_nsecs, 13_000_000_000);
 }
 
 #[test]

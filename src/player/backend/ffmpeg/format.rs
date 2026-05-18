@@ -101,6 +101,39 @@ impl FormatContext {
         }))
     }
 
+    pub(super) fn stream_by_index(
+        &self,
+        index: usize,
+        media_type: ffi::AVMediaType,
+    ) -> std::result::Result<StreamInfo, String> {
+        let stream =
+            self.stream(c_int::try_from(index).map_err(|_| "FFmpeg 媒体流索引无效".to_string())?)?;
+        let codecpar = unsafe { (*stream).codecpar };
+        if codecpar.is_null() {
+            return Err("FFmpeg 媒体流缺少 codec 参数".to_string());
+        }
+        if unsafe { (*codecpar).codec_type } != media_type {
+            return Err("FFmpeg 媒体流类型与所选轨道不匹配".to_string());
+        }
+
+        let decoder = unsafe { ffi::avcodec_find_decoder((*codecpar).codec_id) };
+        if decoder.is_null() {
+            return Err("FFmpeg 未找到所选媒体流的解码器".to_string());
+        }
+        let time_base = unsafe { (*stream).time_base };
+        let start_nsecs = unsafe { timestamp_to_nsecs((*stream).start_time, time_base) };
+        let frame_duration_nsecs = unsafe { stream_frame_duration_nsecs(stream) };
+        Ok(StreamInfo {
+            index: c_int::try_from(index).map_err(|_| "FFmpeg 媒体流索引无效".to_string())?,
+            stream,
+            decoder,
+            codec_id: unsafe { (*codecpar).codec_id },
+            time_base,
+            start_nsecs,
+            frame_duration_nsecs,
+        })
+    }
+
     fn stream(&self, index: c_int) -> std::result::Result<*mut ffi::AVStream, String> {
         let index = usize::try_from(index).map_err(|_| "FFmpeg 媒体流索引无效".to_string())?;
         let stream_count = unsafe { (*self.ptr).nb_streams as usize };

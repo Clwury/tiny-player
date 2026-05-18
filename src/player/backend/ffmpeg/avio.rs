@@ -5,19 +5,25 @@ pub(super) fn input_format_options(
     probe_profile: InputProbeProfile,
 ) -> std::result::Result<*mut ffi::AVDictionary, String> {
     let mut options = ptr::null_mut();
-    if let InputProbeProfile::Fast = probe_profile {
-        if let Err(error) = set_input_format_option(
-            &mut options,
-            "probesize",
-            &FFMPEG_FAST_PROBE_SIZE.to_string(),
-        ) {
+    let probe_limits = match probe_profile {
+        InputProbeProfile::Fast => Some((FFMPEG_FAST_PROBE_SIZE, FFMPEG_FAST_ANALYZE_DURATION_US)),
+        InputProbeProfile::Subtitle => Some((
+            FFMPEG_SUBTITLE_PROBE_SIZE,
+            FFMPEG_SUBTITLE_ANALYZE_DURATION_US,
+        )),
+        InputProbeProfile::Full => None,
+    };
+    if let Some((probe_size, analyze_duration_us)) = probe_limits {
+        if let Err(error) =
+            set_input_format_option(&mut options, "probesize", &probe_size.to_string())
+        {
             unsafe { ffi::av_dict_free(&mut options) };
             return Err(error);
         }
         if let Err(error) = set_input_format_option(
             &mut options,
             "analyzeduration",
-            &FFMPEG_FAST_ANALYZE_DURATION_US.to_string(),
+            &analyze_duration_us.to_string(),
         ) {
             unsafe { ffi::av_dict_free(&mut options) };
             return Err(error);

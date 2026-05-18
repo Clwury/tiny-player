@@ -1,6 +1,7 @@
 use super::super::{
     backend::{BackendControl, BackendEvent, BackendLoadRequest, FfmpegBackend, Result},
     render_host::FrameSlot,
+    tracks::PlaybackTrack,
 };
 
 pub(super) enum PlaybackBackend {
@@ -35,6 +36,22 @@ impl BackendControl for PlaybackBackend {
     fn stop(&mut self) -> Result<()> {
         match self {
             Self::Ffmpeg(backend) => backend.stop(),
+        }
+    }
+
+    fn set_audio_track(&mut self, track_index: Option<usize>, position_seconds: f64) -> Result<()> {
+        match self {
+            Self::Ffmpeg(backend) => backend.set_audio_track(track_index, position_seconds),
+        }
+    }
+
+    fn set_subtitle_track(
+        &mut self,
+        track: Option<PlaybackTrack>,
+        position_seconds: f64,
+    ) -> Result<()> {
+        match self {
+            Self::Ffmpeg(backend) => backend.set_subtitle_track(track, position_seconds),
         }
     }
 

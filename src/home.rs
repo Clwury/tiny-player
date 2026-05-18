@@ -28,13 +28,13 @@ pub enum HomeEvent {
     BackToServers,
     SectionChanged,
     TitleChanged,
-    OpenPlayback(PlaybackRequest),
+    OpenPlayback(Box<PlaybackRequest>),
 }
 
 #[derive(Clone, Debug)]
 enum HomeContentEvent {
     TitleChanged,
-    OpenPlayback(PlaybackRequest),
+    OpenPlayback(Box<PlaybackRequest>),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

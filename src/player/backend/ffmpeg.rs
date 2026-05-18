@@ -3,7 +3,8 @@ use std::{
     env,
     ffi::{CStr, CString},
     io::Read,
-    os::raw::{c_int, c_void},
+    mem,
+    os::raw::{c_char, c_int, c_void},
     ptr, slice,
     sync::{
         Arc, Condvar, Mutex,
@@ -22,7 +23,7 @@ use ffmpeg_sys_next as ffi;
 
 use super::{
     BackendControl, BackendError, BackendEvent, BackendEventKind, BackendLoadRequest,
-    HttpStreamBufferProgress, PlaybackVideoInfo, Result,
+    BackendSubtitleBitmap, BackendSubtitleCue, HttpStreamBufferProgress, PlaybackVideoInfo, Result,
 };
 use crate::player::{
     dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat},
@@ -31,12 +32,14 @@ use crate::player::{
         FrameDynamicMetadata, FramePixels, FramePts, FrameSlot, PlaybackSessionId, PooledBytes,
         RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlane, RawVideoPlanes,
         RawVideoRange, RenderSize, VulkanDecodeDevice, VulkanDecodeQueue, VulkanDecodeQueues,
-        VulkanVideoFrame, VulkanVideoPlane,
+        VulkanVideoFrame, VulkanVideoPlane, render_image_from_bgra,
     },
+    tracks::PlaybackTrack,
 };
 
 mod audio;
 mod avio;
+mod bsf;
 mod clock;
 mod codec;
 mod dovi;
@@ -44,6 +47,7 @@ mod format;
 mod hw;
 mod playback_loop;
 mod reporting;
+mod subtitle;
 mod util;
 mod video;
 mod worker;
@@ -53,13 +57,14 @@ use audio::{
     AudioBuffer, AudioShared, audio_samples_duration, fill_audio_output, samples_for_duration,
 };
 use audio::{AudioOutput, audio_sample_len, frame_sample_format, zeroed_channel_layout};
+use avio::reqwest_header_pairs;
 #[cfg(test)]
 use avio::{
     HttpRingCacheState, content_len_from_content_range, ffmpeg_http_headers,
     http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
-    http_cache_request_headers_for_log, http_cache_response_headers_for_log, reqwest_header_pairs,
-    should_cache_http_url,
+    http_cache_request_headers_for_log, http_cache_response_headers_for_log, should_cache_http_url,
 };
+use bsf::PgsFrameMergeBitstreamFilter;
 #[cfg(test)]
 use clock::{MappedTimestamp, WaitStatus};
 use clock::{
@@ -81,6 +86,7 @@ use hw::{
     vulkan_sw_format,
 };
 use reporting::{BufferedReporter, PositionReporter};
+use subtitle::{DecodedSubtitleCue, decoded_subtitle_cues, load_external_subtitle_cues};
 use util::ffmpeg_error;
 #[cfg(test)]
 use video::ffmpeg_raw_video_format;
@@ -101,6 +107,8 @@ const AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(300);
 const AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(120);
 const VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(90);
 const VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(40);
+const PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(700);
+const PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(500);
 const LATE_VIDEO_DROP_TOLERANCE: Duration = Duration::from_millis(75);
 const HTTP_RING_CACHE_CAPACITY: usize = 500 * 1024 * 1024;
 const HTTP_CACHE_CHUNK_SIZE: usize = 256 * 1024;
@@ -114,12 +122,15 @@ const HTTP_CACHE_PROGRESS_REPORT_THRESHOLD: f64 = 0.001;
 const FFMPEG_AVIO_BUFFER_SIZE: c_int = 256 * 1024;
 const FFMPEG_FAST_PROBE_SIZE: usize = 1024 * 1024;
 const FFMPEG_FAST_ANALYZE_DURATION_US: u64 = 1_000_000;
+const FFMPEG_SUBTITLE_PROBE_SIZE: usize = 64 * 1024 * 1024;
+const FFMPEG_SUBTITLE_ANALYZE_DURATION_US: u64 = 30_000_000;
 
 static FFMPEG_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputProbeProfile {
     Fast,
+    Subtitle,
     Full,
 }
 
@@ -129,6 +140,7 @@ pub struct FfmpegBackend {
     event_rx: Receiver<BackendEvent>,
     worker: Option<FfmpegWorker>,
     current_url: Option<String>,
+    current_request: Option<BackendLoadRequest>,
     current_session_id: PlaybackSessionId,
     loaded: bool,
     paused: bool,
@@ -147,6 +159,7 @@ impl FfmpegBackend {
             event_rx,
             worker: None,
             current_url: None,
+            current_request: None,
             current_session_id: PlaybackSessionId::default(),
             loaded: false,
             paused: true,
@@ -162,16 +175,32 @@ impl FfmpegBackend {
         url: &str,
         http_headers: Vec<(String, String)>,
         content_length: Option<u64>,
+        selected_tracks: crate::player::PlaybackTrackSelection,
     ) -> Result<()> {
         let url = url.trim();
         if url.is_empty() {
             return Err(BackendError::EmptyUrl);
         }
 
+        let request = BackendLoadRequest {
+            url: url.to_string(),
+            http_headers,
+            content_length,
+            selected_tracks,
+        };
+        self.start_playback(request, 0.0)
+    }
+
+    fn start_playback(
+        &mut self,
+        request: BackendLoadRequest,
+        start_position_seconds: f64,
+    ) -> Result<()> {
         let session_id = self.advance_session();
         self.frame_slot.begin_session(session_id);
         self.stop_worker();
-        self.current_url = Some(url.to_string());
+        self.current_url = Some(request.url.clone());
+        self.current_request = Some(request.clone());
         self.loaded = false;
         self.paused = true;
         FFMPEG_FRAME_COUNT.store(0, Ordering::Relaxed);
@@ -184,15 +213,30 @@ impl FfmpegBackend {
         self.worker = Some(FfmpegWorker::spawn(
             FfmpegPlaybackInput {
                 session_id,
-                url: url.to_string(),
-                http_headers,
-                content_length,
-                start_position_seconds: 0.0,
+                url: request.url,
+                http_headers: request.http_headers,
+                content_length: request.content_length,
+                start_position_seconds,
+                selected_tracks: request.selected_tracks,
             },
             self.frame_slot.clone(),
             self.event_tx.clone(),
         )?);
         Ok(())
+    }
+
+    fn restart_with_track_selection(
+        &mut self,
+        selected_tracks: crate::player::PlaybackTrackSelection,
+        position_seconds: f64,
+    ) -> Result<()> {
+        let Some(mut request) = self.current_request.clone() else {
+            return Err(BackendError::Ffmpeg(
+                "FFmpeg 尚未加载可切换轨道的媒体".to_string(),
+            ));
+        };
+        request.selected_tracks = selected_tracks;
+        self.start_playback(request, position_seconds.max(0.0))
     }
 
     pub fn seek_to(&mut self, position_seconds: f64) -> Result<()> {
@@ -253,6 +297,7 @@ impl FfmpegBackend {
         self.frame_slot.begin_session(session_id);
         self.stop_worker();
         self.current_url = None;
+        self.current_request = None;
         self.loaded = false;
         self.paused = true;
         while self.event_rx.try_recv().is_ok() {}
@@ -321,8 +366,9 @@ impl BackendControl for FfmpegBackend {
             url,
             http_headers,
             content_length,
+            selected_tracks,
         } = request;
-        self.load_url(&url, http_headers, content_length)
+        self.load_url(&url, http_headers, content_length, selected_tracks)
     }
 
     fn seek(&mut self, position_seconds: f64) -> Result<()> {
@@ -339,6 +385,30 @@ impl BackendControl for FfmpegBackend {
 
     fn stop(&mut self) -> Result<()> {
         FfmpegBackend::stop(self)
+    }
+
+    fn set_audio_track(&mut self, track_index: Option<usize>, position_seconds: f64) -> Result<()> {
+        let mut selected_tracks = self
+            .current_request
+            .as_ref()
+            .map(|request| request.selected_tracks.clone())
+            .unwrap_or_default();
+        selected_tracks.audio_stream_index = track_index;
+        self.restart_with_track_selection(selected_tracks, position_seconds)
+    }
+
+    fn set_subtitle_track(
+        &mut self,
+        track: Option<PlaybackTrack>,
+        position_seconds: f64,
+    ) -> Result<()> {
+        let mut selected_tracks = self
+            .current_request
+            .as_ref()
+            .map(|request| request.selected_tracks.clone())
+            .unwrap_or_default();
+        selected_tracks.set_subtitle_track(track.as_ref());
+        self.restart_with_track_selection(selected_tracks, position_seconds)
     }
 
     fn poll_events(&mut self) -> Vec<BackendEvent> {

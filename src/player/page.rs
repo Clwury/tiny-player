@@ -3,18 +3,20 @@ use std::{fmt, sync::Arc};
 use gpui::{
     Bounds, Context, DragMoveEvent, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, Pixels, Render,
-    RenderImage, SharedString, StatefulInteractiveElement, Styled, Window, canvas, div, prelude::*,
-    px, relative, rgb, rgba, svg,
+    RenderImage, SharedString, StatefulInteractiveElement, Styled, Window, canvas, deferred, div,
+    prelude::*, px, relative, rgb, rgba, svg,
 };
 
 use crate::theme;
 
 use super::{
     backend::{
-        BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest, FfmpegBackend,
-        HttpStreamBufferProgress, PlaybackVideoInfo,
+        BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest,
+        BackendSubtitleBitmap, BackendSubtitleCue, FfmpegBackend, HttpStreamBufferProgress,
+        PlaybackVideoInfo,
     },
     render_host::RenderSize,
+    tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection},
     video_presenter::VideoPresenter,
 };
 
@@ -44,6 +46,9 @@ pub struct PlaybackRequest {
     pub url: String,
     pub http_headers: Vec<(String, String)>,
     pub content_length: Option<u64>,
+    pub audio_tracks: Vec<PlaybackTrack>,
+    pub subtitle_tracks: Vec<PlaybackTrack>,
+    pub selected_tracks: PlaybackTrackSelection,
 }
 
 impl fmt::Debug for PlaybackRequest {
@@ -54,6 +59,9 @@ impl fmt::Debug for PlaybackRequest {
             .field("url", &"<redacted>")
             .field("http_headers", &self.http_headers.len())
             .field("content_length", &self.content_length)
+            .field("audio_tracks", &self.audio_tracks.len())
+            .field("subtitle_tracks", &self.subtitle_tracks.len())
+            .field("selected_tracks", &self.selected_tracks)
             .finish()
     }
 }
@@ -83,6 +91,12 @@ pub struct PlaybackPage {
     current_file_loaded: bool,
     playback_info_overlay_visible: bool,
     playback_info: Option<PlaybackVideoInfo>,
+    audio_tracks: Vec<PlaybackTrack>,
+    subtitle_tracks: Vec<PlaybackTrack>,
+    selected_audio_stream_index: Option<usize>,
+    selected_subtitle_stream_index: Option<usize>,
+    open_track_select: Option<PlaybackTrackKind>,
+    active_subtitle: Option<BackendSubtitleCue>,
     error_message: Option<SharedString>,
     status_message: SharedString,
 }
@@ -101,6 +115,7 @@ impl PlaybackPage {
                         url: request.url.clone(),
                         http_headers: request.http_headers.clone(),
                         content_length: request.content_length,
+                        selected_tracks: request.selected_tracks.clone(),
                     };
                     if let Err(error) = backend.command(BackendCommand::Load(load_request)) {
                         error_message = Some(format!("加载视频失败：{error}").into());
@@ -141,6 +156,12 @@ impl PlaybackPage {
             current_file_loaded: false,
             playback_info_overlay_visible: false,
             playback_info: None,
+            audio_tracks: request.audio_tracks,
+            subtitle_tracks: request.subtitle_tracks,
+            selected_audio_stream_index: request.selected_tracks.audio_stream_index,
+            selected_subtitle_stream_index: request.selected_tracks.subtitle_stream_index,
+            open_track_select: None,
+            active_subtitle: None,
             error_message,
             status_message,
         }
@@ -199,6 +220,147 @@ impl PlaybackPage {
                 self.playback_buffering = false;
             }
         }
+        cx.notify();
+    }
+
+    fn toggle_audio_track_select(
+        &mut self,
+        _: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        if self.audio_tracks.is_empty() && self.selected_audio_stream_index.is_none() {
+            return;
+        }
+        self.open_track_select = if self.open_track_select == Some(PlaybackTrackKind::Audio) {
+            None
+        } else {
+            Some(PlaybackTrackKind::Audio)
+        };
+        cx.notify();
+    }
+
+    fn toggle_subtitle_track_select(
+        &mut self,
+        _: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        if self.subtitle_tracks.is_empty() && self.selected_subtitle_stream_index.is_none() {
+            return;
+        }
+        self.open_track_select = if self.open_track_select == Some(PlaybackTrackKind::Subtitle) {
+            None
+        } else {
+            Some(PlaybackTrackKind::Subtitle)
+        };
+        cx.notify();
+    }
+
+    fn select_audio_track(
+        &mut self,
+        track_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_track(PlaybackTrackKind::Audio, track_index, window, cx);
+    }
+
+    fn select_subtitle_track(
+        &mut self,
+        track: Option<PlaybackTrack>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_subtitle_track_for_backend(track, window, cx);
+    }
+
+    fn select_track(
+        &mut self,
+        kind: PlaybackTrackKind,
+        track_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let position_seconds = self
+            .progress_drag_position
+            .or(self.playback_position)
+            .unwrap_or(0.0);
+        let previous_audio = self.selected_audio_stream_index;
+        let previous_subtitle = self.selected_subtitle_stream_index;
+        let mut previous_active_subtitle = None;
+        match kind {
+            PlaybackTrackKind::Audio => self.selected_audio_stream_index = track_index,
+            PlaybackTrackKind::Subtitle => {
+                self.selected_subtitle_stream_index = track_index;
+                previous_active_subtitle = self.active_subtitle.take();
+            }
+        }
+        self.open_track_select = None;
+        self.playback_buffering = self.current_file_loaded;
+        self.status_message = "正在切换轨道…".into();
+
+        let command = match kind {
+            PlaybackTrackKind::Audio => BackendCommand::SetAudioTrack {
+                track_index,
+                position_seconds,
+            },
+            PlaybackTrackKind::Subtitle => BackendCommand::SetSubtitleTrack {
+                track: track_index.and_then(|stream_index| {
+                    self.subtitle_tracks
+                        .iter()
+                        .find(|track| track.stream_index == stream_index)
+                        .cloned()
+                }),
+                position_seconds,
+            },
+        };
+        if let Some(backend) = self.video.owner_mut()
+            && let Err(error) = backend.command(command)
+        {
+            self.selected_audio_stream_index = previous_audio;
+            self.selected_subtitle_stream_index = previous_subtitle;
+            self.active_subtitle = previous_active_subtitle.take();
+            self.playback_buffering = false;
+            self.error_message = Some(format!("切换轨道失败：{error}").into());
+        }
+        defer_drop_subtitle(previous_active_subtitle, window);
+        cx.notify();
+    }
+
+    fn select_subtitle_track_for_backend(
+        &mut self,
+        track: Option<PlaybackTrack>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let position_seconds = self
+            .progress_drag_position
+            .or(self.playback_position)
+            .unwrap_or(0.0);
+        let previous_audio = self.selected_audio_stream_index;
+        let previous_subtitle = self.selected_subtitle_stream_index;
+        let mut previous_active_subtitle = self.active_subtitle.take();
+        self.selected_subtitle_stream_index = track.as_ref().map(|track| track.stream_index);
+        self.open_track_select = None;
+        self.playback_buffering = self.current_file_loaded;
+        self.status_message = "正在切换轨道…".into();
+
+        if let Some(backend) = self.video.owner_mut()
+            && let Err(error) = backend.command(BackendCommand::SetSubtitleTrack {
+                track,
+                position_seconds,
+            })
+        {
+            self.selected_audio_stream_index = previous_audio;
+            self.selected_subtitle_stream_index = previous_subtitle;
+            self.active_subtitle = previous_active_subtitle.take();
+            self.playback_buffering = false;
+            self.error_message = Some(format!("切换轨道失败：{error}").into());
+        }
+        defer_drop_subtitle(previous_active_subtitle, window);
         cx.notify();
     }
 
@@ -397,6 +559,7 @@ impl PlaybackPage {
                     self.pending_seek_position = None;
                     self.pending_seek_keeps_frame = false;
                     self.progress_drag_position = None;
+                    defer_drop_subtitle(self.active_subtitle.take(), window);
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("加载视频失败：{message}").into());
                 }
@@ -411,6 +574,7 @@ impl PlaybackPage {
                     self.pending_seek_position = None;
                     self.pending_seek_keeps_frame = false;
                     self.progress_drag_position = None;
+                    defer_drop_subtitle(self.active_subtitle.take(), window);
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("播放后端错误：{message}").into());
                 }
@@ -428,6 +592,12 @@ impl PlaybackPage {
                 }
                 BackendEventKind::PlaybackInfoChanged(info) => {
                     self.playback_info = info;
+                }
+                BackendEventKind::SubtitleChanged(cue) => {
+                    if self.active_subtitle != cue {
+                        defer_drop_subtitle(self.active_subtitle.take(), window);
+                    }
+                    self.active_subtitle = cue;
                 }
                 BackendEventKind::VideoSizeChanged(size) => {
                     if self.video_source_size != size {
@@ -587,6 +757,184 @@ impl PlaybackPage {
             .into_any_element()
     }
 
+    fn render_subtitle_overlay(&self, cx: &Context<Self>) -> impl IntoElement {
+        let Some(cue) = self.active_subtitle.as_ref() else {
+            return div()
+                .id("playback-subtitle-overlay-empty")
+                .into_any_element();
+        };
+        let Some(observed_video_bounds) = self.video_viewport_bounds else {
+            return div()
+                .id("playback-subtitle-overlay-empty")
+                .into_any_element();
+        };
+        // Canvas observations are window-relative, while absolute children below
+        // are laid out relative to the playback view.
+        let video_bounds = local_video_viewport_bounds(observed_video_bounds);
+        let Some(source_size) = self.video_source_size else {
+            return div()
+                .id("playback-subtitle-overlay-empty")
+                .into_any_element();
+        };
+        let Some(video_fitted_bounds) = aspect_fit_bounds(video_bounds, source_size) else {
+            return div()
+                .id("playback-subtitle-overlay-empty")
+                .into_any_element();
+        };
+
+        if !cue.has_content() {
+            return div()
+                .id("playback-subtitle-overlay-empty")
+                .into_any_element();
+        }
+
+        let bitmap_canvas_size = subtitle_bitmap_canvas_size(cue).unwrap_or(source_size);
+        let bitmap_bounds =
+            aspect_fit_bounds(video_bounds, bitmap_canvas_size).unwrap_or(video_fitted_bounds);
+        let scale_x = bitmap_bounds.size.width / px(bitmap_canvas_size.width as f32);
+        let scale_y = bitmap_bounds.size.height / px(bitmap_canvas_size.height as f32);
+        let bitmap_overlay = cue.bitmaps.iter().fold(
+            div()
+                .id("playback-subtitle-bitmap-overlay")
+                .absolute()
+                .left(bitmap_bounds.origin.x)
+                .top(bitmap_bounds.origin.y)
+                .w(bitmap_bounds.size.width)
+                .h(bitmap_bounds.size.height),
+            |this, bitmap| this.child(render_subtitle_bitmap(bitmap, scale_x, scale_y)),
+        );
+        let overlay = div()
+            .id("playback-subtitle-overlay")
+            .absolute()
+            .left_0()
+            .top_0()
+            .w_full()
+            .h_full()
+            .child(bitmap_overlay);
+
+        if cue.text.trim().is_empty() {
+            return overlay.into_any_element();
+        }
+
+        let theme = theme::get(cx);
+        overlay
+            .child(
+                div()
+                    .id("playback-subtitle-text-overlay")
+                    .absolute()
+                    .left(video_fitted_bounds.origin.x)
+                    .top(video_fitted_bounds.origin.y + video_fitted_bounds.size.height * 0.78)
+                    .w(video_fitted_bounds.size.width)
+                    .flex()
+                    .justify_center()
+                    .px_6()
+                    .occlude()
+                    .child(
+                        div()
+                            .max_w(relative(0.86))
+                            .rounded(px(6.0))
+                            .bg(rgba(0x0000009c))
+                            .px_3()
+                            .py_2()
+                            .text_center()
+                            .text_lg()
+                            .line_height(px(28.0))
+                            .text_color(theme.foreground)
+                            .child(cue.text.clone()),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_track_select_menu(
+        &self,
+        kind: PlaybackTrackKind,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = theme::get(cx);
+        let (id, tracks, selected) = match kind {
+            PlaybackTrackKind::Audio => (
+                "playback-audio-menu",
+                &self.audio_tracks,
+                self.selected_audio_stream_index,
+            ),
+            PlaybackTrackKind::Subtitle => (
+                "playback-caption-menu",
+                &self.subtitle_tracks,
+                self.selected_subtitle_stream_index,
+            ),
+        };
+        let off_selected = selected.is_none();
+        let off_mouse_down = cx.listener(move |page: &mut PlaybackPage, _, window, cx| {
+            cx.stop_propagation();
+            match kind {
+                PlaybackTrackKind::Audio => page.select_audio_track(None, window, cx),
+                PlaybackTrackKind::Subtitle => page.select_subtitle_track(None, window, cx),
+            }
+        });
+
+        tracks
+            .iter()
+            .enumerate()
+            .fold(
+                div()
+                    .id(id)
+                    .absolute()
+                    .right_0()
+                    .bottom(px(38.0))
+                    .flex()
+                    .flex_col()
+                    .min_w(px(190.0))
+                    .max_w(px(280.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme.input_border.opacity(0.62))
+                    .bg(rgba(0x000000dd))
+                    .py_1()
+                    .shadow_lg()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        track_select_option("Off", off_selected, cx)
+                            .id("playback-track-off-option")
+                            .on_mouse_down(MouseButton::Left, off_mouse_down),
+                    ),
+                |this, (index, track)| {
+                    let track = track.clone();
+                    let stream_index = track.stream_index;
+                    let selected = selected == Some(stream_index);
+                    let label = if track.is_external {
+                        format!("{} 外挂", track.label)
+                    } else {
+                        track.label.to_string()
+                    };
+                    let on_mouse_down =
+                        cx.listener(move |page: &mut PlaybackPage, _, window, cx| {
+                            cx.stop_propagation();
+                            match kind {
+                                PlaybackTrackKind::Audio => {
+                                    page.select_audio_track(Some(stream_index), window, cx)
+                                }
+                                PlaybackTrackKind::Subtitle => {
+                                    page.select_subtitle_track(Some(track.clone()), window, cx)
+                                }
+                            }
+                        });
+                    this.child(
+                        track_select_option(label, selected, cx)
+                            .id((
+                                gpui::ElementId::from("playback-track-option"),
+                                index.to_string(),
+                            ))
+                            .on_mouse_down(MouseButton::Left, on_mouse_down),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
     fn render_progress_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let Some(duration) = self.playback_duration else {
             return div().id("playback-progress-empty").into_any_element();
@@ -626,6 +974,12 @@ impl PlaybackPage {
         } else {
             "icons/pause.svg"
         };
+        let can_select_audio =
+            !self.audio_tracks.is_empty() || self.selected_audio_stream_index.is_some();
+        let can_select_subtitle =
+            !self.subtitle_tracks.is_empty() || self.selected_subtitle_stream_index.is_some();
+        let audio_select_open = self.open_track_select == Some(PlaybackTrackKind::Audio);
+        let subtitle_select_open = self.open_track_select == Some(PlaybackTrackKind::Subtitle);
 
         div()
             .id("playback-progress")
@@ -707,22 +1061,70 @@ impl PlaybackPage {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(Self::playback_control_button(
-                                "playback-audio-button",
-                                "icons/audio.svg",
-                                px(30.0),
-                                px(16.0),
-                                false,
-                                cx,
-                            ))
-                            .child(Self::playback_control_button(
-                                "playback-caption-button",
-                                "icons/caption.svg",
-                                px(30.0),
-                                px(16.0),
-                                false,
-                                cx,
-                            )),
+                            .child(
+                                div()
+                                    .relative()
+                                    .child(
+                                        Self::playback_control_button(
+                                            "playback-audio-button",
+                                            "icons/audio.svg",
+                                            px(30.0),
+                                            px(16.0),
+                                            can_select_audio,
+                                            cx,
+                                        )
+                                        .when(
+                                            can_select_audio,
+                                            |this| {
+                                                this.on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(Self::toggle_audio_track_select),
+                                                )
+                                            },
+                                        ),
+                                    )
+                                    .when(audio_select_open, |this| {
+                                        this.child(
+                                            deferred(self.render_track_select_menu(
+                                                PlaybackTrackKind::Audio,
+                                                cx,
+                                            ))
+                                            .with_priority(1),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .relative()
+                                    .child(
+                                        Self::playback_control_button(
+                                            "playback-caption-button",
+                                            "icons/caption.svg",
+                                            px(30.0),
+                                            px(16.0),
+                                            can_select_subtitle,
+                                            cx,
+                                        )
+                                        .when(
+                                            can_select_subtitle,
+                                            |this| {
+                                                this.on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(Self::toggle_subtitle_track_select),
+                                                )
+                                            },
+                                        ),
+                                    )
+                                    .when(subtitle_select_open, |this| {
+                                        this.child(
+                                            deferred(self.render_track_select_menu(
+                                                PlaybackTrackKind::Subtitle,
+                                                cx,
+                                            ))
+                                            .with_priority(1),
+                                        )
+                                    }),
+                            ),
                     ),
             )
             .child(
@@ -844,6 +1246,150 @@ fn playback_info_segments(info: &PlaybackVideoInfo) -> Vec<String> {
     segments
 }
 
+fn track_select_option(
+    label: impl Into<SharedString>,
+    selected: bool,
+    cx: &Context<PlaybackPage>,
+) -> gpui::Div {
+    let theme = theme::get(cx);
+    div()
+        .flex()
+        .h(px(32.0))
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .px_3()
+        .text_xs()
+        .text_color(theme.foreground.opacity(if selected { 1.0 } else { 0.82 }))
+        .bg(if selected {
+            theme.foreground.opacity(0.14)
+        } else {
+            theme.background.opacity(0.0)
+        })
+        .cursor_pointer()
+        .hover(move |style| style.bg(theme.foreground.opacity(0.12)))
+        .child(div().min_w_0().truncate().child(label.into()))
+}
+
+fn render_subtitle_bitmap(
+    bitmap: &BackendSubtitleBitmap,
+    scale_x: f32,
+    scale_y: f32,
+) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(bitmap.x as f32) * scale_x)
+        .top(px(bitmap.y as f32) * scale_y)
+        .w(px(bitmap.width as f32) * scale_x)
+        .h(px(bitmap.height as f32) * scale_y)
+        .child(SubtitleBitmapElement {
+            image: bitmap.image.clone(),
+        })
+}
+
+fn local_video_viewport_bounds(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    Bounds::new(gpui::point(px(0.0), px(0.0)), bounds.size)
+}
+
+fn subtitle_bitmap_canvas_size(cue: &BackendSubtitleCue) -> Option<RenderSize> {
+    cue.bitmaps
+        .iter()
+        .filter(|bitmap| bitmap.canvas_width > 0 && bitmap.canvas_height > 0)
+        .fold(None, |size, bitmap| {
+            Some(match size {
+                Some(size) => RenderSize {
+                    width: size.width.max(bitmap.canvas_width),
+                    height: size.height.max(bitmap.canvas_height),
+                },
+                None => RenderSize {
+                    width: bitmap.canvas_width,
+                    height: bitmap.canvas_height,
+                },
+            })
+        })
+}
+
+fn defer_drop_subtitle(cue: Option<BackendSubtitleCue>, window: &mut Window) {
+    if let Some(cue) = cue {
+        for bitmap in cue.bitmaps {
+            defer_drop_frame(bitmap.image, window);
+        }
+    }
+}
+
+struct SubtitleBitmapElement {
+    image: Arc<RenderImage>,
+}
+
+impl gpui::Element for SubtitleBitmapElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let style = gpui::Style {
+            size: gpui::Size {
+                width: gpui::Length::Definite(gpui::DefiniteLength::Fraction(1.0)),
+                height: gpui::Length::Definite(gpui::DefiniteLength::Fraction(1.0)),
+            },
+            ..Default::default()
+        };
+
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut gpui::App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        _cx: &mut gpui::App,
+    ) {
+        _ = window.paint_image(
+            bounds,
+            gpui::Corners::default(),
+            self.image.clone(),
+            0,
+            false,
+        );
+    }
+}
+
+impl IntoElement for SubtitleBitmapElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
 fn valid_frame_rate(frame_rate: f64) -> Option<f64> {
     frame_rate
         .is_finite()
@@ -931,6 +1477,7 @@ impl Render for PlaybackPage {
             .when(self.playback_info_overlay_visible, |this| {
                 this.child(self.render_playback_info_overlay(cx))
             })
+            .child(self.render_subtitle_overlay(cx))
             .child(self.render_progress_bar(cx))
             .child(
                 div()

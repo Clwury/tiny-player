@@ -92,6 +92,7 @@ pub(super) struct FfmpegPlaybackInput {
     pub(super) http_headers: Vec<(String, String)>,
     pub(super) content_length: Option<u64>,
     pub(super) start_position_seconds: f64,
+    pub(super) selected_tracks: crate::player::PlaybackTrackSelection,
 }
 
 pub(super) enum FfmpegCommand {
@@ -111,11 +112,13 @@ pub(super) enum FfmpegCommand {
     SetAudioTrack {
         session_id: PlaybackSessionId,
         track_index: Option<usize>,
+        position_seconds: f64,
     },
     #[allow(dead_code)]
     SetSubtitleTrack {
         session_id: PlaybackSessionId,
         track_index: Option<usize>,
+        position_seconds: f64,
     },
     #[allow(dead_code)]
     SetPlaybackRate {
@@ -286,20 +289,24 @@ pub(super) fn drain_playback_commands(
             FfmpegCommand::SetAudioTrack {
                 session_id,
                 track_index,
+                position_seconds,
             } => {
                 control.set_session_id(session_id);
                 tracing::debug!(
                     ?track_index,
+                    position_seconds,
                     "FFmpeg audio track command queued but not implemented yet"
                 );
             }
             FfmpegCommand::SetSubtitleTrack {
                 session_id,
                 track_index,
+                position_seconds,
             } => {
                 control.set_session_id(session_id);
                 tracing::debug!(
                     ?track_index,
+                    position_seconds,
                     "FFmpeg subtitle track command queued but not implemented yet"
                 );
             }

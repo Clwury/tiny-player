@@ -1,3 +1,7 @@
+use std::{fmt, sync::Arc};
+
+use gpui::RenderImage;
+
 use crate::player::render_host::{PlaybackSessionId, RenderSize};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6,6 +10,58 @@ pub struct PlaybackVideoInfo {
     pub size: RenderSize,
     pub frame_rate: Option<f64>,
     pub hardware_accelerated: bool,
+}
+
+#[derive(Clone)]
+pub struct BackendSubtitleBitmap {
+    pub image: Arc<RenderImage>,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub canvas_width: u32,
+    pub canvas_height: u32,
+}
+
+impl fmt::Debug for BackendSubtitleBitmap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackendSubtitleBitmap")
+            .field("image", &"<render-image>")
+            .field("x", &self.x)
+            .field("y", &self.y)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("canvas_width", &self.canvas_width)
+            .field("canvas_height", &self.canvas_height)
+            .finish()
+    }
+}
+
+impl PartialEq for BackendSubtitleBitmap {
+    fn eq(&self, other: &Self) -> bool {
+        self.x == other.x
+            && self.y == other.y
+            && self.width == other.width
+            && self.height == other.height
+            && self.canvas_width == other.canvas_width
+            && self.canvas_height == other.canvas_height
+            && self.image == other.image
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackendSubtitleCue {
+    pub text: String,
+    pub bitmaps: Vec<BackendSubtitleBitmap>,
+    pub start_nsecs: u64,
+    pub end_nsecs: u64,
+}
+
+impl BackendSubtitleCue {
+    pub fn has_content(&self) -> bool {
+        !self.text.trim().is_empty() || !self.bitmaps.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -37,6 +93,7 @@ pub enum BackendEventKind {
     DurationChanged(f64),
     BufferedChanged(Option<f64>),
     HttpStreamBufferedChanged(Option<HttpStreamBufferProgress>),
+    SubtitleChanged(Option<BackendSubtitleCue>),
     LoadFailed(String),
     Fatal(String),
 }

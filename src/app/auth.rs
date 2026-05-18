@@ -176,7 +176,7 @@ impl TinyApp {
                 HomeEvent::BackToServers => app.show_servers_page_from_home(cx),
                 HomeEvent::SectionChanged | HomeEvent::TitleChanged => cx.notify(),
                 HomeEvent::OpenPlayback(request) => {
-                    app.open_playback_page(playback_return_to.clone(), request.clone(), cx)
+                    app.open_playback_page(playback_return_to.clone(), request.as_ref().clone(), cx)
                 }
             },
         )

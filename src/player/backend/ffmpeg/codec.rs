@@ -11,11 +11,19 @@ pub(super) struct Decoder {
 impl Decoder {
     pub(super) fn open(stream: StreamInfo) -> std::result::Result<Self, String> {
         let decoder = find_decoder(stream)?;
-        Self::open_with_decoder(stream, decoder, None)
+        Self::open_with_decoder(stream, decoder, None, None)
     }
 
     pub(super) fn open_audio(stream: StreamInfo) -> std::result::Result<Self, String> {
         Self::open(stream)
+    }
+
+    pub(super) fn open_subtitle(
+        stream: StreamInfo,
+        canvas_size: Option<RenderSize>,
+    ) -> std::result::Result<Self, String> {
+        let decoder = find_decoder(stream)?;
+        Self::open_with_decoder(stream, decoder, None, canvas_size)
     }
 
     pub(super) fn open_video(
@@ -24,11 +32,11 @@ impl Decoder {
     ) -> std::result::Result<Self, String> {
         let decoder = find_decoder(stream)?;
         if !hw_mode.should_try_vulkan() {
-            return Self::open_with_decoder(stream, decoder, None);
+            return Self::open_with_decoder(stream, decoder, None, None);
         }
 
         match VideoHwDecodeContext::try_create(decoder) {
-            Ok(video_hw) => match Self::open_with_decoder(stream, decoder, Some(video_hw)) {
+            Ok(video_hw) => match Self::open_with_decoder(stream, decoder, Some(video_hw), None) {
                 Ok(decoder_context) => {
                     tracing::info!(
                         decoder = %decoder_name(decoder),
@@ -42,7 +50,7 @@ impl Decoder {
                         decoder = %decoder_name(decoder),
                         "FFmpeg Vulkan decoder open failed; falling back to software"
                     );
-                    Self::open_with_decoder(stream, decoder, None)
+                    Self::open_with_decoder(stream, decoder, None, None)
                 }
                 Err(error) => Err(format!("FFmpeg Vulkan 硬解打开失败：{error}")),
             },
@@ -52,7 +60,7 @@ impl Decoder {
                     decoder = %decoder_name(decoder),
                     "FFmpeg Vulkan hardware decode unavailable; falling back to software"
                 );
-                Self::open_with_decoder(stream, decoder, None)
+                Self::open_with_decoder(stream, decoder, None, None)
             }
             Err(error) => Err(format!("FFmpeg Vulkan 硬解不可用：{error}")),
         }
@@ -62,6 +70,7 @@ impl Decoder {
         stream: StreamInfo,
         decoder: *const ffi::AVCodec,
         video_hw: Option<VideoHwDecodeContext>,
+        subtitle_canvas_size: Option<RenderSize>,
     ) -> std::result::Result<Self, String> {
         let codecpar = unsafe { (*stream.stream).codecpar };
         if codecpar.is_null() {
@@ -95,6 +104,22 @@ impl Decoder {
             (*context).pkt_timebase = stream.time_base;
             (*context).thread_count = 0;
             (*context).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
+        }
+        if unsafe { (*context).codec_type } == ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE
+            && let Some(size) = subtitle_canvas_size
+            && unsafe { (*context).width <= 0 || (*context).height <= 0 }
+        {
+            unsafe {
+                (*context).width =
+                    c_int::try_from(size.width).map_err(|_| "字幕画布宽度无效".to_string())?;
+                (*context).height =
+                    c_int::try_from(size.height).map_err(|_| "字幕画布高度无效".to_string())?;
+            }
+            tracing::debug!(
+                width = size.width,
+                height = size.height,
+                "filled missing FFmpeg subtitle decoder canvas size from video stream"
+            );
         }
         if let Some(selection) = decoder_context.hw_format_selection.as_ref() {
             unsafe {
@@ -171,6 +196,42 @@ impl Decoder {
 
     pub(super) fn flush_buffers(&self) {
         unsafe { ffi::avcodec_flush_buffers(self.ptr) };
+    }
+
+    pub(super) fn decode_subtitle_packet<F>(
+        &self,
+        packet: *const ffi::AVPacket,
+        mut on_cue: F,
+    ) -> std::result::Result<(), String>
+    where
+        F: FnMut(DecodedSubtitleCue) -> std::result::Result<(), String>,
+    {
+        let mut subtitle = unsafe { mem::zeroed::<ffi::AVSubtitle>() };
+        let mut got_subtitle = 0;
+        let result = unsafe {
+            ffi::avcodec_decode_subtitle2(self.ptr, &mut subtitle, &mut got_subtitle, packet)
+        };
+        if result < 0 {
+            return Err(format!("FFmpeg 解码字幕失败：{}", ffmpeg_error(result)));
+        }
+        if got_subtitle == 0 {
+            return Ok(());
+        }
+
+        let cues = decoded_subtitle_cues(
+            &subtitle,
+            self.size().ok(),
+            self.emits_empty_subtitle_cues(),
+        );
+        unsafe { ffi::avsubtitle_free(&mut subtitle) };
+        for cue in cues? {
+            on_cue(cue)?;
+        }
+        Ok(())
+    }
+
+    fn emits_empty_subtitle_cues(&self) -> bool {
+        unsafe { (*self.ptr).codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE }
     }
 
     pub(super) fn vulkan_device(&self) -> Option<Arc<VulkanDecodeDevice>> {

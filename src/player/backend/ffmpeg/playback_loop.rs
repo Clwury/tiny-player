@@ -6,12 +6,15 @@ struct OpenedPlaybackInput {
     video_decoder: Decoder,
     audio_stream: Option<StreamInfo>,
     audio_decoder: Option<Decoder>,
+    subtitle_stream: Option<StreamInfo>,
+    subtitle_decoder: Option<Decoder>,
 }
 
 struct ProbedPlaybackInput {
     input: FormatContext,
     video_stream: StreamInfo,
     audio_stream: Option<StreamInfo>,
+    subtitle_stream: Option<StreamInfo>,
     allow_audio_decoder_failure: bool,
 }
 
@@ -20,37 +23,121 @@ fn open_playback_input_with_fallback(
     control: Arc<FfmpegControl>,
     event_tx: &Sender<BackendEvent>,
 ) -> std::result::Result<OpenedPlaybackInput, String> {
+    let initial_probe_profile = initial_probe_profile(source);
     let probed = match probe_playback_input(
         source,
         Arc::clone(&control),
         event_tx,
-        InputProbeProfile::Fast,
+        initial_probe_profile,
         false,
     ) {
-        Ok(probed) if probed.audio_stream.is_some() => probed,
+        Ok(probed)
+            if probe_result_satisfies_selection(source, &probed)
+                && (initial_probe_profile == InputProbeProfile::Subtitle
+                    || !selected_pgs_subtitle_needs_deeper_probe(&probed)) =>
+        {
+            probed
+        }
         Ok(probed) => {
-            tracing::debug!("FFmpeg fast probe did not find audio stream; retrying full probe");
-            match probe_playback_input(source, control, event_tx, InputProbeProfile::Full, true) {
+            let fallback_probe_profile = fallback_probe_profile(initial_probe_profile, &probed);
+            tracing::debug!(
+                initial_probe_profile = ?initial_probe_profile,
+                fallback_probe_profile = ?fallback_probe_profile,
+                "FFmpeg initial probe did not satisfy selected streams; retrying"
+            );
+            match probe_playback_input(source, control, event_tx, fallback_probe_profile, true) {
                 Ok(probed) => probed,
                 Err(error) => {
                     tracing::warn!(
                         %error,
-                        "FFmpeg full probe fallback failed; continuing with fast probe result"
+                        "FFmpeg probe fallback failed; continuing with initial probe result"
                     );
                     probed
                 }
             }
         }
-        Err(fast_error) => {
-            tracing::debug!(%fast_error, "FFmpeg fast probe failed; retrying full probe");
-            probe_playback_input(source, control, event_tx, InputProbeProfile::Full, true).map_err(
-                |full_error| {
-                    format!("FFmpeg 快速探测失败：{fast_error}；完整探测也失败：{full_error}")
+        Err(initial_error) => {
+            let fallback_probe_profile = fallback_probe_profile_for_source(source);
+            tracing::debug!(
+                %initial_error,
+                initial_probe_profile = ?initial_probe_profile,
+                fallback_probe_profile = ?fallback_probe_profile,
+                "FFmpeg initial probe failed; retrying"
+            );
+            probe_playback_input(source, control, event_tx, fallback_probe_profile, true).map_err(
+                |fallback_error| {
+                    format!(
+                        "FFmpeg 初始探测失败：{initial_error}；重试探测也失败：{fallback_error}"
+                    )
                 },
             )?
         }
     };
     open_decoders_for_probed_input(probed)
+}
+
+pub(super) fn initial_probe_profile(source: &FfmpegPlaybackInput) -> InputProbeProfile {
+    if selected_internal_pgs_subtitle(source) {
+        InputProbeProfile::Subtitle
+    } else {
+        InputProbeProfile::Fast
+    }
+}
+
+fn fallback_probe_profile(
+    initial_probe_profile: InputProbeProfile,
+    probed: &ProbedPlaybackInput,
+) -> InputProbeProfile {
+    if initial_probe_profile == InputProbeProfile::Subtitle
+        || selected_pgs_subtitle_needs_deeper_probe(probed)
+    {
+        InputProbeProfile::Subtitle
+    } else {
+        InputProbeProfile::Full
+    }
+}
+
+fn fallback_probe_profile_for_source(source: &FfmpegPlaybackInput) -> InputProbeProfile {
+    if selected_internal_pgs_subtitle(source) {
+        InputProbeProfile::Subtitle
+    } else {
+        InputProbeProfile::Full
+    }
+}
+
+fn probe_result_satisfies_selection(
+    source: &FfmpegPlaybackInput,
+    probed: &ProbedPlaybackInput,
+) -> bool {
+    let audio_satisfied =
+        source.selected_tracks.audio_stream_index.is_none() || probed.audio_stream.is_some();
+    let subtitle_satisfied =
+        source.selected_tracks.subtitle_stream_index.is_none() || probed.subtitle_stream.is_some();
+    audio_satisfied && subtitle_satisfied
+}
+
+fn selected_internal_pgs_subtitle(source: &FfmpegPlaybackInput) -> bool {
+    source.selected_tracks.subtitle_stream_index.is_some()
+        && source.selected_tracks.subtitle_external_url.is_none()
+        && source
+            .selected_tracks
+            .subtitle_codec
+            .as_deref()
+            .is_some_and(is_pgs_subtitle_codec)
+}
+
+pub(super) fn is_pgs_subtitle_codec(codec: &str) -> bool {
+    matches!(
+        codec.trim().to_ascii_lowercase().as_str(),
+        "pgs" | "pgssub" | "hdmv_pgs_subtitle" | "hdmv pgs subtitle"
+    )
+}
+
+fn selected_pgs_subtitle_needs_deeper_probe(probed: &ProbedPlaybackInput) -> bool {
+    probed
+        .subtitle_stream
+        .as_ref()
+        .is_some_and(|stream| stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE)
 }
 
 fn probe_playback_input(
@@ -73,12 +160,14 @@ fn probe_playback_input(
     let video_stream = input
         .best_stream(ffi::AVMediaType::AVMEDIA_TYPE_VIDEO)?
         .ok_or_else(|| "FFmpeg 未找到可解码视频流".to_string())?;
-    let audio_stream = select_audio_stream(&input, allow_audio_decoder_failure)?;
+    let audio_stream = select_audio_stream(source, &input, allow_audio_decoder_failure)?;
+    let subtitle_stream = select_subtitle_stream(source, &input)?;
 
     Ok(ProbedPlaybackInput {
         input,
         video_stream,
         audio_stream,
+        subtitle_stream,
         allow_audio_decoder_failure,
     })
 }
@@ -90,11 +179,13 @@ fn open_decoders_for_probed_input(
         input,
         video_stream,
         audio_stream,
+        subtitle_stream,
         allow_audio_decoder_failure,
     } = probed;
     let video_decoder = Decoder::open_video(video_stream, HardwareDecodeMode::from_env())
         .map_err(|error| format!("FFmpeg 打开视频解码器失败：{error}"))?;
     let audio_decoder = open_audio_decoder(audio_stream, allow_audio_decoder_failure)?;
+    let subtitle_decoder = open_subtitle_decoder(subtitle_stream, video_decoder.size().ok())?;
 
     Ok(OpenedPlaybackInput {
         input,
@@ -102,21 +193,46 @@ fn open_decoders_for_probed_input(
         video_decoder,
         audio_stream,
         audio_decoder,
+        subtitle_stream,
+        subtitle_decoder,
     })
 }
 
 fn select_audio_stream(
+    source: &FfmpegPlaybackInput,
     input: &FormatContext,
     allow_audio_decoder_failure: bool,
 ) -> std::result::Result<Option<StreamInfo>, String> {
-    match input.best_stream(ffi::AVMediaType::AVMEDIA_TYPE_AUDIO) {
-        Ok(stream) => Ok(stream),
-        Err(error) if allow_audio_decoder_failure => {
-            tracing::warn!(%error, "FFmpeg audio stream selection failed");
-            Ok(None)
-        }
-        Err(error) => Err(format!("FFmpeg 选择音频流失败：{error}")),
+    let Some(stream_index) = source.selected_tracks.audio_stream_index else {
+        return Ok(None);
+    };
+    input
+        .stream_by_index(stream_index, ffi::AVMediaType::AVMEDIA_TYPE_AUDIO)
+        .map(Some)
+        .or_else(|error| {
+            if allow_audio_decoder_failure {
+                tracing::warn!(%error, "FFmpeg selected audio stream unavailable");
+                Ok(None)
+            } else {
+                Err(format!("FFmpeg 选择指定音频流失败：{error}"))
+            }
+        })
+}
+
+fn select_subtitle_stream(
+    source: &FfmpegPlaybackInput,
+    input: &FormatContext,
+) -> std::result::Result<Option<StreamInfo>, String> {
+    if source.selected_tracks.subtitle_external_url.is_some() {
+        return Ok(None);
     }
+    let Some(stream_index) = source.selected_tracks.subtitle_stream_index else {
+        return Ok(None);
+    };
+    input
+        .stream_by_index(stream_index, ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE)
+        .map(Some)
+        .map_err(|error| format!("FFmpeg 选择指定字幕流失败：{error}"))
 }
 
 fn open_audio_decoder(
@@ -134,6 +250,18 @@ fn open_audio_decoder(
         }
         Err(error) => Err(format!("FFmpeg 打开音频解码器失败：{error}")),
     }
+}
+
+fn open_subtitle_decoder(
+    subtitle_stream: Option<StreamInfo>,
+    video_size: Option<RenderSize>,
+) -> std::result::Result<Option<Decoder>, String> {
+    let Some(stream) = subtitle_stream else {
+        return Ok(None);
+    };
+    Decoder::open_subtitle(stream, video_size)
+        .map(Some)
+        .map_err(|error| format!("FFmpeg 打开字幕解码器失败：{error}"))
 }
 
 fn frame_rate_from_duration(frame_duration_nsecs: Option<u64>) -> Option<f64> {
@@ -172,6 +300,8 @@ pub(super) fn run_ffmpeg_playback(
         video_decoder,
         audio_stream,
         audio_decoder: opened_audio_decoder,
+        subtitle_stream,
+        subtitle_decoder,
     } = open_playback_input_with_fallback(&source, Arc::clone(&control), &event_tx)?;
     if let Some(device) = video_decoder.vulkan_device() {
         frame_slot.request_vulkan_prewarm(current_session_id, device);
@@ -185,6 +315,7 @@ pub(super) fn run_ffmpeg_playback(
     let video_frame_duration_nsecs = video_stream
         .frame_duration_nsecs
         .unwrap_or(DEFAULT_VIDEO_FRAME_DURATION_NSECS);
+    let mut playback_timeline_origin_nsecs = video_stream.start_nsecs;
     let mut video_clock = TimestampMapper::new(
         video_stream.start_nsecs,
         current_start_position_nsecs,
@@ -193,6 +324,35 @@ pub(super) fn run_ffmpeg_playback(
     let mut scheduler = PlaybackScheduler::new(current_start_position_nsecs);
     let mut position_reporter = PositionReporter::default();
     let mut dovi_queue = DoviMetadataQueue::default();
+    let external_subtitle_cues = source
+        .selected_tracks
+        .subtitle_external_url
+        .as_deref()
+        .map(|url| {
+            load_external_subtitle_cues(
+                url,
+                source.http_headers.as_slice(),
+                source.selected_tracks.subtitle_codec.as_deref(),
+            )
+            .map(|cues| cues.into_iter().collect::<Vec<_>>())
+            .map_err(|error| format!("加载外挂字幕失败：{error}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut subtitle_cues =
+        subtitle_cue_queue_from_external(&external_subtitle_cues, current_start_position_nsecs);
+    let mut active_subtitle = None;
+    let mut subtitle_filter = match subtitle_stream {
+        Some(stream) => PgsFrameMergeBitstreamFilter::new(stream)?,
+        None => None,
+    };
+    let needs_subtitle_prefetch = subtitle_stream
+        .is_some_and(|stream| stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE);
+    let mut filtered_subtitle_packet = if subtitle_filter.is_some() {
+        Some(AvPacket::new()?)
+    } else {
+        None
+    };
 
     let mut audio_output = None;
     let mut audio_decoder = None;
@@ -255,6 +415,10 @@ pub(super) fn run_ffmpeg_playback(
         current_session_id,
         BackendEventKind::Buffering(true),
     ));
+    let _ = event_tx.send(BackendEvent::new(
+        current_session_id,
+        BackendEventKind::SubtitleChanged(None),
+    ));
 
     while !control.should_stop() {
         if control.wait_while_paused() {
@@ -279,6 +443,15 @@ pub(super) fn run_ffmpeg_playback(
                 if let Some(decoder) = &audio_decoder {
                     decoder.flush_buffers();
                 }
+                if let Some(decoder) = &subtitle_decoder {
+                    decoder.flush_buffers();
+                }
+                if let Some(filter) = subtitle_filter.as_mut() {
+                    filter.flush();
+                }
+                if let Some(packet) = filtered_subtitle_packet.as_mut() {
+                    packet.unref();
+                }
                 video_frame.unref();
                 if let Some(frame) = audio_frame.as_mut() {
                     frame.unref();
@@ -289,6 +462,7 @@ pub(super) fn run_ffmpeg_playback(
                     current_start_position_nsecs,
                     Some(video_frame_duration_nsecs),
                 );
+                playback_timeline_origin_nsecs = video_stream.start_nsecs;
                 audio_clock = TimestampMapper::new(
                     audio_stream.and_then(|stream| stream.start_nsecs),
                     current_start_position_nsecs,
@@ -301,6 +475,11 @@ pub(super) fn run_ffmpeg_playback(
                 queued_video_frames.clear();
                 first_video_frame_pending = true;
                 dovi_queue.clear();
+                subtitle_cues = subtitle_cue_queue_from_external(
+                    &external_subtitle_cues,
+                    current_start_position_nsecs,
+                );
+                active_subtitle = None;
                 buffered_reporter = BufferedReporter::new(audio_output.is_some());
                 buffered_reporter.reset_to(position_seconds, current_session_id, &event_tx);
                 let _ = event_tx.send(BackendEvent::new(
@@ -310,6 +489,10 @@ pub(super) fn run_ffmpeg_playback(
                 let _ = event_tx.send(BackendEvent::new(
                     current_session_id,
                     BackendEventKind::Buffering(true),
+                ));
+                let _ = event_tx.send(BackendEvent::new(
+                    current_session_id,
+                    BackendEventKind::SubtitleChanged(None),
                 ));
                 Ok(())
             })();
@@ -347,6 +530,12 @@ pub(super) fn run_ffmpeg_playback(
                     }
                     let timestamp = video_clock
                         .map(frame_best_effort_timestamp(frame), video_decoder.time_base);
+                    refresh_playback_timeline_origin(
+                        &mut playback_timeline_origin_nsecs,
+                        &video_clock,
+                        subtitle_stream,
+                        &mut subtitle_cues,
+                    );
                     let frame_pts = FramePts {
                         nsecs: timestamp.timeline_nsecs,
                     };
@@ -380,6 +569,13 @@ pub(super) fn run_ffmpeg_playback(
                         let mut decoded_frame =
                             video_converter.convert(&video_decoder, frame, dovi_metadata)?;
                         decoded_frame.pts = Some(frame_pts);
+                        update_subtitle_overlay_from_audio_clock(
+                            output,
+                            &mut subtitle_cues,
+                            &mut active_subtitle,
+                            current_session_id,
+                            &event_tx,
+                        );
 
                         if first_video_frame_pending {
                             present_decoded_video_frame(
@@ -412,7 +608,7 @@ pub(super) fn run_ffmpeg_playback(
                             current_session_id,
                             &event_tx,
                         );
-                        present_due_audio_clocked_video_frames(
+                        let played_until = present_due_audio_clocked_video_frames(
                             &mut queued_video_frames,
                             output,
                             current_session_id,
@@ -421,11 +617,23 @@ pub(super) fn run_ffmpeg_playback(
                             &mut position_reporter,
                             &event_tx,
                         );
+                        update_subtitle_overlay(
+                            played_until,
+                            &mut subtitle_cues,
+                            &mut active_subtitle,
+                            current_session_id,
+                            &event_tx,
+                        );
                         if queued_video_duration(&queued_video_frames)
-                            >= queued_video_limit_duration(&queued_video_frames)
+                            >= queued_video_limit_duration(
+                                &queued_video_frames,
+                                needs_subtitle_prefetch,
+                            )
                         {
-                            let target_duration =
-                                queued_video_target_duration(&queued_video_frames);
+                            let target_duration = queued_video_target_duration(
+                                &queued_video_frames,
+                                needs_subtitle_prefetch,
+                            );
                             wait_for_audio_clocked_video_queue(
                                 &mut queued_video_frames,
                                 output,
@@ -436,6 +644,15 @@ pub(super) fn run_ffmpeg_playback(
                                 &mut position_reporter,
                                 &event_tx,
                                 target_duration,
+                                |played_until| {
+                                    update_subtitle_overlay(
+                                        played_until,
+                                        &mut subtitle_cues,
+                                        &mut active_subtitle,
+                                        current_session_id,
+                                        &event_tx,
+                                    );
+                                },
                             )?;
                         }
                     } else {
@@ -452,6 +669,13 @@ pub(super) fn run_ffmpeg_playback(
                         let mut decoded_frame =
                             video_converter.convert(&video_decoder, frame, dovi_metadata)?;
                         decoded_frame.pts = Some(frame_pts);
+                        update_subtitle_overlay(
+                            timestamp.timeline_nsecs,
+                            &mut subtitle_cues,
+                            &mut active_subtitle,
+                            current_session_id,
+                            &event_tx,
+                        );
 
                         first_video_frame_pending = false;
                         if scheduler
@@ -482,6 +706,67 @@ pub(super) fn run_ffmpeg_playback(
                     }
                     Ok(())
                 })
+            }
+            index
+                if subtitle_decoder
+                    .as_ref()
+                    .is_some_and(|decoder| index == decoder.stream_index) =>
+            {
+                let decoder = subtitle_decoder
+                    .as_ref()
+                    .expect("subtitle decoder checked above");
+                let stream = subtitle_stream.expect("subtitle stream exists with decoder");
+                if let Some(filter) = subtitle_filter.as_mut() {
+                    filter.send_packet(packet.as_mut_ptr())?;
+                    let filtered_packet = filtered_subtitle_packet
+                        .as_mut()
+                        .expect("filtered subtitle packet exists with subtitle filter");
+                    loop {
+                        if !filter.receive_packet(filtered_packet)? {
+                            break;
+                        }
+                        decode_subtitle_packet_into_queue(
+                            decoder,
+                            stream,
+                            filtered_packet,
+                            current_start_position_nsecs,
+                            playback_timeline_origin_nsecs,
+                            &mut subtitle_cues,
+                            &control,
+                        )?;
+                        if let Some(output) = audio_output.as_ref() {
+                            update_subtitle_overlay_from_audio_clock(
+                                output,
+                                &mut subtitle_cues,
+                                &mut active_subtitle,
+                                current_session_id,
+                                &event_tx,
+                            );
+                        }
+                        filtered_packet.unref();
+                    }
+                    Ok(())
+                } else {
+                    decode_subtitle_packet_into_queue(
+                        decoder,
+                        stream,
+                        &packet,
+                        current_start_position_nsecs,
+                        playback_timeline_origin_nsecs,
+                        &mut subtitle_cues,
+                        &control,
+                    )?;
+                    if let Some(output) = audio_output.as_ref() {
+                        update_subtitle_overlay_from_audio_clock(
+                            output,
+                            &mut subtitle_cues,
+                            &mut active_subtitle,
+                            current_session_id,
+                            &event_tx,
+                        );
+                    }
+                    Ok(())
+                }
             }
             index
                 if audio_decoder
@@ -515,13 +800,20 @@ pub(super) fn run_ffmpeg_playback(
                             .timeline_nsecs
                             .saturating_add(audio.duration_nsecs);
                         output.push(audio.samples, &control, || {
-                            present_due_audio_clocked_video_frames(
+                            let played_until = present_due_audio_clocked_video_frames(
                                 &mut queued_video_frames,
                                 output,
                                 current_session_id,
                                 &frame_slot,
                                 &frame_presented,
                                 &mut position_reporter,
+                                &event_tx,
+                            );
+                            update_subtitle_overlay(
+                                played_until,
+                                &mut subtitle_cues,
+                                &mut active_subtitle,
+                                current_session_id,
                                 &event_tx,
                             );
                             Ok(())
@@ -556,6 +848,12 @@ pub(super) fn run_ffmpeg_playback(
     video_decoder.flush(&mut video_frame, |frame| {
         let timestamp =
             video_clock.map(frame_best_effort_timestamp(frame), video_decoder.time_base);
+        refresh_playback_timeline_origin(
+            &mut playback_timeline_origin_nsecs,
+            &video_clock,
+            subtitle_stream,
+            &mut subtitle_cues,
+        );
         if timestamp.timeline_nsecs < current_start_position_nsecs {
             return Ok(());
         }
@@ -583,6 +881,13 @@ pub(super) fn run_ffmpeg_playback(
             let mut decoded_frame =
                 video_converter.convert(&video_decoder, frame, dovi_metadata)?;
             decoded_frame.pts = Some(frame_pts);
+            update_subtitle_overlay_from_audio_clock(
+                output,
+                &mut subtitle_cues,
+                &mut active_subtitle,
+                current_session_id,
+                &event_tx,
+            );
 
             if first_video_frame_pending {
                 present_decoded_video_frame(
@@ -615,13 +920,20 @@ pub(super) fn run_ffmpeg_playback(
                 current_session_id,
                 &event_tx,
             );
-            present_due_audio_clocked_video_frames(
+            let played_until = present_due_audio_clocked_video_frames(
                 &mut queued_video_frames,
                 output,
                 current_session_id,
                 &frame_slot,
                 &frame_presented,
                 &mut position_reporter,
+                &event_tx,
+            );
+            update_subtitle_overlay(
+                played_until,
+                &mut subtitle_cues,
+                &mut active_subtitle,
+                current_session_id,
                 &event_tx,
             );
         } else {
@@ -634,6 +946,13 @@ pub(super) fn run_ffmpeg_playback(
             let mut decoded_frame =
                 video_converter.convert(&video_decoder, frame, dovi_metadata)?;
             decoded_frame.pts = Some(frame_pts);
+            update_subtitle_overlay(
+                timestamp.timeline_nsecs,
+                &mut subtitle_cues,
+                &mut active_subtitle,
+                current_session_id,
+                &event_tx,
+            );
 
             first_video_frame_pending = false;
             if scheduler
@@ -678,13 +997,20 @@ pub(super) fn run_ffmpeg_playback(
                     .timeline_nsecs
                     .saturating_add(audio.duration_nsecs);
                 output.push(audio.samples, &control, || {
-                    present_due_audio_clocked_video_frames(
+                    let played_until = present_due_audio_clocked_video_frames(
                         &mut queued_video_frames,
                         output,
                         current_session_id,
                         &frame_slot,
                         &frame_presented,
                         &mut position_reporter,
+                        &event_tx,
+                    );
+                    update_subtitle_overlay(
+                        played_until,
+                        &mut subtitle_cues,
+                        &mut active_subtitle,
+                        current_session_id,
                         &event_tx,
                     );
                     Ok(())
@@ -710,6 +1036,15 @@ pub(super) fn run_ffmpeg_playback(
             &frame_presented,
             &mut position_reporter,
             &event_tx,
+            |played_until| {
+                update_subtitle_overlay(
+                    played_until,
+                    &mut subtitle_cues,
+                    &mut active_subtitle,
+                    current_session_id,
+                    &event_tx,
+                );
+            },
         )?;
         output.drain(&control)?;
     }
@@ -726,4 +1061,219 @@ fn should_drop_backlogged_vulkan_frame(
     }
     let key_frame = unsafe { (*frame).flags & ffi::AV_FRAME_FLAG_KEY != 0 };
     !key_frame && frame_slot.render_backpressure().should_drop_non_key_frame()
+}
+
+fn push_subtitle_cue(cues: &mut VecDeque<BackendSubtitleCue>, cue: BackendSubtitleCue) {
+    if !cue.has_content() || cue.end_nsecs <= cue.start_nsecs {
+        return;
+    }
+    let index = cues
+        .iter()
+        .position(|current| current.start_nsecs > cue.start_nsecs)
+        .unwrap_or(cues.len());
+    cues.insert(index, cue);
+}
+
+pub(super) fn trim_overlapping_subtitle_cues_at(
+    cues: &mut VecDeque<BackendSubtitleCue>,
+    trim_nsecs: u64,
+) {
+    for cue in cues.iter_mut() {
+        if cue.has_content() && cue.start_nsecs < trim_nsecs && trim_nsecs < cue.end_nsecs {
+            cue.end_nsecs = trim_nsecs;
+        }
+    }
+    cues.retain(|cue| cue.has_content() && cue.end_nsecs > cue.start_nsecs);
+}
+
+fn refresh_playback_timeline_origin(
+    playback_timeline_origin_nsecs: &mut Option<u64>,
+    video_clock: &TimestampMapper,
+    subtitle_stream: Option<StreamInfo>,
+    subtitle_cues: &mut VecDeque<BackendSubtitleCue>,
+) {
+    let next_origin_nsecs = video_clock.timeline_origin_nsecs();
+    if *playback_timeline_origin_nsecs == next_origin_nsecs {
+        return;
+    }
+
+    if subtitle_stream
+        .is_some_and(|stream| stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE)
+    {
+        rebase_subtitle_cues_to_timeline_origin(
+            subtitle_cues,
+            *playback_timeline_origin_nsecs,
+            next_origin_nsecs,
+        );
+    }
+    *playback_timeline_origin_nsecs = next_origin_nsecs;
+}
+
+pub(super) fn rebase_subtitle_cues_to_timeline_origin(
+    cues: &mut VecDeque<BackendSubtitleCue>,
+    previous_origin_nsecs: Option<u64>,
+    next_origin_nsecs: Option<u64>,
+) {
+    let previous_origin_nsecs = previous_origin_nsecs.unwrap_or(0);
+    let next_origin_nsecs = next_origin_nsecs.unwrap_or(0);
+    if previous_origin_nsecs == next_origin_nsecs {
+        return;
+    }
+
+    if next_origin_nsecs > previous_origin_nsecs {
+        let delta = next_origin_nsecs - previous_origin_nsecs;
+        for cue in cues.iter_mut() {
+            cue.start_nsecs = cue.start_nsecs.saturating_sub(delta);
+            cue.end_nsecs = cue.end_nsecs.saturating_sub(delta);
+        }
+    } else {
+        let delta = previous_origin_nsecs - next_origin_nsecs;
+        for cue in cues.iter_mut() {
+            cue.start_nsecs = cue.start_nsecs.saturating_add(delta);
+            cue.end_nsecs = cue.end_nsecs.saturating_add(delta);
+        }
+    }
+    cues.retain(|cue| cue.has_content() && cue.end_nsecs > cue.start_nsecs);
+}
+
+fn decode_subtitle_packet_into_queue(
+    decoder: &Decoder,
+    stream: StreamInfo,
+    packet: &AvPacket,
+    current_start_position_nsecs: u64,
+    playback_timeline_origin_nsecs: Option<u64>,
+    subtitle_cues: &mut VecDeque<BackendSubtitleCue>,
+    control: &FfmpegControl,
+) -> std::result::Result<(), String> {
+    let packet_timestamp = packet.best_timestamp();
+    decoder.decode_subtitle_packet(packet.as_ptr(), |cue| {
+        if control.has_pending_seek() {
+            return Ok(());
+        }
+        let Some(base_timeline_nsecs) = subtitle_cue_timeline_nsecs(
+            cue.pts_nsecs,
+            packet_timestamp,
+            stream,
+            playback_timeline_origin_nsecs,
+        ) else {
+            tracing::debug!(
+                stream_index = stream.index,
+                ?packet_timestamp,
+                cue_pts_nsecs = ?cue.pts_nsecs,
+                "dropping decoded subtitle cue without timestamp"
+            );
+            return Ok(());
+        };
+        let cue_has_content = cue.has_content();
+        let subtitle_cue = BackendSubtitleCue {
+            text: cue.text,
+            bitmaps: cue.bitmaps,
+            start_nsecs: base_timeline_nsecs.saturating_add(cue.start_offset_nsecs),
+            end_nsecs: base_timeline_nsecs.saturating_add(cue.end_offset_nsecs),
+        };
+        if !cue_has_content {
+            if stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE {
+                trim_overlapping_subtitle_cues_at(subtitle_cues, subtitle_cue.start_nsecs);
+            }
+            return Ok(());
+        }
+        if subtitle_cue.end_nsecs >= current_start_position_nsecs {
+            if stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE {
+                trim_overlapping_subtitle_cues_at(subtitle_cues, subtitle_cue.start_nsecs);
+            }
+            push_subtitle_cue(subtitle_cues, subtitle_cue);
+        }
+        Ok(())
+    })
+}
+
+fn subtitle_cue_queue_from_external(
+    cues: &[BackendSubtitleCue],
+    start_position_nsecs: u64,
+) -> VecDeque<BackendSubtitleCue> {
+    cues.iter()
+        .filter(|cue| cue.end_nsecs >= start_position_nsecs)
+        .cloned()
+        .collect()
+}
+
+pub(super) fn subtitle_cue_timeline_nsecs(
+    cue_pts_nsecs: Option<u64>,
+    packet_timestamp: Option<i64>,
+    stream: StreamInfo,
+    playback_timeline_origin_nsecs: Option<u64>,
+) -> Option<u64> {
+    let stream_start_nsecs =
+        subtitle_stream_timeline_origin(stream, playback_timeline_origin_nsecs);
+    if let Some(packet_nsecs) =
+        packet_timestamp.and_then(|timestamp| timestamp_to_nsecs(timestamp, stream.time_base))
+    {
+        return Some(subtitle_timestamp_to_timeline_nsecs(
+            packet_nsecs,
+            stream_start_nsecs,
+        ));
+    }
+    cue_pts_nsecs
+        .map(|pts_nsecs| subtitle_timestamp_to_timeline_nsecs(pts_nsecs, stream_start_nsecs))
+}
+
+fn subtitle_stream_timeline_origin(
+    stream: StreamInfo,
+    playback_timeline_origin_nsecs: Option<u64>,
+) -> Option<u64> {
+    if stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE {
+        playback_timeline_origin_nsecs.or(stream.start_nsecs)
+    } else {
+        stream.start_nsecs
+    }
+}
+
+pub(super) fn subtitle_timestamp_to_timeline_nsecs(
+    timestamp_nsecs: u64,
+    stream_start_nsecs: Option<u64>,
+) -> u64 {
+    timestamp_nsecs.saturating_sub(stream_start_nsecs.unwrap_or(0))
+}
+
+fn update_subtitle_overlay_from_audio_clock(
+    audio_output: &AudioOutput,
+    cues: &mut VecDeque<BackendSubtitleCue>,
+    active: &mut Option<BackendSubtitleCue>,
+    session_id: PlaybackSessionId,
+    event_tx: &Sender<BackendEvent>,
+) {
+    update_subtitle_overlay(
+        audio_output.played_timeline_nsecs(),
+        cues,
+        active,
+        session_id,
+        event_tx,
+    );
+}
+
+fn update_subtitle_overlay(
+    position_nsecs: u64,
+    cues: &mut VecDeque<BackendSubtitleCue>,
+    active: &mut Option<BackendSubtitleCue>,
+    session_id: PlaybackSessionId,
+    event_tx: &Sender<BackendEvent>,
+) {
+    while cues
+        .front()
+        .is_some_and(|cue| cue.end_nsecs <= position_nsecs)
+    {
+        cues.pop_front();
+    }
+    let next = cues
+        .iter()
+        .find(|cue| cue.start_nsecs <= position_nsecs && position_nsecs < cue.end_nsecs)
+        .cloned();
+    if *active == next {
+        return;
+    }
+    *active = next.clone();
+    let _ = event_tx.send(BackendEvent::new(
+        session_id,
+        BackendEventKind::SubtitleChanged(next),
+    ));
 }

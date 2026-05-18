@@ -3,16 +3,18 @@ use std::{cell::RefCell, rc::Rc};
 use gpui::{Bounds, point, px, size};
 
 use super::{
-    AnimationFrameRequestState, HttpStreamBufferProgress, PlaybackVideoInfo, RenderSize,
-    ShutdownOrder, aspect_fit_bounds, buffered_progress_fraction, clamp_playback_position,
-    combined_buffered_until, format_playback_time, http_stream_buffered_range_fractions,
-    http_stream_buffered_until, is_seek_position_buffered, normalize_video_viewport,
+    AnimationFrameRequestState, BackendSubtitleBitmap, BackendSubtitleCue,
+    HttpStreamBufferProgress, PlaybackVideoInfo, RenderSize, ShutdownOrder, aspect_fit_bounds,
+    buffered_progress_fraction, clamp_playback_position, combined_buffered_until,
+    format_playback_time, http_stream_buffered_range_fractions, http_stream_buffered_until,
+    is_seek_position_buffered, local_video_viewport_bounds, normalize_video_viewport,
     playback_info_segments, playback_status_message, progress_fraction,
     progress_fraction_for_cursor, render_output_size, should_apply_backend_position,
-    should_render_frame, should_request_animation_frame, valid_frame_rate,
-    valid_http_stream_buffer_progress, valid_playback_duration, valid_playback_time,
-    viewport_changed,
+    should_render_frame, should_request_animation_frame, subtitle_bitmap_canvas_size,
+    valid_frame_rate, valid_http_stream_buffer_progress, valid_playback_duration,
+    valid_playback_time, viewport_changed,
 };
+use crate::player::render_host::render_image_from_bgra;
 
 struct DropRecorder {
     name: &'static str,
@@ -140,6 +142,57 @@ fn render_output_size_uses_aspect_fitted_viewport() {
         Some(RenderSize {
             width: 1920,
             height: 800,
+        })
+    );
+}
+
+#[test]
+fn local_video_viewport_bounds_strips_window_origin_for_overlay_layout() {
+    let observed = Bounds::new(
+        point(px(0.0), px(1043.3334)),
+        size(px(1485.3334), px(1008.0)),
+    );
+
+    assert_eq!(
+        local_video_viewport_bounds(observed),
+        Bounds::new(point(px(0.0), px(0.0)), observed.size)
+    );
+}
+
+#[test]
+fn subtitle_bitmap_canvas_size_uses_largest_bitmap_canvas() {
+    let image = render_image_from_bgra(vec![0, 0, 0, 0], 1, 1).unwrap();
+    let cue = BackendSubtitleCue {
+        text: String::new(),
+        bitmaps: vec![
+            BackendSubtitleBitmap {
+                image: image.clone(),
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                canvas_width: 1920,
+                canvas_height: 800,
+            },
+            BackendSubtitleBitmap {
+                image,
+                x: 0,
+                y: 900,
+                width: 1,
+                height: 1,
+                canvas_width: 1920,
+                canvas_height: 1080,
+            },
+        ],
+        start_nsecs: 0,
+        end_nsecs: 1_000_000_000,
+    };
+
+    assert_eq!(
+        subtitle_bitmap_canvas_size(&cue),
+        Some(RenderSize {
+            width: 1920,
+            height: 1080,
         })
     );
 }
