@@ -28,7 +28,7 @@ use color::{
     OutputTextureFormat, apply_chroma_location, rect_for_size, source_color_repr,
     source_color_space, swap_red_blue_channels, target_color_repr, target_color_space,
 };
-use dovi::{DoviMetadataCache, apply_dovi_hdr_metadata};
+use dovi::{DoviMetadataCache, apply_dovi_source_luminance_metadata};
 #[cfg(test)]
 use dovi::{
     DoviRenderMetadata, dovi_coefficient, dovi_matrix_coefficient,

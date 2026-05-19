@@ -130,7 +130,7 @@ fn dolby_vision_hdr_metadata_preserves_default_when_source_luminance_is_unknown(
         source_max_pq: 0,
     };
 
-    apply_dovi_hdr_metadata(&mut color, &metadata);
+    apply_dovi_source_luminance_metadata(&mut color, &metadata);
 
     assert_eq!(color.hdr.min_luma, min_luma);
     assert_eq!(color.hdr.max_luma, max_luma);

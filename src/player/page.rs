@@ -42,6 +42,7 @@ use runtime::{PlaybackBackend, ShutdownOrder};
 use video_element::VideoFrameElement;
 
 const KEYBOARD_SEEK_STEP_SECONDS: f64 = 5.0;
+const SUBTITLE_VERTICAL_ADJUST_STEP_FRACTION: f32 = 0.01;
 const PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX: f32 = 24.0;
 const PLAYBACK_PROGRESS_BAR_HEIGHT_PX: f32 = 94.0;
 const FULLSCREEN_CONTROLS_HIDE_DELAY: Duration = Duration::from_secs(1);
@@ -86,6 +87,8 @@ enum PlaybackShortcut {
     SeekBackward,
     SeekForward,
     ToggleInfoOverlay,
+    RaiseSubtitle,
+    LowerSubtitle,
 }
 
 pub struct PlaybackPage {
@@ -118,6 +121,7 @@ pub struct PlaybackPage {
     selected_subtitle_stream_index: Option<usize>,
     open_track_select: Option<PlaybackTrackKind>,
     active_subtitle: Option<BackendSubtitleCue>,
+    subtitle_vertical_offset_fraction: Option<f32>,
     error_message: Option<SharedString>,
     status_message: SharedString,
 }
@@ -141,6 +145,10 @@ fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
         Some(PlaybackShortcut::SeekForward)
     } else if key.eq_ignore_ascii_case("i") {
         Some(PlaybackShortcut::ToggleInfoOverlay)
+    } else if key.eq_ignore_ascii_case("r") {
+        Some(PlaybackShortcut::RaiseSubtitle)
+    } else if key.eq_ignore_ascii_case("t") {
+        Some(PlaybackShortcut::LowerSubtitle)
     } else {
         None
     }
@@ -209,6 +217,7 @@ impl PlaybackPage {
             selected_subtitle_stream_index: request.selected_tracks.subtitle_stream_index,
             open_track_select: None,
             active_subtitle: None,
+            subtitle_vertical_offset_fraction: None,
             error_message,
             status_message,
         }
@@ -507,7 +516,61 @@ impl PlaybackPage {
                 self.playback_info_overlay_visible = !self.playback_info_overlay_visible;
                 cx.notify();
             }
+            PlaybackShortcut::RaiseSubtitle => {
+                self.adjust_subtitle_vertical_offset_fraction(
+                    subtitle_vertical_adjust_step(),
+                    window,
+                    cx,
+                );
+            }
+            PlaybackShortcut::LowerSubtitle => {
+                self.adjust_subtitle_vertical_offset_fraction(
+                    -subtitle_vertical_adjust_step(),
+                    window,
+                    cx,
+                );
+            }
         }
+    }
+
+    fn adjust_subtitle_vertical_offset_fraction(
+        &mut self,
+        delta: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current_offset_fraction = self.current_subtitle_vertical_offset_fraction(window);
+        self.subtitle_vertical_offset_fraction = Some(subtitle_vertical_offset_after_adjustment(
+            current_offset_fraction,
+            delta,
+        ));
+        cx.notify();
+    }
+
+    fn current_subtitle_vertical_offset_fraction(&self, window: &Window) -> f32 {
+        self.subtitle_vertical_offset_fraction
+            .or_else(|| self.default_subtitle_vertical_offset_fraction(window))
+            .unwrap_or(0.0)
+    }
+
+    fn default_subtitle_vertical_offset_fraction(&self, window: &Window) -> Option<f32> {
+        let (video_bounds, video_fitted_bounds) = self.current_video_layout_bounds()?;
+        let default_bottom = subtitle_overlay_bottom(
+            video_fitted_bounds,
+            video_bounds,
+            self.progress_bar_visible(window.is_fullscreen()),
+        );
+
+        Some(subtitle_vertical_offset_fraction(
+            video_fitted_bounds,
+            subtitle_video_bottom(video_fitted_bounds) - default_bottom,
+        ))
+    }
+
+    fn current_video_layout_bounds(&self) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
+        let video_bounds = local_video_viewport_bounds(self.video_viewport_bounds?);
+        let video_fitted_bounds = aspect_fit_bounds(video_bounds, self.video_source_size?)?;
+        Some((video_bounds, video_fitted_bounds))
     }
 
     fn handle_mouse_move(
@@ -940,7 +1003,7 @@ impl PlaybackPage {
     fn render_subtitle_overlay(
         &self,
         progress_bar_visible: bool,
-        cx: &Context<Self>,
+        _cx: &Context<Self>,
     ) -> impl IntoElement {
         let Some(cue) = self.active_subtitle.as_ref() else {
             return div()
@@ -979,14 +1042,29 @@ impl PlaybackPage {
         let scale_y = bitmap_bounds.size.height / px(bitmap_canvas_size.height as f32);
         let subtitle_bottom =
             subtitle_overlay_bottom(video_fitted_bounds, video_bounds, progress_bar_visible);
-        let bitmap_bottom_offset =
-            subtitle_bitmap_bottom_offset(cue, bitmap_bounds, scale_y, subtitle_bottom);
+        let subtitle_render_bottom = subtitle_render_bottom(
+            video_fitted_bounds,
+            subtitle_bottom,
+            self.subtitle_vertical_offset_fraction,
+        );
+        let bitmap_top = if self.subtitle_vertical_offset_fraction.is_some() {
+            subtitle_bitmap_overlay_top_for_bottom(
+                cue,
+                bitmap_bounds,
+                scale_y,
+                subtitle_render_bottom,
+            )
+        } else {
+            let bitmap_bottom_offset =
+                subtitle_bitmap_bottom_offset(cue, bitmap_bounds, scale_y, subtitle_bottom);
+            subtitle_bitmap_overlay_top(bitmap_bounds, bitmap_bottom_offset)
+        };
         let bitmap_overlay = cue.bitmaps.iter().fold(
             div()
                 .id("playback-subtitle-bitmap-overlay")
                 .absolute()
                 .left(bitmap_bounds.origin.x)
-                .top(bitmap_bounds.origin.y - bitmap_bottom_offset)
+                .top(bitmap_top)
                 .w(bitmap_bounds.size.width)
                 .h(bitmap_bounds.size.height),
             |this, bitmap| this.child(render_subtitle_bitmap(bitmap, scale_x, scale_y)),
@@ -1004,18 +1082,20 @@ impl PlaybackPage {
             return overlay.into_any_element();
         }
 
-        let theme = theme::get(cx);
-        let text_overlay_height =
-            subtitle_text_overlay_height_for_bottom(video_fitted_bounds, subtitle_bottom);
+        let text_overlay_bounds = subtitle_text_overlay_bounds(
+            video_fitted_bounds,
+            subtitle_render_bottom,
+            self.subtitle_vertical_offset_fraction,
+        );
         overlay
             .child(
                 div()
                     .id("playback-subtitle-text-overlay")
                     .absolute()
-                    .left(video_fitted_bounds.origin.x)
-                    .top(video_fitted_bounds.origin.y)
-                    .w(video_fitted_bounds.size.width)
-                    .h(text_overlay_height)
+                    .left(text_overlay_bounds.origin.x)
+                    .top(text_overlay_bounds.origin.y)
+                    .w(text_overlay_bounds.size.width)
+                    .h(text_overlay_bounds.size.height)
                     .flex()
                     .justify_center()
                     .items_end()
@@ -1027,7 +1107,7 @@ impl PlaybackPage {
                             .text_center()
                             .text_3xl()
                             .line_height(px(36.0))
-                            .text_color(theme.foreground)
+                            .text_color(rgb(0xffffff))
                             .child(cue.text.clone()),
                     ),
             )
@@ -1523,13 +1603,88 @@ fn subtitle_overlay_bottom(
     video_bounds: Bounds<Pixels>,
     progress_bar_visible: bool,
 ) -> Pixels {
-    let video_bottom = video_fitted_bounds.origin.y + video_fitted_bounds.size.height;
+    let video_bottom = subtitle_video_bottom(video_fitted_bounds);
     if progress_bar_visible {
-        let progress_top = video_bounds.size.height
-            - px(PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX + PLAYBACK_PROGRESS_BAR_HEIGHT_PX);
-        video_bottom.min(progress_top)
+        let controls_top = playback_progress_bar_bounds(video_bounds).origin.y;
+        video_bottom.min(controls_top)
     } else {
         video_bottom
+    }
+}
+
+fn subtitle_video_bottom(video_fitted_bounds: Bounds<Pixels>) -> Pixels {
+    video_fitted_bounds.origin.y + video_fitted_bounds.size.height
+}
+
+fn subtitle_render_bottom(
+    video_fitted_bounds: Bounds<Pixels>,
+    default_subtitle_bottom: Pixels,
+    subtitle_vertical_offset_fraction: Option<f32>,
+) -> Pixels {
+    subtitle_vertical_offset_fraction.map_or(default_subtitle_bottom, |offset_fraction| {
+        subtitle_video_bottom(video_fitted_bounds)
+            - subtitle_vertical_offset_pixels(video_fitted_bounds, offset_fraction)
+    })
+}
+
+fn subtitle_text_overlay_bounds(
+    video_fitted_bounds: Bounds<Pixels>,
+    subtitle_bottom: Pixels,
+    subtitle_vertical_offset_fraction: Option<f32>,
+) -> Bounds<Pixels> {
+    let height = if subtitle_vertical_offset_fraction.is_some() {
+        video_fitted_bounds.size.height
+    } else {
+        subtitle_text_overlay_height_for_bottom(video_fitted_bounds, subtitle_bottom)
+    };
+
+    Bounds::new(
+        gpui::point(video_fitted_bounds.origin.x, subtitle_bottom - height),
+        gpui::size(video_fitted_bounds.size.width, height),
+    )
+}
+
+fn subtitle_bitmap_overlay_top(
+    bitmap_bounds: Bounds<Pixels>,
+    bitmap_bottom_offset: Pixels,
+) -> Pixels {
+    bitmap_bounds.origin.y - bitmap_bottom_offset
+}
+
+fn subtitle_bitmap_overlay_top_for_bottom(
+    cue: &BackendSubtitleCue,
+    bitmap_bounds: Bounds<Pixels>,
+    scale_y: f32,
+    subtitle_bottom: Pixels,
+) -> Pixels {
+    let Some(content_bottom) = subtitle_bitmap_content_bottom(cue, bitmap_bounds, scale_y) else {
+        return bitmap_bounds.origin.y;
+    };
+
+    bitmap_bounds.origin.y - (content_bottom - subtitle_bottom)
+}
+
+fn subtitle_vertical_offset_after_adjustment(current_offset: f32, delta: f32) -> f32 {
+    current_offset + delta
+}
+
+fn subtitle_vertical_adjust_step() -> f32 {
+    SUBTITLE_VERTICAL_ADJUST_STEP_FRACTION
+}
+
+fn subtitle_vertical_offset_pixels(
+    video_fitted_bounds: Bounds<Pixels>,
+    offset_fraction: f32,
+) -> Pixels {
+    video_fitted_bounds.size.height * offset_fraction
+}
+
+fn subtitle_vertical_offset_fraction(video_fitted_bounds: Bounds<Pixels>, offset: Pixels) -> f32 {
+    let video_height = f32::from(video_fitted_bounds.size.height);
+    if video_height > 0.0 {
+        f32::from(offset) / video_height
+    } else {
+        0.0
     }
 }
 
@@ -1558,16 +1713,24 @@ fn subtitle_bitmap_bottom_offset(
     scale_y: f32,
     subtitle_bottom: Pixels,
 ) -> Pixels {
-    let content_bottom = cue.bitmaps.iter().fold(None, |bottom, bitmap| {
-        let bitmap_bottom =
-            bitmap_bounds.origin.y + px(bitmap.y.saturating_add(bitmap.height) as f32) * scale_y;
-        Some(bottom.map_or(bitmap_bottom, |bottom: Pixels| bottom.max(bitmap_bottom)))
-    });
+    let content_bottom = subtitle_bitmap_content_bottom(cue, bitmap_bounds, scale_y);
 
     content_bottom
         .filter(|content_bottom| *content_bottom > subtitle_bottom)
         .map(|content_bottom| content_bottom - subtitle_bottom)
         .unwrap_or(px(0.0))
+}
+
+fn subtitle_bitmap_content_bottom(
+    cue: &BackendSubtitleCue,
+    bitmap_bounds: Bounds<Pixels>,
+    scale_y: f32,
+) -> Option<Pixels> {
+    cue.bitmaps.iter().fold(None, |bottom, bitmap| {
+        let bitmap_bottom =
+            bitmap_bounds.origin.y + px(bitmap.y.saturating_add(bitmap.height) as f32) * scale_y;
+        Some(bottom.map_or(bitmap_bottom, |bottom: Pixels| bottom.max(bitmap_bottom)))
+    })
 }
 
 fn subtitle_bitmap_canvas_size(cue: &BackendSubtitleCue) -> Option<RenderSize> {

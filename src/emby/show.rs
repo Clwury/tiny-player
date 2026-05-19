@@ -243,6 +243,8 @@ pub struct MediaStream {
     pub delivery_method: Option<String>,
     pub is_external: Option<bool>,
     pub is_default: Option<bool>,
+    pub is_text_subtitle_stream: Option<bool>,
+    pub supports_external_stream: Option<bool>,
 }
 
 impl MediaStream {

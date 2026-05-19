@@ -13,9 +13,12 @@ use super::{
     playback_progress_bar_visible, playback_shortcut_for_key, playback_status_message,
     progress_fraction, progress_fraction_for_cursor, render_output_size,
     should_apply_backend_position, should_render_frame, should_request_animation_frame,
-    subtitle_bitmap_bottom_offset, subtitle_bitmap_canvas_size, subtitle_text_overlay_height,
-    valid_frame_rate, valid_http_stream_buffer_progress, valid_playback_duration,
-    valid_playback_time, viewport_changed,
+    subtitle_bitmap_bottom_offset, subtitle_bitmap_canvas_size,
+    subtitle_bitmap_overlay_top_for_bottom, subtitle_render_bottom, subtitle_text_overlay_bounds,
+    subtitle_text_overlay_height, subtitle_vertical_adjust_step,
+    subtitle_vertical_offset_after_adjustment, subtitle_vertical_offset_fraction,
+    subtitle_vertical_offset_pixels, valid_frame_rate, valid_http_stream_buffer_progress,
+    valid_playback_duration, valid_playback_time, viewport_changed,
 };
 use crate::player::render_host::render_image_from_bgra;
 
@@ -218,6 +221,17 @@ fn subtitle_text_overlay_height_stops_at_progress_bar_top() {
 }
 
 #[test]
+fn subtitle_text_overlay_height_uses_video_bounds_origin_for_controls_top() {
+    let video_bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(800.0), px(600.0)));
+    let video_fitted_bounds = Bounds::new(point(px(10.0), px(95.0)), size(px(800.0), px(450.0)));
+
+    assert_eq!(
+        subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true),
+        px(407.0)
+    );
+}
+
+#[test]
 fn subtitle_text_overlay_height_uses_video_bottom_without_visible_progress_bar() {
     let video_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(700.0)));
     let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
@@ -230,6 +244,116 @@ fn subtitle_text_overlay_height_uses_video_bottom_without_visible_progress_bar()
         subtitle_text_overlay_height(video_fitted_bounds, video_bounds, false),
         px(450.0)
     );
+}
+
+#[test]
+fn subtitle_text_overlay_offset_shifts_position_without_changing_default_height() {
+    let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+
+    let raised = subtitle_text_overlay_bounds(video_fitted_bounds, px(25.0), Some(1.0));
+    assert_eq!(raised.origin.y, px(-425.0));
+    assert_eq!(raised.size.height, px(450.0));
+
+    let lowered = subtitle_text_overlay_bounds(video_fitted_bounds, px(530.0), Some(-0.01));
+    assert_eq!(lowered.origin.y, px(80.0));
+    assert_eq!(lowered.size.height, px(450.0));
+}
+
+#[test]
+fn subtitle_render_bottom_offset_is_independent_from_controls_visibility() {
+    let video_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
+    let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+    let controls_default_bottom = px(482.0);
+    let hidden_controls_default_bottom = px(525.0);
+
+    let manual_offset = subtitle_vertical_offset_after_adjustment(
+        subtitle_vertical_offset_fraction(video_fitted_bounds, px(525.0) - controls_default_bottom),
+        subtitle_vertical_adjust_step(),
+    );
+
+    assert_eq!(
+        subtitle_render_bottom(
+            video_fitted_bounds,
+            subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true)
+                + video_fitted_bounds.origin.y,
+            Some(manual_offset),
+        ),
+        px(477.5)
+    );
+    assert_eq!(
+        subtitle_render_bottom(
+            video_fitted_bounds,
+            hidden_controls_default_bottom,
+            Some(manual_offset),
+        ),
+        px(477.5)
+    );
+}
+
+#[test]
+fn subtitle_vertical_adjust_step_uses_one_percent_of_video_height() {
+    let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+
+    assert_eq!(subtitle_vertical_adjust_step(), 0.01);
+    assert_eq!(
+        subtitle_vertical_offset_pixels(video_fitted_bounds, subtitle_vertical_adjust_step()),
+        px(4.5)
+    );
+}
+
+#[test]
+fn subtitle_vertical_offset_fraction_keeps_relative_position_after_resize() {
+    let compact_video = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+    let fullscreen_video = Bounds::new(point(px(0.0), px(0.0)), size(px(1600.0), px(900.0)));
+    let offset_fraction = subtitle_vertical_offset_after_adjustment(43.0 / 450.0, 0.01);
+
+    assert_eq!(
+        subtitle_render_bottom(compact_video, px(0.0), Some(offset_fraction)),
+        px(477.5)
+    );
+    assert_eq!(
+        subtitle_render_bottom(fullscreen_video, px(0.0), Some(offset_fraction)),
+        px(805.0)
+    );
+}
+
+#[test]
+fn subtitle_bitmap_overlay_offset_shifts_position_without_changing_default_limit() {
+    let bitmap_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+    let image = render_image_from_bgra(vec![0, 0, 0, 0], 1, 1).unwrap();
+    let cue = BackendSubtitleCue {
+        text: String::new(),
+        bitmaps: vec![BackendSubtitleBitmap {
+            image,
+            x: 0,
+            y: 900,
+            width: 100,
+            height: 100,
+            canvas_width: 1920,
+            canvas_height: 1080,
+        }],
+        start_nsecs: 0,
+        end_nsecs: 1_000_000_000,
+    };
+
+    assert_eq!(
+        subtitle_bitmap_overlay_top_for_bottom(&cue, bitmap_bounds, 1.0, px(575.0)),
+        px(-425.0)
+    );
+    assert_eq!(
+        subtitle_bitmap_overlay_top_for_bottom(&cue, bitmap_bounds, 1.0, px(1035.0)),
+        px(35.0)
+    );
+}
+
+#[test]
+fn subtitle_vertical_offset_adjustment_allows_moving_past_default_position() {
+    assert_eq!(subtitle_vertical_offset_after_adjustment(0.0, -0.01), -0.01);
+    assert_eq!(
+        subtitle_vertical_offset_after_adjustment(0.02, -0.03),
+        -0.01
+    );
+    assert_eq!(subtitle_vertical_offset_after_adjustment(0.02, 0.01), 0.03);
 }
 
 #[test]
@@ -524,6 +648,14 @@ fn playback_shortcut_keys_map_to_player_actions() {
     assert_eq!(
         playback_shortcut_for_key("i"),
         Some(PlaybackShortcut::ToggleInfoOverlay)
+    );
+    assert_eq!(
+        playback_shortcut_for_key("r"),
+        Some(PlaybackShortcut::RaiseSubtitle)
+    );
+    assert_eq!(
+        playback_shortcut_for_key("t"),
+        Some(PlaybackShortcut::LowerSubtitle)
     );
     assert_eq!(playback_shortcut_for_key("enter"), None);
 }

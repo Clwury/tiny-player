@@ -75,7 +75,7 @@ impl LibplaceboToneMapper {
         frame.repr = unsafe { source_color_repr(input.format, input.color, input.range) };
         frame.color = unsafe { source_color_space(input.color) };
         let dovi_metadata = prepared_dovi.map(|prepared| {
-            apply_dovi_hdr_metadata(&mut frame.color, &prepared);
+            apply_dovi_source_luminance_metadata(&mut frame.color, &prepared);
             Box::new(prepared.placebo)
         });
         if let Some(dovi_metadata) = dovi_metadata.as_ref() {
@@ -137,7 +137,7 @@ impl LibplaceboToneMapper {
         frame.repr = unsafe { source_color_repr(input.format, input.color, input.range) };
         frame.color = unsafe { source_color_space(input.color) };
         let dovi_metadata = prepared_dovi.map(|prepared| {
-            apply_dovi_hdr_metadata(&mut frame.color, &prepared);
+            apply_dovi_source_luminance_metadata(&mut frame.color, &prepared);
             Box::new(prepared.placebo)
         });
         if let Some(dovi_metadata) = dovi_metadata.as_ref() {

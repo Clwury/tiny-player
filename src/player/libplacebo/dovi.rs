@@ -328,18 +328,14 @@ pub(super) fn map_dovi_metadata(
     Ok(dovi)
 }
 
-pub(super) fn apply_dovi_hdr_metadata(
+pub(super) fn apply_dovi_source_luminance_metadata(
     color: &mut ffi::pl_color_space,
     metadata: &DoviRenderMetadata,
 ) {
-    unsafe {
-        ffi::pl_hdr_metadata_from_dovi_rpu(
-            &mut color.hdr,
-            metadata.rpu_payload.as_ptr(),
-            metadata.rpu_payload.len(),
-        );
-    }
-
+    // Do not call pl_hdr_metadata_from_dovi_rpu here: libplacebo routes it
+    // through dovi_tool's C API, whose Rust internals can abort across FFI on
+    // some Profile 5 RPU variants. The render metadata has already resolved
+    // source luminance in safe Rust code.
     if metadata.source_max_pq != 0 {
         color.hdr.min_luma = pq_code_to_nits(metadata.source_min_pq);
         color.hdr.max_luma = pq_code_to_nits(metadata.source_max_pq);

@@ -691,17 +691,17 @@ fn playback_subtitle_external_url(
     item_id: &str,
     media_source_id: &str,
 ) -> Option<String> {
+    if !is_external_subtitle_stream(stream) {
+        return None;
+    }
+
     let delivery_url = stream
         .delivery_url
         .as_deref()
         .map(str::trim)
         .filter(|url| !url.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            is_external_subtitle_stream(stream)
-                .then(|| fallback_external_subtitle_delivery_url(stream, item_id, media_source_id))
-                .flatten()
-        })?;
+        .or_else(|| fallback_external_subtitle_delivery_url(stream, item_id, media_source_id))?;
     let mut url = resolve_direct_stream_url(server, &delivery_url).ok()?;
     if !url.query_pairs().any(|(name, _)| name == "api_key")
         && let Some(access_token) = server
@@ -827,6 +827,8 @@ mod tests {
                 delivery_method: Some("External".to_string()),
                 is_external: Some(true),
                 is_default: Some(false),
+                is_text_subtitle_stream: Some(true),
+                supports_external_stream: Some(true),
             }]),
         };
 
@@ -862,6 +864,8 @@ mod tests {
                 delivery_method: Some("External".to_string()),
                 is_external: Some(true),
                 is_default: Some(false),
+                is_text_subtitle_stream: Some(true),
+                supports_external_stream: Some(true),
             }]),
         };
 
@@ -875,5 +879,69 @@ mod tests {
                 "https://example.com/emby/Videos/1126227/mediasource_1126227/Subtitles/3/0/Stream.ass?api_key=token"
             )
         );
+    }
+
+    #[test]
+    fn playback_subtitle_tracks_keep_internal_ass_on_embedded_stream() {
+        let source = MediaSource {
+            id: Some("mediasource_1126227".to_string()),
+            name: None,
+            path: None,
+            container: None,
+            media_streams: Some(vec![MediaStream {
+                index: Some(2),
+                stream_type: Some("Subtitle".to_string()),
+                display_title: Some("Chinese Simplified (默认 ASS)".to_string()),
+                title: Some("Simplified Chinese (简体中文)".to_string()),
+                language: Some("chi".to_string()),
+                codec: Some("ass".to_string()),
+                delivery_url: None,
+                delivery_method: Some("Embed".to_string()),
+                is_external: Some(false),
+                is_default: Some(true),
+                is_text_subtitle_stream: Some(true),
+                supports_external_stream: Some(true),
+            }]),
+        };
+
+        let tracks = playback_subtitle_tracks(&source, &server(), "1126227", "mediasource_1126227");
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].stream_index, 2);
+        assert!(!tracks[0].is_external);
+        assert_eq!(tracks[0].codec.as_deref(), Some("ass"));
+        assert_eq!(tracks[0].external_url, None);
+    }
+
+    #[test]
+    fn playback_subtitle_tracks_keep_internal_subrip_on_embedded_stream() {
+        let source = MediaSource {
+            id: Some("mediasource_824061".to_string()),
+            name: None,
+            path: None,
+            container: None,
+            media_streams: Some(vec![MediaStream {
+                index: Some(2),
+                stream_type: Some("Subtitle".to_string()),
+                display_title: Some("Chinese Simplified (默认 SUBRIP)".to_string()),
+                title: Some("Chinese Simplified".to_string()),
+                language: Some("chi".to_string()),
+                codec: Some("subrip".to_string()),
+                delivery_url: None,
+                delivery_method: Some("Embed".to_string()),
+                is_external: Some(false),
+                is_default: Some(true),
+                is_text_subtitle_stream: Some(true),
+                supports_external_stream: Some(true),
+            }]),
+        };
+
+        let tracks = playback_subtitle_tracks(&source, &server(), "824061", "mediasource_824061");
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].stream_index, 2);
+        assert!(!tracks[0].is_external);
+        assert_eq!(tracks[0].codec.as_deref(), Some("subrip"));
+        assert_eq!(tracks[0].external_url, None);
     }
 }

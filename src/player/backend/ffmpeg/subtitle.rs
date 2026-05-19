@@ -314,22 +314,20 @@ fn ass_dialogue_text(line: &str) -> String {
     let payload = strip_ass_line_prefix(trimmed, "Dialogue:")
         .unwrap_or(trimmed)
         .trim_start();
-    let mut fields = payload.splitn(10, ',');
-    let mut text = "";
-    for index in 0..10 {
-        let Some(field) = fields.next() else {
-            break;
-        };
-        if index == 9 {
-            text = field;
-            break;
-        }
+    let dialogue_parts = payload.splitn(10, ',').collect::<Vec<_>>();
+    if dialogue_parts.len() == 10
+        && parse_subtitle_timecode(dialogue_parts[1]).is_some()
+        && parse_subtitle_timecode(dialogue_parts[2]).is_some()
+    {
+        return dialogue_parts[9].to_string();
     }
-    if text.is_empty() {
-        trimmed.to_string()
-    } else {
-        text.to_string()
+
+    let packet_parts = payload.splitn(9, ',').collect::<Vec<_>>();
+    if packet_parts.len() == 9 {
+        return packet_parts[8].to_string();
     }
+
+    trimmed.to_string()
 }
 
 fn strip_ass_override_tags(text: &str) -> String {
@@ -677,6 +675,14 @@ mod tests {
         assert_eq!(
             ass_dialogue_text("Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,hello"),
             "hello"
+        );
+    }
+
+    #[test]
+    fn ass_dialogue_text_handles_decoded_packet_event_fields() {
+        assert_eq!(
+            ass_dialogue_text("12,0,Default,,0,0,0,,第一行,第二行"),
+            "第一行,第二行"
         );
     }
 
