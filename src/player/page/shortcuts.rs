@@ -99,3 +99,53 @@ pub(super) fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_shortcut_keys_map_to_player_actions() {
+        assert_eq!(
+            playback_shortcut_for_key("space"),
+            Some(PlaybackShortcut::TogglePlayback)
+        );
+        assert_eq!(
+            playback_shortcut_for_key(" "),
+            Some(PlaybackShortcut::TogglePlayback)
+        );
+        assert_eq!(
+            playback_shortcut_for_key("p"),
+            Some(PlaybackShortcut::TogglePlayback)
+        );
+        assert_eq!(
+            playback_shortcut_for_key("f"),
+            Some(PlaybackShortcut::ToggleFullscreen)
+        );
+        assert_eq!(
+            playback_shortcut_for_key("escape"),
+            Some(PlaybackShortcut::ExitFullscreen)
+        );
+        assert_eq!(
+            playback_shortcut_for_key("left"),
+            Some(PlaybackShortcut::SeekBackward)
+        );
+        assert_eq!(
+            playback_shortcut_for_key("right"),
+            Some(PlaybackShortcut::SeekForward)
+        );
+        assert_eq!(
+            playback_shortcut_for_key("i"),
+            Some(PlaybackShortcut::ToggleInfoOverlay)
+        );
+        assert_eq!(
+            playback_shortcut_for_key("r"),
+            Some(PlaybackShortcut::RaiseSubtitle)
+        );
+        assert_eq!(
+            playback_shortcut_for_key("t"),
+            Some(PlaybackShortcut::LowerSubtitle)
+        );
+        assert_eq!(playback_shortcut_for_key("enter"), None);
+    }
+}

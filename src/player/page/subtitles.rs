@@ -11,7 +11,7 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         let current_offset_fraction = self.current_subtitle_vertical_offset_fraction(window);
-        self.subtitle_vertical_offset_fraction = Some(subtitle_vertical_offset_after_adjustment(
+        self.subtitle.vertical_offset_fraction = Some(subtitle_vertical_offset_after_adjustment(
             current_offset_fraction,
             delta,
         ));
@@ -19,7 +19,8 @@ impl PlaybackPage {
     }
 
     pub(super) fn current_subtitle_vertical_offset_fraction(&self, window: &Window) -> f32 {
-        self.subtitle_vertical_offset_fraction
+        self.subtitle
+            .vertical_offset_fraction
             .or_else(|| self.default_subtitle_vertical_offset_fraction(window))
             .unwrap_or(0.0)
     }
@@ -39,22 +40,18 @@ impl PlaybackPage {
     }
 
     pub(super) fn current_video_layout_bounds(&self) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
-        let video_bounds = local_video_viewport_bounds(self.video_viewport_bounds?);
-        let video_fitted_bounds = aspect_fit_bounds(video_bounds, self.video_source_size?)?;
+        let video_bounds = local_video_viewport_bounds(self.frame.viewport_bounds?);
+        let video_fitted_bounds = aspect_fit_bounds(video_bounds, self.frame.source_size?)?;
         Some((video_bounds, video_fitted_bounds))
     }
 
-    pub(super) fn render_subtitle_overlay(
-        &self,
-        progress_bar_visible: bool,
-        _cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let Some(cue) = self.active_subtitle.as_ref() else {
+    pub(super) fn render_subtitle_overlay(&self, progress_bar_visible: bool) -> impl IntoElement {
+        let Some(cue) = self.subtitle.active.as_ref() else {
             return div()
                 .id("playback-subtitle-overlay-empty")
                 .into_any_element();
         };
-        let Some(observed_video_bounds) = self.video_viewport_bounds else {
+        let Some(observed_video_bounds) = self.frame.viewport_bounds else {
             return div()
                 .id("playback-subtitle-overlay-empty")
                 .into_any_element();
@@ -62,7 +59,7 @@ impl PlaybackPage {
         // Canvas observations are window-relative, while absolute children below
         // are laid out relative to the playback view.
         let video_bounds = local_video_viewport_bounds(observed_video_bounds);
-        let Some(source_size) = self.video_source_size else {
+        let Some(source_size) = self.frame.source_size else {
             return div()
                 .id("playback-subtitle-overlay-empty")
                 .into_any_element();
@@ -89,9 +86,9 @@ impl PlaybackPage {
         let subtitle_render_bottom = subtitle_render_bottom(
             video_fitted_bounds,
             subtitle_bottom,
-            self.subtitle_vertical_offset_fraction,
+            self.subtitle.vertical_offset_fraction,
         );
-        let bitmap_top = if self.subtitle_vertical_offset_fraction.is_some() {
+        let bitmap_top = if self.subtitle.vertical_offset_fraction.is_some() {
             subtitle_bitmap_overlay_top_for_bottom(
                 cue,
                 bitmap_bounds,
@@ -129,7 +126,7 @@ impl PlaybackPage {
         let text_overlay_bounds = subtitle_text_overlay_bounds(
             video_fitted_bounds,
             subtitle_render_bottom,
-            self.subtitle_vertical_offset_fraction,
+            self.subtitle.vertical_offset_fraction,
         );
         overlay
             .child(
@@ -413,5 +410,248 @@ impl IntoElement for SubtitleBitmapElement {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Bounds, point, px, size};
+
+    use crate::player::{
+        backend::{BackendSubtitleBitmap, BackendSubtitleCue},
+        render_host::{RenderSize, render_image_from_bgra},
+    };
+
+    use super::*;
+
+    #[test]
+    fn local_video_viewport_bounds_strips_window_origin_for_overlay_layout() {
+        let observed = Bounds::new(
+            point(px(0.0), px(1043.3334)),
+            size(px(1485.3334), px(1008.0)),
+        );
+
+        assert_eq!(
+            local_video_viewport_bounds(observed),
+            Bounds::new(point(px(0.0), px(0.0)), observed.size)
+        );
+    }
+
+    #[test]
+    fn subtitle_text_overlay_height_stops_at_progress_bar_top() {
+        let video_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
+        let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+
+        assert_eq!(
+            subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true),
+            px(407.0)
+        );
+    }
+
+    #[test]
+    fn subtitle_text_overlay_height_uses_video_bounds_origin_for_controls_top() {
+        let video_bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(800.0), px(600.0)));
+        let video_fitted_bounds =
+            Bounds::new(point(px(10.0), px(95.0)), size(px(800.0), px(450.0)));
+
+        assert_eq!(
+            subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true),
+            px(407.0)
+        );
+    }
+
+    #[test]
+    fn subtitle_text_overlay_height_uses_video_bottom_without_visible_progress_bar() {
+        let video_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(700.0)));
+        let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+
+        assert_eq!(
+            subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true),
+            px(450.0)
+        );
+        assert_eq!(
+            subtitle_text_overlay_height(video_fitted_bounds, video_bounds, false),
+            px(450.0)
+        );
+    }
+
+    #[test]
+    fn subtitle_text_overlay_offset_shifts_position_without_changing_default_height() {
+        let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+
+        let raised = subtitle_text_overlay_bounds(video_fitted_bounds, px(25.0), Some(1.0));
+        assert_eq!(raised.origin.y, px(-425.0));
+        assert_eq!(raised.size.height, px(450.0));
+
+        let lowered = subtitle_text_overlay_bounds(video_fitted_bounds, px(530.0), Some(-0.01));
+        assert_eq!(lowered.origin.y, px(80.0));
+        assert_eq!(lowered.size.height, px(450.0));
+    }
+
+    #[test]
+    fn subtitle_render_bottom_offset_is_independent_from_controls_visibility() {
+        let video_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
+        let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+        let controls_default_bottom = px(482.0);
+        let hidden_controls_default_bottom = px(525.0);
+
+        let manual_offset = subtitle_vertical_offset_after_adjustment(
+            subtitle_vertical_offset_fraction(
+                video_fitted_bounds,
+                px(525.0) - controls_default_bottom,
+            ),
+            subtitle_vertical_adjust_step(),
+        );
+
+        assert_eq!(
+            subtitle_render_bottom(
+                video_fitted_bounds,
+                subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true)
+                    + video_fitted_bounds.origin.y,
+                Some(manual_offset),
+            ),
+            px(477.5)
+        );
+        assert_eq!(
+            subtitle_render_bottom(
+                video_fitted_bounds,
+                hidden_controls_default_bottom,
+                Some(manual_offset),
+            ),
+            px(477.5)
+        );
+    }
+
+    #[test]
+    fn subtitle_vertical_adjust_step_uses_one_percent_of_video_height() {
+        let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+
+        assert_eq!(subtitle_vertical_adjust_step(), 0.01);
+        assert_eq!(
+            subtitle_vertical_offset_pixels(video_fitted_bounds, subtitle_vertical_adjust_step()),
+            px(4.5)
+        );
+    }
+
+    #[test]
+    fn subtitle_vertical_offset_fraction_keeps_relative_position_after_resize() {
+        let compact_video = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+        let fullscreen_video = Bounds::new(point(px(0.0), px(0.0)), size(px(1600.0), px(900.0)));
+        let offset_fraction = subtitle_vertical_offset_after_adjustment(43.0 / 450.0, 0.01);
+
+        assert_eq!(
+            subtitle_render_bottom(compact_video, px(0.0), Some(offset_fraction)),
+            px(477.5)
+        );
+        assert_eq!(
+            subtitle_render_bottom(fullscreen_video, px(0.0), Some(offset_fraction)),
+            px(805.0)
+        );
+    }
+
+    #[test]
+    fn subtitle_bitmap_overlay_offset_shifts_position_without_changing_default_limit() {
+        let bitmap_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
+        let image = render_image_from_bgra(vec![0, 0, 0, 0], 1, 1).unwrap();
+        let cue = BackendSubtitleCue {
+            text: String::new(),
+            bitmaps: vec![BackendSubtitleBitmap {
+                image,
+                x: 0,
+                y: 900,
+                width: 100,
+                height: 100,
+                canvas_width: 1920,
+                canvas_height: 1080,
+            }],
+            start_nsecs: 0,
+            end_nsecs: 1_000_000_000,
+        };
+
+        assert_eq!(
+            subtitle_bitmap_overlay_top_for_bottom(&cue, bitmap_bounds, 1.0, px(575.0)),
+            px(-425.0)
+        );
+        assert_eq!(
+            subtitle_bitmap_overlay_top_for_bottom(&cue, bitmap_bounds, 1.0, px(1035.0)),
+            px(35.0)
+        );
+    }
+
+    #[test]
+    fn subtitle_vertical_offset_adjustment_allows_moving_past_default_position() {
+        assert_eq!(subtitle_vertical_offset_after_adjustment(0.0, -0.01), -0.01);
+        assert_eq!(
+            subtitle_vertical_offset_after_adjustment(0.02, -0.03),
+            -0.01
+        );
+        assert_eq!(subtitle_vertical_offset_after_adjustment(0.02, 0.01), 0.03);
+    }
+
+    #[test]
+    fn subtitle_bitmap_bottom_offset_lifts_only_overlapping_bitmap_content() {
+        let image = render_image_from_bgra(vec![0, 0, 0, 0], 1, 1).unwrap();
+        let cue = BackendSubtitleCue {
+            text: String::new(),
+            bitmaps: vec![BackendSubtitleBitmap {
+                image,
+                x: 0,
+                y: 900,
+                width: 100,
+                height: 100,
+                canvas_width: 1920,
+                canvas_height: 1080,
+            }],
+            start_nsecs: 0,
+            end_nsecs: 1_000_000_000,
+        };
+        let bitmap_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(1920.0), px(1080.0)));
+
+        assert_eq!(
+            subtitle_bitmap_bottom_offset(&cue, bitmap_bounds, 1.0, px(960.0)),
+            px(40.0)
+        );
+        assert_eq!(
+            subtitle_bitmap_bottom_offset(&cue, bitmap_bounds, 1.0, px(1000.0)),
+            px(0.0)
+        );
+    }
+
+    #[test]
+    fn subtitle_bitmap_canvas_size_uses_largest_bitmap_canvas() {
+        let image = render_image_from_bgra(vec![0, 0, 0, 0], 1, 1).unwrap();
+        let cue = BackendSubtitleCue {
+            text: String::new(),
+            bitmaps: vec![
+                BackendSubtitleBitmap {
+                    image: image.clone(),
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                    canvas_width: 1920,
+                    canvas_height: 800,
+                },
+                BackendSubtitleBitmap {
+                    image,
+                    x: 0,
+                    y: 900,
+                    width: 1,
+                    height: 1,
+                    canvas_width: 1920,
+                    canvas_height: 1080,
+                },
+            ],
+            start_nsecs: 0,
+            end_nsecs: 1_000_000_000,
+        };
+
+        assert_eq!(
+            subtitle_bitmap_canvas_size(&cue),
+            Some(RenderSize {
+                width: 1920,
+                height: 1080,
+            })
+        );
     }
 }

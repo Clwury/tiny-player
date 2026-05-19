@@ -1,6 +1,16 @@
 use super::fullscreen::{PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX, PLAYBACK_PROGRESS_BAR_HEIGHT_PX};
 use super::*;
 
+#[derive(Clone, Copy)]
+struct PlaybackControlsRenderState {
+    can_toggle_playback: bool,
+    play_pause_icon: &'static str,
+    can_select_audio: bool,
+    can_select_subtitle: bool,
+    audio_select_open: bool,
+    subtitle_select_open: bool,
+}
+
 impl PlaybackPage {
     fn toggle_playback_pause(
         &mut self,
@@ -17,7 +27,7 @@ impl PlaybackPage {
             return;
         }
 
-        let paused = !self.playback_paused;
+        let paused = !self.timeline.paused;
         let Some(backend) = self.video.owner_mut() else {
             return;
         };
@@ -27,13 +37,13 @@ impl PlaybackPage {
             BackendCommand::Resume
         };
         if let Err(error) = backend.command(command) {
-            self.playback_paused = true;
-            self.playback_buffering = false;
+            self.timeline.paused = true;
+            self.timeline.buffering = false;
             self.error_message = Some(format!("控制播放失败：{error}").into());
         } else {
-            self.playback_paused = paused;
+            self.timeline.paused = paused;
             if paused {
-                self.playback_buffering = false;
+                self.timeline.buffering = false;
             }
         }
         cx.notify();
@@ -46,10 +56,10 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if self.audio_tracks.is_empty() && self.selected_audio_stream_index.is_none() {
+        if self.tracks.audio.is_empty() && self.tracks.selected_audio_stream_index.is_none() {
             return;
         }
-        self.open_track_select = if self.open_track_select == Some(PlaybackTrackKind::Audio) {
+        self.tracks.open = if self.tracks.open == Some(PlaybackTrackKind::Audio) {
             None
         } else {
             Some(PlaybackTrackKind::Audio)
@@ -64,10 +74,11 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if self.subtitle_tracks.is_empty() && self.selected_subtitle_stream_index.is_none() {
+        if self.tracks.subtitles.is_empty() && self.tracks.selected_subtitle_stream_index.is_none()
+        {
             return;
         }
-        self.open_track_select = if self.open_track_select == Some(PlaybackTrackKind::Subtitle) {
+        self.tracks.open = if self.tracks.open == Some(PlaybackTrackKind::Subtitle) {
             None
         } else {
             Some(PlaybackTrackKind::Subtitle)
@@ -82,13 +93,14 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         let position_seconds = self
+            .timeline
             .progress_drag_position
-            .or(self.playback_position)
+            .or(self.timeline.position)
             .unwrap_or(0.0);
-        let previous_audio = self.selected_audio_stream_index;
-        self.selected_audio_stream_index = track_index;
-        self.open_track_select = None;
-        self.playback_buffering = self.current_file_loaded;
+        let previous_audio = self.tracks.selected_audio_stream_index;
+        self.tracks.selected_audio_stream_index = track_index;
+        self.tracks.open = None;
+        self.timeline.buffering = self.timeline.loaded;
         self.status_message = "正在切换轨道…".into();
 
         if let Some(backend) = self.video.owner_mut()
@@ -97,8 +109,8 @@ impl PlaybackPage {
                 position_seconds,
             })
         {
-            self.selected_audio_stream_index = previous_audio;
-            self.playback_buffering = false;
+            self.tracks.selected_audio_stream_index = previous_audio;
+            self.timeline.buffering = false;
             self.error_message = Some(format!("切换轨道失败：{error}").into());
         }
         cx.notify();
@@ -111,15 +123,16 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         let position_seconds = self
+            .timeline
             .progress_drag_position
-            .or(self.playback_position)
+            .or(self.timeline.position)
             .unwrap_or(0.0);
-        let previous_audio = self.selected_audio_stream_index;
-        let previous_subtitle = self.selected_subtitle_stream_index;
-        let mut previous_active_subtitle = self.active_subtitle.take();
-        self.selected_subtitle_stream_index = track.as_ref().map(|track| track.stream_index);
-        self.open_track_select = None;
-        self.playback_buffering = self.current_file_loaded;
+        let previous_audio = self.tracks.selected_audio_stream_index;
+        let previous_subtitle = self.tracks.selected_subtitle_stream_index;
+        let mut previous_active_subtitle = self.subtitle.active.take();
+        self.tracks.selected_subtitle_stream_index = track.as_ref().map(|track| track.stream_index);
+        self.tracks.open = None;
+        self.timeline.buffering = self.timeline.loaded;
         self.status_message = "正在切换轨道…".into();
 
         if let Some(backend) = self.video.owner_mut()
@@ -128,10 +141,10 @@ impl PlaybackPage {
                 position_seconds,
             })
         {
-            self.selected_audio_stream_index = previous_audio;
-            self.selected_subtitle_stream_index = previous_subtitle;
-            self.active_subtitle = previous_active_subtitle.take();
-            self.playback_buffering = false;
+            self.tracks.selected_audio_stream_index = previous_audio;
+            self.tracks.selected_subtitle_stream_index = previous_subtitle;
+            self.subtitle.active = previous_active_subtitle.take();
+            self.timeline.buffering = false;
             self.error_message = Some(format!("切换轨道失败：{error}").into());
         }
         defer_drop_subtitle(previous_active_subtitle, window);
@@ -173,16 +186,17 @@ impl PlaybackPage {
             return;
         };
         if self
+            .timeline
             .progress_drag_position
             .is_none_or(|current| (current - position).abs() >= 0.02)
         {
-            self.progress_drag_position = Some(position);
+            self.timeline.progress_drag_position = Some(position);
             cx.notify();
         }
     }
 
     pub(super) fn commit_progress_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(position) = self.progress_drag_position else {
+        let Some(position) = self.timeline.progress_drag_position else {
             return;
         };
         self.seek_to_position(position, window, cx);
@@ -199,9 +213,10 @@ impl PlaybackPage {
         }
 
         let position = self
+            .timeline
             .progress_drag_position
-            .or(self.pending_seek_position)
-            .or(self.playback_position)
+            .or(self.timeline.pending_seek_position)
+            .or(self.timeline.position)
             .unwrap_or(0.0)
             + delta_seconds;
         self.seek_to_position(position, window, cx);
@@ -214,32 +229,34 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         let position = self
-            .playback_duration
+            .timeline
+            .duration
             .map(|duration| clamp_playback_position(position, duration))
             .unwrap_or(position);
-        self.progress_drag_position = None;
+        self.timeline.progress_drag_position = None;
         let uses_playable_cache_progress = self.video.owner().is_some();
-        let keep_current_frame = self.current_frame.is_some()
+        let keep_current_frame = self.frame.current.is_some()
             && is_seek_position_buffered(
                 position,
-                self.playback_position,
-                self.playback_buffered_until,
-                self.http_stream_buffered_range,
-                self.playback_duration,
+                self.timeline.position,
+                self.timeline.buffered_until,
+                self.timeline.http_stream_buffered_range,
+                self.timeline.duration,
             );
-        self.playback_position = Some(position);
-        self.playback_buffered_until = if uses_playable_cache_progress {
+        self.timeline.position = Some(position);
+        self.timeline.buffered_until = if uses_playable_cache_progress {
             Some(position)
         } else {
-            self.playback_buffered_until
+            self.timeline
+                .buffered_until
                 .map(|buffered_until| buffered_until.max(position))
         };
         if !keep_current_frame {
-            self.http_stream_buffered_range = None;
+            self.timeline.http_stream_buffered_range = None;
         }
-        self.pending_seek_position = Some(position);
-        self.pending_seek_keeps_frame = keep_current_frame;
-        self.playback_buffering = !keep_current_frame;
+        self.timeline.pending_seek_position = Some(position);
+        self.timeline.pending_seek_keeps_frame = keep_current_frame;
+        self.timeline.buffering = !keep_current_frame;
         self.status_message = if keep_current_frame {
             "".into()
         } else {
@@ -257,17 +274,17 @@ impl PlaybackPage {
                 position_seconds: position,
             })
         {
-            self.pending_seek_position = None;
-            self.pending_seek_keeps_frame = false;
-            self.playback_buffering = false;
+            self.timeline.pending_seek_position = None;
+            self.timeline.pending_seek_keeps_frame = false;
+            self.timeline.buffering = false;
             self.error_message = Some(format!("跳转播放位置失败：{error}").into());
         }
         cx.notify();
     }
 
     pub(super) fn position_for_progress_cursor(&self, cursor_x: Pixels) -> Option<f64> {
-        let duration = self.playback_duration?;
-        let bounds = self.progress_track_bounds?;
+        let duration = self.timeline.duration?;
+        let bounds = self.timeline.progress_track_bounds?;
         let fraction = progress_fraction_for_cursor(cursor_x, bounds)?;
         Some(clamp_playback_position(
             duration * fraction as f64,
@@ -358,13 +375,13 @@ impl PlaybackPage {
         let (id, tracks, selected) = match kind {
             PlaybackTrackKind::Audio => (
                 "playback-audio-menu",
-                &self.audio_tracks,
-                self.selected_audio_stream_index,
+                &self.tracks.audio,
+                self.tracks.selected_audio_stream_index,
             ),
             PlaybackTrackKind::Subtitle => (
                 "playback-caption-menu",
-                &self.subtitle_tracks,
-                self.selected_subtitle_stream_index,
+                &self.tracks.subtitles,
+                self.tracks.selected_subtitle_stream_index,
             ),
         };
         let off_selected = selected.is_none();
@@ -438,51 +455,286 @@ impl PlaybackPage {
             .into_any_element()
     }
 
+    pub(super) fn render_back_button(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = theme::get(cx);
+
+        div()
+            .id("playback-back-button")
+            .absolute()
+            .left_4()
+            .top_4()
+            .flex()
+            .size(px(32.0))
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .hover(move |style| style.bg(theme.secondary_hover))
+            .child(
+                svg()
+                    .path("icons/chevron-left.svg")
+                    .size(px(18.0))
+                    .text_color(theme.foreground),
+            )
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::press_back_button))
+            .on_mouse_up(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+    }
+
+    fn render_playback_controls_row(
+        &self,
+        state: PlaybackControlsRenderState,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("playback-controls")
+            .relative()
+            .w_full()
+            .h(px(34.0))
+            .child(self.render_primary_transport_controls(
+                state.can_toggle_playback,
+                state.play_pause_icon,
+                cx,
+            ))
+            .child(self.render_track_control_buttons(
+                state.can_select_audio,
+                state.can_select_subtitle,
+                state.audio_select_open,
+                state.subtitle_select_open,
+                cx,
+            ))
+    }
+
+    fn render_primary_transport_controls(
+        &self,
+        can_toggle_playback: bool,
+        play_pause_icon: &'static str,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(Self::playback_control_button(
+                "playback-previous-button",
+                "icons/previous.svg",
+                px(30.0),
+                px(16.0),
+                false,
+                cx,
+            ))
+            .child(
+                Self::playback_control_button(
+                    "playback-play-pause-button",
+                    play_pause_icon,
+                    px(34.0),
+                    px(18.0),
+                    can_toggle_playback,
+                    cx,
+                )
+                .when(can_toggle_playback, |this| {
+                    this.on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_playback_pause))
+                }),
+            )
+            .child(Self::playback_control_button(
+                "playback-next-button",
+                "icons/next.svg",
+                px(30.0),
+                px(16.0),
+                false,
+                cx,
+            ))
+    }
+
+    fn render_track_control_buttons(
+        &self,
+        can_select_audio: bool,
+        can_select_subtitle: bool,
+        audio_select_open: bool,
+        subtitle_select_open: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .absolute()
+            .right_0()
+            .top_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(self.render_track_control_button(
+                PlaybackTrackKind::Audio,
+                "playback-audio-button",
+                "icons/audio.svg",
+                can_select_audio,
+                audio_select_open,
+                cx,
+            ))
+            .child(self.render_track_control_button(
+                PlaybackTrackKind::Subtitle,
+                "playback-caption-button",
+                "icons/caption.svg",
+                can_select_subtitle,
+                subtitle_select_open,
+                cx,
+            ))
+    }
+
+    fn render_track_control_button(
+        &self,
+        kind: PlaybackTrackKind,
+        id: &'static str,
+        icon_path: &'static str,
+        enabled: bool,
+        select_open: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let button = Self::playback_control_button(id, icon_path, px(30.0), px(16.0), enabled, cx);
+        let button = match kind {
+            PlaybackTrackKind::Audio => button.when(enabled, |this| {
+                this.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(Self::toggle_audio_track_select),
+                )
+            }),
+            PlaybackTrackKind::Subtitle => button.when(enabled, |this| {
+                this.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(Self::toggle_subtitle_track_select),
+                )
+            }),
+        };
+
+        div().relative().child(button).when(select_open, |this| {
+            this.child(deferred(self.render_track_select_menu(kind, cx)).with_priority(1))
+        })
+    }
+
+    fn render_progress_timeline(
+        &self,
+        current_time: String,
+        duration_time: String,
+        played_fraction: f32,
+        playback_buffered_fraction: f32,
+        http_stream_buffered_range: Option<(f32, f32)>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = theme::get(cx);
+
+        div()
+            .flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(48.0))
+                    .text_align(gpui::TextAlign::Left)
+                    .child(current_time),
+            )
+            .child(
+                div()
+                    .id("playback-progress-track")
+                    .relative()
+                    .flex_1()
+                    .h(px(28.0))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_progress_drag))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_progress_drag))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_progress_drag))
+                    .on_drag(ProgressBarDrag, |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| ProgressBarDrag)
+                    })
+                    .on_drag_move(cx.listener(Self::drag_progress))
+                    .child(progress_track_fill(theme.input_border.opacity(0.48), 1.0))
+                    .child(progress_track_fill(
+                        theme.muted_foreground.opacity(0.54),
+                        playback_buffered_fraction,
+                    ))
+                    .when_some(
+                        http_stream_buffered_range,
+                        |this, (start_fraction, end_fraction)| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .left(relative(start_fraction))
+                                    .top(px(11.0))
+                                    .h(px(6.0))
+                                    .w(relative(end_fraction - start_fraction))
+                                    .rounded_full()
+                                    .bg(theme.muted_foreground.opacity(0.54)),
+                            )
+                        },
+                    )
+                    .child(progress_track_fill(
+                        theme.input_border_focused,
+                        played_fraction,
+                    ))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(7.0))
+                            .left(relative(played_fraction))
+                            .ml(-px(6.0))
+                            .size(px(14.0))
+                            .rounded_full()
+                            .bg(theme.foreground)
+                            .border_1()
+                            .border_color(theme.input_border_focused.opacity(0.7)),
+                    )
+                    .child(progress_track_observer(cx)),
+            )
+            .child(
+                div()
+                    .w(px(48.0))
+                    .text_align(gpui::TextAlign::Right)
+                    .child(duration_time),
+            )
+    }
+
     pub(super) fn render_progress_bar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let Some(duration) = self.playback_duration else {
+        let Some(duration) = self.timeline.duration else {
             return div().id("playback-progress-empty").into_any_element();
         };
 
         let theme = theme::get(cx);
         let position = self
+            .timeline
             .progress_drag_position
-            .or(self.playback_position)
+            .or(self.timeline.position)
             .unwrap_or(0.0);
         let played_fraction = progress_fraction(position, duration);
         let playback_buffered_fraction =
-            buffered_progress_fraction(self.playback_buffered_until, position, duration);
+            buffered_progress_fraction(self.timeline.buffered_until, position, duration);
         let http_stream_buffered_range = http_stream_buffered_range_fractions(
-            self.http_stream_buffered_range,
+            self.timeline.http_stream_buffered_range,
             playback_buffered_fraction,
         );
         let current_time = format_playback_time(position);
         let duration_time = format_playback_time(duration);
-        let view = cx.entity().downgrade();
-        let track_observer = canvas(|bounds, _, _| bounds, {
-            let view = view.clone();
-            move |_bounds, observed_bounds, window, _app| {
-                let view = view.clone();
-                window.on_next_frame(move |_, app| {
-                    let _ = view.update(app, |this, cx| {
-                        this.update_progress_track_bounds(observed_bounds, cx);
-                    });
-                });
-            }
-        })
-        .absolute()
-        .size_full();
         let can_toggle_playback = self.can_toggle_playback();
-        let play_pause_icon = if self.playback_paused {
+        let play_pause_icon = if self.timeline.paused {
             "icons/play.svg"
         } else {
             "icons/pause.svg"
         };
         let can_select_audio =
-            !self.audio_tracks.is_empty() || self.selected_audio_stream_index.is_some();
-        let can_select_subtitle =
-            !self.subtitle_tracks.is_empty() || self.selected_subtitle_stream_index.is_some();
-        let audio_select_open = self.open_track_select == Some(PlaybackTrackKind::Audio);
-        let subtitle_select_open = self.open_track_select == Some(PlaybackTrackKind::Subtitle);
+            !self.tracks.audio.is_empty() || self.tracks.selected_audio_stream_index.is_some();
+        let can_select_subtitle = !self.tracks.subtitles.is_empty()
+            || self.tracks.selected_subtitle_stream_index.is_some();
+        let controls = PlaybackControlsRenderState {
+            can_toggle_playback,
+            play_pause_icon,
+            can_select_audio,
+            can_select_subtitle,
+            audio_select_open: self.tracks.open == Some(PlaybackTrackKind::Audio),
+            subtitle_select_open: self.tracks.open == Some(PlaybackTrackKind::Subtitle),
+        };
 
         div()
             .id("playback-progress")
@@ -505,233 +757,45 @@ impl PlaybackPage {
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .text_xs()
             .text_color(theme.foreground.opacity(0.86))
-            .child(
-                div()
-                    .id("playback-controls")
-                    .relative()
-                    .w_full()
-                    .h(px(34.0))
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .top_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_3()
-                            .child(Self::playback_control_button(
-                                "playback-previous-button",
-                                "icons/previous.svg",
-                                px(30.0),
-                                px(16.0),
-                                false,
-                                cx,
-                            ))
-                            .child(
-                                Self::playback_control_button(
-                                    "playback-play-pause-button",
-                                    play_pause_icon,
-                                    px(34.0),
-                                    px(18.0),
-                                    can_toggle_playback,
-                                    cx,
-                                )
-                                .when(
-                                    can_toggle_playback,
-                                    |this| {
-                                        this.on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(Self::toggle_playback_pause),
-                                        )
-                                    },
-                                ),
-                            )
-                            .child(Self::playback_control_button(
-                                "playback-next-button",
-                                "icons/next.svg",
-                                px(30.0),
-                                px(16.0),
-                                false,
-                                cx,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .right_0()
-                            .top_0()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .relative()
-                                    .child(
-                                        Self::playback_control_button(
-                                            "playback-audio-button",
-                                            "icons/audio.svg",
-                                            px(30.0),
-                                            px(16.0),
-                                            can_select_audio,
-                                            cx,
-                                        )
-                                        .when(
-                                            can_select_audio,
-                                            |this| {
-                                                this.on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(Self::toggle_audio_track_select),
-                                                )
-                                            },
-                                        ),
-                                    )
-                                    .when(audio_select_open, |this| {
-                                        this.child(
-                                            deferred(self.render_track_select_menu(
-                                                PlaybackTrackKind::Audio,
-                                                cx,
-                                            ))
-                                            .with_priority(1),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .relative()
-                                    .child(
-                                        Self::playback_control_button(
-                                            "playback-caption-button",
-                                            "icons/caption.svg",
-                                            px(30.0),
-                                            px(16.0),
-                                            can_select_subtitle,
-                                            cx,
-                                        )
-                                        .when(
-                                            can_select_subtitle,
-                                            |this| {
-                                                this.on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(Self::toggle_subtitle_track_select),
-                                                )
-                                            },
-                                        ),
-                                    )
-                                    .when(subtitle_select_open, |this| {
-                                        this.child(
-                                            deferred(self.render_track_select_menu(
-                                                PlaybackTrackKind::Subtitle,
-                                                cx,
-                                            ))
-                                            .with_priority(1),
-                                        )
-                                    }),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(48.0))
-                            .text_align(gpui::TextAlign::Left)
-                            .child(current_time),
-                    )
-                    .child(
-                        div()
-                            .id("playback-progress-track")
-                            .relative()
-                            .flex_1()
-                            .h(px(28.0))
-                            .cursor_pointer()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(Self::begin_progress_drag),
-                            )
-                            .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_progress_drag))
-                            .on_mouse_up_out(
-                                MouseButton::Left,
-                                cx.listener(Self::finish_progress_drag),
-                            )
-                            .on_drag(ProgressBarDrag, |_, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.new(|_| ProgressBarDrag)
-                            })
-                            .on_drag_move(cx.listener(Self::drag_progress))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .right_0()
-                                    .top(px(11.0))
-                                    .h(px(6.0))
-                                    .rounded_full()
-                                    .bg(theme.input_border.opacity(0.48)),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top(px(11.0))
-                                    .h(px(6.0))
-                                    .w(relative(playback_buffered_fraction))
-                                    .rounded_full()
-                                    .bg(theme.muted_foreground.opacity(0.54)),
-                            )
-                            .when_some(
-                                http_stream_buffered_range,
-                                |this, (start_fraction, end_fraction)| {
-                                    this.child(
-                                        div()
-                                            .absolute()
-                                            .left(relative(start_fraction))
-                                            .top(px(11.0))
-                                            .h(px(6.0))
-                                            .w(relative(end_fraction - start_fraction))
-                                            .rounded_full()
-                                            .bg(theme.muted_foreground.opacity(0.54)),
-                                    )
-                                },
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top(px(11.0))
-                                    .h(px(6.0))
-                                    .w(relative(played_fraction))
-                                    .rounded_full()
-                                    .bg(theme.input_border_focused),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top(px(7.0))
-                                    .left(relative(played_fraction))
-                                    .ml(-px(6.0))
-                                    .size(px(14.0))
-                                    .rounded_full()
-                                    .bg(theme.foreground)
-                                    .border_1()
-                                    .border_color(theme.input_border_focused.opacity(0.7)),
-                            )
-                            .child(track_observer),
-                    )
-                    .child(
-                        div()
-                            .w(px(48.0))
-                            .text_align(gpui::TextAlign::Right)
-                            .child(duration_time),
-                    ),
-            )
+            .child(self.render_playback_controls_row(controls, cx))
+            .child(self.render_progress_timeline(
+                current_time,
+                duration_time,
+                played_fraction,
+                playback_buffered_fraction,
+                http_stream_buffered_range,
+                cx,
+            ))
             .into_any_element()
     }
+}
+
+fn progress_track_fill(color: gpui::Hsla, width_fraction: f32) -> impl IntoElement {
+    div()
+        .absolute()
+        .left_0()
+        .top(px(11.0))
+        .h(px(6.0))
+        .w(relative(width_fraction))
+        .rounded_full()
+        .bg(color)
+}
+
+fn progress_track_observer(cx: &Context<PlaybackPage>) -> impl IntoElement {
+    let view = cx.entity().downgrade();
+    canvas(|bounds, _, _| bounds, {
+        let view = view.clone();
+        move |_bounds, observed_bounds, window, _app| {
+            let view = view.clone();
+            window.on_next_frame(move |_, app| {
+                let _ = view.update(app, |this, cx| {
+                    this.update_progress_track_bounds(observed_bounds, cx);
+                });
+            });
+        }
+    })
+    .absolute()
+    .size_full()
 }
 
 pub(super) fn playback_info_segments(info: &PlaybackVideoInfo) -> Vec<String> {
@@ -780,4 +844,59 @@ pub(super) fn valid_frame_rate(frame_rate: f64) -> Option<f64> {
         .is_finite()
         .then_some(frame_rate)
         .filter(|rate| *rate > 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::player::{backend::PlaybackVideoInfo, render_host::RenderSize};
+
+    use super::*;
+
+    #[test]
+    fn playback_info_segments_include_hw_badge_and_frame_rate() {
+        let info = PlaybackVideoInfo {
+            decoder: "hevc".to_string(),
+            size: RenderSize {
+                width: 3840,
+                height: 2160,
+            },
+            frame_rate: Some(23.976),
+            hardware_accelerated: true,
+        };
+
+        assert_eq!(
+            playback_info_segments(&info),
+            vec![
+                "hevc".to_string(),
+                "3840x2160".to_string(),
+                "23.98 FPS".to_string(),
+                "HW".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn playback_info_segments_mark_software_and_skip_invalid_rate() {
+        let info = PlaybackVideoInfo {
+            decoder: "h264".to_string(),
+            size: RenderSize {
+                width: 1920,
+                height: 1080,
+            },
+            frame_rate: Some(f64::NAN),
+            hardware_accelerated: false,
+        };
+
+        assert_eq!(
+            playback_info_segments(&info),
+            vec![
+                "h264".to_string(),
+                "1920x1080".to_string(),
+                "SW".to_string()
+            ]
+        );
+        assert_eq!(valid_frame_rate(0.0), None);
+        assert_eq!(valid_frame_rate(f64::INFINITY), None);
+        assert_eq!(valid_frame_rate(60.0), Some(60.0));
+    }
 }

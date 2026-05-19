@@ -25,11 +25,11 @@ impl PlaybackPage {
     ) {
         match event.kind {
             BackendEventKind::PlaybackRestart => {
-                self.current_file_loaded = true;
-                self.playback_paused = false;
-                self.playback_buffering = false;
-                self.pending_seek_position = None;
-                self.pending_seek_keeps_frame = false;
+                self.timeline.loaded = true;
+                self.timeline.paused = false;
+                self.timeline.buffering = false;
+                self.timeline.pending_seek_position = None;
+                self.timeline.pending_seek_keeps_frame = false;
                 self.status_message = "".into();
                 self.error_message = None;
             }
@@ -48,29 +48,30 @@ impl PlaybackPage {
                 );
             }
             BackendEventKind::Pause(paused) => {
-                self.playback_paused = paused;
+                self.timeline.paused = paused;
             }
             BackendEventKind::Buffering(buffering) => {
-                let hidden_by_soft_seek =
-                    buffering && self.pending_seek_keeps_frame && self.current_frame.is_some();
-                self.playback_buffering = buffering && !hidden_by_soft_seek;
+                let hidden_by_soft_seek = buffering
+                    && self.timeline.pending_seek_keeps_frame
+                    && self.frame.current.is_some();
+                self.timeline.buffering = buffering && !hidden_by_soft_seek;
                 if !hidden_by_soft_seek {
                     self.status_message =
-                        playback_status_message(buffering, self.current_frame.is_some());
+                        playback_status_message(buffering, self.frame.current.is_some());
                 }
             }
             BackendEventKind::PlaybackInfoChanged(info) => {
                 self.playback_info = info;
             }
             BackendEventKind::SubtitleChanged(cue) => {
-                if self.active_subtitle != cue {
-                    defer_drop_subtitle(self.active_subtitle.take(), window);
+                if self.subtitle.active != cue {
+                    defer_drop_subtitle(self.subtitle.active.take(), window);
                 }
-                self.active_subtitle = cue;
+                self.subtitle.active = cue;
             }
             BackendEventKind::VideoSizeChanged(size) => {
-                if self.video_source_size != size {
-                    self.video_source_size = size;
+                if self.frame.source_size != size {
+                    self.frame.source_size = size;
                     self.clear_visible_frame(window, cx);
                 }
                 if let (Some(info), Some(size)) = (self.playback_info.as_mut(), size) {
@@ -79,26 +80,26 @@ impl PlaybackPage {
             }
             BackendEventKind::PositionChanged(position) => {
                 if should_apply_backend_position(
-                    self.progress_drag_position,
-                    self.pending_seek_position,
+                    self.timeline.progress_drag_position,
+                    self.timeline.pending_seek_position,
                 ) {
-                    self.playback_position = valid_playback_time(position);
+                    self.timeline.position = valid_playback_time(position);
                 }
             }
             BackendEventKind::DurationChanged(duration) => {
-                self.playback_duration = valid_playback_duration(duration);
+                self.timeline.duration = valid_playback_duration(duration);
                 if let (Some(drag_position), Some(duration)) =
-                    (self.progress_drag_position, self.playback_duration)
+                    (self.timeline.progress_drag_position, self.timeline.duration)
                 {
-                    self.progress_drag_position =
+                    self.timeline.progress_drag_position =
                         Some(clamp_playback_position(drag_position, duration));
                 }
             }
             BackendEventKind::BufferedChanged(buffered_until) => {
-                self.playback_buffered_until = buffered_until.and_then(valid_playback_time);
+                self.timeline.buffered_until = buffered_until.and_then(valid_playback_time);
             }
             BackendEventKind::HttpStreamBufferedChanged(progress) => {
-                self.http_stream_buffered_range =
+                self.timeline.http_stream_buffered_range =
                     progress.and_then(valid_http_stream_buffer_progress);
             }
         }
@@ -110,17 +111,17 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.current_file_loaded = false;
-        self.video_source_size = None;
+        self.timeline.loaded = false;
+        self.frame.source_size = None;
         self.playback_info = None;
-        self.playback_paused = true;
-        self.playback_buffering = false;
-        self.playback_buffered_until = None;
-        self.http_stream_buffered_range = None;
-        self.pending_seek_position = None;
-        self.pending_seek_keeps_frame = false;
-        self.progress_drag_position = None;
-        defer_drop_subtitle(self.active_subtitle.take(), window);
+        self.timeline.paused = true;
+        self.timeline.buffering = false;
+        self.timeline.buffered_until = None;
+        self.timeline.http_stream_buffered_range = None;
+        self.timeline.pending_seek_position = None;
+        self.timeline.pending_seek_keeps_frame = false;
+        self.timeline.progress_drag_position = None;
+        defer_drop_subtitle(self.subtitle.active.take(), window);
         self.clear_visible_frame(window, cx);
         self.error_message = Some(message);
     }
@@ -131,16 +132,17 @@ impl PlaybackPage {
         }
 
         let render_size = self
-            .video_viewport_bounds
-            .zip(self.video_source_size)
+            .frame
+            .viewport_bounds
+            .zip(self.frame.source_size)
             .and_then(|(viewport_bounds, source_size)| {
                 render_output_size(viewport_bounds, source_size)
             });
         if should_render_frame(
             self.video.dependent().is_some(),
-            self.current_file_loaded,
+            self.timeline.loaded,
             self.error_message.is_some(),
-            self.video_source_size.is_some(),
+            self.frame.source_size.is_some(),
             render_size.is_some(),
         ) {
             let size = render_size.expect("render size checked above");
@@ -153,13 +155,13 @@ impl PlaybackPage {
             match render_result {
                 Ok(Some(frame)) => {
                     self.replace_visible_frame(frame, window, cx);
-                    if !self.playback_buffering {
+                    if !self.timeline.buffering {
                         self.status_message = "".into();
                     }
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    self.playback_paused = true;
+                    self.timeline.paused = true;
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("渲染视频失败：{error}").into());
                 }
