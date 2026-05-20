@@ -324,7 +324,7 @@ pub(super) fn run_ffmpeg_playback(
     );
     let mut scheduler = PlaybackScheduler::new(current_start_position_nsecs);
     let mut position_reporter = PositionReporter::default();
-    let mut dovi_queue = DoviMetadataQueue::default();
+    let mut dovi_state = DoviMetadataState::default();
     let external_subtitle_cues = source
         .selected_tracks
         .subtitle_external_url
@@ -475,7 +475,7 @@ pub(super) fn run_ffmpeg_playback(
                 }
                 queued_video_frames.clear();
                 first_video_frame_pending = true;
-                dovi_queue.clear();
+                dovi_state.clear();
                 subtitle_cues = subtitle_cue_queue_from_external(
                     &external_subtitle_cues,
                     current_start_position_nsecs,
@@ -524,7 +524,7 @@ pub(super) fn run_ffmpeg_playback(
 
         let process_result = match packet.stream_index() {
             index if index == video_decoder.stream_index => {
-                dovi_queue.observe_packet(&packet, video_stream);
+                dovi_state.observe_packet(&packet, video_stream);
                 video_decoder.decode_packet(packet.as_ptr(), &mut video_frame, |frame| {
                     if control.has_pending_seek() {
                         return Ok(());
@@ -541,7 +541,7 @@ pub(super) fn run_ffmpeg_playback(
                         nsecs: timestamp.timeline_nsecs,
                     };
                     if timestamp.timeline_nsecs < current_start_position_nsecs {
-                        let _ = dovi_queue.take_for_frame(frame_pts);
+                        dovi_state.discard_frame(frame_pts);
                         return Ok(());
                     }
 
@@ -553,7 +553,7 @@ pub(super) fn run_ffmpeg_playback(
                                 output.played_timeline_nsecs(),
                             )
                         {
-                            let _ = dovi_queue.take_for_frame(frame_pts);
+                            dovi_state.discard_frame(frame_pts);
                             return Ok(());
                         }
                         if should_drop_backlogged_vulkan_frame(
@@ -561,12 +561,11 @@ pub(super) fn run_ffmpeg_playback(
                             first_video_frame_pending,
                             &frame_slot,
                         ) {
-                            let _ = dovi_queue.take_for_frame(frame_pts);
+                            dovi_state.discard_frame(frame_pts);
                             return Ok(());
                         }
 
-                        let dovi_metadata = dovi_metadata_from_frame(frame)
-                            .or_else(|| dovi_queue.take_for_frame(frame_pts));
+                        let dovi_metadata = dovi_state.metadata_for_frame(frame, frame_pts);
                         let mut decoded_frame =
                             video_converter.convert(&video_decoder, frame, dovi_metadata)?;
                         decoded_frame.pts = Some(frame_pts);
@@ -662,11 +661,10 @@ pub(super) fn run_ffmpeg_playback(
                             first_video_frame_pending,
                             &frame_slot,
                         ) {
-                            let _ = dovi_queue.take_for_frame(frame_pts);
+                            dovi_state.discard_frame(frame_pts);
                             return Ok(());
                         }
-                        let dovi_metadata = dovi_metadata_from_frame(frame)
-                            .or_else(|| dovi_queue.take_for_frame(frame_pts));
+                        let dovi_metadata = dovi_state.metadata_for_frame(frame, frame_pts);
                         let mut decoded_frame =
                             video_converter.convert(&video_decoder, frame, dovi_metadata)?;
                         decoded_frame.pts = Some(frame_pts);
@@ -869,16 +867,15 @@ pub(super) fn run_ffmpeg_playback(
                     output.played_timeline_nsecs(),
                 )
             {
-                let _ = dovi_queue.take_for_frame(frame_pts);
+                dovi_state.discard_frame(frame_pts);
                 return Ok(());
             }
             if should_drop_backlogged_vulkan_frame(frame, first_video_frame_pending, &frame_slot) {
-                let _ = dovi_queue.take_for_frame(frame_pts);
+                dovi_state.discard_frame(frame_pts);
                 return Ok(());
             }
 
-            let dovi_metadata =
-                dovi_metadata_from_frame(frame).or_else(|| dovi_queue.take_for_frame(frame_pts));
+            let dovi_metadata = dovi_state.metadata_for_frame(frame, frame_pts);
             let mut decoded_frame =
                 video_converter.convert(&video_decoder, frame, dovi_metadata)?;
             decoded_frame.pts = Some(frame_pts);
@@ -939,11 +936,10 @@ pub(super) fn run_ffmpeg_playback(
             );
         } else {
             if should_drop_backlogged_vulkan_frame(frame, first_video_frame_pending, &frame_slot) {
-                let _ = dovi_queue.take_for_frame(frame_pts);
+                dovi_state.discard_frame(frame_pts);
                 return Ok(());
             }
-            let dovi_metadata =
-                dovi_metadata_from_frame(frame).or_else(|| dovi_queue.take_for_frame(frame_pts));
+            let dovi_metadata = dovi_state.metadata_for_frame(frame, frame_pts);
             let mut decoded_frame =
                 video_converter.convert(&video_decoder, frame, dovi_metadata)?;
             decoded_frame.pts = Some(frame_pts);

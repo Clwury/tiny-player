@@ -11,6 +11,7 @@ use gpui::RenderImage;
 use image::{Frame, ImageBuffer, RgbaImage};
 
 use super::dovi::DoviFrameMetadata;
+use super::ffmpeg_dovi::FfmpegDoviMetadata;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderSize {
@@ -355,6 +356,7 @@ impl fmt::Display for VulkanDecodeQueue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameDynamicMetadata {
     pub dolby_vision: Option<DoviFrameMetadata>,
+    pub ffmpeg_dovi: Option<FfmpegDoviMetadata>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

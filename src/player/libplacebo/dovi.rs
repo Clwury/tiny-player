@@ -1,4 +1,5 @@
 use super::*;
+use crate::player::ffmpeg_dovi;
 
 #[derive(Default)]
 pub(super) struct DoviMetadataCache {
@@ -11,7 +12,7 @@ pub(super) struct DoviMetadataCache {
 #[derive(Clone)]
 pub(super) struct DoviRenderMetadata {
     pub(super) placebo: ffi::pl_dovi_metadata,
-    pub(super) rpu_payload: Vec<u8>,
+    pub(super) cache_key: Vec<u8>,
     pub(super) source_min_pq: u16,
     pub(super) source_max_pq: u16,
 }
@@ -27,35 +28,68 @@ impl DoviMetadataCache {
         &mut self,
         input: &RawVideoFrame,
     ) -> Result<Option<DoviRenderMetadata>> {
-        let Some(metadata) = input
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.dolby_vision.as_ref())
+        let frame_metadata = input.metadata.as_ref();
+        let Some(metadata) = frame_metadata.and_then(|metadata| metadata.dolby_vision.as_ref())
         else {
+            if let Some(metadata) =
+                frame_metadata.and_then(|metadata| metadata.ffmpeg_dovi.as_ref())
+            {
+                return self.prepare_ffmpeg_dovi(metadata);
+            }
             if input.color == FrameColor::DolbyVisionProfile5 {
                 return Err(anyhow!("Dolby Vision Profile 5 缺少 RPU 元数据"));
             }
             return Ok(None);
         };
 
-        if let Some(rendered) = self
-            .rendered
-            .as_ref()
-            .filter(|rendered| rendered.rpu_payload == metadata.rpu_payload)
-        {
-            return Ok(Some(rendered.clone()));
+        if let Some(rendered) = self.cached(&metadata.rpu_payload) {
+            return Ok(Some(rendered));
         }
 
         let resolved = self.resolve(metadata)?;
         self.trace_metadata(&resolved, input.range);
         let rendered = DoviRenderMetadata {
             placebo: map_dovi_metadata(&resolved.rpu, &resolved.mapping, &resolved.color)?,
-            rpu_payload: metadata.rpu_payload.clone(),
+            cache_key: metadata.rpu_payload.clone(),
             source_min_pq: resolved.color.source_min_pq,
             source_max_pq: resolved.color.source_max_pq,
         };
         self.rendered = Some(rendered.clone());
         Ok(Some(rendered))
+    }
+
+    fn prepare_ffmpeg_dovi(
+        &mut self,
+        metadata: &FfmpegDoviMetadata,
+    ) -> Result<Option<DoviRenderMetadata>> {
+        let cache_key = ffmpeg_dovi_cache_key(metadata);
+        if let Some(rendered) = self.cached(&cache_key) {
+            return Ok(Some(rendered));
+        }
+
+        let placebo = map_ffmpeg_dovi_metadata(metadata)
+            .ok_or_else(|| anyhow!("FFmpeg Dolby Vision metadata is incomplete"))?;
+        let (source_min_pq, source_max_pq) = metadata.source_luminance_pq().unwrap_or((0, 0));
+        tracing::debug!(
+            source_min_pq,
+            source_max_pq,
+            "using FFmpeg parsed Dolby Vision metadata"
+        );
+        let rendered = DoviRenderMetadata {
+            placebo,
+            cache_key,
+            source_min_pq,
+            source_max_pq,
+        };
+        self.rendered = Some(rendered.clone());
+        Ok(Some(rendered))
+    }
+
+    fn cached(&self, cache_key: &[u8]) -> Option<DoviRenderMetadata> {
+        self.rendered
+            .as_ref()
+            .filter(|rendered| rendered.cache_key == cache_key)
+            .cloned()
     }
 
     fn resolve(&mut self, metadata: &DoviFrameMetadata) -> Result<ResolvedDoviRpu> {
@@ -158,6 +192,75 @@ impl DoviMetadataCache {
             "using Dolby Vision metadata"
         );
     }
+}
+
+fn ffmpeg_dovi_cache_key(metadata: &FfmpegDoviMetadata) -> Vec<u8> {
+    let mut key = Vec::with_capacity("ffmpeg-avdovi\0".len() + metadata.as_bytes().len());
+    key.extend_from_slice(b"ffmpeg-avdovi\0");
+    key.extend_from_slice(metadata.as_bytes());
+    key
+}
+
+fn map_ffmpeg_dovi_metadata(metadata: &FfmpegDoviMetadata) -> Option<ffi::pl_dovi_metadata> {
+    let header = metadata.rpu_header()?;
+    let mapping = metadata.data_mapping()?;
+    let color = metadata.color_metadata()?;
+
+    let mut dovi = unsafe { mem::zeroed::<ffi::pl_dovi_metadata>() };
+    for i in 0..3 {
+        dovi.nonlinear_offset[i] = ffmpeg_dovi::av_q2d(color.ycc_to_rgb_offset[i]);
+    }
+    for i in 0..9 {
+        dovi.nonlinear.m[i / 3][i % 3] = ffmpeg_dovi::av_q2d(color.ycc_to_rgb_matrix[i]);
+        dovi.linear.m[i / 3][i % 3] = ffmpeg_dovi::av_q2d(color.rgb_to_lms_matrix[i]);
+    }
+
+    let pivot_scale = 1.0 / ((1u32 << u32::from(header.bl_bit_depth)) - 1) as f32;
+    let coefficient_scale = 1.0 / (1u32 << u32::from(header.coef_log2_denom)) as f32;
+    for component in 0..3 {
+        let source = &mapping.curves[component];
+        let target = &mut dovi.comp[component];
+        let pivot_count = usize::from(source.num_pivots).min(target.pivots.len());
+        target.num_pivots = pivot_count as u8;
+        for i in 0..pivot_count {
+            target.pivots[i] = source.pivots[i] as f32 * pivot_scale;
+        }
+
+        let piece_count = pivot_count.saturating_sub(1).min(target.method.len());
+        for piece in 0..piece_count {
+            let method = source.mapping_idc[piece];
+            target.method[piece] = method as u8;
+            match method {
+                0 => {
+                    for coefficient in 0..target.poly_coeffs[piece].len() {
+                        target.poly_coeffs[piece][coefficient] =
+                            if coefficient <= usize::from(source.poly_order[piece]) {
+                                source.poly_coef[piece][coefficient] as f32 * coefficient_scale
+                            } else {
+                                0.0
+                            };
+                    }
+                }
+                1 => {
+                    target.mmr_order[piece] = source.mmr_order[piece];
+                    target.mmr_constant[piece] =
+                        source.mmr_constant[piece] as f32 * coefficient_scale;
+                    for order in
+                        0..usize::from(source.mmr_order[piece]).min(target.mmr_coeffs[piece].len())
+                    {
+                        for coefficient in 0..target.mmr_coeffs[piece][order].len() {
+                            target.mmr_coeffs[piece][order][coefficient] =
+                                source.mmr_coef[piece][order][coefficient] as f32
+                                    * coefficient_scale;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Some(dovi)
 }
 
 pub(super) fn profile5_default_dovi_color() -> VdrDmData {

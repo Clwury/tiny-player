@@ -71,14 +71,18 @@ pub(super) fn vulkan_video_frame_from_av_frame(
     let Some(device) = decoder.vulkan_device() else {
         return Err("FFmpeg Vulkan 帧缺少解码设备引用".to_string());
     };
-    let color = frame_color(frame, dovi_metadata.as_ref());
+    let ffmpeg_dovi = ffmpeg_dovi_metadata_from_frame(frame);
+    let dovi_metadata = if ffmpeg_dovi.is_some() {
+        None
+    } else {
+        dovi_metadata
+    };
+    let color = frame_color(frame, dovi_metadata.as_ref(), ffmpeg_dovi.as_ref());
     let range = frame_range(frame);
     let chroma_site = frame_chroma_site(frame);
     let frame_images = vulkan_frame_planes(frame, sw_format)?;
     let frame_ref = FfmpegFrameRef::new_ref(frame).map_err(|error| error.to_string())?;
-    let metadata = dovi_metadata.map(|dolby_vision| FrameDynamicMetadata {
-        dolby_vision: Some(dolby_vision),
-    });
+    let metadata = dynamic_metadata(dovi_metadata, ffmpeg_dovi);
 
     Ok(VulkanVideoFrame {
         frame: frame_ref,
@@ -102,13 +106,17 @@ pub(super) fn raw_video_frame_from_av_frame(
     let Some(format) = ffmpeg_raw_video_format(unsafe { (*frame).format }) else {
         return Ok(None);
     };
-    let color = frame_color(frame, dovi_metadata.as_ref());
+    let ffmpeg_dovi = ffmpeg_dovi_metadata_from_frame(frame);
+    let dovi_metadata = if ffmpeg_dovi.is_some() {
+        None
+    } else {
+        dovi_metadata
+    };
+    let color = frame_color(frame, dovi_metadata.as_ref(), ffmpeg_dovi.as_ref());
     let range = frame_range(frame);
     let chroma_site = frame_chroma_site(frame);
     let planes = copy_raw_video_planes(frame, format, size, buffer_pool)?;
-    let metadata = dovi_metadata.map(|dolby_vision| FrameDynamicMetadata {
-        dolby_vision: Some(dolby_vision),
-    });
+    let metadata = dynamic_metadata(dovi_metadata, ffmpeg_dovi);
 
     Ok(Some(RawVideoFrame {
         format,
@@ -182,8 +190,12 @@ pub(super) fn copy_raw_video_planes(
 pub(super) fn frame_color(
     frame: *mut ffi::AVFrame,
     dovi_metadata: Option<&DoviFrameMetadata>,
+    ffmpeg_dovi: Option<&FfmpegDoviMetadata>,
 ) -> FrameColor {
     if dovi_metadata.is_some_and(|metadata| metadata.profile == 5) {
+        return FrameColor::DolbyVisionProfile5;
+    }
+    if ffmpeg_dovi.is_some_and(FfmpegDoviMetadata::is_profile5) {
         return FrameColor::DolbyVisionProfile5;
     }
 
@@ -202,6 +214,19 @@ pub(super) fn frame_color(
     } else {
         FrameColor::Sdr
     }
+}
+
+fn dynamic_metadata(
+    dolby_vision: Option<DoviFrameMetadata>,
+    ffmpeg_dovi: Option<FfmpegDoviMetadata>,
+) -> Option<FrameDynamicMetadata> {
+    if dolby_vision.is_none() && ffmpeg_dovi.is_none() {
+        return None;
+    }
+    Some(FrameDynamicMetadata {
+        dolby_vision,
+        ffmpeg_dovi,
+    })
 }
 
 pub(super) fn frame_range(frame: *mut ffi::AVFrame) -> RawVideoRange {

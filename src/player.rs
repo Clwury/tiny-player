@@ -1,5 +1,6 @@
 mod backend;
 mod dovi;
+mod ffmpeg_dovi;
 mod ffmpeg_vulkan;
 mod libplacebo;
 mod page;

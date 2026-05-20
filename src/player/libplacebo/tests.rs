@@ -125,7 +125,7 @@ fn dolby_vision_hdr_metadata_preserves_default_when_source_luminance_is_unknown(
     let max_luma = color.hdr.max_luma;
     let metadata = DoviRenderMetadata {
         placebo: unsafe { mem::zeroed() },
-        rpu_payload: Vec::new(),
+        cache_key: Vec::new(),
         source_min_pq: 0,
         source_max_pq: 0,
     };

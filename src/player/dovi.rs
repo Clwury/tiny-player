@@ -20,10 +20,13 @@ pub struct DoviFrameMetadata {
 impl DoviFrameMetadata {
     pub fn from_rpu_payload(rpu_payload: &[u8]) -> Result<Self> {
         let rpu = DoviRpu::parse_rpu(rpu_payload).context("解析 Dolby Vision RPU payload 失败")?;
+        let rpu_payload = rpu
+            .write_rpu()
+            .context("写出 Dolby Vision RPU payload 失败")?;
         Ok(Self {
             profile: rpu.dovi_profile,
             rpu_nalu: Vec::new(),
-            rpu_payload: rpu_payload.to_vec(),
+            rpu_payload,
         })
     }
 
@@ -119,15 +122,35 @@ fn extract_from_length_prefixed(
 }
 
 fn metadata_from_nalu(nalu: &[u8]) -> Result<Option<DoviFrameMetadata>> {
-    if nalu_type(nalu) != Some(62) {
-        return Ok(None);
+    if nalu_type(nalu) == Some(62) {
+        return DoviFrameMetadata::from_unspec62_nalu(nalu).map(Some);
     }
 
-    DoviFrameMetadata::from_unspec62_nalu(nalu).map(Some)
+    if is_rpu_payload_candidate(nalu) {
+        return DoviFrameMetadata::from_rpu_payload(nalu).map(Some);
+    }
+
+    Ok(None)
 }
 
 fn nalu_type(nalu: &[u8]) -> Option<u8> {
     nalu.first().map(|header| (header >> 1) & 0x3f)
+}
+
+fn is_rpu_payload_candidate(data: &[u8]) -> bool {
+    if data.len() < 5 {
+        return false;
+    }
+
+    matches!(
+        &data[..5],
+        [0, 0, 0, 1, 25]
+            | [0, 0, 1, 25, 8]
+            | [0, 1, 25, 8, 9]
+            | [124, 1, 25, 8, 9]
+            | [1, 25, 8, 9, _]
+            | [25, 8, 9, _, _]
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +215,26 @@ mod tests {
     }
 
     #[test]
+    fn length_prefixed_raw_rpu_payload_extracts_metadata() {
+        let mut extractor = DoviRpuExtractor;
+        let payload = profile5_rpu_payload();
+        let mut data = Vec::new();
+        data.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        data.extend_from_slice(&payload);
+
+        let metadata = extractor
+            .extract_from_hevc_access_unit(
+                &data,
+                HevcStreamFormat::LengthPrefixed { length_size: 4 },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(metadata.profile, 5);
+        assert_eq!(metadata.rpu_payload, payload);
+    }
+
+    #[test]
     fn malformed_rpu_nalu_returns_error() {
         let mut extractor = DoviRpuExtractor;
         let data = [0, 0, 1, 0x7c, 0x01, 0xaa, 0xbb];
@@ -242,5 +285,18 @@ mod tests {
                 next_offset: 10,
             })
         );
+    }
+
+    fn profile5_rpu_payload() -> Vec<u8> {
+        use dolby_vision::rpu::generate::{GenerateConfig, GenerateProfile};
+
+        let config = GenerateConfig {
+            profile: GenerateProfile::Profile5,
+            ..Default::default()
+        };
+        DoviRpu::profile5_config(&config)
+            .unwrap()
+            .write_rpu()
+            .unwrap()
     }
 }

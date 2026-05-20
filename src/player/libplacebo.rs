@@ -11,6 +11,7 @@ use ffmpeg_sys_next as ffmpeg_ffi;
 
 use super::{
     dovi::DoviFrameMetadata,
+    ffmpeg_dovi::FfmpegDoviMetadata,
     ffmpeg_vulkan,
     render_host::{
         FfmpegAvBufferRef, FrameColor, RawVideoChromaSite, RawVideoFormat, RawVideoFrame,

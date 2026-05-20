@@ -27,6 +27,7 @@ use super::{
 };
 use crate::player::{
     dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat},
+    ffmpeg_dovi::FfmpegDoviMetadata,
     render_host::{
         DecodedFrame, FfmpegAvBufferRef, FfmpegFrameRef, FrameBufferPool, FrameColor,
         FrameDynamicMetadata, FramePixels, FramePts, FrameSlot, PlaybackSessionId, PooledBytes,
@@ -77,7 +78,7 @@ use clock::{
     wait_for_audio_clocked_video_queue,
 };
 use codec::{AudioResampler, AvFrame, AvPacket, Decoder, VideoScaler};
-use dovi::{DoviMetadataQueue, dovi_metadata_from_frame};
+use dovi::{DoviMetadataState, ffmpeg_dovi_metadata_from_frame};
 #[cfg(test)]
 use dovi::{dovi_packet_timeline_nsecs, has_annex_b_start_code};
 use format::{FormatContext, StreamInfo};
