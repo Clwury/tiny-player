@@ -96,7 +96,15 @@ impl PlaybackPage {
                 }
             }
             BackendEventKind::BufferedChanged(buffered_until) => {
-                self.timeline.buffered_until = buffered_until.and_then(valid_playback_time);
+                let buffered_until = buffered_until.and_then(valid_playback_time);
+                self.timeline.buffered_until = if self.timeline.pending_seek_keeps_frame {
+                    match (self.timeline.buffered_until, buffered_until) {
+                        (Some(current), Some(next)) => Some(current.max(next)),
+                        (_, next) => next,
+                    }
+                } else {
+                    buffered_until
+                };
             }
             BackendEventKind::HttpStreamBufferedChanged(progress) => {
                 self.timeline.http_stream_buffered_range =

@@ -1,3 +1,4 @@
+use super::avio::HttpCacheRangeKind;
 use super::worker::PendingSeek;
 use super::*;
 use playback_loop::{
@@ -788,6 +789,83 @@ fn http_ring_cache_state_copies_available_bytes() {
 }
 
 #[test]
+fn http_ring_cache_state_retains_cached_range_across_tail_metadata_restart() {
+    let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
+    state.append_at(100, b"abcdef");
+
+    state.restart_at_with_kind(990, HttpCacheRangeKind::TailMetadataProbe);
+    state.append_at(990, b"tail");
+
+    let mut output = [0; 3];
+    assert_eq!(state.copy_available(102, &mut output), Some(3));
+    assert_eq!(&output, b"cde");
+    assert_eq!(state.copy_available(990, &mut output), Some(3));
+    assert_eq!(&output, b"tai");
+}
+
+#[test]
+fn http_ring_cache_state_hides_tail_metadata_range_from_progress() {
+    let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
+    state.append_at(100, b"abcdef");
+
+    state.restart_at_with_kind(990, HttpCacheRangeKind::TailMetadataProbe);
+    state.append_at(990, b"tail");
+
+    assert_eq!(
+        state.stream_buffer_progress(),
+        Some(HttpStreamBufferProgress {
+            start_fraction: 0.1,
+            end_fraction: 0.106,
+        })
+    );
+}
+
+#[test]
+fn http_ring_cache_state_reports_near_tail_playback_range() {
+    let mut state = HttpRingCacheState::new(980).with_content_len_hint(Some(1_000));
+    state.append_at(980, b"tail");
+
+    assert_eq!(
+        state.stream_buffer_progress(),
+        Some(HttpStreamBufferProgress {
+            start_fraction: 0.98,
+            end_fraction: 0.984,
+        })
+    );
+}
+
+#[test]
+fn http_ring_cache_state_classifies_far_tail_seek_as_metadata_probe() {
+    let content_len = HTTP_CACHE_RANGE_REQUEST_BYTES * 4;
+    let mut state = HttpRingCacheState::new(HTTP_CACHE_RANGE_REQUEST_BYTES)
+        .with_content_len_hint(Some(content_len));
+    state.append_at(HTTP_CACHE_RANGE_REQUEST_BYTES, b"abcdef");
+
+    assert!(state.is_tail_metadata_probe_seek(content_len - 1024));
+}
+
+#[test]
+fn http_ring_cache_state_treats_near_tail_active_range_as_playback() {
+    let content_len = HTTP_CACHE_RANGE_REQUEST_BYTES * 4;
+    let start_offset = content_len - HTTP_CACHE_RANGE_REQUEST_BYTES / 2;
+    let mut state = HttpRingCacheState::new(start_offset).with_content_len_hint(Some(content_len));
+    state.append_at(start_offset, b"abcdef");
+
+    assert!(!state.is_tail_metadata_probe_seek(content_len - 1024));
+}
+
+#[test]
+fn http_ring_cache_state_does_not_retain_cached_range_for_non_tail_restart() {
+    let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000_000_000));
+    state.append_at(100, b"abcdef");
+
+    state.restart_at(10_000);
+
+    let mut output = [0; 3];
+    assert_eq!(state.copy_available(102, &mut output), None);
+}
+
+#[test]
 fn http_ring_cache_state_uses_content_length_hint_for_progress() {
     let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(100));
 
@@ -886,7 +964,7 @@ fn http_ring_cache_state_ignores_seek_outside_cached_range_until_read() {
     let mut state = HttpRingCacheState::new(100);
     state.append_at(100, b"abcdef");
 
-    state.note_seek_offset(10_000);
+    state.note_seek_offset(10_000, HttpCacheRangeKind::Playback);
     state.trim_to_capacity(4);
 
     assert_eq!(state.base_offset, 100);

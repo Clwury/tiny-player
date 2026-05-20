@@ -36,8 +36,8 @@ mod video_element;
 pub use request::PlaybackRequest;
 
 use progress::{
-    ProgressBarDrag, buffered_progress_fraction, clamp_playback_position, format_playback_time,
-    http_stream_buffered_range_fractions, is_seek_position_buffered, playback_status_message,
+    ProgressBarDrag, buffered_progress_fraction, clamp_playback_position,
+    combined_buffered_progress_fraction, format_playback_time, playback_status_message,
     progress_fraction, progress_fraction_for_cursor, should_apply_backend_position,
     valid_http_stream_buffer_progress, valid_playback_duration, valid_playback_time,
 };

@@ -225,7 +225,7 @@ impl PlaybackPage {
     pub(super) fn seek_to_position(
         &mut self,
         position: f64,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let position = self
@@ -234,37 +234,16 @@ impl PlaybackPage {
             .map(|duration| clamp_playback_position(position, duration))
             .unwrap_or(position);
         self.timeline.progress_drag_position = None;
-        let uses_playable_cache_progress = self.video.owner().is_some();
-        let keep_current_frame = self.frame.current.is_some()
-            && is_seek_position_buffered(
-                position,
-                self.timeline.position,
-                self.timeline.buffered_until,
-                self.timeline.http_stream_buffered_range,
-                self.timeline.duration,
-            );
         self.timeline.position = Some(position);
-        self.timeline.buffered_until = if uses_playable_cache_progress {
-            Some(position)
-        } else {
-            self.timeline
-                .buffered_until
-                .map(|buffered_until| buffered_until.max(position))
-        };
-        if !keep_current_frame {
-            self.timeline.http_stream_buffered_range = None;
-        }
+        self.timeline.buffered_until = self
+            .timeline
+            .buffered_until
+            .map(|buffered_until| buffered_until.max(position))
+            .or(Some(position));
         self.timeline.pending_seek_position = Some(position);
-        self.timeline.pending_seek_keeps_frame = keep_current_frame;
-        self.timeline.buffering = !keep_current_frame;
-        self.status_message = if keep_current_frame {
-            "".into()
-        } else {
-            "正在跳转…".into()
-        };
-        if !keep_current_frame {
-            self.clear_visible_frame(window, cx);
-        }
+        self.timeline.pending_seek_keeps_frame = true;
+        self.timeline.buffering = false;
+        self.status_message = "".into();
         if let Some(presenter) = self.video.dependent_mut() {
             presenter.discard_pending_frames();
         }
@@ -619,8 +598,7 @@ impl PlaybackPage {
         current_time: String,
         duration_time: String,
         played_fraction: f32,
-        playback_buffered_fraction: f32,
-        http_stream_buffered_range: Option<(f32, f32)>,
+        buffered_fraction: f32,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = theme::get(cx);
@@ -654,23 +632,8 @@ impl PlaybackPage {
                     .child(progress_track_fill(theme.input_border.opacity(0.48), 1.0))
                     .child(progress_track_fill(
                         theme.muted_foreground.opacity(0.54),
-                        playback_buffered_fraction,
+                        buffered_fraction,
                     ))
-                    .when_some(
-                        http_stream_buffered_range,
-                        |this, (start_fraction, end_fraction)| {
-                            this.child(
-                                div()
-                                    .absolute()
-                                    .left(relative(start_fraction))
-                                    .top(px(11.0))
-                                    .h(px(6.0))
-                                    .w(relative(end_fraction - start_fraction))
-                                    .rounded_full()
-                                    .bg(theme.muted_foreground.opacity(0.54)),
-                            )
-                        },
-                    )
                     .child(progress_track_fill(
                         theme.input_border_focused,
                         played_fraction,
@@ -711,9 +674,9 @@ impl PlaybackPage {
         let played_fraction = progress_fraction(position, duration);
         let playback_buffered_fraction =
             buffered_progress_fraction(self.timeline.buffered_until, position, duration);
-        let http_stream_buffered_range = http_stream_buffered_range_fractions(
-            self.timeline.http_stream_buffered_range,
+        let buffered_fraction = combined_buffered_progress_fraction(
             playback_buffered_fraction,
+            self.timeline.http_stream_buffered_range,
         );
         let current_time = format_playback_time(position);
         let duration_time = format_playback_time(duration);
@@ -762,8 +725,7 @@ impl PlaybackPage {
                 current_time,
                 duration_time,
                 played_fraction,
-                playback_buffered_fraction,
-                http_stream_buffered_range,
+                buffered_fraction,
                 cx,
             ))
             .into_any_element()

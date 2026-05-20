@@ -1,7 +1,7 @@
 use super::*;
 
+#[cfg(test)]
 const HTTP_STREAM_BUFFER_POSITION_TOLERANCE: f64 = 0.02;
-const PLAYBACK_BUFFER_POSITION_TOLERANCE_SECONDS: f64 = 0.05;
 
 pub(super) struct ProgressBarDrag;
 
@@ -44,15 +44,15 @@ pub(super) fn valid_http_stream_buffer_progress(
     })
 }
 
-pub(super) fn http_stream_buffered_range_fractions(
-    progress: Option<HttpStreamBufferProgress>,
-    continuous_until_fraction: f32,
-) -> Option<(f32, f32)> {
-    let progress = progress.and_then(valid_http_stream_buffer_progress)?;
-    let continuous_until_fraction = continuous_until_fraction.clamp(0.0, 1.0);
-    let start_fraction = (progress.start_fraction as f32).min(continuous_until_fraction);
-    let end_fraction = progress.end_fraction as f32;
-    (end_fraction > continuous_until_fraction).then_some((start_fraction, end_fraction))
+pub(super) fn combined_buffered_progress_fraction(
+    playback_buffered_fraction: f32,
+    http_stream_progress: Option<HttpStreamBufferProgress>,
+) -> f32 {
+    let playback_buffered_fraction = playback_buffered_fraction.clamp(0.0, 1.0);
+    let Some(progress) = http_stream_progress.and_then(valid_http_stream_buffer_progress) else {
+        return playback_buffered_fraction;
+    };
+    playback_buffered_fraction.max(progress.end_fraction as f32)
 }
 
 pub(super) fn clamp_playback_position(position: f64, duration: f64) -> f64 {
@@ -85,39 +85,6 @@ pub(super) fn should_apply_backend_position(
     progress_drag_position.is_none() && pending_seek_position.is_none()
 }
 
-pub(super) fn is_seek_position_buffered(
-    position: f64,
-    playback_position: Option<f64>,
-    playback_buffered_until: Option<f64>,
-    http_stream_buffered_range: Option<HttpStreamBufferProgress>,
-    duration: Option<f64>,
-) -> bool {
-    let Some(duration) = duration.and_then(valid_playback_duration) else {
-        return false;
-    };
-    let position = clamp_playback_position(position, duration);
-    let playback_position = playback_position
-        .and_then(valid_playback_time)
-        .map(|position| clamp_playback_position(position, duration))
-        .unwrap_or(position);
-
-    let playback_buffered = playback_buffered_until
-        .and_then(valid_playback_time)
-        .is_some_and(|buffered_until| {
-            let buffered_until = clamp_playback_position(buffered_until, duration);
-            position + PLAYBACK_BUFFER_POSITION_TOLERANCE_SECONDS >= playback_position
-                && position <= buffered_until + PLAYBACK_BUFFER_POSITION_TOLERANCE_SECONDS
-        });
-    let http_stream_buffered =
-        http_stream_buffered_until(http_stream_buffered_range, position, duration).is_some_and(
-            |buffered_until| {
-                position <= buffered_until + PLAYBACK_BUFFER_POSITION_TOLERANCE_SECONDS
-            },
-        );
-
-    playback_buffered || http_stream_buffered
-}
-
 #[cfg(test)]
 pub(super) fn combined_buffered_until(
     playback_buffered_until: Option<f64>,
@@ -138,6 +105,7 @@ pub(super) fn combined_buffered_until(
     }
 }
 
+#[cfg(test)]
 pub(super) fn http_stream_buffered_until(
     progress: Option<HttpStreamBufferProgress>,
     position: f64,
@@ -228,43 +196,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_seek_detects_playback_and_http_buffered_ranges() {
-        assert!(is_seek_position_buffered(
-            60.0,
-            Some(40.0),
-            Some(80.0),
-            None,
-            Some(100.0),
-        ));
-        assert!(!is_seek_position_buffered(
-            20.0,
-            Some(40.0),
-            Some(80.0),
-            None,
-            Some(100.0),
-        ));
-
-        let http_range = Some(HttpStreamBufferProgress {
-            start_fraction: 0.2,
-            end_fraction: 0.8,
-        });
-        assert!(is_seek_position_buffered(
-            30.0,
-            Some(90.0),
-            None,
-            http_range,
-            Some(100.0),
-        ));
-        assert!(!is_seek_position_buffered(
-            90.0,
-            Some(10.0),
-            None,
-            http_range,
-            Some(100.0),
-        ));
-    }
-
-    #[test]
     fn http_stream_buffer_progress_validates_and_clamps_fraction_range() {
         assert_eq!(
             valid_http_stream_buffer_progress(HttpStreamBufferProgress {
@@ -305,21 +236,17 @@ mod tests {
     }
 
     #[test]
-    fn http_stream_buffer_progress_range_fills_gap_from_continuous_cache() {
+    fn combined_buffered_progress_uses_http_end_as_continuous_extent() {
         let range = Some(HttpStreamBufferProgress {
             start_fraction: 0.4,
             end_fraction: 0.7,
         });
 
-        assert_eq!(
-            http_stream_buffered_range_fractions(range, 0.1),
-            Some((0.1, 0.7))
-        );
-        assert_eq!(
-            http_stream_buffered_range_fractions(range, 0.5),
-            Some((0.4, 0.7))
-        );
-        assert_eq!(http_stream_buffered_range_fractions(range, 0.8), None);
+        assert_eq!(combined_buffered_progress_fraction(0.1, range), 0.7);
+        assert_eq!(combined_buffered_progress_fraction(0.39, range), 0.7);
+        assert_eq!(combined_buffered_progress_fraction(0.5, range), 0.7);
+        assert_eq!(combined_buffered_progress_fraction(0.8, range), 0.8);
+        assert_eq!(combined_buffered_progress_fraction(0.8, None), 0.8);
         assert_eq!(http_stream_buffered_until(range, 10.0, 100.0), None);
     }
 

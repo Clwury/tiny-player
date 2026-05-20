@@ -199,11 +199,14 @@ pub(super) struct HttpRingCacheState {
     buffer: ByteRingBuffer,
     pub(super) base_offset: u64,
     pub(super) next_offset: u64,
+    retained_range: Option<RetainedCacheRange>,
+    active_range_kind: HttpCacheRangeKind,
+    pending_seek_range_kind: Option<(u64, HttpCacheRangeKind)>,
     reader_offset: u64,
     content_len: Option<u64>,
     pub(super) eof: bool,
     shutdown: bool,
-    restart_offset: Option<u64>,
+    restart_request: Option<CacheRestartRequest>,
     error: Option<String>,
     last_reported_stream_buffer: Option<HttpStreamBufferProgress>,
 }
@@ -232,6 +235,24 @@ enum HttpDownloadOutcome {
     Eof,
     Restart(u64),
     Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HttpCacheRangeKind {
+    Playback,
+    TailMetadataProbe,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CacheRestartRequest {
+    offset: u64,
+    range_kind: HttpCacheRangeKind,
+}
+
+struct RetainedCacheRange {
+    buffer: ByteRingBuffer,
+    base_offset: u64,
+    next_offset: u64,
 }
 
 struct ByteRingBuffer {
@@ -428,14 +449,22 @@ impl HttpRingCache {
         }
     }
 
-    fn note_reader_offset(&self, offset: u64) {
+    fn note_reader_offset(&self, offset: u64, range_kind: HttpCacheRangeKind) {
         let mut guard = self
             .shared
             .state
             .lock()
             .expect("HTTP stream cache poisoned");
-        guard.note_seek_offset(offset);
+        guard.note_seek_offset(offset, range_kind);
         self.shared.ready.notify_all();
+    }
+
+    pub(super) fn is_tail_metadata_probe_seek(&self, offset: u64) -> bool {
+        self.shared
+            .state
+            .lock()
+            .expect("HTTP stream cache poisoned")
+            .is_tail_metadata_probe_seek(offset)
     }
 
     fn content_len(&self) -> Option<u64> {
@@ -493,11 +522,14 @@ impl HttpRingCacheState {
             buffer: ByteRingBuffer::new(capacity),
             base_offset: start_offset,
             next_offset: start_offset,
+            retained_range: None,
+            active_range_kind: HttpCacheRangeKind::Playback,
+            pending_seek_range_kind: None,
             reader_offset: start_offset,
             content_len: None,
             eof: false,
             shutdown: false,
-            restart_offset: None,
+            restart_request: None,
             error: None,
             last_reported_stream_buffer: None,
         }
@@ -508,19 +540,75 @@ impl HttpRingCacheState {
         self
     }
 
+    #[cfg(test)]
     pub(super) fn restart_at(&mut self, offset: u64) {
+        self.restart_at_with_kind(offset, HttpCacheRangeKind::Playback);
+    }
+
+    pub(super) fn restart_at_with_kind(&mut self, offset: u64, range_kind: HttpCacheRangeKind) {
+        self.retain_current_range_for_tail_restart(offset, range_kind);
         self.buffer.clear();
         self.base_offset = offset;
         self.next_offset = offset;
+        self.active_range_kind = range_kind;
+        self.pending_seek_range_kind = None;
         self.reader_offset = offset;
         self.eof = false;
         self.error = None;
         self.last_reported_stream_buffer = None;
     }
 
+    fn retain_current_range_for_tail_restart(
+        &mut self,
+        offset: u64,
+        range_kind: HttpCacheRangeKind,
+    ) {
+        if range_kind != HttpCacheRangeKind::TailMetadataProbe
+            || self.active_range_kind != HttpCacheRangeKind::Playback
+        {
+            return;
+        }
+        if self.buffer.len() == 0 || (offset >= self.base_offset && offset <= self.next_offset) {
+            return;
+        }
+        if !self.content_len.is_some_and(|content_len| {
+            offset < content_len
+                && offset >= content_len.saturating_sub(HTTP_CACHE_RANGE_REQUEST_BYTES)
+        }) {
+            return;
+        }
+
+        tracing::debug!(
+            base_offset = self.base_offset,
+            next_offset = self.next_offset,
+            restart_offset = offset,
+            "retaining HTTP stream cache range across tail metadata read"
+        );
+        let capacity = self.buffer.max_capacity();
+        let buffer = std::mem::replace(&mut self.buffer, ByteRingBuffer::new(capacity));
+        self.retained_range = Some(RetainedCacheRange {
+            buffer,
+            base_offset: self.base_offset,
+            next_offset: self.next_offset,
+        });
+    }
+
     fn request_restart_at(&mut self, offset: u64) {
-        self.restart_at(offset);
-        self.restart_offset = Some(offset);
+        let range_kind = self.take_pending_seek_range_kind(offset);
+        self.restart_at_with_kind(offset, range_kind);
+        self.restart_request = Some(CacheRestartRequest { offset, range_kind });
+    }
+
+    fn take_pending_seek_range_kind(&mut self, offset: u64) -> HttpCacheRangeKind {
+        let Some((pending_offset, range_kind)) = self.pending_seek_range_kind else {
+            return HttpCacheRangeKind::Playback;
+        };
+        self.pending_seek_range_kind = None;
+        if pending_offset == offset {
+            range_kind
+        } else {
+            HttpCacheRangeKind::Playback
+        }
     }
 
     pub(super) fn append_at(&mut self, offset: u64, data: &[u8]) -> bool {
@@ -530,7 +618,7 @@ impl HttpRingCacheState {
         let mut offset = offset;
         let mut data = data;
         if offset != self.next_offset {
-            self.restart_at(offset);
+            self.restart_at_with_kind(offset, self.active_range_kind);
         }
 
         let max_capacity = self.buffer.max_capacity();
@@ -538,7 +626,7 @@ impl HttpRingCacheState {
             let trim = data.len() - max_capacity;
             offset = offset.saturating_add(trim as u64);
             data = &data[trim..];
-            self.restart_at(offset);
+            self.restart_at_with_kind(offset, self.active_range_kind);
         }
 
         self.trim_to_capacity(max_capacity.saturating_sub(data.len()));
@@ -569,15 +657,24 @@ impl HttpRingCacheState {
     }
 
     pub(super) fn copy_available(&self, offset: u64, output: &mut [u8]) -> Option<usize> {
-        if offset < self.base_offset || offset >= self.next_offset {
-            return None;
+        if let Some(read) = copy_available_from_range(
+            &self.buffer,
+            self.base_offset,
+            self.next_offset,
+            offset,
+            output,
+        ) {
+            return Some(read);
         }
-        let start = usize::try_from(offset - self.base_offset).ok()?;
-        if start >= self.buffer.len() {
-            return None;
-        }
-        let read = self.buffer.copy_at(start, output);
-        (read > 0).then_some(read)
+        self.retained_range.as_ref().and_then(|range| {
+            copy_available_from_range(
+                &range.buffer,
+                range.base_offset,
+                range.next_offset,
+                offset,
+                output,
+            )
+        })
     }
 
     pub(super) fn set_reader_offset(&mut self, offset: u64) {
@@ -585,10 +682,34 @@ impl HttpRingCacheState {
         self.trim_to_capacity(HTTP_RING_CACHE_CAPACITY);
     }
 
-    pub(super) fn note_seek_offset(&mut self, offset: u64) {
-        if offset >= self.base_offset && offset <= self.next_offset {
+    pub(super) fn note_seek_offset(&mut self, offset: u64, range_kind: HttpCacheRangeKind) {
+        self.pending_seek_range_kind = Some((offset, range_kind));
+        if range_kind == HttpCacheRangeKind::Playback
+            && offset >= self.base_offset
+            && offset <= self.next_offset
+        {
             self.set_reader_offset(offset);
         }
+    }
+
+    pub(super) fn is_tail_metadata_probe_seek(&self, offset: u64) -> bool {
+        let Some(content_len) = self.content_len else {
+            return false;
+        };
+        if offset >= content_len
+            || offset < content_len.saturating_sub(HTTP_CACHE_RANGE_REQUEST_BYTES)
+        {
+            return false;
+        }
+
+        let active_range_near_offset = self.active_range_kind == HttpCacheRangeKind::Playback
+            && self.buffer.len() > 0
+            && offset
+                <= self
+                    .next_offset
+                    .saturating_add(HTTP_CACHE_RANGE_REQUEST_BYTES)
+            && self.base_offset <= offset.saturating_add(HTTP_CACHE_RANGE_REQUEST_BYTES);
+        !active_range_near_offset
     }
 
     pub(super) fn append_capacity_from(&mut self, offset: u64) -> usize {
@@ -604,8 +725,28 @@ impl HttpRingCacheState {
             return None;
         }
 
-        let start_offset = self.base_offset.min(content_len);
-        let end_offset = self.next_offset.min(content_len).max(start_offset);
+        let mut start_offset = None;
+        let mut end_offset = None;
+        if let Some(range) = &self.retained_range {
+            extend_buffer_progress_range(
+                &mut start_offset,
+                &mut end_offset,
+                range.base_offset,
+                range.next_offset,
+                content_len,
+            );
+        }
+        if self.active_range_kind == HttpCacheRangeKind::Playback {
+            extend_buffer_progress_range(
+                &mut start_offset,
+                &mut end_offset,
+                self.base_offset,
+                self.next_offset,
+                content_len,
+            );
+        }
+        let start_offset = start_offset?;
+        let end_offset = end_offset?.max(start_offset);
         let content_len = content_len as f64;
         Some(HttpStreamBufferProgress {
             start_fraction: start_offset as f64 / content_len,
@@ -622,6 +763,40 @@ impl HttpRingCacheState {
         self.last_reported_stream_buffer = Some(progress);
         Some(progress)
     }
+}
+
+fn extend_buffer_progress_range(
+    start_offset: &mut Option<u64>,
+    end_offset: &mut Option<u64>,
+    base_offset: u64,
+    next_offset: u64,
+    content_len: u64,
+) {
+    let range_start = base_offset.min(content_len);
+    let range_end = next_offset.min(content_len).max(range_start);
+    if range_end <= range_start {
+        return;
+    }
+    *start_offset = Some(start_offset.map_or(range_start, |start| start.min(range_start)));
+    *end_offset = Some(end_offset.map_or(range_end, |end| end.max(range_end)));
+}
+
+fn copy_available_from_range(
+    buffer: &ByteRingBuffer,
+    base_offset: u64,
+    next_offset: u64,
+    offset: u64,
+    output: &mut [u8],
+) -> Option<usize> {
+    if offset < base_offset || offset >= next_offset {
+        return None;
+    }
+    let start = usize::try_from(offset - base_offset).ok()?;
+    if start >= buffer.len() {
+        return None;
+    }
+    let read = buffer.copy_at(start, output);
+    (read > 0).then_some(read)
 }
 
 fn http_ring_cache_download_loop(
@@ -699,8 +874,9 @@ impl HttpRingCacheShared {
         self.state
             .lock()
             .expect("HTTP stream cache poisoned")
-            .restart_offset
+            .restart_request
             .take()
+            .map(|request| request.offset)
     }
 
     fn set_error(&self, error: String) {
@@ -722,10 +898,10 @@ impl HttpRingCacheShared {
             if guard.shutdown || self.control.should_stop() {
                 return None;
             }
-            if let Some(next_offset) = guard.restart_offset.take() {
-                guard.restart_at(next_offset);
+            if let Some(request) = guard.restart_request.take() {
+                guard.restart_at_with_kind(request.offset, request.range_kind);
                 self.ready.notify_all();
-                return Some(next_offset);
+                return Some(request.offset);
             }
             let (next_guard, _) = self
                 .ready
@@ -756,10 +932,10 @@ impl HttpRingCacheShared {
             if guard.shutdown || self.control.should_stop() {
                 return CacheAppendPermit::Stopped;
             }
-            if let Some(next_offset) = guard.restart_offset.take() {
-                guard.restart_at(next_offset);
+            if let Some(request) = guard.restart_request.take() {
+                guard.restart_at_with_kind(request.offset, request.range_kind);
                 self.ready.notify_all();
-                return CacheAppendPermit::Restart(next_offset);
+                return CacheAppendPermit::Restart(request.offset);
             }
             let capacity = guard.append_capacity_from(offset);
             if capacity > 0 {
@@ -778,10 +954,10 @@ impl HttpRingCacheShared {
         if guard.shutdown || self.control.should_stop() {
             return CacheAppendPermit::Stopped;
         }
-        if let Some(next_offset) = guard.restart_offset.take() {
-            guard.restart_at(next_offset);
+        if let Some(request) = guard.restart_request.take() {
+            guard.restart_at_with_kind(request.offset, request.range_kind);
             self.ready.notify_all();
-            return CacheAppendPermit::Restart(next_offset);
+            return CacheAppendPermit::Restart(request.offset);
         }
         let capacity = guard.append_capacity_from(offset);
         if capacity > 0 {
@@ -797,10 +973,10 @@ impl HttpRingCacheShared {
             if guard.shutdown || self.control.should_stop() {
                 return CacheAppendResult::Stopped;
             }
-            if let Some(next_offset) = guard.restart_offset.take() {
-                guard.restart_at(next_offset);
+            if let Some(request) = guard.restart_request.take() {
+                guard.restart_at_with_kind(request.offset, request.range_kind);
                 self.ready.notify_all();
-                return CacheAppendResult::Restart(next_offset);
+                return CacheAppendResult::Restart(request.offset);
             }
             if !guard.append_at(offset, data) {
                 return CacheAppendResult::Restart(offset);
@@ -1101,6 +1277,13 @@ unsafe extern "C" fn cached_avio_seek(opaque: *mut c_void, offset: i64, whence: 
     }
     let next = next as u64;
     reader.read_pos = next;
-    reader.cache.note_reader_offset(next);
+    let range_kind = if seek_mode == ffi::SEEK_END
+        || (seek_mode == ffi::SEEK_SET && reader.cache.is_tail_metadata_probe_seek(next))
+    {
+        HttpCacheRangeKind::TailMetadataProbe
+    } else {
+        HttpCacheRangeKind::Playback
+    };
+    reader.cache.note_reader_offset(next, range_kind);
     i64::try_from(next).unwrap_or(i64::MAX)
 }
