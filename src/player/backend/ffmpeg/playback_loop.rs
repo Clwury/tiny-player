@@ -466,24 +466,16 @@ pub(super) fn run_ffmpeg_playback(
                 input.seek_stream(video_stream, position_seconds)?;
                 source.selected_tracks = pending_track_selection.selected_tracks;
 
-                video_decoder.flush_buffers();
-                if let Some(decoder) = &audio_decoder {
-                    decoder.flush_buffers();
-                }
-                if let Some(decoder) = &subtitle_decoder {
-                    decoder.flush_buffers();
-                }
-                if let Some(filter) = subtitle_filter.as_mut() {
-                    filter.flush();
-                }
-                if let Some(packet) = filtered_subtitle_packet.as_mut() {
-                    packet.unref();
-                }
-                video_frame.unref();
-                if let Some(frame) = audio_frame.as_mut() {
-                    frame.unref();
-                }
-                packet.unref();
+                flush_playback_decode_state(
+                    &video_decoder,
+                    audio_decoder.as_ref(),
+                    subtitle_decoder.as_ref(),
+                    subtitle_filter.as_mut(),
+                    filtered_subtitle_packet.as_mut(),
+                    &mut video_frame,
+                    audio_frame.as_mut(),
+                    &mut packet,
+                );
 
                 let previous_audio_output = audio_output.take();
                 audio_decoder = None;
@@ -544,21 +536,20 @@ pub(super) fn run_ffmpeg_playback(
                     stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE
                 });
 
-                video_clock = TimestampMapper::new(
-                    video_stream.start_nsecs,
+                reset_playback_timeline_state(
+                    video_stream,
+                    audio_stream,
+                    video_frame_duration_nsecs,
                     current_start_position_nsecs,
-                    Some(video_frame_duration_nsecs),
-                );
-                playback_timeline_origin_nsecs = video_stream.start_nsecs;
-                audio_clock = TimestampMapper::new(
-                    audio_stream.and_then(|stream| stream.start_nsecs),
-                    current_start_position_nsecs,
+                    &mut video_clock,
+                    &mut playback_timeline_origin_nsecs,
+                    &mut audio_clock,
+                    &mut scheduler,
                     None,
+                    &mut queued_video_frames,
+                    &mut first_video_frame_pending,
+                    &mut dovi_state,
                 );
-                scheduler.reset(current_start_position_nsecs);
-                queued_video_frames.clear();
-                first_video_frame_pending = true;
-                dovi_state.clear();
                 buffered_reporter = BufferedReporter::new(audio_output.is_some());
                 buffered_reporter.reset_to(position_seconds, current_session_id, &event_tx);
                 let _ = event_tx.send(BackendEvent::new(
@@ -611,42 +602,30 @@ pub(super) fn run_ffmpeg_playback(
                 let position_seconds = pending_seek.position_seconds.max(0.0);
                 current_start_position_nsecs = seconds_to_nsecs(position_seconds);
                 input.seek_stream(video_stream, position_seconds)?;
-                video_decoder.flush_buffers();
-                if let Some(decoder) = &audio_decoder {
-                    decoder.flush_buffers();
-                }
-                if let Some(decoder) = &subtitle_decoder {
-                    decoder.flush_buffers();
-                }
-                if let Some(filter) = subtitle_filter.as_mut() {
-                    filter.flush();
-                }
-                if let Some(packet) = filtered_subtitle_packet.as_mut() {
-                    packet.unref();
-                }
-                video_frame.unref();
-                if let Some(frame) = audio_frame.as_mut() {
-                    frame.unref();
-                }
-                packet.unref();
-                video_clock = TimestampMapper::new(
-                    video_stream.start_nsecs,
-                    current_start_position_nsecs,
-                    Some(video_frame_duration_nsecs),
+                flush_playback_decode_state(
+                    &video_decoder,
+                    audio_decoder.as_ref(),
+                    subtitle_decoder.as_ref(),
+                    subtitle_filter.as_mut(),
+                    filtered_subtitle_packet.as_mut(),
+                    &mut video_frame,
+                    audio_frame.as_mut(),
+                    &mut packet,
                 );
-                playback_timeline_origin_nsecs = video_stream.start_nsecs;
-                audio_clock = TimestampMapper::new(
-                    audio_stream.and_then(|stream| stream.start_nsecs),
+                reset_playback_timeline_state(
+                    video_stream,
+                    audio_stream,
+                    video_frame_duration_nsecs,
                     current_start_position_nsecs,
-                    None,
+                    &mut video_clock,
+                    &mut playback_timeline_origin_nsecs,
+                    &mut audio_clock,
+                    &mut scheduler,
+                    audio_output.as_ref(),
+                    &mut queued_video_frames,
+                    &mut first_video_frame_pending,
+                    &mut dovi_state,
                 );
-                scheduler.reset(current_start_position_nsecs);
-                if let Some(output) = &audio_output {
-                    output.reset_clock(current_start_position_nsecs);
-                }
-                queued_video_frames.clear();
-                first_video_frame_pending = true;
-                dovi_state.clear();
                 subtitle_cues = subtitle_cue_queue_from_external(
                     &external_subtitle_cues,
                     current_start_position_nsecs,
@@ -1217,6 +1196,72 @@ pub(super) fn run_ffmpeg_playback(
         output.drain(&control)?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_playback_decode_state(
+    video_decoder: &Decoder,
+    audio_decoder: Option<&Decoder>,
+    subtitle_decoder: Option<&Decoder>,
+    subtitle_filter: Option<&mut PgsFrameMergeBitstreamFilter>,
+    filtered_subtitle_packet: Option<&mut AvPacket>,
+    video_frame: &mut AvFrame,
+    audio_frame: Option<&mut AvFrame>,
+    packet: &mut AvPacket,
+) {
+    video_decoder.flush_buffers();
+    if let Some(decoder) = audio_decoder {
+        decoder.flush_buffers();
+    }
+    if let Some(decoder) = subtitle_decoder {
+        decoder.flush_buffers();
+    }
+    if let Some(filter) = subtitle_filter {
+        filter.flush();
+    }
+    if let Some(packet) = filtered_subtitle_packet {
+        packet.unref();
+    }
+    video_frame.unref();
+    if let Some(frame) = audio_frame {
+        frame.unref();
+    }
+    packet.unref();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reset_playback_timeline_state(
+    video_stream: StreamInfo,
+    audio_stream: Option<StreamInfo>,
+    video_frame_duration_nsecs: u64,
+    current_start_position_nsecs: u64,
+    video_clock: &mut TimestampMapper,
+    playback_timeline_origin_nsecs: &mut Option<u64>,
+    audio_clock: &mut TimestampMapper,
+    scheduler: &mut PlaybackScheduler,
+    audio_output: Option<&AudioOutput>,
+    queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
+    first_video_frame_pending: &mut bool,
+    dovi_state: &mut DoviMetadataState,
+) {
+    *video_clock = TimestampMapper::new(
+        video_stream.start_nsecs,
+        current_start_position_nsecs,
+        Some(video_frame_duration_nsecs),
+    );
+    *playback_timeline_origin_nsecs = video_stream.start_nsecs;
+    *audio_clock = TimestampMapper::new(
+        audio_stream.and_then(|stream| stream.start_nsecs),
+        current_start_position_nsecs,
+        None,
+    );
+    scheduler.reset(current_start_position_nsecs);
+    if let Some(output) = audio_output {
+        output.reset_clock(current_start_position_nsecs);
+    }
+    queued_video_frames.clear();
+    *first_video_frame_pending = true;
+    dovi_state.clear();
 }
 
 pub(super) fn playback_read_finished(
