@@ -68,7 +68,34 @@ fn dovi_metadata_from_rpu_buffer(data: &[u8]) -> anyhow::Result<Option<DoviFrame
 }
 
 #[derive(Default)]
-pub(super) struct DoviMetadataState {
+pub(super) struct DoviPipeline {
+    state: DoviMetadataState,
+}
+
+impl DoviPipeline {
+    pub(super) fn observe_video_packet(&mut self, packet: &AvPacket, stream: StreamInfo) {
+        self.state.observe_packet(packet, stream);
+    }
+
+    pub(super) fn metadata_for_decoded_frame(
+        &mut self,
+        frame: *mut ffi::AVFrame,
+        pts: FramePts,
+    ) -> Option<DoviFrameMetadata> {
+        self.state.metadata_for_frame(frame, pts)
+    }
+
+    pub(super) fn discard_frame(&mut self, pts: FramePts) {
+        self.state.discard_frame(pts);
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.state.clear();
+    }
+}
+
+#[derive(Default)]
+struct DoviMetadataState {
     queue: DoviMetadataQueue,
     last_profile5: Option<DoviFrameMetadata>,
     reused_profile5_logged: bool,

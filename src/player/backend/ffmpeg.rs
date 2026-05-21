@@ -78,7 +78,7 @@ use clock::{
     wait_for_audio_clocked_video_queue,
 };
 use codec::{AudioResampler, AvFrame, AvPacket, Decoder, VideoScaler};
-use dovi::{DoviMetadataState, ffmpeg_dovi_metadata_from_frame};
+use dovi::{DoviPipeline, ffmpeg_dovi_metadata_from_frame};
 #[cfg(test)]
 use dovi::{dovi_packet_timeline_nsecs, has_annex_b_start_code};
 use format::{FormatContext, StreamInfo};

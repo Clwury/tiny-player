@@ -1,5 +1,17 @@
 use super::*;
 
+mod commands;
+mod decode;
+mod session;
+mod subtitles;
+mod timeline;
+
+use commands::{begin_seek, begin_track_switch};
+use decode::{flush_playback_decode_state, should_drop_backlogged_vulkan_frame};
+use session::PlaybackSession;
+use subtitles::{SubtitleDecodeContext, SubtitlePipeline};
+use timeline::reset_playback_timeline_state;
+
 const END_OF_PLAYBACK_READ_ERROR_TOLERANCE_SECONDS: f64 = 2.0;
 
 struct OpenedPlaybackInput {
@@ -330,26 +342,26 @@ pub(super) fn run_ffmpeg_playback(
     command_rx: Receiver<FfmpegCommand>,
     frame_presented: Arc<AtomicBool>,
 ) -> std::result::Result<(), String> {
-    let mut current_session_id = source.session_id;
-    control.set_session_id(current_session_id);
+    let mut session = PlaybackSession::new(source.session_id, source.start_position_seconds);
+    control.set_session_id(session.id());
     let OpenedPlaybackInput {
         mut input,
         video_stream,
         video_decoder,
         mut audio_stream,
         audio_decoder: opened_audio_decoder,
-        mut subtitle_stream,
-        mut subtitle_decoder,
+        subtitle_stream,
+        subtitle_decoder,
     } = open_playback_input_with_fallback(&source, Arc::clone(&control), &event_tx)?;
     if let Some(device) = video_decoder.vulkan_device() {
-        frame_slot.request_vulkan_prewarm(current_session_id, device);
+        frame_slot.request_vulkan_prewarm(session.id(), device);
     }
     if source.start_position_seconds > 0.0 {
         input.seek_stream(video_stream, source.start_position_seconds)?;
     }
     let mut video_frame = AvFrame::new()?;
     let mut video_converter = VideoFrameConverter::new(frame_slot.buffer_pool());
-    let mut current_start_position_nsecs = seconds_to_nsecs(source.start_position_seconds);
+    let mut current_start_position_nsecs = session.start_position_nsecs();
     let video_frame_duration_nsecs = video_stream
         .frame_duration_nsecs
         .unwrap_or(DEFAULT_VIDEO_FRAME_DURATION_NSECS);
@@ -361,23 +373,13 @@ pub(super) fn run_ffmpeg_playback(
     );
     let mut scheduler = PlaybackScheduler::new(current_start_position_nsecs);
     let mut position_reporter = PositionReporter::default();
-    let mut dovi_state = DoviMetadataState::default();
-    let mut external_subtitle_cues =
-        load_external_subtitle_cue_list(&source.selected_tracks, source.http_headers.as_slice())?;
-    let mut subtitle_cues =
-        subtitle_cue_queue_from_external(&external_subtitle_cues, current_start_position_nsecs);
-    let mut active_subtitle = None;
-    let mut subtitle_filter = match subtitle_stream {
-        Some(stream) => PgsFrameMergeBitstreamFilter::new(stream)?,
-        None => None,
-    };
-    let mut needs_subtitle_prefetch = subtitle_stream
-        .is_some_and(|stream| stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE);
-    let mut filtered_subtitle_packet = if subtitle_filter.is_some() {
-        Some(AvPacket::new()?)
-    } else {
-        None
-    };
+    let mut dovi_pipeline = DoviPipeline::default();
+    let mut subtitle_pipeline = SubtitlePipeline::new(
+        subtitle_stream,
+        subtitle_decoder,
+        &source,
+        current_start_position_nsecs,
+    )?;
 
     let mut audio_output = None;
     let mut audio_decoder = None;
@@ -417,12 +419,12 @@ pub(super) fn run_ffmpeg_playback(
 
     if let Some(duration) = input.duration_seconds() {
         let _ = event_tx.send(BackendEvent::new(
-            current_session_id,
+            session.id(),
             BackendEventKind::DurationChanged(duration),
         ));
     }
     let _ = event_tx.send(BackendEvent::new(
-        current_session_id,
+        session.id(),
         BackendEventKind::PlaybackInfoChanged(playback_video_info(video_stream, &video_decoder)),
     ));
     let duration_seconds = input.duration_seconds();
@@ -433,15 +435,15 @@ pub(super) fn run_ffmpeg_playback(
     let mut first_video_frame_pending = true;
     buffered_reporter.reset_to(
         source.start_position_seconds.max(0.0),
-        current_session_id,
+        session.id(),
         &event_tx,
     );
     let _ = event_tx.send(BackendEvent::new(
-        current_session_id,
+        session.id(),
         BackendEventKind::Buffering(true),
     ));
     let _ = event_tx.send(BackendEvent::new(
-        current_session_id,
+        session.id(),
         BackendEventKind::SubtitleChanged(None),
     ));
 
@@ -456,22 +458,17 @@ pub(super) fn run_ffmpeg_playback(
         }
 
         if let Some(pending_track_selection) = drained_commands.pending_track_selection {
-            current_session_id = pending_track_selection.session_id;
-            control.set_session_id(current_session_id);
-            control.set_paused(false);
-            control.finish_seek(pending_track_selection.generation);
+            let position_seconds =
+                begin_track_switch(&mut session, &control, &pending_track_selection);
             let switch_result: std::result::Result<(), String> = (|| {
-                let position_seconds = pending_track_selection.position_seconds.max(0.0);
-                current_start_position_nsecs = seconds_to_nsecs(position_seconds);
+                current_start_position_nsecs = session.start_position_nsecs();
                 input.seek_stream(video_stream, position_seconds)?;
                 source.selected_tracks = pending_track_selection.selected_tracks;
 
                 flush_playback_decode_state(
                     &video_decoder,
                     audio_decoder.as_ref(),
-                    subtitle_decoder.as_ref(),
-                    subtitle_filter.as_mut(),
-                    filtered_subtitle_packet.as_mut(),
+                    &mut subtitle_pipeline,
                     &mut video_frame,
                     audio_frame.as_mut(),
                     &mut packet,
@@ -510,31 +507,12 @@ pub(super) fn run_ffmpeg_playback(
                     }
                 }
 
-                subtitle_stream =
-                    select_subtitle_stream_for_selection(&source.selected_tracks, &input)?;
-                subtitle_decoder =
-                    open_subtitle_decoder(subtitle_stream, video_decoder.size().ok())?;
-                subtitle_filter = match subtitle_stream {
-                    Some(stream) => PgsFrameMergeBitstreamFilter::new(stream)?,
-                    None => None,
-                };
-                filtered_subtitle_packet = if subtitle_filter.is_some() {
-                    Some(AvPacket::new()?)
-                } else {
-                    None
-                };
-                external_subtitle_cues = load_external_subtitle_cue_list(
-                    &source.selected_tracks,
-                    source.http_headers.as_slice(),
-                )?;
-                subtitle_cues = subtitle_cue_queue_from_external(
-                    &external_subtitle_cues,
+                subtitle_pipeline.switch_tracks(
+                    &source,
+                    &input,
+                    video_decoder.size().ok(),
                     current_start_position_nsecs,
-                );
-                active_subtitle = None;
-                needs_subtitle_prefetch = subtitle_stream.is_some_and(|stream| {
-                    stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE
-                });
+                )?;
 
                 reset_playback_timeline_state(
                     video_stream,
@@ -548,38 +526,36 @@ pub(super) fn run_ffmpeg_playback(
                     None,
                     &mut queued_video_frames,
                     &mut first_video_frame_pending,
-                    &mut dovi_state,
+                    &mut dovi_pipeline,
                 );
                 buffered_reporter = BufferedReporter::new(audio_output.is_some());
-                buffered_reporter.reset_to(position_seconds, current_session_id, &event_tx);
+                buffered_reporter.reset_to(position_seconds, session.id(), &event_tx);
                 let _ = event_tx.send(BackendEvent::new(
-                    current_session_id,
+                    session.id(),
                     BackendEventKind::PositionChanged(position_seconds),
                 ));
                 let _ = event_tx.send(BackendEvent::new(
-                    current_session_id,
+                    session.id(),
                     BackendEventKind::SubtitleChanged(None),
                 ));
                 if pending_track_selection.pause_after_switch {
                     control.set_paused(true);
-                    update_subtitle_overlay(
+                    subtitle_pipeline.update_overlay(
                         current_start_position_nsecs,
-                        &mut subtitle_cues,
-                        &mut active_subtitle,
-                        current_session_id,
+                        session.id(),
                         &event_tx,
                     );
                     let _ = event_tx.send(BackendEvent::new(
-                        current_session_id,
+                        session.id(),
                         BackendEventKind::Pause(true),
                     ));
                     let _ = event_tx.send(BackendEvent::new(
-                        current_session_id,
+                        session.id(),
                         BackendEventKind::Buffering(false),
                     ));
                 } else {
                     let _ = event_tx.send(BackendEvent::new(
-                        current_session_id,
+                        session.id(),
                         BackendEventKind::Buffering(true),
                     ));
                 }
@@ -594,20 +570,14 @@ pub(super) fn run_ffmpeg_playback(
         }
 
         if let Some(pending_seek) = drained_commands.pending_seek {
-            current_session_id = pending_seek.session_id;
-            control.set_session_id(current_session_id);
-            control.set_paused(false);
-            control.finish_seek(pending_seek.generation);
+            let position_seconds = begin_seek(&mut session, &control, &pending_seek);
             let seek_result: std::result::Result<(), String> = (|| {
-                let position_seconds = pending_seek.position_seconds.max(0.0);
-                current_start_position_nsecs = seconds_to_nsecs(position_seconds);
+                current_start_position_nsecs = session.start_position_nsecs();
                 input.seek_stream(video_stream, position_seconds)?;
                 flush_playback_decode_state(
                     &video_decoder,
                     audio_decoder.as_ref(),
-                    subtitle_decoder.as_ref(),
-                    subtitle_filter.as_mut(),
-                    filtered_subtitle_packet.as_mut(),
+                    &mut subtitle_pipeline,
                     &mut video_frame,
                     audio_frame.as_mut(),
                     &mut packet,
@@ -624,25 +594,21 @@ pub(super) fn run_ffmpeg_playback(
                     audio_output.as_ref(),
                     &mut queued_video_frames,
                     &mut first_video_frame_pending,
-                    &mut dovi_state,
+                    &mut dovi_pipeline,
                 );
-                subtitle_cues = subtitle_cue_queue_from_external(
-                    &external_subtitle_cues,
-                    current_start_position_nsecs,
-                );
-                active_subtitle = None;
+                subtitle_pipeline.reset_cues_for_position(current_start_position_nsecs);
                 buffered_reporter = BufferedReporter::new(audio_output.is_some());
-                buffered_reporter.reset_to(position_seconds, current_session_id, &event_tx);
+                buffered_reporter.reset_to(position_seconds, session.id(), &event_tx);
                 let _ = event_tx.send(BackendEvent::new(
-                    current_session_id,
+                    session.id(),
                     BackendEventKind::PositionChanged(position_seconds),
                 ));
                 let _ = event_tx.send(BackendEvent::new(
-                    current_session_id,
+                    session.id(),
                     BackendEventKind::Buffering(true),
                 ));
                 let _ = event_tx.send(BackendEvent::new(
-                    current_session_id,
+                    session.id(),
                     BackendEventKind::SubtitleChanged(None),
                 ));
                 Ok(())
@@ -674,24 +640,20 @@ pub(super) fn run_ffmpeg_playback(
 
         let process_result = match packet.stream_index() {
             index if index == video_decoder.stream_index => {
-                dovi_state.observe_packet(&packet, video_stream);
+                dovi_pipeline.observe_video_packet(&packet, video_stream);
                 video_decoder.decode_packet(packet.as_ptr(), &mut video_frame, |frame| {
                     if control.has_pending_seek() {
                         return Ok(());
                     }
                     let timestamp = video_clock
                         .map(frame_best_effort_timestamp(frame), video_decoder.time_base);
-                    refresh_playback_timeline_origin(
-                        &mut playback_timeline_origin_nsecs,
-                        &video_clock,
-                        subtitle_stream,
-                        &mut subtitle_cues,
-                    );
+                    subtitle_pipeline
+                        .refresh_timeline_origin(&mut playback_timeline_origin_nsecs, &video_clock);
                     let frame_pts = FramePts {
                         nsecs: timestamp.timeline_nsecs,
                     };
                     if timestamp.timeline_nsecs < current_start_position_nsecs {
-                        dovi_state.discard_frame(frame_pts);
+                        dovi_pipeline.discard_frame(frame_pts);
                         return Ok(());
                     }
 
@@ -703,7 +665,7 @@ pub(super) fn run_ffmpeg_playback(
                                 output.played_timeline_nsecs(),
                             )
                         {
-                            dovi_state.discard_frame(frame_pts);
+                            dovi_pipeline.discard_frame(frame_pts);
                             return Ok(());
                         }
                         if should_drop_backlogged_vulkan_frame(
@@ -711,26 +673,25 @@ pub(super) fn run_ffmpeg_playback(
                             first_video_frame_pending,
                             &frame_slot,
                         ) {
-                            dovi_state.discard_frame(frame_pts);
+                            dovi_pipeline.discard_frame(frame_pts);
                             return Ok(());
                         }
 
-                        let dovi_metadata = dovi_state.metadata_for_frame(frame, frame_pts);
+                        let dovi_metadata =
+                            dovi_pipeline.metadata_for_decoded_frame(frame, frame_pts);
                         let mut decoded_frame =
                             video_converter.convert(&video_decoder, frame, dovi_metadata)?;
                         decoded_frame.pts = Some(frame_pts);
-                        update_subtitle_overlay_from_audio_clock(
+                        subtitle_pipeline.update_overlay_from_audio_clock(
                             output,
-                            &mut subtitle_cues,
-                            &mut active_subtitle,
-                            current_session_id,
+                            session.id(),
                             &event_tx,
                         );
 
                         if first_video_frame_pending {
                             present_decoded_video_frame(
                                 decoded_frame,
-                                current_session_id,
+                                session.id(),
                                 timestamp.timeline_nsecs,
                                 &frame_slot,
                                 &frame_presented,
@@ -741,7 +702,7 @@ pub(super) fn run_ffmpeg_playback(
                                 timestamp
                                     .timeline_nsecs
                                     .saturating_add(video_frame_duration_nsecs),
-                                current_session_id,
+                                session.id(),
                                 &event_tx,
                             );
                             first_video_frame_pending = false;
@@ -755,51 +716,43 @@ pub(super) fn run_ffmpeg_playback(
                             timestamp
                                 .timeline_nsecs
                                 .saturating_add(video_frame_duration_nsecs),
-                            current_session_id,
+                            session.id(),
                             &event_tx,
                         );
                         let played_until = present_due_audio_clocked_video_frames(
                             &mut queued_video_frames,
                             output,
-                            current_session_id,
+                            session.id(),
                             &frame_slot,
                             &frame_presented,
                             &mut position_reporter,
                             &event_tx,
                         );
-                        update_subtitle_overlay(
-                            played_until,
-                            &mut subtitle_cues,
-                            &mut active_subtitle,
-                            current_session_id,
-                            &event_tx,
-                        );
+                        subtitle_pipeline.update_overlay(played_until, session.id(), &event_tx);
                         if queued_video_duration(&queued_video_frames)
                             >= queued_video_limit_duration(
                                 &queued_video_frames,
-                                needs_subtitle_prefetch,
+                                subtitle_pipeline.needs_prefetch(),
                             )
                         {
                             let target_duration = queued_video_target_duration(
                                 &queued_video_frames,
-                                needs_subtitle_prefetch,
+                                subtitle_pipeline.needs_prefetch(),
                             );
                             wait_for_audio_clocked_video_queue(
                                 &mut queued_video_frames,
                                 output,
                                 &control,
-                                current_session_id,
+                                session.id(),
                                 &frame_slot,
                                 &frame_presented,
                                 &mut position_reporter,
                                 &event_tx,
                                 target_duration,
                                 |played_until| {
-                                    update_subtitle_overlay(
+                                    subtitle_pipeline.update_overlay(
                                         played_until,
-                                        &mut subtitle_cues,
-                                        &mut active_subtitle,
-                                        current_session_id,
+                                        session.id(),
                                         &event_tx,
                                     );
                                 },
@@ -811,18 +764,17 @@ pub(super) fn run_ffmpeg_playback(
                             first_video_frame_pending,
                             &frame_slot,
                         ) {
-                            dovi_state.discard_frame(frame_pts);
+                            dovi_pipeline.discard_frame(frame_pts);
                             return Ok(());
                         }
-                        let dovi_metadata = dovi_state.metadata_for_frame(frame, frame_pts);
+                        let dovi_metadata =
+                            dovi_pipeline.metadata_for_decoded_frame(frame, frame_pts);
                         let mut decoded_frame =
                             video_converter.convert(&video_decoder, frame, dovi_metadata)?;
                         decoded_frame.pts = Some(frame_pts);
-                        update_subtitle_overlay(
+                        subtitle_pipeline.update_overlay(
                             timestamp.timeline_nsecs,
-                            &mut subtitle_cues,
-                            &mut active_subtitle,
-                            current_session_id,
+                            session.id(),
                             &event_tx,
                         );
 
@@ -838,7 +790,7 @@ pub(super) fn run_ffmpeg_playback(
                         }
                         present_decoded_video_frame(
                             decoded_frame,
-                            current_session_id,
+                            session.id(),
                             timestamp.timeline_nsecs,
                             &frame_slot,
                             &frame_presented,
@@ -849,74 +801,25 @@ pub(super) fn run_ffmpeg_playback(
                             timestamp
                                 .timeline_nsecs
                                 .saturating_add(video_frame_duration_nsecs),
-                            current_session_id,
+                            session.id(),
                             &event_tx,
                         );
                     }
                     Ok(())
                 })
             }
-            index
-                if subtitle_decoder
-                    .as_ref()
-                    .is_some_and(|decoder| index == decoder.stream_index) =>
-            {
-                let decoder = subtitle_decoder
-                    .as_ref()
-                    .expect("subtitle decoder checked above");
-                let stream = subtitle_stream.expect("subtitle stream exists with decoder");
-                if let Some(filter) = subtitle_filter.as_mut() {
-                    filter.send_packet(packet.as_mut_ptr())?;
-                    let filtered_packet = filtered_subtitle_packet
-                        .as_mut()
-                        .expect("filtered subtitle packet exists with subtitle filter");
-                    loop {
-                        if !filter.receive_packet(filtered_packet)? {
-                            break;
-                        }
-                        decode_subtitle_packet_into_queue(
-                            decoder,
-                            stream,
-                            filtered_packet,
-                            current_start_position_nsecs,
-                            playback_timeline_origin_nsecs,
-                            &mut subtitle_cues,
-                            &control,
-                        )?;
-                        if let Some(output) = audio_output.as_ref() {
-                            update_subtitle_overlay_from_audio_clock(
-                                output,
-                                &mut subtitle_cues,
-                                &mut active_subtitle,
-                                current_session_id,
-                                &event_tx,
-                            );
-                        }
-                        filtered_packet.unref();
-                    }
-                    Ok(())
-                } else {
-                    decode_subtitle_packet_into_queue(
-                        decoder,
-                        stream,
-                        &packet,
+            index if subtitle_pipeline.matches_stream_index(index) => subtitle_pipeline
+                .decode_packet(
+                    &mut packet,
+                    SubtitleDecodeContext {
                         current_start_position_nsecs,
                         playback_timeline_origin_nsecs,
-                        &mut subtitle_cues,
-                        &control,
-                    )?;
-                    if let Some(output) = audio_output.as_ref() {
-                        update_subtitle_overlay_from_audio_clock(
-                            output,
-                            &mut subtitle_cues,
-                            &mut active_subtitle,
-                            current_session_id,
-                            &event_tx,
-                        );
-                    }
-                    Ok(())
-                }
-            }
+                        control: &control,
+                        audio_output: audio_output.as_ref(),
+                        session_id: session.id(),
+                        event_tx: &event_tx,
+                    },
+                ),
             index
                 if audio_decoder
                     .as_ref()
@@ -952,24 +855,18 @@ pub(super) fn run_ffmpeg_playback(
                             let played_until = present_due_audio_clocked_video_frames(
                                 &mut queued_video_frames,
                                 output,
-                                current_session_id,
+                                session.id(),
                                 &frame_slot,
                                 &frame_presented,
                                 &mut position_reporter,
                                 &event_tx,
                             );
-                            update_subtitle_overlay(
-                                played_until,
-                                &mut subtitle_cues,
-                                &mut active_subtitle,
-                                current_session_id,
-                                &event_tx,
-                            );
+                            subtitle_pipeline.update_overlay(played_until, session.id(), &event_tx);
                             Ok(())
                         })?;
                         buffered_reporter.report_audio_timeline_nsecs(
                             buffered_until_nsecs,
-                            current_session_id,
+                            session.id(),
                             &event_tx,
                         );
                     }
@@ -997,12 +894,8 @@ pub(super) fn run_ffmpeg_playback(
     video_decoder.flush(&mut video_frame, |frame| {
         let timestamp =
             video_clock.map(frame_best_effort_timestamp(frame), video_decoder.time_base);
-        refresh_playback_timeline_origin(
-            &mut playback_timeline_origin_nsecs,
-            &video_clock,
-            subtitle_stream,
-            &mut subtitle_cues,
-        );
+        subtitle_pipeline
+            .refresh_timeline_origin(&mut playback_timeline_origin_nsecs, &video_clock);
         if timestamp.timeline_nsecs < current_start_position_nsecs {
             return Ok(());
         }
@@ -1017,30 +910,24 @@ pub(super) fn run_ffmpeg_playback(
                     output.played_timeline_nsecs(),
                 )
             {
-                dovi_state.discard_frame(frame_pts);
+                dovi_pipeline.discard_frame(frame_pts);
                 return Ok(());
             }
             if should_drop_backlogged_vulkan_frame(frame, first_video_frame_pending, &frame_slot) {
-                dovi_state.discard_frame(frame_pts);
+                dovi_pipeline.discard_frame(frame_pts);
                 return Ok(());
             }
 
-            let dovi_metadata = dovi_state.metadata_for_frame(frame, frame_pts);
+            let dovi_metadata = dovi_pipeline.metadata_for_decoded_frame(frame, frame_pts);
             let mut decoded_frame =
                 video_converter.convert(&video_decoder, frame, dovi_metadata)?;
             decoded_frame.pts = Some(frame_pts);
-            update_subtitle_overlay_from_audio_clock(
-                output,
-                &mut subtitle_cues,
-                &mut active_subtitle,
-                current_session_id,
-                &event_tx,
-            );
+            subtitle_pipeline.update_overlay_from_audio_clock(output, session.id(), &event_tx);
 
             if first_video_frame_pending {
                 present_decoded_video_frame(
                     decoded_frame,
-                    current_session_id,
+                    session.id(),
                     timestamp.timeline_nsecs,
                     &frame_slot,
                     &frame_presented,
@@ -1051,7 +938,7 @@ pub(super) fn run_ffmpeg_playback(
                     timestamp
                         .timeline_nsecs
                         .saturating_add(video_frame_duration_nsecs),
-                    current_session_id,
+                    session.id(),
                     &event_tx,
                 );
                 first_video_frame_pending = false;
@@ -1065,41 +952,29 @@ pub(super) fn run_ffmpeg_playback(
                 timestamp
                     .timeline_nsecs
                     .saturating_add(video_frame_duration_nsecs),
-                current_session_id,
+                session.id(),
                 &event_tx,
             );
             let played_until = present_due_audio_clocked_video_frames(
                 &mut queued_video_frames,
                 output,
-                current_session_id,
+                session.id(),
                 &frame_slot,
                 &frame_presented,
                 &mut position_reporter,
                 &event_tx,
             );
-            update_subtitle_overlay(
-                played_until,
-                &mut subtitle_cues,
-                &mut active_subtitle,
-                current_session_id,
-                &event_tx,
-            );
+            subtitle_pipeline.update_overlay(played_until, session.id(), &event_tx);
         } else {
             if should_drop_backlogged_vulkan_frame(frame, first_video_frame_pending, &frame_slot) {
-                dovi_state.discard_frame(frame_pts);
+                dovi_pipeline.discard_frame(frame_pts);
                 return Ok(());
             }
-            let dovi_metadata = dovi_state.metadata_for_frame(frame, frame_pts);
+            let dovi_metadata = dovi_pipeline.metadata_for_decoded_frame(frame, frame_pts);
             let mut decoded_frame =
                 video_converter.convert(&video_decoder, frame, dovi_metadata)?;
             decoded_frame.pts = Some(frame_pts);
-            update_subtitle_overlay(
-                timestamp.timeline_nsecs,
-                &mut subtitle_cues,
-                &mut active_subtitle,
-                current_session_id,
-                &event_tx,
-            );
+            subtitle_pipeline.update_overlay(timestamp.timeline_nsecs, session.id(), &event_tx);
 
             first_video_frame_pending = false;
             if scheduler
@@ -1110,7 +985,7 @@ pub(super) fn run_ffmpeg_playback(
             }
             present_decoded_video_frame(
                 decoded_frame,
-                current_session_id,
+                session.id(),
                 timestamp.timeline_nsecs,
                 &frame_slot,
                 &frame_presented,
@@ -1121,7 +996,7 @@ pub(super) fn run_ffmpeg_playback(
                 timestamp
                     .timeline_nsecs
                     .saturating_add(video_frame_duration_nsecs),
-                current_session_id,
+                session.id(),
                 &event_tx,
             );
         }
@@ -1147,24 +1022,18 @@ pub(super) fn run_ffmpeg_playback(
                     let played_until = present_due_audio_clocked_video_frames(
                         &mut queued_video_frames,
                         output,
-                        current_session_id,
+                        session.id(),
                         &frame_slot,
                         &frame_presented,
                         &mut position_reporter,
                         &event_tx,
                     );
-                    update_subtitle_overlay(
-                        played_until,
-                        &mut subtitle_cues,
-                        &mut active_subtitle,
-                        current_session_id,
-                        &event_tx,
-                    );
+                    subtitle_pipeline.update_overlay(played_until, session.id(), &event_tx);
                     Ok(())
                 })?;
                 buffered_reporter.report_audio_timeline_nsecs(
                     buffered_until_nsecs,
-                    current_session_id,
+                    session.id(),
                     &event_tx,
                 );
             }
@@ -1172,96 +1041,24 @@ pub(super) fn run_ffmpeg_playback(
         })?;
     }
 
-    buffered_reporter.report_value(duration_seconds, current_session_id, &event_tx);
+    buffered_reporter.report_value(duration_seconds, session.id(), &event_tx);
     if let Some(output) = &audio_output {
         drain_audio_clocked_video_queue(
             &mut queued_video_frames,
             output,
             &control,
-            current_session_id,
+            session.id(),
             &frame_slot,
             &frame_presented,
             &mut position_reporter,
             &event_tx,
             |played_until| {
-                update_subtitle_overlay(
-                    played_until,
-                    &mut subtitle_cues,
-                    &mut active_subtitle,
-                    current_session_id,
-                    &event_tx,
-                );
+                subtitle_pipeline.update_overlay(played_until, session.id(), &event_tx);
             },
         )?;
         output.drain(&control)?;
     }
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn flush_playback_decode_state(
-    video_decoder: &Decoder,
-    audio_decoder: Option<&Decoder>,
-    subtitle_decoder: Option<&Decoder>,
-    subtitle_filter: Option<&mut PgsFrameMergeBitstreamFilter>,
-    filtered_subtitle_packet: Option<&mut AvPacket>,
-    video_frame: &mut AvFrame,
-    audio_frame: Option<&mut AvFrame>,
-    packet: &mut AvPacket,
-) {
-    video_decoder.flush_buffers();
-    if let Some(decoder) = audio_decoder {
-        decoder.flush_buffers();
-    }
-    if let Some(decoder) = subtitle_decoder {
-        decoder.flush_buffers();
-    }
-    if let Some(filter) = subtitle_filter {
-        filter.flush();
-    }
-    if let Some(packet) = filtered_subtitle_packet {
-        packet.unref();
-    }
-    video_frame.unref();
-    if let Some(frame) = audio_frame {
-        frame.unref();
-    }
-    packet.unref();
-}
-
-#[allow(clippy::too_many_arguments)]
-fn reset_playback_timeline_state(
-    video_stream: StreamInfo,
-    audio_stream: Option<StreamInfo>,
-    video_frame_duration_nsecs: u64,
-    current_start_position_nsecs: u64,
-    video_clock: &mut TimestampMapper,
-    playback_timeline_origin_nsecs: &mut Option<u64>,
-    audio_clock: &mut TimestampMapper,
-    scheduler: &mut PlaybackScheduler,
-    audio_output: Option<&AudioOutput>,
-    queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
-    first_video_frame_pending: &mut bool,
-    dovi_state: &mut DoviMetadataState,
-) {
-    *video_clock = TimestampMapper::new(
-        video_stream.start_nsecs,
-        current_start_position_nsecs,
-        Some(video_frame_duration_nsecs),
-    );
-    *playback_timeline_origin_nsecs = video_stream.start_nsecs;
-    *audio_clock = TimestampMapper::new(
-        audio_stream.and_then(|stream| stream.start_nsecs),
-        current_start_position_nsecs,
-        None,
-    );
-    scheduler.reset(current_start_position_nsecs);
-    if let Some(output) = audio_output {
-        output.reset_clock(current_start_position_nsecs);
-    }
-    queued_video_frames.clear();
-    *first_video_frame_pending = true;
-    dovi_state.clear();
 }
 
 pub(super) fn playback_read_finished(
@@ -1289,18 +1086,6 @@ fn playback_buffered_near_duration(
 
     duration_seconds > 0.0
         && buffered_until_seconds + END_OF_PLAYBACK_READ_ERROR_TOLERANCE_SECONDS >= duration_seconds
-}
-
-fn should_drop_backlogged_vulkan_frame(
-    frame: *const ffi::AVFrame,
-    first_video_frame_pending: bool,
-    frame_slot: &FrameSlot,
-) -> bool {
-    if first_video_frame_pending || !is_vulkan_frame(frame) {
-        return false;
-    }
-    let key_frame = unsafe { (*frame).flags & ffi::AV_FRAME_FLAG_KEY != 0 };
-    !key_frame && frame_slot.render_backpressure().should_drop_non_key_frame()
 }
 
 fn push_subtitle_cue(cues: &mut VecDeque<BackendSubtitleCue>, cue: BackendSubtitleCue) {
@@ -1515,22 +1300,6 @@ pub(super) fn subtitle_timestamp_to_timeline_nsecs(
     stream_start_nsecs: Option<u64>,
 ) -> u64 {
     timestamp_nsecs.saturating_sub(stream_start_nsecs.unwrap_or(0))
-}
-
-fn update_subtitle_overlay_from_audio_clock(
-    audio_output: &AudioOutput,
-    cues: &mut VecDeque<BackendSubtitleCue>,
-    active: &mut Option<BackendSubtitleCue>,
-    session_id: PlaybackSessionId,
-    event_tx: &Sender<BackendEvent>,
-) {
-    update_subtitle_overlay(
-        audio_output.played_timeline_nsecs(),
-        cues,
-        active,
-        session_id,
-        event_tx,
-    );
 }
 
 fn update_subtitle_overlay(
