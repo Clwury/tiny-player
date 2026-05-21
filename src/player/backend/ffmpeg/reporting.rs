@@ -125,6 +125,16 @@ impl BufferedReporter {
         self.report_value(Some(buffered_until), session_id, event_tx);
     }
 
+    pub(super) fn buffered_until(&self) -> Option<f64> {
+        if self.needs_audio {
+            self.video_buffered_until
+                .zip(self.audio_buffered_until)
+                .map(|(video, audio)| video.min(audio))
+        } else {
+            self.video_buffered_until
+        }
+    }
+
     pub(super) fn report_value(
         &mut self,
         buffered_until: Option<f64>,

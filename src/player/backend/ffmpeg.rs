@@ -317,8 +317,14 @@ impl FfmpegBackend {
             if event.session_id != self.current_session_id {
                 continue;
             }
-            if let BackendEventKind::Pause(paused) = &event.kind {
-                self.paused = *paused;
+            match &event.kind {
+                BackendEventKind::Pause(paused) => {
+                    self.paused = *paused;
+                }
+                BackendEventKind::PlaybackEnded => {
+                    self.paused = true;
+                }
+                _ => {}
             }
             events.push(event);
         }

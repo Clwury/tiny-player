@@ -133,11 +133,14 @@ impl PlaybackPage {
     }
 
     fn can_toggle_playback(&self) -> bool {
-        self.timeline.loaded && self.error_message.is_none()
+        self.timeline.loaded && !self.timeline.ended && self.error_message.is_none()
     }
 
     fn can_seek_playback(&self) -> bool {
-        self.timeline.loaded && self.error_message.is_none() && self.timeline.duration.is_some()
+        self.timeline.loaded
+            && !self.timeline.ended
+            && self.error_message.is_none()
+            && self.timeline.duration.is_some()
     }
 
     fn back_to_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -153,6 +156,57 @@ impl PlaybackPage {
     ) {
         cx.stop_propagation();
         self.back_to_detail(window, cx);
+    }
+
+    fn toggle_playback_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_fullscreen_controls();
+        window.toggle_fullscreen();
+        cx.notify();
+    }
+
+    fn handle_surface_left_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        if self.close_track_select(cx) {
+            return;
+        }
+        if event.click_count == 2 {
+            self.toggle_playback_fullscreen(window, cx);
+        }
+    }
+
+    fn handle_surface_right_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        if self.close_track_select(cx) {
+            return;
+        }
+        if event.click_count == 1 {
+            self.toggle_playback_pause_command(cx);
+        }
+    }
+
+    fn handle_surface_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !window.is_fullscreen() && event.dragging() {
+            cx.stop_propagation();
+            window.start_window_move();
+            return;
+        }
+
+        self.handle_mouse_move(event, window, cx);
     }
 
     fn replace_visible_frame(
@@ -206,6 +260,28 @@ impl PlaybackPage {
             .clone()
             .unwrap_or_else(|| self.status_message.clone())
     }
+
+    fn render_mouse_capture(&self, is_fullscreen: bool, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .id("playback-mouse-capture")
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(Self::handle_surface_left_mouse_down),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(Self::handle_surface_right_mouse_down),
+            )
+            .on_mouse_move(cx.listener(Self::handle_surface_mouse_move))
+            .when(is_fullscreen && !self.fullscreen.cursor_visible, |this| {
+                this.cursor(CursorStyle::None)
+            })
+    }
 }
 
 impl Render for PlaybackPage {
@@ -248,6 +324,7 @@ impl Render for PlaybackPage {
             has_backend: self.video.owner().is_some(),
             has_video_presenter: self.video.dependent().is_some(),
             has_loaded_file: self.timeline.loaded,
+            playback_ended: self.timeline.ended,
             has_error: self.error_message.is_some(),
             has_viewport,
             has_visible_frame: current_frame.is_some(),
@@ -292,23 +369,9 @@ impl Render for PlaybackPage {
                 )
             })
             .child(viewport_observer)
+            .child(self.render_mouse_capture(is_fullscreen, cx))
             .when(self.playback_info_overlay_visible, |this| {
                 this.child(self.render_playback_info_overlay(cx))
-            })
-            .when(is_fullscreen, |this| {
-                this.child(
-                    div()
-                        .id("playback-fullscreen-mouse-capture")
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
-                        .left_0()
-                        .on_mouse_move(cx.listener(Self::handle_mouse_move))
-                        .when(!self.fullscreen.cursor_visible, |this| {
-                            this.cursor(CursorStyle::None)
-                        }),
-                )
             })
             .child(self.render_subtitle_overlay(progress_bar_visible))
             .when(progress_bar_visible, |this| {

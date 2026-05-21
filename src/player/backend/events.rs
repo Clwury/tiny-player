@@ -85,6 +85,7 @@ impl BackendEvent {
 #[derive(Debug)]
 pub enum BackendEventKind {
     Pause(bool),
+    PlaybackEnded,
     PlaybackRestart,
     PlaybackInfoChanged(Option<PlaybackVideoInfo>),
     VideoSizeChanged(Option<RenderSize>),

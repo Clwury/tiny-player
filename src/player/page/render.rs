@@ -72,6 +72,7 @@ pub(super) struct AnimationFrameRequestState {
     pub(super) has_backend: bool,
     pub(super) has_video_presenter: bool,
     pub(super) has_loaded_file: bool,
+    pub(super) playback_ended: bool,
     pub(super) has_error: bool,
     pub(super) has_viewport: bool,
     pub(super) has_visible_frame: bool,
@@ -84,6 +85,7 @@ pub(super) fn should_request_animation_frame(state: AnimationFrameRequestState) 
     state.has_backend
         && state.has_video_presenter
         && !state.has_error
+        && !state.playback_ended
         && (!state.has_loaded_file
             || state.playback_buffering
             || state.pending_seek
@@ -292,6 +294,17 @@ mod tests {
     }
 
     #[test]
+    fn should_request_animation_frame_stops_after_playback_ends() {
+        assert!(!should_request_animation_frame(
+            AnimationFrameRequestState {
+                has_visible_frame: false,
+                playback_ended: true,
+                ..animation_frame_request_state()
+            }
+        ));
+    }
+
+    #[test]
     fn should_request_animation_frame_requires_unpaused_loaded_video_with_viewport() {
         assert!(should_request_animation_frame(AnimationFrameRequestState {
             playback_paused: false,
@@ -340,6 +353,7 @@ mod tests {
             has_backend: true,
             has_video_presenter: true,
             has_loaded_file: true,
+            playback_ended: false,
             has_error: false,
             has_viewport: true,
             has_visible_frame: true,

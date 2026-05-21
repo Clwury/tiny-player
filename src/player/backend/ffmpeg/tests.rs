@@ -2,8 +2,9 @@ use super::avio::HttpCacheRangeKind;
 use super::worker::PendingSeek;
 use super::*;
 use playback_loop::{
-    initial_probe_profile, rebase_subtitle_cues_to_timeline_origin, subtitle_cue_timeline_nsecs,
-    subtitle_timestamp_to_timeline_nsecs, trim_overlapping_subtitle_cues_at,
+    initial_probe_profile, playback_read_finished, rebase_subtitle_cues_to_timeline_origin,
+    subtitle_cue_timeline_nsecs, subtitle_timestamp_to_timeline_nsecs,
+    trim_overlapping_subtitle_cues_at,
 };
 
 #[test]
@@ -35,6 +36,30 @@ fn ffmpeg_control_tracks_seek_generations() {
     assert!(control.has_pending_seek());
     control.finish_seek(second);
     assert!(!control.has_pending_seek());
+}
+
+#[test]
+fn playback_read_finished_treats_eio_near_duration_as_end() {
+    assert!(playback_read_finished(
+        ffi::AVERROR_EOF,
+        Some(120.0),
+        Some(1.0)
+    ));
+    assert!(playback_read_finished(
+        ffi::AVERROR(ffi::EIO),
+        Some(120.0),
+        Some(119.0)
+    ));
+    assert!(!playback_read_finished(
+        ffi::AVERROR(ffi::EIO),
+        Some(120.0),
+        Some(80.0)
+    ));
+    assert!(!playback_read_finished(
+        ffi::AVERROR(ffi::EIO),
+        None,
+        Some(119.0)
+    ));
 }
 
 #[test]

@@ -26,6 +26,7 @@ impl PlaybackPage {
         match event.kind {
             BackendEventKind::PlaybackRestart => {
                 self.timeline.loaded = true;
+                self.timeline.ended = false;
                 self.timeline.paused = false;
                 self.timeline.buffering = false;
                 self.timeline.pending_seek_position = None;
@@ -46,6 +47,9 @@ impl PlaybackPage {
                     window,
                     cx,
                 );
+            }
+            BackendEventKind::PlaybackEnded => {
+                self.finish_playback(window, cx);
             }
             BackendEventKind::Pause(paused) => {
                 self.timeline.paused = paused;
@@ -113,6 +117,28 @@ impl PlaybackPage {
         }
     }
 
+    fn finish_playback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.timeline.loaded = true;
+        self.timeline.ended = true;
+        self.timeline.paused = true;
+        self.timeline.buffering = false;
+        self.timeline.pending_seek_position = None;
+        self.timeline.pending_seek_keeps_frame = false;
+        self.timeline.progress_drag_position = None;
+        if let Some(duration) = self.timeline.duration {
+            self.timeline.position = Some(duration);
+            self.timeline.buffered_until = Some(duration);
+        }
+        self.timeline.http_stream_buffered_range = None;
+        self.tracks.open = None;
+        self.frame.source_size = None;
+        self.playback_info = None;
+        self.status_message = "".into();
+        self.error_message = None;
+        defer_drop_subtitle(self.subtitle.active.take(), window);
+        self.clear_visible_frame(window, cx);
+    }
+
     fn reset_after_backend_failure(
         &mut self,
         message: SharedString,
@@ -120,6 +146,7 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         self.timeline.loaded = false;
+        self.timeline.ended = false;
         self.frame.source_size = None;
         self.playback_info = None;
         self.timeline.paused = true;

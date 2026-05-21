@@ -1,6 +1,8 @@
 use super::fullscreen::{PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX, PLAYBACK_PROGRESS_BAR_HEIGHT_PX};
 use super::*;
 
+const TRACK_SELECT_MENU_MAX_HEIGHT_PX: f32 = 260.0;
+
 #[derive(Clone, Copy)]
 struct PlaybackControlsRenderState {
     can_toggle_playback: bool,
@@ -19,7 +21,26 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
+        self.close_track_select(cx);
         self.toggle_playback_pause_command(cx);
+    }
+
+    pub(super) fn close_track_select(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = self.tracks.open.take().is_some();
+        if closed {
+            cx.notify();
+        }
+        closed
+    }
+
+    fn close_track_select_on_mouse_down(
+        &mut self,
+        _: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_track_select(cx);
+        cx.stop_propagation();
     }
 
     pub(super) fn toggle_playback_pause_command(&mut self, cx: &mut Context<Self>) {
@@ -157,6 +178,10 @@ impl PlaybackPage {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.close_track_select(cx) {
+            cx.stop_propagation();
+            return;
+        }
         self.update_progress_drag(event.position.x, cx);
         cx.stop_propagation();
     }
@@ -234,6 +259,7 @@ impl PlaybackPage {
             .map(|duration| clamp_playback_position(position, duration))
             .unwrap_or(position);
         self.timeline.progress_drag_position = None;
+        self.timeline.ended = false;
         self.timeline.position = Some(position);
         self.timeline.buffered_until = self
             .timeline
@@ -380,16 +406,17 @@ impl PlaybackPage {
                     .id(id)
                     .absolute()
                     .right_0()
-                    .bottom(px(38.0))
+                    .bottom(px(32.0))
                     .flex()
                     .flex_col()
                     .min_w(px(190.0))
                     .max_w(px(280.0))
+                    .max_h(px(TRACK_SELECT_MENU_MAX_HEIGHT_PX))
+                    .overflow_y_scroll()
                     .rounded(px(8.0))
                     .border_1()
                     .border_color(theme.input_border.opacity(0.62))
                     .bg(rgba(0x000000dd))
-                    .py_1()
                     .shadow_lg()
                     .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -448,6 +475,7 @@ impl PlaybackPage {
             .justify_center()
             .rounded_md()
             .hover(move |style| style.bg(theme.secondary_hover))
+            .occlude()
             .child(
                 svg()
                     .path("icons/chevron-left.svg")
@@ -455,7 +483,14 @@ impl PlaybackPage {
                     .text_color(theme.foreground),
             )
             .on_mouse_down(MouseButton::Left, cx.listener(Self::press_back_button))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(Self::close_track_select_on_mouse_down),
+            )
             .on_mouse_up(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_up(MouseButton::Right, |_, _, cx| {
                 cx.stop_propagation();
             })
     }
@@ -717,6 +752,14 @@ impl PlaybackPage {
             .px_4()
             .shadow_lg()
             .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(Self::close_track_select_on_mouse_down),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(Self::close_track_select_on_mouse_down),
+            )
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .text_xs()
             .text_color(theme.foreground.opacity(0.86))
@@ -784,7 +827,9 @@ pub(super) fn track_select_option(
     let theme = theme::get(cx);
     div()
         .flex()
+        .flex_none()
         .h(px(32.0))
+        .min_h(px(32.0))
         .items_center()
         .justify_between()
         .gap_3()

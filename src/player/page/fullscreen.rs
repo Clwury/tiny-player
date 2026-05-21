@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) const PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX: f32 = 24.0;
 pub(super) const PLAYBACK_PROGRESS_BAR_HEIGHT_PX: f32 = 94.0;
-const FULLSCREEN_CONTROLS_HIDE_DELAY: Duration = Duration::from_secs(1);
+const FULLSCREEN_CONTROLS_HIDE_DELAY: Duration = Duration::from_millis(500);
 const FULLSCREEN_CONTROLS_HOT_ZONE_FRACTION: f32 = 0.5;
 
 impl PlaybackPage {

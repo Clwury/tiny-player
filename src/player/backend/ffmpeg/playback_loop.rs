@@ -1,5 +1,7 @@
 use super::*;
 
+const END_OF_PLAYBACK_READ_ERROR_TOLERANCE_SECONDS: f64 = 2.0;
+
 struct OpenedPlaybackInput {
     input: FormatContext,
     video_stream: StreamInfo,
@@ -511,7 +513,7 @@ pub(super) fn run_ffmpeg_playback(
         }
 
         let read = unsafe { ffi::av_read_frame(input.as_mut_ptr(), packet.as_mut_ptr()) };
-        if read == ffi::AVERROR_EOF {
+        if playback_read_finished(read, duration_seconds, buffered_reporter.buffered_until()) {
             break;
         }
         if read < 0 {
@@ -1046,6 +1048,33 @@ pub(super) fn run_ffmpeg_playback(
         output.drain(&control)?;
     }
     Ok(())
+}
+
+pub(super) fn playback_read_finished(
+    read_result: c_int,
+    duration_seconds: Option<f64>,
+    buffered_until_seconds: Option<f64>,
+) -> bool {
+    read_result == ffi::AVERROR_EOF
+        || (read_result == ffi::AVERROR(ffi::EIO)
+            && playback_buffered_near_duration(duration_seconds, buffered_until_seconds))
+}
+
+fn playback_buffered_near_duration(
+    duration_seconds: Option<f64>,
+    buffered_until_seconds: Option<f64>,
+) -> bool {
+    let Some(duration_seconds) = duration_seconds.filter(|duration| duration.is_finite()) else {
+        return false;
+    };
+    let Some(buffered_until_seconds) =
+        buffered_until_seconds.filter(|buffered_until| buffered_until.is_finite())
+    else {
+        return false;
+    };
+
+    duration_seconds > 0.0
+        && buffered_until_seconds + END_OF_PLAYBACK_READ_ERROR_TOLERANCE_SECONDS >= duration_seconds
 }
 
 fn should_drop_backlogged_vulkan_frame(

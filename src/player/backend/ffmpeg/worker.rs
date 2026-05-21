@@ -173,7 +173,7 @@ impl FfmpegWorker {
                     Ok(()) => {
                         let _ = event_tx.send(BackendEvent::new(
                             event_session_id,
-                            BackendEventKind::Pause(true),
+                            BackendEventKind::PlaybackEnded,
                         ));
                     }
                     Err(error) if worker_presented.load(Ordering::Relaxed) => {

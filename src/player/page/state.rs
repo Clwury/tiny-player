@@ -9,6 +9,7 @@ pub(super) struct PlaybackFrameState {
 
 pub(super) struct PlaybackTimelineState {
     pub(super) loaded: bool,
+    pub(super) ended: bool,
     pub(super) paused: bool,
     pub(super) buffering: bool,
     pub(super) position: Option<f64>,
@@ -25,6 +26,7 @@ impl Default for PlaybackTimelineState {
     fn default() -> Self {
         Self {
             loaded: false,
+            ended: false,
             paused: true,
             buffering: false,
             position: None,
