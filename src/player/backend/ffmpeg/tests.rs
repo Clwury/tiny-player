@@ -1,5 +1,5 @@
 use super::avio::HttpCacheRangeKind;
-use super::worker::PendingSeek;
+use super::worker::{PendingSeek, PendingTrackSelection};
 use super::*;
 use playback_loop::{
     initial_probe_profile, playback_read_finished, rebase_subtitle_cues_to_timeline_origin,
@@ -100,6 +100,85 @@ fn ffmpeg_command_drain_applies_pause_resume_and_keeps_latest_seek() {
             session_id: PlaybackSessionId(5),
             position_seconds: 24.0,
             generation: second_generation,
+        })
+    );
+}
+
+#[test]
+fn ffmpeg_command_drain_keeps_latest_track_selection() {
+    let control = FfmpegControl::new(PlaybackSessionId(1));
+    let (tx, rx) = mpsc::channel();
+    let seek_generation = control.request_seek();
+    let track_generation = control.request_seek();
+    let selected_tracks = crate::player::PlaybackTrackSelection {
+        audio_stream_index: Some(3),
+        subtitle_stream_index: Some(4),
+        ..Default::default()
+    };
+
+    tx.send(FfmpegCommand::Seek {
+        session_id: PlaybackSessionId(2),
+        position_seconds: 10.0,
+        generation: seek_generation,
+    })
+    .unwrap();
+    tx.send(FfmpegCommand::SetTrackSelection {
+        session_id: PlaybackSessionId(3),
+        selected_tracks: selected_tracks.clone(),
+        position_seconds: 24.0,
+        generation: track_generation,
+        pause_after_switch: true,
+    })
+    .unwrap();
+
+    let drained = drain_playback_commands(&rx, &control);
+
+    assert_eq!(drained.pending_seek, None);
+    assert_eq!(
+        drained.pending_track_selection,
+        Some(PendingTrackSelection {
+            session_id: PlaybackSessionId(3),
+            selected_tracks,
+            position_seconds: 24.0,
+            generation: track_generation,
+            pause_after_switch: true,
+        })
+    );
+}
+
+#[test]
+fn ffmpeg_command_drain_applies_pause_to_pending_track_selection() {
+    let control = FfmpegControl::new(PlaybackSessionId(1));
+    let (tx, rx) = mpsc::channel();
+    let track_generation = control.request_seek();
+    let selected_tracks = crate::player::PlaybackTrackSelection {
+        audio_stream_index: Some(3),
+        ..Default::default()
+    };
+
+    tx.send(FfmpegCommand::SetTrackSelection {
+        session_id: PlaybackSessionId(2),
+        selected_tracks: selected_tracks.clone(),
+        position_seconds: 24.0,
+        generation: track_generation,
+        pause_after_switch: false,
+    })
+    .unwrap();
+    tx.send(FfmpegCommand::Pause {
+        session_id: PlaybackSessionId(2),
+    })
+    .unwrap();
+
+    let drained = drain_playback_commands(&rx, &control);
+
+    assert_eq!(
+        drained.pending_track_selection,
+        Some(PendingTrackSelection {
+            session_id: PlaybackSessionId(2),
+            selected_tracks,
+            position_seconds: 24.0,
+            generation: track_generation,
+            pause_after_switch: true,
         })
     );
 }

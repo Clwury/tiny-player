@@ -79,6 +79,8 @@ impl PlaybackPage {
     pub fn new(request: PlaybackRequest, cx: &mut Context<Self>) -> Self {
         let mut error_message = None;
         let status_message = "正在加载视频…".into();
+        let http_stream_buffer_poll_active =
+            should_poll_paused_http_stream_buffer(&request.url, request.content_length);
 
         let (backend, video_presenter) = match FfmpegBackend::new() {
             Ok(mut backend) => match VideoPresenter::new(BackendControl::frame_slot(&backend)) {
@@ -108,12 +110,17 @@ impl PlaybackPage {
             }
         };
 
+        let timeline = PlaybackTimelineState {
+            http_stream_buffer_poll_active,
+            ..PlaybackTimelineState::default()
+        };
+
         Self {
             focus_handle: cx.focus_handle(),
             title: request.title,
             video: ShutdownOrder::new(backend, video_presenter),
             frame: PlaybackFrameState::default(),
-            timeline: PlaybackTimelineState::default(),
+            timeline,
             playback_info_overlay_visible: false,
             fullscreen: FullscreenControlsState::default(),
             playback_info: None,
@@ -282,6 +289,15 @@ impl PlaybackPage {
                 this.cursor(CursorStyle::None)
             })
     }
+}
+
+fn should_poll_paused_http_stream_buffer(url: &str, content_length: Option<u64>) -> bool {
+    content_length.is_some() && playback_url_is_http(url)
+}
+
+fn playback_url_is_http(url: &str) -> bool {
+    let url = url.trim_start().to_ascii_lowercase();
+    url.starts_with("http://") || url.starts_with("https://")
 }
 
 impl Render for PlaybackPage {

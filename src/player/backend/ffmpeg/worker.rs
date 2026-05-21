@@ -108,17 +108,12 @@ pub(super) enum FfmpegCommand {
         session_id: PlaybackSessionId,
     },
     Stop,
-    #[allow(dead_code)]
-    SetAudioTrack {
+    SetTrackSelection {
         session_id: PlaybackSessionId,
-        track_index: Option<usize>,
+        selected_tracks: crate::player::PlaybackTrackSelection,
         position_seconds: f64,
-    },
-    #[allow(dead_code)]
-    SetSubtitleTrack {
-        session_id: PlaybackSessionId,
-        track_index: Option<usize>,
-        position_seconds: f64,
+        generation: u64,
+        pause_after_switch: bool,
     },
     #[allow(dead_code)]
     SetPlaybackRate {
@@ -134,9 +129,19 @@ pub(super) struct PendingSeek {
     pub(super) generation: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PendingTrackSelection {
+    pub(super) session_id: PlaybackSessionId,
+    pub(super) selected_tracks: crate::player::PlaybackTrackSelection,
+    pub(super) position_seconds: f64,
+    pub(super) generation: u64,
+    pub(super) pause_after_switch: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct DrainedFfmpegCommands {
     pub(super) pending_seek: Option<PendingSeek>,
+    pub(super) pending_track_selection: Option<PendingTrackSelection>,
 }
 
 impl FfmpegWorker {
@@ -230,6 +235,30 @@ impl FfmpegWorker {
         Ok(())
     }
 
+    pub(super) fn set_track_selection(
+        &self,
+        selected_tracks: crate::player::PlaybackTrackSelection,
+        position_seconds: f64,
+        session_id: PlaybackSessionId,
+        pause_after_switch: bool,
+    ) -> Result<()> {
+        let generation = self.control.request_seek();
+        self.control.set_paused(false);
+        self.command_tx
+            .send(FfmpegCommand::SetTrackSelection {
+                session_id,
+                selected_tracks,
+                position_seconds,
+                generation,
+                pause_after_switch,
+            })
+            .map_err(|_| {
+                self.control.finish_seek(generation);
+                BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string())
+            })?;
+        Ok(())
+    }
+
     pub(super) fn stop(self) {
         let Self {
             control,
@@ -262,6 +291,7 @@ pub(super) fn drain_playback_commands(
     control: &FfmpegControl,
 ) -> DrainedFfmpegCommands {
     let mut pending_seek = None;
+    let mut pending_track_selection: Option<PendingTrackSelection> = None;
     while let Ok(command) = command_rx.try_recv() {
         match command {
             FfmpegCommand::Seek {
@@ -269,6 +299,7 @@ pub(super) fn drain_playback_commands(
                 position_seconds,
                 generation,
             } => {
+                pending_track_selection = None;
                 pending_seek = Some(PendingSeek {
                     session_id,
                     position_seconds: position_seconds.max(0.0),
@@ -278,37 +309,35 @@ pub(super) fn drain_playback_commands(
             FfmpegCommand::Pause { session_id } => {
                 control.set_session_id(session_id);
                 control.set_paused(true);
+                if let Some(pending) = pending_track_selection.as_mut() {
+                    pending.pause_after_switch = true;
+                }
             }
             FfmpegCommand::Resume { session_id } => {
                 control.set_session_id(session_id);
                 control.set_paused(false);
+                if let Some(pending) = pending_track_selection.as_mut() {
+                    pending.pause_after_switch = false;
+                }
             }
             FfmpegCommand::Stop => {
                 control.shutdown();
             }
-            FfmpegCommand::SetAudioTrack {
+            FfmpegCommand::SetTrackSelection {
                 session_id,
-                track_index,
+                selected_tracks,
                 position_seconds,
+                generation,
+                pause_after_switch,
             } => {
-                control.set_session_id(session_id);
-                tracing::debug!(
-                    ?track_index,
-                    position_seconds,
-                    "FFmpeg audio track command queued but not implemented yet"
-                );
-            }
-            FfmpegCommand::SetSubtitleTrack {
-                session_id,
-                track_index,
-                position_seconds,
-            } => {
-                control.set_session_id(session_id);
-                tracing::debug!(
-                    ?track_index,
-                    position_seconds,
-                    "FFmpeg subtitle track command queued but not implemented yet"
-                );
+                pending_seek = None;
+                pending_track_selection = Some(PendingTrackSelection {
+                    session_id,
+                    selected_tracks,
+                    position_seconds: position_seconds.max(0.0),
+                    generation,
+                    pause_after_switch,
+                });
             }
             FfmpegCommand::SetPlaybackRate { session_id, rate } => {
                 control.set_session_id(session_id);
@@ -319,7 +348,10 @@ pub(super) fn drain_playback_commands(
             }
         }
     }
-    DrainedFfmpegCommands { pending_seek }
+    DrainedFfmpegCommands {
+        pending_seek,
+        pending_track_selection,
+    }
 }
 
 pub(super) unsafe extern "C" fn ffmpeg_interrupt_callback(opaque: *mut c_void) -> c_int {

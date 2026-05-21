@@ -229,18 +229,53 @@ impl FfmpegBackend {
         Ok(())
     }
 
-    fn restart_with_track_selection(
+    fn set_track_selection_in_place(
         &mut self,
         selected_tracks: crate::player::PlaybackTrackSelection,
         position_seconds: f64,
     ) -> Result<()> {
-        let Some(mut request) = self.current_request.clone() else {
+        if self.worker.is_none() {
             return Err(BackendError::Ffmpeg(
                 "FFmpeg 尚未加载可切换轨道的媒体".to_string(),
             ));
-        };
-        request.selected_tracks = selected_tracks;
-        self.start_playback(request, position_seconds.max(0.0))
+        }
+
+        let mut request = self
+            .current_request
+            .clone()
+            .ok_or_else(|| BackendError::Ffmpeg("FFmpeg 尚未加载可切换轨道的媒体".to_string()))?;
+        request.selected_tracks = selected_tracks.clone();
+        let position_seconds = position_seconds.max(0.0);
+        let pause_after_switch = self.paused;
+        let session_id = self.advance_session();
+        self.frame_slot.begin_session(session_id);
+        if !pause_after_switch {
+            self.loaded = false;
+        }
+        self.paused = true;
+        FFMPEG_FRAME_COUNT.store(0, Ordering::Relaxed);
+        while self.event_rx.try_recv().is_ok() {}
+
+        let worker = self
+            .worker
+            .as_ref()
+            .expect("worker exists after early return");
+        worker.set_track_selection(
+            selected_tracks,
+            position_seconds,
+            session_id,
+            pause_after_switch,
+        )?;
+        self.current_request = Some(request);
+        let _ = self.event_tx.send(BackendEvent::new(
+            session_id,
+            BackendEventKind::PositionChanged(position_seconds),
+        ));
+        let _ = self.event_tx.send(BackendEvent::new(
+            session_id,
+            BackendEventKind::BufferedChanged(Some(position_seconds)),
+        ));
+        Ok(())
     }
 
     pub fn seek_to(&mut self, position_seconds: f64) -> Result<()> {
@@ -404,7 +439,7 @@ impl BackendControl for FfmpegBackend {
             .map(|request| request.selected_tracks.clone())
             .unwrap_or_default();
         selected_tracks.audio_stream_index = track_index;
-        self.restart_with_track_selection(selected_tracks, position_seconds)
+        self.set_track_selection_in_place(selected_tracks, position_seconds)
     }
 
     fn set_subtitle_track(
@@ -418,7 +453,7 @@ impl BackendControl for FfmpegBackend {
             .map(|request| request.selected_tracks.clone())
             .unwrap_or_default();
         selected_tracks.set_subtitle_track(track.as_ref());
-        self.restart_with_track_selection(selected_tracks, position_seconds)
+        self.set_track_selection_in_place(selected_tracks, position_seconds)
     }
 
     fn poll_events(&mut self) -> Vec<BackendEvent> {

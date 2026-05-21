@@ -206,7 +206,15 @@ fn select_audio_stream(
     input: &FormatContext,
     allow_audio_decoder_failure: bool,
 ) -> std::result::Result<Option<StreamInfo>, String> {
-    let Some(stream_index) = source.selected_tracks.audio_stream_index else {
+    select_audio_stream_for_selection(&source.selected_tracks, input, allow_audio_decoder_failure)
+}
+
+fn select_audio_stream_for_selection(
+    selected_tracks: &crate::player::PlaybackTrackSelection,
+    input: &FormatContext,
+    allow_audio_decoder_failure: bool,
+) -> std::result::Result<Option<StreamInfo>, String> {
+    let Some(stream_index) = selected_tracks.audio_stream_index else {
         return Ok(None);
     };
     input
@@ -226,10 +234,17 @@ fn select_subtitle_stream(
     source: &FfmpegPlaybackInput,
     input: &FormatContext,
 ) -> std::result::Result<Option<StreamInfo>, String> {
-    if source.selected_tracks.subtitle_external_url.is_some() {
+    select_subtitle_stream_for_selection(&source.selected_tracks, input)
+}
+
+fn select_subtitle_stream_for_selection(
+    selected_tracks: &crate::player::PlaybackTrackSelection,
+    input: &FormatContext,
+) -> std::result::Result<Option<StreamInfo>, String> {
+    if selected_tracks.subtitle_external_url.is_some() {
         return Ok(None);
     }
-    let Some(stream_index) = source.selected_tracks.subtitle_stream_index else {
+    let Some(stream_index) = selected_tracks.subtitle_stream_index else {
         return Ok(None);
     };
     input
@@ -267,6 +282,26 @@ fn open_subtitle_decoder(
         .map_err(|error| format!("FFmpeg 打开字幕解码器失败：{error}"))
 }
 
+fn load_external_subtitle_cue_list(
+    selected_tracks: &crate::player::PlaybackTrackSelection,
+    http_headers: &[(String, String)],
+) -> std::result::Result<Vec<BackendSubtitleCue>, String> {
+    selected_tracks
+        .subtitle_external_url
+        .as_deref()
+        .map(|url| {
+            load_external_subtitle_cues(
+                url,
+                http_headers,
+                selected_tracks.subtitle_codec.as_deref(),
+            )
+            .map(|cues| cues.into_iter().collect::<Vec<_>>())
+            .map_err(|error| format!("加载外挂字幕失败：{error}"))
+        })
+        .transpose()
+        .map(|cues| cues.unwrap_or_default())
+}
+
 fn frame_rate_from_duration(frame_duration_nsecs: Option<u64>) -> Option<f64> {
     let duration = frame_duration_nsecs?;
     if duration == 0 {
@@ -288,7 +323,7 @@ fn playback_video_info(
 }
 
 pub(super) fn run_ffmpeg_playback(
-    source: FfmpegPlaybackInput,
+    mut source: FfmpegPlaybackInput,
     frame_slot: FrameSlot,
     event_tx: Sender<BackendEvent>,
     control: Arc<FfmpegControl>,
@@ -301,10 +336,10 @@ pub(super) fn run_ffmpeg_playback(
         mut input,
         video_stream,
         video_decoder,
-        audio_stream,
+        mut audio_stream,
         audio_decoder: opened_audio_decoder,
-        subtitle_stream,
-        subtitle_decoder,
+        mut subtitle_stream,
+        mut subtitle_decoder,
     } = open_playback_input_with_fallback(&source, Arc::clone(&control), &event_tx)?;
     if let Some(device) = video_decoder.vulkan_device() {
         frame_slot.request_vulkan_prewarm(current_session_id, device);
@@ -327,21 +362,8 @@ pub(super) fn run_ffmpeg_playback(
     let mut scheduler = PlaybackScheduler::new(current_start_position_nsecs);
     let mut position_reporter = PositionReporter::default();
     let mut dovi_state = DoviMetadataState::default();
-    let external_subtitle_cues = source
-        .selected_tracks
-        .subtitle_external_url
-        .as_deref()
-        .map(|url| {
-            load_external_subtitle_cues(
-                url,
-                source.http_headers.as_slice(),
-                source.selected_tracks.subtitle_codec.as_deref(),
-            )
-            .map(|cues| cues.into_iter().collect::<Vec<_>>())
-            .map_err(|error| format!("加载外挂字幕失败：{error}"))
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let mut external_subtitle_cues =
+        load_external_subtitle_cue_list(&source.selected_tracks, source.http_headers.as_slice())?;
     let mut subtitle_cues =
         subtitle_cue_queue_from_external(&external_subtitle_cues, current_start_position_nsecs);
     let mut active_subtitle = None;
@@ -349,7 +371,7 @@ pub(super) fn run_ffmpeg_playback(
         Some(stream) => PgsFrameMergeBitstreamFilter::new(stream)?,
         None => None,
     };
-    let needs_subtitle_prefetch = subtitle_stream
+    let mut needs_subtitle_prefetch = subtitle_stream
         .is_some_and(|stream| stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE);
     let mut filtered_subtitle_packet = if subtitle_filter.is_some() {
         Some(AvPacket::new()?)
@@ -431,6 +453,153 @@ pub(super) fn run_ffmpeg_playback(
         let drained_commands = drain_playback_commands(&command_rx, &control);
         if control.should_stop() {
             break;
+        }
+
+        if let Some(pending_track_selection) = drained_commands.pending_track_selection {
+            current_session_id = pending_track_selection.session_id;
+            control.set_session_id(current_session_id);
+            control.set_paused(false);
+            control.finish_seek(pending_track_selection.generation);
+            let switch_result: std::result::Result<(), String> = (|| {
+                let position_seconds = pending_track_selection.position_seconds.max(0.0);
+                current_start_position_nsecs = seconds_to_nsecs(position_seconds);
+                input.seek_stream(video_stream, position_seconds)?;
+                source.selected_tracks = pending_track_selection.selected_tracks;
+
+                video_decoder.flush_buffers();
+                if let Some(decoder) = &audio_decoder {
+                    decoder.flush_buffers();
+                }
+                if let Some(decoder) = &subtitle_decoder {
+                    decoder.flush_buffers();
+                }
+                if let Some(filter) = subtitle_filter.as_mut() {
+                    filter.flush();
+                }
+                if let Some(packet) = filtered_subtitle_packet.as_mut() {
+                    packet.unref();
+                }
+                video_frame.unref();
+                if let Some(frame) = audio_frame.as_mut() {
+                    frame.unref();
+                }
+                packet.unref();
+
+                let previous_audio_output = audio_output.take();
+                audio_decoder = None;
+                audio_frame = None;
+                audio_resampler = None;
+                audio_stream =
+                    select_audio_stream_for_selection(&source.selected_tracks, &input, false)?;
+                if let Some(decoder) = open_audio_decoder(audio_stream, false)? {
+                    let output = match previous_audio_output {
+                        Some(output) => Some(output),
+                        None => match AudioOutput::new(Arc::clone(&control)) {
+                            Ok(output) => Some(output),
+                            Err(error) => {
+                                tracing::warn!(%error, "native audio output initialization failed; playing video without audio");
+                                None
+                            }
+                        },
+                    };
+                    if let Some(output) = output {
+                        match AudioResampler::new(output.sample_rate(), output.channels()) {
+                            Ok(resampler) => {
+                                audio_frame = Some(AvFrame::new()?);
+                                output.reset_clock(current_start_position_nsecs);
+                                audio_resampler = Some(resampler);
+                                audio_output = Some(output);
+                                audio_decoder = Some(decoder);
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "FFmpeg audio resampler initialization failed");
+                            }
+                        }
+                    }
+                }
+
+                subtitle_stream =
+                    select_subtitle_stream_for_selection(&source.selected_tracks, &input)?;
+                subtitle_decoder =
+                    open_subtitle_decoder(subtitle_stream, video_decoder.size().ok())?;
+                subtitle_filter = match subtitle_stream {
+                    Some(stream) => PgsFrameMergeBitstreamFilter::new(stream)?,
+                    None => None,
+                };
+                filtered_subtitle_packet = if subtitle_filter.is_some() {
+                    Some(AvPacket::new()?)
+                } else {
+                    None
+                };
+                external_subtitle_cues = load_external_subtitle_cue_list(
+                    &source.selected_tracks,
+                    source.http_headers.as_slice(),
+                )?;
+                subtitle_cues = subtitle_cue_queue_from_external(
+                    &external_subtitle_cues,
+                    current_start_position_nsecs,
+                );
+                active_subtitle = None;
+                needs_subtitle_prefetch = subtitle_stream.is_some_and(|stream| {
+                    stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE
+                });
+
+                video_clock = TimestampMapper::new(
+                    video_stream.start_nsecs,
+                    current_start_position_nsecs,
+                    Some(video_frame_duration_nsecs),
+                );
+                playback_timeline_origin_nsecs = video_stream.start_nsecs;
+                audio_clock = TimestampMapper::new(
+                    audio_stream.and_then(|stream| stream.start_nsecs),
+                    current_start_position_nsecs,
+                    None,
+                );
+                scheduler.reset(current_start_position_nsecs);
+                queued_video_frames.clear();
+                first_video_frame_pending = true;
+                dovi_state.clear();
+                buffered_reporter = BufferedReporter::new(audio_output.is_some());
+                buffered_reporter.reset_to(position_seconds, current_session_id, &event_tx);
+                let _ = event_tx.send(BackendEvent::new(
+                    current_session_id,
+                    BackendEventKind::PositionChanged(position_seconds),
+                ));
+                let _ = event_tx.send(BackendEvent::new(
+                    current_session_id,
+                    BackendEventKind::SubtitleChanged(None),
+                ));
+                if pending_track_selection.pause_after_switch {
+                    control.set_paused(true);
+                    update_subtitle_overlay(
+                        current_start_position_nsecs,
+                        &mut subtitle_cues,
+                        &mut active_subtitle,
+                        current_session_id,
+                        &event_tx,
+                    );
+                    let _ = event_tx.send(BackendEvent::new(
+                        current_session_id,
+                        BackendEventKind::Pause(true),
+                    ));
+                    let _ = event_tx.send(BackendEvent::new(
+                        current_session_id,
+                        BackendEventKind::Buffering(false),
+                    ));
+                } else {
+                    let _ = event_tx.send(BackendEvent::new(
+                        current_session_id,
+                        BackendEventKind::Buffering(true),
+                    ));
+                }
+                Ok(())
+            })();
+            if control.has_pending_seek() {
+                packet.unref();
+                continue;
+            }
+            switch_result?;
+            continue;
         }
 
         if let Some(pending_seek) = drained_commands.pending_seek {

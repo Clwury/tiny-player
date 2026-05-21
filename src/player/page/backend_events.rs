@@ -2,12 +2,15 @@ use crate::player::backend::BackendEvent;
 
 use super::*;
 
+const PAUSED_BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 impl PlaybackPage {
     pub(super) fn poll_backend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for event in self.poll_backend_events() {
             self.apply_backend_event(event, window, cx);
         }
         self.poll_video_presenter(window, cx);
+        self.schedule_paused_backend_poll(cx);
     }
 
     fn poll_backend_events(&mut self) -> Vec<BackendEvent> {
@@ -113,8 +116,39 @@ impl PlaybackPage {
             BackendEventKind::HttpStreamBufferedChanged(progress) => {
                 self.timeline.http_stream_buffered_range =
                     progress.and_then(valid_http_stream_buffer_progress);
+                if let Some(progress) = self.timeline.http_stream_buffered_range {
+                    self.timeline.http_stream_buffer_poll_active = progress.end_fraction < 1.0;
+                }
             }
         }
+    }
+
+    fn schedule_paused_backend_poll(&mut self, cx: &mut Context<Self>) {
+        if self.timeline.paused_backend_poll_scheduled || !self.should_poll_backend_while_paused() {
+            return;
+        }
+
+        self.timeline.paused_backend_poll_scheduled = true;
+        cx.spawn(async move |page, cx| {
+            Timer::after(PAUSED_BACKEND_POLL_INTERVAL).await;
+            page.update(cx, |page, cx| {
+                page.timeline.paused_backend_poll_scheduled = false;
+                if page.should_poll_backend_while_paused() {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn should_poll_backend_while_paused(&self) -> bool {
+        self.video.owner().is_some()
+            && self.timeline.loaded
+            && self.timeline.paused
+            && !self.timeline.ended
+            && self.error_message.is_none()
+            && self.timeline.http_stream_buffer_poll_active
     }
 
     fn finish_playback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -122,6 +156,7 @@ impl PlaybackPage {
         self.timeline.ended = true;
         self.timeline.paused = true;
         self.timeline.buffering = false;
+        self.timeline.http_stream_buffer_poll_active = false;
         self.timeline.pending_seek_position = None;
         self.timeline.pending_seek_keeps_frame = false;
         self.timeline.progress_drag_position = None;
@@ -153,6 +188,7 @@ impl PlaybackPage {
         self.timeline.buffering = false;
         self.timeline.buffered_until = None;
         self.timeline.http_stream_buffered_range = None;
+        self.timeline.http_stream_buffer_poll_active = false;
         self.timeline.pending_seek_position = None;
         self.timeline.pending_seek_keeps_frame = false;
         self.timeline.progress_drag_position = None;
