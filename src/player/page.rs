@@ -3,9 +3,9 @@ use std::{fmt, sync::Arc, time::Duration};
 use gpui::{
     AppContext as _, Bounds, Context, CursorStyle, DragMoveEvent, EventEmitter, FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, RenderImage, SharedString,
-    StatefulInteractiveElement, Styled, Timer, Window, canvas, deferred, div, prelude::*, px,
-    relative, rgb, rgba, svg,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, Timer, Window, canvas, deferred, div,
+    prelude::*, px, relative, rgb, rgba, svg,
 };
 
 use crate::theme;
@@ -47,8 +47,8 @@ use render::{
 };
 use runtime::{PlaybackBackend, ShutdownOrder};
 use state::{
-    FullscreenControlsState, PlaybackFrameState, PlaybackTimelineState, SubtitleOverlayState,
-    TrackSelectState,
+    FullscreenControlsState, PlaybackFrameState, PlaybackTimelineState, PlaybackVolumeState,
+    SubtitleOverlayState, TrackSelectState,
 };
 use subtitles::defer_drop_subtitle;
 use video_element::VideoFrameElement;
@@ -69,6 +69,7 @@ pub struct PlaybackPage {
     playback_info: Option<PlaybackVideoInfo>,
     tracks: TrackSelectState,
     subtitle: SubtitleOverlayState,
+    volume: PlaybackVolumeState,
     error_message: Option<SharedString>,
     status_message: SharedString,
 }
@@ -130,6 +131,7 @@ impl PlaybackPage {
                 request.selected_tracks,
             ),
             subtitle: SubtitleOverlayState::default(),
+            volume: PlaybackVolumeState::default(),
             error_message,
             status_message,
         }
@@ -199,6 +201,20 @@ impl PlaybackPage {
         if event.click_count == 1 {
             self.toggle_playback_pause_command(cx);
         }
+    }
+
+    fn handle_surface_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        let delta = volume_delta_from_scroll_delta(event.delta);
+        if delta.abs() < f32::EPSILON {
+            return;
+        }
+        self.adjust_playback_volume(delta, cx);
     }
 
     fn handle_surface_mouse_move(
@@ -285,6 +301,7 @@ impl PlaybackPage {
                 cx.listener(Self::handle_surface_right_mouse_down),
             )
             .on_mouse_move(cx.listener(Self::handle_surface_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::handle_surface_scroll_wheel))
             .when(is_fullscreen && !self.fullscreen.cursor_visible, |this| {
                 this.cursor(CursorStyle::None)
             })
@@ -298,6 +315,23 @@ fn should_poll_paused_http_stream_buffer(url: &str, content_length: Option<u64>)
 fn playback_url_is_http(url: &str) -> bool {
     let url = url.trim_start().to_ascii_lowercase();
     url.starts_with("http://") || url.starts_with("https://")
+}
+
+fn clamp_playback_volume(volume: f32) -> f32 {
+    let volume = if volume.is_finite() { volume } else { 1.0 };
+    volume.clamp(0.0, 1.0)
+}
+
+fn playback_volume_percent(volume: f32) -> u32 {
+    (clamp_playback_volume(volume) * 100.0).round() as u32
+}
+
+fn volume_delta_from_scroll_delta(delta: ScrollDelta) -> f32 {
+    match delta {
+        ScrollDelta::Lines(point) => point.y * 0.05,
+        ScrollDelta::Pixels(point) => f32::from(point.y) / 500.0,
+    }
+    .clamp(-0.2, 0.2)
 }
 
 impl Render for PlaybackPage {
@@ -361,6 +395,7 @@ impl Render for PlaybackPage {
             .text_color(rgb(0xe6edf3))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::handle_surface_scroll_wheel))
             .when(is_fullscreen && !self.fullscreen.cursor_visible, |this| {
                 this.cursor(CursorStyle::None)
             })
@@ -390,6 +425,9 @@ impl Render for PlaybackPage {
                 this.child(self.render_playback_info_overlay(cx))
             })
             .child(self.render_subtitle_overlay(progress_bar_visible))
+            .when(self.volume.indicator_visible, |this| {
+                this.child(self.render_volume_indicator(cx))
+            })
             .when(progress_bar_visible, |this| {
                 this.child(self.render_progress_bar(cx))
             })

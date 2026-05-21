@@ -2,6 +2,8 @@ use super::fullscreen::{PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX, PLAYBACK_PROGRES
 use super::*;
 
 const TRACK_SELECT_MENU_MAX_HEIGHT_PX: f32 = 260.0;
+const VOLUME_INDICATOR_HIDE_DELAY: Duration = Duration::from_millis(1200);
+const VOLUME_INDICATOR_BAR_HEIGHT_PX: f32 = 192.0;
 
 #[derive(Clone, Copy)]
 struct PlaybackControlsRenderState {
@@ -67,6 +69,43 @@ impl PlaybackPage {
                 self.timeline.buffering = false;
             }
         }
+        cx.notify();
+    }
+
+    pub(super) fn adjust_playback_volume(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let volume = clamp_playback_volume(self.volume.level + delta);
+        if (self.volume.level - volume).abs() < f32::EPSILON {
+            self.show_volume_indicator(cx);
+            return;
+        }
+
+        let previous_volume = self.volume.level;
+        self.volume.level = volume;
+        if let Some(backend) = self.video.owner_mut()
+            && let Err(error) = backend.command(BackendCommand::SetVolume { volume })
+        {
+            self.volume.level = previous_volume;
+            self.error_message = Some(format!("调整音量失败：{error}").into());
+        }
+        self.show_volume_indicator(cx);
+    }
+
+    fn show_volume_indicator(&mut self, cx: &mut Context<Self>) {
+        self.volume.indicator_visible = true;
+        self.volume.hide_generation = self.volume.hide_generation.wrapping_add(1);
+        let generation = self.volume.hide_generation;
+        cx.spawn(async move |page, cx| {
+            Timer::after(VOLUME_INDICATOR_HIDE_DELAY).await;
+            page.update(cx, |page, cx| {
+                if page.volume.hide_generation != generation {
+                    return;
+                }
+                page.volume.indicator_visible = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -495,6 +534,51 @@ impl PlaybackPage {
             })
     }
 
+    pub(super) fn render_volume_indicator(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = theme::get(cx);
+        let volume = clamp_playback_volume(self.volume.level);
+        let fill_height = VOLUME_INDICATOR_BAR_HEIGHT_PX * volume;
+        let percent = playback_volume_percent(volume);
+
+        div()
+            .id("playback-volume-indicator")
+            .absolute()
+            .right(px(24.0))
+            .top(relative(0.5))
+            .mt(-px(106.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .relative()
+                    .w(px(8.0))
+                    .h(px(VOLUME_INDICATOR_BAR_HEIGHT_PX))
+                    .overflow_hidden()
+                    .rounded_full()
+                    .bg(theme.foreground.opacity(0.24))
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .h(px(fill_height))
+                            .rounded_full()
+                            .bg(theme.input_border_focused),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(42.0))
+                    .text_align(gpui::TextAlign::Center)
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .child(format!("{percent}%")),
+            )
+    }
+
     fn render_playback_controls_row(
         &self,
         state: PlaybackControlsRenderState,
@@ -905,5 +989,24 @@ mod tests {
         assert_eq!(valid_frame_rate(0.0), None);
         assert_eq!(valid_frame_rate(f64::INFINITY), None);
         assert_eq!(valid_frame_rate(60.0), Some(60.0));
+    }
+
+    #[test]
+    fn playback_volume_helpers_clamp_and_scale_scroll() {
+        assert_eq!(playback_volume_percent(-0.5), 0);
+        assert_eq!(playback_volume_percent(0.525), 52);
+        assert_eq!(playback_volume_percent(f32::NAN), 100);
+        assert_eq!(playback_volume_percent(1.5), 100);
+        assert_eq!(
+            volume_delta_from_scroll_delta(ScrollDelta::Lines(gpui::Point { x: 0.0, y: 1.0 })),
+            0.05
+        );
+        assert_eq!(
+            volume_delta_from_scroll_delta(ScrollDelta::Pixels(gpui::Point {
+                x: px(0.0),
+                y: px(-250.0),
+            })),
+            -0.2
+        );
     }
 }

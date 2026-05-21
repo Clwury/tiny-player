@@ -10,16 +10,23 @@ pub(super) struct FfmpegWorker {
 pub(super) struct FfmpegControl {
     shutdown: AtomicBool,
     paused: AtomicBool,
+    volume: AtomicU32,
     session_id: AtomicU64,
     seek_generation: AtomicU64,
     handled_seek_generation: AtomicU64,
 }
 
 impl FfmpegControl {
+    #[cfg(test)]
     pub(super) fn new(session_id: PlaybackSessionId) -> Self {
+        Self::with_volume(session_id, DEFAULT_PLAYBACK_VOLUME)
+    }
+
+    pub(super) fn with_volume(session_id: PlaybackSessionId, volume: f32) -> Self {
         Self {
             shutdown: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            volume: AtomicU32::new(volume_to_storage(volume)),
             session_id: AtomicU64::new(session_id.0),
             seek_generation: AtomicU64::new(0),
             handled_seek_generation: AtomicU64::new(0),
@@ -44,6 +51,15 @@ impl FfmpegControl {
 
     pub(super) fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Release);
+    }
+
+    pub(super) fn set_volume(&self, volume: f32) {
+        self.volume
+            .store(volume_to_storage(volume), Ordering::Release);
+    }
+
+    pub(super) fn volume(&self) -> f32 {
+        self.volume.load(Ordering::Acquire) as f32 / PLAYBACK_VOLUME_SCALE as f32
     }
 
     pub(super) fn wait_while_paused(&self) -> bool {
@@ -84,6 +100,10 @@ impl FfmpegControl {
         self.seek_generation.load(Ordering::Acquire)
             > self.handled_seek_generation.load(Ordering::Acquire)
     }
+}
+
+fn volume_to_storage(volume: f32) -> u32 {
+    (normalize_playback_volume(volume) * PLAYBACK_VOLUME_SCALE as f32).round() as u32
 }
 
 pub(super) struct FfmpegPlaybackInput {
@@ -149,9 +169,10 @@ impl FfmpegWorker {
         input: FfmpegPlaybackInput,
         frame_slot: FrameSlot,
         event_tx: Sender<BackendEvent>,
+        volume: f32,
     ) -> Result<Self> {
         let session_id = input.session_id;
-        let control = Arc::new(FfmpegControl::new(session_id));
+        let control = Arc::new(FfmpegControl::with_volume(session_id, volume));
         let (command_tx, command_rx) = mpsc::channel();
         let frame_presented = Arc::new(AtomicBool::new(false));
         let worker_control = Arc::clone(&control);
@@ -257,6 +278,10 @@ impl FfmpegWorker {
                 BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string())
             })?;
         Ok(())
+    }
+
+    pub(super) fn set_volume(&self, volume: f32) {
+        self.control.set_volume(volume);
     }
 
     pub(super) fn stop(self) {

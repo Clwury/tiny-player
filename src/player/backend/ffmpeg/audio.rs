@@ -498,12 +498,13 @@ where
         return;
     }
 
+    let volume = shared.control.volume();
     let mut played = 0u64;
     for sample in data {
         let value = match guard.pop_sample() {
             Some(value) => {
                 played = played.saturating_add(1);
-                value
+                value * volume
             }
             None => 0.0,
         }

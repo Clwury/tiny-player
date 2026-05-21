@@ -82,3 +82,19 @@ pub(super) struct SubtitleOverlayState {
     pub(super) active: Option<BackendSubtitleCue>,
     pub(super) vertical_offset_fraction: Option<f32>,
 }
+
+pub(super) struct PlaybackVolumeState {
+    pub(super) level: f32,
+    pub(super) indicator_visible: bool,
+    pub(super) hide_generation: u64,
+}
+
+impl Default for PlaybackVolumeState {
+    fn default() -> Self {
+        Self {
+            level: 1.0,
+            indicator_visible: false,
+            hide_generation: 0,
+        }
+    }
+}

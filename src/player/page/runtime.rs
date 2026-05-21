@@ -55,6 +55,12 @@ impl BackendControl for PlaybackBackend {
         }
     }
 
+    fn set_volume(&mut self, volume: f32) -> Result<()> {
+        match self {
+            Self::Ffmpeg(backend) => backend.set_volume(volume),
+        }
+    }
+
     fn poll_events(&mut self) -> Vec<BackendEvent> {
         match self {
             Self::Ffmpeg(backend) => backend.poll_events(),

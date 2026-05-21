@@ -38,6 +38,9 @@ pub enum BackendCommand {
         track: Option<PlaybackTrack>,
         position_seconds: f64,
     },
+    SetVolume {
+        volume: f32,
+    },
     #[allow(dead_code)]
     SetPlaybackRate {
         rate: f64,
@@ -65,6 +68,9 @@ pub trait BackendControl {
     ) -> Result<()> {
         Err(BackendError::UnsupportedCommand("切换字幕轨"))
     }
+    fn set_volume(&mut self, _volume: f32) -> Result<()> {
+        Err(BackendError::UnsupportedCommand("调整音量"))
+    }
     fn poll_events(&mut self) -> Vec<BackendEvent>;
     fn frame_slot(&self) -> FrameSlot;
 
@@ -83,6 +89,7 @@ pub trait BackendControl {
                 track,
                 position_seconds,
             } => self.set_subtitle_track(track, position_seconds),
+            BackendCommand::SetVolume { volume } => self.set_volume(volume),
             BackendCommand::SetPlaybackRate { .. } => {
                 Err(BackendError::UnsupportedCommand("调整播放速度"))
             }

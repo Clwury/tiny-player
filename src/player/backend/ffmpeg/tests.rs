@@ -753,6 +753,26 @@ fn fill_audio_output_converts_samples_and_outputs_silence_on_underrun() {
 }
 
 #[test]
+fn fill_audio_output_applies_playback_volume() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    control.set_volume(0.25);
+    let mut buffer = AudioBuffer::with_capacity(8);
+    assert_eq!(buffer.push_slice(&[-1.0, 0.5, 1.0]), 3);
+    let shared = AudioShared {
+        buffer: Mutex::new(buffer),
+        ready: Condvar::new(),
+        played_samples: AtomicU64::new(0),
+        control,
+    };
+    let mut output = [0.0f64; 3];
+
+    fill_audio_output(&mut output, &shared);
+
+    assert_eq!(output, [-0.25, 0.125, 0.25]);
+    assert_eq!(shared.played_samples.load(Ordering::Relaxed), 3);
+}
+
+#[test]
 fn fill_audio_output_preserves_buffer_while_paused() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     control.set_paused(true);

@@ -8,7 +8,7 @@ use std::{
     ptr, slice,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
@@ -114,6 +114,8 @@ const VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis
 const PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(700);
 const PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(500);
 const LATE_VIDEO_DROP_TOLERANCE: Duration = Duration::from_millis(75);
+const DEFAULT_PLAYBACK_VOLUME: f32 = 1.0;
+const PLAYBACK_VOLUME_SCALE: u32 = 10_000;
 const HTTP_RING_CACHE_CAPACITY: usize = 500 * 1024 * 1024;
 const HTTP_CACHE_CHUNK_SIZE: usize = 256 * 1024;
 const HTTP_CACHE_RANGE_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
@@ -130,6 +132,15 @@ const FFMPEG_SUBTITLE_PROBE_SIZE: usize = 64 * 1024 * 1024;
 const FFMPEG_SUBTITLE_ANALYZE_DURATION_US: u64 = 30_000_000;
 
 static FFMPEG_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn normalize_playback_volume(volume: f32) -> f32 {
+    let volume = if volume.is_finite() {
+        volume
+    } else {
+        DEFAULT_PLAYBACK_VOLUME
+    };
+    volume.clamp(0.0, 1.0)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputProbeProfile {
@@ -148,6 +159,7 @@ pub struct FfmpegBackend {
     current_session_id: PlaybackSessionId,
     loaded: bool,
     paused: bool,
+    volume: f32,
 }
 
 impl FfmpegBackend {
@@ -167,6 +179,7 @@ impl FfmpegBackend {
             current_session_id: PlaybackSessionId::default(),
             loaded: false,
             paused: true,
+            volume: DEFAULT_PLAYBACK_VOLUME,
         })
     }
 
@@ -225,6 +238,7 @@ impl FfmpegBackend {
             },
             self.frame_slot.clone(),
             self.event_tx.clone(),
+            self.volume,
         )?);
         Ok(())
     }
@@ -329,6 +343,15 @@ impl FfmpegBackend {
 
     pub fn resume(&mut self) -> Result<()> {
         self.set_paused(false)
+    }
+
+    pub fn set_volume(&mut self, volume: f32) -> Result<()> {
+        let volume = normalize_playback_volume(volume);
+        self.volume = volume;
+        if let Some(worker) = self.worker.as_ref() {
+            worker.set_volume(volume);
+        }
+        Ok(())
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -454,6 +477,10 @@ impl BackendControl for FfmpegBackend {
             .unwrap_or_default();
         selected_tracks.set_subtitle_track(track.as_ref());
         self.set_track_selection_in_place(selected_tracks, position_seconds)
+    }
+
+    fn set_volume(&mut self, volume: f32) -> Result<()> {
+        FfmpegBackend::set_volume(self, volume)
     }
 
     fn poll_events(&mut self) -> Vec<BackendEvent> {
