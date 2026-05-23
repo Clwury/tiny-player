@@ -6,7 +6,7 @@ use crate::player::render_host::FrameSlot;
 use super::tracks::{PlaybackTrack, PlaybackTrackSelection};
 pub use events::{
     BackendError, BackendEvent, BackendEventKind, BackendSubtitleBitmap, BackendSubtitleCue,
-    HttpStreamBufferProgress, PlaybackVideoInfo, Result,
+    HttpStreamBufferProgress, HttpStreamCacheStatus, PlaybackVideoInfo, Result,
 };
 pub use ffmpeg::FfmpegBackend;
 

@@ -81,6 +81,10 @@ impl FfmpegControl {
         self.seek_generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    pub(super) fn seek_generation(&self) -> u64 {
+        self.seek_generation.load(Ordering::Acquire)
+    }
+
     pub(super) fn finish_seek(&self, generation: u64) {
         let mut current = self.handled_seek_generation.load(Ordering::Acquire);
         while generation > current {
@@ -106,6 +110,7 @@ fn volume_to_storage(volume: f32) -> u32 {
     (normalize_playback_volume(volume) * PLAYBACK_VOLUME_SCALE as f32).round() as u32
 }
 
+#[derive(Clone)]
 pub(super) struct FfmpegPlaybackInput {
     pub(super) session_id: PlaybackSessionId,
     pub(super) url: String,
@@ -230,6 +235,12 @@ impl FfmpegWorker {
     pub(super) fn seek(&self, position_seconds: f64, session_id: PlaybackSessionId) -> Result<()> {
         let generation = self.control.request_seek();
         self.control.set_paused(false);
+        tracing::debug!(
+            ?session_id,
+            position_seconds,
+            generation,
+            "queueing FFmpeg seek command"
+        );
         self.command_tx
             .send(FfmpegCommand::Seek {
                 session_id,
@@ -265,6 +276,14 @@ impl FfmpegWorker {
     ) -> Result<()> {
         let generation = self.control.request_seek();
         self.control.set_paused(false);
+        tracing::debug!(
+            ?session_id,
+            position_seconds,
+            generation,
+            pause_after_switch,
+            ?selected_tracks,
+            "queueing FFmpeg track selection command"
+        );
         self.command_tx
             .send(FfmpegCommand::SetTrackSelection {
                 session_id,
@@ -384,5 +403,5 @@ pub(super) unsafe extern "C" fn ffmpeg_interrupt_callback(opaque: *mut c_void) -
         return 0;
     }
     let control = unsafe { &*(opaque as *const FfmpegControl) };
-    control.should_interrupt() as c_int
+    control.should_stop() as c_int
 }

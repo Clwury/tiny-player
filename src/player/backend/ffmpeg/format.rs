@@ -15,7 +15,7 @@ impl FormatContext {
         control: Arc<FfmpegControl>,
         event_tx: Sender<BackendEvent>,
     ) -> std::result::Result<Self, String> {
-        let mut cached_io = if should_cache_http_url(url) {
+        let cached_io = if should_cache_http_url(url) {
             Some(CachedAvio::new(
                 url,
                 http_headers,
@@ -26,6 +26,16 @@ impl FormatContext {
         } else {
             None
         };
+        Self::open_with_cached_io(url, http_headers, probe_profile, control, cached_io)
+    }
+
+    fn open_with_cached_io(
+        url: &str,
+        http_headers: &[(String, String)],
+        probe_profile: InputProbeProfile,
+        control: Arc<FfmpegControl>,
+        mut cached_io: Option<CachedAvio>,
+    ) -> std::result::Result<Self, String> {
         let url = CString::new(url).map_err(|_| "播放地址包含无效字符".to_string())?;
         let mut options = input_format_options(http_headers, probe_profile)?;
         let mut context = unsafe { ffi::avformat_alloc_context() };
@@ -134,6 +144,33 @@ impl FormatContext {
         })
     }
 
+    pub(super) fn streams(&self) -> std::result::Result<Vec<StreamInfo>, String> {
+        let stream_count = unsafe { (*self.ptr).nb_streams as usize };
+        let mut streams = Vec::with_capacity(stream_count);
+        for index in 0..stream_count {
+            let stream = self
+                .stream(c_int::try_from(index).map_err(|_| "FFmpeg 媒体流索引无效".to_string())?)?;
+            let codecpar = unsafe { (*stream).codecpar };
+            if codecpar.is_null() {
+                continue;
+            }
+            let decoder = unsafe { ffi::avcodec_find_decoder((*codecpar).codec_id) };
+            let time_base = unsafe { (*stream).time_base };
+            let start_nsecs = unsafe { timestamp_to_nsecs((*stream).start_time, time_base) };
+            let frame_duration_nsecs = unsafe { stream_frame_duration_nsecs(stream) };
+            streams.push(StreamInfo {
+                index: c_int::try_from(index).map_err(|_| "FFmpeg 媒体流索引无效".to_string())?,
+                stream,
+                decoder,
+                codec_id: unsafe { (*codecpar).codec_id },
+                time_base,
+                start_nsecs,
+                frame_duration_nsecs,
+            });
+        }
+        Ok(streams)
+    }
+
     fn stream(&self, index: c_int) -> std::result::Result<*mut ffi::AVStream, String> {
         let index = usize::try_from(index).map_err(|_| "FFmpeg 媒体流索引无效".to_string())?;
         let stream_count = unsafe { (*self.ptr).nb_streams as usize };
@@ -155,6 +192,10 @@ impl FormatContext {
         Some(duration as f64 / ffi::AV_TIME_BASE as f64)
     }
 
+    pub(super) fn cached_io_cache(&self) -> Option<HttpRingCache> {
+        self._cached_io.as_ref().map(CachedAvio::cache)
+    }
+
     pub(super) fn seek_stream(
         &mut self,
         stream: StreamInfo,
@@ -163,6 +204,13 @@ impl FormatContext {
         let target_nsecs =
             seconds_to_nsecs(position_seconds).saturating_add(stream.start_nsecs.unwrap_or(0));
         let timestamp = nsecs_to_timestamp(target_nsecs, stream.time_base);
+        tracing::debug!(
+            stream_index = stream.index,
+            position_seconds,
+            target_nsecs,
+            timestamp,
+            "seeking FFmpeg input stream"
+        );
         let result = unsafe {
             ffi::av_seek_frame(self.ptr, stream.index, timestamp, ffi::AVSEEK_FLAG_BACKWARD)
         };
@@ -176,6 +224,8 @@ impl FormatContext {
         self.ptr
     }
 }
+
+unsafe impl Send for FormatContext {}
 
 impl Drop for FormatContext {
     fn drop(&mut self) {
@@ -195,3 +245,5 @@ pub(super) struct StreamInfo {
     pub(super) start_nsecs: Option<u64>,
     pub(super) frame_duration_nsecs: Option<u64>,
 }
+
+unsafe impl Send for StreamInfo {}

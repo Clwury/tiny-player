@@ -1,8 +1,9 @@
 use super::{
     cache::{CacheAppendPermit, CacheAppendResult, HttpRingCacheShared},
     http::{
-        content_len_from_content_range, content_len_from_response, http_cache_range_header,
-        http_cache_range_request_len, http_cache_range_request_timeout, http_cache_read_timed_out,
+        content_len_from_content_range, content_len_from_response, content_range_from_headers,
+        http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
+        http_cache_read_timed_out,
     },
     *,
 };
@@ -89,6 +90,13 @@ fn download_http_cache_range(
     let range = http_cache_range_header(offset, known_content_len);
     let range_len = http_cache_range_request_len(offset, known_content_len);
     let request_timeout = http_cache_range_request_timeout(range_len);
+    tracing::debug!(
+        offset,
+        range = %range,
+        range_len,
+        request_timeout_ms = request_timeout.as_millis(),
+        "requesting HTTP stream cache range"
+    );
     let mut request = client
         .get(url)
         .timeout(request_timeout)
@@ -102,6 +110,11 @@ fn download_http_cache_range(
     let mut response = match request.send() {
         Ok(response) => response,
         Err(error) if error.is_timeout() => {
+            tracing::debug!(
+                offset,
+                range = %range,
+                "HTTP stream cache range request timed out; restarting"
+            );
             return Ok(HttpDownloadOutcome::Restart(offset));
         }
         Err(error) => return Err(format!("HTTP 视频缓存请求失败：{error}")),
@@ -120,10 +133,20 @@ fn download_http_cache_range(
     {
         return Err(format!("HTTP 视频缓存请求失败：服务器返回 {status}"));
     }
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        let content_range = content_range_from_headers(response.headers())
+            .ok_or_else(|| "HTTP 视频缓存 Range 响应缺少 Content-Range".to_string())?;
+        if content_range.start != offset {
+            return Err(format!(
+                "HTTP 视频缓存 Range 响应偏移不匹配：请求 {offset}，返回 {}",
+                content_range.start
+            ));
+        }
+    }
     let content_len = content_len_from_response(&response, offset);
     shared.set_content_len(content_len);
 
-    let mut chunk = vec![0; HTTP_CACHE_CHUNK_SIZE];
+    let mut chunk = vec![0; shared.chunk_size()];
     loop {
         if shared.should_stop() {
             return Ok(HttpDownloadOutcome::Stopped);
@@ -141,8 +164,19 @@ fn download_http_cache_range(
             Ok(read) => read,
             Err(error) if http_cache_read_timed_out(&error) => {
                 if let Some(next_offset) = shared.take_restart_offset() {
+                    tracing::debug!(
+                        offset,
+                        next_offset,
+                        range = %range,
+                        "HTTP stream cache read timed out with pending restart"
+                    );
                     return Ok(HttpDownloadOutcome::Restart(next_offset));
                 }
+                tracing::debug!(
+                    offset,
+                    range = %range,
+                    "HTTP stream cache read timed out; restarting current range"
+                );
                 return Ok(HttpDownloadOutcome::Restart(offset));
             }
             Err(error) => {

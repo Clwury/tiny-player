@@ -43,16 +43,22 @@ pub(super) struct BufferedReporter {
     video_buffered_until: Option<f64>,
     audio_buffered_until: Option<f64>,
     needs_audio: bool,
+    emit_events: bool,
 }
 
 impl BufferedReporter {
     pub(super) fn new(needs_audio: bool) -> Self {
+        Self::new_with_events(needs_audio, true)
+    }
+
+    pub(super) fn new_with_events(needs_audio: bool, emit_events: bool) -> Self {
         Self {
             last_report: None,
             last_buffered_until: None,
             video_buffered_until: None,
             audio_buffered_until: None,
             needs_audio,
+            emit_events,
         }
     }
 
@@ -147,9 +153,11 @@ impl BufferedReporter {
 
         self.last_report = Some(Instant::now());
         self.last_buffered_until = buffered_until;
-        let _ = event_tx.send(BackendEvent::new(
-            session_id,
-            BackendEventKind::BufferedChanged(buffered_until),
-        ));
+        if self.emit_events {
+            let _ = event_tx.send(BackendEvent::new(
+                session_id,
+                BackendEventKind::BufferedChanged(buffered_until),
+            ));
+        }
     }
 }

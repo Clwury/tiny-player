@@ -14,7 +14,7 @@ use super::{
     backend::{
         BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest,
         BackendSubtitleBitmap, BackendSubtitleCue, FfmpegBackend, HttpStreamBufferProgress,
-        PlaybackVideoInfo,
+        HttpStreamCacheStatus, PlaybackVideoInfo,
     },
     render_host::RenderSize,
     tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection},
@@ -36,10 +36,10 @@ mod video_element;
 pub use request::PlaybackRequest;
 
 use progress::{
-    ProgressBarDrag, buffered_progress_fraction, clamp_playback_position,
-    combined_buffered_progress_fraction, format_playback_time, playback_status_message,
-    progress_fraction, progress_fraction_for_cursor, should_apply_backend_position,
-    valid_http_stream_buffer_progress, valid_playback_duration, valid_playback_time,
+    ProgressBarDrag, buffered_progress_fraction, buffered_until_after_seek,
+    clamp_playback_position, format_playback_time, playback_status_message, progress_fraction,
+    progress_fraction_for_cursor, should_apply_backend_position, valid_http_stream_buffer_progress,
+    valid_playback_duration, valid_playback_time,
 };
 use render::{
     AnimationFrameRequestState, aspect_fit_bounds, defer_drop_frame, normalize_video_viewport,

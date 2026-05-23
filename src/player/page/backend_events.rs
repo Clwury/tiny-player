@@ -120,6 +120,9 @@ impl PlaybackPage {
                     self.timeline.http_stream_buffer_poll_active = progress.end_fraction < 1.0;
                 }
             }
+            BackendEventKind::HttpStreamCacheStatusChanged(status) => {
+                self.timeline.http_stream_cache_status = Some(status);
+            }
         }
     }
 
@@ -165,6 +168,7 @@ impl PlaybackPage {
             self.timeline.buffered_until = Some(duration);
         }
         self.timeline.http_stream_buffered_range = None;
+        self.timeline.http_stream_cache_status = None;
         self.tracks.open = None;
         self.frame.source_size = None;
         self.playback_info = None;
@@ -188,6 +192,7 @@ impl PlaybackPage {
         self.timeline.buffering = false;
         self.timeline.buffered_until = None;
         self.timeline.http_stream_buffered_range = None;
+        self.timeline.http_stream_cache_status = None;
         self.timeline.http_stream_buffer_poll_active = false;
         self.timeline.pending_seek_position = None;
         self.timeline.pending_seek_keeps_frame = false;

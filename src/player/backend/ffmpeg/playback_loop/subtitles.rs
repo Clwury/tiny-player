@@ -57,11 +57,14 @@ impl SubtitlePipeline {
     pub(super) fn switch_tracks(
         &mut self,
         source: &FfmpegPlaybackInput,
-        input: &FormatContext,
+        stream_catalog: &StreamCatalog,
         video_size: Option<RenderSize>,
         start_position_nsecs: u64,
     ) -> std::result::Result<(), String> {
-        let stream = select_subtitle_stream_for_selection(&source.selected_tracks, input)?;
+        let stream = select_subtitle_stream_for_selection_from_catalog(
+            &source.selected_tracks,
+            stream_catalog,
+        )?;
         let decoder = open_subtitle_decoder(stream, video_size)?;
         let filter = match stream {
             Some(stream) => PgsFrameMergeBitstreamFilter::new(stream)?,

@@ -217,17 +217,39 @@ pub(super) fn content_len_from_response(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) struct HttpContentRange {
+    pub(in crate::player::backend::ffmpeg) start: u64,
+    pub(in crate::player::backend::ffmpeg) end: u64,
+    pub(in crate::player::backend::ffmpeg) total: Option<u64>,
+}
+
 pub(in crate::player::backend::ffmpeg) fn content_len_from_content_range(
     headers: &reqwest::header::HeaderMap,
 ) -> Option<u64> {
+    content_range_from_headers(headers)?.total
+}
+
+pub(in crate::player::backend::ffmpeg) fn content_range_from_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<HttpContentRange> {
     let value = headers
         .get(reqwest::header::CONTENT_RANGE)?
         .to_str()
         .ok()?
         .trim();
-    let total = value.rsplit_once('/')?.1;
-    if total == "*" {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, total) = value.rsplit_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    if end < start {
         return None;
     }
-    total.parse().ok()
+    let total = if total == "*" {
+        None
+    } else {
+        Some(total.parse().ok()?)
+    };
+    Some(HttpContentRange { start, end, total })
 }

@@ -300,11 +300,8 @@ impl PlaybackPage {
         self.timeline.progress_drag_position = None;
         self.timeline.ended = false;
         self.timeline.position = Some(position);
-        self.timeline.buffered_until = self
-            .timeline
-            .buffered_until
-            .map(|buffered_until| buffered_until.max(position))
-            .or(Some(position));
+        self.timeline.buffered_until =
+            buffered_until_after_seek(self.timeline.buffered_until, position);
         self.timeline.pending_seek_position = Some(position);
         self.timeline.pending_seek_keeps_frame = true;
         self.timeline.buffering = false;
@@ -791,12 +788,8 @@ impl PlaybackPage {
             .or(self.timeline.position)
             .unwrap_or(0.0);
         let played_fraction = progress_fraction(position, duration);
-        let playback_buffered_fraction =
+        let buffered_fraction =
             buffered_progress_fraction(self.timeline.buffered_until, position, duration);
-        let buffered_fraction = combined_buffered_progress_fraction(
-            playback_buffered_fraction,
-            self.timeline.http_stream_buffered_range,
-        );
         let current_time = format_playback_time(position);
         let duration_time = format_playback_time(duration);
         let can_toggle_playback = self.can_toggle_playback();

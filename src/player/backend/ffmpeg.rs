@@ -2,9 +2,12 @@ use std::{
     collections::VecDeque,
     env,
     ffi::{CStr, CString},
+    fs::{File, OpenOptions},
     io::Read,
     mem,
     os::raw::{c_char, c_int, c_void},
+    os::unix::fs::FileExt,
+    path::PathBuf,
     ptr, slice,
     sync::{
         Arc, Condvar, Mutex,
@@ -12,7 +15,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use cpal::{
@@ -23,10 +26,14 @@ use ffmpeg_sys_next as ffi;
 
 use super::{
     BackendControl, BackendError, BackendEvent, BackendEventKind, BackendLoadRequest,
-    BackendSubtitleBitmap, BackendSubtitleCue, HttpStreamBufferProgress, PlaybackVideoInfo, Result,
+    BackendSubtitleBitmap, BackendSubtitleCue, HttpStreamBufferProgress, HttpStreamCacheStatus,
+    PlaybackVideoInfo, Result,
 };
 use crate::player::{
-    dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat},
+    dovi::{
+        DoviFrameMetadata, DoviRpuExtractor, DoviRpuStripResult, HevcStreamFormat,
+        strip_dovi_rpu_nalus,
+    },
     ffmpeg_dovi::FfmpegDoviMetadata,
     render_host::{
         DecodedFrame, FfmpegAvBufferRef, FfmpegFrameRef, FrameBufferPool, FrameColor,
@@ -58,26 +65,33 @@ use audio::{
     AudioBuffer, AudioShared, audio_samples_duration, fill_audio_output, samples_for_duration,
 };
 use audio::{AudioOutput, audio_sample_len, frame_sample_format, zeroed_channel_layout};
-use avio::reqwest_header_pairs;
 #[cfg(test)]
 use avio::{
-    HttpRingCacheState, content_len_from_content_range, ffmpeg_http_headers,
-    http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
+    CacheReadResult, HttpContentRange, HttpRingCacheState, content_len_from_content_range,
+    content_range_from_headers, ffmpeg_http_headers, http_cache_range_header,
+    http_cache_range_request_len, http_cache_range_request_timeout,
     http_cache_request_headers_for_log, http_cache_response_headers_for_log, should_cache_http_url,
 };
+use avio::{HttpRingCache, reqwest_header_pairs};
 use bsf::PgsFrameMergeBitstreamFilter;
 #[cfg(test)]
-use clock::{MappedTimestamp, WaitStatus};
+use clock::{
+    MappedTimestamp, WaitStatus, pop_audio_clocked_video_frame,
+    queued_video_frame_ready_for_audio_clock, should_drop_late_video_frame,
+};
 use clock::{
     PlaybackScheduler, QueuedVideoFrame, TimestampMapper, drain_audio_clocked_video_queue,
-    duration_nsecs, frame_best_effort_timestamp, max_optional_seconds, nsecs_to_timestamp,
-    optional_buffered_value_changed, present_decoded_video_frame,
-    present_due_audio_clocked_video_frames, pts_distance, queued_video_duration,
-    queued_video_limit_duration, queued_video_target_duration, seconds_to_nsecs,
-    should_drop_late_video_frame, stream_frame_duration_nsecs, timestamp_to_nsecs,
-    wait_for_audio_clocked_video_queue,
+    duration_nsecs, frame_best_effort_timestamp, frame_decode_error_flags, frame_is_corrupt,
+    max_optional_seconds, nsecs_to_seconds, nsecs_to_timestamp, optional_buffered_value_changed,
+    present_decoded_video_frame, present_due_audio_clocked_video_frames, pts_distance,
+    queued_video_duration, queued_video_limit_duration, queued_video_target_duration,
+    seconds_to_nsecs, should_drop_late_queued_video_frame, stream_frame_duration_nsecs,
+    timestamp_to_nsecs, wait_for_audio_clocked_video_queue,
 };
-use codec::{AudioResampler, AvFrame, AvPacket, Decoder, VideoScaler};
+use codec::{
+    AudioResampler, AvFrame, AvPacket, Decoder, VideoScaler, packet_is_video_recovery_point,
+    packet_is_video_seek_point,
+};
 use dovi::{DoviPipeline, ffmpeg_dovi_metadata_from_frame};
 #[cfg(test)]
 use dovi::{dovi_packet_timeline_nsecs, has_annex_b_start_code};
@@ -109,23 +123,42 @@ const RPU_QUEUE_CAPACITY: usize = 2048;
 const AUDIO_BUFFER_SECONDS: usize = 4;
 const AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(300);
 const AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(120);
+const AUDIO_CLOCK_VIDEO_PRESENT_LEAD: Duration = Duration::from_millis(15);
+const AUDIO_OUTPUT_DELAY_LIMIT: Duration = Duration::from_millis(500);
 const VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(90);
 const VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(40);
 const PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(700);
 const PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(500);
+const DEMUX_PACKET_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+const DEMUX_PACKET_CACHE_READAHEAD_NSECS: u64 = 120 * 1_000_000_000;
+const DEMUX_PACKET_CACHE_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+const DEMUX_PACKET_CACHE_STALL_LOG_AFTER: Duration = Duration::from_millis(500);
+const DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_AFTER: Duration = Duration::from_millis(500);
+const DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const DEMUX_PACKET_CACHE_DEFAULT_DISK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const LATE_VIDEO_DROP_TOLERANCE: Duration = Duration::from_millis(75);
 const DEFAULT_PLAYBACK_VOLUME: f32 = 1.0;
 const PLAYBACK_VOLUME_SCALE: u32 = 10_000;
 const HTTP_RING_CACHE_CAPACITY: usize = 500 * 1024 * 1024;
-const HTTP_CACHE_CHUNK_SIZE: usize = 256 * 1024;
+const HTTP_CACHE_CHUNK_SIZE: usize = 1024 * 1024;
 const HTTP_CACHE_RANGE_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
 const HTTP_CACHE_WAIT_INTERVAL: Duration = Duration::from_millis(50);
+const HTTP_CACHE_STALL_LOG_AFTER: Duration = Duration::from_millis(500);
+const HTTP_CACHE_STALL_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const HTTP_CACHE_PREFETCH_PAUSE_LOG_AFTER: Duration = Duration::from_millis(500);
+const HTTP_CACHE_PREFETCH_PAUSE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const HTTP_CACHE_PARTIAL_READ_MIN_BYTES: usize = 256 * 1024;
 const HTTP_CACHE_CONTENT_LEN_WAIT: Duration = Duration::from_secs(1);
 const HTTP_CACHE_RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
 const HTTP_CACHE_SMALL_RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_CACHE_PROGRESS_REPORT_THRESHOLD: f64 = 0.001;
-const FFMPEG_AVIO_BUFFER_SIZE: c_int = 256 * 1024;
+#[cfg(test)]
+const HTTP_CACHE_PROBE_READ_WAIT: Duration = Duration::from_millis(250);
+const HTTP_CACHE_DEFAULT_READAHEAD_SECONDS: f64 = 120.0;
+const HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS: f64 = 10.0;
+const FFMPEG_AVIO_BUFFER_SIZE: c_int = 1024 * 1024;
 const FFMPEG_FAST_PROBE_SIZE: usize = 1024 * 1024;
 const FFMPEG_FAST_ANALYZE_DURATION_US: u64 = 1_000_000;
 const FFMPEG_SUBTITLE_PROBE_SIZE: usize = 64 * 1024 * 1024;

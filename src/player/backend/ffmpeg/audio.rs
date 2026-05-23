@@ -11,6 +11,12 @@ pub(super) struct AudioShared {
     pub(super) buffer: Mutex<AudioBuffer>,
     pub(super) ready: Condvar,
     pub(super) played_samples: AtomicU64,
+    pub(super) queued_end_timeline_nsecs: AtomicU64,
+    output_delay_nsecs: AtomicU64,
+    output_delay_updated_nsecs: AtomicU64,
+    clock_start: Instant,
+    sample_rate: c_int,
+    channels: c_int,
     pub(super) control: Arc<FfmpegControl>,
 }
 
@@ -81,6 +87,109 @@ impl AudioBuffer {
     }
 }
 
+impl AudioShared {
+    pub(super) fn new(
+        max_samples: usize,
+        sample_rate: c_int,
+        channels: c_int,
+        control: Arc<FfmpegControl>,
+    ) -> Self {
+        Self {
+            buffer: Mutex::new(AudioBuffer::with_capacity(max_samples)),
+            ready: Condvar::new(),
+            played_samples: AtomicU64::new(0),
+            queued_end_timeline_nsecs: AtomicU64::new(0),
+            output_delay_nsecs: AtomicU64::new(0),
+            output_delay_updated_nsecs: AtomicU64::new(0),
+            clock_start: Instant::now(),
+            sample_rate,
+            channels,
+            control,
+        }
+    }
+
+    pub(super) fn reset_clock(&self, timeline_nsecs: u64) {
+        if let Ok(mut guard) = self.buffer.lock() {
+            guard.clear();
+            self.ready.notify_all();
+        }
+        self.played_samples.store(
+            samples_for_duration(timeline_nsecs, self.sample_rate, self.channels),
+            Ordering::Relaxed,
+        );
+        self.queued_end_timeline_nsecs
+            .store(timeline_nsecs, Ordering::Relaxed);
+        self.update_output_delay(Duration::ZERO);
+    }
+
+    pub(super) fn set_queued_end_timeline_nsecs(&self, timeline_nsecs: u64) {
+        self.queued_end_timeline_nsecs
+            .store(timeline_nsecs, Ordering::Relaxed);
+    }
+
+    fn queued_duration(&self) -> std::result::Result<Duration, String> {
+        let queued_samples = self
+            .buffer
+            .lock()
+            .map_err(|_| "系统音频缓冲区已损坏".to_string())?
+            .len();
+        Ok(audio_samples_duration(
+            queued_samples,
+            self.sample_rate,
+            self.channels,
+        ))
+    }
+
+    fn queued_duration_nsecs(&self) -> u64 {
+        self.queued_duration()
+            .map(duration_nsecs)
+            .unwrap_or_default()
+    }
+
+    fn output_delay_nsecs(&self) -> u64 {
+        let delay = self.output_delay_nsecs.load(Ordering::Relaxed);
+        if delay == 0 {
+            return 0;
+        }
+        let updated = self.output_delay_updated_nsecs.load(Ordering::Relaxed);
+        let elapsed = duration_nsecs(self.clock_start.elapsed()).saturating_sub(updated);
+        delay.saturating_sub(elapsed)
+    }
+
+    fn update_output_delay(&self, delay: Duration) {
+        let delay = delay.min(AUDIO_OUTPUT_DELAY_LIMIT);
+        self.output_delay_nsecs
+            .store(duration_nsecs(delay), Ordering::Relaxed);
+        self.output_delay_updated_nsecs.store(
+            duration_nsecs(self.clock_start.elapsed()),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(super) fn played_timeline_nsecs(&self) -> u64 {
+        self.queued_end_timeline_nsecs
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.queued_duration_nsecs())
+            .saturating_sub(self.output_delay_nsecs())
+    }
+
+    fn pending_duration(&self) -> std::result::Result<Duration, String> {
+        Ok(self
+            .queued_duration()?
+            .saturating_add(Duration::from_nanos(self.output_delay_nsecs())))
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_output_delay_for_test(&self, delay: Duration) {
+        self.output_delay_nsecs
+            .store(duration_nsecs(delay), Ordering::Relaxed);
+        self.output_delay_updated_nsecs.store(
+            duration_nsecs(self.clock_start.elapsed()).saturating_add(1_000_000_000),
+            Ordering::Relaxed,
+        );
+    }
+}
+
 impl AudioOutput {
     pub(super) fn new(control: Arc<FfmpegControl>) -> std::result::Result<Self, String> {
         let host = cpal::default_host();
@@ -123,12 +232,12 @@ impl AudioOutput {
             .and_then(|rate| rate.checked_mul(usize::try_from(channels).ok()?))
             .and_then(|samples| samples.checked_mul(AUDIO_BUFFER_SECONDS))
             .ok_or_else(|| "系统音频缓冲区过大".to_string())?;
-        let shared = Arc::new(AudioShared {
-            buffer: Mutex::new(AudioBuffer::with_capacity(max_samples)),
-            ready: Condvar::new(),
-            played_samples: AtomicU64::new(0),
+        let shared = Arc::new(AudioShared::new(
+            max_samples,
+            sample_rate,
+            channels,
             control,
-        });
+        ));
         let config: cpal::StreamConfig = supported_config.clone().into();
         let sample_format = supported_config.sample_format();
         tracing::debug!(
@@ -194,9 +303,11 @@ impl AudioOutput {
         self.channels
     }
 
-    pub(super) fn push<F>(
+    pub(super) fn push_timed<F>(
         &self,
         samples: Vec<f32>,
+        start_timeline_nsecs: u64,
+        end_timeline_nsecs: u64,
         control: &FfmpegControl,
         mut on_wait: F,
     ) -> std::result::Result<(), String>
@@ -204,6 +315,7 @@ impl AudioOutput {
         F: FnMut() -> std::result::Result<(), String>,
     {
         let mut offset = 0;
+        let total_samples = samples.len();
         while offset < samples.len() {
             if control.should_interrupt() {
                 return Ok(());
@@ -238,6 +350,15 @@ impl AudioOutput {
             let end = (offset + capacity).min(samples.len());
             let written = guard.push_slice(&samples[offset..end]);
             offset += written;
+            if total_samples > 0 {
+                self.shared
+                    .set_queued_end_timeline_nsecs(interpolated_audio_timeline_nsecs(
+                        start_timeline_nsecs,
+                        end_timeline_nsecs,
+                        offset,
+                        total_samples,
+                    ));
+            }
             self.shared.ready.notify_all();
             drop(guard);
             on_wait()?;
@@ -246,27 +367,11 @@ impl AudioOutput {
     }
 
     pub(super) fn reset_clock(&self, timeline_nsecs: u64) {
-        if let Ok(mut guard) = self.shared.buffer.lock() {
-            guard.clear();
-            self.shared.played_samples.store(0, Ordering::Relaxed);
-            self.shared.ready.notify_all();
-        }
-        self.shared.played_samples.store(
-            samples_for_duration(timeline_nsecs, self.sample_rate, self.channels),
-            Ordering::Relaxed,
-        );
+        self.shared.reset_clock(timeline_nsecs);
     }
 
     pub(super) fn played_timeline_nsecs(&self) -> u64 {
-        audio_samples_duration(
-            usize::try_from(self.shared.played_samples.load(Ordering::Relaxed))
-                .unwrap_or(usize::MAX),
-            self.sample_rate,
-            self.channels,
-        )
-        .as_nanos()
-        .try_into()
-        .unwrap_or(u64::MAX)
+        self.shared.played_timeline_nsecs()
     }
 
     pub(super) fn wait_for_progress(
@@ -280,7 +385,7 @@ impl AudioOutput {
             .lock()
             .map_err(|_| "系统音频缓冲区已损坏".to_string())?;
         while self.shared.played_samples.load(Ordering::Relaxed) == previous
-            && !guard.is_empty()
+            && (!guard.is_empty() || self.shared.output_delay_nsecs() > 0)
             && !control.should_interrupt()
         {
             let (next_guard, _) = self
@@ -295,7 +400,7 @@ impl AudioOutput {
 
     pub(super) fn drain(&self, control: &FfmpegControl) -> std::result::Result<(), String> {
         let timeout = self
-            .queued_duration()?
+            .pending_duration()?
             .saturating_add(Duration::from_millis(250));
         let Some(deadline) = Instant::now().checked_add(timeout) else {
             return Ok(());
@@ -306,7 +411,9 @@ impl AudioOutput {
             .buffer
             .lock()
             .map_err(|_| "系统音频缓冲区已损坏".to_string())?;
-        while !guard.is_empty() && !control.should_interrupt() {
+        while (!guard.is_empty() || self.shared.output_delay_nsecs() > 0)
+            && !control.should_interrupt()
+        {
             let now = Instant::now();
             if now >= deadline {
                 tracing::debug!(
@@ -326,18 +433,8 @@ impl AudioOutput {
         Ok(())
     }
 
-    pub(super) fn queued_duration(&self) -> std::result::Result<Duration, String> {
-        let queued_samples = self
-            .shared
-            .buffer
-            .lock()
-            .map_err(|_| "系统音频缓冲区已损坏".to_string())?
-            .len();
-        Ok(audio_samples_duration(
-            queued_samples,
-            self.sample_rate,
-            self.channels,
-        ))
+    pub(super) fn pending_duration(&self) -> std::result::Result<Duration, String> {
+        self.shared.pending_duration()
     }
 }
 
@@ -479,14 +576,37 @@ where
     let error_callback = |error| tracing::warn!(%error, "native audio output stream error");
     device.build_output_stream(
         config,
-        move |data: &mut [T], _| fill_audio_output(data, &shared),
+        move |data: &mut [T], info| fill_audio_output_with_timing(data, info, &shared),
         error_callback,
         None,
     )
 }
 
+#[cfg(test)]
 pub(super) fn fill_audio_output<T>(data: &mut [T], shared: &AudioShared)
 where
+    T: Sample + FromSample<f32>,
+{
+    fill_audio_output_samples(data, shared, None);
+}
+
+pub(super) fn fill_audio_output_with_timing<T>(
+    data: &mut [T],
+    info: &cpal::OutputCallbackInfo,
+    shared: &AudioShared,
+) where
+    T: Sample + FromSample<f32>,
+{
+    let timestamp = info.timestamp();
+    let playback_delay = timestamp.playback.duration_since(&timestamp.callback);
+    fill_audio_output_samples(data, shared, playback_delay);
+}
+
+fn fill_audio_output_samples<T>(
+    data: &mut [T],
+    shared: &AudioShared,
+    playback_delay: Option<Duration>,
+) where
     T: Sample + FromSample<f32>,
 {
     let mut guard = shared.buffer.lock().expect("audio output buffer poisoned");
@@ -494,6 +614,7 @@ where
         for sample in data {
             *sample = T::from_sample(0.0);
         }
+        shared.update_output_delay(Duration::ZERO);
         shared.ready.notify_all();
         return;
     }
@@ -515,6 +636,18 @@ where
 
     if played > 0 {
         shared.played_samples.fetch_add(played, Ordering::Relaxed);
+        let played_duration = audio_samples_duration(
+            usize::try_from(played).unwrap_or(usize::MAX),
+            shared.sample_rate,
+            shared.channels,
+        );
+        shared.update_output_delay(
+            playback_delay
+                .unwrap_or_default()
+                .saturating_add(played_duration),
+        );
+    } else {
+        shared.update_output_delay(Duration::ZERO);
     }
     shared.ready.notify_all();
 }
@@ -592,6 +725,22 @@ pub(super) fn audio_samples_duration(
     }
     let nanos = (samples as u128).saturating_mul(1_000_000_000) / denominator;
     Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+fn interpolated_audio_timeline_nsecs(
+    start_timeline_nsecs: u64,
+    end_timeline_nsecs: u64,
+    written_samples: usize,
+    total_samples: usize,
+) -> u64 {
+    if written_samples >= total_samples || total_samples == 0 {
+        return end_timeline_nsecs;
+    }
+
+    let duration = end_timeline_nsecs.saturating_sub(start_timeline_nsecs);
+    let written_duration =
+        (duration as u128).saturating_mul(written_samples as u128) / total_samples as u128;
+    start_timeline_nsecs.saturating_add(u64::try_from(written_duration).unwrap_or(u64::MAX))
 }
 
 pub(super) fn samples_for_duration(

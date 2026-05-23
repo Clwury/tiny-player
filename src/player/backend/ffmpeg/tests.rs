@@ -2,9 +2,11 @@ use super::avio::HttpCacheRangeKind;
 use super::worker::{PendingSeek, PendingTrackSelection};
 use super::*;
 use playback_loop::{
-    initial_probe_profile, playback_read_finished, rebase_subtitle_cues_to_timeline_origin,
-    subtitle_cue_timeline_nsecs, subtitle_timestamp_to_timeline_nsecs,
-    trim_overlapping_subtitle_cues_at,
+    DecodedVideoFrameStartAction, VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VideoDecodeRecovery,
+    decoded_video_frame_start_action, initial_probe_profile, playback_read_finished,
+    rebase_subtitle_cues_to_timeline_origin, subtitle_cue_timeline_nsecs,
+    subtitle_timestamp_to_timeline_nsecs, trim_overlapping_subtitle_cues_at,
+    video_decode_error_is_recoverable,
 };
 
 #[test]
@@ -491,6 +493,19 @@ fn buffered_reporter_reports_first_audio_video_update_after_reset() {
     assert_buffered_event(&rx, session_id, Some(13.0));
 }
 
+#[test]
+fn buffered_reporter_can_update_without_emitting_events() {
+    let (tx, rx) = mpsc::channel();
+    let mut reporter = BufferedReporter::new_with_events(false, false);
+    let session_id = PlaybackSessionId(9);
+
+    reporter.reset_to(0.0, session_id, &tx);
+    reporter.report_video_timeline_nsecs(2_000_000_000, session_id, &tx);
+
+    assert_eq!(reporter.buffered_until(), Some(2.0));
+    assert!(rx.try_recv().is_err());
+}
+
 fn assert_buffered_event(
     rx: &Receiver<BackendEvent>,
     expected_session_id: PlaybackSessionId,
@@ -544,6 +559,48 @@ fn queued_video_window_expands_for_pgs_subtitle_prefetch() {
         queued_video_target_duration(&queue, true),
         PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION
     );
+}
+
+#[test]
+fn audio_clock_video_frames_are_ready_with_small_present_lead() {
+    let mut queue = VecDeque::new();
+    queue.push_back(test_queued_video_frame(1_000_000_000));
+
+    assert!(!queued_video_frame_ready_for_audio_clock(
+        &queue,
+        984_000_000
+    ));
+    assert!(queued_video_frame_ready_for_audio_clock(
+        &queue,
+        985_000_000
+    ));
+}
+
+#[test]
+fn audio_clock_video_pop_only_advances_one_early_frame() {
+    let mut queue = VecDeque::new();
+    queue.push_back(test_queued_video_frame(1_000_000_000));
+    queue.push_back(test_queued_video_frame(1_010_000_000));
+
+    let frame = pop_audio_clocked_video_frame(&mut queue, 985_000_000).unwrap();
+
+    assert_eq!(frame.timeline_nsecs, 1_000_000_000);
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue.front().unwrap().timeline_nsecs, 1_010_000_000);
+}
+
+#[test]
+fn audio_clock_video_pop_catches_up_to_latest_overdue_frame() {
+    let mut queue = VecDeque::new();
+    queue.push_back(test_queued_video_frame(1_000_000_000));
+    queue.push_back(test_queued_video_frame(1_010_000_000));
+    queue.push_back(test_queued_video_frame(1_020_000_000));
+
+    let frame = pop_audio_clocked_video_frame(&mut queue, 1_015_000_000).unwrap();
+
+    assert_eq!(frame.timeline_nsecs, 1_010_000_000);
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue.front().unwrap().timeline_nsecs, 1_020_000_000);
 }
 
 #[test]
@@ -626,6 +683,198 @@ fn late_video_drop_waits_for_grace_after_frame_end() {
     ));
 }
 
+#[test]
+fn late_video_drop_keeps_frame_when_video_queue_is_empty() {
+    let empty_queue = VecDeque::new();
+    let queued_frame = test_queued_video_frame(1_200_000_000);
+    let queued = VecDeque::from([queued_frame]);
+
+    assert!(!should_drop_late_queued_video_frame(
+        1_000_000_000,
+        16_000_000,
+        1_091_000_000,
+        &empty_queue
+    ));
+    assert!(should_drop_late_queued_video_frame(
+        1_000_000_000,
+        16_000_000,
+        1_091_000_000,
+        &queued
+    ));
+}
+
+#[test]
+fn video_frame_corruption_detection_uses_flags_and_decode_errors() {
+    assert!(!frame_is_corrupt(std::ptr::null_mut()));
+    assert_eq!(frame_decode_error_flags(std::ptr::null_mut()), 0);
+
+    let mut frame = AvFrame::new().expect("frame allocates");
+    assert!(!frame_is_corrupt(frame.as_mut_ptr()));
+
+    unsafe {
+        (*frame.as_mut_ptr()).flags = ffi::AV_FRAME_FLAG_CORRUPT;
+    }
+    assert!(frame_is_corrupt(frame.as_mut_ptr()));
+
+    unsafe {
+        (*frame.as_mut_ptr()).flags = 0;
+        (*frame.as_mut_ptr()).decode_error_flags = ffi::FF_DECODE_ERROR_MISSING_REFERENCE;
+    }
+    assert!(frame_is_corrupt(frame.as_mut_ptr()));
+    assert_eq!(
+        frame_decode_error_flags(frame.as_mut_ptr()),
+        ffi::FF_DECODE_ERROR_MISSING_REFERENCE
+    );
+}
+
+#[test]
+fn video_decode_recovery_waits_for_keyframe_after_error() {
+    let mut recovery = VideoDecodeRecovery::default();
+    let mut delta_packet = AvPacket::new().expect("packet allocates");
+    let mut key_packet = AvPacket::new().expect("packet allocates");
+    unsafe {
+        (*delta_packet.as_mut_ptr()).flags = 0;
+        (*key_packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+    }
+
+    assert!(!recovery.waiting_for_keyframe());
+    assert!(!recovery.should_skip_packet(&delta_packet, ffi::AVCodecID::AV_CODEC_ID_MPEG4));
+
+    recovery.begin_with_realign(true);
+    assert!(recovery.waiting_for_keyframe());
+    assert!(recovery.should_skip_packet(&delta_packet, ffi::AVCodecID::AV_CODEC_ID_MPEG4));
+    assert_eq!(recovery.record_skipped_packet(), 1);
+    assert_eq!(recovery.record_skipped_packet(), 2);
+    assert!(!recovery.should_skip_packet(&key_packet, ffi::AVCodecID::AV_CODEC_ID_MPEG4));
+    assert!(recovery.accept_recovery_point(&key_packet, ffi::AVCodecID::AV_CODEC_ID_MPEG4));
+    assert!(!recovery.waiting_for_keyframe());
+    assert!(recovery.take_realign_on_next_frame());
+    assert!(!recovery.take_realign_on_next_frame());
+}
+
+#[test]
+fn video_decode_recovery_can_resume_without_realign_after_live_error() {
+    let mut recovery = VideoDecodeRecovery::default();
+    let mut key_packet = AvPacket::new().expect("packet allocates");
+    unsafe {
+        (*key_packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+    }
+
+    recovery.begin_with_realign(false);
+    assert!(recovery.waiting_for_keyframe());
+    assert!(recovery.accept_recovery_point(&key_packet, ffi::AVCodecID::AV_CODEC_ID_MPEG4));
+    assert!(!recovery.waiting_for_keyframe());
+    assert!(!recovery.take_realign_on_next_frame());
+}
+
+#[test]
+fn video_decode_recovery_waits_for_hevc_seek_recovery_point_after_seek() {
+    let mut recovery = VideoDecodeRecovery::default();
+    let mut key_idr_packet = test_packet_from_data(&[0, 0, 0, 3, 0x26, 0x01, 0xaa]);
+    unsafe {
+        (*key_idr_packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+    }
+
+    recovery.reset_for_timeline_start(ffi::AVCodecID::AV_CODEC_ID_HEVC, 0);
+    assert!(!recovery.waiting_for_keyframe());
+
+    recovery.reset_for_timeline_start(ffi::AVCodecID::AV_CODEC_ID_MPEG4, 1_000_000_000);
+    assert!(!recovery.waiting_for_keyframe());
+
+    recovery.reset_for_timeline_start(ffi::AVCodecID::AV_CODEC_ID_HEVC, 1_000_000_000);
+    assert!(recovery.waiting_for_keyframe());
+    assert!(recovery.accept_recovery_point(&key_idr_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+    assert!(!recovery.take_realign_on_next_frame());
+}
+
+fn test_packet_from_data(data: &[u8]) -> AvPacket {
+    let props = AvPacket::new().expect("packet props allocate");
+    AvPacket::from_data_and_props(data, &props).expect("packet data allocates")
+}
+
+#[test]
+fn video_decode_recovery_hevc_requires_safe_key_recovery_point() {
+    let mut recovery = VideoDecodeRecovery::default();
+    let mut non_key_idr_packet = test_packet_from_data(&[0, 0, 0, 3, 0x26, 0x01, 0xaa]);
+    let mut key_idr_packet = test_packet_from_data(&[0, 0, 0, 3, 0x26, 0x01, 0xaa]);
+    unsafe {
+        (*non_key_idr_packet.as_mut_ptr()).flags = 0;
+        (*key_idr_packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+    }
+
+    recovery.begin_with_realign(true);
+    assert!(recovery.should_skip_packet(&non_key_idr_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+    assert!(!recovery.accept_recovery_point(&non_key_idr_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+    assert!(!recovery.should_skip_packet(&key_idr_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+    assert!(recovery.accept_recovery_point(&key_idr_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+}
+
+#[test]
+fn video_decode_recovery_has_bounded_wait_for_recovery_point() {
+    let mut recovery = VideoDecodeRecovery::default();
+    let delta_packet = AvPacket::new().expect("packet allocates");
+
+    recovery.begin_with_realign(true);
+    for _ in 0..VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS {
+        assert!(recovery.should_skip_packet(&delta_packet, ffi::AVCodecID::AV_CODEC_ID_MPEG4));
+        recovery.record_skipped_packet();
+    }
+
+    assert!(!recovery.should_skip_packet(&delta_packet, ffi::AVCodecID::AV_CODEC_ID_MPEG4));
+    assert!(recovery.accept_after_wait_limit(ffi::AVCodecID::AV_CODEC_ID_MPEG4));
+    assert!(!recovery.waiting_for_keyframe());
+    assert!(recovery.take_realign_on_next_frame());
+}
+
+#[test]
+fn video_decode_recovery_hevc_does_not_resume_after_wait_limit() {
+    let mut recovery = VideoDecodeRecovery::default();
+    let delta_packet = AvPacket::new().expect("packet allocates");
+
+    recovery.begin_with_realign(true);
+    for _ in 0..VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS {
+        assert!(recovery.should_skip_packet(&delta_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+        recovery.record_skipped_packet();
+    }
+
+    assert!(recovery.should_skip_packet(&delta_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+    assert!(!recovery.accept_after_wait_limit(ffi::AVCodecID::AV_CODEC_ID_HEVC));
+    assert!(recovery.waiting_for_keyframe());
+    assert!(!recovery.take_realign_on_next_frame());
+}
+
+#[test]
+fn recovered_video_frame_realigns_before_start_gate() {
+    assert_eq!(
+        decoded_video_frame_start_action(9_000_000_000, 10_000_000_000, false),
+        DecodedVideoFrameStartAction::DropBeforeStart
+    );
+    assert_eq!(
+        decoded_video_frame_start_action(9_000_000_000, 10_000_000_000, true),
+        DecodedVideoFrameStartAction::Use { realign: true }
+    );
+    assert_eq!(
+        decoded_video_frame_start_action(11_000_000_000, 10_000_000_000, true),
+        DecodedVideoFrameStartAction::Use { realign: true }
+    );
+}
+
+#[test]
+fn video_decode_error_recovery_classifies_decoder_errors() {
+    assert!(video_decode_error_is_recoverable(
+        "FFmpeg 接收解码帧失败：Invalid data found when processing input"
+    ));
+    assert!(video_decode_error_is_recoverable(
+        "FFmpeg 发送解码包失败：Invalid data found when processing input"
+    ));
+    assert!(!video_decode_error_is_recoverable(
+        "FFmpeg 发送解码包失败：Cannot allocate memory"
+    ));
+    assert!(!video_decode_error_is_recoverable(
+        "FFmpeg 创建视频色彩转换器失败"
+    ));
+}
+
 fn test_queued_video_frame(timeline_nsecs: u64) -> QueuedVideoFrame {
     QueuedVideoFrame {
         frame: DecodedFrame {
@@ -640,6 +889,7 @@ fn test_queued_video_frame(timeline_nsecs: u64) -> QueuedVideoFrame {
             pixels: FramePixels::Bgra8(vec![0, 0, 0, 255].into()),
         },
         timeline_nsecs,
+        duration_nsecs: DEFAULT_VIDEO_FRAME_DURATION_NSECS,
     }
 }
 
@@ -695,6 +945,50 @@ fn samples_for_duration_accounts_for_interleaved_channels() {
     assert_eq!(samples_for_duration(1_000_000_000, 48_000, 0), 0);
 }
 
+fn test_audio_shared(max_samples: usize) -> AudioShared {
+    AudioShared::new(
+        max_samples,
+        48_000,
+        FALLBACK_AUDIO_OUTPUT_CHANNELS,
+        Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
+    )
+}
+
+#[test]
+fn audio_clock_uses_queued_end_minus_pending_audio() {
+    let shared = test_audio_shared(960);
+    shared.reset_clock(1_000_000_000);
+    assert_eq!(
+        shared
+            .buffer
+            .lock()
+            .expect("audio output buffer poisoned")
+            .push_slice(&vec![0.0; 960]),
+        960
+    );
+    shared.set_queued_end_timeline_nsecs(1_010_000_000);
+
+    assert_eq!(shared.played_timeline_nsecs(), 1_000_000_000);
+}
+
+#[test]
+fn audio_clock_subtracts_output_device_delay() {
+    let shared = test_audio_shared(960);
+    shared.reset_clock(1_000_000_000);
+    assert_eq!(
+        shared
+            .buffer
+            .lock()
+            .expect("audio output buffer poisoned")
+            .push_slice(&vec![0.0; 960]),
+        960
+    );
+    shared.set_queued_end_timeline_nsecs(1_010_000_000);
+    shared.set_output_delay_for_test(Duration::from_millis(20));
+
+    assert_eq!(shared.played_timeline_nsecs(), 980_000_000);
+}
+
 #[test]
 fn dovi_packet_timeline_uses_stream_start_when_available() {
     let time_base = ffi::AVRational { num: 1, den: 1_000 };
@@ -729,14 +1023,15 @@ fn dovi_packet_timeline_uses_first_packet_when_stream_start_is_missing() {
 
 #[test]
 fn fill_audio_output_converts_samples_and_outputs_silence_on_underrun() {
-    let mut buffer = AudioBuffer::with_capacity(8);
-    assert_eq!(buffer.push_slice(&[-1.0, 0.0, 1.0]), 3);
-    let shared = AudioShared {
-        buffer: Mutex::new(buffer),
-        ready: Condvar::new(),
-        played_samples: AtomicU64::new(0),
-        control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
-    };
+    let shared = test_audio_shared(8);
+    assert_eq!(
+        shared
+            .buffer
+            .lock()
+            .expect("audio output buffer poisoned")
+            .push_slice(&[-1.0, 0.0, 1.0]),
+        3
+    );
     let mut output = [0.0f64; 4];
 
     fill_audio_output(&mut output, &shared);
@@ -754,16 +1049,16 @@ fn fill_audio_output_converts_samples_and_outputs_silence_on_underrun() {
 
 #[test]
 fn fill_audio_output_applies_playback_volume() {
-    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
-    control.set_volume(0.25);
-    let mut buffer = AudioBuffer::with_capacity(8);
-    assert_eq!(buffer.push_slice(&[-1.0, 0.5, 1.0]), 3);
-    let shared = AudioShared {
-        buffer: Mutex::new(buffer),
-        ready: Condvar::new(),
-        played_samples: AtomicU64::new(0),
-        control,
-    };
+    let shared = test_audio_shared(8);
+    shared.control.set_volume(0.25);
+    assert_eq!(
+        shared
+            .buffer
+            .lock()
+            .expect("audio output buffer poisoned")
+            .push_slice(&[-1.0, 0.5, 1.0]),
+        3
+    );
     let mut output = [0.0f64; 3];
 
     fill_audio_output(&mut output, &shared);
@@ -774,16 +1069,16 @@ fn fill_audio_output_applies_playback_volume() {
 
 #[test]
 fn fill_audio_output_preserves_buffer_while_paused() {
-    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
-    control.set_paused(true);
-    let mut buffer = AudioBuffer::with_capacity(8);
-    assert_eq!(buffer.push_slice(&[-1.0, 0.0, 1.0]), 3);
-    let shared = AudioShared {
-        buffer: Mutex::new(buffer),
-        ready: Condvar::new(),
-        played_samples: AtomicU64::new(0),
-        control,
-    };
+    let shared = test_audio_shared(8);
+    shared.control.set_paused(true);
+    assert_eq!(
+        shared
+            .buffer
+            .lock()
+            .expect("audio output buffer poisoned")
+            .push_slice(&[-1.0, 0.0, 1.0]),
+        3
+    );
     let mut output = [0.5f64; 4];
 
     fill_audio_output(&mut output, &shared);
@@ -913,6 +1208,69 @@ fn http_ring_cache_state_copies_available_bytes() {
 }
 
 #[test]
+fn http_ring_cache_probe_read_does_not_move_playback_reader() {
+    let mut state = HttpRingCacheState::new(100);
+    state.append_at(100, b"abcdef");
+    state.set_reader_offset(103);
+    let cache = HttpRingCache::from_state_for_test(state);
+    let mut output = [0; 2];
+
+    assert!(matches!(
+        cache.read_cached_at(104, &mut output),
+        CacheReadResult::Data(2)
+    ));
+    assert_eq!(&output, b"ef");
+    assert_eq!(cache.reader_offset_for_test(), 103);
+    assert!(!cache.has_restart_request_for_test());
+
+    assert_eq!(cache.reader_offset_for_test(), 103);
+    assert!(!cache.has_restart_request_for_test());
+}
+
+#[test]
+fn http_ring_cache_probe_read_does_not_restart_trimmed_range() {
+    let mut state = HttpRingCacheState::new(100);
+    state.append_at(100, b"abcdef");
+    state.set_reader_offset(104);
+    state.trim_to_capacity(2);
+    let cache = HttpRingCache::from_state_for_test(state);
+    let mut output = [0; 2];
+
+    assert!(matches!(
+        cache.read_cached_at(100, &mut output),
+        CacheReadResult::Interrupted
+    ));
+    assert!(!cache.has_restart_request_for_test());
+}
+
+#[test]
+fn http_ring_cache_read_at_returns_large_partial_buffer_without_waiting_for_full_request() {
+    let mut state = HttpRingCacheState::new(0);
+    let cached = vec![0x5a; HTTP_CACHE_PARTIAL_READ_MIN_BYTES];
+    state.append_at(0, &cached);
+    let cache = HttpRingCache::from_state_for_test(state);
+    let mut output = vec![0; HTTP_CACHE_PARTIAL_READ_MIN_BYTES * 2];
+
+    assert!(matches!(
+        cache.read_at_for_test(0, &mut output),
+        CacheReadResult::Data(HTTP_CACHE_PARTIAL_READ_MIN_BYTES)
+    ));
+    assert_eq!(&output[..HTTP_CACHE_PARTIAL_READ_MIN_BYTES], &cached);
+}
+
+#[test]
+fn http_ring_cache_state_reports_buffered_ahead_for_active_playback_range() {
+    let mut state = HttpRingCacheState::new(10);
+    state.append_at(10, b"abcdef");
+
+    assert_eq!(state.buffered_ahead_from(10), 6);
+    assert_eq!(state.buffered_ahead_from(13), 3);
+    assert_eq!(state.buffered_ahead_from(16), 0);
+    assert_eq!(state.buffered_ahead_from(9), 0);
+    assert_eq!(state.buffered_ahead_from(17), 0);
+}
+
+#[test]
 fn http_ring_cache_state_retains_cached_range_across_tail_metadata_restart() {
     let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
     state.append_at(100, b"abcdef");
@@ -940,6 +1298,46 @@ fn http_ring_cache_state_hides_tail_metadata_range_from_progress() {
         Some(HttpStreamBufferProgress {
             start_fraction: 0.1,
             end_fraction: 0.106,
+        })
+    );
+}
+
+#[test]
+fn http_ring_cache_state_reports_playback_progress_while_tail_metadata_active() {
+    let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
+    state.append_at(100, b"abcdef");
+
+    state.restart_at_with_kind(990, HttpCacheRangeKind::TailMetadataProbe);
+    state.append_at(990, b"tail");
+
+    assert_eq!(
+        state
+            .playback_buffer_range()
+            .map(HttpStreamBufferProgress::from),
+        Some(HttpStreamBufferProgress {
+            start_fraction: 0.1,
+            end_fraction: 0.106,
+        })
+    );
+}
+
+#[test]
+fn http_ring_cache_state_playback_progress_ignores_retained_range_after_playback_restart() {
+    let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
+    state.append_at(100, b"abcdef");
+
+    state.restart_at_with_kind(990, HttpCacheRangeKind::TailMetadataProbe);
+    state.append_at(990, b"tail");
+    state.restart_at_with_kind(200, HttpCacheRangeKind::Playback);
+    state.append_at(200, b"ghij");
+
+    assert_eq!(
+        state
+            .playback_buffer_range()
+            .map(HttpStreamBufferProgress::from),
+        Some(HttpStreamBufferProgress {
+            start_fraction: 0.2,
+            end_fraction: 0.204,
         })
     );
 }
@@ -1071,6 +1469,8 @@ fn http_ring_cache_state_limits_prefetch_window_from_reader() {
         state.append_capacity_from(100 + HTTP_RING_CACHE_CAPACITY as u64),
         0
     );
+
+    let mut state = HttpRingCacheState::new(100);
     assert_eq!(
         state.append_capacity_from(99 + HTTP_RING_CACHE_CAPACITY as u64),
         1
@@ -1080,6 +1480,47 @@ fn http_ring_cache_state_limits_prefetch_window_from_reader() {
     assert_eq!(
         state.append_capacity_from(100 + HTTP_RING_CACHE_CAPACITY as u64),
         100
+    );
+}
+
+#[test]
+fn http_ring_cache_state_pauses_prefetch_until_hysteresis_resume() {
+    let mut state = HttpRingCacheState::new_with_readahead_for_test(0, 1_000, 10.0, 2.0)
+        .with_content_len_hint(Some(10_000));
+    state.set_duration_seconds_for_test(100.0);
+
+    assert_eq!(state.append_capacity_from(1_000), 0);
+    assert_eq!(state.append_capacity_from(999), 0);
+    assert_eq!(state.append_capacity_from(800), 200);
+}
+
+#[test]
+fn http_ring_cache_state_reads_trimmed_bytes_from_disk_cache() {
+    let mut state =
+        HttpRingCacheState::new_with_disk_cache_for_test(0, 4, 16).with_content_len_hint(Some(8));
+    assert!(state.append_at(0, b"abcd"));
+
+    state.set_reader_offset(4);
+    assert!(state.append_at(4, b"efgh"));
+
+    let mut output = [0; 4];
+    assert_eq!(state.copy_available(0, &mut output), Some(4));
+    assert_eq!(&output, b"abcd");
+}
+
+#[test]
+fn http_ring_cache_state_uses_active_range_for_prefetch_window() {
+    let tail_offset = 100 + HTTP_RING_CACHE_CAPACITY as u64 + 1_000;
+    let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(tail_offset + 1_000));
+    state.append_at(100, b"abcdef");
+
+    state.restart_at_with_kind(tail_offset, HttpCacheRangeKind::TailMetadataProbe);
+    state.append_at(tail_offset, b"tail");
+    state.set_reader_offset(102);
+
+    assert_eq!(
+        state.append_capacity_from(tail_offset + 4),
+        HTTP_RING_CACHE_CAPACITY - 4
     );
 }
 
@@ -1120,6 +1561,39 @@ fn content_range_parser_reads_total_size() {
     );
 
     assert_eq!(content_len_from_content_range(&headers), Some(12345));
+    assert_eq!(
+        content_range_from_headers(&headers),
+        Some(HttpContentRange {
+            start: 100,
+            end: 199,
+            total: Some(12345),
+        })
+    );
+}
+
+#[test]
+fn content_range_parser_reads_unknown_total_and_rejects_invalid_ranges() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::CONTENT_RANGE,
+        reqwest::header::HeaderValue::from_static("bytes 2048-4095/*"),
+    );
+
+    assert_eq!(
+        content_range_from_headers(&headers),
+        Some(HttpContentRange {
+            start: 2048,
+            end: 4095,
+            total: None,
+        })
+    );
+    assert_eq!(content_len_from_content_range(&headers), None);
+
+    headers.insert(
+        reqwest::header::CONTENT_RANGE,
+        reqwest::header::HeaderValue::from_static("bytes 4095-2048/8192"),
+    );
+    assert_eq!(content_range_from_headers(&headers), None);
 }
 
 #[test]

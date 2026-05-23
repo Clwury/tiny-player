@@ -104,6 +104,13 @@ impl Decoder {
             (*context).pkt_timebase = stream.time_base;
             (*context).thread_count = 0;
             (*context).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
+            if (*context).codec_type == ffi::AVMediaType::AVMEDIA_TYPE_VIDEO
+                && let Some(error_recognition) = video_error_recognition(stream.codec_id)
+            {
+                (*context).flags &= !(ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT as c_int);
+                (*context).flags2 &= !ffi::AV_CODEC_FLAG2_SHOW_ALL;
+                (*context).err_recognition |= error_recognition;
+            }
         }
         if unsafe { (*context).codec_type } == ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE
             && let Some(size) = subtitle_canvas_size
@@ -138,6 +145,7 @@ impl Decoder {
             decoder = %decoder_name(decoder),
             thread_count = unsafe { (*context).thread_count },
             active_thread_type = unsafe { (*context).active_thread_type },
+            err_recognition = unsafe { (*context).err_recognition },
             hw_pixel_format = ?decoder_context.video_hw.as_ref().map(|hw| hw.pixel_format()),
             "opened FFmpeg decoder"
         );
@@ -271,6 +279,222 @@ impl Decoder {
     }
 }
 
+fn video_error_recognition(codec_id: ffi::AVCodecID) -> Option<c_int> {
+    match codec_id {
+        ffi::AVCodecID::AV_CODEC_ID_H264 => {
+            Some(ffi::AV_EF_BITSTREAM | ffi::AV_EF_BUFFER | ffi::AV_EF_EXPLODE)
+        }
+        ffi::AVCodecID::AV_CODEC_ID_HEVC => Some(ffi::AV_EF_BITSTREAM | ffi::AV_EF_BUFFER),
+        _ => None,
+    }
+}
+
+pub(super) fn packet_is_video_recovery_point(packet: &AvPacket, codec_id: ffi::AVCodecID) -> bool {
+    match codec_id {
+        ffi::AVCodecID::AV_CODEC_ID_H264 => packet
+            .data()
+            .map(|data| h264_access_unit_recovery_state(data).unwrap_or_else(|| packet.is_key()))
+            .unwrap_or_else(|| packet.is_key()),
+        ffi::AVCodecID::AV_CODEC_ID_HEVC => packet
+            .data()
+            .map(|data| hevc_access_unit_recovery_state(data).unwrap_or_else(|| packet.is_key()))
+            .unwrap_or_else(|| packet.is_key()),
+        _ => packet.is_key(),
+    }
+}
+
+pub(super) fn packet_is_video_seek_point(packet: &AvPacket, codec_id: ffi::AVCodecID) -> bool {
+    if !packet.is_key() {
+        return false;
+    }
+
+    match codec_id {
+        ffi::AVCodecID::AV_CODEC_ID_H264 => packet
+            .data()
+            .map(|data| h264_access_unit_recovery_state(data).unwrap_or(true))
+            .unwrap_or(true),
+        ffi::AVCodecID::AV_CODEC_ID_HEVC => packet
+            .data()
+            .map(|data| hevc_access_unit_seek_state(data).unwrap_or(false))
+            .unwrap_or(false),
+        _ => true,
+    }
+}
+
+fn h264_access_unit_recovery_state(data: &[u8]) -> Option<bool> {
+    access_unit_nal_recovery_state(data, |nal| {
+        nal.first()
+            .is_some_and(|header| header & 0x1f == H264_NAL_IDR)
+    })
+}
+
+fn hevc_access_unit_recovery_state(data: &[u8]) -> Option<bool> {
+    access_unit_nal_recovery_state(data, |nal| {
+        nal.first()
+            .map(|header| hevc_nal_is_recovery_point(hevc_nal_type(*header)))
+            .unwrap_or(false)
+    })
+}
+
+fn hevc_access_unit_seek_state(data: &[u8]) -> Option<bool> {
+    let mut found_safe_seek_vcl = false;
+    let mut found_unsafe_vcl = false;
+    access_unit_nal_recovery_state(data, |nal| {
+        if let Some(header) = nal.first() {
+            let nal_type = hevc_nal_type(*header);
+            if hevc_nal_is_vcl(nal_type) {
+                if hevc_nal_is_safe_seek_point(nal_type) {
+                    found_safe_seek_vcl = true;
+                } else {
+                    found_unsafe_vcl = true;
+                }
+            }
+        }
+        false
+    })
+    .map(|_| found_safe_seek_vcl && !found_unsafe_vcl)
+}
+
+const H264_NAL_IDR: u8 = 5;
+const HEVC_NAL_BLA_W_LP: u8 = 16;
+const HEVC_NAL_BLA_W_RADL: u8 = 17;
+const HEVC_NAL_BLA_N_LP: u8 = 18;
+const HEVC_NAL_IDR_W_RADL: u8 = 19;
+const HEVC_NAL_IDR_N_LP: u8 = 20;
+const HEVC_NAL_CRA: u8 = 21;
+
+fn hevc_nal_type(header: u8) -> u8 {
+    (header >> 1) & 0x3f
+}
+
+fn hevc_nal_is_vcl(nal_type: u8) -> bool {
+    nal_type <= 31
+}
+
+fn hevc_nal_is_recovery_point(nal_type: u8) -> bool {
+    hevc_nal_is_safe_seek_point(nal_type) || nal_type == HEVC_NAL_CRA
+}
+
+fn hevc_nal_is_safe_seek_point(nal_type: u8) -> bool {
+    matches!(
+        nal_type,
+        HEVC_NAL_BLA_W_LP
+            | HEVC_NAL_BLA_W_RADL
+            | HEVC_NAL_BLA_N_LP
+            | HEVC_NAL_IDR_W_RADL
+            | HEVC_NAL_IDR_N_LP
+    )
+}
+
+fn access_unit_nal_recovery_state(
+    data: &[u8],
+    mut matches_nal: impl FnMut(&[u8]) -> bool,
+) -> Option<bool> {
+    if access_unit_starts_with_annex_b_start_code(data)
+        && let Some(result) = access_unit_has_annex_b_nal(data, &mut matches_nal)
+    {
+        return Some(result);
+    }
+
+    for length_size in [4, 3, 2, 1] {
+        match access_unit_has_length_prefixed_nal(data, length_size, &mut matches_nal) {
+            Some(result) => return Some(result),
+            None => continue,
+        }
+    }
+
+    if !access_unit_starts_with_annex_b_start_code(data) {
+        return access_unit_has_annex_b_nal(data, &mut matches_nal);
+    }
+
+    None
+}
+
+fn access_unit_has_annex_b_nal(
+    data: &[u8],
+    matches_nal: &mut impl FnMut(&[u8]) -> bool,
+) -> Option<bool> {
+    let mut cursor = 0;
+    let mut found_start_code = false;
+    while let Some((start_code_pos, start_code_len)) = find_annex_b_start_code(data, cursor) {
+        found_start_code = true;
+        let nal_start = start_code_pos + start_code_len;
+        let nal_end = find_annex_b_start_code(data, nal_start)
+            .map(|(next_start, _)| next_start)
+            .unwrap_or(data.len());
+        let nal = trim_annex_b_trailing_zeroes(&data[nal_start..nal_end]);
+        if !nal.is_empty() && matches_nal(nal) {
+            return Some(true);
+        }
+        cursor = nal_end;
+    }
+    found_start_code.then_some(false)
+}
+
+fn find_annex_b_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut index = from;
+    while index + 3 <= data.len() {
+        if data[index..].starts_with(&[0, 0, 1]) {
+            return Some((index, 3));
+        }
+        if data[index..].starts_with(&[0, 0, 0, 1]) {
+            return Some((index, 4));
+        }
+        index += 1;
+    }
+    None
+}
+
+fn access_unit_starts_with_annex_b_start_code(data: &[u8]) -> bool {
+    data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])
+}
+
+fn trim_annex_b_trailing_zeroes(nal: &[u8]) -> &[u8] {
+    let mut end = nal.len();
+    while end > 0 && nal[end - 1] == 0 {
+        end -= 1;
+    }
+    &nal[..end]
+}
+
+fn access_unit_has_length_prefixed_nal(
+    data: &[u8],
+    length_size: usize,
+    matches_nal: &mut impl FnMut(&[u8]) -> bool,
+) -> Option<bool> {
+    let mut cursor = 0;
+    let mut found_nal = false;
+    while cursor < data.len() {
+        let len_end = cursor.checked_add(length_size)?;
+        if len_end > data.len() {
+            return None;
+        }
+        let nal_len = read_be_nal_len(&data[cursor..len_end])?;
+        cursor = len_end;
+        if nal_len == 0 {
+            return None;
+        }
+        let nal_end = cursor.checked_add(nal_len)?;
+        if nal_end > data.len() {
+            return None;
+        }
+        found_nal = true;
+        if matches_nal(&data[cursor..nal_end]) {
+            return Some(true);
+        }
+        cursor = nal_end;
+    }
+    found_nal.then_some(false)
+}
+
+fn read_be_nal_len(bytes: &[u8]) -> Option<usize> {
+    let mut len = 0usize;
+    for byte in bytes {
+        len = len.checked_shl(8)?.checked_add(usize::from(*byte))?;
+    }
+    Some(len)
+}
+
 impl Drop for Decoder {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -352,6 +576,64 @@ impl AvPacket {
         Ok(Self { ptr })
     }
 
+    pub(super) fn ref_from(packet: &Self) -> std::result::Result<Self, String> {
+        let clone = Self::new()?;
+        let result = unsafe { ffi::av_packet_ref(clone.ptr, packet.ptr) };
+        if result < 0 {
+            return Err(format!("FFmpeg 复制 packet 失败：{}", ffmpeg_error(result)));
+        }
+        Ok(clone)
+    }
+
+    pub(super) fn props_from(packet: &Self) -> std::result::Result<Self, String> {
+        let props = Self::new()?;
+        let result = unsafe { ffi::av_packet_copy_props(props.ptr, packet.ptr) };
+        if result < 0 {
+            return Err(format!(
+                "FFmpeg 复制 packet metadata 失败：{}",
+                ffmpeg_error(result)
+            ));
+        }
+        unsafe {
+            (*props.ptr).stream_index = (*packet.ptr).stream_index;
+        }
+        Ok(props)
+    }
+
+    pub(super) fn from_data_and_props(
+        data: &[u8],
+        props: &Self,
+    ) -> std::result::Result<Self, String> {
+        let packet = Self::new()?;
+        if !data.is_empty() {
+            let size = c_int::try_from(data.len())
+                .map_err(|_| "FFmpeg packet payload 过大".to_string())?;
+            let result = unsafe { ffi::av_new_packet(packet.ptr, size) };
+            if result < 0 {
+                return Err(format!(
+                    "FFmpeg 分配 packet payload 失败：{}",
+                    ffmpeg_error(result)
+                ));
+            }
+            let target = unsafe { (*packet.ptr).data };
+            if target.is_null() {
+                return Err("FFmpeg packet payload 为空".to_string());
+            }
+            unsafe { ptr::copy_nonoverlapping(data.as_ptr(), target, data.len()) };
+        }
+        let result = unsafe { ffi::av_packet_copy_props(packet.ptr, props.ptr) };
+        if result < 0 {
+            return Err(format!(
+                "FFmpeg 恢复 packet metadata 失败：{}",
+                ffmpeg_error(result)
+            ));
+        }
+        unsafe {
+            (*packet.ptr).stream_index = (*props.ptr).stream_index;
+        }
+        Ok(packet)
+    }
+
     pub(super) fn as_ptr(&self) -> *const ffi::AVPacket {
         self.ptr
     }
@@ -381,6 +663,21 @@ impl AvPacket {
         (duration > 0).then_some(duration)
     }
 
+    pub(super) fn is_key(&self) -> bool {
+        unsafe { (*self.ptr).flags & ffi::AV_PKT_FLAG_KEY != 0 }
+    }
+
+    pub(super) fn size(&self) -> Option<u64> {
+        let size = unsafe { (*self.ptr).size };
+        (size > 0).then_some(size as u64)
+    }
+
+    pub(super) fn byte_len(&self) -> usize {
+        self.size()
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(0)
+    }
+
     pub(super) fn data(&self) -> Option<&[u8]> {
         let (data, size) = unsafe { ((*self.ptr).data, (*self.ptr).size) };
         if data.is_null() || size <= 0 {
@@ -393,6 +690,8 @@ impl AvPacket {
         unsafe { ffi::av_packet_unref(self.ptr) };
     }
 }
+
+unsafe impl Send for AvPacket {}
 
 impl Drop for AvPacket {
     fn drop(&mut self) {
@@ -709,4 +1008,202 @@ impl Drop for AudioResampler {
 pub(super) struct DecodedAudio {
     pub(super) samples: Vec<f32>,
     pub(super) duration_nsecs: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packet_from_data(data: &[u8]) -> AvPacket {
+        let props = AvPacket::new().expect("packet props allocate");
+        AvPacket::from_data_and_props(data, &props).expect("packet data allocates")
+    }
+
+    #[test]
+    fn h264_recovery_point_detects_annex_b_idr() {
+        let packet = packet_from_data(&[0, 0, 1, 0x67, 0xaa, 0, 0, 0, 1, 0x65, 0xbb]);
+
+        assert!(packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_H264
+        ));
+    }
+
+    #[test]
+    fn h264_recovery_point_detects_length_prefixed_idr() {
+        let packet = packet_from_data(&[0, 0, 0, 2, 0x65, 0xaa]);
+
+        assert!(packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_H264
+        ));
+    }
+
+    #[test]
+    fn h264_recovery_point_rejects_key_packet_without_idr() {
+        let mut packet = packet_from_data(&[0, 0, 0, 2, 0x41, 0xaa]);
+        unsafe {
+            (*packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+        }
+
+        assert!(!packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_H264
+        ));
+    }
+
+    #[test]
+    fn hevc_recovery_point_detects_irap() {
+        let packet = packet_from_data(&[0, 0, 0, 3, 0x26, 0x01, 0xaa]);
+
+        assert!(packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+    }
+
+    #[test]
+    fn video_error_recognition_keeps_hevc_decode_errors_non_fatal() {
+        assert_eq!(
+            video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_H264),
+            Some(ffi::AV_EF_BITSTREAM | ffi::AV_EF_BUFFER | ffi::AV_EF_EXPLODE)
+        );
+        assert_eq!(
+            video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_HEVC),
+            Some(ffi::AV_EF_BITSTREAM | ffi::AV_EF_BUFFER)
+        );
+        assert_eq!(
+            video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_MPEG4),
+            None
+        );
+    }
+
+    #[test]
+    fn hevc_seek_point_requires_container_key_flag() {
+        let mut packet = packet_from_data(&[0, 0, 0, 3, 0x26, 0x01, 0xaa]);
+
+        assert!(packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+        assert!(!packet_is_video_seek_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+
+        unsafe {
+            (*packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+        }
+        assert!(packet_is_video_seek_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+    }
+
+    #[test]
+    fn hevc_seek_point_rejects_cra_open_gop_keyframes() {
+        let mut packet = packet_from_data(&[0, 0, 0, 3, 0x2a, 0x01, 0xaa]);
+        unsafe {
+            (*packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+        }
+
+        assert!(packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+        assert!(!packet_is_video_seek_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+    }
+
+    #[test]
+    fn hevc_seek_point_rejects_mixed_access_unit_with_unsafe_vcl() {
+        let mut packet = packet_from_data(&[
+            0, 0, 0, 3, 0x26, 0x01, 0xaa, // IDR_W_RADL
+            0, 0, 0, 3, 0x02, 0x01, 0xbb, // TRAIL_R
+        ]);
+        unsafe {
+            (*packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+        }
+
+        assert!(packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+        assert!(!packet_is_video_seek_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+    }
+
+    #[test]
+    fn hevc_recovery_point_detects_three_byte_length_prefixed_irap() {
+        let packet = packet_from_data(&[0, 0, 3, 0x26, 0x01, 0xaa]);
+
+        assert!(packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+    }
+
+    #[test]
+    fn hevc_recovery_point_ignores_embedded_start_code_bytes_in_length_prefixed_payload() {
+        let mut packet = packet_from_data(&[0, 0, 0, 7, 0x02, 0x01, 0, 0, 1, 0x26, 0x01]);
+        unsafe {
+            (*packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+        }
+
+        assert!(!packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+        assert!(!packet_is_video_seek_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+    }
+
+    #[test]
+    fn hevc_seek_point_rejects_unknown_payload_layout() {
+        let mut packet = packet_from_data(&[0xaa, 0xbb, 0xcc]);
+        unsafe {
+            (*packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+        }
+
+        assert!(!packet_is_video_seek_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+    }
+
+    #[test]
+    fn h264_recovery_point_falls_back_to_key_flag_for_unknown_payload_layout() {
+        let mut packet = packet_from_data(&[0xaa, 0xbb, 0xcc]);
+        unsafe {
+            (*packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+        }
+
+        assert!(packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_H264
+        ));
+    }
+
+    #[test]
+    fn generic_recovery_point_uses_packet_key_flag() {
+        let mut packet = AvPacket::new().expect("packet allocates");
+        assert!(!packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_MPEG4
+        ));
+
+        unsafe {
+            (*packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+        }
+        assert!(packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_MPEG4
+        ));
+    }
 }

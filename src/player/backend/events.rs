@@ -70,6 +70,17 @@ pub struct HttpStreamBufferProgress {
     pub end_fraction: f64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct HttpStreamCacheStatus {
+    pub ranges: Vec<HttpStreamBufferProgress>,
+    pub reader_fraction: Option<f64>,
+    pub download_fraction: Option<f64>,
+    pub cached_bytes: u64,
+    pub content_length: Option<u64>,
+    pub disk_cache_enabled: bool,
+    pub idle: bool,
+}
+
 #[derive(Debug)]
 pub struct BackendEvent {
     pub session_id: PlaybackSessionId,
@@ -94,6 +105,7 @@ pub enum BackendEventKind {
     DurationChanged(f64),
     BufferedChanged(Option<f64>),
     HttpStreamBufferedChanged(Option<HttpStreamBufferProgress>),
+    HttpStreamCacheStatusChanged(HttpStreamCacheStatus),
     SubtitleChanged(Option<BackendSubtitleCue>),
     LoadFailed(String),
     Fatal(String),

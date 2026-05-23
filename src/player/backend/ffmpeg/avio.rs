@@ -5,14 +5,15 @@ mod callbacks;
 mod download;
 mod http;
 
-use cache::HttpRingCache;
+pub(super) use cache::HttpRingCache;
 #[cfg(test)]
-pub(super) use cache::{HttpCacheRangeKind, HttpRingCacheState};
+pub(super) use cache::{CacheReadResult, HttpCacheRangeKind, HttpRingCacheState};
 use callbacks::{CachedAvioReader, cached_avio_read_packet, cached_avio_seek};
 #[cfg(test)]
 pub(super) use http::{
-    content_len_from_content_range, ffmpeg_http_headers, http_cache_range_header,
-    http_cache_range_request_len, http_cache_range_request_timeout,
+    HttpContentRange, content_len_from_content_range, content_range_from_headers,
+    ffmpeg_http_headers, http_cache_range_header, http_cache_range_request_len,
+    http_cache_range_request_timeout,
 };
 #[cfg(test)]
 pub(super) use http::{http_cache_request_headers_for_log, http_cache_response_headers_for_log};
@@ -22,6 +23,7 @@ pub(super) struct CachedAvio {
     ptr: *mut ffi::AVIOContext,
     reader: *mut CachedAvioReader,
     cache: HttpRingCache,
+    shutdown_cache_on_drop: bool,
 }
 
 impl CachedAvio {
@@ -39,6 +41,13 @@ impl CachedAvio {
             control,
             event_tx,
         )?;
+        Self::from_cache(cache, true)
+    }
+
+    fn from_cache(
+        cache: HttpRingCache,
+        shutdown_cache_on_drop: bool,
+    ) -> std::result::Result<Self, String> {
         let reader = Box::into_raw(Box::new(CachedAvioReader {
             cache: cache.clone(),
             read_pos: 0,
@@ -71,17 +80,28 @@ impl CachedAvio {
             (*ptr).seekable = ffi::AVIO_SEEKABLE_NORMAL;
         }
 
-        Ok(Self { ptr, reader, cache })
+        Ok(Self {
+            ptr,
+            reader,
+            cache,
+            shutdown_cache_on_drop,
+        })
     }
 
     pub(super) fn as_mut_ptr(&mut self) -> *mut ffi::AVIOContext {
         self.ptr
     }
+
+    pub(super) fn cache(&self) -> HttpRingCache {
+        self.cache.clone()
+    }
 }
 
 impl Drop for CachedAvio {
     fn drop(&mut self) {
-        self.cache.shutdown();
+        if self.shutdown_cache_on_drop {
+            self.cache.shutdown();
+        }
         if !self.ptr.is_null() {
             let mut ptr = self.ptr;
             unsafe { ffi::avio_context_free(&mut ptr) };

@@ -1,4 +1,5 @@
 use super::*;
+use crate::player::dovi::dovi_rpu_is_profile5;
 use crate::player::ffmpeg_dovi;
 
 #[derive(Default)]
@@ -95,7 +96,8 @@ impl DoviMetadataCache {
     fn resolve(&mut self, metadata: &DoviFrameMetadata) -> Result<ResolvedDoviRpu> {
         let rpu = metadata.parse_rpu()?;
         let mapping = self.resolve_mapping(rpu.rpu_data_mapping.clone())?;
-        let color = self.resolve_color(rpu.dovi_profile, rpu.vdr_dm_data.clone())?;
+        let profile5 = metadata.is_profile5() || dovi_rpu_is_profile5(&rpu);
+        let color = self.resolve_color_for_profile(profile5, rpu.vdr_dm_data.clone())?;
 
         Ok(ResolvedDoviRpu {
             rpu,
@@ -115,9 +117,18 @@ impl DoviMetadataCache {
             .ok_or_else(|| anyhow!("Dolby Vision RPU 缺少可复用的 reshaping metadata"))
     }
 
+    #[cfg(test)]
     pub(super) fn resolve_color(
         &mut self,
         profile: u8,
+        color: Option<VdrDmData>,
+    ) -> Result<VdrDmData> {
+        self.resolve_color_for_profile(profile == 5, color)
+    }
+
+    fn resolve_color_for_profile(
+        &mut self,
+        profile5: bool,
         color: Option<VdrDmData>,
     ) -> Result<VdrDmData> {
         match color {
@@ -125,7 +136,7 @@ impl DoviMetadataCache {
                 self.color = Some(color.clone());
                 Ok(color)
             }
-            Some(_) | None if profile == 5 => Ok(self.profile5_fallback_color()),
+            Some(_) | None if profile5 => Ok(self.profile5_fallback_color()),
             Some(_) | None => self
                 .color
                 .clone()
@@ -149,14 +160,17 @@ impl DoviMetadataCache {
             return;
         }
         self.metadata_logged = true;
+        let profile5 = dovi_rpu_is_profile5(&resolved.rpu);
         tracing::debug!(
             profile = resolved.rpu.dovi_profile,
+            profile5,
             vdr_profile = resolved.rpu.header.vdr_rpu_profile,
             bl_full_range = resolved.rpu.header.bl_video_full_range_flag,
+            disable_residual = resolved.rpu.header.disable_residual_flag,
             signal_full_range = resolved.color.signal_full_range_flag,
             raw_range = ?range,
             compressed_color = resolved.color.compressed,
-            dovi_tool_profile5_default_color = resolved.rpu.dovi_profile == 5
+            dovi_tool_profile5_default_color = profile5
                 && is_dovi_tool_profile5_default_color(&resolved.color),
             coef_type = resolved.rpu.header.coefficient_data_type,
             coef_denom = resolved.rpu.header.coefficient_log2_denom,

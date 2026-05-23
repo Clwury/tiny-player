@@ -3,6 +3,7 @@ use super::*;
 pub(super) struct VideoFrameConverter {
     scaler: Option<VideoScaler>,
     buffer_pool: FrameBufferPool,
+    converted_frame_count: u64,
 }
 
 impl VideoFrameConverter {
@@ -10,6 +11,7 @@ impl VideoFrameConverter {
         Self {
             scaler: None,
             buffer_pool,
+            converted_frame_count: 0,
         }
     }
 
@@ -24,12 +26,22 @@ impl VideoFrameConverter {
             .or_else(|| decoder.size().ok())
             .ok_or_else(|| "FFmpeg 视频帧缺少有效尺寸".to_string())?;
         let key_frame = unsafe { (*frame).flags & ffi::AV_FRAME_FLAG_KEY != 0 };
+        self.converted_frame_count = self.converted_frame_count.saturating_add(1);
+        let frame_count = self.converted_frame_count;
         if is_vulkan_frame(frame) {
             let sw_format = vulkan_sw_format(frame)
                 .and_then(ffmpeg_raw_video_format)
                 .ok_or_else(|| "FFmpeg Vulkan 帧缺少可识别的软件像素格式".to_string())?;
             let vulkan =
                 vulkan_video_frame_from_av_frame(decoder, frame, sw_format, dovi_metadata)?;
+            log_video_frame_color_metadata(
+                frame_count,
+                "vulkan",
+                vulkan.format,
+                vulkan.color,
+                vulkan.range,
+                vulkan.metadata.as_ref(),
+            );
             return Ok(DecodedFrame {
                 size,
                 pts: None,
@@ -40,6 +52,14 @@ impl VideoFrameConverter {
         if let Some(raw) =
             raw_video_frame_from_av_frame(frame, size, dovi_metadata, &self.buffer_pool)?
         {
+            log_video_frame_color_metadata(
+                frame_count,
+                "raw",
+                raw.format,
+                raw.color,
+                raw.range,
+                raw.metadata.as_ref(),
+            );
             return Ok(DecodedFrame {
                 size,
                 pts: None,
@@ -53,6 +73,12 @@ impl VideoFrameConverter {
             None => self.scaler.insert(VideoScaler::new(decoder)?),
         };
         let pixels = scaler.convert(frame, &self.buffer_pool)?;
+        if frame_count == 1 {
+            tracing::debug!(
+                frame_count,
+                "converted FFmpeg video frame through software scaler"
+            );
+        }
         Ok(DecodedFrame {
             size: scaler.size,
             pts: None,
@@ -60,6 +86,38 @@ impl VideoFrameConverter {
             pixels: FramePixels::Bgra8(pixels),
         })
     }
+}
+
+fn log_video_frame_color_metadata(
+    frame_count: u64,
+    path: &'static str,
+    format: RawVideoFormat,
+    color: FrameColor,
+    range: RawVideoRange,
+    metadata: Option<&FrameDynamicMetadata>,
+) {
+    let dovi = metadata.and_then(|metadata| metadata.dolby_vision.as_ref());
+    let ffmpeg_dovi = metadata.and_then(|metadata| metadata.ffmpeg_dovi.as_ref());
+    let has_metadata = dovi.is_some() || ffmpeg_dovi.is_some();
+    let suspicious = (has_metadata && color != FrameColor::DolbyVisionProfile5)
+        || (color == FrameColor::DolbyVisionProfile5 && !has_metadata);
+    let should_log = frame_count == 1 || suspicious;
+    if !should_log {
+        return;
+    }
+
+    tracing::debug!(
+        frame_count,
+        path,
+        format = ?format,
+        color = ?color,
+        range = ?range,
+        dovi_profile = ?dovi.map(|metadata| metadata.profile),
+        dovi_profile5 = ?dovi.map(DoviFrameMetadata::is_profile5),
+        dovi_rpu_bytes = ?dovi.map(|metadata| metadata.rpu_payload.len()),
+        ffmpeg_dovi_profile5 = ?ffmpeg_dovi.map(FfmpegDoviMetadata::is_profile5),
+        "converted FFmpeg video frame color metadata"
+    );
 }
 
 pub(super) fn vulkan_video_frame_from_av_frame(
@@ -72,7 +130,10 @@ pub(super) fn vulkan_video_frame_from_av_frame(
         return Err("FFmpeg Vulkan 帧缺少解码设备引用".to_string());
     };
     let ffmpeg_dovi = ffmpeg_dovi_metadata_from_frame(frame);
-    let dovi_metadata = if ffmpeg_dovi.is_some() {
+    let dovi_metadata = if ffmpeg_dovi
+        .as_ref()
+        .is_some_and(FfmpegDoviMetadata::is_profile5)
+    {
         None
     } else {
         dovi_metadata
@@ -107,7 +168,10 @@ pub(super) fn raw_video_frame_from_av_frame(
         return Ok(None);
     };
     let ffmpeg_dovi = ffmpeg_dovi_metadata_from_frame(frame);
-    let dovi_metadata = if ffmpeg_dovi.is_some() {
+    let dovi_metadata = if ffmpeg_dovi
+        .as_ref()
+        .is_some_and(FfmpegDoviMetadata::is_profile5)
+    {
         None
     } else {
         dovi_metadata
@@ -192,7 +256,7 @@ pub(super) fn frame_color(
     dovi_metadata: Option<&DoviFrameMetadata>,
     ffmpeg_dovi: Option<&FfmpegDoviMetadata>,
 ) -> FrameColor {
-    if dovi_metadata.is_some_and(|metadata| metadata.profile == 5) {
+    if dovi_metadata.is_some_and(DoviFrameMetadata::is_profile5) {
         return FrameColor::DolbyVisionProfile5;
     }
     if ffmpeg_dovi.is_some_and(FfmpegDoviMetadata::is_profile5) {

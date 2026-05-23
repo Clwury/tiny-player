@@ -2,20 +2,26 @@ use super::*;
 
 mod commands;
 mod decode;
+mod demux_cache;
 mod session;
 mod subtitles;
 mod timeline;
 
 use commands::{begin_seek, begin_track_switch};
 use decode::{flush_playback_decode_state, should_drop_backlogged_vulkan_frame};
+use demux_cache::{DemuxPacketCache, DemuxPacketCacheInput, DemuxReadResult};
 use session::PlaybackSession;
 use subtitles::{SubtitleDecodeContext, SubtitlePipeline};
 use timeline::reset_playback_timeline_state;
 
 const END_OF_PLAYBACK_READ_ERROR_TOLERANCE_SECONDS: f64 = 2.0;
+const CORRUPT_VIDEO_FRAME_RECOVERY_ERROR: &str = "__tiny_corrupt_video_frame_recovery__";
+pub(super) const VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS: u64 = 240;
+pub(super) const HEVC_SEEK_PREROLL_NSECS: u64 = 5_000_000_000;
 
 struct OpenedPlaybackInput {
     input: FormatContext,
+    stream_catalog: StreamCatalog,
     video_stream: StreamInfo,
     video_decoder: Decoder,
     audio_stream: Option<StreamInfo>,
@@ -26,10 +32,159 @@ struct OpenedPlaybackInput {
 
 struct ProbedPlaybackInput {
     input: FormatContext,
+    stream_catalog: StreamCatalog,
     video_stream: StreamInfo,
     audio_stream: Option<StreamInfo>,
     subtitle_stream: Option<StreamInfo>,
     allow_audio_decoder_failure: bool,
+}
+
+#[derive(Default)]
+pub(super) struct VideoDecodeRecovery {
+    waiting_for_keyframe: bool,
+    realign_on_next_frame: bool,
+    realign_after_recovery_point: bool,
+    skipped_packets: u64,
+}
+
+impl VideoDecodeRecovery {
+    pub(super) fn reset(&mut self) {
+        self.waiting_for_keyframe = false;
+        self.realign_on_next_frame = false;
+        self.realign_after_recovery_point = false;
+        self.skipped_packets = 0;
+    }
+
+    pub(super) fn reset_for_timeline_start(
+        &mut self,
+        codec_id: ffi::AVCodecID,
+        current_start_position_nsecs: u64,
+    ) {
+        self.reset();
+        if codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC && current_start_position_nsecs > 0 {
+            self.begin_with_realign(false);
+        }
+    }
+
+    pub(super) fn waiting_for_keyframe(&self) -> bool {
+        self.waiting_for_keyframe
+    }
+
+    pub(super) fn should_skip_packet(&self, packet: &AvPacket, codec_id: ffi::AVCodecID) -> bool {
+        if !self.waiting_for_keyframe || packet_is_video_decode_recovery_point(packet, codec_id) {
+            return false;
+        }
+        codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC
+            || self.skipped_packets < VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS
+    }
+
+    pub(super) fn record_skipped_packet(&mut self) -> u64 {
+        self.skipped_packets = self.skipped_packets.saturating_add(1);
+        self.skipped_packets
+    }
+
+    pub(super) fn accept_recovery_point(
+        &mut self,
+        packet: &AvPacket,
+        codec_id: ffi::AVCodecID,
+    ) -> bool {
+        if !self.waiting_for_keyframe || !packet_is_video_decode_recovery_point(packet, codec_id) {
+            return false;
+        }
+
+        self.waiting_for_keyframe = false;
+        self.realign_on_next_frame = self.realign_after_recovery_point;
+        self.realign_after_recovery_point = false;
+        self.skipped_packets = 0;
+        true
+    }
+
+    pub(super) fn accept_after_wait_limit(&mut self, codec_id: ffi::AVCodecID) -> bool {
+        if codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC {
+            return false;
+        }
+        if !self.waiting_for_keyframe
+            || self.skipped_packets < VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS
+        {
+            return false;
+        }
+
+        self.waiting_for_keyframe = false;
+        self.realign_on_next_frame = self.realign_after_recovery_point;
+        self.realign_after_recovery_point = false;
+        self.skipped_packets = 0;
+        true
+    }
+
+    pub(super) fn take_realign_on_next_frame(&mut self) -> bool {
+        let realign = self.realign_on_next_frame;
+        self.realign_on_next_frame = false;
+        realign
+    }
+
+    pub(super) fn begin_with_realign(&mut self, realign_after_recovery_point: bool) {
+        self.waiting_for_keyframe = true;
+        self.realign_on_next_frame = false;
+        self.realign_after_recovery_point = realign_after_recovery_point;
+        self.skipped_packets = 0;
+    }
+}
+
+fn packet_is_video_decode_recovery_point(packet: &AvPacket, codec_id: ffi::AVCodecID) -> bool {
+    if codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC {
+        return packet_is_video_seek_point(packet, codec_id);
+    }
+    packet_is_video_recovery_point(packet, codec_id)
+}
+
+fn video_seek_preroll_nsecs(codec_id: ffi::AVCodecID) -> u64 {
+    match codec_id {
+        ffi::AVCodecID::AV_CODEC_ID_HEVC => HEVC_SEEK_PREROLL_NSECS,
+        _ => 0,
+    }
+}
+
+fn preroll_seek_position_seconds(codec_id: ffi::AVCodecID, position_seconds: f64) -> f64 {
+    let position_seconds = position_seconds.max(0.0);
+    let preroll_seconds = nsecs_to_seconds(video_seek_preroll_nsecs(codec_id));
+    (position_seconds - preroll_seconds).max(0.0)
+}
+
+#[derive(Clone)]
+struct StreamCatalog {
+    streams: Vec<StreamInfo>,
+}
+
+impl StreamCatalog {
+    fn from_input(input: &FormatContext) -> std::result::Result<Self, String> {
+        Ok(Self {
+            streams: input.streams()?,
+        })
+    }
+
+    fn stream_by_index(
+        &self,
+        index: usize,
+        media_type: ffi::AVMediaType,
+    ) -> std::result::Result<StreamInfo, String> {
+        let stream = self
+            .streams
+            .iter()
+            .copied()
+            .find(|stream| usize::try_from(stream.index).ok() == Some(index))
+            .ok_or_else(|| "FFmpeg 媒体流索引越界".to_string())?;
+        let codecpar = unsafe { (*stream.stream).codecpar };
+        if codecpar.is_null() {
+            return Err("FFmpeg 媒体流缺少 codec 参数".to_string());
+        }
+        if unsafe { (*codecpar).codec_type } != media_type {
+            return Err("FFmpeg 媒体流类型与所选轨道不匹配".to_string());
+        }
+        if stream.decoder.is_null() {
+            return Err("FFmpeg 未找到所选媒体流的解码器".to_string());
+        }
+        Ok(stream)
+    }
 }
 
 fn open_playback_input_with_fallback(
@@ -171,6 +326,7 @@ fn probe_playback_input(
         event_tx.clone(),
     )?;
     input.find_stream_info()?;
+    let stream_catalog = StreamCatalog::from_input(&input)?;
 
     let video_stream = input
         .best_stream(ffi::AVMediaType::AVMEDIA_TYPE_VIDEO)?
@@ -180,6 +336,7 @@ fn probe_playback_input(
 
     Ok(ProbedPlaybackInput {
         input,
+        stream_catalog,
         video_stream,
         audio_stream,
         subtitle_stream,
@@ -192,6 +349,7 @@ fn open_decoders_for_probed_input(
 ) -> std::result::Result<OpenedPlaybackInput, String> {
     let ProbedPlaybackInput {
         input,
+        stream_catalog,
         video_stream,
         audio_stream,
         subtitle_stream,
@@ -204,6 +362,7 @@ fn open_decoders_for_probed_input(
 
     Ok(OpenedPlaybackInput {
         input,
+        stream_catalog,
         video_stream,
         video_decoder,
         audio_stream,
@@ -242,6 +401,27 @@ fn select_audio_stream_for_selection(
         })
 }
 
+fn select_audio_stream_for_selection_from_catalog(
+    selected_tracks: &crate::player::PlaybackTrackSelection,
+    catalog: &StreamCatalog,
+    allow_audio_decoder_failure: bool,
+) -> std::result::Result<Option<StreamInfo>, String> {
+    let Some(stream_index) = selected_tracks.audio_stream_index else {
+        return Ok(None);
+    };
+    catalog
+        .stream_by_index(stream_index, ffi::AVMediaType::AVMEDIA_TYPE_AUDIO)
+        .map(Some)
+        .or_else(|error| {
+            if allow_audio_decoder_failure {
+                tracing::warn!(%error, "FFmpeg selected audio stream unavailable");
+                Ok(None)
+            } else {
+                Err(format!("FFmpeg 选择指定音频流失败：{error}"))
+            }
+        })
+}
+
 fn select_subtitle_stream(
     source: &FfmpegPlaybackInput,
     input: &FormatContext,
@@ -260,6 +440,22 @@ fn select_subtitle_stream_for_selection(
         return Ok(None);
     };
     input
+        .stream_by_index(stream_index, ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE)
+        .map(Some)
+        .map_err(|error| format!("FFmpeg 选择指定字幕流失败：{error}"))
+}
+
+fn select_subtitle_stream_for_selection_from_catalog(
+    selected_tracks: &crate::player::PlaybackTrackSelection,
+    catalog: &StreamCatalog,
+) -> std::result::Result<Option<StreamInfo>, String> {
+    if selected_tracks.subtitle_external_url.is_some() {
+        return Ok(None);
+    }
+    let Some(stream_index) = selected_tracks.subtitle_stream_index else {
+        return Ok(None);
+    };
+    catalog
         .stream_by_index(stream_index, ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE)
         .map(Some)
         .map_err(|error| format!("FFmpeg 选择指定字幕流失败：{error}"))
@@ -346,6 +542,7 @@ pub(super) fn run_ffmpeg_playback(
     control.set_session_id(session.id());
     let OpenedPlaybackInput {
         mut input,
+        stream_catalog,
         video_stream,
         video_decoder,
         mut audio_stream,
@@ -357,8 +554,34 @@ pub(super) fn run_ffmpeg_playback(
         frame_slot.request_vulkan_prewarm(session.id(), device);
     }
     if source.start_position_seconds > 0.0 {
-        input.seek_stream(video_stream, source.start_position_seconds)?;
+        let seek_position_seconds =
+            preroll_seek_position_seconds(video_stream.codec_id, source.start_position_seconds);
+        tracing::debug!(
+            target_position_seconds = source.start_position_seconds,
+            seek_position_seconds,
+            preroll_nsecs = video_seek_preroll_nsecs(video_stream.codec_id),
+            codec = ?video_stream.codec_id,
+            "applying FFmpeg initial seek preroll"
+        );
+        input.seek_stream(video_stream, seek_position_seconds)?;
     }
+    let duration_seconds = input.duration_seconds();
+    let http_cache = input.cached_io_cache();
+    if let Some(cache) = &http_cache {
+        cache.set_duration_seconds(duration_seconds);
+    }
+    let demux_cache = DemuxPacketCache::spawn(
+        DemuxPacketCacheInput {
+            input,
+            video_stream,
+            audio_stream,
+            duration_seconds,
+            start_position_seconds: source.start_position_seconds,
+            session_id: session.id(),
+        },
+        Arc::clone(&control),
+        event_tx.clone(),
+    )?;
     let mut video_frame = AvFrame::new()?;
     let mut video_converter = VideoFrameConverter::new(frame_slot.buffer_pool());
     let mut current_start_position_nsecs = session.start_position_nsecs();
@@ -417,7 +640,7 @@ pub(super) fn run_ffmpeg_playback(
         output.reset_clock(current_start_position_nsecs);
     }
 
-    if let Some(duration) = input.duration_seconds() {
+    if let Some(duration) = duration_seconds {
         let _ = event_tx.send(BackendEvent::new(
             session.id(),
             BackendEventKind::DurationChanged(duration),
@@ -427,12 +650,20 @@ pub(super) fn run_ffmpeg_playback(
         session.id(),
         BackendEventKind::PlaybackInfoChanged(playback_video_info(video_stream, &video_decoder)),
     ));
-    let duration_seconds = input.duration_seconds();
-
     let mut packet = AvPacket::new()?;
-    let mut buffered_reporter = BufferedReporter::new(audio_output.is_some());
+    let emit_playback_buffered_events = false;
+    let mut buffered_reporter =
+        BufferedReporter::new_with_events(audio_output.is_some(), emit_playback_buffered_events);
     let mut queued_video_frames = VecDeque::new();
     let mut first_video_frame_pending = true;
+    let mut video_decode_recovery = VideoDecodeRecovery::default();
+    video_decode_recovery
+        .reset_for_timeline_start(video_stream.codec_id, current_start_position_nsecs);
+    let mut video_packet_count = 0u64;
+    let mut decoded_video_frame_count = 0u64;
+    let mut dropped_video_frames_before_start_count = 0u64;
+    let mut dropped_audio_frames_before_start_count = 0u64;
+    let mut dropped_audio_frames_waiting_for_video_count = 0u64;
     buffered_reporter.reset_to(
         source.start_position_seconds.max(0.0),
         session.id(),
@@ -462,7 +693,21 @@ pub(super) fn run_ffmpeg_playback(
                 begin_track_switch(&mut session, &control, &pending_track_selection);
             let switch_result: std::result::Result<(), String> = (|| {
                 current_start_position_nsecs = session.start_position_nsecs();
-                input.seek_stream(video_stream, position_seconds)?;
+                let demux_seek_result = demux_cache.seek(
+                    position_seconds,
+                    session.id(),
+                    pending_track_selection.generation,
+                );
+                tracing::debug!(
+                    session_id = ?session.id(),
+                    position_seconds,
+                    generation = pending_track_selection.generation,
+                    current_start_position_nsecs,
+                    ?demux_seek_result,
+                    selected_tracks = ?pending_track_selection.selected_tracks,
+                    "handling FFmpeg playback track selection seek"
+                );
+                control.finish_seek(pending_track_selection.generation);
                 source.selected_tracks = pending_track_selection.selected_tracks;
 
                 flush_playback_decode_state(
@@ -478,8 +723,11 @@ pub(super) fn run_ffmpeg_playback(
                 audio_decoder = None;
                 audio_frame = None;
                 audio_resampler = None;
-                audio_stream =
-                    select_audio_stream_for_selection(&source.selected_tracks, &input, false)?;
+                audio_stream = select_audio_stream_for_selection_from_catalog(
+                    &source.selected_tracks,
+                    &stream_catalog,
+                    false,
+                )?;
                 if let Some(decoder) = open_audio_decoder(audio_stream, false)? {
                     let output = match previous_audio_output {
                         Some(output) => Some(output),
@@ -509,7 +757,7 @@ pub(super) fn run_ffmpeg_playback(
 
                 subtitle_pipeline.switch_tracks(
                     &source,
-                    &input,
+                    &stream_catalog,
                     video_decoder.size().ok(),
                     current_start_position_nsecs,
                 )?;
@@ -528,7 +776,15 @@ pub(super) fn run_ffmpeg_playback(
                     &mut first_video_frame_pending,
                     &mut dovi_pipeline,
                 );
-                buffered_reporter = BufferedReporter::new(audio_output.is_some());
+                dropped_video_frames_before_start_count = 0;
+                dropped_audio_frames_before_start_count = 0;
+                dropped_audio_frames_waiting_for_video_count = 0;
+                video_decode_recovery
+                    .reset_for_timeline_start(video_stream.codec_id, current_start_position_nsecs);
+                buffered_reporter = BufferedReporter::new_with_events(
+                    audio_output.is_some(),
+                    emit_playback_buffered_events,
+                );
                 buffered_reporter.reset_to(position_seconds, session.id(), &event_tx);
                 let _ = event_tx.send(BackendEvent::new(
                     session.id(),
@@ -571,53 +827,67 @@ pub(super) fn run_ffmpeg_playback(
 
         if let Some(pending_seek) = drained_commands.pending_seek {
             let position_seconds = begin_seek(&mut session, &control, &pending_seek);
-            let seek_result: std::result::Result<(), String> = (|| {
-                current_start_position_nsecs = session.start_position_nsecs();
-                input.seek_stream(video_stream, position_seconds)?;
-                flush_playback_decode_state(
-                    &video_decoder,
-                    audio_decoder.as_ref(),
-                    &mut subtitle_pipeline,
-                    &mut video_frame,
-                    audio_frame.as_mut(),
-                    &mut packet,
-                );
-                reset_playback_timeline_state(
-                    video_stream,
-                    audio_stream,
-                    video_frame_duration_nsecs,
-                    current_start_position_nsecs,
-                    &mut video_clock,
-                    &mut playback_timeline_origin_nsecs,
-                    &mut audio_clock,
-                    &mut scheduler,
-                    audio_output.as_ref(),
-                    &mut queued_video_frames,
-                    &mut first_video_frame_pending,
-                    &mut dovi_pipeline,
-                );
-                subtitle_pipeline.reset_cues_for_position(current_start_position_nsecs);
-                buffered_reporter = BufferedReporter::new(audio_output.is_some());
-                buffered_reporter.reset_to(position_seconds, session.id(), &event_tx);
-                let _ = event_tx.send(BackendEvent::new(
-                    session.id(),
-                    BackendEventKind::PositionChanged(position_seconds),
-                ));
-                let _ = event_tx.send(BackendEvent::new(
-                    session.id(),
-                    BackendEventKind::Buffering(true),
-                ));
-                let _ = event_tx.send(BackendEvent::new(
-                    session.id(),
-                    BackendEventKind::SubtitleChanged(None),
-                ));
-                Ok(())
-            })();
+            current_start_position_nsecs = session.start_position_nsecs();
+            let demux_seek_result =
+                demux_cache.seek(position_seconds, session.id(), pending_seek.generation);
+            tracing::debug!(
+                session_id = ?session.id(),
+                position_seconds,
+                generation = pending_seek.generation,
+                current_start_position_nsecs,
+                ?demux_seek_result,
+                "handling FFmpeg playback seek"
+            );
+            control.finish_seek(pending_seek.generation);
+            flush_playback_decode_state(
+                &video_decoder,
+                audio_decoder.as_ref(),
+                &mut subtitle_pipeline,
+                &mut video_frame,
+                audio_frame.as_mut(),
+                &mut packet,
+            );
+            reset_playback_timeline_state(
+                video_stream,
+                audio_stream,
+                video_frame_duration_nsecs,
+                current_start_position_nsecs,
+                &mut video_clock,
+                &mut playback_timeline_origin_nsecs,
+                &mut audio_clock,
+                &mut scheduler,
+                audio_output.as_ref(),
+                &mut queued_video_frames,
+                &mut first_video_frame_pending,
+                &mut dovi_pipeline,
+            );
+            dropped_video_frames_before_start_count = 0;
+            dropped_audio_frames_before_start_count = 0;
+            dropped_audio_frames_waiting_for_video_count = 0;
+            video_decode_recovery
+                .reset_for_timeline_start(video_stream.codec_id, current_start_position_nsecs);
+            subtitle_pipeline.reset_cues_for_position(current_start_position_nsecs);
+            buffered_reporter = BufferedReporter::new_with_events(
+                audio_output.is_some(),
+                emit_playback_buffered_events,
+            );
+            buffered_reporter.reset_to(position_seconds, session.id(), &event_tx);
+            let _ = event_tx.send(BackendEvent::new(
+                session.id(),
+                BackendEventKind::PositionChanged(position_seconds),
+            ));
+            let _ = event_tx.send(BackendEvent::new(
+                session.id(),
+                BackendEventKind::Buffering(true),
+            ));
+            let _ = event_tx.send(BackendEvent::new(
+                session.id(),
+                BackendEventKind::SubtitleChanged(None),
+            ));
             if control.has_pending_seek() {
                 packet.unref();
                 continue;
             }
-            seek_result?;
             continue;
         }
 
@@ -626,187 +896,478 @@ pub(super) fn run_ffmpeg_playback(
             continue;
         }
 
-        let read = unsafe { ffi::av_read_frame(input.as_mut_ptr(), packet.as_mut_ptr()) };
-        if playback_read_finished(read, duration_seconds, buffered_reporter.buffered_until()) {
-            break;
-        }
-        if read < 0 {
-            if control.has_pending_seek() {
-                packet.unref();
-                continue;
+        packet = match demux_cache.read_packet() {
+            DemuxReadResult::Packet(packet) => packet,
+            DemuxReadResult::Eof => break,
+            DemuxReadResult::Interrupted if control.should_stop() => break,
+            DemuxReadResult::Interrupted => continue,
+            DemuxReadResult::Error(error) => {
+                if control.has_pending_seek() {
+                    continue;
+                }
+                return Err(error);
             }
-            return Err(format!("FFmpeg 读取媒体包失败：{}", ffmpeg_error(read)));
-        }
+        };
 
         let process_result = match packet.stream_index() {
             index if index == video_decoder.stream_index => {
-                dovi_pipeline.observe_video_packet(&packet, video_stream);
-                video_decoder.decode_packet(packet.as_ptr(), &mut video_frame, |frame| {
-                    if control.has_pending_seek() {
-                        return Ok(());
-                    }
-                    let timestamp = video_clock
-                        .map(frame_best_effort_timestamp(frame), video_decoder.time_base);
-                    subtitle_pipeline
-                        .refresh_timeline_origin(&mut playback_timeline_origin_nsecs, &video_clock);
-                    let frame_pts = FramePts {
-                        nsecs: timestamp.timeline_nsecs,
-                    };
-                    if timestamp.timeline_nsecs < current_start_position_nsecs {
-                        dovi_pipeline.discard_frame(frame_pts);
-                        return Ok(());
-                    }
-
-                    if let Some(output) = audio_output.as_ref() {
-                        if !first_video_frame_pending
-                            && should_drop_late_video_frame(
-                                timestamp.timeline_nsecs,
-                                video_frame_duration_nsecs,
-                                output.played_timeline_nsecs(),
-                            )
-                        {
-                            dovi_pipeline.discard_frame(frame_pts);
-                            return Ok(());
-                        }
-                        if should_drop_backlogged_vulkan_frame(
-                            frame,
-                            first_video_frame_pending,
-                            &frame_slot,
-                        ) {
-                            dovi_pipeline.discard_frame(frame_pts);
-                            return Ok(());
-                        }
-
-                        let dovi_metadata =
-                            dovi_pipeline.metadata_for_decoded_frame(frame, frame_pts);
-                        let mut decoded_frame =
-                            video_converter.convert(&video_decoder, frame, dovi_metadata)?;
-                        decoded_frame.pts = Some(frame_pts);
-                        subtitle_pipeline.update_overlay_from_audio_clock(
-                            output,
-                            session.id(),
-                            &event_tx,
-                        );
-
-                        if first_video_frame_pending {
-                            present_decoded_video_frame(
-                                decoded_frame,
-                                session.id(),
-                                timestamp.timeline_nsecs,
-                                &frame_slot,
-                                &frame_presented,
-                                &mut position_reporter,
-                                &event_tx,
-                            );
-                            buffered_reporter.report_video_timeline_nsecs(
-                                timestamp
-                                    .timeline_nsecs
-                                    .saturating_add(video_frame_duration_nsecs),
-                                session.id(),
-                                &event_tx,
-                            );
-                            first_video_frame_pending = false;
-                            return Ok(());
-                        }
-                        queued_video_frames.push_back(QueuedVideoFrame {
-                            frame: decoded_frame,
-                            timeline_nsecs: timestamp.timeline_nsecs,
-                        });
-                        buffered_reporter.report_video_timeline_nsecs(
-                            timestamp
-                                .timeline_nsecs
-                                .saturating_add(video_frame_duration_nsecs),
-                            session.id(),
-                            &event_tx,
-                        );
-                        let played_until = present_due_audio_clocked_video_frames(
-                            &mut queued_video_frames,
-                            output,
-                            session.id(),
-                            &frame_slot,
-                            &frame_presented,
-                            &mut position_reporter,
-                            &event_tx,
-                        );
-                        subtitle_pipeline.update_overlay(played_until, session.id(), &event_tx);
-                        if queued_video_duration(&queued_video_frames)
-                            >= queued_video_limit_duration(
-                                &queued_video_frames,
-                                subtitle_pipeline.needs_prefetch(),
-                            )
-                        {
-                            let target_duration = queued_video_target_duration(
-                                &queued_video_frames,
-                                subtitle_pipeline.needs_prefetch(),
-                            );
-                            wait_for_audio_clocked_video_queue(
-                                &mut queued_video_frames,
-                                output,
-                                &control,
-                                session.id(),
-                                &frame_slot,
-                                &frame_presented,
-                                &mut position_reporter,
-                                &event_tx,
-                                target_duration,
-                                |played_until| {
-                                    subtitle_pipeline.update_overlay(
-                                        played_until,
-                                        session.id(),
-                                        &event_tx,
-                                    );
-                                },
-                            )?;
-                        }
-                    } else {
-                        if should_drop_backlogged_vulkan_frame(
-                            frame,
-                            first_video_frame_pending,
-                            &frame_slot,
-                        ) {
-                            dovi_pipeline.discard_frame(frame_pts);
-                            return Ok(());
-                        }
-                        let dovi_metadata =
-                            dovi_pipeline.metadata_for_decoded_frame(frame, frame_pts);
-                        let mut decoded_frame =
-                            video_converter.convert(&video_decoder, frame, dovi_metadata)?;
-                        decoded_frame.pts = Some(frame_pts);
-                        subtitle_pipeline.update_overlay(
-                            timestamp.timeline_nsecs,
-                            session.id(),
-                            &event_tx,
-                        );
-
-                        first_video_frame_pending = false;
-                        if scheduler
-                            .wait_until(timestamp.timeline_nsecs, &control)
-                            .interrupted()
-                        {
-                            return Ok(());
-                        }
-                        if control.has_pending_seek() {
-                            return Ok(());
-                        }
-                        present_decoded_video_frame(
-                            decoded_frame,
-                            session.id(),
-                            timestamp.timeline_nsecs,
-                            &frame_slot,
-                            &frame_presented,
-                            &mut position_reporter,
-                            &event_tx,
-                        );
-                        buffered_reporter.report_video_timeline_nsecs(
-                            timestamp
-                                .timeline_nsecs
-                                .saturating_add(video_frame_duration_nsecs),
-                            session.id(),
-                            &event_tx,
+                video_packet_count = video_packet_count.saturating_add(1);
+                if video_decode_recovery.should_skip_packet(&packet, video_stream.codec_id) {
+                    let skipped_packets = video_decode_recovery.record_skipped_packet();
+                    if skipped_packets == 1 || skipped_packets.is_multiple_of(60) {
+                        tracing::debug!(
+                            pts = ?packet.best_timestamp(),
+                            keyframe = packet.is_key(),
+                            codec = ?video_stream.codec_id,
+                            packet_bytes = packet.byte_len(),
+                            recovery_point = packet_is_video_recovery_point(&packet, video_stream.codec_id),
+                            safe_seek_point = packet_is_video_seek_point(&packet, video_stream.codec_id),
+                            skipped_packets,
+                            "skipping FFmpeg video packets while waiting for decode recovery point"
                         );
                     }
                     Ok(())
-                })
+                } else {
+                    if video_decode_recovery.accept_recovery_point(&packet, video_stream.codec_id) {
+                        tracing::debug!(
+                            pts = ?packet.best_timestamp(),
+                            keyframe = packet.is_key(),
+                            codec = ?video_stream.codec_id,
+                            packet_bytes = packet.byte_len(),
+                            recovery_point = packet_is_video_recovery_point(&packet, video_stream.codec_id),
+                            safe_seek_point = packet_is_video_seek_point(&packet, video_stream.codec_id),
+                            "resuming FFmpeg video decode at recovery point"
+                        );
+                        video_decoder.flush_buffers();
+                    } else if video_decode_recovery.accept_after_wait_limit(video_stream.codec_id) {
+                        tracing::debug!(
+                            pts = ?packet.best_timestamp(),
+                            keyframe = packet.is_key(),
+                            codec = ?video_stream.codec_id,
+                            packet_bytes = packet.byte_len(),
+                            recovery_point = packet_is_video_recovery_point(&packet, video_stream.codec_id),
+                            safe_seek_point = packet_is_video_seek_point(&packet, video_stream.codec_id),
+                            max_skipped_packets = VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS,
+                            "resuming FFmpeg video decode after recovery point wait limit"
+                        );
+                        video_decoder.flush_buffers();
+                    }
+                    log_video_decode_packet_if_needed(
+                        &packet,
+                        video_stream.codec_id,
+                        video_packet_count,
+                        &video_decode_recovery,
+                    );
+                    let stripped_video_packet = strip_hevc_dovi_rpu_decode_packet(
+                        &packet,
+                        video_stream.codec_id,
+                        HevcDecodePacketLogContext {
+                            video_packet_count,
+                            first_video_frame_pending,
+                            recovery_waiting: video_decode_recovery.waiting_for_keyframe(),
+                        },
+                    )?;
+                    if let Some(metadata) = stripped_video_packet
+                        .as_ref()
+                        .and_then(|packet| packet.metadata.clone())
+                    {
+                        tracing::trace!(
+                            pts = ?packet.best_timestamp(),
+                            profile = metadata.profile,
+                            profile5 = metadata.is_profile5(),
+                            rpu_bytes = metadata.rpu_payload.len(),
+                            "using stripped Dolby Vision RPU metadata for FFmpeg packet"
+                        );
+                        dovi_pipeline.observe_video_packet_metadata(
+                            &packet,
+                            video_stream,
+                            metadata,
+                        );
+                    } else {
+                        dovi_pipeline.observe_video_packet(&packet, video_stream);
+                    }
+                    let stripped_to_empty = stripped_video_packet
+                        .as_ref()
+                        .is_some_and(|stripped| stripped.packet.byte_len() == 0);
+                    let decode_packet_ptr = stripped_video_packet
+                        .as_ref()
+                        .map_or(packet.as_ptr(), |stripped| stripped.packet.as_ptr());
+                    let decode_packet_for_recovery = stripped_video_packet
+                        .as_ref()
+                        .map_or(&packet, |stripped| &stripped.packet);
+                    let decode_result = if stripped_to_empty {
+                        Ok(())
+                    } else {
+                        video_decoder.decode_packet(
+                            decode_packet_ptr,
+                            &mut video_frame,
+                            |frame| {
+                            if control.has_pending_seek() {
+                                return Ok(());
+                            }
+                            decoded_video_frame_count =
+                                decoded_video_frame_count.saturating_add(1);
+                            let frame_timestamp = frame_best_effort_timestamp(frame);
+                            let timestamp = video_clock.map(frame_timestamp, video_decoder.time_base);
+                            subtitle_pipeline.refresh_timeline_origin(
+                                &mut playback_timeline_origin_nsecs,
+                                &video_clock,
+                            );
+                            let frame_pts = FramePts {
+                                nsecs: timestamp.timeline_nsecs,
+                            };
+                            if decoded_video_frame_count == 1
+                                || decoded_video_frame_count.is_multiple_of(60)
+                                || video_decode_recovery.waiting_for_keyframe()
+                            {
+                                tracing::debug!(
+                                    frame_count = decoded_video_frame_count,
+                                    raw_timestamp = frame_timestamp,
+                                    timeline_nsecs = timestamp.timeline_nsecs,
+                                    current_start_position_nsecs,
+                                    first_video_frame_pending,
+                                    recovery_waiting = video_decode_recovery.waiting_for_keyframe(),
+                                    decode_error_flags = frame_decode_error_flags(frame),
+                                    corrupt = frame_is_corrupt(frame),
+                                    "decoded FFmpeg video frame"
+                                );
+                            }
+                            if drop_corrupt_video_frame_if_needed(
+                                frame,
+                                frame_pts,
+                                &mut dovi_pipeline,
+                            ) {
+                                return Err(CORRUPT_VIDEO_FRAME_RECOVERY_ERROR.to_string());
+                            }
+                            let realign_on_next_frame =
+                                video_decode_recovery.take_realign_on_next_frame();
+                            let start_action = decoded_video_frame_start_action(
+                                timestamp.timeline_nsecs,
+                                current_start_position_nsecs,
+                                realign_on_next_frame,
+                            );
+                            match start_action {
+                                DecodedVideoFrameStartAction::DropBeforeStart => {
+                                    dropped_video_frames_before_start_count =
+                                        dropped_video_frames_before_start_count.saturating_add(1);
+                                    if dropped_video_frames_before_start_count == 1 {
+                                        tracing::trace!(
+                                            frame_count = decoded_video_frame_count,
+                                            dropped_frames_before_start =
+                                                dropped_video_frames_before_start_count,
+                                            raw_timestamp = frame_timestamp,
+                                            timeline_nsecs = timestamp.timeline_nsecs,
+                                            current_start_position_nsecs,
+                                            first_video_frame_pending,
+                                            recovery_realign_on_next_frame =
+                                                realign_on_next_frame,
+                                            "dropping decoded FFmpeg video frame before playback start"
+                                        );
+                                    } else if dropped_video_frames_before_start_count
+                                        .is_multiple_of(60)
+                                    {
+                                        tracing::debug!(
+                                            frame_count = decoded_video_frame_count,
+                                            dropped_frames_before_start =
+                                                dropped_video_frames_before_start_count,
+                                            raw_timestamp = frame_timestamp,
+                                            timeline_nsecs = timestamp.timeline_nsecs,
+                                            current_start_position_nsecs,
+                                            first_video_frame_pending,
+                                            recovery_realign_on_next_frame =
+                                                realign_on_next_frame,
+                                            "dropping decoded FFmpeg video frame before playback start"
+                                        );
+                                    }
+                                    dovi_pipeline.discard_frame(frame_pts);
+                                    return Ok(());
+                                }
+                                DecodedVideoFrameStartAction::Use { realign } if realign => {
+                                    tracing::debug!(
+                                        previous_start_position_nsecs =
+                                            current_start_position_nsecs,
+                                        pts = frame_pts.nsecs,
+                                        "realigning FFmpeg playback clock to recovered video keyframe"
+                                    );
+                                    current_start_position_nsecs = frame_pts.nsecs;
+                                    scheduler.reset(frame_pts.nsecs);
+                                    if let Some(output) = audio_output.as_ref() {
+                                        output.reset_clock(frame_pts.nsecs);
+                                    }
+                                    audio_clock = TimestampMapper::new(
+                                        audio_stream.and_then(|stream| stream.start_nsecs),
+                                        frame_pts.nsecs,
+                                        None,
+                                    );
+                                    queued_video_frames.clear();
+                                    first_video_frame_pending = true;
+                                    subtitle_pipeline.reset_cues_for_position(frame_pts.nsecs);
+                                    buffered_reporter.reset_to(
+                                        nsecs_to_seconds(frame_pts.nsecs),
+                                        session.id(),
+                                        &event_tx,
+                                    );
+                                }
+                                DecodedVideoFrameStartAction::Use { .. } => {}
+                            }
+
+                            if let Some(output) = audio_output.as_ref() {
+                                if !first_video_frame_pending
+                                    && should_drop_late_queued_video_frame(
+                                        timestamp.timeline_nsecs,
+                                        video_frame_duration_nsecs,
+                                        output.played_timeline_nsecs(),
+                                        &queued_video_frames,
+                                    )
+                                {
+                                    tracing::trace!(
+                                        pts = timestamp.timeline_nsecs,
+                                        played_until = output.played_timeline_nsecs(),
+                                        queued_frames = queued_video_frames.len(),
+                                        "dropping late FFmpeg video frame while newer queued frames are available"
+                                    );
+                                    dovi_pipeline.discard_frame(frame_pts);
+                                    return Ok(());
+                                }
+                                if should_drop_backlogged_vulkan_frame(
+                                    frame,
+                                    first_video_frame_pending,
+                                    &frame_slot,
+                                ) {
+                                    dovi_pipeline.discard_frame(frame_pts);
+                                    return Ok(());
+                                }
+
+                                let dovi_metadata =
+                                    dovi_pipeline.metadata_for_decoded_frame(frame, frame_pts);
+                                let mut decoded_frame = video_converter.convert(
+                                    &video_decoder,
+                                    frame,
+                                    dovi_metadata,
+                                )?;
+                                decoded_frame.pts = Some(frame_pts);
+                                subtitle_pipeline.update_overlay_from_audio_clock(
+                                    output,
+                                    session.id(),
+                                    &event_tx,
+                                );
+
+                                if first_video_frame_pending {
+                                    if timestamp.timeline_nsecs > current_start_position_nsecs {
+                                        tracing::debug!(
+                                            previous_start_position_nsecs =
+                                                current_start_position_nsecs,
+                                            first_video_frame_nsecs = timestamp.timeline_nsecs,
+                                            "realigning FFmpeg playback start to first decoded video frame"
+                                        );
+                                        current_start_position_nsecs = timestamp.timeline_nsecs;
+                                        scheduler.reset(timestamp.timeline_nsecs);
+                                        output.reset_clock(timestamp.timeline_nsecs);
+                                        subtitle_pipeline
+                                            .reset_cues_for_position(timestamp.timeline_nsecs);
+                                        buffered_reporter.reset_to(
+                                            nsecs_to_seconds(timestamp.timeline_nsecs),
+                                            session.id(),
+                                            &event_tx,
+                                        );
+                                    }
+                                    tracing::debug!(
+                                        frame_count = decoded_video_frame_count,
+                                        pts = timestamp.timeline_nsecs,
+                                        current_start_position_nsecs,
+                                        queued_video_frames = queued_video_frames.len(),
+                                        audio_played_until_nsecs = output.played_timeline_nsecs(),
+                                        "presenting first FFmpeg video frame after start gate"
+                                    );
+                                    present_decoded_video_frame(
+                                        decoded_frame,
+                                        session.id(),
+                                        timestamp.timeline_nsecs,
+                                        &frame_slot,
+                                        &frame_presented,
+                                        &mut position_reporter,
+                                        &event_tx,
+                                    );
+                                    buffered_reporter.report_video_timeline_nsecs(
+                                        timestamp
+                                            .timeline_nsecs
+                                            .saturating_add(video_frame_duration_nsecs),
+                                        session.id(),
+                                        &event_tx,
+                                    );
+                                    first_video_frame_pending = false;
+                                    return Ok(());
+                                }
+                                queued_video_frames.push_back(QueuedVideoFrame {
+                                    frame: decoded_frame,
+                                    timeline_nsecs: timestamp.timeline_nsecs,
+                                    duration_nsecs: video_frame_duration_nsecs,
+                                });
+                                buffered_reporter.report_video_timeline_nsecs(
+                                    timestamp
+                                        .timeline_nsecs
+                                        .saturating_add(video_frame_duration_nsecs),
+                                    session.id(),
+                                    &event_tx,
+                                );
+                                let played_until = present_due_audio_clocked_video_frames(
+                                    &mut queued_video_frames,
+                                    output,
+                                    session.id(),
+                                    &frame_slot,
+                                    &frame_presented,
+                                    &mut position_reporter,
+                                    &event_tx,
+                                );
+                                subtitle_pipeline.update_overlay(
+                                    played_until,
+                                    session.id(),
+                                    &event_tx,
+                                );
+                                if queued_video_duration(&queued_video_frames)
+                                    >= queued_video_limit_duration(
+                                        &queued_video_frames,
+                                        subtitle_pipeline.needs_prefetch(),
+                                    )
+                                {
+                                    let target_duration = queued_video_target_duration(
+                                        &queued_video_frames,
+                                        subtitle_pipeline.needs_prefetch(),
+                                    );
+                                    wait_for_audio_clocked_video_queue(
+                                        &mut queued_video_frames,
+                                        output,
+                                        &control,
+                                        session.id(),
+                                        &frame_slot,
+                                        &frame_presented,
+                                        &mut position_reporter,
+                                        &event_tx,
+                                        target_duration,
+                                        |played_until| {
+                                            subtitle_pipeline.update_overlay(
+                                                played_until,
+                                                session.id(),
+                                                &event_tx,
+                                            );
+                                        },
+                                    )?;
+                                }
+                            } else {
+                                if should_drop_backlogged_vulkan_frame(
+                                    frame,
+                                    first_video_frame_pending,
+                                    &frame_slot,
+                                ) {
+                                    dovi_pipeline.discard_frame(frame_pts);
+                                    return Ok(());
+                                }
+                                let dovi_metadata =
+                                    dovi_pipeline.metadata_for_decoded_frame(frame, frame_pts);
+                                let mut decoded_frame = video_converter.convert(
+                                    &video_decoder,
+                                    frame,
+                                    dovi_metadata,
+                                )?;
+                                decoded_frame.pts = Some(frame_pts);
+                                subtitle_pipeline.update_overlay(
+                                    timestamp.timeline_nsecs,
+                                    session.id(),
+                                    &event_tx,
+                                );
+
+                                if first_video_frame_pending {
+                                    if timestamp.timeline_nsecs > current_start_position_nsecs {
+                                        tracing::debug!(
+                                            previous_start_position_nsecs =
+                                                current_start_position_nsecs,
+                                            first_video_frame_nsecs = timestamp.timeline_nsecs,
+                                            "realigning FFmpeg playback start to first decoded video frame"
+                                        );
+                                        current_start_position_nsecs = timestamp.timeline_nsecs;
+                                        scheduler.reset(timestamp.timeline_nsecs);
+                                        subtitle_pipeline
+                                            .reset_cues_for_position(timestamp.timeline_nsecs);
+                                        buffered_reporter.reset_to(
+                                            nsecs_to_seconds(timestamp.timeline_nsecs),
+                                            session.id(),
+                                            &event_tx,
+                                        );
+                                    }
+                                    tracing::debug!(
+                                        frame_count = decoded_video_frame_count,
+                                        pts = timestamp.timeline_nsecs,
+                                        current_start_position_nsecs,
+                                        "presenting first FFmpeg video frame after start gate"
+                                    );
+                                    present_decoded_video_frame(
+                                        decoded_frame,
+                                        session.id(),
+                                        timestamp.timeline_nsecs,
+                                        &frame_slot,
+                                        &frame_presented,
+                                        &mut position_reporter,
+                                        &event_tx,
+                                    );
+                                    buffered_reporter.report_video_timeline_nsecs(
+                                        timestamp
+                                            .timeline_nsecs
+                                            .saturating_add(video_frame_duration_nsecs),
+                                        session.id(),
+                                        &event_tx,
+                                    );
+                                    first_video_frame_pending = false;
+                                    return Ok(());
+                                }
+                                first_video_frame_pending = false;
+                                if scheduler
+                                    .wait_until(timestamp.timeline_nsecs, &control)
+                                    .interrupted()
+                                {
+                                    return Ok(());
+                                }
+                                if control.has_pending_seek() {
+                                    return Ok(());
+                                }
+                                present_decoded_video_frame(
+                                    decoded_frame,
+                                    session.id(),
+                                    timestamp.timeline_nsecs,
+                                    &frame_slot,
+                                    &frame_presented,
+                                    &mut position_reporter,
+                                    &event_tx,
+                                );
+                                buffered_reporter.report_video_timeline_nsecs(
+                                    timestamp
+                                        .timeline_nsecs
+                                        .saturating_add(video_frame_duration_nsecs),
+                                    session.id(),
+                                    &event_tx,
+                                );
+                            }
+                            Ok(())
+                            },
+                        )
+                    };
+                    let realign_after_decode_recovery = first_video_frame_pending;
+                    let process_result = recover_video_decode_error_if_needed(
+                        decode_result,
+                        &video_decoder,
+                        video_stream.codec_id,
+                        decode_packet_for_recovery,
+                        &mut video_decode_recovery,
+                        realign_after_decode_recovery,
+                    );
+                    if video_decode_recovery.waiting_for_keyframe() {
+                        if realign_after_decode_recovery {
+                            queued_video_frames.clear();
+                            first_video_frame_pending = true;
+                        }
+                        dovi_pipeline.reset();
+                    }
+                    process_result
+                }
             }
             index if subtitle_pipeline.matches_stream_index(index) => subtitle_pipeline
                 .decode_packet(
@@ -839,9 +1400,58 @@ pub(super) fn run_ffmpeg_playback(
                     if control.has_pending_seek() {
                         return Ok(());
                     }
-                    let timestamp =
-                        audio_clock.map(frame_best_effort_timestamp(frame), decoder.time_base);
+                    let raw_timestamp = frame_best_effort_timestamp(frame);
+                    let timestamp = audio_clock.map(raw_timestamp, decoder.time_base);
                     if timestamp.timeline_nsecs < current_start_position_nsecs {
+                        dropped_audio_frames_before_start_count =
+                            dropped_audio_frames_before_start_count.saturating_add(1);
+                        if dropped_audio_frames_before_start_count == 1 {
+                            tracing::trace!(
+                                dropped_audio_frames_before_start =
+                                    dropped_audio_frames_before_start_count,
+                                raw_timestamp,
+                                timeline_nsecs = timestamp.timeline_nsecs,
+                                current_start_position_nsecs,
+                                first_video_frame_pending,
+                                "dropping FFmpeg audio frame before playback start"
+                            );
+                        } else if dropped_audio_frames_before_start_count.is_multiple_of(60) {
+                            tracing::debug!(
+                                dropped_audio_frames_before_start =
+                                    dropped_audio_frames_before_start_count,
+                                raw_timestamp,
+                                timeline_nsecs = timestamp.timeline_nsecs,
+                                current_start_position_nsecs,
+                                first_video_frame_pending,
+                                "dropping FFmpeg audio frame before playback start"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    if first_video_frame_pending {
+                        dropped_audio_frames_waiting_for_video_count =
+                            dropped_audio_frames_waiting_for_video_count.saturating_add(1);
+                        if dropped_audio_frames_waiting_for_video_count == 1 {
+                            tracing::trace!(
+                                dropped_audio_frames_waiting_for_video =
+                                    dropped_audio_frames_waiting_for_video_count,
+                                raw_timestamp,
+                                timeline_nsecs = timestamp.timeline_nsecs,
+                                current_start_position_nsecs,
+                                queued_video_frames = queued_video_frames.len(),
+                                "dropping FFmpeg audio frame while waiting for first video frame"
+                            );
+                        } else if dropped_audio_frames_waiting_for_video_count.is_multiple_of(60) {
+                            tracing::debug!(
+                                dropped_audio_frames_waiting_for_video =
+                                    dropped_audio_frames_waiting_for_video_count,
+                                raw_timestamp,
+                                timeline_nsecs = timestamp.timeline_nsecs,
+                                current_start_position_nsecs,
+                                queued_video_frames = queued_video_frames.len(),
+                                "dropping FFmpeg audio frame while waiting for first video frame"
+                            );
+                        }
                         return Ok(());
                     }
                     if let Some(audio) = resampler.convert(frame)? {
@@ -851,19 +1461,29 @@ pub(super) fn run_ffmpeg_playback(
                         let buffered_until_nsecs = timestamp
                             .timeline_nsecs
                             .saturating_add(audio.duration_nsecs);
-                        output.push(audio.samples, &control, || {
-                            let played_until = present_due_audio_clocked_video_frames(
-                                &mut queued_video_frames,
-                                output,
-                                session.id(),
-                                &frame_slot,
-                                &frame_presented,
-                                &mut position_reporter,
-                                &event_tx,
-                            );
-                            subtitle_pipeline.update_overlay(played_until, session.id(), &event_tx);
-                            Ok(())
-                        })?;
+                        output.push_timed(
+                            audio.samples,
+                            timestamp.timeline_nsecs,
+                            buffered_until_nsecs,
+                            &control,
+                            || {
+                                let played_until = present_due_audio_clocked_video_frames(
+                                    &mut queued_video_frames,
+                                    output,
+                                    session.id(),
+                                    &frame_slot,
+                                    &frame_presented,
+                                    &mut position_reporter,
+                                    &event_tx,
+                                );
+                                subtitle_pipeline.update_overlay(
+                                    played_until,
+                                    session.id(),
+                                    &event_tx,
+                                );
+                                Ok(())
+                            },
+                        )?;
                         buffered_reporter.report_audio_timeline_nsecs(
                             buffered_until_nsecs,
                             session.id(),
@@ -902,14 +1522,24 @@ pub(super) fn run_ffmpeg_playback(
         let frame_pts = FramePts {
             nsecs: timestamp.timeline_nsecs,
         };
+        if drop_corrupt_video_frame_if_needed(frame, frame_pts, &mut dovi_pipeline) {
+            return Ok(());
+        }
         if let Some(output) = audio_output.as_ref() {
             if !first_video_frame_pending
-                && should_drop_late_video_frame(
+                && should_drop_late_queued_video_frame(
                     timestamp.timeline_nsecs,
                     video_frame_duration_nsecs,
                     output.played_timeline_nsecs(),
+                    &queued_video_frames,
                 )
             {
+                tracing::trace!(
+                    pts = timestamp.timeline_nsecs,
+                    played_until = output.played_timeline_nsecs(),
+                    queued_frames = queued_video_frames.len(),
+                    "dropping late FFmpeg video frame while newer queued frames are available"
+                );
                 dovi_pipeline.discard_frame(frame_pts);
                 return Ok(());
             }
@@ -947,6 +1577,7 @@ pub(super) fn run_ffmpeg_playback(
             queued_video_frames.push_back(QueuedVideoFrame {
                 frame: decoded_frame,
                 timeline_nsecs: timestamp.timeline_nsecs,
+                duration_nsecs: video_frame_duration_nsecs,
             });
             buffered_reporter.report_video_timeline_nsecs(
                 timestamp
@@ -1018,19 +1649,25 @@ pub(super) fn run_ffmpeg_playback(
                 let buffered_until_nsecs = timestamp
                     .timeline_nsecs
                     .saturating_add(audio.duration_nsecs);
-                output.push(audio.samples, &control, || {
-                    let played_until = present_due_audio_clocked_video_frames(
-                        &mut queued_video_frames,
-                        output,
-                        session.id(),
-                        &frame_slot,
-                        &frame_presented,
-                        &mut position_reporter,
-                        &event_tx,
-                    );
-                    subtitle_pipeline.update_overlay(played_until, session.id(), &event_tx);
-                    Ok(())
-                })?;
+                output.push_timed(
+                    audio.samples,
+                    timestamp.timeline_nsecs,
+                    buffered_until_nsecs,
+                    &control,
+                    || {
+                        let played_until = present_due_audio_clocked_video_frames(
+                            &mut queued_video_frames,
+                            output,
+                            session.id(),
+                            &frame_slot,
+                            &frame_presented,
+                            &mut position_reporter,
+                            &event_tx,
+                        );
+                        subtitle_pipeline.update_overlay(played_until, session.id(), &event_tx);
+                        Ok(())
+                    },
+                )?;
                 buffered_reporter.report_audio_timeline_nsecs(
                     buffered_until_nsecs,
                     session.id(),
@@ -1061,6 +1698,7 @@ pub(super) fn run_ffmpeg_playback(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn playback_read_finished(
     read_result: c_int,
     duration_seconds: Option<f64>,
@@ -1086,6 +1724,390 @@ fn playback_buffered_near_duration(
 
     duration_seconds > 0.0
         && buffered_until_seconds + END_OF_PLAYBACK_READ_ERROR_TOLERANCE_SECONDS >= duration_seconds
+}
+
+fn drop_corrupt_video_frame_if_needed(
+    frame: *mut ffi::AVFrame,
+    frame_pts: FramePts,
+    dovi_pipeline: &mut DoviPipeline,
+) -> bool {
+    if !frame_is_corrupt(frame) {
+        return false;
+    }
+
+    tracing::debug!(
+        pts = frame_pts.nsecs,
+        decode_error_flags = frame_decode_error_flags(frame),
+        "dropping corrupt FFmpeg video frame"
+    );
+    dovi_pipeline.discard_frame(frame_pts);
+    true
+}
+
+fn strip_hevc_dovi_rpu_decode_packet(
+    packet: &AvPacket,
+    codec_id: ffi::AVCodecID,
+    log_context: HevcDecodePacketLogContext,
+) -> std::result::Result<Option<StrippedDoviDecodePacket>, String> {
+    if codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
+        return Ok(None);
+    }
+    let Some(data) = packet.data() else {
+        return Ok(None);
+    };
+    let Some(stripped) = strip_dovi_rpu_nalus(data) else {
+        if should_debug_hevc_decode_packet_without_rpu(log_context) {
+            tracing::debug!(
+                packet_count = log_context.video_packet_count,
+                pts = ?packet.best_timestamp(),
+                keyframe = packet.is_key(),
+                packet_bytes = packet.byte_len(),
+                first_video_frame_pending = log_context.first_video_frame_pending,
+                recovery_waiting = log_context.recovery_waiting,
+                original_nals = %hevc_nal_summary(data, None),
+                "HEVC decode packet has no stripped Dolby Vision RPU NALs"
+            );
+        } else if should_trace_hevc_decode_packet_nals(packet, log_context) {
+            tracing::trace!(
+                packet_count = log_context.video_packet_count,
+                pts = ?packet.best_timestamp(),
+                keyframe = packet.is_key(),
+                packet_bytes = packet.byte_len(),
+                first_video_frame_pending = log_context.first_video_frame_pending,
+                recovery_waiting = log_context.recovery_waiting,
+                original_nals = %hevc_nal_summary(data, None),
+                "HEVC decode packet has no stripped Dolby Vision RPU NALs"
+            );
+        }
+        return Ok(None);
+    };
+
+    if should_debug_stripped_hevc_dovi_packet(log_context, &stripped) {
+        tracing::debug!(
+            packet_count = log_context.video_packet_count,
+            pts = ?packet.best_timestamp(),
+            keyframe = packet.is_key(),
+            packet_bytes = packet.byte_len(),
+            stripped_packet_bytes = stripped.data.len(),
+            stripped_bytes = stripped.stripped_bytes,
+            nal_count = stripped.nal_count,
+            stripped_nal_count = stripped.stripped_nal_count,
+            stream_format = ?stripped.stream_format,
+            rpu_metadata = stripped.metadata.is_some(),
+            rpu_profile = ?stripped.metadata.as_ref().map(|metadata| metadata.profile),
+            rpu_profile5 = ?stripped.metadata.as_ref().map(DoviFrameMetadata::is_profile5),
+            first_video_frame_pending = log_context.first_video_frame_pending,
+            recovery_waiting = log_context.recovery_waiting,
+            original_nals = %hevc_nal_summary(data, Some(stripped.stream_format)),
+            stripped_nals = %hevc_nal_summary(&stripped.data, Some(stripped.stream_format)),
+            "stripped Dolby Vision RPU NALs before HEVC decode"
+        );
+    } else if should_trace_hevc_decode_packet_nals(packet, log_context) {
+        tracing::trace!(
+            packet_count = log_context.video_packet_count,
+            pts = ?packet.best_timestamp(),
+            keyframe = packet.is_key(),
+            packet_bytes = packet.byte_len(),
+            stripped_packet_bytes = stripped.data.len(),
+            stripped_bytes = stripped.stripped_bytes,
+            nal_count = stripped.nal_count,
+            stripped_nal_count = stripped.stripped_nal_count,
+            stream_format = ?stripped.stream_format,
+            rpu_metadata = stripped.metadata.is_some(),
+            rpu_profile = ?stripped.metadata.as_ref().map(|metadata| metadata.profile),
+            rpu_profile5 = ?stripped.metadata.as_ref().map(DoviFrameMetadata::is_profile5),
+            original_nals = %hevc_nal_summary(data, Some(stripped.stream_format)),
+            stripped_nals = %hevc_nal_summary(&stripped.data, Some(stripped.stream_format)),
+            "stripped Dolby Vision RPU NALs before HEVC decode"
+        );
+    }
+
+    AvPacket::from_data_and_props(&stripped.data, packet).map(|packet| {
+        Some(StrippedDoviDecodePacket {
+            packet,
+            metadata: stripped.metadata,
+        })
+    })
+}
+
+struct StrippedDoviDecodePacket {
+    packet: AvPacket,
+    metadata: Option<DoviFrameMetadata>,
+}
+
+#[derive(Clone, Copy)]
+struct HevcDecodePacketLogContext {
+    video_packet_count: u64,
+    first_video_frame_pending: bool,
+    recovery_waiting: bool,
+}
+
+fn should_debug_hevc_decode_packet_without_rpu(context: HevcDecodePacketLogContext) -> bool {
+    context.recovery_waiting
+}
+
+fn should_debug_stripped_hevc_dovi_packet(
+    context: HevcDecodePacketLogContext,
+    stripped: &DoviRpuStripResult,
+) -> bool {
+    context.recovery_waiting || stripped.metadata.is_none()
+}
+
+fn should_trace_hevc_decode_packet_nals(
+    packet: &AvPacket,
+    context: HevcDecodePacketLogContext,
+) -> bool {
+    context.first_video_frame_pending
+        || context.recovery_waiting
+        || packet.is_key()
+        || context.video_packet_count == 1
+        || context.video_packet_count.is_multiple_of(120)
+}
+
+fn hevc_nal_summary(data: &[u8], format_hint: Option<HevcStreamFormat>) -> String {
+    let format = format_hint.or_else(|| detect_hevc_stream_format(data));
+    match format {
+        Some(HevcStreamFormat::ByteStream) => hevc_annex_b_nal_summary(data),
+        Some(HevcStreamFormat::LengthPrefixed { length_size }) => {
+            hevc_length_prefixed_nal_summary(data, length_size)
+        }
+        None => format!("format=unknown;bytes={}", data.len()),
+    }
+}
+
+fn detect_hevc_stream_format(data: &[u8]) -> Option<HevcStreamFormat> {
+    if data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1]) {
+        return Some(HevcStreamFormat::ByteStream);
+    }
+    for length_size in [4, 3, 2, 1] {
+        if hevc_length_prefixed_nal_types(data, length_size).is_some() {
+            return Some(HevcStreamFormat::LengthPrefixed { length_size });
+        }
+    }
+    if data.windows(3).any(|window| window == [0, 0, 1])
+        || data.windows(4).any(|window| window == [0, 0, 0, 1])
+    {
+        return Some(HevcStreamFormat::ByteStream);
+    }
+    None
+}
+
+fn hevc_length_prefixed_nal_types(
+    data: &[u8],
+    length_size: usize,
+) -> Option<Vec<(Option<u8>, usize)>> {
+    let mut offset = 0usize;
+    let mut nals = Vec::new();
+    while offset < data.len() {
+        let length_end = offset.checked_add(length_size)?;
+        if length_end > data.len() {
+            return None;
+        }
+        let mut nal_len = 0usize;
+        for byte in &data[offset..length_end] {
+            nal_len = nal_len.checked_shl(8)?.checked_add(usize::from(*byte))?;
+        }
+        if nal_len == 0 {
+            return None;
+        }
+        let nal_start = length_end;
+        let nal_end = nal_start.checked_add(nal_len)?;
+        if nal_end > data.len() {
+            return None;
+        }
+        let nal = trim_hevc_nal_trailing_zeroes(&data[nal_start..nal_end]);
+        nals.push((nal.first().map(|header| (header >> 1) & 0x3f), nal.len()));
+        offset = nal_end;
+    }
+    Some(nals)
+}
+
+fn hevc_length_prefixed_nal_summary(data: &[u8], length_size: usize) -> String {
+    match hevc_length_prefixed_nal_types(data, length_size) {
+        Some(nals) => format_hevc_nal_summary(
+            format!("length_prefixed({length_size})"),
+            data.len(),
+            &nals,
+            None,
+        ),
+        None => format!(
+            "format=length_prefixed({length_size});bytes={};parse_error=true",
+            data.len()
+        ),
+    }
+}
+
+fn hevc_annex_b_nal_summary(data: &[u8]) -> String {
+    let mut cursor = 0usize;
+    let mut nals = Vec::new();
+    while let Some((start_code_pos, start_code_len)) = find_hevc_start_code(data, cursor) {
+        let nal_start = start_code_pos.saturating_add(start_code_len);
+        let nal_end = find_hevc_start_code(data, nal_start)
+            .map(|(next_start, _)| next_start)
+            .unwrap_or(data.len());
+        let nal = trim_hevc_nal_trailing_zeroes(&data[nal_start..nal_end]);
+        if !nal.is_empty() {
+            nals.push((nal.first().map(|header| (header >> 1) & 0x3f), nal.len()));
+        }
+        cursor = nal_end;
+    }
+    let parse_error = nals.is_empty().then_some("no_start_code_nals");
+    format_hevc_nal_summary("annex_b".to_string(), data.len(), &nals, parse_error)
+}
+
+fn format_hevc_nal_summary(
+    format: String,
+    bytes: usize,
+    nals: &[(Option<u8>, usize)],
+    parse_error: Option<&'static str>,
+) -> String {
+    const NAL_SUMMARY_LIMIT: usize = 16;
+    let rpu_nals = nals
+        .iter()
+        .filter(|(nal_type, _)| *nal_type == Some(62))
+        .count();
+    let nal_parts = nals
+        .iter()
+        .take(NAL_SUMMARY_LIMIT)
+        .enumerate()
+        .map(|(index, (nal_type, len))| format!("{index}:{nal_type:?}/{len}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let truncated = if nals.len() > NAL_SUMMARY_LIMIT {
+        ";truncated=true"
+    } else {
+        ""
+    };
+    let parse_error = parse_error
+        .map(|error| format!(";parse_error={error}"))
+        .unwrap_or_default();
+    format!(
+        "format={format};bytes={bytes};count={};rpu62={rpu_nals};nals=[{nal_parts}]{truncated}{parse_error}",
+        nals.len()
+    )
+}
+
+fn find_hevc_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut index = from;
+    while index + 3 <= data.len() {
+        if data[index..].starts_with(&[0, 0, 1]) {
+            return Some((index, 3));
+        }
+        if data[index..].starts_with(&[0, 0, 0, 1]) {
+            return Some((index, 4));
+        }
+        index = index.saturating_add(1);
+    }
+    None
+}
+
+fn trim_hevc_nal_trailing_zeroes(nal: &[u8]) -> &[u8] {
+    let mut end = nal.len();
+    while end > 0 && nal[end - 1] == 0 {
+        end -= 1;
+    }
+    &nal[..end]
+}
+
+fn log_video_decode_packet_if_needed(
+    packet: &AvPacket,
+    codec_id: ffi::AVCodecID,
+    video_packet_count: u64,
+    recovery: &VideoDecodeRecovery,
+) {
+    let recovery_point = packet_is_video_recovery_point(packet, codec_id);
+    let safe_seek_point = packet_is_video_seek_point(packet, codec_id);
+    if video_packet_count != 1
+        && !video_packet_count.is_multiple_of(120)
+        && !recovery.waiting_for_keyframe()
+        && !packet.is_key()
+        && !recovery_point
+        && !safe_seek_point
+    {
+        return;
+    }
+
+    tracing::debug!(
+        packet_count = video_packet_count,
+        pts = ?packet.best_timestamp(),
+        keyframe = packet.is_key(),
+        codec = ?codec_id,
+        packet_bytes = packet.byte_len(),
+        recovery_point,
+        safe_seek_point,
+        recovery_waiting = recovery.waiting_for_keyframe(),
+        recovery_skipped_packets = recovery.skipped_packets,
+        "decoding FFmpeg video packet"
+    );
+}
+
+fn recover_video_decode_error_if_needed(
+    result: std::result::Result<(), String>,
+    video_decoder: &Decoder,
+    codec_id: ffi::AVCodecID,
+    packet: &AvPacket,
+    recovery: &mut VideoDecodeRecovery,
+    realign_after_recovery_point: bool,
+) -> std::result::Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if video_decode_error_is_recoverable(&error) => {
+            tracing::debug!(
+                %error,
+                codec = ?codec_id,
+                packet_pts = ?packet.best_timestamp(),
+                packet_keyframe = packet.is_key(),
+                packet_bytes = packet.byte_len(),
+                recovery_point = packet_is_video_recovery_point(packet, codec_id),
+                safe_seek_point = packet_is_video_seek_point(packet, codec_id),
+                recovery_waiting_before = recovery.waiting_for_keyframe(),
+                recovery_skipped_packets = recovery.skipped_packets,
+                realign_after_recovery_point,
+                "recovering FFmpeg video decoder after damaged reference chain"
+            );
+            video_decoder.flush_buffers();
+            recovery.begin_with_realign(realign_after_recovery_point);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn video_decode_error_is_recoverable(error: &str) -> bool {
+    !video_decode_error_is_resource_exhaustion(error)
+        && (error == CORRUPT_VIDEO_FRAME_RECOVERY_ERROR
+            || error.starts_with("FFmpeg 发送解码包失败")
+            || error.starts_with("FFmpeg 接收解码帧失败"))
+}
+
+fn video_decode_error_is_resource_exhaustion(error: &str) -> bool {
+    error.contains("Cannot allocate memory") || error.contains("VK_ERROR_OUT_OF_DEVICE_MEMORY")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DecodedVideoFrameStartAction {
+    DropBeforeStart,
+    Use { realign: bool },
+}
+
+pub(super) fn decoded_video_frame_start_action(
+    frame_timeline_nsecs: u64,
+    current_start_position_nsecs: u64,
+    recovery_realign: bool,
+) -> DecodedVideoFrameStartAction {
+    if recovery_realign {
+        return DecodedVideoFrameStartAction::Use { realign: true };
+    }
+    if frame_timeline_nsecs < current_start_position_nsecs {
+        return DecodedVideoFrameStartAction::DropBeforeStart;
+    }
+    DecodedVideoFrameStartAction::Use { realign: false }
+}
+
+fn packet_duration_nsecs(packet: &AvPacket, stream: StreamInfo) -> Option<u64> {
+    packet
+        .duration()
+        .and_then(|duration| timestamp_to_nsecs(duration, stream.time_base))
 }
 
 fn push_subtitle_cue(cues: &mut VecDeque<BackendSubtitleCue>, cue: BackendSubtitleCue) {

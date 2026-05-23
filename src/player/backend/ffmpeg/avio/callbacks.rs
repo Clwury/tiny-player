@@ -20,11 +20,36 @@ pub(super) unsafe extern "C" fn cached_avio_read_packet(
     let output = unsafe { slice::from_raw_parts_mut(buf, buf_size as usize) };
     match reader.cache.read_at(reader.read_pos, output) {
         CacheReadResult::Data(read) => {
+            if read < output.len() {
+                tracing::trace!(
+                    read_pos = reader.read_pos,
+                    read,
+                    requested = output.len(),
+                    next_read_pos = reader.read_pos.saturating_add(read as u64),
+                    "cached FFmpeg AVIO read returned short data"
+                );
+            }
             reader.read_pos = reader.read_pos.saturating_add(read as u64);
             c_int::try_from(read).unwrap_or(c_int::MAX)
         }
-        CacheReadResult::Eof => ffi::AVERROR_EOF,
-        CacheReadResult::Interrupted => ffi::AVERROR(ffi::EIO),
+        CacheReadResult::Eof => {
+            tracing::debug!(
+                read_pos = reader.read_pos,
+                requested = output.len(),
+                "cached FFmpeg AVIO read reached EOF"
+            );
+            ffi::AVERROR_EOF
+        }
+        #[cfg(test)]
+        CacheReadResult::WouldBlock => ffi::AVERROR(ffi::EAGAIN),
+        CacheReadResult::Interrupted => {
+            tracing::debug!(
+                read_pos = reader.read_pos,
+                requested = output.len(),
+                "cached FFmpeg AVIO read interrupted"
+            );
+            ffi::AVERROR(ffi::EIO)
+        }
         CacheReadResult::Error(error) => {
             tracing::warn!(%error, "cached FFmpeg AVIO read failed");
             ffi::AVERROR(ffi::EIO)
@@ -69,6 +94,7 @@ pub(super) unsafe extern "C" fn cached_avio_seek(
         return i64::from(ffi::AVERROR(ffi::EINVAL));
     }
     let next = next as u64;
+    let previous_read_pos = reader.read_pos;
     reader.read_pos = next;
     let range_kind = if seek_mode == ffi::SEEK_END
         || (seek_mode == ffi::SEEK_SET && reader.cache.is_tail_metadata_probe_seek(next))
@@ -77,6 +103,15 @@ pub(super) unsafe extern "C" fn cached_avio_seek(
     } else {
         HttpCacheRangeKind::Playback
     };
+    tracing::debug!(
+        previous_read_pos,
+        next_read_pos = next,
+        offset,
+        whence,
+        seek_mode,
+        ?range_kind,
+        "cached FFmpeg AVIO seek"
+    );
     reader.cache.note_reader_offset(next, range_kind);
     i64::try_from(next).unwrap_or(i64::MAX)
 }
