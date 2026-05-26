@@ -10,14 +10,16 @@ pub(super) struct PlaybackFrameState {
 pub(super) struct PlaybackTimelineState {
     pub(super) loaded: bool,
     pub(super) ended: bool,
+    pub(super) user_paused: bool,
     pub(super) paused: bool,
     pub(super) buffering: bool,
     pub(super) position: Option<f64>,
     pub(super) duration: Option<f64>,
     pub(super) buffered_until: Option<f64>,
-    pub(super) http_stream_buffered_range: Option<HttpStreamBufferProgress>,
-    pub(super) http_stream_cache_status: Option<HttpStreamCacheStatus>,
-    pub(super) http_stream_buffer_poll_active: bool,
+    pub(super) cache_state: Option<PlaybackCacheState>,
+    pub(super) cache_status_open: bool,
+    pub(super) paused_for_cache: bool,
+    pub(super) cache_buffering_percent: Option<u8>,
     pub(super) paused_backend_poll_scheduled: bool,
     pub(super) pending_seek_position: Option<f64>,
     pub(super) pending_seek_keeps_frame: bool,
@@ -30,20 +32,38 @@ impl Default for PlaybackTimelineState {
         Self {
             loaded: false,
             ended: false,
+            user_paused: true,
             paused: true,
             buffering: false,
             position: None,
             duration: None,
             buffered_until: None,
-            http_stream_buffered_range: None,
-            http_stream_cache_status: None,
-            http_stream_buffer_poll_active: false,
+            cache_state: None,
+            cache_status_open: false,
+            paused_for_cache: false,
+            cache_buffering_percent: None,
             paused_backend_poll_scheduled: false,
             pending_seek_position: None,
             pending_seek_keeps_frame: false,
             progress_track_bounds: None,
             progress_drag_position: None,
         }
+    }
+}
+
+pub(super) fn effective_playback_paused(user_paused: bool, paused_for_cache: bool) -> bool {
+    user_paused || paused_for_cache
+}
+
+pub(super) fn user_pause_from_effective_pause_event(
+    current_user_paused: bool,
+    paused_for_cache: bool,
+    effective_paused: bool,
+) -> bool {
+    if paused_for_cache {
+        current_user_paused
+    } else {
+        effective_paused
     }
 }
 

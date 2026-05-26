@@ -7,6 +7,7 @@ mod session;
 mod subtitles;
 mod timeline;
 
+use super::avio::{CachedInputSource, should_cache_http_url};
 use commands::{begin_seek, begin_track_switch};
 use decode::{flush_playback_decode_state, should_drop_backlogged_vulkan_frame};
 use demux_cache::{DemuxPacketCache, DemuxPacketCacheInput, DemuxReadResult};
@@ -192,11 +193,19 @@ fn open_playback_input_with_fallback(
     control: Arc<FfmpegControl>,
     event_tx: &Sender<BackendEvent>,
 ) -> std::result::Result<OpenedPlaybackInput, String> {
+    let mut cached_source = CachedInputSource::new(
+        &source.url,
+        source.http_headers.as_slice(),
+        source.content_length,
+        &source.cache_config,
+        Arc::clone(&control),
+        event_tx.clone(),
+    )?;
     let initial_probe_profile = initial_probe_profile(source);
     let probed = match probe_playback_input(
         source,
+        &cached_source,
         Arc::clone(&control),
-        event_tx,
         initial_probe_profile,
         false,
     ) {
@@ -214,7 +223,13 @@ fn open_playback_input_with_fallback(
                 fallback_probe_profile = ?fallback_probe_profile,
                 "FFmpeg initial probe did not satisfy selected streams; retrying"
             );
-            match probe_playback_input(source, control, event_tx, fallback_probe_profile, true) {
+            match probe_playback_input(
+                source,
+                &cached_source,
+                control,
+                fallback_probe_profile,
+                true,
+            ) {
                 Ok(probed) => probed,
                 Err(error) => {
                     tracing::warn!(
@@ -233,15 +248,21 @@ fn open_playback_input_with_fallback(
                 fallback_probe_profile = ?fallback_probe_profile,
                 "FFmpeg initial probe failed; retrying"
             );
-            probe_playback_input(source, control, event_tx, fallback_probe_profile, true).map_err(
-                |fallback_error| {
-                    format!(
-                        "FFmpeg 初始探测失败：{initial_error}；重试探测也失败：{fallback_error}"
-                    )
-                },
-            )?
+            probe_playback_input(
+                source,
+                &cached_source,
+                control,
+                fallback_probe_profile,
+                true,
+            )
+            .map_err(|fallback_error| {
+                format!("FFmpeg 初始探测失败：{initial_error}；重试探测也失败：{fallback_error}")
+            })?
         }
     };
+    let mut probed = probed;
+    probed.input.shutdown_cached_io_on_drop();
+    cached_source.release();
     open_decoders_for_probed_input(probed)
 }
 
@@ -312,18 +333,17 @@ fn selected_pgs_subtitle_needs_deeper_probe(probed: &ProbedPlaybackInput) -> boo
 
 fn probe_playback_input(
     source: &FfmpegPlaybackInput,
+    cached_source: &CachedInputSource,
     control: Arc<FfmpegControl>,
-    event_tx: &Sender<BackendEvent>,
     probe_profile: InputProbeProfile,
     allow_audio_decoder_failure: bool,
 ) -> std::result::Result<ProbedPlaybackInput, String> {
     let mut input = FormatContext::open(
         &source.url,
         source.http_headers.as_slice(),
-        source.content_length,
         probe_profile,
+        cached_source,
         Arc::clone(&control),
-        event_tx.clone(),
     )?;
     input.find_stream_info()?;
     let stream_catalog = StreamCatalog::from_input(&input)?;
@@ -570,14 +590,21 @@ pub(super) fn run_ffmpeg_playback(
     if let Some(cache) = &http_cache {
         cache.set_duration_seconds(duration_seconds);
     }
+    let input_cacheable = should_cache_http_url(&source.url);
+    let demux_cache_config = source
+        .cache_config
+        .clone()
+        .resolved_for_cacheable_input(input_cacheable);
     let demux_cache = DemuxPacketCache::spawn(
         DemuxPacketCacheInput {
             input,
             video_stream,
             audio_stream,
+            subtitle_stream,
             duration_seconds,
             start_position_seconds: source.start_position_seconds,
             session_id: session.id(),
+            cache_config: demux_cache_config,
         },
         Arc::clone(&control),
         event_tx.clone(),
@@ -631,6 +658,14 @@ pub(super) fn run_ffmpeg_playback(
             }
         }
     }
+    demux_cache.set_output_underrun_detection_enabled(audio_output.is_some());
+    if source.cache_config.demuxer_cache_wait {
+        tracing::debug!(
+            session_id = ?session.id(),
+            "waiting for initial FFmpeg demux cache fill before playback restart"
+        );
+        demux_cache.wait_until_initial_cache_fill()?;
+    }
     let mut audio_clock = TimestampMapper::new(
         audio_stream.and_then(|stream| stream.start_nsecs),
         current_start_position_nsecs,
@@ -679,13 +714,20 @@ pub(super) fn run_ffmpeg_playback(
     ));
 
     while !control.should_stop() {
-        if control.wait_while_paused() {
-            continue;
-        }
-
         let drained_commands = drain_playback_commands(&command_rx, &control);
         if control.should_stop() {
             break;
+        }
+
+        if let Some(cache_config) = drained_commands.cache_config {
+            source.cache_config = cache_config.clone();
+            let demux_cache_config = cache_config
+                .clone()
+                .resolved_for_cacheable_input(should_cache_http_url(&source.url));
+            demux_cache.apply_cache_config(demux_cache_config);
+            if let Some(cache) = &http_cache {
+                cache.apply_cache_config(&cache_config);
+            }
         }
 
         if let Some(pending_track_selection) = drained_commands.pending_track_selection {
@@ -754,6 +796,7 @@ pub(super) fn run_ffmpeg_playback(
                         }
                     }
                 }
+                demux_cache.set_output_underrun_detection_enabled(audio_output.is_some());
 
                 subtitle_pipeline.switch_tracks(
                     &source,
@@ -795,7 +838,7 @@ pub(super) fn run_ffmpeg_playback(
                     BackendEventKind::SubtitleChanged(None),
                 ));
                 if pending_track_selection.pause_after_switch {
-                    control.set_paused(true);
+                    control.set_user_paused(true);
                     subtitle_pipeline.update_overlay(
                         current_start_position_nsecs,
                         session.id(),
@@ -891,12 +934,19 @@ pub(super) fn run_ffmpeg_playback(
             continue;
         }
 
+        if control.is_paused() {
+            thread::sleep(SCHEDULER_POLL_INTERVAL);
+            continue;
+        }
+
         if control.has_pending_seek() {
             thread::yield_now();
             continue;
         }
 
-        packet = match demux_cache.read_packet() {
+        let video_output_waiting_for_demux =
+            !first_video_frame_pending && queued_video_frames.is_empty();
+        packet = match demux_cache.read_packet(video_output_waiting_for_demux) {
             DemuxReadResult::Packet(packet) => packet,
             DemuxReadResult::Eof => break,
             DemuxReadResult::Interrupted if control.should_stop() => break,

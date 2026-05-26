@@ -161,13 +161,14 @@ pub(in crate::player::backend::ffmpeg) fn http_cache_response_headers_for_log(
 pub(in crate::player::backend::ffmpeg) fn http_cache_range_header(
     offset: u64,
     content_len: Option<u64>,
+    request_bytes: u64,
 ) -> String {
-    let end = http_cache_range_end(offset, content_len);
+    let end = http_cache_range_end(offset, content_len, request_bytes);
     format!("bytes={offset}-{end}")
 }
 
-fn http_cache_range_end(offset: u64, content_len: Option<u64>) -> u64 {
-    let requested_end = offset.saturating_add(HTTP_CACHE_RANGE_REQUEST_BYTES.saturating_sub(1));
+fn http_cache_range_end(offset: u64, content_len: Option<u64>, request_bytes: u64) -> u64 {
+    let requested_end = offset.saturating_add(request_bytes.max(1).saturating_sub(1));
     content_len
         .and_then(|content_len| content_len.checked_sub(1))
         .map_or(requested_end, |content_end| requested_end.min(content_end))
@@ -176,8 +177,9 @@ fn http_cache_range_end(offset: u64, content_len: Option<u64>) -> u64 {
 pub(in crate::player::backend::ffmpeg) fn http_cache_range_request_len(
     offset: u64,
     content_len: Option<u64>,
+    request_bytes: u64,
 ) -> u64 {
-    http_cache_range_end(offset, content_len)
+    http_cache_range_end(offset, content_len, request_bytes)
         .saturating_sub(offset)
         .saturating_add(1)
 }

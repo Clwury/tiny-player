@@ -7,7 +7,9 @@ mod http;
 
 pub(super) use cache::HttpRingCache;
 #[cfg(test)]
-pub(super) use cache::{CacheReadResult, HttpCacheRangeKind, HttpRingCacheState};
+pub(super) use cache::{
+    CacheReadResult, CacheRestartRequest, HttpCacheRangeKind, HttpRingCacheState,
+};
 use callbacks::{CachedAvioReader, cached_avio_read_packet, cached_avio_seek};
 #[cfg(test)]
 pub(super) use http::{
@@ -26,25 +28,72 @@ pub(super) struct CachedAvio {
     shutdown_cache_on_drop: bool,
 }
 
-impl CachedAvio {
+pub(super) struct CachedInputSource {
+    cache: Option<HttpRingCache>,
+    released: bool,
+}
+
+impl CachedInputSource {
     pub(super) fn new(
         url: &str,
         http_headers: &[(String, String)],
         content_len_hint: Option<u64>,
+        cache_config: &PlaybackCacheConfig,
         control: Arc<FfmpegControl>,
         event_tx: Sender<BackendEvent>,
     ) -> std::result::Result<Self, String> {
-        let cache = HttpRingCache::spawn(
-            url.to_string(),
-            http_headers,
-            content_len_hint,
-            control,
-            event_tx,
-        )?;
-        Self::from_cache(cache, true)
+        let cache = if should_cache_http_url(url)
+            && !matches!(cache_config.mode, PlaybackCacheMode::Disabled)
+        {
+            Some(HttpRingCache::spawn(
+                url.to_string(),
+                http_headers,
+                content_len_hint,
+                cache_config,
+                control,
+                event_tx,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            cache,
+            released: false,
+        })
     }
 
-    fn from_cache(
+    pub(super) fn cached_avio(&self) -> std::result::Result<Option<CachedAvio>, String> {
+        self.cache
+            .as_ref()
+            .map(|cache| CachedAvio::from_cache(cache.clone(), false))
+            .transpose()
+    }
+
+    pub(super) fn release(&mut self) {
+        self.released = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_cache_for_test(cache: HttpRingCache) -> Self {
+        Self {
+            cache: Some(cache),
+            released: false,
+        }
+    }
+}
+
+impl Drop for CachedInputSource {
+    fn drop(&mut self) {
+        if !self.released
+            && let Some(cache) = &self.cache
+        {
+            cache.shutdown();
+        }
+    }
+}
+
+impl CachedAvio {
+    pub(super) fn from_cache(
         cache: HttpRingCache,
         shutdown_cache_on_drop: bool,
     ) -> std::result::Result<Self, String> {
@@ -94,6 +143,10 @@ impl CachedAvio {
 
     pub(super) fn cache(&self) -> HttpRingCache {
         self.cache.clone()
+    }
+
+    pub(super) fn shutdown_cache_on_drop(&mut self) {
+        self.shutdown_cache_on_drop = true;
     }
 }
 

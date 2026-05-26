@@ -1,5 +1,5 @@
 use super::{
-    cache::{CacheAppendPermit, CacheAppendResult, HttpRingCacheShared},
+    cache::{CacheAppendPermit, CacheAppendResult, CacheRestartRequest, HttpRingCacheShared},
     http::{
         content_len_from_content_range, content_len_from_response, content_range_from_headers,
         http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
@@ -75,6 +75,64 @@ pub(super) fn http_ring_cache_download_loop(
     }
 }
 
+pub(super) fn http_ring_cache_side_download_loop(
+    shared: Arc<HttpRingCacheShared>,
+    url: String,
+    headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+) {
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            shared.set_error(format!("创建 HTTP 视频缓存辅助客户端失败：{error}"));
+            return;
+        }
+    };
+
+    loop {
+        if shared.should_stop() {
+            return;
+        }
+        let Some(request) = shared.wait_for_side_download_request() else {
+            return;
+        };
+        let mut offset = request.offset;
+        loop {
+            match download_http_side_cache_range(
+                &client,
+                &url,
+                &headers,
+                Arc::clone(&shared),
+                request,
+                offset,
+            ) {
+                Ok(HttpDownloadOutcome::Restart(next_offset)) => {
+                    offset = next_offset;
+                }
+                Ok(HttpDownloadOutcome::Eof) => {
+                    shared.finish_side_download(request, true);
+                    break;
+                }
+                Ok(HttpDownloadOutcome::Stopped) => {
+                    shared.finish_side_download(request, false);
+                    return;
+                }
+                Err(error) => {
+                    if shared.should_stop() {
+                        shared.finish_side_download(request, false);
+                        return;
+                    }
+                    shared.finish_side_download(request, false);
+                    shared.set_error(error);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 fn download_http_cache_range(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -87,8 +145,9 @@ fn download_http_cache_range(
         return Ok(HttpDownloadOutcome::Eof);
     }
 
-    let range = http_cache_range_header(offset, known_content_len);
-    let range_len = http_cache_range_request_len(offset, known_content_len);
+    let range_request_bytes = shared.range_request_bytes();
+    let range = http_cache_range_header(offset, known_content_len, range_request_bytes);
+    let range_len = http_cache_range_request_len(offset, known_content_len, range_request_bytes);
     let request_timeout = http_cache_range_request_timeout(range_len);
     tracing::debug!(
         offset,
@@ -198,5 +257,182 @@ fn download_http_cache_range(
             }
             CacheAppendResult::Stopped => return Ok(HttpDownloadOutcome::Stopped),
         }
+    }
+}
+
+fn download_http_side_cache_range(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
+    shared: Arc<HttpRingCacheShared>,
+    request: CacheRestartRequest,
+    mut offset: u64,
+) -> std::result::Result<HttpDownloadOutcome, String> {
+    let known_content_len = shared.content_len_now();
+    if known_content_len.is_some_and(|content_len| offset >= content_len) {
+        return Ok(HttpDownloadOutcome::Eof);
+    }
+
+    let range_request_bytes = shared.range_request_bytes();
+    let Some(request_bytes) =
+        side_request_remaining_bytes(request, offset, known_content_len, range_request_bytes)
+    else {
+        return Ok(HttpDownloadOutcome::Eof);
+    };
+    let range = http_cache_range_header(offset, known_content_len, request_bytes);
+    let range_len = http_cache_range_request_len(offset, known_content_len, request_bytes);
+    let request_timeout = http_cache_range_request_timeout(range_len);
+    tracing::debug!(
+        offset,
+        request_offset = request.offset,
+        range = %range,
+        range_len,
+        request_timeout_ms = request_timeout.as_millis(),
+        range_kind = ?request.range_kind,
+        "requesting HTTP side cache range"
+    );
+    let mut http_request = client
+        .get(url)
+        .timeout(request_timeout)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .header(reqwest::header::CONNECTION, "keep-alive")
+        .header(reqwest::header::RANGE, range.as_str());
+    for (name, value) in headers {
+        http_request = http_request.header(name, value);
+    }
+
+    let mut response = match http_request.send() {
+        Ok(response) => response,
+        Err(error) if error.is_timeout() => {
+            tracing::debug!(
+                offset,
+                range = %range,
+                "HTTP side cache range request timed out; restarting"
+            );
+            return Ok(HttpDownloadOutcome::Restart(offset));
+        }
+        Err(error) => return Err(format!("HTTP 视频缓存辅助请求失败：{error}")),
+    };
+    let status = response.status();
+    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        shared.set_content_len(content_len_from_content_range(response.headers()));
+        return Ok(HttpDownloadOutcome::Eof);
+    }
+    if offset > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(format!(
+            "HTTP 视频缓存辅助 Range 请求失败：服务器返回 {status}"
+        ));
+    }
+    if offset == 0
+        && status != reqwest::StatusCode::OK
+        && status != reqwest::StatusCode::PARTIAL_CONTENT
+    {
+        return Err(format!("HTTP 视频缓存辅助请求失败：服务器返回 {status}"));
+    }
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        let content_range = content_range_from_headers(response.headers())
+            .ok_or_else(|| "HTTP 视频缓存辅助 Range 响应缺少 Content-Range".to_string())?;
+        if content_range.start != offset {
+            return Err(format!(
+                "HTTP 视频缓存辅助 Range 响应偏移不匹配：请求 {offset}，返回 {}",
+                content_range.start
+            ));
+        }
+    }
+    let content_len = content_len_from_response(&response, offset);
+    shared.set_content_len(content_len);
+
+    let mut chunk = vec![0; shared.chunk_size()];
+    loop {
+        if shared.should_stop() {
+            return Ok(HttpDownloadOutcome::Stopped);
+        }
+        let Some(request_remaining) =
+            side_request_remaining_bytes(request, offset, content_len, range_request_bytes)
+        else {
+            return Ok(HttpDownloadOutcome::Eof);
+        };
+        let read_capacity = chunk
+            .len()
+            .min(usize::try_from(request_remaining).unwrap_or(usize::MAX));
+        let read = match response.read(&mut chunk[..read_capacity]) {
+            Ok(read) => read,
+            Err(error) if http_cache_read_timed_out(&error) => {
+                tracing::debug!(
+                    offset,
+                    range = %range,
+                    "HTTP side cache read timed out; restarting current side range"
+                );
+                return Ok(HttpDownloadOutcome::Restart(offset));
+            }
+            Err(error) => {
+                return Err(format!("读取 HTTP 视频缓存辅助 range 失败：{error}"));
+            }
+        };
+        if read == 0 {
+            if content_len.is_some_and(|content_len| offset < content_len)
+                && side_request_remaining_bytes(request, offset, content_len, range_request_bytes)
+                    .is_some()
+            {
+                return Ok(HttpDownloadOutcome::Restart(offset));
+            }
+            return Ok(HttpDownloadOutcome::Eof);
+        }
+        match shared.append_side_download_or_stop(request, offset, &chunk[..read]) {
+            CacheAppendResult::Appended => {
+                offset = offset.saturating_add(read as u64);
+                if side_request_remaining_bytes(request, offset, content_len, range_request_bytes)
+                    .is_none()
+                {
+                    return Ok(HttpDownloadOutcome::Eof);
+                }
+            }
+            CacheAppendResult::Restart(next_offset) => {
+                return Ok(HttpDownloadOutcome::Restart(next_offset));
+            }
+            CacheAppendResult::Stopped => return Ok(HttpDownloadOutcome::Stopped),
+        }
+    }
+}
+
+fn side_request_remaining_bytes(
+    request: CacheRestartRequest,
+    offset: u64,
+    content_len: Option<u64>,
+    range_request_bytes: u64,
+) -> Option<u64> {
+    let request_end = request.offset.saturating_add(range_request_bytes.max(1));
+    let request_end = content_len.map_or(request_end, |content_len| request_end.min(content_len));
+    (offset < request_end).then_some(request_end - offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn side_request_remaining_bytes_stops_at_side_range_boundary() {
+        let request = CacheRestartRequest {
+            offset: 500,
+            range_kind: HttpCacheRangeKind::Playback,
+        };
+
+        assert_eq!(
+            side_request_remaining_bytes(request, 500, None, 128),
+            Some(128)
+        );
+        assert_eq!(
+            side_request_remaining_bytes(request, 627, None, 128),
+            Some(1)
+        );
+        assert_eq!(side_request_remaining_bytes(request, 628, None, 128), None);
+        assert_eq!(
+            side_request_remaining_bytes(request, 500, Some(550), 128),
+            Some(50)
+        );
+        assert_eq!(
+            side_request_remaining_bytes(request, 550, Some(550), 128),
+            None
+        );
     }
 }

@@ -13,8 +13,8 @@ use crate::theme;
 use super::{
     backend::{
         BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest,
-        BackendSubtitleBitmap, BackendSubtitleCue, FfmpegBackend, HttpStreamBufferProgress,
-        HttpStreamCacheStatus, PlaybackVideoInfo,
+        BackendSubtitleBitmap, BackendSubtitleCue, FfmpegBackend, PlaybackCacheState,
+        PlaybackVideoInfo,
     },
     render_host::RenderSize,
     tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection},
@@ -37,9 +37,9 @@ pub use request::PlaybackRequest;
 
 use progress::{
     ProgressBarDrag, buffered_progress_fraction, buffered_until_after_seek,
-    clamp_playback_position, format_playback_time, playback_status_message, progress_fraction,
-    progress_fraction_for_cursor, should_apply_backend_position, valid_http_stream_buffer_progress,
-    valid_playback_duration, valid_playback_time,
+    byte_cache_range_fractions, cache_range_fractions, cached_seek_target, clamp_playback_position,
+    format_playback_time, playback_status_message, progress_fraction, progress_fraction_for_cursor,
+    should_apply_backend_position, valid_playback_duration, valid_playback_time,
 };
 use render::{
     AnimationFrameRequestState, aspect_fit_bounds, defer_drop_frame, normalize_video_viewport,
@@ -80,8 +80,6 @@ impl PlaybackPage {
     pub fn new(request: PlaybackRequest, cx: &mut Context<Self>) -> Self {
         let mut error_message = None;
         let status_message = "正在加载视频…".into();
-        let http_stream_buffer_poll_active =
-            should_poll_paused_http_stream_buffer(&request.url, request.content_length);
 
         let (backend, video_presenter) = match FfmpegBackend::new() {
             Ok(mut backend) => match VideoPresenter::new(BackendControl::frame_slot(&backend)) {
@@ -91,6 +89,7 @@ impl PlaybackPage {
                         http_headers: request.http_headers.clone(),
                         content_length: request.content_length,
                         selected_tracks: request.selected_tracks.clone(),
+                        cache_config: Default::default(),
                     };
                     if let Err(error) = backend.command(BackendCommand::Load(load_request)) {
                         error_message = Some(format!("加载视频失败：{error}").into());
@@ -111,10 +110,7 @@ impl PlaybackPage {
             }
         };
 
-        let timeline = PlaybackTimelineState {
-            http_stream_buffer_poll_active,
-            ..PlaybackTimelineState::default()
-        };
+        let timeline = PlaybackTimelineState::default();
 
         Self {
             focus_handle: cx.focus_handle(),
@@ -306,15 +302,6 @@ impl PlaybackPage {
                 this.cursor(CursorStyle::None)
             })
     }
-}
-
-fn should_poll_paused_http_stream_buffer(url: &str, content_length: Option<u64>) -> bool {
-    content_length.is_some() && playback_url_is_http(url)
-}
-
-fn playback_url_is_http(url: &str) -> bool {
-    let url = url.trim_start().to_ascii_lowercase();
-    url.starts_with("http://") || url.starts_with("https://")
 }
 
 fn clamp_playback_volume(volume: f32) -> f32 {

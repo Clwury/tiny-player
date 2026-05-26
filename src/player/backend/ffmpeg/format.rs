@@ -1,4 +1,4 @@
-use super::avio::{CachedAvio, input_format_options, should_cache_http_url};
+use super::avio::{CachedAvio, CachedInputSource, input_format_options};
 use super::*;
 
 pub(super) struct FormatContext {
@@ -10,22 +10,11 @@ impl FormatContext {
     pub(super) fn open(
         url: &str,
         http_headers: &[(String, String)],
-        content_len_hint: Option<u64>,
         probe_profile: InputProbeProfile,
+        cached_source: &CachedInputSource,
         control: Arc<FfmpegControl>,
-        event_tx: Sender<BackendEvent>,
     ) -> std::result::Result<Self, String> {
-        let cached_io = if should_cache_http_url(url) {
-            Some(CachedAvio::new(
-                url,
-                http_headers,
-                content_len_hint,
-                Arc::clone(&control),
-                event_tx,
-            )?)
-        } else {
-            None
-        };
+        let cached_io = cached_source.cached_avio()?;
         Self::open_with_cached_io(url, http_headers, probe_profile, control, cached_io)
     }
 
@@ -194,6 +183,12 @@ impl FormatContext {
 
     pub(super) fn cached_io_cache(&self) -> Option<HttpRingCache> {
         self._cached_io.as_ref().map(CachedAvio::cache)
+    }
+
+    pub(super) fn shutdown_cached_io_on_drop(&mut self) {
+        if let Some(cached_io) = self._cached_io.as_mut() {
+            cached_io.shutdown_cache_on_drop();
+        }
     }
 
     pub(super) fn seek_stream(

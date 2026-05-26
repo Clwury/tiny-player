@@ -1,5 +1,6 @@
 use crate::player::backend::BackendEvent;
 
+use super::state::{effective_playback_paused, user_pause_from_effective_pause_event};
 use super::*;
 
 const PAUSED_BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -28,10 +29,19 @@ impl PlaybackPage {
     ) {
         match event.kind {
             BackendEventKind::PlaybackRestart => {
+                let paused_for_cache = self.timeline.paused_for_cache;
+                let cache_buffering_percent = self.timeline.cache_buffering_percent;
                 self.timeline.loaded = true;
                 self.timeline.ended = false;
-                self.timeline.paused = false;
+                self.timeline.user_paused = false;
+                self.timeline.paused =
+                    effective_playback_paused(self.timeline.user_paused, paused_for_cache);
                 self.timeline.buffering = false;
+                self.timeline.cache_state = None;
+                self.timeline.cache_status_open = false;
+                self.timeline.paused_for_cache = paused_for_cache;
+                self.timeline.cache_buffering_percent =
+                    cache_buffering_percent.filter(|_| paused_for_cache);
                 self.timeline.pending_seek_position = None;
                 self.timeline.pending_seek_keeps_frame = false;
                 self.status_message = "".into();
@@ -55,7 +65,15 @@ impl PlaybackPage {
                 self.finish_playback(window, cx);
             }
             BackendEventKind::Pause(paused) => {
-                self.timeline.paused = paused;
+                self.timeline.user_paused = user_pause_from_effective_pause_event(
+                    self.timeline.user_paused,
+                    self.timeline.paused_for_cache,
+                    paused,
+                );
+                self.timeline.paused = effective_playback_paused(
+                    self.timeline.user_paused,
+                    self.timeline.paused_for_cache,
+                );
             }
             BackendEventKind::Buffering(buffering) => {
                 let hidden_by_soft_seek = buffering
@@ -113,15 +131,14 @@ impl PlaybackPage {
                     buffered_until
                 };
             }
-            BackendEventKind::HttpStreamBufferedChanged(progress) => {
-                self.timeline.http_stream_buffered_range =
-                    progress.and_then(valid_http_stream_buffer_progress);
-                if let Some(progress) = self.timeline.http_stream_buffered_range {
-                    self.timeline.http_stream_buffer_poll_active = progress.end_fraction < 1.0;
-                }
+            BackendEventKind::CacheStateChanged(state) => {
+                self.apply_cache_state(state);
             }
-            BackendEventKind::HttpStreamCacheStatusChanged(status) => {
-                self.timeline.http_stream_cache_status = Some(status);
+            BackendEventKind::PausedForCacheChanged(paused_for_cache) => {
+                apply_paused_for_cache_to_timeline(&mut self.timeline, paused_for_cache);
+            }
+            BackendEventKind::CacheBufferingChanged(percent) => {
+                apply_cache_buffering_to_timeline(&mut self.timeline, percent);
             }
         }
     }
@@ -151,15 +168,32 @@ impl PlaybackPage {
             && self.timeline.paused
             && !self.timeline.ended
             && self.error_message.is_none()
-            && self.timeline.http_stream_buffer_poll_active
+            && self
+                .timeline
+                .cache_state
+                .as_ref()
+                .is_some_and(cache_state_needs_poll)
+    }
+
+    fn apply_cache_state(&mut self, state: PlaybackCacheState) {
+        self.timeline.buffered_until = state.demux.cache_end.and_then(valid_playback_time);
+        self.timeline.paused_for_cache = state.paused_for_cache;
+        self.timeline.paused =
+            effective_playback_paused(self.timeline.user_paused, state.paused_for_cache);
+        self.timeline.cache_buffering_percent = state.buffering_percent;
+        self.timeline.cache_state = Some(state);
     }
 
     fn finish_playback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.timeline.loaded = true;
         self.timeline.ended = true;
+        self.timeline.user_paused = true;
         self.timeline.paused = true;
         self.timeline.buffering = false;
-        self.timeline.http_stream_buffer_poll_active = false;
+        self.timeline.cache_state = None;
+        self.timeline.cache_status_open = false;
+        self.timeline.paused_for_cache = false;
+        self.timeline.cache_buffering_percent = None;
         self.timeline.pending_seek_position = None;
         self.timeline.pending_seek_keeps_frame = false;
         self.timeline.progress_drag_position = None;
@@ -167,11 +201,13 @@ impl PlaybackPage {
             self.timeline.position = Some(duration);
             self.timeline.buffered_until = Some(duration);
         }
-        self.timeline.http_stream_buffered_range = None;
-        self.timeline.http_stream_cache_status = None;
+        self.timeline.cache_state = None;
+        self.timeline.paused_for_cache = false;
+        self.timeline.cache_buffering_percent = None;
         self.tracks.open = None;
         self.frame.source_size = None;
         self.playback_info = None;
+        self.timeline.user_paused = true;
         self.status_message = "".into();
         self.error_message = None;
         defer_drop_subtitle(self.subtitle.active.take(), window);
@@ -188,12 +224,14 @@ impl PlaybackPage {
         self.timeline.ended = false;
         self.frame.source_size = None;
         self.playback_info = None;
+        self.timeline.user_paused = true;
         self.timeline.paused = true;
         self.timeline.buffering = false;
         self.timeline.buffered_until = None;
-        self.timeline.http_stream_buffered_range = None;
-        self.timeline.http_stream_cache_status = None;
-        self.timeline.http_stream_buffer_poll_active = false;
+        self.timeline.cache_state = None;
+        self.timeline.cache_status_open = false;
+        self.timeline.paused_for_cache = false;
+        self.timeline.cache_buffering_percent = None;
         self.timeline.pending_seek_position = None;
         self.timeline.pending_seek_keeps_frame = false;
         self.timeline.progress_drag_position = None;
@@ -237,6 +275,7 @@ impl PlaybackPage {
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    self.timeline.user_paused = true;
                     self.timeline.paused = true;
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("渲染视频失败：{error}").into());
@@ -245,5 +284,176 @@ impl PlaybackPage {
         } else {
             self.clear_visible_frame(window, cx);
         }
+    }
+}
+
+fn cache_state_needs_poll(state: &PlaybackCacheState) -> bool {
+    if state.paused_for_cache || state.buffering_percent.is_some() {
+        return true;
+    }
+    if state.byte.as_ref().is_some_and(|byte| !byte.idle) {
+        return true;
+    }
+    !state.demux.idle && !state.demux.eof
+}
+
+fn apply_paused_for_cache_to_timeline(
+    timeline: &mut PlaybackTimelineState,
+    paused_for_cache: bool,
+) {
+    timeline.paused_for_cache = paused_for_cache;
+    timeline.paused = effective_playback_paused(timeline.user_paused, paused_for_cache);
+    if !paused_for_cache {
+        timeline.cache_buffering_percent = None;
+    }
+    if let Some(cache_state) = timeline.cache_state.as_mut() {
+        cache_state.paused_for_cache = paused_for_cache;
+        if !paused_for_cache {
+            cache_state.buffering_percent = None;
+        }
+    }
+}
+
+fn apply_cache_buffering_to_timeline(timeline: &mut PlaybackTimelineState, percent: Option<u8>) {
+    timeline.cache_buffering_percent = percent;
+    if let Some(cache_state) = timeline.cache_state.as_mut() {
+        cache_state.buffering_percent = percent;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::player::backend::{ByteCacheState, DemuxCacheState, PlaybackCacheState};
+
+    use super::{
+        apply_cache_buffering_to_timeline, apply_paused_for_cache_to_timeline,
+        cache_state_needs_poll,
+    };
+    use crate::player::page::state::PlaybackTimelineState;
+
+    fn byte_cache_state(idle: bool, download_fraction: Option<f64>) -> ByteCacheState {
+        ByteCacheState {
+            ranges: Vec::new(),
+            reader_fraction: None,
+            download_fraction,
+            cached_bytes: 0,
+            content_length: None,
+            disk_cache_enabled: false,
+            idle,
+            raw_input_rate: None,
+            byte_level_seeks: 0,
+        }
+    }
+
+    fn idle_demux_state() -> DemuxCacheState {
+        DemuxCacheState {
+            idle: true,
+            ..DemuxCacheState::default()
+        }
+    }
+
+    #[test]
+    fn cache_state_poll_continues_while_cache_pause_is_active() {
+        let state = PlaybackCacheState {
+            demux: idle_demux_state(),
+            byte: Some(byte_cache_state(true, None)),
+            paused_for_cache: true,
+            ..PlaybackCacheState::default()
+        };
+
+        assert!(cache_state_needs_poll(&state));
+    }
+
+    #[test]
+    fn cache_state_poll_continues_while_byte_cache_is_active() {
+        let state = PlaybackCacheState {
+            demux: idle_demux_state(),
+            byte: Some(byte_cache_state(false, None)),
+            ..PlaybackCacheState::default()
+        };
+
+        assert!(cache_state_needs_poll(&state));
+    }
+
+    #[test]
+    fn cache_state_poll_stops_when_byte_and_demux_cache_are_idle() {
+        let state = PlaybackCacheState {
+            demux: idle_demux_state(),
+            byte: Some(byte_cache_state(true, None)),
+            ..PlaybackCacheState::default()
+        };
+
+        assert!(!cache_state_needs_poll(&state));
+    }
+
+    #[test]
+    fn cache_state_poll_continues_until_byte_cache_reports_idle_even_when_download_completed() {
+        let state = PlaybackCacheState {
+            demux: idle_demux_state(),
+            byte: Some(byte_cache_state(false, Some(1.0))),
+            ..PlaybackCacheState::default()
+        };
+
+        assert!(cache_state_needs_poll(&state));
+    }
+
+    #[test]
+    fn cache_state_poll_continues_while_demux_cache_is_active() {
+        let state = PlaybackCacheState {
+            demux: DemuxCacheState::default(),
+            byte: Some(byte_cache_state(true, None)),
+            ..PlaybackCacheState::default()
+        };
+
+        assert!(cache_state_needs_poll(&state));
+    }
+
+    #[test]
+    fn cache_pause_event_updates_stored_cache_state_copy() {
+        let mut timeline = PlaybackTimelineState {
+            loaded: true,
+            user_paused: false,
+            paused: true,
+            paused_for_cache: true,
+            cache_buffering_percent: Some(42),
+            cache_state: Some(PlaybackCacheState {
+                demux: idle_demux_state(),
+                paused_for_cache: true,
+                buffering_percent: Some(42),
+                ..PlaybackCacheState::default()
+            }),
+            ..PlaybackTimelineState::default()
+        };
+
+        apply_paused_for_cache_to_timeline(&mut timeline, false);
+
+        assert!(!timeline.paused_for_cache);
+        assert!(!timeline.paused);
+        assert_eq!(timeline.cache_buffering_percent, None);
+        let cache_state = timeline.cache_state.expect("cache state remains available");
+        assert!(!cache_state.paused_for_cache);
+        assert_eq!(cache_state.buffering_percent, None);
+    }
+
+    #[test]
+    fn cache_buffering_event_updates_stored_cache_state_copy() {
+        let mut timeline = PlaybackTimelineState {
+            cache_state: Some(PlaybackCacheState {
+                demux: idle_demux_state(),
+                ..PlaybackCacheState::default()
+            }),
+            ..PlaybackTimelineState::default()
+        };
+
+        apply_cache_buffering_to_timeline(&mut timeline, Some(37));
+
+        assert_eq!(timeline.cache_buffering_percent, Some(37));
+        assert_eq!(
+            timeline
+                .cache_state
+                .as_ref()
+                .and_then(|state| state.buffering_percent),
+            Some(37)
+        );
     }
 }

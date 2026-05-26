@@ -1,6 +1,7 @@
-use super::avio::HttpCacheRangeKind;
-use super::worker::{PendingSeek, PendingTrackSelection};
+use super::avio::{CacheRestartRequest, CachedInputSource, HttpCacheRangeKind};
+use super::worker::{FfmpegCommand, PendingSeek, PendingTrackSelection, drain_playback_commands};
 use super::*;
+use crate::player::backend::PlaybackCacheTimeRange;
 use playback_loop::{
     DecodedVideoFrameStartAction, VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VideoDecodeRecovery,
     decoded_video_frame_start_action, initial_probe_profile, playback_read_finished,
@@ -38,6 +39,90 @@ fn ffmpeg_control_tracks_seek_generations() {
     assert!(control.has_pending_seek());
     control.finish_seek(second);
     assert!(!control.has_pending_seek());
+}
+
+#[test]
+fn ffmpeg_control_splits_user_pause_from_cache_pause() {
+    let control = FfmpegControl::new(PlaybackSessionId::default());
+
+    assert!(!control.is_paused());
+    assert!(!control.is_user_paused());
+    assert!(!control.is_cache_paused());
+
+    assert!(control.set_cache_paused(true));
+    assert!(control.is_paused());
+    assert!(!control.is_user_paused());
+    assert!(control.is_cache_paused());
+
+    control.set_user_paused(true);
+    assert!(control.set_cache_paused(false));
+    assert!(control.is_paused());
+    assert!(control.is_user_paused());
+    assert!(!control.is_cache_paused());
+
+    control.set_user_paused(false);
+    assert!(!control.is_paused());
+}
+
+#[test]
+fn ffmpeg_control_tracks_output_underrun_as_sticky_event() {
+    let control = FfmpegControl::new(PlaybackSessionId::default());
+
+    assert!(!control.take_output_underrun());
+    control.mark_output_underrun();
+    assert!(control.take_output_underrun());
+    assert!(!control.take_output_underrun());
+
+    control.mark_output_underrun();
+    control.clear_output_underrun();
+    assert!(!control.take_output_underrun());
+}
+
+#[test]
+fn ffmpeg_control_clears_output_underrun_on_seek_generation() {
+    let control = FfmpegControl::new(PlaybackSessionId::default());
+    control.mark_output_underrun();
+
+    let generation = control.request_seek();
+
+    assert_eq!(generation, 1);
+    assert!(!control.take_output_underrun());
+}
+
+#[test]
+fn drain_playback_commands_keeps_latest_live_cache_config() {
+    let control = FfmpegControl::new(PlaybackSessionId(1));
+    let (command_tx, command_rx) = mpsc::channel();
+    let mut first = PlaybackCacheConfig {
+        cache_secs: 2.0,
+        ..PlaybackCacheConfig::default()
+    };
+    let second = PlaybackCacheConfig {
+        cache_secs: 4.0,
+        demuxer_readahead_secs: 3.0,
+        ..PlaybackCacheConfig::default()
+    };
+    first.demuxer_hysteresis_secs = f64::NAN;
+
+    command_tx
+        .send(FfmpegCommand::SetCacheConfig {
+            session_id: PlaybackSessionId(7),
+            config: first,
+        })
+        .unwrap();
+    command_tx
+        .send(FfmpegCommand::SetCacheConfig {
+            session_id: PlaybackSessionId(8),
+            config: second.clone(),
+        })
+        .unwrap();
+
+    let drained = drain_playback_commands(&command_rx, &control);
+
+    assert_eq!(control.session_id(), PlaybackSessionId(8));
+    assert_eq!(drained.cache_config, Some(second.normalized()));
+    assert!(drained.pending_seek.is_none());
+    assert!(drained.pending_track_selection.is_none());
 }
 
 #[test]
@@ -330,6 +415,7 @@ fn playback_input_with_selection(
         content_length: None,
         start_position_seconds: 0.0,
         selected_tracks,
+        cache_config: PlaybackCacheConfig::default(),
     }
 }
 
@@ -358,6 +444,562 @@ fn ffmpeg_backend_discards_stale_session_events() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].session_id, PlaybackSessionId(2));
     assert!(matches!(events[0].kind, BackendEventKind::Buffering(true)));
+}
+
+#[test]
+fn ffmpeg_backend_maps_http_raw_input_rate_into_unified_cache_state() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::CacheStateChanged(PlaybackCacheState {
+                demux: DemuxCacheState {
+                    raw_input_rate: Some(123_456),
+                    byte_level_seeks: 2,
+                    ..DemuxCacheState::default()
+                },
+                byte: Some(ByteCacheState {
+                    ranges: Vec::new(),
+                    reader_fraction: None,
+                    download_fraction: None,
+                    cached_bytes: 0,
+                    content_length: None,
+                    disk_cache_enabled: false,
+                    idle: false,
+                    raw_input_rate: Some(123_456),
+                    byte_level_seeks: 2,
+                }),
+                ..PlaybackCacheState::default()
+            }),
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            BackendEventKind::CacheStateChanged(state)
+                if state.demux.raw_input_rate == Some(123_456)
+                    && state.demux.byte_level_seeks == 2
+                    && state
+                        .byte
+                        .as_ref()
+                        .is_some_and(|byte| byte.raw_input_rate == Some(123_456))
+        )
+    }));
+}
+
+#[test]
+fn ffmpeg_backend_byte_cache_update_does_not_replace_authoritative_demux_state() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    backend.cache_state.demux = DemuxCacheState {
+        cache_end: Some(20.0),
+        reader_pts: Some(5.0),
+        cache_duration: Some(15.0),
+        cached_seeks: 4,
+        seekable_ranges: vec![PlaybackCacheTimeRange {
+            start: 0.0,
+            end: 20.0,
+        }],
+        ..DemuxCacheState::default()
+    };
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::CacheStateChanged(PlaybackCacheState {
+                demux: DemuxCacheState {
+                    raw_input_rate: Some(64 * 1024),
+                    byte_level_seeks: 3,
+                    ..DemuxCacheState::default()
+                },
+                byte: Some(ByteCacheState {
+                    ranges: Vec::new(),
+                    reader_fraction: Some(0.1),
+                    download_fraction: Some(0.5),
+                    cached_bytes: 4096,
+                    content_length: Some(8192),
+                    disk_cache_enabled: false,
+                    idle: false,
+                    raw_input_rate: Some(64 * 1024),
+                    byte_level_seeks: 3,
+                }),
+                ..PlaybackCacheState::default()
+            }),
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            BackendEventKind::CacheStateChanged(state)
+                if state.demux.cache_end == Some(20.0)
+                    && state.demux.cached_seeks == 4
+                    && state.demux.raw_input_rate == Some(64 * 1024)
+                    && state.demux.byte_level_seeks == 3
+                    && state.byte.as_ref().is_some_and(|byte| byte.cached_bytes == 4096)
+        )
+    }));
+}
+
+#[test]
+fn ffmpeg_backend_byte_cache_update_uses_byte_state_as_metric_source() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    backend.cache_state.demux = DemuxCacheState {
+        cache_end: Some(20.0),
+        reader_pts: Some(5.0),
+        cache_duration: Some(15.0),
+        byte_level_seeks: 2,
+        ..DemuxCacheState::default()
+    };
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::CacheStateChanged(PlaybackCacheState {
+                demux: DemuxCacheState::default(),
+                byte: Some(ByteCacheState {
+                    ranges: Vec::new(),
+                    reader_fraction: Some(0.1),
+                    download_fraction: Some(0.5),
+                    cached_bytes: 4096,
+                    content_length: Some(8192),
+                    disk_cache_enabled: false,
+                    idle: false,
+                    raw_input_rate: Some(96 * 1024),
+                    byte_level_seeks: 4,
+                }),
+                ..PlaybackCacheState::default()
+            }),
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            BackendEventKind::CacheStateChanged(state)
+                if state.demux.cache_end == Some(20.0)
+                    && state.demux.raw_input_rate == Some(96 * 1024)
+                    && state.demux.byte_level_seeks == 4
+                    && state.byte.as_ref().is_some_and(|byte| byte.cached_bytes == 4096)
+        )
+    }));
+}
+
+#[test]
+fn ffmpeg_backend_byte_cache_update_can_clear_stale_raw_input_rate() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    backend.cache_state.demux = DemuxCacheState {
+        cache_end: Some(20.0),
+        reader_pts: Some(5.0),
+        cache_duration: Some(15.0),
+        raw_input_rate: Some(64 * 1024),
+        byte_level_seeks: 5,
+        ..DemuxCacheState::default()
+    };
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::CacheStateChanged(PlaybackCacheState {
+                demux: DemuxCacheState {
+                    cache_end: Some(22.0),
+                    reader_pts: Some(6.0),
+                    cache_duration: Some(16.0),
+                    ..DemuxCacheState::default()
+                },
+                byte: Some(ByteCacheState {
+                    ranges: Vec::new(),
+                    reader_fraction: Some(0.2),
+                    download_fraction: Some(0.6),
+                    cached_bytes: 8192,
+                    content_length: Some(16_384),
+                    disk_cache_enabled: false,
+                    idle: true,
+                    raw_input_rate: None,
+                    byte_level_seeks: 3,
+                }),
+                ..PlaybackCacheState::default()
+            }),
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            BackendEventKind::CacheStateChanged(state)
+                if state.demux.cache_end == Some(22.0)
+                    && state.demux.raw_input_rate.is_none()
+                    && state.demux.byte_level_seeks == 5
+                    && state.byte.as_ref().is_some_and(|byte| byte.raw_input_rate.is_none())
+        )
+    }));
+}
+
+#[test]
+fn ffmpeg_backend_cache_pause_event_does_not_set_user_pause() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    backend.user_paused = false;
+    backend.paused = false;
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::PausedForCacheChanged(true),
+        ))
+        .unwrap();
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::Pause(true),
+        ))
+        .unwrap();
+
+    let _ = backend.poll_events();
+
+    assert!(backend.paused);
+    assert!(!backend.user_paused);
+    assert!(backend.cache_state.paused_for_cache);
+}
+
+#[test]
+fn ffmpeg_backend_effective_pause_follows_cache_pause_without_waiting_for_pause_event() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    backend.user_paused = false;
+    backend.paused = true;
+    backend.cache_state.paused_for_cache = true;
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::PausedForCacheChanged(false),
+        ))
+        .unwrap();
+
+    let _ = backend.poll_events();
+
+    assert!(!backend.paused);
+    assert!(!backend.user_paused);
+    assert!(!backend.cache_state.paused_for_cache);
+}
+
+#[test]
+fn ffmpeg_backend_pause_false_does_not_clear_effective_pause_while_cache_paused() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    backend.user_paused = false;
+    backend.paused = true;
+    backend.cache_state.paused_for_cache = true;
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::Pause(false),
+        ))
+        .unwrap();
+
+    let _ = backend.poll_events();
+
+    assert!(backend.paused);
+    assert!(!backend.user_paused);
+    assert!(backend.cache_state.paused_for_cache);
+}
+
+#[test]
+fn ffmpeg_backend_playback_ended_clears_cache_pause_state() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    backend.user_paused = false;
+    backend.paused = false;
+    backend.cache_state.paused_for_cache = true;
+    backend.cache_state.buffering_percent = Some(42);
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::PlaybackEnded,
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert!(backend.paused);
+    assert!(!backend.cache_state.paused_for_cache);
+    assert_eq!(backend.cache_state.buffering_percent, None);
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            BackendEventKind::CacheStateChanged(state)
+                if state.demux.eof
+                    && state.demux.idle
+                    && !state.paused_for_cache
+                    && state.buffering_percent.is_none()
+        )
+    }));
+}
+
+#[test]
+fn ffmpeg_backend_demux_cache_update_preserves_latest_byte_cache_state() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    backend.cache_state.byte = Some(ByteCacheState {
+        ranges: Vec::new(),
+        reader_fraction: Some(0.25),
+        download_fraction: Some(0.75),
+        cached_bytes: 8192,
+        content_length: Some(16_384),
+        disk_cache_enabled: true,
+        idle: false,
+        raw_input_rate: Some(32 * 1024),
+        byte_level_seeks: 5,
+    });
+    backend.cache_state.demux.raw_input_rate = Some(32 * 1024);
+    backend.cache_state.demux.byte_level_seeks = 5;
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::CacheStateChanged(PlaybackCacheState {
+                demux: DemuxCacheState {
+                    cache_end: Some(12.0),
+                    reader_pts: Some(10.0),
+                    cache_duration: Some(2.0),
+                    low_level_seeks: 2,
+                    cached_seeks: 1,
+                    ..DemuxCacheState::default()
+                },
+                ..PlaybackCacheState::default()
+            }),
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            BackendEventKind::CacheStateChanged(state)
+                if state.demux.cache_end == Some(12.0)
+                    && state.demux.cached_seeks == 1
+                    && state.demux.low_level_seeks == 2
+                    && state.demux.raw_input_rate == Some(32 * 1024)
+                    && state.demux.byte_level_seeks == 5
+                    && state.byte.as_ref().is_some_and(|byte| byte.cached_bytes == 8192)
+        )
+    }));
+}
+
+#[test]
+fn ffmpeg_backend_prefers_byte_cache_raw_rate_over_demux_estimate() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    backend.cache_state.byte = Some(ByteCacheState {
+        ranges: Vec::new(),
+        reader_fraction: Some(0.25),
+        download_fraction: Some(0.75),
+        cached_bytes: 8192,
+        content_length: Some(16_384),
+        disk_cache_enabled: true,
+        idle: false,
+        raw_input_rate: Some(32 * 1024),
+        byte_level_seeks: 5,
+    });
+    backend.cache_state.demux.raw_input_rate = Some(32 * 1024);
+    backend.cache_state.demux.byte_level_seeks = 5;
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::CacheStateChanged(PlaybackCacheState {
+                demux: DemuxCacheState {
+                    cache_end: Some(12.0),
+                    reader_pts: Some(10.0),
+                    cache_duration: Some(2.0),
+                    raw_input_rate: Some(8 * 1024),
+                    ..DemuxCacheState::default()
+                },
+                ..PlaybackCacheState::default()
+            }),
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            BackendEventKind::CacheStateChanged(state)
+                if state.demux.raw_input_rate == Some(32 * 1024)
+                    && state.byte.as_ref().is_some_and(|byte| byte.raw_input_rate == Some(32 * 1024))
+        )
+    }));
+}
+
+#[test]
+fn ffmpeg_backend_does_not_synthesize_demux_cache_state_from_buffered_event() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::BufferedChanged(Some(12.0)),
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].kind,
+        BackendEventKind::BufferedChanged(Some(12.0))
+    ));
+    let cache_state = backend.cache_state().expect("cache state exists");
+    assert_eq!(cache_state.demux.cache_end, None);
+    assert!(cache_state.demux.seekable_ranges.is_empty());
+    assert!(!cache_state.demux.bof_cached);
+    assert!(!cache_state.demux.eof_cached);
+}
+
+#[test]
+fn ffmpeg_backend_position_events_do_not_rewrite_authoritative_demux_cache_state() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    let demux_state = DemuxCacheState {
+        cache_end: Some(10.0),
+        reader_pts: Some(1.0),
+        cache_duration: Some(9.0),
+        seekable_ranges: vec![PlaybackCacheTimeRange {
+            start: 0.0,
+            end: 10.0,
+        }],
+        ..DemuxCacheState::default()
+    };
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::CacheStateChanged(PlaybackCacheState {
+                demux: demux_state.clone(),
+                ..PlaybackCacheState::default()
+            }),
+        ))
+        .unwrap();
+    let _ = backend.poll_events();
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::PositionChanged(5.0),
+        ))
+        .unwrap();
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::DurationChanged(10.0),
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.kind, BackendEventKind::CacheStateChanged(_)))
+    );
+    assert_eq!(
+        backend.cache_state().expect("cache state exists").demux,
+        demux_state
+    );
+}
+
+#[test]
+fn ffmpeg_backend_does_not_preserve_cached_seek_count_over_demux_state() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::CacheStateChanged(PlaybackCacheState {
+                demux: DemuxCacheState {
+                    cache_end: Some(10.0),
+                    reader_pts: Some(1.0),
+                    cache_duration: Some(9.0),
+                    cached_seeks: 3,
+                    ..DemuxCacheState::default()
+                },
+                ..PlaybackCacheState::default()
+            }),
+        ))
+        .unwrap();
+    let _ = backend.poll_events();
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::CacheStateChanged(PlaybackCacheState {
+                demux: DemuxCacheState {
+                    cache_end: Some(2.0),
+                    reader_pts: Some(1.0),
+                    cache_duration: Some(1.0),
+                    cached_seeks: 0,
+                    ..DemuxCacheState::default()
+                },
+                ..PlaybackCacheState::default()
+            }),
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            BackendEventKind::CacheStateChanged(state)
+                if state.demux.cache_end == Some(2.0) && state.demux.cached_seeks == 0
+        )
+    }));
+    assert_eq!(
+        backend
+            .cache_state()
+            .expect("cache state exists")
+            .demux
+            .cached_seeks,
+        0
+    );
 }
 
 #[test]
@@ -465,7 +1107,7 @@ fn optional_buffered_value_changed_uses_small_threshold() {
 #[test]
 fn buffered_reporter_reports_first_video_update_after_reset() {
     let (tx, rx) = mpsc::channel();
-    let mut reporter = BufferedReporter::new(false);
+    let mut reporter = BufferedReporter::new_with_events(false, true);
     let session_id = PlaybackSessionId(7);
 
     reporter.reset_to(0.0, session_id, &tx);
@@ -479,7 +1121,7 @@ fn buffered_reporter_reports_first_video_update_after_reset() {
 #[test]
 fn buffered_reporter_reports_first_audio_video_update_after_reset() {
     let (tx, rx) = mpsc::channel();
-    let mut reporter = BufferedReporter::new(true);
+    let mut reporter = BufferedReporter::new_with_events(true, true);
     let session_id = PlaybackSessionId(8);
 
     reporter.reset_to(12.0, session_id, &tx);
@@ -1037,6 +1679,7 @@ fn fill_audio_output_converts_samples_and_outputs_silence_on_underrun() {
     fill_audio_output(&mut output, &shared);
 
     assert_eq!(output, [-1.0, 0.0, 1.0, 0.0]);
+    assert!(shared.control.take_output_underrun());
     assert!(
         shared
             .buffer
@@ -1070,7 +1713,7 @@ fn fill_audio_output_applies_playback_volume() {
 #[test]
 fn fill_audio_output_preserves_buffer_while_paused() {
     let shared = test_audio_shared(8);
-    shared.control.set_paused(true);
+    shared.control.set_user_paused(true);
     assert_eq!(
         shared
             .buffer
@@ -1126,6 +1769,71 @@ fn detects_cacheable_http_urls() {
 }
 
 #[test]
+fn cached_input_source_keeps_http_cache_alive_between_probe_readers() {
+    let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new_with_cache_capacity(
+        0,
+        HTTP_CACHE_CHUNK_SIZE,
+    ));
+    let mut source = CachedInputSource::from_cache_for_test(cache.clone());
+
+    let first_reader = source
+        .cached_avio()
+        .expect("cached AVIO can be created")
+        .expect("HTTP source uses cached AVIO");
+    drop(first_reader);
+    assert!(!cache.is_shutdown_for_test());
+
+    let mut final_reader = source
+        .cached_avio()
+        .expect("cached AVIO can be recreated")
+        .expect("HTTP source uses cached AVIO");
+    final_reader.shutdown_cache_on_drop();
+    source.release();
+    drop(source);
+    assert!(!cache.is_shutdown_for_test());
+
+    drop(final_reader);
+    assert!(cache.is_shutdown_for_test());
+}
+
+#[test]
+fn cached_input_source_shutdowns_http_cache_when_no_reader_is_released() {
+    let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new_with_cache_capacity(
+        0,
+        HTTP_CACHE_CHUNK_SIZE,
+    ));
+
+    drop(CachedInputSource::from_cache_for_test(cache.clone()));
+
+    assert!(cache.is_shutdown_for_test());
+}
+
+#[test]
+fn cached_input_source_skips_http_cache_when_cache_mode_is_disabled() {
+    let (event_tx, _) = mpsc::channel();
+    let config = PlaybackCacheConfig {
+        mode: PlaybackCacheMode::Disabled,
+        ..PlaybackCacheConfig::default()
+    };
+    let source = CachedInputSource::new(
+        "https://example.test/video.mp4",
+        &[],
+        Some(1_024),
+        &config,
+        Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
+        event_tx,
+    )
+    .expect("source creates without spawning HTTP cache");
+
+    assert!(
+        source
+            .cached_avio()
+            .expect("cache lookup succeeds")
+            .is_none()
+    );
+}
+
+#[test]
 fn http_cache_request_header_log_includes_effective_headers() {
     let headers = reqwest_header_pairs(&[
         ("X-Emby-Token".to_string(), "token".to_string()),
@@ -1147,22 +1855,41 @@ fn http_cache_request_header_log_includes_effective_headers() {
 
 #[test]
 fn http_cache_range_header_limits_request_size() {
-    assert_eq!(http_cache_range_header(0, None), "bytes=0-33554431");
-    assert_eq!(http_cache_range_header(128, None), "bytes=128-33554559");
     assert_eq!(
-        http_cache_range_header(595_453_649, Some(596_486_439)),
+        http_cache_range_header(0, None, HTTP_CACHE_RANGE_REQUEST_BYTES),
+        "bytes=0-33554431"
+    );
+    assert_eq!(
+        http_cache_range_header(128, None, HTTP_CACHE_RANGE_REQUEST_BYTES),
+        "bytes=128-33554559"
+    );
+    assert_eq!(
+        http_cache_range_header(
+            595_453_649,
+            Some(596_486_439),
+            HTTP_CACHE_RANGE_REQUEST_BYTES
+        ),
         "bytes=595453649-596486438"
     );
     assert_eq!(
-        http_cache_range_header(10_675_366_349, Some(10_675_368_645)),
+        http_cache_range_header(
+            10_675_366_349,
+            Some(10_675_368_645),
+            HTTP_CACHE_RANGE_REQUEST_BYTES
+        ),
         "bytes=10675366349-10675368644"
     );
+    assert_eq!(http_cache_range_header(0, None, 1024), "bytes=0-1023");
 }
 
 #[test]
 fn http_cache_range_request_timeout_is_short_for_small_tail_ranges() {
     assert_eq!(
-        http_cache_range_request_len(10_675_366_349, Some(10_675_368_645)),
+        http_cache_range_request_len(
+            10_675_366_349,
+            Some(10_675_368_645),
+            HTTP_CACHE_RANGE_REQUEST_BYTES
+        ),
         2_296
     );
     assert_eq!(
@@ -1228,7 +1955,7 @@ fn http_ring_cache_probe_read_does_not_move_playback_reader() {
 }
 
 #[test]
-fn http_ring_cache_probe_read_does_not_restart_trimmed_range() {
+fn http_ring_cache_probe_read_queues_trimmed_range_without_active_restart() {
     let mut state = HttpRingCacheState::new(100);
     state.append_at(100, b"abcdef");
     state.set_reader_offset(104);
@@ -1238,9 +1965,39 @@ fn http_ring_cache_probe_read_does_not_restart_trimmed_range() {
 
     assert!(matches!(
         cache.read_cached_at(100, &mut output),
-        CacheReadResult::Interrupted
+        CacheReadResult::WouldBlock
     ));
     assert!(!cache.has_restart_request_for_test());
+    assert_eq!(
+        cache.side_download_requests_for_test(),
+        vec![CacheRestartRequest {
+            offset: 100,
+            range_kind: HttpCacheRangeKind::Playback,
+        }]
+    );
+}
+
+#[test]
+fn http_ring_cache_probe_read_queues_side_download_without_active_restart() {
+    let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
+    state.append_at(100, b"abcdef");
+    state.set_reader_offset(103);
+    let cache = HttpRingCache::from_state_for_test(state);
+    let mut output = [0; 2];
+
+    assert!(matches!(
+        cache.read_cached_at(500, &mut output),
+        CacheReadResult::WouldBlock
+    ));
+    assert_eq!(cache.reader_offset_for_test(), 103);
+    assert!(!cache.has_restart_request_for_test());
+    assert_eq!(
+        cache.side_download_requests_for_test(),
+        vec![CacheRestartRequest {
+            offset: 500,
+            range_kind: HttpCacheRangeKind::Playback,
+        }]
+    );
 }
 
 #[test]
@@ -1295,7 +2052,7 @@ fn http_ring_cache_state_hides_tail_metadata_range_from_progress() {
 
     assert_eq!(
         state.stream_buffer_progress(),
-        Some(HttpStreamBufferProgress {
+        Some(PlaybackCacheByteRange {
             start_fraction: 0.1,
             end_fraction: 0.106,
         })
@@ -1313,8 +2070,8 @@ fn http_ring_cache_state_reports_playback_progress_while_tail_metadata_active() 
     assert_eq!(
         state
             .playback_buffer_range()
-            .map(HttpStreamBufferProgress::from),
-        Some(HttpStreamBufferProgress {
+            .map(PlaybackCacheByteRange::from),
+        Some(PlaybackCacheByteRange {
             start_fraction: 0.1,
             end_fraction: 0.106,
         })
@@ -1322,7 +2079,7 @@ fn http_ring_cache_state_reports_playback_progress_while_tail_metadata_active() 
 }
 
 #[test]
-fn http_ring_cache_state_playback_progress_ignores_retained_range_after_playback_restart() {
+fn http_ring_cache_state_keeps_retained_ranges_after_playback_restart() {
     let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
     state.append_at(100, b"abcdef");
 
@@ -1331,14 +2088,34 @@ fn http_ring_cache_state_playback_progress_ignores_retained_range_after_playback
     state.restart_at_with_kind(200, HttpCacheRangeKind::Playback);
     state.append_at(200, b"ghij");
 
+    let mut output = [0; 3];
+    assert_eq!(state.copy_available(102, &mut output), Some(3));
+    assert_eq!(&output, b"cde");
     assert_eq!(
         state
             .playback_buffer_range()
-            .map(HttpStreamBufferProgress::from),
-        Some(HttpStreamBufferProgress {
+            .map(PlaybackCacheByteRange::from),
+        Some(PlaybackCacheByteRange {
             start_fraction: 0.2,
             end_fraction: 0.204,
         })
+    );
+    assert_eq!(
+        state.stream_cache_status_for_test().ranges,
+        vec![
+            PlaybackCacheByteRange {
+                start_fraction: 0.1,
+                end_fraction: 0.106,
+            },
+            PlaybackCacheByteRange {
+                start_fraction: 0.2,
+                end_fraction: 0.204,
+            },
+            PlaybackCacheByteRange {
+                start_fraction: 0.99,
+                end_fraction: 0.994,
+            },
+        ]
     );
 }
 
@@ -1349,7 +2126,7 @@ fn http_ring_cache_state_reports_near_tail_playback_range() {
 
     assert_eq!(
         state.stream_buffer_progress(),
-        Some(HttpStreamBufferProgress {
+        Some(PlaybackCacheByteRange {
             start_fraction: 0.98,
             end_fraction: 0.984,
         })
@@ -1377,14 +2154,108 @@ fn http_ring_cache_state_treats_near_tail_active_range_as_playback() {
 }
 
 #[test]
-fn http_ring_cache_state_does_not_retain_cached_range_for_non_tail_restart() {
+fn http_ring_cache_state_retains_cached_range_for_non_tail_restart() {
     let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000_000_000));
     state.append_at(100, b"abcdef");
 
     state.restart_at(10_000);
 
     let mut output = [0; 3];
-    assert_eq!(state.copy_available(102, &mut output), None);
+    assert_eq!(state.copy_available(102, &mut output), Some(3));
+    assert_eq!(&output, b"cde");
+}
+
+#[test]
+fn http_ring_cache_state_appends_side_range_without_restarting_active_range() {
+    let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
+    state.append_at(100, b"abcdef");
+
+    assert!(state.append_retained_at(900, b"tail", HttpCacheRangeKind::TailMetadataProbe));
+
+    assert_eq!(state.base_offset, 100);
+    assert_eq!(state.next_offset, 106);
+    let mut output = [0; 4];
+    assert_eq!(state.copy_available(900, &mut output), Some(4));
+    assert_eq!(&output, b"tail");
+    assert_eq!(
+        state.stream_cache_status_for_test().ranges,
+        vec![
+            PlaybackCacheByteRange {
+                start_fraction: 0.1,
+                end_fraction: 0.106,
+            },
+            PlaybackCacheByteRange {
+                start_fraction: 0.9,
+                end_fraction: 0.904,
+            },
+        ]
+    );
+}
+
+#[test]
+fn http_ring_cache_state_appends_overlapping_side_range_without_duplicate_bytes() {
+    let mut state =
+        HttpRingCacheState::new_with_cache_capacity(0, 16).with_content_len_hint(Some(1_000));
+
+    assert!(state.append_retained_at(900, b"tail", HttpCacheRangeKind::TailMetadataProbe));
+    assert!(state.append_retained_at(902, b"il!!", HttpCacheRangeKind::TailMetadataProbe));
+
+    let mut output = [0; 6];
+    assert_eq!(state.copy_available(900, &mut output), Some(6));
+    assert_eq!(&output, b"tail!!");
+    assert_eq!(state.stream_cache_status_for_test().cached_bytes, 6);
+}
+
+#[test]
+fn http_ring_cache_state_prunes_least_recently_used_retained_range() {
+    let mut state =
+        HttpRingCacheState::new_with_cache_capacity(0, 8).with_content_len_hint(Some(1_000));
+    state.append_at(0, b"abcd");
+    state.restart_at(100);
+    state.append_at(100, b"efgh");
+    state.restart_at(200);
+
+    let mut output = [0; 4];
+    assert_eq!(state.copy_available(0, &mut output), Some(4));
+    assert_eq!(&output, b"abcd");
+
+    state.append_at(200, b"ijkl");
+
+    assert_eq!(state.copy_available(0, &mut output), Some(4));
+    assert_eq!(&output, b"abcd");
+    assert_eq!(state.copy_available(100, &mut output), None);
+    assert_eq!(state.copy_available(200, &mut output), Some(4));
+    assert_eq!(&output, b"ijkl");
+}
+
+#[test]
+fn http_ring_cache_state_counts_byte_level_seeks_outside_active_range() {
+    let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
+    state.append_at(100, b"abcdef");
+
+    state.note_seek_offset(102, HttpCacheRangeKind::Playback);
+    assert_eq!(state.stream_cache_status_for_test().byte_level_seeks, 0);
+
+    state.note_seek_offset(500, HttpCacheRangeKind::Playback);
+    assert_eq!(state.stream_cache_status_for_test().byte_level_seeks, 1);
+
+    state.restart_at(500);
+    state.append_at(500, b"ghij");
+    state.note_seek_offset(102, HttpCacheRangeKind::Playback);
+    assert_eq!(state.stream_cache_status_for_test().byte_level_seeks, 2);
+}
+
+#[test]
+fn http_ring_cache_state_reports_recent_raw_input_rate() {
+    let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(1_000));
+
+    state.append_at(0, b"abcdef");
+    state.append_at(6, b"ghij");
+
+    assert_eq!(
+        state.stream_cache_status_for_test().raw_input_rate,
+        Some(10)
+    );
 }
 
 #[test]
@@ -1395,7 +2266,7 @@ fn http_ring_cache_state_uses_content_length_hint_for_progress() {
 
     assert_eq!(
         state.stream_buffer_progress(),
-        Some(HttpStreamBufferProgress {
+        Some(PlaybackCacheByteRange {
             start_fraction: 0.0,
             end_fraction: 0.05,
         })
@@ -1495,6 +2366,60 @@ fn http_ring_cache_state_pauses_prefetch_until_hysteresis_resume() {
 }
 
 #[test]
+fn http_ring_cache_state_applies_live_cache_config() {
+    let mut state = HttpRingCacheState::new_with_readahead_for_test(0, 1_000, 10.0, 2.0)
+        .with_content_len_hint(Some(1_000));
+    state.set_duration_seconds_for_test(100.0);
+
+    assert_eq!(state.append_capacity_from(0), 100);
+
+    let config = PlaybackCacheConfig {
+        mode: PlaybackCacheMode::Enabled,
+        cache_secs: 2.0,
+        demuxer_readahead_secs: 1.0,
+        demuxer_hysteresis_secs: 0.5,
+        ..PlaybackCacheConfig::default()
+    };
+    state.apply_cache_config(&config);
+
+    assert_eq!(state.append_capacity_from(0), 20);
+}
+
+#[test]
+fn http_ring_cache_applies_live_memory_budget_from_cache_config() {
+    let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new_with_cache_capacity(
+        0,
+        1024 * 1024,
+    ));
+    let config = PlaybackCacheConfig {
+        http_cache_max_bytes: 128 * 1024,
+        http_cache_chunk_bytes: 64 * 1024,
+        ..PlaybackCacheConfig::default()
+    };
+
+    cache.apply_cache_config(&config);
+
+    assert_eq!(cache.memory_capacity_for_test(), 128 * 1024);
+}
+
+#[test]
+fn http_ring_cache_applies_live_range_request_budget_from_cache_config() {
+    let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new_with_cache_capacity(
+        0,
+        1024 * 1024,
+    ));
+    let config = PlaybackCacheConfig {
+        http_cache_chunk_bytes: 64 * 1024,
+        http_cache_range_request_bytes: 2 * 1024 * 1024,
+        ..PlaybackCacheConfig::default()
+    };
+
+    cache.apply_cache_config(&config);
+
+    assert_eq!(cache.range_request_bytes_for_test(), 2 * 1024 * 1024);
+}
+
+#[test]
 fn http_ring_cache_state_reads_trimmed_bytes_from_disk_cache() {
     let mut state =
         HttpRingCacheState::new_with_disk_cache_for_test(0, 4, 16).with_content_len_hint(Some(8));
@@ -1506,6 +2431,28 @@ fn http_ring_cache_state_reads_trimmed_bytes_from_disk_cache() {
     let mut output = [0; 4];
     assert_eq!(state.copy_available(0, &mut output), Some(4));
     assert_eq!(&output, b"abcd");
+}
+
+#[test]
+fn http_ring_cache_state_counts_overlapping_memory_and_disk_bytes_once() {
+    let mut state =
+        HttpRingCacheState::new_with_disk_cache_for_test(0, 4, 16).with_content_len_hint(Some(8));
+
+    assert!(state.append_at(0, b"abcd"));
+    assert_eq!(state.stream_cache_status_for_test().cached_bytes, 4);
+
+    state.set_reader_offset(4);
+    assert!(state.append_at(4, b"efgh"));
+
+    let status = state.stream_cache_status_for_test();
+    assert_eq!(status.cached_bytes, 8);
+    assert_eq!(
+        status.ranges,
+        vec![PlaybackCacheByteRange {
+            start_fraction: 0.0,
+            end_fraction: 1.0,
+        }]
+    );
 }
 
 #[test]
@@ -1525,14 +2472,14 @@ fn http_ring_cache_state_uses_active_range_for_prefetch_window() {
 }
 
 #[test]
-fn http_ring_cache_state_ignores_seek_outside_cached_range_until_read() {
+fn http_ring_cache_state_demotes_active_range_on_seek_outside_cached_range() {
     let mut state = HttpRingCacheState::new(100);
     state.append_at(100, b"abcdef");
 
     state.note_seek_offset(10_000, HttpCacheRangeKind::Playback);
     state.trim_to_capacity(4);
 
-    assert_eq!(state.base_offset, 100);
+    assert_eq!(state.base_offset, 106);
     assert_eq!(state.next_offset, 106);
     let mut output = [0; 6];
     assert_eq!(state.copy_available(100, &mut output), Some(6));
@@ -1622,11 +2569,11 @@ fn playback_scheduler_holds_target_while_paused() {
     });
 
     thread::sleep(Duration::from_millis(10));
-    control.set_paused(true);
+    control.set_user_paused(true);
     thread::sleep(Duration::from_millis(70));
     assert!(done_rx.try_recv().is_err());
 
-    control.set_paused(false);
+    control.set_user_paused(false);
     assert_eq!(
         done_rx
             .recv_timeout(Duration::from_millis(100))

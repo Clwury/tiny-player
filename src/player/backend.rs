@@ -4,9 +4,12 @@ mod ffmpeg;
 use crate::player::render_host::FrameSlot;
 
 use super::tracks::{PlaybackTrack, PlaybackTrackSelection};
+#[allow(unused_imports)]
 pub use events::{
     BackendError, BackendEvent, BackendEventKind, BackendSubtitleBitmap, BackendSubtitleCue,
-    HttpStreamBufferProgress, HttpStreamCacheStatus, PlaybackVideoInfo, Result,
+    ByteCacheState, CacheUnlinkPolicy, DemuxCacheState, PlaybackCacheByteRange,
+    PlaybackCacheConfig, PlaybackCacheMode, PlaybackCacheState, PlaybackCacheTimeRange,
+    PlaybackSeekableCacheMode, PlaybackVideoInfo, Result, StreamCacheKind, StreamCacheState,
 };
 pub use ffmpeg::FfmpegBackend;
 
@@ -16,6 +19,7 @@ pub struct BackendLoadRequest {
     pub http_headers: Vec<(String, String)>,
     pub content_length: Option<u64>,
     pub selected_tracks: PlaybackTrackSelection,
+    pub cache_config: PlaybackCacheConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +45,8 @@ pub enum BackendCommand {
     SetVolume {
         volume: f32,
     },
+    #[allow(dead_code)]
+    SetCacheConfig(PlaybackCacheConfig),
     #[allow(dead_code)]
     SetPlaybackRate {
         rate: f64,
@@ -71,6 +77,13 @@ pub trait BackendControl {
     fn set_volume(&mut self, _volume: f32) -> Result<()> {
         Err(BackendError::UnsupportedCommand("调整音量"))
     }
+    fn set_cache_config(&mut self, _config: PlaybackCacheConfig) -> Result<()> {
+        Err(BackendError::UnsupportedCommand("调整缓存设置"))
+    }
+    #[allow(dead_code)]
+    fn cache_state(&self) -> Option<PlaybackCacheState> {
+        None
+    }
     fn poll_events(&mut self) -> Vec<BackendEvent>;
     fn frame_slot(&self) -> FrameSlot;
 
@@ -90,6 +103,7 @@ pub trait BackendControl {
                 position_seconds,
             } => self.set_subtitle_track(track, position_seconds),
             BackendCommand::SetVolume { volume } => self.set_volume(volume),
+            BackendCommand::SetCacheConfig(config) => self.set_cache_config(config),
             BackendCommand::SetPlaybackRate { .. } => {
                 Err(BackendError::UnsupportedCommand("调整播放速度"))
             }

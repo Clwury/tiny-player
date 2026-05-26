@@ -47,10 +47,6 @@ pub(super) struct BufferedReporter {
 }
 
 impl BufferedReporter {
-    pub(super) fn new(needs_audio: bool) -> Self {
-        Self::new_with_events(needs_audio, true)
-    }
-
     pub(super) fn new_with_events(needs_audio: bool, emit_events: bool) -> Self {
         Self {
             last_report: None,

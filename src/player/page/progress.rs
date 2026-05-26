@@ -26,21 +26,6 @@ pub(super) fn valid_playback_duration(duration: f64) -> Option<f64> {
     (duration.is_finite() && duration > 0.0).then_some(duration)
 }
 
-pub(super) fn valid_http_stream_buffer_progress(
-    progress: HttpStreamBufferProgress,
-) -> Option<HttpStreamBufferProgress> {
-    if !progress.start_fraction.is_finite() || !progress.end_fraction.is_finite() {
-        return None;
-    }
-
-    let start_fraction = progress.start_fraction.clamp(0.0, 1.0);
-    let end_fraction = progress.end_fraction.clamp(0.0, 1.0);
-    (end_fraction >= start_fraction).then_some(HttpStreamBufferProgress {
-        start_fraction,
-        end_fraction,
-    })
-}
-
 pub(super) fn clamp_playback_position(position: f64, duration: f64) -> f64 {
     if !position.is_finite() {
         return 0.0;
@@ -62,6 +47,128 @@ pub(super) fn buffered_progress_fraction(
 ) -> f32 {
     let buffered_until = buffered_until.unwrap_or(position).max(position);
     progress_fraction(buffered_until, duration)
+}
+
+pub(super) fn cache_range_fractions(
+    cache_state: Option<&PlaybackCacheState>,
+    duration: f64,
+) -> Vec<(f32, f32)> {
+    let Some(duration) = valid_playback_duration(duration) else {
+        return Vec::new();
+    };
+    let Some(cache_state) = cache_state else {
+        return Vec::new();
+    };
+    let mut ranges: Vec<_> = cache_state
+        .demux
+        .seekable_ranges
+        .iter()
+        .filter_map(|range| {
+            if !range.start.is_finite() || !range.end.is_finite() {
+                return None;
+            }
+            let start = range.start;
+            let end = range.end;
+            let start = clamp_playback_position(start, duration);
+            let end = clamp_playback_position(end, duration);
+            (end > start).then_some((start, end))
+        })
+        .collect();
+    ranges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+
+    merged
+        .into_iter()
+        .map(|(start, end)| ((start / duration) as f32, (end / duration) as f32))
+        .collect()
+}
+
+pub(super) fn byte_cache_range_fractions(
+    cache_state: Option<&PlaybackCacheState>,
+    duration: f64,
+) -> Vec<(f32, f32)> {
+    if valid_playback_duration(duration).is_none() {
+        return Vec::new();
+    }
+    let Some(byte_cache) = cache_state.and_then(|state| state.byte.as_ref()) else {
+        return Vec::new();
+    };
+    if byte_cache
+        .content_length
+        .is_none_or(|content_length| content_length == 0)
+    {
+        return Vec::new();
+    }
+
+    let mut ranges: Vec<_> = byte_cache
+        .ranges
+        .iter()
+        .filter_map(|range| {
+            if !range.start_fraction.is_finite() || !range.end_fraction.is_finite() {
+                return None;
+            }
+            let start = range.start_fraction.clamp(0.0, 1.0);
+            let end = range.end_fraction.clamp(0.0, 1.0);
+            (end > start).then_some((start, end))
+        })
+        .collect();
+    ranges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+
+    merged
+        .into_iter()
+        .map(|(start, end)| (start as f32, end as f32))
+        .collect()
+}
+
+pub(super) fn cached_seek_target(
+    cache_state: Option<&PlaybackCacheState>,
+    buffered_until: Option<f64>,
+    reader_position: Option<f64>,
+    target: f64,
+) -> bool {
+    let Some(target) = valid_playback_time(target) else {
+        return false;
+    };
+    if let Some(cache_state) = cache_state {
+        let ranges = &cache_state.demux.seekable_ranges;
+        if !ranges.is_empty() {
+            return ranges.iter().any(|range| {
+                range.start.is_finite()
+                    && range.end.is_finite()
+                    && target >= range.start
+                    && target <= range.end
+            });
+        }
+    }
+
+    let Some(reader_position) = reader_position.and_then(valid_playback_time) else {
+        return false;
+    };
+    let Some(buffered_until) = buffered_until.and_then(valid_playback_time) else {
+        return false;
+    };
+    target >= reader_position && target <= buffered_until
 }
 
 pub(super) fn buffered_until_after_seek(previous: Option<f64>, position: f64) -> Option<f64> {
@@ -109,7 +216,10 @@ pub(super) fn format_playback_time(seconds: f64) -> String {
 mod tests {
     use gpui::{Bounds, point, px, size};
 
-    use crate::player::backend::HttpStreamBufferProgress;
+    use crate::player::backend::{
+        ByteCacheState, DemuxCacheState, PlaybackCacheByteRange, PlaybackCacheState,
+        PlaybackCacheTimeRange,
+    };
 
     use super::*;
 
@@ -147,6 +257,121 @@ mod tests {
     }
 
     #[test]
+    fn cache_range_fractions_clamp_and_merge_ranges() {
+        let state = PlaybackCacheState {
+            demux: DemuxCacheState {
+                seekable_ranges: vec![
+                    PlaybackCacheTimeRange {
+                        start: -10.0,
+                        end: 20.0,
+                    },
+                    PlaybackCacheTimeRange {
+                        start: 15.0,
+                        end: 40.0,
+                    },
+                    PlaybackCacheTimeRange {
+                        start: 80.0,
+                        end: 120.0,
+                    },
+                ],
+                ..DemuxCacheState::default()
+            },
+            ..PlaybackCacheState::default()
+        };
+
+        assert_eq!(
+            cache_range_fractions(Some(&state), 100.0),
+            vec![(0.0, 0.4), (0.8, 1.0)]
+        );
+    }
+
+    #[test]
+    fn byte_cache_range_fractions_require_content_length_and_merge_ranges() {
+        let state = PlaybackCacheState {
+            byte: Some(ByteCacheState {
+                ranges: vec![
+                    PlaybackCacheByteRange {
+                        start_fraction: -0.1,
+                        end_fraction: 0.2,
+                    },
+                    PlaybackCacheByteRange {
+                        start_fraction: 0.15,
+                        end_fraction: 0.5,
+                    },
+                    PlaybackCacheByteRange {
+                        start_fraction: 0.8,
+                        end_fraction: 1.2,
+                    },
+                ],
+                reader_fraction: None,
+                download_fraction: None,
+                cached_bytes: 0,
+                content_length: Some(100),
+                disk_cache_enabled: false,
+                idle: false,
+                raw_input_rate: None,
+                byte_level_seeks: 0,
+            }),
+            ..PlaybackCacheState::default()
+        };
+
+        assert_eq!(
+            byte_cache_range_fractions(Some(&state), 100.0),
+            vec![(0.0, 0.5), (0.8, 1.0)]
+        );
+
+        let without_content_length = PlaybackCacheState {
+            byte: Some(ByteCacheState {
+                content_length: None,
+                ..state.byte.expect("byte cache state exists")
+            }),
+            ..PlaybackCacheState::default()
+        };
+        assert!(byte_cache_range_fractions(Some(&without_content_length), 100.0).is_empty());
+    }
+
+    #[test]
+    fn cached_seek_target_uses_seekable_ranges_before_buffered_fallback() {
+        let state = PlaybackCacheState {
+            demux: DemuxCacheState {
+                seekable_ranges: vec![
+                    PlaybackCacheTimeRange {
+                        start: 10.0,
+                        end: 20.0,
+                    },
+                    PlaybackCacheTimeRange {
+                        start: 40.0,
+                        end: 50.0,
+                    },
+                ],
+                ..DemuxCacheState::default()
+            },
+            ..PlaybackCacheState::default()
+        };
+
+        assert!(cached_seek_target(
+            Some(&state),
+            Some(100.0),
+            Some(0.0),
+            15.0
+        ));
+        assert!(!cached_seek_target(
+            Some(&state),
+            Some(100.0),
+            Some(0.0),
+            30.0
+        ));
+    }
+
+    #[test]
+    fn cached_seek_target_falls_back_to_forward_buffer_when_ranges_are_missing() {
+        assert!(cached_seek_target(None, Some(50.0), Some(10.0), 30.0));
+        assert!(!cached_seek_target(None, Some(50.0), Some(10.0), 5.0));
+        assert!(!cached_seek_target(None, Some(50.0), Some(10.0), 60.0));
+        assert!(!cached_seek_target(None, Some(f64::NAN), Some(10.0), 30.0));
+    }
+
+    #[test]
     fn buffered_until_keeps_cached_end_when_seek_target_is_buffered() {
         assert_eq!(buffered_until_after_seek(Some(80.0), 20.0), Some(80.0));
         assert_eq!(buffered_until_after_seek(Some(10.0), 40.0), Some(40.0));
@@ -159,34 +384,6 @@ mod tests {
         assert!(should_apply_backend_position(None, None));
         assert!(!should_apply_backend_position(Some(40.0), None));
         assert!(!should_apply_backend_position(None, Some(80.0)));
-    }
-
-    #[test]
-    fn http_stream_buffer_progress_validates_and_clamps_fraction_range() {
-        assert_eq!(
-            valid_http_stream_buffer_progress(HttpStreamBufferProgress {
-                start_fraction: -0.5,
-                end_fraction: 1.5,
-            }),
-            Some(HttpStreamBufferProgress {
-                start_fraction: 0.0,
-                end_fraction: 1.0,
-            })
-        );
-        assert_eq!(
-            valid_http_stream_buffer_progress(HttpStreamBufferProgress {
-                start_fraction: 0.8,
-                end_fraction: 0.2,
-            }),
-            None
-        );
-        assert_eq!(
-            valid_http_stream_buffer_progress(HttpStreamBufferProgress {
-                start_fraction: f64::NAN,
-                end_fraction: 0.2,
-            }),
-            None
-        );
     }
 
     #[test]

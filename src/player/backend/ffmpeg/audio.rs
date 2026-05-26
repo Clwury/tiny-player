@@ -113,6 +113,7 @@ impl AudioShared {
             guard.clear();
             self.ready.notify_all();
         }
+        self.control.clear_output_underrun();
         self.played_samples.store(
             samples_for_duration(timeline_nsecs, self.sample_rate, self.channels),
             Ordering::Relaxed,
@@ -621,6 +622,7 @@ fn fill_audio_output_samples<T>(
 
     let volume = shared.control.volume();
     let mut played = 0u64;
+    let requested = data.len();
     for sample in data {
         let value = match guard.pop_sample() {
             Some(value) => {
@@ -648,6 +650,9 @@ fn fill_audio_output_samples<T>(
         );
     } else {
         shared.update_output_delay(Duration::ZERO);
+    }
+    if requested > usize::try_from(played).unwrap_or(usize::MAX) {
+        shared.control.mark_output_underrun();
     }
     shared.ready.notify_all();
 }

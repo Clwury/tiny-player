@@ -9,7 +9,9 @@ pub(super) struct FfmpegWorker {
 #[derive(Debug)]
 pub(super) struct FfmpegControl {
     shutdown: AtomicBool,
-    paused: AtomicBool,
+    user_paused: AtomicBool,
+    cache_paused: AtomicBool,
+    output_underrun: AtomicBool,
     volume: AtomicU32,
     session_id: AtomicU64,
     seek_generation: AtomicU64,
@@ -25,7 +27,9 @@ impl FfmpegControl {
     pub(super) fn with_volume(session_id: PlaybackSessionId, volume: f32) -> Self {
         Self {
             shutdown: AtomicBool::new(false),
-            paused: AtomicBool::new(false),
+            user_paused: AtomicBool::new(false),
+            cache_paused: AtomicBool::new(false),
+            output_underrun: AtomicBool::new(false),
             volume: AtomicU32::new(volume_to_storage(volume)),
             session_id: AtomicU64::new(session_id.0),
             seek_generation: AtomicU64::new(0),
@@ -46,11 +50,35 @@ impl FfmpegControl {
     }
 
     pub(super) fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Acquire)
+        self.is_user_paused() || self.is_cache_paused()
     }
 
-    pub(super) fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Release);
+    pub(super) fn is_user_paused(&self) -> bool {
+        self.user_paused.load(Ordering::Acquire)
+    }
+
+    pub(super) fn set_user_paused(&self, paused: bool) {
+        self.user_paused.store(paused, Ordering::Release);
+    }
+
+    pub(super) fn is_cache_paused(&self) -> bool {
+        self.cache_paused.load(Ordering::Acquire)
+    }
+
+    pub(super) fn set_cache_paused(&self, paused: bool) -> bool {
+        self.cache_paused.swap(paused, Ordering::AcqRel) != paused
+    }
+
+    pub(super) fn mark_output_underrun(&self) {
+        self.output_underrun.store(true, Ordering::Release);
+    }
+
+    pub(super) fn take_output_underrun(&self) -> bool {
+        self.output_underrun.swap(false, Ordering::AcqRel)
+    }
+
+    pub(super) fn clear_output_underrun(&self) {
+        self.output_underrun.store(false, Ordering::Release);
     }
 
     pub(super) fn set_volume(&self, volume: f32) {
@@ -78,6 +106,7 @@ impl FfmpegControl {
     }
 
     pub(super) fn request_seek(&self) -> u64 {
+        self.clear_output_underrun();
         self.seek_generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
@@ -118,6 +147,7 @@ pub(super) struct FfmpegPlaybackInput {
     pub(super) content_length: Option<u64>,
     pub(super) start_position_seconds: f64,
     pub(super) selected_tracks: crate::player::PlaybackTrackSelection,
+    pub(super) cache_config: PlaybackCacheConfig,
 }
 
 pub(super) enum FfmpegCommand {
@@ -139,6 +169,10 @@ pub(super) enum FfmpegCommand {
         position_seconds: f64,
         generation: u64,
         pause_after_switch: bool,
+    },
+    SetCacheConfig {
+        session_id: PlaybackSessionId,
+        config: PlaybackCacheConfig,
     },
     #[allow(dead_code)]
     SetPlaybackRate {
@@ -167,6 +201,7 @@ pub(super) struct PendingTrackSelection {
 pub(super) struct DrainedFfmpegCommands {
     pub(super) pending_seek: Option<PendingSeek>,
     pub(super) pending_track_selection: Option<PendingTrackSelection>,
+    pub(super) cache_config: Option<PlaybackCacheConfig>,
 }
 
 impl FfmpegWorker {
@@ -234,7 +269,7 @@ impl FfmpegWorker {
 
     pub(super) fn seek(&self, position_seconds: f64, session_id: PlaybackSessionId) -> Result<()> {
         let generation = self.control.request_seek();
-        self.control.set_paused(false);
+        self.control.set_cache_paused(false);
         tracing::debug!(
             ?session_id,
             position_seconds,
@@ -255,7 +290,7 @@ impl FfmpegWorker {
     }
 
     pub(super) fn set_paused(&self, paused: bool, session_id: PlaybackSessionId) -> Result<()> {
-        self.control.set_paused(paused);
+        self.control.set_user_paused(paused);
         let command = if paused {
             FfmpegCommand::Pause { session_id }
         } else {
@@ -275,7 +310,7 @@ impl FfmpegWorker {
         pause_after_switch: bool,
     ) -> Result<()> {
         let generation = self.control.request_seek();
-        self.control.set_paused(false);
+        self.control.set_cache_paused(false);
         tracing::debug!(
             ?session_id,
             position_seconds,
@@ -301,6 +336,24 @@ impl FfmpegWorker {
 
     pub(super) fn set_volume(&self, volume: f32) {
         self.control.set_volume(volume);
+    }
+
+    pub(super) fn set_cache_config(
+        &self,
+        session_id: PlaybackSessionId,
+        config: PlaybackCacheConfig,
+    ) -> Result<()> {
+        self.command_tx
+            .send(FfmpegCommand::SetCacheConfig {
+                session_id,
+                config: config.normalized(),
+            })
+            .map_err(|_| BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string()))?;
+        Ok(())
+    }
+
+    pub(super) fn is_paused(&self) -> bool {
+        self.control.is_paused()
     }
 
     pub(super) fn stop(self) {
@@ -336,6 +389,7 @@ pub(super) fn drain_playback_commands(
 ) -> DrainedFfmpegCommands {
     let mut pending_seek = None;
     let mut pending_track_selection: Option<PendingTrackSelection> = None;
+    let mut cache_config = None;
     while let Ok(command) = command_rx.try_recv() {
         match command {
             FfmpegCommand::Seek {
@@ -352,14 +406,14 @@ pub(super) fn drain_playback_commands(
             }
             FfmpegCommand::Pause { session_id } => {
                 control.set_session_id(session_id);
-                control.set_paused(true);
+                control.set_user_paused(true);
                 if let Some(pending) = pending_track_selection.as_mut() {
                     pending.pause_after_switch = true;
                 }
             }
             FfmpegCommand::Resume { session_id } => {
                 control.set_session_id(session_id);
-                control.set_paused(false);
+                control.set_user_paused(false);
                 if let Some(pending) = pending_track_selection.as_mut() {
                     pending.pause_after_switch = false;
                 }
@@ -383,6 +437,10 @@ pub(super) fn drain_playback_commands(
                     pause_after_switch,
                 });
             }
+            FfmpegCommand::SetCacheConfig { session_id, config } => {
+                control.set_session_id(session_id);
+                cache_config = Some(config.normalized());
+            }
             FfmpegCommand::SetPlaybackRate { session_id, rate } => {
                 control.set_session_id(session_id);
                 tracing::debug!(
@@ -395,6 +453,7 @@ pub(super) fn drain_playback_commands(
     DrainedFfmpegCommands {
         pending_seek,
         pending_track_selection,
+        cache_config,
     }
 }
 

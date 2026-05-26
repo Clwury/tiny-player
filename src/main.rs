@@ -1,16 +1,6 @@
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+mod logging;
 
 fn main() {
-    init_tracing();
+    logging::init();
     tiny::run();
-}
-
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("tiny=debug,reqwest=debug,hyper=info"));
-
-    let _ = tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().with_target(true).pretty())
-        .try_init();
 }

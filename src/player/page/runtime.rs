@@ -1,5 +1,8 @@
 use super::super::{
-    backend::{BackendControl, BackendEvent, BackendLoadRequest, FfmpegBackend, Result},
+    backend::{
+        BackendControl, BackendEvent, BackendLoadRequest, FfmpegBackend, PlaybackCacheConfig,
+        PlaybackCacheState, Result,
+    },
     render_host::FrameSlot,
     tracks::PlaybackTrack,
 };
@@ -58,6 +61,18 @@ impl BackendControl for PlaybackBackend {
     fn set_volume(&mut self, volume: f32) -> Result<()> {
         match self {
             Self::Ffmpeg(backend) => backend.set_volume(volume),
+        }
+    }
+
+    fn set_cache_config(&mut self, config: PlaybackCacheConfig) -> Result<()> {
+        match self {
+            Self::Ffmpeg(backend) => backend.set_cache_config(config),
+        }
+    }
+
+    fn cache_state(&self) -> Option<PlaybackCacheState> {
+        match self {
+            Self::Ffmpeg(backend) => backend.cache_state(),
         }
     }
 
