@@ -37,31 +37,12 @@ fn begin_position_reset(
     session.reset_to(session_id, position_seconds);
     control.set_session_id(session.id());
     control.set_cache_paused(false);
-    control.clear_output_underrun();
     position_seconds
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn begin_seek_clears_stale_output_underrun_for_restart_gate() {
-        let control = FfmpegControl::new(PlaybackSessionId(1));
-        let mut session = PlaybackSession::new(PlaybackSessionId(1), 0.0);
-        let pending = PendingSeek {
-            session_id: PlaybackSessionId(2),
-            position_seconds: 12.0,
-            generation: 1,
-        };
-        control.mark_output_underrun();
-
-        let position = begin_seek(&mut session, &control, &pending);
-
-        assert_eq!(position, 12.0);
-        assert_eq!(session.id(), PlaybackSessionId(2));
-        assert!(!control.take_output_underrun());
-    }
 
     #[test]
     fn begin_seek_preserves_user_pause_while_clearing_cache_pause() {

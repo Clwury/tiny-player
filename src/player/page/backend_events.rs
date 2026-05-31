@@ -260,11 +260,26 @@ impl PlaybackPage {
             render_size.is_some(),
         ) {
             let size = render_size.expect("render size checked above");
-            let render_result = self
+            let presenter = self
                 .video
                 .dependent_mut()
-                .expect("video presenter checked above")
-                .render_if_needed(size);
+                .expect("video presenter checked above");
+            let render_result = presenter.render_if_needed(size);
+            let presenter_snapshot = presenter.snapshot();
+            if let Some(blocked_on) = presenter_snapshot.blocked_on {
+                tracing::trace!(
+                    blocked_on,
+                    queued = presenter_snapshot.queued,
+                    queue_capacity = presenter_snapshot.queue_capacity,
+                    rendering = presenter_snapshot.rendering,
+                    ready = presenter_snapshot.ready,
+                    pending_render_requests = presenter_snapshot.pending_render_requests,
+                    last_render_ms = presenter_snapshot.last_render_ms,
+                    average_render_ms = presenter_snapshot.average_render_ms,
+                    dropped_frames = presenter_snapshot.dropped_frames,
+                    "video presenter output snapshot"
+                );
+            }
 
             match render_result {
                 Ok(Some(frame)) => {

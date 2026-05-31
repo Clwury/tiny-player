@@ -3,7 +3,7 @@ use super::super::{
         BackendControl, BackendEvent, BackendLoadRequest, FfmpegBackend, PlaybackCacheConfig,
         PlaybackCacheState, Result,
     },
-    render_host::FrameSlot,
+    render_host::VideoOutputQueue,
     tracks::PlaybackTrack,
 };
 
@@ -82,9 +82,9 @@ impl BackendControl for PlaybackBackend {
         }
     }
 
-    fn frame_slot(&self) -> FrameSlot {
+    fn video_output_queue(&self) -> VideoOutputQueue {
         match self {
-            Self::Ffmpeg(backend) => backend.frame_slot(),
+            Self::Ffmpeg(backend) => backend.video_output_queue(),
         }
     }
 }

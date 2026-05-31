@@ -1,0 +1,252 @@
+use super::playback_snapshot::PlaybackPipelineTelemetry;
+use super::playback_wait_service::{PlaybackPipelineWaitContext, PlaybackPipelineWaitService};
+use super::video_output_gate::{
+    service_audio_clocked_video_queue_if_playing, service_decode_backpressure_step,
+    service_video_clocked_video_queue_if_no_audio,
+};
+use super::*;
+
+#[derive(Default)]
+pub(super) struct OutputQueueService;
+
+impl OutputQueueService {
+    pub(super) fn before_decoder_input(
+        &mut self,
+        context: OutputQueueServiceContext<'_>,
+    ) -> std::result::Result<OutputQueueServiceStatus, String> {
+        service_output_queues_before_decoder_input(context)
+    }
+
+    pub(super) fn after_decoder_input(
+        &mut self,
+        context: OutputQueueAfterDecoderInputContext<'_>,
+    ) -> std::result::Result<(), String> {
+        service_output_queues_after_decoder_input(context)
+    }
+
+    pub(super) fn after_decoder_input_backpressure_or_wait(
+        &mut self,
+        context: OutputQueueServiceContext<'_>,
+    ) -> std::result::Result<OutputQueueServiceStatus, String> {
+        service_output_queues_after_decoder_input_backpressure_or_wait(context)
+    }
+
+    pub(super) fn after_demux_would_block_or_wait(
+        &mut self,
+        context: OutputQueueServiceContext<'_>,
+    ) -> std::result::Result<OutputQueueServiceStatus, String> {
+        service_output_queues_after_demux_would_block_or_wait(context)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OutputQueueServiceStatus {
+    Idle,
+    Continue,
+}
+
+impl OutputQueueServiceStatus {
+    pub(super) fn should_continue(self) -> bool {
+        matches!(self, Self::Continue)
+    }
+}
+
+pub(super) struct OutputQueueServiceContext<'a> {
+    pub(super) session_id: PlaybackSessionId,
+    pub(super) demux_cache: &'a DemuxPacketCache,
+    pub(super) pipeline: &'a mut PlaybackPipelineState,
+    pub(super) control: &'a FfmpegControl,
+    pub(super) event_tx: &'a Sender<BackendEvent>,
+    pub(super) vo_queue: &'a VideoOutputQueue,
+    pub(super) frame_presented: &'a AtomicBool,
+    pub(super) playback_wait: &'a PlaybackPipelineWaitService,
+    pub(super) playback_telemetry: &'a mut PlaybackPipelineTelemetry,
+}
+
+pub(super) struct OutputQueueAfterDecoderInputContext<'a> {
+    pub(super) session_id: PlaybackSessionId,
+    pub(super) pipeline: &'a mut PlaybackPipelineState,
+    pub(super) control: &'a FfmpegControl,
+    pub(super) event_tx: &'a Sender<BackendEvent>,
+    pub(super) vo_queue: &'a VideoOutputQueue,
+    pub(super) frame_presented: &'a AtomicBool,
+}
+
+fn service_output_queues_before_decoder_input(
+    mut context: OutputQueueServiceContext<'_>,
+) -> std::result::Result<OutputQueueServiceStatus, String> {
+    service_audio_clocked_video_queue_if_playing(
+        context.pipeline.audio_output.as_ref(),
+        context.control,
+        &mut context.pipeline.output_scheduler,
+        context.session_id,
+        context.vo_queue,
+        context.frame_presented,
+        &mut context.pipeline.position_reporter,
+        context.event_tx,
+        &mut context.pipeline.subtitle_pipeline,
+    )?;
+
+    if service_video_clocked_video_queue_if_no_audio(
+        &context.pipeline.scheduler,
+        context.control,
+        &mut context.pipeline.output_scheduler,
+        context.pipeline.audio_output.is_some(),
+        context.session_id,
+        context.vo_queue,
+        context.frame_presented,
+        &mut context.pipeline.position_reporter,
+        context.event_tx,
+        &mut context.pipeline.subtitle_pipeline,
+        &mut context.pipeline.buffered_reporter,
+    ) {
+        if context.control.has_pending_seek() {
+            return Ok(OutputQueueServiceStatus::Continue);
+        }
+        if context
+            .pipeline
+            .output_scheduler
+            .scheduled_video_queue_limit_reached(
+                context.pipeline.subtitle_pipeline.needs_prefetch(),
+            )
+        {
+            wait_after_output_queue_stall(&mut context, "scheduled_video_queue_limit");
+            return Ok(OutputQueueServiceStatus::Continue);
+        }
+    }
+
+    Ok(OutputQueueServiceStatus::Idle)
+}
+
+fn service_output_queues_after_decoder_input(
+    context: OutputQueueAfterDecoderInputContext<'_>,
+) -> std::result::Result<(), String> {
+    service_audio_clocked_video_queue_if_playing(
+        context.pipeline.audio_output.as_ref(),
+        context.control,
+        &mut context.pipeline.output_scheduler,
+        context.session_id,
+        context.vo_queue,
+        context.frame_presented,
+        &mut context.pipeline.position_reporter,
+        context.event_tx,
+        &mut context.pipeline.subtitle_pipeline,
+    )?;
+    Ok(())
+}
+
+fn service_output_queues_after_decoder_input_backpressure_or_wait(
+    mut context: OutputQueueServiceContext<'_>,
+) -> std::result::Result<OutputQueueServiceStatus, String> {
+    observe_output_queue_stall(&mut context, "demux_decoder_backpressure");
+    let made_progress = service_decode_backpressure_step(
+        &context.pipeline.scheduler,
+        context.pipeline.audio_output.as_ref(),
+        context.control,
+        &mut context.pipeline.output_scheduler,
+        context.session_id,
+        context.vo_queue,
+        context.frame_presented,
+        &mut context.pipeline.position_reporter,
+        context.event_tx,
+        &mut context.pipeline.subtitle_pipeline,
+        &mut context.pipeline.buffered_reporter,
+    )?;
+    if !made_progress {
+        wait_after_output_queue_stall(&mut context, "demux_decoder_backpressure_wait");
+    }
+    Ok(OutputQueueServiceStatus::Continue)
+}
+
+fn service_output_queues_after_demux_would_block_or_wait(
+    mut context: OutputQueueServiceContext<'_>,
+) -> std::result::Result<OutputQueueServiceStatus, String> {
+    observe_output_queue_stall(&mut context, "demux_would_block");
+    if !service_output_queues_after_demux_would_block(&mut context)? {
+        wait_after_output_queue_stall(&mut context, "demux_would_block_wait");
+    }
+    Ok(OutputQueueServiceStatus::Continue)
+}
+
+fn service_output_queues_after_demux_would_block(
+    context: &mut OutputQueueServiceContext<'_>,
+) -> std::result::Result<bool, String> {
+    let audio_progressed = service_audio_clocked_video_queue_if_playing(
+        context.pipeline.audio_output.as_ref(),
+        context.control,
+        &mut context.pipeline.output_scheduler,
+        context.session_id,
+        context.vo_queue,
+        context.frame_presented,
+        &mut context.pipeline.position_reporter,
+        context.event_tx,
+        &mut context.pipeline.subtitle_pipeline,
+    )?;
+    let video_progressed = service_video_clocked_video_queue_if_no_audio(
+        &context.pipeline.scheduler,
+        context.control,
+        &mut context.pipeline.output_scheduler,
+        context.pipeline.audio_output.is_some(),
+        context.session_id,
+        context.vo_queue,
+        context.frame_presented,
+        &mut context.pipeline.position_reporter,
+        context.event_tx,
+        &mut context.pipeline.subtitle_pipeline,
+        &mut context.pipeline.buffered_reporter,
+    );
+    Ok(audio_progressed || video_progressed)
+}
+
+fn observe_output_queue_stall(
+    context: &mut OutputQueueServiceContext<'_>,
+    stall_reason: &'static str,
+) {
+    context.playback_wait.observe_stall(
+        PlaybackPipelineWaitContext {
+            session_id: context.session_id,
+            demux_cache: context.demux_cache,
+            video_decode_pipeline: &context.pipeline.video_decode_pipeline,
+            video_frame_prepare_worker: Some(&context.pipeline.video_frame_prepare_worker),
+            audio_decode_pipeline: context.pipeline.audio_decode_pipeline.as_ref(),
+            subtitle_pipeline: &context.pipeline.subtitle_pipeline,
+            output_scheduler: &context.pipeline.output_scheduler,
+            audio_output: context.pipeline.audio_output.as_ref(),
+            vo_queue: context.vo_queue,
+            playback_telemetry: &mut *context.playback_telemetry,
+        },
+        stall_reason,
+    );
+}
+
+fn wait_after_output_queue_stall(
+    context: &mut OutputQueueServiceContext<'_>,
+    stall_reason: &'static str,
+) {
+    context.playback_wait.wait_after_stall(
+        PlaybackPipelineWaitContext {
+            session_id: context.session_id,
+            demux_cache: context.demux_cache,
+            video_decode_pipeline: &context.pipeline.video_decode_pipeline,
+            video_frame_prepare_worker: Some(&context.pipeline.video_frame_prepare_worker),
+            audio_decode_pipeline: context.pipeline.audio_decode_pipeline.as_ref(),
+            subtitle_pipeline: &context.pipeline.subtitle_pipeline,
+            output_scheduler: &context.pipeline.output_scheduler,
+            audio_output: context.pipeline.audio_output.as_ref(),
+            vo_queue: context.vo_queue,
+            playback_telemetry: &mut *context.playback_telemetry,
+        },
+        stall_reason,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_queue_service_status_reports_continue() {
+        assert!(OutputQueueServiceStatus::Continue.should_continue());
+        assert!(!OutputQueueServiceStatus::Idle.should_continue());
+    }
+}

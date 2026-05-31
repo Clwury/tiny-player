@@ -11,8 +11,6 @@ pub(super) fn reset_playback_timeline_state(
     audio_clock: &mut TimestampMapper,
     scheduler: &mut PlaybackScheduler,
     audio_output: Option<&AudioOutput>,
-    queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
-    first_video_frame_pending: &mut bool,
     dovi_pipeline: &mut DoviPipeline,
 ) {
     *video_clock = TimestampMapper::new(
@@ -30,7 +28,5 @@ pub(super) fn reset_playback_timeline_state(
     if let Some(output) = audio_output {
         output.reset_clock(current_start_position_nsecs);
     }
-    queued_video_frames.clear();
-    *first_video_frame_pending = true;
     dovi_pipeline.reset();
 }

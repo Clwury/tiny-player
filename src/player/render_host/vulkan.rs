@@ -118,6 +118,10 @@ impl FfmpegFrameRef {
     pub fn as_ptr(&self) -> *const ffmpeg_ffi::AVFrame {
         self.ptr
     }
+
+    pub fn as_mut_ptr(&self) -> *mut ffmpeg_ffi::AVFrame {
+        self.ptr
+    }
 }
 
 impl Clone for FfmpegFrameRef {

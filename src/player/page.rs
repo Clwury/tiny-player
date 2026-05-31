@@ -14,7 +14,7 @@ use super::{
     backend::{
         BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest,
         BackendSubtitleBitmap, BackendSubtitleCue, FfmpegBackend, PlaybackCacheState,
-        PlaybackVideoInfo,
+        PlaybackVideoInfo, StreamCacheKind,
     },
     render_host::RenderSize,
     tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection},
@@ -82,28 +82,30 @@ impl PlaybackPage {
         let status_message = "正在加载视频…".into();
 
         let (backend, video_presenter) = match FfmpegBackend::new() {
-            Ok(mut backend) => match VideoPresenter::new(BackendControl::frame_slot(&backend)) {
-                Ok(video_presenter) => {
-                    let load_request = BackendLoadRequest {
-                        url: request.url.clone(),
-                        http_headers: request.http_headers.clone(),
-                        content_length: request.content_length,
-                        selected_tracks: request.selected_tracks.clone(),
-                        cache_config: Default::default(),
-                    };
-                    if let Err(error) = backend.command(BackendCommand::Load(load_request)) {
-                        error_message = Some(format!("加载视频失败：{error}").into());
+            Ok(mut backend) => {
+                match VideoPresenter::new(BackendControl::video_output_queue(&backend)) {
+                    Ok(video_presenter) => {
+                        let load_request = BackendLoadRequest {
+                            url: request.url.clone(),
+                            http_headers: request.http_headers.clone(),
+                            content_length: request.content_length,
+                            selected_tracks: request.selected_tracks.clone(),
+                            cache_config: Default::default(),
+                        };
+                        if let Err(error) = backend.command(BackendCommand::Load(load_request)) {
+                            error_message = Some(format!("加载视频失败：{error}").into());
+                        }
+                        (
+                            Some(PlaybackBackend::Ffmpeg(backend)),
+                            Some(video_presenter),
+                        )
                     }
-                    (
-                        Some(PlaybackBackend::Ffmpeg(backend)),
-                        Some(video_presenter),
-                    )
+                    Err(error) => {
+                        error_message = Some(format!("创建视频渲染器失败：{error}").into());
+                        (Some(PlaybackBackend::Ffmpeg(backend)), None)
+                    }
                 }
-                Err(error) => {
-                    error_message = Some(format!("创建视频渲染器失败：{error}").into());
-                    (Some(PlaybackBackend::Ffmpeg(backend)), None)
-                }
-            },
+            }
             Err(error) => {
                 error_message = Some(format!("创建 FFmpeg 播放后端失败：{error}").into());
                 (None, None)

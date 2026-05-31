@@ -22,6 +22,7 @@ pub(in crate::player::backend::ffmpeg) struct HttpRingCacheState {
     buffer: ByteRingBuffer,
     pub(in crate::player::backend::ffmpeg) base_offset: u64,
     pub(in crate::player::backend::ffmpeg) next_offset: u64,
+    active_request_start_offset: u64,
     retained_ranges: VecDeque<RetainedCacheRange>,
     disk_cache: Option<HttpDiskCache>,
     disk_cache_writable: bool,
@@ -1035,6 +1036,7 @@ impl HttpRingCacheState {
             buffer: ByteRingBuffer::new(config.memory_capacity),
             base_offset: start_offset,
             next_offset: start_offset,
+            active_request_start_offset: start_offset,
             retained_ranges: VecDeque::new(),
             disk_cache,
             disk_cache_writable,
@@ -1135,6 +1137,7 @@ impl HttpRingCacheState {
         self.buffer.clear();
         self.base_offset = offset;
         self.next_offset = offset;
+        self.active_request_start_offset = offset;
         self.active_range_kind = range_kind;
         self.pending_seek_range_kind = None;
         self.reader_offset = offset;
@@ -1360,6 +1363,7 @@ impl HttpRingCacheState {
         }
         self.buffer.append(data);
         self.next_offset = offset.saturating_add(data.len() as u64);
+        self.maybe_queue_playback_continuation();
         self.trim_to_capacity(self.config.memory_capacity);
         self.trim_retained_ranges_to_capacity(
             self.config
@@ -1367,6 +1371,107 @@ impl HttpRingCacheState {
                 .saturating_sub(self.buffer.len()),
         );
         true
+    }
+
+    fn maybe_queue_playback_continuation(&mut self) {
+        if self.active_range_kind != HttpCacheRangeKind::Playback
+            || self.config.range_request_bytes == 0
+        {
+            return;
+        }
+        let continuation_offset = self
+            .active_request_start_offset
+            .saturating_add(self.config.range_request_bytes);
+        if self
+            .content_len
+            .is_some_and(|content_len| continuation_offset >= content_len)
+        {
+            return;
+        }
+        if self.next_offset < self.playback_continuation_prefetch_offset(continuation_offset) {
+            return;
+        }
+        if self.request_side_download_at(continuation_offset, HttpCacheRangeKind::Playback) {
+            tracing::debug!(
+                continuation_offset,
+                active_request_start_offset = self.active_request_start_offset,
+                active_next_offset = self.next_offset,
+                range_request_bytes = self.config.range_request_bytes,
+                "queued proactive HTTP playback continuation range"
+            );
+        }
+    }
+
+    fn playback_continuation_prefetch_offset(&self, continuation_offset: u64) -> u64 {
+        let trigger_bytes = self
+            .config
+            .range_request_bytes
+            .saturating_mul(HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR)
+            / HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR.max(1);
+        self.active_request_start_offset
+            .saturating_add(trigger_bytes.max(1))
+            .min(continuation_offset)
+    }
+
+    fn splice_retained_playback_at_active_end(&mut self, offset: u64) -> Option<u64> {
+        if self.active_range_kind != HttpCacheRangeKind::Playback || offset != self.next_offset {
+            return None;
+        }
+        let range_index = self.retained_ranges.iter().position(|range| {
+            range.range_kind == HttpCacheRangeKind::Playback
+                && offset >= range.base_offset
+                && offset < range.next_offset
+        })?;
+        let range = self.retained_ranges.get(range_index)?;
+        let copy_offset = usize::try_from(offset.saturating_sub(range.base_offset)).ok()?;
+        let copy_len = usize::try_from(range.next_offset.saturating_sub(offset)).ok()?;
+        if copy_len == 0 {
+            return None;
+        }
+
+        let max_capacity = self.buffer.max_capacity();
+        if copy_len > max_capacity {
+            return None;
+        }
+        self.trim_to_capacity(max_capacity.saturating_sub(copy_len));
+        if self.buffer.len().saturating_add(copy_len) > max_capacity {
+            return None;
+        }
+
+        let mut data = vec![0; copy_len];
+        let copied = self
+            .retained_ranges
+            .get(range_index)?
+            .buffer
+            .copy_at(copy_offset, &mut data);
+        if copied == 0 {
+            return None;
+        }
+        data.truncate(copied);
+        let next_offset = offset.saturating_add(copied as u64);
+        self.buffer.append(&data);
+        self.next_offset = next_offset;
+        self.active_request_start_offset = offset;
+        if self
+            .retained_ranges
+            .get(range_index)
+            .is_some_and(|range| offset <= range.base_offset && next_offset >= range.next_offset)
+        {
+            self.retained_ranges.remove(range_index);
+        }
+        self.maybe_queue_playback_continuation();
+        self.trim_retained_ranges_to_capacity(
+            self.config
+                .memory_capacity
+                .saturating_sub(self.buffer.len()),
+        );
+        tracing::debug!(
+            offset,
+            next_offset,
+            copied,
+            "spliced proactive HTTP playback range into active stream cache"
+        );
+        Some(next_offset)
     }
 
     pub(in crate::player::backend::ffmpeg) fn append_retained_at(
@@ -2155,6 +2260,10 @@ impl HttpRingCacheShared {
                 self.ready.notify_all();
                 return CacheAppendPermit::Restart(request.offset);
             }
+            if let Some(next_offset) = guard.splice_retained_playback_at_active_end(offset) {
+                self.ready.notify_all();
+                return CacheAppendPermit::Restart(next_offset);
+            }
             let capacity = guard.append_capacity_from(offset);
             if capacity > 0 {
                 return CacheAppendPermit::Ready(capacity);
@@ -2223,6 +2332,10 @@ impl HttpRingCacheShared {
                 guard.restart_at_with_kind(request.offset, request.range_kind);
                 self.ready.notify_all();
                 return CacheAppendPermit::Restart(request.offset);
+            }
+            if let Some(next_offset) = guard.splice_retained_playback_at_active_end(offset) {
+                self.ready.notify_all();
+                return CacheAppendPermit::Restart(next_offset);
             }
             let capacity = guard.append_capacity_from(offset);
             let status = (capacity == 0)
@@ -2432,6 +2545,33 @@ mod tests {
             }]
         );
         assert!(state.side_download_may_produce(500));
+    }
+
+    #[test]
+    fn http_cache_state_proactively_queues_next_playback_range() {
+        let config = HttpCacheConfig {
+            range_request_bytes: 100,
+            ..HttpCacheConfig::for_test(1_000)
+        };
+        let mut state =
+            HttpRingCacheState::new_with_config(0, config).with_content_len_hint(Some(1_000));
+
+        assert!(state.append_at(0, &[0; 49]));
+        assert!(state.side_download_requests.is_empty());
+
+        assert!(state.append_at(49, &[0; 1]));
+
+        assert_eq!(
+            state
+                .side_download_requests
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![CacheRestartRequest {
+                offset: 100,
+                range_kind: HttpCacheRangeKind::Playback,
+            }]
+        );
     }
 
     #[test]
@@ -2677,6 +2817,27 @@ mod tests {
 
         assert!(state.side_download_active.is_empty());
         assert!(state.restart_request.is_none());
+    }
+
+    #[test]
+    fn http_cache_state_splices_proactive_playback_range_at_active_end() {
+        let config = HttpCacheConfig {
+            range_request_bytes: 6,
+            ..HttpCacheConfig::for_test(64)
+        };
+        let mut state =
+            HttpRingCacheState::new_with_config(0, config).with_content_len_hint(Some(64));
+        assert!(state.append_at(0, b"abcdef"));
+        assert!(state.append_retained_at(6, b"ghijkl", HttpCacheRangeKind::Playback));
+
+        assert_eq!(state.splice_retained_playback_at_active_end(6), Some(12));
+
+        let mut output = [0; 12];
+        assert_eq!(state.copy_available(0, &mut output), Some(12));
+        assert_eq!(&output, b"abcdefghijkl");
+        assert_eq!(state.next_offset, 12);
+        assert_eq!(state.active_request_start_offset, 6);
+        assert!(state.retained_ranges.is_empty());
     }
 
     #[test]

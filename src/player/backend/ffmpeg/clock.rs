@@ -1,83 +1,16 @@
 use super::*;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WaitStatus {
     Ready,
     Interrupted,
 }
 
-impl WaitStatus {
-    pub(super) fn interrupted(self) -> bool {
-        matches!(self, Self::Interrupted)
-    }
-}
-
 pub(super) struct QueuedVideoFrame {
     pub(super) frame: DecodedFrame,
     pub(super) timeline_nsecs: u64,
     pub(super) duration_nsecs: u64,
-}
-
-pub(super) fn present_due_audio_clocked_video_frames(
-    queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
-    audio_output: &AudioOutput,
-    session_id: PlaybackSessionId,
-    frame_slot: &FrameSlot,
-    frame_presented: &AtomicBool,
-    position_reporter: &mut PositionReporter,
-    event_tx: &Sender<BackendEvent>,
-) -> u64 {
-    let played_until = audio_output.played_timeline_nsecs();
-    if let Some(frame) = pop_audio_clocked_video_frame(queued_video_frames, played_until) {
-        present_decoded_video_frame(
-            frame.frame,
-            session_id,
-            frame.timeline_nsecs,
-            frame_slot,
-            frame_presented,
-            position_reporter,
-            event_tx,
-        );
-    }
-    played_until
-}
-
-pub(super) fn pop_audio_clocked_video_frame(
-    queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
-    played_until_nsecs: u64,
-) -> Option<QueuedVideoFrame> {
-    let mut due_frame = None;
-    while queued_video_frames
-        .front()
-        .is_some_and(|frame| frame.timeline_nsecs <= played_until_nsecs)
-    {
-        due_frame = Some(
-            queued_video_frames
-                .pop_front()
-                .expect("queued video frame checked above"),
-        );
-    }
-    if due_frame.is_none()
-        && queued_video_frame_ready_for_audio_clock(queued_video_frames, played_until_nsecs)
-    {
-        due_frame = queued_video_frames.pop_front();
-    }
-    due_frame
-}
-
-pub(super) fn queued_video_frame_ready_for_audio_clock(
-    queued_video_frames: &VecDeque<QueuedVideoFrame>,
-    played_until_nsecs: u64,
-) -> bool {
-    let Some(frame) = queued_video_frames.front() else {
-        return false;
-    };
-    frame.timeline_nsecs
-        <= played_until_nsecs.saturating_add(audio_clock_video_present_lead_nsecs(frame))
-}
-
-fn audio_clock_video_present_lead_nsecs(frame: &QueuedVideoFrame) -> u64 {
-    duration_nsecs(AUDIO_CLOCK_VIDEO_PRESENT_LEAD).min(frame.duration_nsecs)
 }
 
 pub(super) fn queued_video_duration(queued_video_frames: &VecDeque<QueuedVideoFrame>) -> Duration {
@@ -93,10 +26,10 @@ pub(super) fn queued_video_limit_duration(
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
     needs_subtitle_prefetch: bool,
 ) -> Duration {
-    if needs_subtitle_prefetch {
-        PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION
-    } else if queued_video_frames_have_vulkan(queued_video_frames) {
+    if queued_video_frames_have_vulkan(queued_video_frames) {
         VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION
+    } else if needs_subtitle_prefetch {
+        PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION
     } else {
         AUDIO_VIDEO_QUEUE_LIMIT_DURATION
     }
@@ -106,44 +39,64 @@ pub(super) fn queued_video_target_duration(
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
     needs_subtitle_prefetch: bool,
 ) -> Duration {
-    if needs_subtitle_prefetch {
-        PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION
-    } else if queued_video_frames_have_vulkan(queued_video_frames) {
+    if queued_video_frames_have_vulkan(queued_video_frames) {
         VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION
+    } else if needs_subtitle_prefetch {
+        PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION
     } else {
         AUDIO_VIDEO_QUEUE_TARGET_DURATION
     }
 }
 
-fn queued_video_frames_have_vulkan(queued_video_frames: &VecDeque<QueuedVideoFrame>) -> bool {
+pub(super) fn queued_video_limit_frames(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    _needs_subtitle_prefetch: bool,
+) -> usize {
+    if queued_video_frames_have_vulkan(queued_video_frames) {
+        return VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES;
+    }
+    DECODED_VIDEO_QUEUE_LIMIT_FRAMES
+}
+
+pub(super) fn queued_video_target_frames(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    _needs_subtitle_prefetch: bool,
+) -> usize {
+    if queued_video_frames_have_vulkan(queued_video_frames) {
+        return VULKAN_DECODED_VIDEO_QUEUE_TARGET_FRAMES;
+    }
+    DECODED_VIDEO_QUEUE_TARGET_FRAMES
+}
+
+pub(super) fn queued_video_limit_reached(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    needs_subtitle_prefetch: bool,
+) -> bool {
+    !queued_video_frames.is_empty()
+        && (queued_video_duration(queued_video_frames)
+            >= queued_video_limit_duration(queued_video_frames, needs_subtitle_prefetch)
+            || queued_video_frames.len()
+                >= queued_video_limit_frames(queued_video_frames, needs_subtitle_prefetch))
+}
+
+#[cfg(test)]
+pub(super) fn queued_video_target_reached(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    needs_subtitle_prefetch: bool,
+) -> bool {
+    !queued_video_frames.is_empty()
+        && (queued_video_duration(queued_video_frames)
+            >= queued_video_target_duration(queued_video_frames, needs_subtitle_prefetch)
+            || queued_video_frames.len()
+                >= queued_video_target_frames(queued_video_frames, needs_subtitle_prefetch))
+}
+
+pub(super) fn queued_video_frames_have_vulkan(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+) -> bool {
     queued_video_frames
         .iter()
         .any(|frame| matches!(&frame.frame.pixels, FramePixels::VulkanVideo(_)))
-}
-
-pub(super) fn should_drop_late_video_frame(
-    frame_timeline_nsecs: u64,
-    frame_duration_nsecs: u64,
-    played_until_nsecs: u64,
-) -> bool {
-    let late_cutoff = frame_timeline_nsecs
-        .saturating_add(frame_duration_nsecs)
-        .saturating_add(duration_nsecs(LATE_VIDEO_DROP_TOLERANCE));
-    late_cutoff <= played_until_nsecs
-}
-
-pub(super) fn should_drop_late_queued_video_frame(
-    frame_timeline_nsecs: u64,
-    frame_duration_nsecs: u64,
-    played_until_nsecs: u64,
-    queued_video_frames: &VecDeque<QueuedVideoFrame>,
-) -> bool {
-    !queued_video_frames.is_empty()
-        && should_drop_late_video_frame(
-            frame_timeline_nsecs,
-            frame_duration_nsecs,
-            played_until_nsecs,
-        )
 }
 
 pub(super) fn frame_decode_error_flags(frame: *mut ffi::AVFrame) -> c_int {
@@ -164,148 +117,6 @@ pub(super) fn frame_is_corrupt(frame: *mut ffi::AVFrame) -> bool {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn wait_for_audio_clocked_video_queue<F>(
-    queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
-    audio_output: &AudioOutput,
-    control: &FfmpegControl,
-    session_id: PlaybackSessionId,
-    frame_slot: &FrameSlot,
-    frame_presented: &AtomicBool,
-    position_reporter: &mut PositionReporter,
-    event_tx: &Sender<BackendEvent>,
-    target_duration: Duration,
-    mut on_audio_progress: F,
-) -> std::result::Result<(), String>
-where
-    F: FnMut(u64),
-{
-    let mut wait_started_at = None;
-    let mut next_stall_log_at = None;
-    while queued_video_duration(queued_video_frames) >= target_duration
-        && !control.should_interrupt()
-    {
-        let played_until = present_due_audio_clocked_video_frames(
-            queued_video_frames,
-            audio_output,
-            session_id,
-            frame_slot,
-            frame_presented,
-            position_reporter,
-            event_tx,
-        );
-        on_audio_progress(played_until);
-        let queue_duration = queued_video_duration(queued_video_frames);
-        let pending_audio = audio_output.pending_duration()?;
-        if queue_duration < target_duration || pending_audio == Duration::ZERO {
-            break;
-        }
-        let now = Instant::now();
-        let wait_started = *wait_started_at.get_or_insert(now);
-        if next_stall_log_at.is_none() {
-            next_stall_log_at = now.checked_add(DEMUX_PACKET_CACHE_STALL_LOG_AFTER);
-        } else if next_stall_log_at.is_some_and(|deadline| now >= deadline) {
-            let backpressure = frame_slot.render_backpressure();
-            tracing::debug!(
-                session_id = ?session_id,
-                waited_ms = now.saturating_duration_since(wait_started).as_millis(),
-                queued_frames = queued_video_frames.len(),
-                queue_duration_ms = queue_duration.as_secs_f64() * 1000.0,
-                target_duration_ms = target_duration.as_secs_f64() * 1000.0,
-                pending_audio_ms = pending_audio.as_secs_f64() * 1000.0,
-                played_until_nsecs = played_until,
-                first_queued_nsecs = queued_video_frames.front().map(|frame| frame.timeline_nsecs),
-                last_queued_nsecs = queued_video_frames.back().map(|frame| frame.timeline_nsecs),
-                render_backlogged = backpressure.is_backlogged(),
-                pending_render_requests = backpressure.pending_requests,
-                render_last_ms = backpressure.last_render_nsecs as f64 / 1_000_000.0,
-                render_avg_ms = backpressure.average_render_nsecs as f64 / 1_000_000.0,
-                "waiting for audio clocked FFmpeg video queue to drain"
-            );
-            next_stall_log_at = now.checked_add(DEMUX_PACKET_CACHE_STALL_LOG_AFTER);
-        }
-        audio_output.wait_for_progress(control)?;
-        on_audio_progress(audio_output.played_timeline_nsecs());
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn drain_audio_clocked_video_queue<F>(
-    queued_video_frames: &mut VecDeque<QueuedVideoFrame>,
-    audio_output: &AudioOutput,
-    control: &FfmpegControl,
-    session_id: PlaybackSessionId,
-    frame_slot: &FrameSlot,
-    frame_presented: &AtomicBool,
-    position_reporter: &mut PositionReporter,
-    event_tx: &Sender<BackendEvent>,
-    mut on_audio_progress: F,
-) -> std::result::Result<(), String>
-where
-    F: FnMut(u64),
-{
-    while !queued_video_frames.is_empty() && !control.should_interrupt() {
-        let played_until = present_due_audio_clocked_video_frames(
-            queued_video_frames,
-            audio_output,
-            session_id,
-            frame_slot,
-            frame_presented,
-            position_reporter,
-            event_tx,
-        );
-        on_audio_progress(played_until);
-        if queued_video_frames.is_empty() || audio_output.pending_duration()? == Duration::ZERO {
-            break;
-        }
-        audio_output.wait_for_progress(control)?;
-        on_audio_progress(audio_output.played_timeline_nsecs());
-    }
-    Ok(())
-}
-
-pub(super) fn present_decoded_video_frame(
-    frame: DecodedFrame,
-    session_id: PlaybackSessionId,
-    timeline_nsecs: u64,
-    frame_slot: &FrameSlot,
-    frame_presented: &AtomicBool,
-    position_reporter: &mut PositionReporter,
-    event_tx: &Sender<BackendEvent>,
-) {
-    let backpressure = frame_slot.render_backpressure();
-    if !frame.key_frame && backpressure.should_drop_non_key_frame() {
-        tracing::debug!(
-            pts = timeline_nsecs,
-            pending_render_requests = backpressure.pending_requests,
-            render_avg_ms = backpressure.average_render_nsecs as f64 / 1_000_000.0,
-            render_last_ms = backpressure.last_render_nsecs as f64 / 1_000_000.0,
-            "dropped non-key video frame because rendering is backlogged"
-        );
-        return;
-    }
-
-    if !frame_slot.push(session_id, frame) {
-        tracing::debug!(
-            session_id = ?session_id,
-            pts = timeline_nsecs,
-            "dropped FFmpeg video frame for inactive playback session"
-        );
-        return;
-    }
-    let count = FFMPEG_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if count == 1 || count.is_multiple_of(60) {
-        tracing::debug!(
-            frame_count = count,
-            pts = timeline_nsecs,
-            "presented FFmpeg video frame"
-        );
-    }
-    frame_presented.store(true, Ordering::Relaxed);
-    position_reporter.report(timeline_nsecs, session_id, event_tx);
-}
-
 pub(super) struct PlaybackScheduler {
     start_instant: Instant,
     start_position_nsecs: u64,
@@ -324,6 +135,23 @@ impl PlaybackScheduler {
         self.start_position_nsecs = start_position_nsecs;
     }
 
+    pub(super) fn delay_by(&mut self, duration: Duration) {
+        self.start_instant = self
+            .start_instant
+            .checked_add(duration)
+            .unwrap_or(self.start_instant);
+    }
+
+    pub(super) fn ready_for(&self, timeline_nsecs: u64) -> bool {
+        let target_offset = timeline_nsecs.saturating_sub(self.start_position_nsecs);
+        let target = self
+            .start_instant
+            .checked_add(Duration::from_nanos(target_offset))
+            .unwrap_or(self.start_instant);
+        Instant::now() >= target
+    }
+
+    #[cfg(test)]
     pub(super) fn wait_until(
         &mut self,
         timeline_nsecs: u64,

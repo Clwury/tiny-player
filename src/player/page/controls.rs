@@ -1106,6 +1106,28 @@ pub(super) fn cache_status_segments(cache_state: Option<&PlaybackCacheState>) ->
     {
         segments.push(format!("Demux {:.1}s", duration.max(0.0)));
     }
+    for stream in &cache_state.demux.streams {
+        let Some(duration) = stream
+            .cache_duration
+            .filter(|duration| duration.is_finite())
+        else {
+            continue;
+        };
+        let label = match stream.kind {
+            StreamCacheKind::Video => "V",
+            StreamCacheKind::Audio => "A",
+            StreamCacheKind::Subtitle => "S",
+            StreamCacheKind::Unknown => "?",
+        };
+        let status = if stream.underrun {
+            " 断供"
+        } else if stream.idle {
+            " 空闲"
+        } else {
+            ""
+        };
+        segments.push(format!("{label} {:.1}s{status}", duration.max(0.0)));
+    }
     if let Some(byte_cache) = cache_state.byte.as_ref()
         && byte_cache.cached_bytes > 0
     {
@@ -1189,7 +1211,10 @@ pub(super) fn valid_frame_rate(frame_rate: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use crate::player::{
-        backend::{ByteCacheState, DemuxCacheState, PlaybackCacheState, PlaybackVideoInfo},
+        backend::{
+            ByteCacheState, DemuxCacheState, PlaybackCacheState, PlaybackVideoInfo,
+            StreamCacheState,
+        },
         page::state::user_pause_from_effective_pause_event,
         render_host::RenderSize,
     };
@@ -1255,6 +1280,24 @@ mod tests {
                 cached_seeks: 1,
                 low_level_seeks: 2,
                 byte_level_seeks: 3,
+                streams: vec![
+                    StreamCacheState {
+                        kind: StreamCacheKind::Video,
+                        cache_end: Some(3.0),
+                        reader_pts: Some(1.0),
+                        cache_duration: Some(2.0),
+                        underrun: false,
+                        idle: true,
+                    },
+                    StreamCacheState {
+                        kind: StreamCacheKind::Audio,
+                        cache_end: Some(2.5),
+                        reader_pts: Some(1.0),
+                        cache_duration: Some(1.5),
+                        underrun: true,
+                        idle: false,
+                    },
+                ],
                 ..DemuxCacheState::default()
             },
             byte: Some(ByteCacheState {
@@ -1277,6 +1320,8 @@ mod tests {
             vec![
                 "速率 1.5 KiB/s".to_string(),
                 "Demux 2.2s".to_string(),
+                "V 2.0s 空闲".to_string(),
+                "A 1.5s 断供".to_string(),
                 "Byte 8.0 KiB".to_string(),
                 "磁盘 4.0 MiB".to_string(),
                 "状态 空闲".to_string(),

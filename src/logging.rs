@@ -8,7 +8,7 @@ use std::{
 
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-const DEFAULT_FILTER: &str = "tiny=debug,reqwest=debug,hyper=info";
+const DEFAULT_FILTER: &str = "tiny=info,reqwest=warn,hyper=warn,hyper_util=warn";
 const LOG_FILE_ENV: &str = "TINY_LOG_FILE";
 
 pub(crate) fn init() {

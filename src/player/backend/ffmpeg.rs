@@ -40,10 +40,10 @@ use crate::player::{
     ffmpeg_dovi::FfmpegDoviMetadata,
     render_host::{
         DecodedFrame, FfmpegAvBufferRef, FfmpegFrameRef, FrameBufferPool, FrameColor,
-        FrameDynamicMetadata, FramePixels, FramePts, FrameSlot, PlaybackSessionId, PooledBytes,
+        FrameDynamicMetadata, FramePixels, FramePts, PlaybackSessionId, PooledBytes,
         RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlane, RawVideoPlanes,
-        RawVideoRange, RenderSize, VulkanDecodeDevice, VulkanDecodeQueue, VulkanDecodeQueues,
-        VulkanVideoFrame, VulkanVideoPlane, render_image_from_bgra,
+        RawVideoRange, RenderSize, VideoOutputQueue, VulkanDecodeDevice, VulkanDecodeQueue,
+        VulkanDecodeQueues, VulkanVideoFrame, VulkanVideoPlane, render_image_from_bgra,
     },
     tracks::PlaybackTrack,
 };
@@ -67,7 +67,10 @@ mod worker;
 use audio::{
     AudioBuffer, AudioShared, audio_samples_duration, fill_audio_output, samples_for_duration,
 };
-use audio::{AudioOutput, audio_sample_len, frame_sample_format, zeroed_channel_layout};
+use audio::{
+    AudioOutput, AudioOutputDrainStatus, AudioOutputPushResult, AudioOutputSnapshot,
+    audio_sample_len, frame_sample_format, zeroed_channel_layout,
+};
 #[cfg(test)]
 use avio::{
     CacheReadResult, HttpContentRange, HttpRingCacheState, content_len_from_content_range,
@@ -78,22 +81,20 @@ use avio::{
 use avio::{HttpRingCache, reqwest_header_pairs};
 use bsf::PgsFrameMergeBitstreamFilter;
 #[cfg(test)]
+use clock::queued_video_target_reached;
+#[cfg(test)]
+use clock::{MappedTimestamp, WaitStatus};
 use clock::{
-    MappedTimestamp, WaitStatus, pop_audio_clocked_video_frame,
-    queued_video_frame_ready_for_audio_clock, should_drop_late_video_frame,
-};
-use clock::{
-    PlaybackScheduler, QueuedVideoFrame, TimestampMapper, drain_audio_clocked_video_queue,
-    duration_nsecs, frame_best_effort_timestamp, frame_decode_error_flags, frame_is_corrupt,
-    max_optional_seconds, nsecs_to_seconds, nsecs_to_timestamp, optional_buffered_value_changed,
-    present_decoded_video_frame, present_due_audio_clocked_video_frames, pts_distance,
-    queued_video_duration, queued_video_limit_duration, queued_video_target_duration,
-    seconds_to_nsecs, should_drop_late_queued_video_frame, stream_frame_duration_nsecs,
-    timestamp_to_nsecs, wait_for_audio_clocked_video_queue,
+    PlaybackScheduler, QueuedVideoFrame, TimestampMapper, duration_nsecs,
+    frame_best_effort_timestamp, frame_decode_error_flags, frame_is_corrupt, max_optional_seconds,
+    nsecs_to_seconds, nsecs_to_timestamp, optional_buffered_value_changed, pts_distance,
+    queued_video_duration, queued_video_frames_have_vulkan, queued_video_limit_duration,
+    queued_video_limit_frames, queued_video_limit_reached, queued_video_target_duration,
+    queued_video_target_frames, seconds_to_nsecs, stream_frame_duration_nsecs, timestamp_to_nsecs,
 };
 use codec::{
-    AudioResampler, AvFrame, AvPacket, Decoder, VideoScaler, packet_is_video_recovery_point,
-    packet_is_video_seek_point,
+    AudioResampler, AvFrame, AvPacket, DecodedAudio, Decoder, VideoScaler,
+    packet_is_video_recovery_point, packet_is_video_seek_point,
 };
 use dovi::{DoviPipeline, ffmpeg_dovi_metadata_from_frame};
 #[cfg(test)]
@@ -111,7 +112,7 @@ use subtitle::{
 use util::ffmpeg_error;
 #[cfg(test)]
 use video::ffmpeg_raw_video_format;
-use video::{VideoFrameConverter, frame_size, video_frame_len};
+use video::{VideoFrameConvertContext, VideoFrameConverter, frame_size, video_frame_len};
 use worker::{
     FfmpegCommand, FfmpegControl, FfmpegPlaybackInput, FfmpegWorker, drain_playback_commands,
     ffmpeg_interrupt_callback,
@@ -124,17 +125,37 @@ const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const RPU_MATCH_TOLERANCE: Duration = Duration::from_millis(60);
 const RPU_QUEUE_CAPACITY: usize = 2048;
 const AUDIO_BUFFER_SECONDS: usize = 4;
-const AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(300);
-const AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(120);
+const AUDIO_DECODE_QUEUE_LIMIT_DURATION: Duration = Duration::from_secs(2);
+const AUDIO_QUEUE_WAIT_LOG_AFTER: Duration = Duration::from_millis(50);
+const AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(500);
+const AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(300);
+const DECODED_VIDEO_QUEUE_LIMIT_FRAMES: usize = 24;
+const DECODED_VIDEO_QUEUE_TARGET_FRAMES: usize = 12;
+const VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES: usize = 12;
+const VULKAN_DECODED_VIDEO_QUEUE_TARGET_FRAMES: usize = 8;
 const AUDIO_CLOCK_VIDEO_PRESENT_LEAD: Duration = Duration::from_millis(15);
 const AUDIO_OUTPUT_DELAY_LIMIT: Duration = Duration::from_millis(500);
-const VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(90);
-const VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(40);
-const PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(700);
-const PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(500);
+const VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(350);
+const VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(300);
+const PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_secs(4);
+const PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_secs(3);
+const VIDEO_OUTPUT_REBUFFER_ENTER_AFTER: Duration = Duration::from_millis(250);
+const VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION: Duration = Duration::from_millis(250);
+const VIDEO_OUTPUT_REBUFFER_RESUME_DURATION: Duration = Duration::from_millis(500);
+const VIDEO_OUTPUT_START_PREBUFFER_DURATION: Duration = Duration::from_millis(800);
+const VIDEO_DECODE_SKIP_NONREF_LOW_WATER_DURATION: Duration = Duration::from_millis(900);
+#[cfg(test)]
+const VIDEO_OUTPUT_REBUFFER_RESUME_FRAMES: usize = 20;
+#[cfg(test)]
+const VIDEO_OUTPUT_START_PREBUFFER_FRAMES: usize = 20;
+const AUDIO_OUTPUT_VIDEO_LEAD_DURATION: Duration = Duration::from_millis(120);
+const AUDIO_VIDEO_REBUFFER_DRIFT_RESET_THRESHOLD: Duration = Duration::from_millis(500);
+const PENDING_AUDIO_CONTINUITY_TOLERANCE: Duration = Duration::from_millis(5);
+const DECODE_PACKET_SLOW_LOG_AFTER: Duration = Duration::from_millis(20);
 #[cfg(test)]
 const DEMUX_PACKET_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 const DEMUX_PACKET_CACHE_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+const DEMUX_READ_WAIT_LOG_AFTER: Duration = Duration::from_millis(50);
 const DEMUX_PACKET_CACHE_STALL_LOG_AFTER: Duration = Duration::from_millis(500);
 const DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_AFTER: Duration = Duration::from_millis(500);
@@ -148,6 +169,8 @@ const HTTP_CACHE_CHUNK_SIZE: usize = 1024 * 1024;
 #[cfg(test)]
 const HTTP_CACHE_RANGE_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
 const HTTP_CACHE_SIDE_DOWNLOAD_WORKERS: usize = 2;
+const HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR: u64 = 1;
+const HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR: u64 = 2;
 const HTTP_CACHE_WAIT_INTERVAL: Duration = Duration::from_millis(50);
 const HTTP_CACHE_STALL_LOG_AFTER: Duration = Duration::from_millis(500);
 const HTTP_CACHE_STALL_LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -194,7 +217,7 @@ enum InputProbeProfile {
 }
 
 pub struct FfmpegBackend {
-    frame_slot: FrameSlot,
+    video_output_queue: VideoOutputQueue,
     event_tx: Sender<BackendEvent>,
     event_rx: Receiver<BackendEvent>,
     worker: Option<FfmpegWorker>,
@@ -215,11 +238,11 @@ impl FfmpegBackend {
     pub fn new() -> Result<Self> {
         init_ffmpeg_network()?;
 
-        let frame_slot = FrameSlot::default();
+        let video_output_queue = VideoOutputQueue::default();
         let (event_tx, event_rx) = mpsc::channel();
 
         Ok(Self {
-            frame_slot,
+            video_output_queue,
             event_tx,
             event_rx,
             worker: None,
@@ -237,8 +260,8 @@ impl FfmpegBackend {
         })
     }
 
-    pub fn frame_slot(&self) -> FrameSlot {
-        self.frame_slot.clone()
+    pub fn video_output_queue(&self) -> VideoOutputQueue {
+        self.video_output_queue.clone()
     }
 
     pub fn load_url(
@@ -270,7 +293,7 @@ impl FfmpegBackend {
     ) -> Result<()> {
         request.cache_config = request.cache_config.clone().normalized();
         let session_id = self.advance_session();
-        self.frame_slot.begin_session(session_id);
+        self.video_output_queue.begin_session(session_id);
         self.stop_worker();
         self.current_url = Some(request.url.clone());
         self.current_request = Some(request.clone());
@@ -298,7 +321,7 @@ impl FfmpegBackend {
                 selected_tracks: request.selected_tracks,
                 cache_config: request.cache_config,
             },
-            self.frame_slot.clone(),
+            self.video_output_queue.clone(),
             self.event_tx.clone(),
             self.volume,
         )?);
@@ -324,7 +347,7 @@ impl FfmpegBackend {
         let position_seconds = position_seconds.max(0.0);
         let pause_after_switch = self.user_paused;
         let session_id = self.advance_session();
-        self.frame_slot.begin_session(session_id);
+        self.video_output_queue.begin_session(session_id);
         if !pause_after_switch {
             self.loaded = false;
         }
@@ -367,7 +390,7 @@ impl FfmpegBackend {
         let position_seconds = position_seconds.max(0.0);
 
         let session_id = self.advance_session();
-        self.frame_slot.begin_session(session_id);
+        self.video_output_queue.begin_session(session_id);
         self.loaded = false;
         self.paused = true;
         FFMPEG_FRAME_COUNT.store(0, Ordering::Relaxed);
@@ -428,7 +451,7 @@ impl FfmpegBackend {
 
     pub fn stop(&mut self) -> Result<()> {
         let session_id = self.advance_session();
-        self.frame_slot.begin_session(session_id);
+        self.video_output_queue.begin_session(session_id);
         self.stop_worker();
         self.current_url = None;
         self.current_request = None;
@@ -479,7 +502,7 @@ impl FfmpegBackend {
             }
         }
 
-        if let Some((session_id, size)) = self.frame_slot.take_size_change() {
+        if let Some((session_id, size)) = self.video_output_queue.take_size_change() {
             if session_id != self.current_session_id {
                 return events;
             }
@@ -706,8 +729,8 @@ impl BackendControl for FfmpegBackend {
         FfmpegBackend::poll_events(self)
     }
 
-    fn frame_slot(&self) -> FrameSlot {
-        FfmpegBackend::frame_slot(self)
+    fn video_output_queue(&self) -> VideoOutputQueue {
+        FfmpegBackend::video_output_queue(self)
     }
 }
 
@@ -716,7 +739,7 @@ impl Drop for FfmpegBackend {
         if let Some(worker) = self.worker.take() {
             worker.stop_async();
         }
-        self.frame_slot.clear();
+        self.video_output_queue.clear();
     }
 }
 

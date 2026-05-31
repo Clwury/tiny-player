@@ -111,6 +111,9 @@ pub struct PlaybackCacheConfig {
     pub unlink_files: CacheUnlinkPolicy,
 }
 
+const NETWORK_DEMUXER_READAHEAD_SECS: f64 = 8.0;
+const NETWORK_DEMUXER_HYSTERESIS_SECS: f64 = 2.0;
+
 impl Default for PlaybackCacheConfig {
     fn default() -> Self {
         Self {
@@ -169,6 +172,14 @@ impl PlaybackCacheConfig {
                 PlaybackCacheMode::Disabled
             };
         }
+        if input_cacheable && !matches!(self.mode, PlaybackCacheMode::Disabled) {
+            self.demuxer_readahead_secs = self
+                .demuxer_readahead_secs
+                .max(NETWORK_DEMUXER_READAHEAD_SECS);
+            self.demuxer_hysteresis_secs = self
+                .demuxer_hysteresis_secs
+                .max(NETWORK_DEMUXER_HYSTERESIS_SECS);
+        }
         self
     }
 
@@ -224,6 +235,8 @@ pub struct StreamCacheState {
     pub cache_end: Option<f64>,
     pub reader_pts: Option<f64>,
     pub cache_duration: Option<f64>,
+    pub underrun: bool,
+    pub idle: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -395,5 +408,35 @@ mod tests {
         }
         .resolved_for_cacheable_input(false);
         assert_eq!(forced.mode, PlaybackCacheMode::Enabled);
+    }
+
+    #[test]
+    fn cache_config_resolves_network_demux_prebuffer_defaults() {
+        let network = PlaybackCacheConfig::default().resolved_for_cacheable_input(true);
+        let local = PlaybackCacheConfig::default().resolved_for_cacheable_input(false);
+
+        assert!(!network.demuxer_cache_wait);
+        assert!(!network.cache_pause_initial);
+        assert_eq!(network.cache_pause_wait, 1.0);
+        assert_eq!(network.demuxer_readahead_secs, 8.0);
+        assert_eq!(network.demuxer_hysteresis_secs, 2.0);
+
+        assert!(!local.demuxer_cache_wait);
+        assert!(!local.cache_pause_initial);
+        assert_eq!(local.cache_pause_wait, 1.0);
+        assert_eq!(local.demuxer_readahead_secs, 1.0);
+    }
+
+    #[test]
+    fn cache_config_respects_disabled_cache_pause_for_network_inputs() {
+        let network = PlaybackCacheConfig {
+            cache_pause: false,
+            ..PlaybackCacheConfig::default()
+        }
+        .resolved_for_cacheable_input(true);
+
+        assert!(!network.cache_pause);
+        assert!(!network.cache_pause_initial);
+        assert!(!network.demuxer_cache_wait);
     }
 }

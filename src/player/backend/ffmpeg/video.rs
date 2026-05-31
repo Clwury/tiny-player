@@ -1,5 +1,36 @@
 use super::*;
 
+#[derive(Clone)]
+pub(super) struct VideoFrameConvertContext {
+    size: Option<RenderSize>,
+    vulkan_device: Option<Arc<VulkanDecodeDevice>>,
+}
+
+impl VideoFrameConvertContext {
+    pub(super) fn from_decoder(decoder: &Decoder) -> Self {
+        Self {
+            size: decoder.size().ok(),
+            vulkan_device: decoder.vulkan_device(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(size: RenderSize) -> Self {
+        Self {
+            size: Some(size),
+            vulkan_device: None,
+        }
+    }
+
+    pub(super) fn size(&self) -> Option<RenderSize> {
+        self.size
+    }
+
+    pub(super) fn vulkan_device(&self) -> Option<Arc<VulkanDecodeDevice>> {
+        self.vulkan_device.clone()
+    }
+}
+
 pub(super) struct VideoFrameConverter {
     scaler: Option<VideoScaler>,
     buffer_pool: FrameBufferPool,
@@ -15,15 +46,15 @@ impl VideoFrameConverter {
         }
     }
 
-    pub(super) fn convert(
+    pub(super) fn convert_with_context(
         &mut self,
-        decoder: &Decoder,
+        context: &VideoFrameConvertContext,
         frame: *mut ffi::AVFrame,
         dovi_metadata: Option<DoviFrameMetadata>,
     ) -> std::result::Result<DecodedFrame, String> {
         let size = frame_size(frame)
             .or_else(|| self.scaler.as_ref().map(|scaler| scaler.size))
-            .or_else(|| decoder.size().ok())
+            .or(context.size())
             .ok_or_else(|| "FFmpeg 视频帧缺少有效尺寸".to_string())?;
         let key_frame = unsafe { (*frame).flags & ffi::AV_FRAME_FLAG_KEY != 0 };
         self.converted_frame_count = self.converted_frame_count.saturating_add(1);
@@ -32,8 +63,12 @@ impl VideoFrameConverter {
             let sw_format = vulkan_sw_format(frame)
                 .and_then(ffmpeg_raw_video_format)
                 .ok_or_else(|| "FFmpeg Vulkan 帧缺少可识别的软件像素格式".to_string())?;
-            let vulkan =
-                vulkan_video_frame_from_av_frame(decoder, frame, sw_format, dovi_metadata)?;
+            let vulkan = vulkan_video_frame_from_av_frame_with_device(
+                frame,
+                context.vulkan_device(),
+                sw_format,
+                dovi_metadata,
+            )?;
             log_video_frame_color_metadata(
                 frame_count,
                 "vulkan",
@@ -70,7 +105,7 @@ impl VideoFrameConverter {
 
         let scaler = match self.scaler.as_mut() {
             Some(scaler) => scaler,
-            None => self.scaler.insert(VideoScaler::new(decoder)?),
+            None => self.scaler.insert(VideoScaler::new_for_frame(frame, size)?),
         };
         let pixels = scaler.convert(frame, &self.buffer_pool)?;
         if frame_count == 1 {
@@ -120,13 +155,13 @@ fn log_video_frame_color_metadata(
     );
 }
 
-pub(super) fn vulkan_video_frame_from_av_frame(
-    decoder: &Decoder,
+pub(super) fn vulkan_video_frame_from_av_frame_with_device(
     frame: *mut ffi::AVFrame,
+    device: Option<Arc<VulkanDecodeDevice>>,
     sw_format: RawVideoFormat,
     dovi_metadata: Option<DoviFrameMetadata>,
 ) -> std::result::Result<VulkanVideoFrame, String> {
-    let Some(device) = decoder.vulkan_device() else {
+    let Some(device) = device else {
         return Err("FFmpeg Vulkan 帧缺少解码设备引用".to_string());
     };
     let ffmpeg_dovi = ffmpeg_dovi_metadata_from_frame(frame);

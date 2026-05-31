@@ -11,7 +11,7 @@ pub(super) struct FfmpegControl {
     shutdown: AtomicBool,
     user_paused: AtomicBool,
     cache_paused: AtomicBool,
-    output_underrun: AtomicBool,
+    output_rebuffer_paused: AtomicBool,
     volume: AtomicU32,
     session_id: AtomicU64,
     seek_generation: AtomicU64,
@@ -29,7 +29,7 @@ impl FfmpegControl {
             shutdown: AtomicBool::new(false),
             user_paused: AtomicBool::new(false),
             cache_paused: AtomicBool::new(false),
-            output_underrun: AtomicBool::new(false),
+            output_rebuffer_paused: AtomicBool::new(false),
             volume: AtomicU32::new(volume_to_storage(volume)),
             session_id: AtomicU64::new(session_id.0),
             seek_generation: AtomicU64::new(0),
@@ -53,6 +53,10 @@ impl FfmpegControl {
         self.is_user_paused() || self.is_cache_paused()
     }
 
+    pub(super) fn should_pause_audio_output(&self) -> bool {
+        self.is_paused() || self.is_output_rebuffer_paused()
+    }
+
     pub(super) fn is_user_paused(&self) -> bool {
         self.user_paused.load(Ordering::Acquire)
     }
@@ -69,16 +73,12 @@ impl FfmpegControl {
         self.cache_paused.swap(paused, Ordering::AcqRel) != paused
     }
 
-    pub(super) fn mark_output_underrun(&self) {
-        self.output_underrun.store(true, Ordering::Release);
+    pub(super) fn is_output_rebuffer_paused(&self) -> bool {
+        self.output_rebuffer_paused.load(Ordering::Acquire)
     }
 
-    pub(super) fn take_output_underrun(&self) -> bool {
-        self.output_underrun.swap(false, Ordering::AcqRel)
-    }
-
-    pub(super) fn clear_output_underrun(&self) {
-        self.output_underrun.store(false, Ordering::Release);
+    pub(super) fn set_output_rebuffer_paused(&self, paused: bool) -> bool {
+        self.output_rebuffer_paused.swap(paused, Ordering::AcqRel) != paused
     }
 
     pub(super) fn set_volume(&self, volume: f32) {
@@ -90,6 +90,7 @@ impl FfmpegControl {
         self.volume.load(Ordering::Acquire) as f32 / PLAYBACK_VOLUME_SCALE as f32
     }
 
+    #[cfg(test)]
     pub(super) fn wait_while_paused(&self) -> bool {
         while self.is_paused() && !self.should_stop() && !self.has_pending_seek() {
             thread::sleep(SCHEDULER_POLL_INTERVAL);
@@ -106,7 +107,7 @@ impl FfmpegControl {
     }
 
     pub(super) fn request_seek(&self) -> u64 {
-        self.clear_output_underrun();
+        self.set_output_rebuffer_paused(false);
         self.seek_generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
@@ -207,7 +208,7 @@ pub(super) struct DrainedFfmpegCommands {
 impl FfmpegWorker {
     pub(super) fn spawn(
         input: FfmpegPlaybackInput,
-        frame_slot: FrameSlot,
+        video_output_queue: VideoOutputQueue,
         event_tx: Sender<BackendEvent>,
         volume: f32,
     ) -> Result<Self> {
@@ -223,7 +224,7 @@ impl FfmpegWorker {
             .spawn(move || {
                 let result = super::playback_loop::run_ffmpeg_playback(
                     input,
-                    frame_slot,
+                    video_output_queue,
                     event_tx.clone(),
                     worker_control.clone(),
                     command_rx,

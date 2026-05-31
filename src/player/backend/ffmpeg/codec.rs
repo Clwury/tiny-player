@@ -8,6 +8,9 @@ pub(super) struct Decoder {
     hw_format_selection: Option<Box<VideoHwFormatSelection>>,
 }
 
+// Decoder is moved into a dedicated worker thread and then accessed only from that thread.
+unsafe impl Send for Decoder {}
+
 impl Decoder {
     pub(super) fn open(stream: StreamInfo) -> std::result::Result<Self, String> {
         let decoder = find_decoder(stream)?;
@@ -162,6 +165,17 @@ impl Decoder {
             width: u32::try_from(width).map_err(|_| "视频宽度无效".to_string())?,
             height: u32::try_from(height).map_err(|_| "视频高度无效".to_string())?,
         })
+    }
+
+    pub(super) fn set_skip_nonref_frames(&self, enabled: bool) {
+        let skip_frame = if enabled {
+            ffi::AVDiscard::AVDISCARD_NONREF
+        } else {
+            ffi::AVDiscard::AVDISCARD_DEFAULT
+        };
+        unsafe {
+            (*self.ptr).skip_frame = skip_frame;
+        }
     }
 
     pub(super) fn decode_packet<F>(
@@ -737,9 +751,18 @@ pub(super) struct VideoScaler {
 }
 
 impl VideoScaler {
-    pub(super) fn new(decoder: &Decoder) -> std::result::Result<Self, String> {
-        let size = decoder.size()?;
-        let src_format = unsafe { (*decoder.ptr).pix_fmt };
+    pub(super) fn new_for_frame(
+        frame: *const ffi::AVFrame,
+        size: RenderSize,
+    ) -> std::result::Result<Self, String> {
+        let src_format = unsafe { mem::transmute::<c_int, ffi::AVPixelFormat>((*frame).format) };
+        Self::new_with_format(size, src_format)
+    }
+
+    fn new_with_format(
+        size: RenderSize,
+        src_format: ffi::AVPixelFormat,
+    ) -> std::result::Result<Self, String> {
         let ptr = unsafe {
             ffi::sws_getContext(
                 i32::try_from(size.width).map_err(|_| "视频宽度过大".to_string())?,

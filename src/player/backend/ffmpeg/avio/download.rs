@@ -168,11 +168,12 @@ fn download_http_cache_range(
 
     let mut response = match request.send() {
         Ok(response) => response,
-        Err(error) if error.is_timeout() => {
+        Err(error) if http_cache_request_should_retry(&error) => {
             tracing::debug!(
                 offset,
                 range = %range,
-                "HTTP stream cache range request timed out; restarting"
+                %error,
+                "HTTP stream cache range request failed transiently; restarting"
             );
             return Ok(HttpDownloadOutcome::Restart(offset));
         }
@@ -221,20 +222,22 @@ fn download_http_cache_range(
         let read_capacity = chunk.len().min(capacity);
         let read = match response.read(&mut chunk[..read_capacity]) {
             Ok(read) => read,
-            Err(error) if http_cache_read_timed_out(&error) => {
+            Err(error) if http_cache_read_should_restart(&error) => {
                 if let Some(next_offset) = shared.take_restart_offset() {
                     tracing::debug!(
                         offset,
                         next_offset,
                         range = %range,
-                        "HTTP stream cache read timed out with pending restart"
+                        %error,
+                        "HTTP stream cache read failed transiently with pending restart"
                     );
                     return Ok(HttpDownloadOutcome::Restart(next_offset));
                 }
                 tracing::debug!(
                     offset,
                     range = %range,
-                    "HTTP stream cache read timed out; restarting current range"
+                    %error,
+                    "HTTP stream cache read failed transiently; restarting current range"
                 );
                 return Ok(HttpDownloadOutcome::Restart(offset));
             }
@@ -303,11 +306,12 @@ fn download_http_side_cache_range(
 
     let mut response = match http_request.send() {
         Ok(response) => response,
-        Err(error) if error.is_timeout() => {
+        Err(error) if http_cache_request_should_retry(&error) => {
             tracing::debug!(
                 offset,
                 range = %range,
-                "HTTP side cache range request timed out; restarting"
+                %error,
+                "HTTP side cache range request failed transiently; restarting"
             );
             return Ok(HttpDownloadOutcome::Restart(offset));
         }
@@ -357,11 +361,12 @@ fn download_http_side_cache_range(
             .min(usize::try_from(request_remaining).unwrap_or(usize::MAX));
         let read = match response.read(&mut chunk[..read_capacity]) {
             Ok(read) => read,
-            Err(error) if http_cache_read_timed_out(&error) => {
+            Err(error) if http_cache_read_should_restart(&error) => {
                 tracing::debug!(
                     offset,
                     range = %range,
-                    "HTTP side cache read timed out; restarting current side range"
+                    %error,
+                    "HTTP side cache read failed transiently; restarting current side range"
                 );
                 return Ok(HttpDownloadOutcome::Restart(offset));
             }
@@ -406,6 +411,37 @@ fn side_request_remaining_bytes(
     (offset < request_end).then_some(request_end - offset)
 }
 
+fn http_cache_request_should_retry(error: &reqwest::Error) -> bool {
+    error.is_timeout()
+        || error.is_connect()
+        || error.is_body()
+        || transient_http_error_message(&error.to_string())
+}
+
+fn http_cache_read_should_restart(error: &std::io::Error) -> bool {
+    http_cache_read_timed_out(error)
+        || matches!(
+            error.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        )
+        || transient_http_error_message(&error.to_string())
+}
+
+fn transient_http_error_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("incomplete")
+        || message.contains("connection reset")
+        || message.contains("connection closed")
+        || message.contains("connection aborted")
+        || message.contains("broken pipe")
+        || message.contains("unexpected eof")
+        || message.contains("end of file")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +470,16 @@ mod tests {
             side_request_remaining_bytes(request, 550, Some(550), 128),
             None
         );
+    }
+
+    #[test]
+    fn transient_http_error_message_matches_incomplete_body() {
+        assert!(transient_http_error_message(
+            "error reading a body from connection: IncompleteMessage"
+        ));
+        assert!(transient_http_error_message("connection reset by peer"));
+        assert!(!transient_http_error_message(
+            "HTTP 视频缓存 Range 响应偏移不匹配"
+        ));
     }
 }
