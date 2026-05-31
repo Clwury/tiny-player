@@ -1,49 +1,101 @@
 use super::*;
 
+#[path = "playback_loop/audio/audio_decode_pipeline.rs"]
 mod audio_decode_pipeline;
+#[path = "playback_loop/audio/audio_decode_worker.rs"]
 mod audio_decode_worker;
+#[path = "playback_loop/audio/audio_output_gate.rs"]
 mod audio_output_gate;
-mod commands;
-mod coordinator_commands;
-mod coordinator_drain;
-mod coordinator_gate;
-mod coordinator_tick;
-mod decode;
-mod decode_pipeline_service;
+#[path = "playback_loop/audio/decoded_audio_frame.rs"]
 mod decoded_audio_frame;
-mod decoded_output_service;
-mod decoded_video_frame;
-mod decoder_drain_service;
-mod decoder_input_service;
-mod decoder_packet_queue;
-mod demux_cache;
-mod demux_packet_pump;
-mod drain_phase;
-mod output_drain_service;
-mod output_gate;
-mod output_gate_service;
-mod output_queue_service;
-mod output_rebuffer;
+#[path = "playback_loop/audio/pending_audio_queue.rs"]
 mod pending_audio_queue;
-mod playback_block;
-mod playback_pipeline_state;
+
+#[path = "playback_loop/coordinator/commands.rs"]
+mod commands;
+#[path = "playback_loop/coordinator/coordinator_commands.rs"]
+mod coordinator_commands;
+#[path = "playback_loop/coordinator/coordinator_drain.rs"]
+mod coordinator_drain;
+#[path = "playback_loop/coordinator/coordinator_gate.rs"]
+mod coordinator_gate;
+#[path = "playback_loop/coordinator/coordinator_tick.rs"]
+mod coordinator_tick;
+#[path = "playback_loop/coordinator/playback_reset_service.rs"]
 mod playback_reset_service;
+#[path = "playback_loop/coordinator/playback_services.rs"]
 mod playback_services;
-mod playback_snapshot;
+#[path = "playback_loop/coordinator/playback_wait_service.rs"]
 mod playback_wait_service;
-mod scheduled_video_queue;
-mod session;
-mod subtitle_decode_worker;
-mod subtitles;
-mod timeline;
+#[path = "playback_loop/coordinator/track_switch.rs"]
 mod track_switch;
+
+#[path = "playback_loop/decoder/decode.rs"]
+mod decode;
+#[path = "playback_loop/decoder/decode_pipeline_service.rs"]
+mod decode_pipeline_service;
+#[path = "playback_loop/decoder/decoded_output_service.rs"]
+mod decoded_output_service;
+#[path = "playback_loop/decoder/decoder_drain_service.rs"]
+mod decoder_drain_service;
+#[path = "playback_loop/decoder/decoder_input_service.rs"]
+mod decoder_input_service;
+#[path = "playback_loop/decoder/decoder_packet_queue.rs"]
+mod decoder_packet_queue;
+#[path = "playback_loop/decoder/drain_phase.rs"]
+mod drain_phase;
+
+#[path = "playback_loop/demux/demux_cache.rs"]
+mod demux_cache;
+#[path = "playback_loop/demux/demux_packet_pump.rs"]
+mod demux_packet_pump;
+
+#[path = "playback_loop/output/output_drain_service.rs"]
+mod output_drain_service;
+#[path = "playback_loop/output/output_gate.rs"]
+mod output_gate;
+#[path = "playback_loop/output/output_gate_service.rs"]
+mod output_gate_service;
+#[path = "playback_loop/output/output_queue_service.rs"]
+mod output_queue_service;
+#[path = "playback_loop/output/output_rebuffer.rs"]
+mod output_rebuffer;
+
+#[path = "playback_loop/state/playback_block.rs"]
+mod playback_block;
+#[path = "playback_loop/state/playback_pipeline_state.rs"]
+mod playback_pipeline_state;
+#[path = "playback_loop/state/playback_snapshot.rs"]
+mod playback_snapshot;
+#[path = "playback_loop/state/session.rs"]
+mod session;
+#[path = "playback_loop/state/timeline.rs"]
+mod timeline;
+
+#[path = "playback_loop/subtitle/subtitle_decode_worker.rs"]
+mod subtitle_decode_worker;
+#[path = "playback_loop/subtitle/subtitles.rs"]
+mod subtitles;
+
+#[path = "playback_loop/video/decoded_video_frame.rs"]
+mod decoded_video_frame;
+#[path = "playback_loop/video/scheduled_video_queue.rs"]
+mod scheduled_video_queue;
+#[path = "playback_loop/video/video_decode_drain_frame_processor.rs"]
 mod video_decode_drain_frame_processor;
+#[path = "playback_loop/video/video_decode_pipeline.rs"]
 mod video_decode_pipeline;
+#[path = "playback_loop/video/video_decode_recovery_service.rs"]
 mod video_decode_recovery_service;
+#[path = "playback_loop/video/video_decode_worker.rs"]
 mod video_decode_worker;
+#[path = "playback_loop/video/video_frame_admission_service.rs"]
 mod video_frame_admission_service;
+#[path = "playback_loop/video/video_frame_prepare_admission_service.rs"]
 mod video_frame_prepare_admission_service;
+#[path = "playback_loop/video/video_frame_prepare_worker.rs"]
 mod video_frame_prepare_worker;
+#[path = "playback_loop/video/video_output_gate.rs"]
 mod video_output_gate;
 
 use super::avio::{CachedInputSource, should_cache_http_url};
