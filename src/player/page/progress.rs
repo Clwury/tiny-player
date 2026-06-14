@@ -40,15 +40,6 @@ pub(super) fn progress_fraction(position: f64, duration: f64) -> f32 {
     (clamp_playback_position(position, duration) / duration) as f32
 }
 
-pub(super) fn buffered_progress_fraction(
-    buffered_until: Option<f64>,
-    position: f64,
-    duration: f64,
-) -> f32 {
-    let buffered_until = buffered_until.unwrap_or(position).max(position);
-    progress_fraction(buffered_until, duration)
-}
-
 pub(super) fn cache_range_fractions(
     cache_state: Option<&PlaybackCacheState>,
     duration: f64,
@@ -63,16 +54,7 @@ pub(super) fn cache_range_fractions(
         .demux
         .seekable_ranges
         .iter()
-        .filter_map(|range| {
-            if !range.start.is_finite() || !range.end.is_finite() {
-                return None;
-            }
-            let start = range.start;
-            let end = range.end;
-            let start = clamp_playback_position(start, duration);
-            let end = clamp_playback_position(end, duration);
-            (end > start).then_some((start, end))
-        })
+        .filter_map(|range| normalized_cache_range(range.start, range.end, duration))
         .collect();
     ranges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -93,52 +75,13 @@ pub(super) fn cache_range_fractions(
         .collect()
 }
 
-pub(super) fn byte_cache_range_fractions(
-    cache_state: Option<&PlaybackCacheState>,
-    duration: f64,
-) -> Vec<(f32, f32)> {
-    if valid_playback_duration(duration).is_none() {
-        return Vec::new();
+fn normalized_cache_range(start: f64, end: f64, duration: f64) -> Option<(f64, f64)> {
+    if !start.is_finite() || !end.is_finite() {
+        return None;
     }
-    let Some(byte_cache) = cache_state.and_then(|state| state.byte.as_ref()) else {
-        return Vec::new();
-    };
-    if byte_cache
-        .content_length
-        .is_none_or(|content_length| content_length == 0)
-    {
-        return Vec::new();
-    }
-
-    let mut ranges: Vec<_> = byte_cache
-        .ranges
-        .iter()
-        .filter_map(|range| {
-            if !range.start_fraction.is_finite() || !range.end_fraction.is_finite() {
-                return None;
-            }
-            let start = range.start_fraction.clamp(0.0, 1.0);
-            let end = range.end_fraction.clamp(0.0, 1.0);
-            (end > start).then_some((start, end))
-        })
-        .collect();
-    ranges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(ranges.len());
-    for (start, end) in ranges {
-        if let Some(last) = merged.last_mut()
-            && start <= last.1
-        {
-            last.1 = last.1.max(end);
-            continue;
-        }
-        merged.push((start, end));
-    }
-
-    merged
-        .into_iter()
-        .map(|(start, end)| (start as f32, end as f32))
-        .collect()
+    let start = clamp_playback_position(start, duration);
+    let end = clamp_playback_position(end, duration);
+    (end > start).then_some((start, end))
 }
 
 pub(super) fn cached_seek_target(
@@ -216,10 +159,7 @@ pub(super) fn format_playback_time(seconds: f64) -> String {
 mod tests {
     use gpui::{Bounds, point, px, size};
 
-    use crate::player::backend::{
-        ByteCacheState, DemuxCacheState, PlaybackCacheByteRange, PlaybackCacheState,
-        PlaybackCacheTimeRange,
-    };
+    use crate::player::backend::{DemuxCacheState, PlaybackCacheState, PlaybackCacheTimeRange};
 
     use super::*;
 
@@ -247,13 +187,6 @@ mod tests {
         assert_eq!(progress_fraction(25.0, 100.0), 0.25);
         assert_eq!(progress_fraction(125.0, 100.0), 1.0);
         assert_eq!(progress_fraction(25.0, 0.0), 0.0);
-    }
-
-    #[test]
-    fn buffered_progress_never_falls_behind_played_progress() {
-        assert_eq!(buffered_progress_fraction(Some(20.0), 40.0, 100.0), 0.4);
-        assert_eq!(buffered_progress_fraction(Some(80.0), 40.0, 100.0), 0.8);
-        assert_eq!(buffered_progress_fraction(None, 40.0, 100.0), 0.4);
     }
 
     #[test]
@@ -286,48 +219,30 @@ mod tests {
     }
 
     #[test]
-    fn byte_cache_range_fractions_require_content_length_and_merge_ranges() {
+    fn cache_range_fractions_prefers_seekable_ranges() {
         let state = PlaybackCacheState {
-            byte: Some(ByteCacheState {
-                ranges: vec![
-                    PlaybackCacheByteRange {
-                        start_fraction: -0.1,
-                        end_fraction: 0.2,
+            demux: DemuxCacheState {
+                cache_end: Some(45.0),
+                reader_pts: Some(30.0),
+                seekable_ranges: vec![
+                    PlaybackCacheTimeRange {
+                        start: 10.0,
+                        end: 20.0,
                     },
-                    PlaybackCacheByteRange {
-                        start_fraction: 0.15,
-                        end_fraction: 0.5,
-                    },
-                    PlaybackCacheByteRange {
-                        start_fraction: 0.8,
-                        end_fraction: 1.2,
+                    PlaybackCacheTimeRange {
+                        start: 40.0,
+                        end: 50.0,
                     },
                 ],
-                reader_fraction: None,
-                download_fraction: None,
-                cached_bytes: 0,
-                content_length: Some(100),
-                disk_cache_enabled: false,
-                idle: false,
-                raw_input_rate: None,
-                byte_level_seeks: 0,
-            }),
+                ..DemuxCacheState::default()
+            },
             ..PlaybackCacheState::default()
         };
 
         assert_eq!(
-            byte_cache_range_fractions(Some(&state), 100.0),
-            vec![(0.0, 0.5), (0.8, 1.0)]
+            cache_range_fractions(Some(&state), 100.0),
+            vec![(0.1, 0.2), (0.4, 0.5)]
         );
-
-        let without_content_length = PlaybackCacheState {
-            byte: Some(ByteCacheState {
-                content_length: None,
-                ..state.byte.expect("byte cache state exists")
-            }),
-            ..PlaybackCacheState::default()
-        };
-        assert!(byte_cache_range_fractions(Some(&without_content_length), 100.0).is_empty());
     }
 
     #[test]

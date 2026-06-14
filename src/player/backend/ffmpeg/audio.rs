@@ -59,6 +59,11 @@ pub(super) struct AudioShared {
     pub(super) queued_end_timeline_nsecs: AtomicU64,
     output_delay_nsecs: AtomicU64,
     output_delay_updated_nsecs: AtomicU64,
+    callback_count: AtomicU64,
+    underrun_count: AtomicU64,
+    underrun_active: AtomicBool,
+    underrun_timeline_nsecs: AtomicU64,
+    last_callback_nsecs: AtomicU64,
     clock_start: Instant,
     sample_rate: c_int,
     channels: c_int,
@@ -282,6 +287,11 @@ impl AudioShared {
             queued_end_timeline_nsecs: AtomicU64::new(0),
             output_delay_nsecs: AtomicU64::new(0),
             output_delay_updated_nsecs: AtomicU64::new(0),
+            callback_count: AtomicU64::new(0),
+            underrun_count: AtomicU64::new(0),
+            underrun_active: AtomicBool::new(false),
+            underrun_timeline_nsecs: AtomicU64::new(0),
+            last_callback_nsecs: AtomicU64::new(0),
             clock_start: Instant::now(),
             sample_rate,
             channels,
@@ -301,6 +311,7 @@ impl AudioShared {
         self.queued_end_timeline_nsecs
             .store(timeline_nsecs, Ordering::Relaxed);
         self.update_output_delay(Duration::ZERO);
+        self.clear_underrun();
     }
 
     pub(super) fn set_queued_end_timeline_nsecs(&self, timeline_nsecs: u64) {
@@ -349,12 +360,59 @@ impl AudioShared {
         );
     }
 
-    #[cfg(test)]
-    pub(super) fn played_timeline_nsecs(&self) -> u64 {
+    fn played_timeline_nsecs_for_pending(&self, pending_nsecs: u64) -> u64 {
+        if self.underrun_active.load(Ordering::Acquire) {
+            return self.underrun_timeline_nsecs.load(Ordering::Acquire);
+        }
+        self.played_timeline_nsecs_from_pending(pending_nsecs)
+    }
+
+    fn played_timeline_nsecs_from_pending(&self, pending_nsecs: u64) -> u64 {
         self.queued_end_timeline_nsecs
             .load(Ordering::Relaxed)
-            .saturating_sub(self.queued_duration_nsecs())
+            .saturating_sub(pending_nsecs)
             .saturating_sub(self.output_delay_nsecs())
+    }
+
+    fn mark_underrun(&self, played_timeline_nsecs: u64) -> bool {
+        match self.underrun_active.compare_exchange(
+            false,
+            true,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.underrun_timeline_nsecs
+                    .store(played_timeline_nsecs, Ordering::Release);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn clear_underrun(&self) {
+        self.underrun_active.store(false, Ordering::Release);
+    }
+
+    fn clear_underrun_if_recovered(&self, pending_nsecs: u64) {
+        if pending_nsecs >= duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION) {
+            self.clear_underrun();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn underrun_active_for_test(&self) -> bool {
+        self.underrun_active.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear_underrun_if_recovered_for_test(&self, pending_nsecs: u64) {
+        self.clear_underrun_if_recovered(pending_nsecs);
+    }
+
+    #[cfg(test)]
+    pub(super) fn played_timeline_nsecs(&self) -> u64 {
+        self.played_timeline_nsecs_for_pending(self.queued_duration_nsecs())
     }
 
     fn snapshot(&self) -> std::result::Result<AudioSharedSnapshot, String> {
@@ -370,11 +428,7 @@ impl AudioShared {
         ));
         let output_delay_nsecs = self.output_delay_nsecs();
         let pending_nsecs = queued_duration_nsecs.saturating_add(output_delay_nsecs);
-        let played_timeline_nsecs = self
-            .queued_end_timeline_nsecs
-            .load(Ordering::Relaxed)
-            .saturating_sub(queued_duration_nsecs)
-            .saturating_sub(output_delay_nsecs);
+        let played_timeline_nsecs = self.played_timeline_nsecs_for_pending(queued_duration_nsecs);
         Ok(AudioSharedSnapshot {
             played_timeline_nsecs,
             pending_nsecs,
@@ -555,6 +609,10 @@ impl AudioOutput {
         self.shared.reset_clock(timeline_nsecs);
     }
 
+    pub(super) fn underrun_active(&self) -> bool {
+        self.shared.underrun_active.load(Ordering::Acquire)
+    }
+
     pub(super) fn drain_deadline(&self) -> std::result::Result<Option<Instant>, String> {
         let timeout = Duration::from_nanos(self.snapshot()?.total_pending_nsecs)
             .saturating_add(Duration::from_millis(250));
@@ -591,9 +649,15 @@ impl AudioOutput {
     }
 
     pub(super) fn snapshot(&self) -> std::result::Result<AudioOutputSnapshot, String> {
-        let shared = self.shared.snapshot()?;
+        let mut shared = self.shared.snapshot()?;
         let queue = self.queue.snapshot()?;
         let total_pending_nsecs = shared.pending_nsecs.saturating_add(queue.pending_nsecs);
+        if self.shared.underrun_active.load(Ordering::Acquire) {
+            self.shared.clear_underrun_if_recovered(total_pending_nsecs);
+            if !self.shared.underrun_active.load(Ordering::Acquire) {
+                shared = self.shared.snapshot()?;
+            }
+        }
         Ok(AudioOutputSnapshot {
             played_timeline_nsecs: shared.played_timeline_nsecs,
             buffered_until_timeline_nsecs: shared
@@ -892,9 +956,29 @@ fn fill_audio_output_samples<T>(
 ) where
     T: Sample + FromSample<f32>,
 {
+    let callback_nsecs = duration_nsecs(shared.clock_start.elapsed());
+    let callback_index = shared
+        .callback_count
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let previous_callback_nsecs = shared
+        .last_callback_nsecs
+        .swap(callback_nsecs, Ordering::Relaxed);
+    if previous_callback_nsecs > 0 {
+        let callback_gap_nsecs = callback_nsecs.saturating_sub(previous_callback_nsecs);
+        if callback_gap_nsecs >= duration_nsecs(AUDIO_CALLBACK_GAP_LOG_AFTER) {
+            tracing::debug!(
+                callback_index,
+                callback_gap_ms = callback_gap_nsecs as f64 / 1_000_000.0,
+                output_samples = data.len(),
+                "native audio output callback gap exceeded threshold"
+            );
+        }
+    }
+
     let mut guard = shared.buffer.lock().expect("audio output buffer poisoned");
     if shared.control.should_pause_audio_output() {
-        for sample in data {
+        for sample in data.iter_mut() {
             *sample = T::from_sample(0.0);
         }
         shared.update_output_delay(Duration::ZERO);
@@ -904,6 +988,8 @@ fn fill_audio_output_samples<T>(
 
     let volume = shared.control.volume();
     let mut played = 0u64;
+    let output_samples = data.len();
+    let queued_samples_before = guard.len();
     for sample in data {
         let value = match guard.pop_sample() {
             Some(value) => {
@@ -915,6 +1001,7 @@ fn fill_audio_output_samples<T>(
         .clamp(-1.0, 1.0);
         *sample = T::from_sample(value);
     }
+    let queued_samples_after = guard.len();
     drop(guard);
 
     if played > 0 {
@@ -931,6 +1018,35 @@ fn fill_audio_output_samples<T>(
         );
     } else {
         shared.update_output_delay(Duration::ZERO);
+    }
+    let underrun_samples = output_samples.saturating_sub(usize::try_from(played).unwrap_or(0));
+    if underrun_samples > 0 {
+        let queued_duration_after_nsecs = duration_nsecs(audio_samples_duration(
+            queued_samples_after,
+            shared.sample_rate,
+            shared.channels,
+        ));
+        let underrun_timeline_nsecs =
+            shared.played_timeline_nsecs_from_pending(queued_duration_after_nsecs);
+        let underrun_started = shared.mark_underrun(underrun_timeline_nsecs);
+        let underrun_index = shared
+            .underrun_count
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if underrun_index == 1 || underrun_index.is_multiple_of(120) {
+            tracing::debug!(
+                callback_index,
+                underrun_count = underrun_index,
+                underrun_samples,
+                played_samples = played,
+                output_samples,
+                queued_samples_before,
+                queued_samples_after,
+                underrun_started,
+                underrun_timeline_nsecs,
+                "native audio output callback filled silence after underrun"
+            );
+        }
     }
     shared.ready.notify_all();
 }

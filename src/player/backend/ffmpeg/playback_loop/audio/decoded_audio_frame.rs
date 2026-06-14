@@ -112,6 +112,25 @@ pub(super) fn drain_ready_audio_decode_output(
         let Some(front_generation) = worker.front_generation() else {
             break;
         };
+        if output_scheduler.pending_start_audio_backpressured() {
+            let Some(output) = audio_output else {
+                break;
+            };
+            output_scheduler.flush_pending_start_audio_if_ready(
+                output,
+                control,
+                session_id,
+                vo_queue,
+                frame_presented,
+                position_reporter,
+                event_tx,
+                subtitle_pipeline,
+                buffered_reporter,
+            )?;
+            if output_scheduler.pending_start_audio_backpressured() {
+                break;
+            }
+        }
         let audio_time_base = worker.info().time_base;
 
         if let Some(decoded_frame) = worker.poll_frame(front_generation)? {

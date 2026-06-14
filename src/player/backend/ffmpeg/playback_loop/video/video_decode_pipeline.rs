@@ -440,6 +440,7 @@ impl VideoDecodePipeline {
         match result {
             Ok(()) => Ok(()),
             Err(error) if video_decode_error_is_recoverable(&error) => {
+                let resource_pressure = video_decode_error_is_resource_pressure(&error);
                 tracing::debug!(
                     %error,
                     codec = ?codec_id,
@@ -451,7 +452,8 @@ impl VideoDecodePipeline {
                     recovery_waiting_before = recovery.waiting_for_keyframe(),
                     recovery_skipped_packets = recovery.skipped_packets,
                     realign_after_recovery_point,
-                    "recovering FFmpeg video decoder after damaged reference chain"
+                    resource_pressure,
+                    "recovering FFmpeg video decoder after recoverable decode error"
                 );
                 let generation = playback_generation.advance();
                 self.flush_buffers(generation)?;
@@ -480,6 +482,10 @@ impl VideoDecodePipeline {
         self.worker.flush_buffers(generation)?;
         self.clear_packets();
         Ok(())
+    }
+
+    pub(super) fn service_worker(&mut self) -> std::result::Result<(), String> {
+        self.worker.service()
     }
 
     pub(super) fn request_drain(&mut self, generation: u64) -> std::result::Result<(), String> {
@@ -843,13 +849,12 @@ fn log_video_decode_packet_if_needed(
 }
 
 pub(in crate::player::backend::ffmpeg) fn video_decode_error_is_recoverable(error: &str) -> bool {
-    !video_decode_error_is_resource_exhaustion(error)
-        && (error == CORRUPT_VIDEO_FRAME_RECOVERY_ERROR
-            || error.starts_with("FFmpeg 发送解码包失败")
-            || error.starts_with("FFmpeg 接收解码帧失败"))
+    error == CORRUPT_VIDEO_FRAME_RECOVERY_ERROR
+        || error.starts_with("FFmpeg 发送解码包失败")
+        || error.starts_with("FFmpeg 接收解码帧失败")
 }
 
-fn video_decode_error_is_resource_exhaustion(error: &str) -> bool {
+fn video_decode_error_is_resource_pressure(error: &str) -> bool {
     error.contains("Cannot allocate memory") || error.contains("VK_ERROR_OUT_OF_DEVICE_MEMORY")
 }
 

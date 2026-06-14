@@ -181,6 +181,7 @@ where
     F: FnMut() -> DemuxReaderWatermark,
 {
     let mut made_progress = false;
+    video_decode_pipeline.service_worker()?;
     loop {
         let Some(front_generation) = video_decode_pipeline.front_generation() else {
             break;

@@ -14,7 +14,7 @@ use super::{
     backend::{
         BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest,
         BackendSubtitleBitmap, BackendSubtitleCue, FfmpegBackend, PlaybackCacheState,
-        PlaybackVideoInfo, StreamCacheKind,
+        PlaybackSeekMode, PlaybackVideoInfo, StreamCacheKind,
     },
     render_host::RenderSize,
     tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection},
@@ -36,10 +36,10 @@ mod video_element;
 pub use request::PlaybackRequest;
 
 use progress::{
-    ProgressBarDrag, buffered_progress_fraction, buffered_until_after_seek,
-    byte_cache_range_fractions, cache_range_fractions, cached_seek_target, clamp_playback_position,
-    format_playback_time, playback_status_message, progress_fraction, progress_fraction_for_cursor,
-    should_apply_backend_position, valid_playback_duration, valid_playback_time,
+    ProgressBarDrag, buffered_until_after_seek, cache_range_fractions, cached_seek_target,
+    clamp_playback_position, format_playback_time, playback_status_message, progress_fraction,
+    progress_fraction_for_cursor, should_apply_backend_position, valid_playback_duration,
+    valid_playback_time,
 };
 use render::{
     AnimationFrameRequestState, aspect_fit_bounds, defer_drop_frame, normalize_video_viewport,
@@ -359,6 +359,10 @@ impl Render for PlaybackPage {
             .frame
             .viewport_bounds
             .is_some_and(|viewport_bounds| normalize_video_viewport(viewport_bounds).is_some());
+        let video_presenter_needs_frame = self
+            .video
+            .dependent()
+            .is_some_and(|presenter| presenter.snapshot().needs_animation_frame());
         if should_request_animation_frame(AnimationFrameRequestState {
             has_backend: self.video.owner().is_some(),
             has_video_presenter: self.video.dependent().is_some(),
@@ -370,6 +374,7 @@ impl Render for PlaybackPage {
             playback_paused: self.timeline.paused,
             playback_buffering: self.timeline.buffering,
             pending_seek: self.timeline.pending_seek_position.is_some(),
+            video_presenter_needs_frame,
         }) {
             window.request_animation_frame();
         }

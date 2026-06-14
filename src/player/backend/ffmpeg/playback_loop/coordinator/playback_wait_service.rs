@@ -32,7 +32,7 @@ impl PlaybackPipelineWaitService {
 
     pub(super) fn observe_stall(
         &self,
-        context: PlaybackPipelineWaitContext<'_>,
+        context: &mut PlaybackPipelineWaitContext<'_>,
         stall_reason: &'static str,
     ) {
         let snapshot = PlaybackPipelineSnapshot::capture(PlaybackPipelineSnapshotContext {
@@ -52,10 +52,36 @@ impl PlaybackPipelineWaitService {
 
     pub(super) fn wait_after_stall(
         &self,
-        context: PlaybackPipelineWaitContext<'_>,
+        mut context: PlaybackPipelineWaitContext<'_>,
         stall_reason: &'static str,
     ) {
-        self.observe_stall(context, stall_reason);
-        thread::sleep(SCHEDULER_POLL_INTERVAL);
+        self.observe_stall(&mut context, stall_reason);
+        let wait_duration = self.wait_duration_after_stall(&context);
+        wait_for_stall_duration(wait_duration);
+    }
+
+    fn wait_duration_after_stall(&self, context: &PlaybackPipelineWaitContext<'_>) -> Duration {
+        let Some(audio_output) = context.audio_output else {
+            return SCHEDULER_POLL_INTERVAL;
+        };
+        let Ok(audio_snapshot) = audio_output.snapshot() else {
+            return SCHEDULER_POLL_INTERVAL;
+        };
+        if audio_snapshot.total_pending_nsecs == 0 {
+            return SCHEDULER_POLL_INTERVAL;
+        }
+        context
+            .output_scheduler
+            .audio_clocked_video_wait_duration(audio_snapshot.played_timeline_nsecs)
+            .map(|duration| duration.min(SCHEDULER_POLL_INTERVAL))
+            .unwrap_or(SCHEDULER_POLL_INTERVAL)
+    }
+}
+
+fn wait_for_stall_duration(duration: Duration) {
+    if duration.is_zero() {
+        thread::yield_now();
+    } else {
+        thread::sleep(duration);
     }
 }

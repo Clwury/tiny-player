@@ -1,5 +1,6 @@
 use super::output_gate::{OutputGateResumeStatus, service_output_gate_resume_if_ready};
 use super::output_rebuffer::demux_reader_ready_for_output;
+use super::playback_block::video_output_resource_pressure;
 use super::playback_snapshot::PlaybackPipelineTelemetry;
 use super::playback_wait_service::{PlaybackPipelineWaitContext, PlaybackPipelineWaitService};
 use super::*;
@@ -54,6 +55,27 @@ fn service_output_gate_or_wait(
 ) -> std::result::Result<OutputGateServiceStatus, String> {
     let status = output_gate_service_status(&mut context)?;
     let current_start_position_nsecs = context.pipeline.current_start_position_nsecs;
+    let video_decode_snapshot = context.pipeline.video_decode_pipeline.snapshot();
+    let output_resource_pressure = video_output_resource_pressure(
+        context
+            .pipeline
+            .output_scheduler
+            .scheduled_video_queue_len(),
+        video_decode_snapshot.queued_frames,
+        video_decode_snapshot.in_flight_packets,
+        context
+            .pipeline
+            .video_decode_pipeline
+            .info()
+            .hardware_accelerated,
+        context
+            .pipeline
+            .output_scheduler
+            .scheduled_video_queue_limit_reached(
+                context.pipeline.subtitle_pipeline.needs_prefetch(),
+            ),
+        context.pipeline.output_scheduler.output_fill_phase(),
+    );
     match service_output_gate_resume_if_ready(
         &mut context.pipeline.output_scheduler,
         context.pipeline.audio_output.as_ref(),
@@ -68,6 +90,7 @@ fn service_output_gate_or_wait(
         current_start_position_nsecs,
         &mut context.pipeline.current_start_position_nsecs,
         &mut context.pipeline.scheduler,
+        output_resource_pressure,
         || context.demux_cache.reader_watermark(),
     )? {
         OutputGateResumeStatus::Resumed => Ok(OutputGateServiceStatus {
@@ -97,24 +120,27 @@ fn output_gate_service_status(
         .as_ref()
         .map(AudioOutput::snapshot)
         .transpose()?;
+    let output_underrun = context
+        .pipeline
+        .audio_output
+        .as_ref()
+        .is_some_and(AudioOutput::underrun_active);
     let played_until_nsecs = audio_output_snapshot.map(|snapshot| snapshot.played_timeline_nsecs);
     let output_snapshot = context
         .pipeline
         .output_scheduler
         .snapshot_for_played_until(played_until_nsecs);
-    let video_output_underflowing = output_snapshot.underflowing();
-    let demux_cache_insufficient = demux_cache_insufficient_for_output_rebuffer(
-        video_output_underflowing,
-        has_audio_output,
-        render_backlogged,
-        || context.demux_cache.reader_watermark(),
-    );
+    let output_underflowing = output_snapshot.underflowing()
+        || audio_output_starving(output_snapshot, audio_output_snapshot);
+    let demux_cache_insufficient =
+        !demux_reader_ready_for_output(context.demux_cache.reader_watermark(), has_audio_output);
     context
         .pipeline
         .output_scheduler
         .maybe_enter_video_output_rebuffer(
             Instant::now(),
-            video_output_underflowing,
+            output_underflowing,
+            output_underrun,
             demux_cache_insufficient,
             render_backlogged,
             has_audio_output,
@@ -138,20 +164,13 @@ fn output_gate_service_status(
     })
 }
 
-fn demux_cache_insufficient_for_output_rebuffer<F>(
-    video_output_underflowing: bool,
-    has_audio_output: bool,
-    render_backlogged: bool,
-    demux_reader_watermark: F,
-) -> bool
-where
-    F: FnOnce() -> DemuxReaderWatermark,
-{
-    if !video_output_underflowing || !has_audio_output || render_backlogged {
-        return false;
-    }
-
-    !demux_reader_ready_for_output(demux_reader_watermark(), has_audio_output)
+fn audio_output_starving(
+    output_snapshot: PlaybackOutputSnapshot,
+    audio_output_snapshot: Option<AudioOutputSnapshot>,
+) -> bool {
+    matches!(output_snapshot.state, PlaybackOutputState::Playing)
+        && output_snapshot.queued_video_frames > 0
+        && audio_output_snapshot.is_some_and(|snapshot| snapshot.total_pending_nsecs == 0)
 }
 
 fn wait_after_output_gate_stall(
@@ -179,22 +198,6 @@ fn wait_after_output_gate_stall(
 mod tests {
     use super::*;
 
-    fn ready_demux_watermark() -> DemuxReaderWatermark {
-        let target_nsecs = duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
-        DemuxReaderWatermark {
-            video_forward_nsecs: Some(target_nsecs),
-            audio_forward_nsecs: Some(target_nsecs),
-            selected_min_forward_nsecs: Some(target_nsecs),
-            video_underrun: false,
-            audio_underrun: false,
-            video_idle: false,
-            audio_idle: false,
-            underrun: false,
-            idle: false,
-            forward_bytes: 1024,
-        }
-    }
-
     #[test]
     fn output_gate_service_status_reports_continue() {
         let status = OutputGateServiceStatus {
@@ -216,38 +219,57 @@ mod tests {
     }
 
     #[test]
-    fn output_gate_rebuffer_does_not_query_demux_when_render_is_backlogged() {
-        assert!(!demux_cache_insufficient_for_output_rebuffer(
-            true,
-            true,
-            true,
-            || panic!("render backlog must not ask demux cache for rebuffer")
-        ));
-    }
+    fn audio_output_starving_tracks_audio_clock_output_underrun() {
+        let playing_with_video = PlaybackOutputSnapshot {
+            state: PlaybackOutputState::Playing,
+            first_video_frame_pending: false,
+            rebuffering: false,
+            queued_video_frames: 20,
+            queued_video_duration_nsecs: 800_000_000,
+            queued_video_range_nsecs: Some((1_000_000_000, 1_800_000_000)),
+            queued_video_forward_nsecs: Some(800_000_000),
+            video_output_low_water: false,
+            pending_start_audio_frames: 0,
+            pending_start_audio_nsecs: 0,
+            video_output_rebuffer_anchor: None,
+        };
+        let underrun_audio = AudioOutputSnapshot {
+            played_timeline_nsecs: 1_000_000_000,
+            buffered_until_timeline_nsecs: 1_000_000_000,
+            shared_pending_nsecs: 0,
+            queue_pending_nsecs: 0,
+            total_pending_nsecs: 0,
+            queue_frames: 0,
+            queue_generation: 7,
+        };
+        let buffered_audio = AudioOutputSnapshot {
+            total_pending_nsecs: 100_000_000,
+            buffered_until_timeline_nsecs: 1_100_000_000,
+            ..underrun_audio
+        };
 
-    #[test]
-    fn output_gate_rebuffer_uses_demux_watermark_only_for_real_output_underflow() {
-        let insufficient = demux_cache_insufficient_for_output_rebuffer(true, true, false, || {
-            DemuxReaderWatermark {
-                video_forward_nsecs: Some(1),
-                audio_forward_nsecs: Some(1),
-                selected_min_forward_nsecs: Some(1),
-                ..ready_demux_watermark()
-            }
-        });
-        assert!(insufficient);
-
-        assert!(!demux_cache_insufficient_for_output_rebuffer(
-            false,
-            true,
-            false,
-            || panic!("non-underflow output must not ask demux cache for rebuffer")
+        assert!(audio_output_starving(
+            playing_with_video,
+            Some(underrun_audio)
         ));
-        assert!(!demux_cache_insufficient_for_output_rebuffer(
-            true,
-            false,
-            false,
-            || panic!("video-only output must not ask demux cache for audio rebuffer")
+        assert!(!audio_output_starving(
+            playing_with_video,
+            Some(buffered_audio)
+        ));
+        assert!(!audio_output_starving(
+            PlaybackOutputSnapshot {
+                queued_video_frames: 0,
+                ..playing_with_video
+            },
+            Some(underrun_audio)
+        ));
+        assert!(!audio_output_starving(
+            PlaybackOutputSnapshot {
+                state: PlaybackOutputState::Rebuffering,
+                rebuffering: true,
+                ..playing_with_video
+            },
+            Some(underrun_audio)
         ));
     }
 }

@@ -38,6 +38,12 @@ pub struct VideoPresenterSnapshot {
     pub blocked_on: Option<&'static str>,
 }
 
+impl VideoPresenterSnapshot {
+    pub fn needs_animation_frame(&self) -> bool {
+        self.queued > 0 || self.rendering || self.ready || self.pending_render_requests > 0
+    }
+}
+
 pub struct VideoPresenter {
     vo_queue: VideoOutputQueue,
     render_worker: VideoRenderWorker,

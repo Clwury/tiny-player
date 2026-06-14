@@ -79,6 +79,7 @@ pub(super) struct AnimationFrameRequestState {
     pub(super) playback_paused: bool,
     pub(super) playback_buffering: bool,
     pub(super) pending_seek: bool,
+    pub(super) video_presenter_needs_frame: bool,
 }
 
 pub(super) fn should_request_animation_frame(state: AnimationFrameRequestState) -> bool {
@@ -89,7 +90,10 @@ pub(super) fn should_request_animation_frame(state: AnimationFrameRequestState) 
         && (!state.has_loaded_file
             || state.playback_buffering
             || state.pending_seek
-            || (state.has_viewport && (!state.playback_paused || !state.has_visible_frame)))
+            || (state.has_viewport
+                && (state.video_presenter_needs_frame
+                    || !state.playback_paused
+                    || !state.has_visible_frame)))
 }
 
 #[cfg(test)]
@@ -348,6 +352,25 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn should_request_animation_frame_continues_while_presenter_has_work() {
+        assert!(should_request_animation_frame(AnimationFrameRequestState {
+            video_presenter_needs_frame: true,
+            ..animation_frame_request_state()
+        }));
+    }
+
+    #[test]
+    fn should_request_animation_frame_waits_for_viewport_when_only_presenter_has_work() {
+        assert!(!should_request_animation_frame(
+            AnimationFrameRequestState {
+                has_viewport: false,
+                video_presenter_needs_frame: true,
+                ..animation_frame_request_state()
+            }
+        ));
+    }
+
     fn animation_frame_request_state() -> AnimationFrameRequestState {
         AnimationFrameRequestState {
             has_backend: true,
@@ -360,6 +383,7 @@ mod tests {
             playback_paused: true,
             playback_buffering: false,
             pending_seek: false,
+            video_presenter_needs_frame: false,
         }
     }
 }

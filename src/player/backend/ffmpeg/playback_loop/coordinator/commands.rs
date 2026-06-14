@@ -51,6 +51,7 @@ mod tests {
         let pending = PendingSeek {
             session_id: PlaybackSessionId(2),
             position_seconds: 12.0,
+            mode: PlaybackSeekMode::Fast,
             generation: 1,
         };
         control.set_user_paused(true);

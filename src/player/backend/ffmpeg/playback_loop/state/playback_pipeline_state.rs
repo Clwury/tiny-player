@@ -2,6 +2,9 @@ use super::audio_decode_worker::AudioDecodePacketResult;
 use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
 use super::decoded_audio_frame::process_audio_decode_drain_result;
 use super::drain_phase::{PlaybackDrainPhase, PlaybackDrainResults};
+use super::playback_block::{
+    video_decode_block_reason_with_output_queue, video_output_resource_pressure,
+};
 use super::video_decode_drain_frame_processor::{
     VideoDecodeDrainFrameProcessor, VideoDecodeDrainProcessStatus,
 };
@@ -180,11 +183,14 @@ impl PlaybackPipelineState {
     ) -> std::result::Result<DecodeInputRetryStatus, String> {
         let video_retry_status = self.video_decode_pipeline.retry_pending_input(session_id)?;
 
-        let audio_retry_status = self
-            .audio_decode_pipeline
-            .as_mut()
-            .map(|worker| worker.retry_pending_input(session_id))
-            .transpose()?;
+        let audio_retry_status = if self.audio_input_suppressed_until_output_resume() {
+            None
+        } else {
+            self.audio_decode_pipeline
+                .as_mut()
+                .map(|worker| worker.retry_pending_input(session_id))
+                .transpose()?
+        };
 
         let subtitle_retry_status = self.subtitle_pipeline.retry_pending_input(
             SubtitleDecodeContext {
@@ -207,18 +213,33 @@ impl PlaybackPipelineState {
 
     pub(super) fn decoder_input_snapshot(&self) -> DecoderInputSnapshot {
         let video_decode_snapshot = self.video_decode_pipeline.snapshot();
-        let video_decode_blocked_on = VideoDecodePipeline::block_reason_for(
-            video_decode_snapshot,
-            self.video_decode_pipeline.info(),
+        let scheduled_video_queue_limit_reached = self
+            .output_scheduler
+            .scheduled_video_queue_limit_reached(self.subtitle_pipeline.needs_prefetch());
+        let video_decode_blocked_on = video_decode_block_reason_with_output_queue(
+            VideoDecodePipeline::block_reason_for(
+                video_decode_snapshot,
+                self.video_decode_pipeline.info(),
+            ),
+            video_output_resource_pressure(
+                self.output_scheduler.scheduled_video_queue_len(),
+                video_decode_snapshot.queued_frames,
+                video_decode_snapshot.in_flight_packets,
+                self.video_decode_pipeline.info().hardware_accelerated,
+                scheduled_video_queue_limit_reached,
+                self.output_scheduler.output_fill_phase(),
+            ),
         );
         let video_stream_index = self.video_decode_stream_index();
+        let audio_input_suppressed = self.audio_input_suppressed_until_output_resume();
         let audio_stream = self.audio_decode_pipeline.as_ref().map(|pipeline| {
             let audio_decode_snapshot = pipeline.snapshot();
             DecoderInputStreamState {
                 stream_index: pipeline.info().stream_index,
-                packet_input_blocked: decoder_block_reason_blocks_packet_input(
-                    AudioDecodePipeline::block_reason_for(audio_decode_snapshot),
-                ),
+                packet_input_blocked: audio_input_suppressed
+                    || decoder_block_reason_blocks_packet_input(
+                        AudioDecodePipeline::block_reason_for(audio_decode_snapshot),
+                    ),
             }
         });
         let subtitle_stream = self.subtitle_pipeline.stream_index().map(|stream_index| {
@@ -253,6 +274,17 @@ impl PlaybackPipelineState {
         }
     }
 
+    fn audio_input_suppressed_until_output_resume(&self) -> bool {
+        audio_input_suppressed_until_output_resume_state(
+            self.audio_decode_pipeline.is_some(),
+            self.output_scheduler.rebuffering(),
+            self.output_scheduler.first_video_frame_pending,
+            self.output_scheduler
+                .pending_start_audio
+                .buffered_duration(),
+        )
+    }
+
     pub(super) fn video_packet_admission_pressure(
         &self,
         played_until_nsecs: Option<u64>,
@@ -262,9 +294,11 @@ impl PlaybackPipelineState {
             output_snapshot: self
                 .output_scheduler
                 .snapshot_for_played_until(played_until_nsecs),
-            skip_nonref_for_pressure: self
-                .output_scheduler
-                .video_decode_skip_nonref_for_pressure(played_until_nsecs, has_audio_output),
+            skip_nonref_for_pressure: self.output_scheduler.video_decode_skip_nonref_for_pressure(
+                played_until_nsecs,
+                has_audio_output,
+                self.video_decode_skip_nonref_active,
+            ),
             played_until_nsecs,
         }
     }
@@ -344,10 +378,22 @@ fn decoder_block_reason_blocks_packet_input(blocked_on: Option<PlaybackBlockReas
         blocked_on,
         Some(
             PlaybackBlockReason::PacketQueueFull
+                | PlaybackBlockReason::DecodedVideoQueue
                 | PlaybackBlockReason::DecodedQueueFull
                 | PlaybackBlockReason::HwSurfacePool
         )
     )
+}
+
+fn audio_input_suppressed_until_output_resume_state(
+    has_audio_decode_pipeline: bool,
+    output_rebuffering: bool,
+    first_video_frame_pending: bool,
+    pending_start_audio_duration: Duration,
+) -> bool {
+    has_audio_decode_pipeline
+        && (output_rebuffering || first_video_frame_pending)
+        && pending_start_audio_duration >= VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
 }
 
 fn decoder_input_streams_for_state(
@@ -428,9 +474,50 @@ mod tests {
     }
 
     #[test]
+    fn audio_input_suppression_waits_until_audio_covers_resume_waterline() {
+        assert!(audio_input_suppressed_until_output_resume_state(
+            true,
+            true,
+            false,
+            VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
+        ));
+        assert!(audio_input_suppressed_until_output_resume_state(
+            true,
+            false,
+            true,
+            VIDEO_OUTPUT_REBUFFER_RESUME_DURATION + Duration::from_millis(1)
+        ));
+        assert!(!audio_input_suppressed_until_output_resume_state(
+            true,
+            true,
+            false,
+            VIDEO_OUTPUT_REBUFFER_RESUME_DURATION - Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn audio_input_suppression_only_applies_while_output_waits_for_video() {
+        assert!(!audio_input_suppressed_until_output_resume_state(
+            false,
+            true,
+            false,
+            VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
+        ));
+        assert!(!audio_input_suppressed_until_output_resume_state(
+            true,
+            false,
+            false,
+            VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
+        ));
+    }
+
+    #[test]
     fn decoder_block_reason_blocks_only_packet_input_pressure() {
         assert!(decoder_block_reason_blocks_packet_input(Some(
             PlaybackBlockReason::PacketQueueFull
+        )));
+        assert!(decoder_block_reason_blocks_packet_input(Some(
+            PlaybackBlockReason::DecodedVideoQueue
         )));
         assert!(decoder_block_reason_blocks_packet_input(Some(
             PlaybackBlockReason::DecodedQueueFull

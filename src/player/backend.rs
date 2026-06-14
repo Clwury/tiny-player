@@ -22,11 +22,19 @@ pub struct BackendLoadRequest {
     pub cache_config: PlaybackCacheConfig,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlaybackSeekMode {
+    #[default]
+    Precise,
+    Fast,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum BackendCommand {
     Load(BackendLoadRequest),
     Seek {
         position_seconds: f64,
+        mode: PlaybackSeekMode,
     },
     Pause,
     Resume,
@@ -56,6 +64,9 @@ pub enum BackendCommand {
 pub trait BackendControl {
     fn load(&mut self, request: BackendLoadRequest) -> Result<()>;
     fn seek(&mut self, position_seconds: f64) -> Result<()>;
+    fn seek_with_mode(&mut self, position_seconds: f64, _mode: PlaybackSeekMode) -> Result<()> {
+        self.seek(position_seconds)
+    }
     fn pause(&mut self) -> Result<()>;
     fn resume(&mut self) -> Result<()>;
     #[allow(dead_code)]
@@ -90,7 +101,10 @@ pub trait BackendControl {
     fn command(&mut self, command: BackendCommand) -> Result<()> {
         match command {
             BackendCommand::Load(request) => self.load(request),
-            BackendCommand::Seek { position_seconds } => self.seek(position_seconds),
+            BackendCommand::Seek {
+                position_seconds,
+                mode,
+            } => self.seek_with_mode(position_seconds, mode),
             BackendCommand::Pause => self.pause(),
             BackendCommand::Resume => self.resume(),
             BackendCommand::Stop => self.stop(),

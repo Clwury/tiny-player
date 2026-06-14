@@ -79,9 +79,6 @@ fn service_decoder_input_once(
         Ok(status) => status,
         Err(error) => return DecoderInputServiceStatus::Error(error),
     };
-    if retry_status.backpressured() {
-        return DecoderInputServiceStatus::Backpressured;
-    }
 
     let result = service
         .demux_packet_pump
@@ -108,6 +105,13 @@ fn decoder_input_status_after_retry(
         )
     {
         DecoderInputServiceStatus::Progress
+    } else if retry_status.backpressured()
+        && matches!(
+            status,
+            DecoderInputServiceStatus::WouldBlock | DecoderInputServiceStatus::Eof
+        )
+    {
+        DecoderInputServiceStatus::Backpressured
     } else {
         status
     }
@@ -168,6 +172,31 @@ mod tests {
             decoder_input_status_after_retry(
                 DecodeInputRetryStatus::Queued,
                 DemuxPacketPumpResult::Backpressured
+            ),
+            DecoderInputServiceStatus::Backpressured
+        );
+    }
+
+    #[test]
+    fn decoder_input_service_pumps_other_streams_while_retry_backpressured() {
+        assert_eq!(
+            decoder_input_status_after_retry(
+                DecodeInputRetryStatus::Backpressured,
+                DemuxPacketPumpResult::Progress
+            ),
+            DecoderInputServiceStatus::Progress
+        );
+        assert_eq!(
+            decoder_input_status_after_retry(
+                DecodeInputRetryStatus::Backpressured,
+                DemuxPacketPumpResult::WouldBlock
+            ),
+            DecoderInputServiceStatus::Backpressured
+        );
+        assert_eq!(
+            decoder_input_status_after_retry(
+                DecodeInputRetryStatus::Backpressured,
+                DemuxPacketPumpResult::Eof
             ),
             DecoderInputServiceStatus::Backpressured
         );

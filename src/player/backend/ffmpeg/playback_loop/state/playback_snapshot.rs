@@ -1,5 +1,8 @@
 use super::audio_decode_worker::AudioDecodeWorkerSnapshot;
 use super::demux_cache::DemuxPacketQueueSnapshot;
+use super::playback_block::{
+    video_decode_block_reason_with_output_queue, video_output_resource_pressure,
+};
 use super::subtitle_decode_worker::SubtitleDecodeWorkerSnapshot;
 use super::video_decode_worker::VideoDecodeWorkerSnapshot;
 use super::video_frame_prepare_worker::VideoFramePrepareWorkerSnapshot;
@@ -36,16 +39,41 @@ pub(super) struct PlaybackPipelineSnapshot {
     output_snapshot: PlaybackOutputSnapshot,
     vo_snapshot: VideoOutputQueueSnapshot,
     audio_output_snapshot: Option<AudioOutputSnapshot>,
+    demux_snapshot_unavailable: bool,
+    demux_read_blocked_for: Option<Duration>,
 }
 
 impl PlaybackPipelineSnapshot {
     pub(super) fn capture(context: PlaybackPipelineSnapshotContext<'_>) -> Self {
-        let demux_packet_snapshot = context.demux_cache.packet_queue_snapshot();
-        let demux_reader_watermark = context.demux_cache.reader_watermark();
+        let (demux_packet_snapshot, demux_reader_watermark, demux_snapshot_unavailable) = context
+            .demux_cache
+            .try_monitor_snapshot()
+            .map(|(packet_snapshot, watermark)| (packet_snapshot, watermark, false))
+            .unwrap_or_else(|| {
+                (
+                    DemuxPacketQueueSnapshot::default(),
+                    DemuxReaderWatermark::default(),
+                    true,
+                )
+            });
+        let demux_read_blocked_for = context.demux_cache.demux_read_blocked_for();
         let video_decode_snapshot = context.video_decode_pipeline.snapshot();
-        let video_decode_blocked_on = VideoDecodePipeline::block_reason_for(
-            video_decode_snapshot,
-            context.video_decode_pipeline.info(),
+        let scheduled_video_queue_limit_reached = context
+            .output_scheduler
+            .scheduled_video_queue_limit_reached(context.subtitle_pipeline.needs_prefetch());
+        let video_decode_blocked_on = video_decode_block_reason_with_output_queue(
+            VideoDecodePipeline::block_reason_for(
+                video_decode_snapshot,
+                context.video_decode_pipeline.info(),
+            ),
+            video_output_resource_pressure(
+                context.output_scheduler.scheduled_video_queue_len(),
+                video_decode_snapshot.queued_frames,
+                video_decode_snapshot.in_flight_packets,
+                context.video_decode_pipeline.info().hardware_accelerated,
+                scheduled_video_queue_limit_reached,
+                context.output_scheduler.output_fill_phase(),
+            ),
         );
         let video_frame_prepare_snapshot = context
             .video_frame_prepare_worker
@@ -64,7 +92,9 @@ impl PlaybackPipelineSnapshot {
         let audio_output_snapshot = context
             .audio_output
             .and_then(|output| output.snapshot().ok());
-        let output_snapshot = context.output_scheduler.snapshot();
+        let output_snapshot = context.output_scheduler.snapshot_for_played_until(
+            audio_output_snapshot.map(|snapshot| snapshot.played_timeline_nsecs),
+        );
         let blocked_reasons = Self::resolve_block_reasons(
             vo_snapshot,
             video_decode_blocked_on,
@@ -101,6 +131,8 @@ impl PlaybackPipelineSnapshot {
             output_snapshot,
             vo_snapshot,
             audio_output_snapshot,
+            demux_snapshot_unavailable,
+            demux_read_blocked_for,
         }
     }
 
@@ -274,6 +306,10 @@ impl PlaybackPipelineSnapshot {
             demux_packet_queued = self.demux_packet_snapshot.total_packets,
             demux_packet_bytes = self.demux_packet_snapshot.total_bytes,
             demux_packet_limit_bytes = self.demux_packet_snapshot.memory_limit_bytes,
+            demux_snapshot_unavailable = self.demux_snapshot_unavailable,
+            demux_read_blocked_ms = ?self
+                .demux_read_blocked_for
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
             demux_packet_streams = ?self.demux_packet_snapshot.streams,
             demux_video_forward_ms = ?self
                 .demux_reader_watermark
@@ -413,6 +449,7 @@ fn decoder_backpressure_reasons(
         matches!(
             reason,
             PlaybackBlockReason::PacketQueueFull
+                | PlaybackBlockReason::DecodedVideoQueue
                 | PlaybackBlockReason::DecodedQueueFull
                 | PlaybackBlockReason::HwSurfacePool
                 | PlaybackBlockReason::FramePrepareWorker
@@ -591,6 +628,23 @@ mod tests {
         );
 
         assert_eq!(blocked_on, PlaybackBlockReason::DecodedQueueFull);
+    }
+
+    #[test]
+    fn playback_snapshot_reports_decoded_video_queue_pressure() {
+        let blocked_on = PlaybackPipelineSnapshot::resolve_blocked_on(
+            vo_snapshot(0, 3, RenderBackpressure::default()),
+            Some(PlaybackBlockReason::DecodedVideoQueue),
+            None,
+            None,
+            None,
+            false,
+            idle_demux_watermark(),
+            None,
+            PlaybackOutputState::Playing,
+        );
+
+        assert_eq!(blocked_on, PlaybackBlockReason::DecodedVideoQueue);
     }
 
     #[test]

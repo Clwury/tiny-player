@@ -111,9 +111,6 @@ pub struct PlaybackCacheConfig {
     pub unlink_files: CacheUnlinkPolicy,
 }
 
-const NETWORK_DEMUXER_READAHEAD_SECS: f64 = 8.0;
-const NETWORK_DEMUXER_HYSTERESIS_SECS: f64 = 2.0;
-
 impl Default for PlaybackCacheConfig {
     fn default() -> Self {
         Self {
@@ -171,14 +168,6 @@ impl PlaybackCacheConfig {
             } else {
                 PlaybackCacheMode::Disabled
             };
-        }
-        if input_cacheable && !matches!(self.mode, PlaybackCacheMode::Disabled) {
-            self.demuxer_readahead_secs = self
-                .demuxer_readahead_secs
-                .max(NETWORK_DEMUXER_READAHEAD_SECS);
-            self.demuxer_hysteresis_secs = self
-                .demuxer_hysteresis_secs
-                .max(NETWORK_DEMUXER_HYSTERESIS_SECS);
         }
         self
     }
@@ -418,13 +407,20 @@ mod tests {
         assert!(!network.demuxer_cache_wait);
         assert!(!network.cache_pause_initial);
         assert_eq!(network.cache_pause_wait, 1.0);
-        assert_eq!(network.demuxer_readahead_secs, 8.0);
-        assert_eq!(network.demuxer_hysteresis_secs, 2.0);
+        assert_eq!(network.demuxer_readahead_secs, 1.0);
+        assert_eq!(network.demuxer_hysteresis_secs, 0.0);
+        assert_eq!(network.demuxer_max_bytes, 150 * 1024 * 1024);
+        assert_eq!(network.demuxer_max_back_bytes, 50 * 1024 * 1024);
+        assert!(network.demuxer_donate_buffer);
+        assert_eq!(network.effective_readahead_secs(true), 1000.0 * 60.0 * 60.0);
 
         assert!(!local.demuxer_cache_wait);
         assert!(!local.cache_pause_initial);
         assert_eq!(local.cache_pause_wait, 1.0);
         assert_eq!(local.demuxer_readahead_secs, 1.0);
+        assert_eq!(local.demuxer_hysteresis_secs, 0.0);
+        assert!(local.demuxer_donate_buffer);
+        assert_eq!(local.effective_readahead_secs(false), 1.0);
     }
 
     #[test]

@@ -155,6 +155,7 @@ pub(super) enum FfmpegCommand {
     Seek {
         session_id: PlaybackSessionId,
         position_seconds: f64,
+        mode: PlaybackSeekMode,
         generation: u64,
     },
     Pause {
@@ -186,6 +187,7 @@ pub(super) enum FfmpegCommand {
 pub(super) struct PendingSeek {
     pub(super) session_id: PlaybackSessionId,
     pub(super) position_seconds: f64,
+    pub(super) mode: PlaybackSeekMode,
     pub(super) generation: u64,
 }
 
@@ -268,12 +270,18 @@ impl FfmpegWorker {
         })
     }
 
-    pub(super) fn seek(&self, position_seconds: f64, session_id: PlaybackSessionId) -> Result<()> {
+    pub(super) fn seek(
+        &self,
+        position_seconds: f64,
+        mode: PlaybackSeekMode,
+        session_id: PlaybackSessionId,
+    ) -> Result<()> {
         let generation = self.control.request_seek();
         self.control.set_cache_paused(false);
         tracing::debug!(
             ?session_id,
             position_seconds,
+            ?mode,
             generation,
             "queueing FFmpeg seek command"
         );
@@ -281,6 +289,7 @@ impl FfmpegWorker {
             .send(FfmpegCommand::Seek {
                 session_id,
                 position_seconds,
+                mode,
                 generation,
             })
             .map_err(|_| {
@@ -396,12 +405,14 @@ pub(super) fn drain_playback_commands(
             FfmpegCommand::Seek {
                 session_id,
                 position_seconds,
+                mode,
                 generation,
             } => {
                 pending_track_selection = None;
                 pending_seek = Some(PendingSeek {
                     session_id,
                     position_seconds: position_seconds.max(0.0),
+                    mode,
                     generation,
                 });
             }

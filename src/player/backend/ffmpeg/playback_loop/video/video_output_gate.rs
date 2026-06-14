@@ -1,6 +1,6 @@
 use super::audio_output_gate::{
-    drain_audio_clocked_decoded_video_step, flush_pending_start_audio,
-    service_audio_clocked_video_queue,
+    DelayedAudioStartSilencePolicy, drain_audio_clocked_decoded_video_step,
+    flush_pending_start_audio, service_audio_clocked_video_queue,
 };
 use super::output_gate::{
     OutputGateResumeStatus, PlaybackOutputScheduler, service_output_gate_resume_if_ready,
@@ -95,6 +95,7 @@ pub(in crate::player::backend::ffmpeg) fn service_audio_clocked_video_queue_if_p
     position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
     subtitle_pipeline: &mut SubtitlePipeline,
+    buffered_reporter: &mut BufferedReporter,
 ) -> std::result::Result<bool, String> {
     let Some(output) = output else {
         return Ok(false);
@@ -106,6 +107,17 @@ pub(in crate::player::backend::ffmpeg) fn service_audio_clocked_video_queue_if_p
     {
         return Ok(false);
     }
+    output_scheduler.flush_pending_start_audio_if_ready(
+        output,
+        control,
+        session_id,
+        vo_queue,
+        frame_presented,
+        position_reporter,
+        event_tx,
+        subtitle_pipeline,
+        buffered_reporter,
+    )?;
     service_audio_clocked_video_queue(
         output,
         control,
@@ -143,6 +155,7 @@ pub(in crate::player::backend::ffmpeg) fn service_decode_backpressure_step(
         position_reporter,
         event_tx,
         subtitle_pipeline,
+        buffered_reporter,
     )?;
     let video_progressed = service_video_clocked_video_queue_if_no_audio(
         scheduler,
@@ -426,30 +439,19 @@ where
         timeline_nsecs,
         current_start_position_nsecs,
         scheduler,
+        false,
         demux_watermark,
     )? {
-        OutputGateResumeStatus::Resumed if first_video_frame_pending_before_queue => {
-            return Ok(DecodedVideoAdmissionStatus::Stop);
-        }
+        OutputGateResumeStatus::Resumed => return Ok(DecodedVideoAdmissionStatus::Stop),
         OutputGateResumeStatus::Waiting | OutputGateResumeStatus::WaitingForDemux => {
             return Ok(DecodedVideoAdmissionStatus::Stop);
         }
-        OutputGateResumeStatus::Idle | OutputGateResumeStatus::Resumed => {}
+        OutputGateResumeStatus::Idle => {}
     }
     if !output_scheduler.pending_start_audio.is_empty() {
-        let audio_snapshot = output.snapshot()?;
-        let audio_start_timeline_nsecs = audio_snapshot.played_timeline_nsecs;
-        let audio_flush_until_timeline_nsecs = output_scheduler
-            .scheduled_video_queue
-            .audio_output_lead_until_nsecs()
-            .unwrap_or(audio_start_timeline_nsecs);
-        flush_pending_start_audio(
-            &mut output_scheduler.pending_start_audio,
+        output_scheduler.flush_pending_start_audio_if_ready(
             output,
-            audio_start_timeline_nsecs,
-            audio_flush_until_timeline_nsecs,
             control,
-            &mut output_scheduler.scheduled_video_queue,
             session_id,
             vo_queue,
             frame_presented,
@@ -510,6 +512,7 @@ pub(in crate::player::backend::ffmpeg) fn service_audio_clocked_drain_decoded_vi
             output,
             timeline_nsecs,
             audio_flush_until_timeline_nsecs,
+            DelayedAudioStartSilencePolicy::Allow,
             control,
             &mut output_scheduler.scheduled_video_queue,
             session_id,
@@ -534,19 +537,9 @@ pub(in crate::player::backend::ffmpeg) fn service_audio_clocked_drain_decoded_vi
         buffered_reporter,
     );
     if !output_scheduler.pending_start_audio.is_empty() {
-        let audio_snapshot = output.snapshot()?;
-        let audio_start_timeline_nsecs = audio_snapshot.played_timeline_nsecs;
-        let audio_flush_until_timeline_nsecs = output_scheduler
-            .scheduled_video_queue
-            .audio_output_lead_until_nsecs()
-            .unwrap_or(audio_start_timeline_nsecs);
-        flush_pending_start_audio(
-            &mut output_scheduler.pending_start_audio,
+        output_scheduler.flush_pending_start_audio_if_ready(
             output,
-            audio_start_timeline_nsecs,
-            audio_flush_until_timeline_nsecs,
             control,
-            &mut output_scheduler.scheduled_video_queue,
             session_id,
             vo_queue,
             frame_presented,

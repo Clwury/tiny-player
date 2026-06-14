@@ -85,6 +85,7 @@ fn service_output_queues_before_decoder_input(
         &mut context.pipeline.position_reporter,
         context.event_tx,
         &mut context.pipeline.subtitle_pipeline,
+        &mut context.pipeline.buffered_reporter,
     )?;
 
     if service_video_clocked_video_queue_if_no_audio(
@@ -131,6 +132,7 @@ fn service_output_queues_after_decoder_input(
         &mut context.pipeline.position_reporter,
         context.event_tx,
         &mut context.pipeline.subtitle_pipeline,
+        &mut context.pipeline.buffered_reporter,
     )?;
     Ok(())
 }
@@ -181,6 +183,7 @@ fn service_output_queues_after_demux_would_block(
         &mut context.pipeline.position_reporter,
         context.event_tx,
         &mut context.pipeline.subtitle_pipeline,
+        &mut context.pipeline.buffered_reporter,
     )?;
     let video_progressed = service_video_clocked_video_queue_if_no_audio(
         &context.pipeline.scheduler,
@@ -202,21 +205,21 @@ fn observe_output_queue_stall(
     context: &mut OutputQueueServiceContext<'_>,
     stall_reason: &'static str,
 ) {
-    context.playback_wait.observe_stall(
-        PlaybackPipelineWaitContext {
-            session_id: context.session_id,
-            demux_cache: context.demux_cache,
-            video_decode_pipeline: &context.pipeline.video_decode_pipeline,
-            video_frame_prepare_worker: Some(&context.pipeline.video_frame_prepare_worker),
-            audio_decode_pipeline: context.pipeline.audio_decode_pipeline.as_ref(),
-            subtitle_pipeline: &context.pipeline.subtitle_pipeline,
-            output_scheduler: &context.pipeline.output_scheduler,
-            audio_output: context.pipeline.audio_output.as_ref(),
-            vo_queue: context.vo_queue,
-            playback_telemetry: &mut *context.playback_telemetry,
-        },
-        stall_reason,
-    );
+    let mut wait_context = PlaybackPipelineWaitContext {
+        session_id: context.session_id,
+        demux_cache: context.demux_cache,
+        video_decode_pipeline: &context.pipeline.video_decode_pipeline,
+        video_frame_prepare_worker: Some(&context.pipeline.video_frame_prepare_worker),
+        audio_decode_pipeline: context.pipeline.audio_decode_pipeline.as_ref(),
+        subtitle_pipeline: &context.pipeline.subtitle_pipeline,
+        output_scheduler: &context.pipeline.output_scheduler,
+        audio_output: context.pipeline.audio_output.as_ref(),
+        vo_queue: context.vo_queue,
+        playback_telemetry: &mut *context.playback_telemetry,
+    };
+    context
+        .playback_wait
+        .observe_stall(&mut wait_context, stall_reason);
 }
 
 fn wait_after_output_queue_stall(

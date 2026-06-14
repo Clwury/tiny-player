@@ -212,6 +212,10 @@ impl VideoDecodeWorker {
         }
     }
 
+    pub(super) fn service(&mut self) -> std::result::Result<(), String> {
+        self.pump_available_results()
+    }
+
     #[allow(dead_code)]
     pub(super) fn try_enqueue_packet(
         &mut self,
@@ -265,6 +269,13 @@ impl VideoDecodeWorker {
         generation: u64,
     ) -> std::result::Result<Option<VideoDecodePacketStatus>, String> {
         self.pump_available_results()?;
+        if self
+            .decoded_frames
+            .iter()
+            .any(|frame| frame.generation == generation)
+        {
+            return Ok(None);
+        }
         let Some(index) = self
             .completed_packets
             .iter()
@@ -584,5 +595,133 @@ fn run_video_decode_worker(
             }
             VideoDecodeCommand::Shutdown => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_worker() -> (VideoDecodeWorker, mpsc::SyncSender<VideoDecodeResult>) {
+        let (worker, result_tx, _command_rx) = test_worker_with_command_rx();
+        (worker, result_tx)
+    }
+
+    fn test_worker_with_command_rx() -> (
+        VideoDecodeWorker,
+        mpsc::SyncSender<VideoDecodeResult>,
+        mpsc::Receiver<VideoDecodeCommand>,
+    ) {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let size = RenderSize {
+            width: 1,
+            height: 1,
+        };
+
+        (
+            VideoDecodeWorker {
+                command_tx,
+                result_rx,
+                handle: None,
+                info: VideoDecodeWorkerInfo {
+                    stream_index: 0,
+                    time_base: ffi::AVRational { num: 1, den: 1 },
+                    size: Some(size),
+                    decoder_name: "test".to_string(),
+                    hardware_accelerated: false,
+                    vulkan_device: None,
+                    convert_context: VideoFrameConvertContext::new_for_test(size),
+                },
+                decoded_frames: VecDeque::new(),
+                completed_packets: VecDeque::new(),
+                decoded_frame_queue_capacity: SOFTWARE_DECODED_VIDEO_QUEUE_CAPACITY,
+                in_flight_packets: 0,
+                flush_generation: None,
+                flush_command_sent: false,
+                drain_generation: None,
+                drain_command_sent: false,
+                pending_skip_nonref: None,
+                drain_frames: Vec::new(),
+                completed_drains: VecDeque::new(),
+                draining: false,
+                recovering: false,
+                eof: false,
+            },
+            result_tx,
+            command_rx,
+        )
+    }
+
+    fn test_decoded_frame() -> VideoDecodedFrame {
+        let mut frame = AvFrame::new().expect("FFmpeg frame allocates");
+        unsafe {
+            (*frame.as_mut_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA as c_int;
+            (*frame.as_mut_ptr()).width = 1;
+            (*frame.as_mut_ptr()).height = 1;
+        }
+        let result = unsafe { ffi::av_frame_get_buffer(frame.as_mut_ptr(), 1) };
+        assert!(result >= 0, "FFmpeg frame buffer allocates");
+        VideoDecodedFrame::new_for_test(
+            FfmpegFrameRef::new_ref(frame.as_mut_ptr()).expect("FFmpeg frame refs"),
+        )
+    }
+
+    #[test]
+    fn packet_status_waits_until_decoded_frames_for_generation_are_drained() {
+        let (mut worker, _result_tx) = test_worker();
+        let generation = 7;
+        worker.record_result(VideoDecodeResult::Frame {
+            generation,
+            frame: test_decoded_frame(),
+        });
+        worker.record_result(VideoDecodeResult::PacketDone {
+            generation,
+            result: Ok(()),
+            decoded_frames: 1,
+            elapsed: Duration::from_millis(1),
+        });
+
+        assert!(worker.poll_packet_status(generation).unwrap().is_none());
+        assert!(worker.poll_frame(generation).unwrap().is_some());
+
+        let status = worker
+            .poll_packet_status(generation)
+            .unwrap()
+            .expect("packet status is available after frames drain");
+        assert_eq!(status.generation, generation);
+    }
+
+    #[test]
+    fn service_pumps_recovery_after_tracked_packets_are_cleared() {
+        let (mut worker, result_tx, _command_rx) = test_worker_with_command_rx();
+        let generation = 9;
+        worker.in_flight_packets = 1;
+        worker.flush_buffers(generation).unwrap();
+
+        assert_eq!(worker.snapshot().state, VideoDecodeWorkerState::Recovering);
+
+        result_tx
+            .send(VideoDecodeResult::PacketDone {
+                generation: generation - 1,
+                result: Ok(()),
+                decoded_frames: 0,
+                elapsed: Duration::from_millis(1),
+            })
+            .unwrap();
+        worker.service().unwrap();
+
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.state, VideoDecodeWorkerState::Recovering);
+        assert_eq!(snapshot.in_flight_packets, 0);
+
+        result_tx
+            .send(VideoDecodeResult::Flushed { generation })
+            .unwrap();
+        worker.service().unwrap();
+
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.state, VideoDecodeWorkerState::NeedPacket);
+        assert_eq!(snapshot.in_flight_packets, 0);
     }
 }

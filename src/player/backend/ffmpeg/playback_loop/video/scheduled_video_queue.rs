@@ -6,7 +6,8 @@ use super::output_rebuffer::{
     AudioClockResumeDecision, PlaybackOutputState, PlaybackResumeWaterline,
     initial_audio_clock_resume_decision, initial_playback_resume_waterline,
     log_playback_resume_waterline_wait, rebuffer_audio_clock_resume_decision,
-    rebuffer_playback_resume_waterline, video_decode_should_skip_nonref_for_pressure,
+    rebuffer_playback_resume_waterline_with_resource_pressure,
+    video_decode_should_skip_nonref_for_pressure,
 };
 use super::pending_audio_queue::PendingStartAudio;
 use super::*;
@@ -111,10 +112,11 @@ pub(in crate::player::backend::ffmpeg) fn video_output_rebuffer_low_water(
         .is_none_or(|forward| forward <= duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION))
 }
 
-pub(in crate::player::backend::ffmpeg) fn audio_output_video_lead_until_nsecs(
+pub(in crate::player::backend::ffmpeg) fn audio_output_video_lead_until_from_nsecs(
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    timeline_nsecs: u64,
 ) -> Option<u64> {
-    queued_video_buffered_until_nsecs(queued_video_frames)
+    queued_video_buffered_until_from_nsecs(queued_video_frames, timeline_nsecs)
         .map(|timeline| timeline.saturating_add(duration_nsecs(AUDIO_OUTPUT_VIDEO_LEAD_DURATION)))
 }
 
@@ -154,10 +156,6 @@ impl ScheduledVideoQueue {
 
     pub(in crate::player::backend::ffmpeg) fn range_nsecs(&self) -> Option<(u64, u64)> {
         queued_video_range_nsecs(&self.frames)
-    }
-
-    pub(in crate::player::backend::ffmpeg) fn buffered_until_nsecs(&self) -> Option<u64> {
-        queued_video_buffered_until_nsecs(&self.frames)
     }
 
     pub(in crate::player::backend::ffmpeg) fn buffered_until_from_nsecs(
@@ -218,17 +216,29 @@ impl ScheduledVideoQueue {
         output_state: PlaybackOutputState,
         played_until_nsecs: Option<u64>,
         has_audio_output: bool,
+        skip_nonref_active: bool,
     ) -> bool {
         video_decode_should_skip_nonref_for_pressure(
             output_state,
             &self.frames,
             played_until_nsecs,
             has_audio_output,
+            skip_nonref_active,
         )
     }
 
-    pub(in crate::player::backend::ffmpeg) fn audio_output_lead_until_nsecs(&self) -> Option<u64> {
-        audio_output_video_lead_until_nsecs(&self.frames)
+    pub(in crate::player::backend::ffmpeg) fn audio_output_lead_until_from_nsecs(
+        &self,
+        timeline_nsecs: u64,
+    ) -> Option<u64> {
+        audio_output_video_lead_until_from_nsecs(&self.frames, timeline_nsecs)
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn audio_clock_wait_duration(
+        &self,
+        played_until_nsecs: u64,
+    ) -> Option<Duration> {
+        audio_clocked_video_wait_duration(&self.frames, played_until_nsecs)
     }
 
     pub(in crate::player::backend::ffmpeg) fn push_queued(&mut self, frame: QueuedVideoFrame) {
@@ -284,7 +294,8 @@ impl ScheduledVideoQueue {
         )
     }
 
-    pub(in crate::player::backend::ffmpeg) fn rebuffer_playback_resume_waterline(
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::player::backend::ffmpeg) fn rebuffer_playback_resume_waterline_with_resource_pressure(
         &self,
         pending_audio: &PendingStartAudio,
         resume_timeline_nsecs: u64,
@@ -292,8 +303,9 @@ impl ScheduledVideoQueue {
         audio_output_buffered_until_nsecs: Option<u64>,
         needs_prefetch: bool,
         has_audio_output: bool,
+        output_resource_pressure: bool,
     ) -> PlaybackResumeWaterline {
-        rebuffer_playback_resume_waterline(
+        rebuffer_playback_resume_waterline_with_resource_pressure(
             &self.frames,
             pending_audio,
             resume_timeline_nsecs,
@@ -301,6 +313,7 @@ impl ScheduledVideoQueue {
             audio_output_buffered_until_nsecs,
             needs_prefetch,
             has_audio_output,
+            output_resource_pressure,
         )
     }
 
@@ -391,6 +404,19 @@ pub(in crate::player::backend::ffmpeg) fn queued_video_frame_ready_for_audio_clo
     };
     frame.timeline_nsecs
         <= played_until_nsecs.saturating_add(audio_clock_video_present_lead_nsecs(frame))
+}
+
+pub(in crate::player::backend::ffmpeg) fn audio_clocked_video_wait_duration(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    played_until_nsecs: u64,
+) -> Option<Duration> {
+    let frame = queued_video_frames.front()?;
+    let ready_at_nsecs = frame
+        .timeline_nsecs
+        .saturating_sub(audio_clock_video_present_lead_nsecs(frame));
+    Some(Duration::from_nanos(
+        ready_at_nsecs.saturating_sub(played_until_nsecs),
+    ))
 }
 
 fn audio_clock_video_present_lead_nsecs(frame: &QueuedVideoFrame) -> u64 {

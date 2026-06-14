@@ -30,7 +30,7 @@ use super::{
     BackendControl, BackendError, BackendEvent, BackendEventKind, BackendLoadRequest,
     BackendSubtitleBitmap, BackendSubtitleCue, ByteCacheState, CacheUnlinkPolicy, DemuxCacheState,
     PlaybackCacheByteRange, PlaybackCacheConfig, PlaybackCacheMode, PlaybackCacheState,
-    PlaybackVideoInfo, Result, StreamCacheKind, StreamCacheState,
+    PlaybackSeekMode, PlaybackVideoInfo, Result, StreamCacheKind, StreamCacheState,
 };
 use crate::player::{
     dovi::{
@@ -64,12 +64,10 @@ mod video;
 mod worker;
 
 #[cfg(test)]
-use audio::{
-    AudioBuffer, AudioShared, audio_samples_duration, fill_audio_output, samples_for_duration,
-};
+use audio::{AudioBuffer, AudioShared, audio_samples_duration, fill_audio_output};
 use audio::{
     AudioOutput, AudioOutputDrainStatus, AudioOutputPushResult, AudioOutputSnapshot,
-    audio_sample_len, frame_sample_format, zeroed_channel_layout,
+    audio_sample_len, frame_sample_format, samples_for_duration, zeroed_channel_layout,
 };
 #[cfg(test)]
 use avio::{
@@ -127,34 +125,42 @@ const RPU_QUEUE_CAPACITY: usize = 2048;
 const AUDIO_BUFFER_SECONDS: usize = 4;
 const AUDIO_DECODE_QUEUE_LIMIT_DURATION: Duration = Duration::from_secs(2);
 const AUDIO_QUEUE_WAIT_LOG_AFTER: Duration = Duration::from_millis(50);
-const AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(500);
-const AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(300);
-const DECODED_VIDEO_QUEUE_LIMIT_FRAMES: usize = 24;
-const DECODED_VIDEO_QUEUE_TARGET_FRAMES: usize = 12;
-const VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES: usize = 12;
-const VULKAN_DECODED_VIDEO_QUEUE_TARGET_FRAMES: usize = 8;
+const AUDIO_CALLBACK_GAP_LOG_AFTER: Duration = Duration::from_millis(50);
+const AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION: Duration = Duration::from_millis(250);
+const AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(1500);
+const AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(600);
+const DECODED_VIDEO_QUEUE_LIMIT_FRAMES: usize = 48;
+const DECODED_VIDEO_QUEUE_TARGET_FRAMES: usize = 36;
+const VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES: usize = 48;
+const VULKAN_DECODED_VIDEO_QUEUE_TARGET_FRAMES: usize = 36;
+const VULKAN_VIDEO_OUTPUT_RESOURCE_PRESSURE_FRAMES: usize = 20;
 const AUDIO_CLOCK_VIDEO_PRESENT_LEAD: Duration = Duration::from_millis(15);
 const AUDIO_OUTPUT_DELAY_LIMIT: Duration = Duration::from_millis(500);
-const VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(350);
-const VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(300);
+const VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(1500);
+const VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(600);
+const PENDING_START_AUDIO_BACKPRESSURE_DURATION: Duration = Duration::from_millis(2500);
 const PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_secs(4);
 const PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_secs(3);
 const VIDEO_OUTPUT_REBUFFER_ENTER_AFTER: Duration = Duration::from_millis(250);
 const VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION: Duration = Duration::from_millis(250);
-const VIDEO_OUTPUT_REBUFFER_RESUME_DURATION: Duration = Duration::from_millis(500);
-const VIDEO_OUTPUT_START_PREBUFFER_DURATION: Duration = Duration::from_millis(800);
+const VIDEO_OUTPUT_REBUFFER_RESUME_DURATION: Duration = Duration::from_millis(1000);
+const VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER: Duration = Duration::from_millis(1000);
+const VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER: Duration = Duration::from_millis(2000);
+const VIDEO_OUTPUT_START_PREBUFFER_DURATION: Duration = Duration::from_millis(250);
+const VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER: Duration = Duration::from_millis(800);
 const VIDEO_DECODE_SKIP_NONREF_LOW_WATER_DURATION: Duration = Duration::from_millis(900);
 #[cfg(test)]
 const VIDEO_OUTPUT_REBUFFER_RESUME_FRAMES: usize = 20;
 #[cfg(test)]
 const VIDEO_OUTPUT_START_PREBUFFER_FRAMES: usize = 20;
-const AUDIO_OUTPUT_VIDEO_LEAD_DURATION: Duration = Duration::from_millis(120);
+const AUDIO_OUTPUT_VIDEO_LEAD_DURATION: Duration = Duration::from_millis(500);
 const AUDIO_VIDEO_REBUFFER_DRIFT_RESET_THRESHOLD: Duration = Duration::from_millis(500);
 const PENDING_AUDIO_CONTINUITY_TOLERANCE: Duration = Duration::from_millis(5);
 const DECODE_PACKET_SLOW_LOG_AFTER: Duration = Duration::from_millis(20);
 #[cfg(test)]
 const DEMUX_PACKET_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 const DEMUX_PACKET_CACHE_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+const DEMUX_PACKET_CACHE_LOCK_WAIT: Duration = Duration::from_millis(5);
 const DEMUX_READ_WAIT_LOG_AFTER: Duration = Duration::from_millis(50);
 const DEMUX_PACKET_CACHE_STALL_LOG_AFTER: Duration = Duration::from_millis(500);
 const DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -176,7 +182,8 @@ const HTTP_CACHE_STALL_LOG_AFTER: Duration = Duration::from_millis(500);
 const HTTP_CACHE_STALL_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const HTTP_CACHE_PREFETCH_PAUSE_LOG_AFTER: Duration = Duration::from_millis(500);
 const HTTP_CACHE_PREFETCH_PAUSE_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const HTTP_CACHE_PARTIAL_READ_MIN_BYTES: usize = 256 * 1024;
+const HTTP_CACHE_MAX_READ_CHUNK_BYTES: usize = 128 * 1024;
+const HTTP_CACHE_PARTIAL_READ_MIN_BYTES: usize = 64 * 1024;
 const HTTP_CACHE_CONTENT_LEN_WAIT: Duration = Duration::from_secs(1);
 const HTTP_CACHE_RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
@@ -382,6 +389,14 @@ impl FfmpegBackend {
     }
 
     pub fn seek_to(&mut self, position_seconds: f64) -> Result<()> {
+        self.seek_to_with_mode(position_seconds, PlaybackSeekMode::Precise)
+    }
+
+    pub fn seek_to_with_mode(
+        &mut self,
+        position_seconds: f64,
+        seek_mode: PlaybackSeekMode,
+    ) -> Result<()> {
         if self.worker.is_none() {
             return Err(BackendError::Ffmpeg(
                 "FFmpeg 尚未加载可跳转的媒体".to_string(),
@@ -399,7 +414,7 @@ impl FfmpegBackend {
             .worker
             .as_ref()
             .expect("worker exists after early return");
-        worker.seek(position_seconds, session_id)?;
+        worker.seek(position_seconds, seek_mode, session_id)?;
         let _ = self.event_tx.send(BackendEvent::new(
             session_id,
             BackendEventKind::PositionChanged(position_seconds),
@@ -675,6 +690,10 @@ impl BackendControl for FfmpegBackend {
 
     fn seek(&mut self, position_seconds: f64) -> Result<()> {
         FfmpegBackend::seek_to(self, position_seconds)
+    }
+
+    fn seek_with_mode(&mut self, position_seconds: f64, mode: PlaybackSeekMode) -> Result<()> {
+        FfmpegBackend::seek_to_with_mode(self, position_seconds, mode)
     }
 
     fn pause(&mut self) -> Result<()> {

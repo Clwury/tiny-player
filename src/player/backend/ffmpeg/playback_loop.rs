@@ -100,6 +100,11 @@ mod video_output_gate;
 
 use super::avio::{CachedInputSource, should_cache_http_url};
 use audio_decode_pipeline::AudioDecodePipeline;
+#[cfg(test)]
+pub(super) use audio_output_gate::{
+    PendingAudioUnderrunRecoveryPlan, discard_stale_pending_audio_before_recovery_start,
+    pending_audio_underrun_recovery_plan,
+};
 use coordinator_commands::{
     PlaybackCommandContext, PlaybackCommandServiceStatus, service_playback_commands,
 };
@@ -124,9 +129,11 @@ pub(super) use output_rebuffer::{
     decoded_audio_forward_nsecs_from, decoded_video_start_prebuffer_reached,
     demux_reader_ready_for_output, initial_audio_clock_resume_decision, playback_resume_waterline,
     playback_resume_waterline_blocked_on, rebuffer_audio_clock_resume_decision,
-    rebuffer_playback_resume_waterline, should_block_for_demux_read,
-    video_decode_should_skip_nonref_for_pressure, video_output_rebuffer_resume_reached,
-    video_output_rebuffer_should_enter,
+    rebuffer_playback_resume_waterline, rebuffer_playback_resume_waterline_after_prolonged_wait,
+    rebuffer_playback_resume_waterline_with_resource_pressure, should_block_for_demux_read,
+    video_decode_should_skip_nonref_for_pressure, video_output_rebuffer_resume_duration,
+    video_output_rebuffer_resume_duration_with_resource_pressure,
+    video_output_rebuffer_resume_reached, video_output_rebuffer_should_enter,
 };
 #[cfg(test)]
 pub(super) use pending_audio_queue::PendingStartAudio;
@@ -135,7 +142,7 @@ use playback_pipeline_state::PlaybackPipelineState;
 use playback_services::PlaybackPipelineServices;
 #[cfg(test)]
 pub(super) use scheduled_video_queue::{
-    discard_queued_video_before, pop_audio_clocked_video_frame,
+    audio_clocked_video_wait_duration, discard_queued_video_before, pop_audio_clocked_video_frame,
     pop_audio_clocked_video_frame_with_policy, push_queued_video_frame,
     queued_video_buffered_until_nsecs, queued_video_frame_ready_for_audio_clock,
     should_drop_late_video_frame, video_output_rebuffer_low_water,
@@ -155,7 +162,10 @@ pub(super) use video_output_gate::admit_decoded_video_frame_to_vo;
 const END_OF_PLAYBACK_READ_ERROR_TOLERANCE_SECONDS: f64 = 2.0;
 const CORRUPT_VIDEO_FRAME_RECOVERY_ERROR: &str = "__tiny_corrupt_video_frame_recovery__";
 pub(super) const VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS: u64 = 240;
-pub(super) const HEVC_SEEK_PREROLL_NSECS: u64 = 5_000_000_000;
+// Low-level seeks already snap backward to a keyframe; keep this small so seek-forward
+// shortcuts do not spend several seconds decoding and dropping HEVC preroll frames.
+pub(super) const HEVC_SEEK_PREROLL_NSECS: u64 = 1_000_000_000;
+pub(super) const HEVC_CACHED_SEEK_PREROLL_NSECS: u64 = 5_000_000_000;
 
 struct OpenedPlaybackInput {
     input: FormatContext,
@@ -184,10 +194,38 @@ fn video_seek_preroll_nsecs(codec_id: ffi::AVCodecID) -> u64 {
     }
 }
 
+fn video_cached_seek_preroll_nsecs(codec_id: ffi::AVCodecID) -> u64 {
+    match codec_id {
+        ffi::AVCodecID::AV_CODEC_ID_HEVC => HEVC_CACHED_SEEK_PREROLL_NSECS,
+        _ => 0,
+    }
+}
+
 fn preroll_seek_position_seconds(codec_id: ffi::AVCodecID, position_seconds: f64) -> f64 {
     let position_seconds = position_seconds.max(0.0);
     let preroll_seconds = nsecs_to_seconds(video_seek_preroll_nsecs(codec_id));
     (position_seconds - preroll_seconds).max(0.0)
+}
+
+#[cfg(test)]
+mod seek_preroll_tests {
+    use super::*;
+
+    #[test]
+    fn hevc_low_level_seek_uses_shorter_preroll_than_cached_seek() {
+        assert_eq!(
+            video_seek_preroll_nsecs(ffi::AVCodecID::AV_CODEC_ID_HEVC),
+            1_000_000_000
+        );
+        assert_eq!(
+            video_cached_seek_preroll_nsecs(ffi::AVCodecID::AV_CODEC_ID_HEVC),
+            5_000_000_000
+        );
+        assert!(
+            (preroll_seek_position_seconds(ffi::AVCodecID::AV_CODEC_ID_HEVC, 62.36) - 61.36).abs()
+                < f64::EPSILON
+        );
+    }
 }
 
 #[derive(Clone)]

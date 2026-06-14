@@ -659,6 +659,18 @@ impl HttpRingCache {
                 }
                 continue;
             }
+            if total > 0 {
+                tracing::trace!(
+                    offset,
+                    current_offset,
+                    total,
+                    requested = output.len(),
+                    base_offset = guard.base_offset,
+                    next_offset = guard.next_offset,
+                    "HTTP stream cache read returning currently available partial data"
+                );
+                return CacheReadResult::Data(total);
+            }
             if current_offset < guard.base_offset || current_offset > guard.next_offset {
                 tracing::debug!(
                     offset,
@@ -1222,6 +1234,24 @@ impl HttpRingCacheState {
         true
     }
 
+    fn request_playback_continuation_at(&mut self, offset: u64) -> bool {
+        if self.stale_playback_continuation_offset(offset) {
+            tracing::trace!(
+                offset,
+                active_base_offset = self.base_offset,
+                active_next_offset = self.next_offset,
+                reader_offset = self.reader_offset,
+                "skipping stale HTTP playback continuation range"
+            );
+            return false;
+        }
+        self.request_side_download_at(offset, HttpCacheRangeKind::Playback)
+    }
+
+    fn stale_playback_continuation_offset(&self, offset: u64) -> bool {
+        self.active_range_kind == HttpCacheRangeKind::Playback && offset < self.next_offset
+    }
+
     fn side_download_request_exists(&self, offset: u64, range_kind: HttpCacheRangeKind) -> bool {
         self.side_download_requests
             .iter()
@@ -1303,6 +1333,17 @@ impl HttpRingCacheState {
             .is_some_and(|content_len| continuation_offset >= content_len)
         {
             self.eof = true;
+            return;
+        }
+        if self.stale_playback_continuation_offset(continuation_offset) {
+            tracing::debug!(
+                request_offset = request.offset,
+                continuation_offset,
+                active_base_offset = self.base_offset,
+                active_next_offset = self.next_offset,
+                reader_offset = self.reader_offset,
+                "skipping stale HTTP active playback continuation after side range"
+            );
             return;
         }
         if self.offset_in_active_range(continuation_offset)
@@ -1391,7 +1432,7 @@ impl HttpRingCacheState {
         if self.next_offset < self.playback_continuation_prefetch_offset(continuation_offset) {
             return;
         }
-        if self.request_side_download_at(continuation_offset, HttpCacheRangeKind::Playback) {
+        if self.request_playback_continuation_at(continuation_offset) {
             tracing::debug!(
                 continuation_offset,
                 active_request_start_offset = self.active_request_start_offset,
@@ -2820,6 +2861,24 @@ mod tests {
     }
 
     #[test]
+    fn http_cache_state_does_not_schedule_stale_active_continuation_after_side_range() {
+        let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(1_000));
+        assert!(state.append_at(0, &vec![0; 600]));
+        state.set_reader_offset(500);
+        let request = CacheRestartRequest {
+            offset: 500,
+            range_kind: HttpCacheRangeKind::Playback,
+        };
+        state.side_download_active.push(request);
+        assert!(state.append_retained_at(500, b"side", HttpCacheRangeKind::Playback));
+
+        state.finish_side_download_request(request, true);
+
+        assert!(state.side_download_active.is_empty());
+        assert!(state.restart_request.is_none());
+    }
+
+    #[test]
     fn http_cache_state_splices_proactive_playback_range_at_active_end() {
         let config = HttpCacheConfig {
             range_request_bytes: 6,
@@ -2838,6 +2897,20 @@ mod tests {
         assert_eq!(state.next_offset, 12);
         assert_eq!(state.active_request_start_offset, 6);
         assert!(state.retained_ranges.is_empty());
+    }
+
+    #[test]
+    fn http_cache_state_does_not_queue_stale_proactive_playback_continuation() {
+        let config = HttpCacheConfig {
+            range_request_bytes: 6,
+            ..HttpCacheConfig::for_test(64)
+        };
+        let mut state =
+            HttpRingCacheState::new_with_config(0, config).with_content_len_hint(Some(64));
+
+        assert!(state.append_at(0, b"abcdefghijkl"));
+
+        assert!(state.side_download_requests.is_empty());
     }
 
     #[test]

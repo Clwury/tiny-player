@@ -4,23 +4,28 @@ use super::*;
 use crate::player::backend::PlaybackCacheTimeRange;
 use playback_loop::{
     AudioClockResumeDecision, DecodedVideoFrameStartAction, DemuxReaderWatermark,
-    PendingStartAudio, PlaybackBlockReason, PlaybackOutputScheduler, PlaybackOutputState,
-    RebufferResumeAnchor, VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VideoDecodeRecovery,
+    PendingAudioUnderrunRecoveryPlan, PendingStartAudio, PlaybackBlockReason,
+    PlaybackOutputScheduler, PlaybackOutputState, RebufferResumeAnchor,
+    VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VideoDecodeRecovery,
     admit_decoded_video_frame_to_vo, audio_clock_resume_decision,
-    audio_clock_resume_timeline_nsecs, audio_output_buffered_until_for_resume,
-    decoded_audio_forward_nsecs_from, decoded_video_frame_start_action,
-    decoded_video_start_prebuffer_reached, demux_reader_ready_for_output,
-    discard_queued_video_before, initial_audio_clock_resume_decision, initial_probe_profile,
-    playback_read_finished, playback_resume_waterline, playback_resume_waterline_blocked_on,
-    pop_audio_clocked_video_frame, pop_audio_clocked_video_frame_with_policy,
-    push_queued_video_frame, queued_video_buffered_until_nsecs,
-    queued_video_frame_ready_for_audio_clock, rebase_subtitle_cues_to_timeline_origin,
-    rebuffer_audio_clock_resume_decision, rebuffer_playback_resume_waterline,
-    should_block_for_demux_read, should_drop_late_video_frame, subtitle_cue_timeline_nsecs,
+    audio_clock_resume_timeline_nsecs, audio_clocked_video_wait_duration,
+    audio_output_buffered_until_for_resume, decoded_audio_forward_nsecs_from,
+    decoded_video_frame_start_action, decoded_video_start_prebuffer_reached,
+    demux_reader_ready_for_output, discard_queued_video_before,
+    discard_stale_pending_audio_before_recovery_start, initial_audio_clock_resume_decision,
+    initial_probe_profile, pending_audio_underrun_recovery_plan, playback_read_finished,
+    playback_resume_waterline, playback_resume_waterline_blocked_on, pop_audio_clocked_video_frame,
+    pop_audio_clocked_video_frame_with_policy, push_queued_video_frame,
+    queued_video_buffered_until_nsecs, queued_video_frame_ready_for_audio_clock,
+    rebase_subtitle_cues_to_timeline_origin, rebuffer_audio_clock_resume_decision,
+    rebuffer_playback_resume_waterline, rebuffer_playback_resume_waterline_after_prolonged_wait,
+    rebuffer_playback_resume_waterline_with_resource_pressure, should_block_for_demux_read,
+    should_drop_late_video_frame, subtitle_cue_timeline_nsecs,
     subtitle_timestamp_to_timeline_nsecs, trim_overlapping_subtitle_cues_at,
     video_decode_error_is_recoverable, video_decode_should_skip_nonref_for_pressure,
-    video_output_rebuffer_low_water, video_output_rebuffer_resume_reached,
-    video_output_rebuffer_should_enter,
+    video_output_rebuffer_low_water, video_output_rebuffer_resume_duration,
+    video_output_rebuffer_resume_duration_with_resource_pressure,
+    video_output_rebuffer_resume_reached, video_output_rebuffer_should_enter,
 };
 
 #[test]
@@ -182,6 +187,7 @@ fn ffmpeg_command_drain_applies_pause_resume_and_keeps_latest_seek() {
     tx.send(FfmpegCommand::Seek {
         session_id: PlaybackSessionId(3),
         position_seconds: 12.0,
+        mode: PlaybackSeekMode::Precise,
         generation: first_generation,
     })
     .unwrap();
@@ -192,6 +198,7 @@ fn ffmpeg_command_drain_applies_pause_resume_and_keeps_latest_seek() {
     tx.send(FfmpegCommand::Seek {
         session_id: PlaybackSessionId(5),
         position_seconds: 24.0,
+        mode: PlaybackSeekMode::Fast,
         generation: second_generation,
     })
     .unwrap();
@@ -205,6 +212,7 @@ fn ffmpeg_command_drain_applies_pause_resume_and_keeps_latest_seek() {
         Some(PendingSeek {
             session_id: PlaybackSessionId(5),
             position_seconds: 24.0,
+            mode: PlaybackSeekMode::Fast,
             generation: second_generation,
         })
     );
@@ -225,6 +233,7 @@ fn ffmpeg_command_drain_keeps_latest_track_selection() {
     tx.send(FfmpegCommand::Seek {
         session_id: PlaybackSessionId(2),
         position_seconds: 10.0,
+        mode: PlaybackSeekMode::Fast,
         generation: seek_generation,
     })
     .unwrap();
@@ -613,6 +622,58 @@ fn ffmpeg_backend_byte_cache_update_uses_byte_state_as_metric_source() {
                     && state.demux.raw_input_rate == Some(96 * 1024)
                     && state.demux.byte_level_seeks == 4
                     && state.byte.as_ref().is_some_and(|byte| byte.cached_bytes == 4096)
+        )
+    }));
+}
+
+#[test]
+fn ffmpeg_backend_byte_cache_update_does_not_extend_demux_seekable_ranges() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    backend.duration_seconds = Some(100.0);
+    backend.cache_state.demux = DemuxCacheState {
+        reader_pts: Some(25.0),
+        seekable_ranges: vec![PlaybackCacheTimeRange {
+            start: 20.0,
+            end: 28.0,
+        }],
+        ..DemuxCacheState::default()
+    };
+
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            PlaybackSessionId(1),
+            BackendEventKind::CacheStateChanged(PlaybackCacheState {
+                byte: Some(ByteCacheState {
+                    ranges: vec![PlaybackCacheByteRange {
+                        start_fraction: 0.2,
+                        end_fraction: 0.5,
+                    }],
+                    reader_fraction: Some(0.25),
+                    download_fraction: Some(0.5),
+                    cached_bytes: 4096,
+                    content_length: Some(8192),
+                    disk_cache_enabled: false,
+                    idle: false,
+                    raw_input_rate: Some(64 * 1024),
+                    byte_level_seeks: 1,
+                }),
+                ..PlaybackCacheState::default()
+            }),
+        ))
+        .unwrap();
+
+    let events = backend.poll_events();
+
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            BackendEventKind::CacheStateChanged(state)
+                if state.demux.seekable_ranges == vec![PlaybackCacheTimeRange {
+                    start: 20.0,
+                    end: 28.0,
+                }]
         )
     }));
 }
@@ -1279,6 +1340,15 @@ fn queued_video_limit_uses_frame_and_duration_caps() {
 }
 
 #[test]
+fn queued_video_limit_keeps_decode_headroom_above_one_second() {
+    let mut queue = VecDeque::new();
+    queue.push_back(test_queued_video_frame(1_000_000_000));
+    queue.push_back(test_queued_video_frame(2_200_000_000));
+
+    assert!(!queued_video_limit_reached(&queue, false));
+}
+
+#[test]
 fn queued_video_limit_uses_vulkan_frame_cap() {
     let mut queue = VecDeque::new();
     for index in 0..VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES {
@@ -1307,6 +1377,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         now,
         false,
         false,
+        true,
         false,
         true,
         PlaybackOutputState::Playing,
@@ -1318,16 +1389,6 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         now,
         true,
         false,
-        false,
-        true,
-        PlaybackOutputState::Playing,
-    ));
-    assert!(underrun_started_at.is_none());
-
-    assert!(!video_output_rebuffer_should_enter(
-        &mut underrun_started_at,
-        now,
-        true,
         true,
         false,
         true,
@@ -1339,6 +1400,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER - Duration::from_millis(1),
         true,
+        false,
         true,
         false,
         true,
@@ -1348,6 +1410,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         true,
+        false,
         true,
         false,
         true,
@@ -1357,16 +1420,19 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         true,
+        false,
         true,
         false,
         true,
         PlaybackOutputState::Rebuffering,
     ));
+    assert_eq!(underrun_started_at, Some(now));
 
     assert!(video_output_rebuffer_should_enter(
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         true,
+        false,
         true,
         false,
         true,
@@ -1377,6 +1443,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         true,
+        false,
         true,
         true,
         true,
@@ -1389,6 +1456,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         now,
         false,
         false,
+        true,
         false,
         true,
         PlaybackOutputState::Playing,
@@ -1397,7 +1465,79 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
 }
 
 #[test]
-fn video_output_rebuffer_entry_uses_demux_watermark() {
+fn video_output_rebuffer_waits_for_demux_cache_insufficient() {
+    let now = Instant::now();
+    let mut underrun_started_at = Some(now);
+
+    assert!(!video_output_rebuffer_should_enter(
+        &mut underrun_started_at,
+        now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
+        true,
+        false,
+        false,
+        false,
+        true,
+        PlaybackOutputState::Playing,
+    ));
+    assert!(underrun_started_at.is_none());
+}
+
+#[test]
+fn video_output_rebuffer_enters_on_output_underrun_even_when_demux_ready() {
+    let now = Instant::now();
+    let mut underrun_started_at = None;
+
+    assert!(video_output_rebuffer_should_enter(
+        &mut underrun_started_at,
+        now,
+        true,
+        true,
+        false,
+        false,
+        true,
+        PlaybackOutputState::Playing,
+    ));
+    assert_eq!(underrun_started_at, Some(now));
+}
+
+#[test]
+fn video_output_rebuffer_keeps_wait_timer_while_rebuffering() {
+    let now = Instant::now();
+    let mut underrun_started_at = Some(now);
+
+    assert!(!video_output_rebuffer_should_enter(
+        &mut underrun_started_at,
+        now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
+        false,
+        false,
+        true,
+        false,
+        true,
+        PlaybackOutputState::Rebuffering,
+    ));
+    assert_eq!(underrun_started_at, Some(now));
+}
+
+#[test]
+fn video_output_rebuffer_enters_immediately_after_output_underrun() {
+    let mut underrun_started_at = None;
+    let now = Instant::now();
+
+    assert!(video_output_rebuffer_should_enter(
+        &mut underrun_started_at,
+        now,
+        true,
+        true,
+        true,
+        false,
+        true,
+        PlaybackOutputState::Playing,
+    ));
+    assert_eq!(underrun_started_at, Some(now));
+}
+
+#[test]
+fn demux_reader_ready_for_output_uses_combined_watermark() {
     let target_nsecs = duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
     let ready = DemuxReaderWatermark {
         video_forward_nsecs: Some(target_nsecs),
@@ -1449,6 +1589,7 @@ fn output_scheduler_enters_rebuffer_and_updates_first_frame_gate() {
     assert!(scheduler.maybe_enter_video_output_rebuffer(
         started_at + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         true,
+        false,
         true,
         false,
         true,
@@ -1509,6 +1650,45 @@ fn output_scheduler_snapshot_reports_decoded_output_watermarks() {
 }
 
 #[test]
+fn output_scheduler_backpressures_large_pending_start_audio() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+
+    assert!(!scheduler.pending_start_audio_backpressured());
+
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: duration_nsecs(PENDING_START_AUDIO_BACKPRESSURE_DURATION),
+        },
+        1_000_000_000,
+        1_000_000_000 + duration_nsecs(PENDING_START_AUDIO_BACKPRESSURE_DURATION),
+    );
+
+    assert!(scheduler.pending_start_audio_backpressured());
+}
+
+#[test]
+fn output_scheduler_allows_startup_audio_until_first_video() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: duration_nsecs(PENDING_START_AUDIO_BACKPRESSURE_DURATION),
+        },
+        1_000_000_000,
+        1_000_000_000 + duration_nsecs(PENDING_START_AUDIO_BACKPRESSURE_DURATION),
+    );
+
+    assert!(!scheduler.pending_start_audio_backpressured());
+
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(1_000_000_000));
+
+    assert!(scheduler.pending_start_audio_backpressured());
+}
+
+#[test]
 fn output_scheduler_snapshot_keeps_coordinator_gate_decisions() {
     let mut scheduler = PlaybackOutputScheduler::new();
     let start_snapshot = scheduler.snapshot_for_played_until(Some(1_000_000_000));
@@ -1564,18 +1744,27 @@ fn output_scheduler_reset_clears_queued_output_state() {
 }
 
 #[test]
-fn video_output_rebuffer_uses_compact_decoded_queue_target() {
+fn video_output_rebuffer_requires_stable_decoded_queue_target() {
+    let mut short_queue = VecDeque::new();
+    short_queue.push_back(test_queued_video_frame(1_000_000_000));
+    short_queue.push_back(test_queued_video_frame(
+        1_000_000_000 + duration_nsecs(AUDIO_VIDEO_QUEUE_TARGET_DURATION),
+    ));
+
+    assert!(!video_output_rebuffer_resume_reached(&short_queue, false));
+    assert!(queued_video_target_reached(&short_queue, false));
+
     let mut duration_ready = VecDeque::new();
     duration_ready.push_back(test_queued_video_frame(1_000_000_000));
     duration_ready.push_back(test_queued_video_frame(
-        1_000_000_000 + duration_nsecs(AUDIO_VIDEO_QUEUE_TARGET_DURATION),
+        1_000_000_000 + duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
     ));
 
     assert!(video_output_rebuffer_resume_reached(&duration_ready, false));
     assert!(queued_video_target_reached(&duration_ready, false));
 
     let mut frame_ready = VecDeque::new();
-    for index in 0..DECODED_VIDEO_QUEUE_TARGET_FRAMES {
+    for index in 0..26 {
         frame_ready.push_back(test_queued_video_frame(
             1_000_000_000 + u64::try_from(index).unwrap() * 40_000_000,
         ));
@@ -1583,6 +1772,495 @@ fn video_output_rebuffer_uses_compact_decoded_queue_target() {
 
     assert!(video_output_rebuffer_resume_reached(&frame_ready, false));
     assert!(queued_video_target_reached(&frame_ready, false));
+}
+
+#[test]
+fn video_output_rebuffer_resume_fits_vulkan_resource_pressure_budget() {
+    let frame_duration_nsecs = 25_000_000;
+    let mut queued = VecDeque::new();
+    for index in 0..VULKAN_VIDEO_OUTPUT_RESOURCE_PRESSURE_FRAMES.saturating_sub(2) {
+        let mut frame = test_vulkan_queued_video_frame(
+            1_000_000_000 + u64::try_from(index).unwrap() * frame_duration_nsecs,
+        );
+        frame.duration_nsecs = frame_duration_nsecs;
+        queued.push_back(frame);
+    }
+
+    let unpressured_duration = video_output_rebuffer_resume_duration(&queued, false);
+    let pressured_duration =
+        video_output_rebuffer_resume_duration_with_resource_pressure(&queued, false, true);
+
+    assert_eq!(unpressured_duration, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
+    assert!(pressured_duration < VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
+    assert_eq!(
+        duration_nsecs(pressured_duration),
+        frame_duration_nsecs * u64::try_from(queued.len()).unwrap()
+    );
+
+    let resume_timeline_nsecs = queued.front().unwrap().timeline_nsecs;
+    let target_nsecs = duration_nsecs(pressured_duration);
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: target_nsecs,
+        },
+        resume_timeline_nsecs,
+        resume_timeline_nsecs + target_nsecs,
+    );
+    let ready_demux = DemuxReaderWatermark {
+        video_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+        audio_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+        selected_min_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+        video_underrun: false,
+        audio_underrun: false,
+        video_idle: false,
+        audio_idle: false,
+        underrun: false,
+        idle: false,
+        forward_bytes: 1024,
+    };
+
+    let waterline = rebuffer_playback_resume_waterline_with_resource_pressure(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        ready_demux,
+        None,
+        false,
+        true,
+        true,
+    );
+
+    assert_eq!(waterline.target_nsecs, target_nsecs);
+    assert!(waterline.ready());
+}
+
+#[test]
+fn video_output_rebuffer_resume_budget_uses_resume_timeline_under_resource_pressure() {
+    let first_timeline_nsecs = 18_550_000_000;
+    let resume_timeline_nsecs = 18_551_651_321;
+    let frame_duration_nsecs = 20_000_000;
+    let mut queued = VecDeque::new();
+    for index in 0..VULKAN_VIDEO_OUTPUT_RESOURCE_PRESSURE_FRAMES.saturating_sub(2) {
+        let mut frame = test_vulkan_queued_video_frame(
+            first_timeline_nsecs + u64::try_from(index).unwrap() * frame_duration_nsecs,
+        );
+        frame.duration_nsecs = frame_duration_nsecs;
+        queued.push_back(frame);
+    }
+
+    let buffered_until_nsecs =
+        first_timeline_nsecs + frame_duration_nsecs * u64::try_from(queued.len()).unwrap();
+    let resume_budget_nsecs = buffered_until_nsecs - resume_timeline_nsecs;
+    let front_budget_nsecs = duration_nsecs(
+        video_output_rebuffer_resume_duration_with_resource_pressure(&queued, false, true),
+    );
+
+    assert!(resume_budget_nsecs < front_budget_nsecs);
+
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: resume_budget_nsecs,
+        },
+        resume_timeline_nsecs,
+        resume_timeline_nsecs + resume_budget_nsecs,
+    );
+    let ready_demux = DemuxReaderWatermark {
+        video_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+        audio_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+        selected_min_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+        video_underrun: false,
+        audio_underrun: false,
+        video_idle: false,
+        audio_idle: false,
+        underrun: false,
+        idle: false,
+        forward_bytes: 1024,
+    };
+
+    let waterline = rebuffer_playback_resume_waterline_with_resource_pressure(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        ready_demux,
+        None,
+        false,
+        true,
+        true,
+    );
+
+    assert_eq!(waterline.target_nsecs, resume_budget_nsecs);
+    assert_eq!(
+        waterline.decoded_video_forward_nsecs,
+        Some(resume_budget_nsecs)
+    );
+    assert!(waterline.ready());
+}
+
+#[test]
+fn video_output_rebuffer_resume_keeps_low_water_floor_under_resource_pressure() {
+    let frame_duration_nsecs = 50_000_000;
+    let mut queued = VecDeque::new();
+    let mut frame = test_vulkan_queued_video_frame(1_000_000_000);
+    frame.duration_nsecs = frame_duration_nsecs;
+    queued.push_back(frame);
+
+    let pressured_duration =
+        video_output_rebuffer_resume_duration_with_resource_pressure(&queued, false, true);
+
+    assert_eq!(pressured_duration, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION);
+
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
+        },
+        1_000_000_000,
+        1_000_000_000 + duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
+    );
+    let ready_demux = DemuxReaderWatermark {
+        video_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)),
+        audio_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)),
+        selected_min_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)),
+        video_underrun: false,
+        audio_underrun: false,
+        video_idle: false,
+        audio_idle: false,
+        underrun: false,
+        idle: false,
+        forward_bytes: 1024,
+    };
+
+    let waterline = rebuffer_playback_resume_waterline_with_resource_pressure(
+        &queued,
+        &pending,
+        1_000_000_000,
+        ready_demux,
+        None,
+        false,
+        true,
+        true,
+    );
+
+    assert_eq!(
+        waterline.target_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
+    );
+    assert_eq!(
+        waterline.decoded_video_forward_nsecs,
+        Some(frame_duration_nsecs)
+    );
+    assert!(!waterline.ready());
+    assert_eq!(
+        playback_resume_waterline_blocked_on(waterline),
+        PlaybackBlockReason::DecodedVideoQueue
+    );
+
+    for index in 1..5 {
+        let mut frame = test_vulkan_queued_video_frame(
+            1_000_000_000 + u64::try_from(index).unwrap() * frame_duration_nsecs,
+        );
+        frame.duration_nsecs = frame_duration_nsecs;
+        queued.push_back(frame);
+    }
+
+    let waterline = rebuffer_playback_resume_waterline_with_resource_pressure(
+        &queued,
+        &pending,
+        1_000_000_000,
+        ready_demux,
+        None,
+        false,
+        true,
+        true,
+    );
+
+    assert!(waterline.ready());
+}
+
+#[test]
+fn rebuffer_resume_fallback_waits_for_stable_target_before_timeout() {
+    let resume_timeline_nsecs = 1_000_000_000;
+    let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 8, 100_000_000);
+    let pending = test_pending_audio(
+        resume_timeline_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+    );
+    let ready_demux = ready_demux_watermark(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION));
+
+    let waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        ready_demux,
+        None,
+        false,
+        true,
+    );
+    let before_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER - Duration::from_millis(1)),
+    );
+
+    assert_eq!(
+        before_timeout.target_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+    );
+    assert_eq!(
+        before_timeout.decoded_video_forward_nsecs,
+        Some(800_000_000)
+    );
+    assert!(!before_timeout.ready());
+}
+
+#[test]
+fn rebuffer_resume_fallback_uses_available_decoded_window_after_timeout() {
+    let resume_timeline_nsecs = 1_000_000_000;
+    let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 8, 100_000_000);
+    let pending = test_pending_audio(
+        resume_timeline_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+    );
+    let ready_demux = ready_demux_watermark(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION));
+
+    let waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        ready_demux,
+        None,
+        false,
+        true,
+    );
+    let after_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+    );
+
+    assert_eq!(after_timeout.target_nsecs, 800_000_000);
+    assert_eq!(after_timeout.decoded_video_forward_nsecs, Some(800_000_000));
+    assert!(after_timeout.ready());
+}
+
+#[test]
+fn rebuffer_resume_fallback_resumes_on_video_when_audio_stalls_past_timeout() {
+    let resume_timeline_nsecs = 1_000_000_000;
+    // Plenty of decoded video ahead of the resume point.
+    let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 13, 100_000_000);
+    // Audio sits entirely behind the resume point, so it never covers it
+    // (decoded_audio_forward = None): a structurally lagging / unavailable audio track.
+    let pending = test_pending_audio(resume_timeline_nsecs - 500_000_000, 100_000_000);
+    let ready_demux = ready_demux_watermark(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION));
+
+    let waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        ready_demux,
+        None,
+        false,
+        true,
+    );
+    assert!(!waterline.decoded_audio_ready);
+
+    // At the standard stall timeout, audio is still not ready -> keep waiting for it.
+    let at_standard = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+    );
+    assert!(!at_standard.ready());
+
+    // Past the longer audio-stall fallback, resume on the decoded-video window alone
+    // rather than freezing forever waiting for audio that is not arriving.
+    let after_audio_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER),
+    );
+    assert!(after_audio_timeout.ready());
+    assert!(after_audio_timeout.decoded_video_ready);
+}
+
+#[test]
+fn rebuffer_resume_fallback_waits_for_delayed_audio_start_safety_window_after_demux_recovers() {
+    let first_video_nsecs = 11_800_000_000;
+    let resume_timeline_nsecs = 11_815_079_780;
+    let queued = test_queued_video_frames_with_duration(first_video_nsecs, 5, 40_000_000);
+    let decoded_video_forward_nsecs = first_video_nsecs + 5 * 40_000_000 - resume_timeline_nsecs;
+    assert!(decoded_video_forward_nsecs < duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION));
+    assert!(decoded_video_forward_nsecs >= DEFAULT_VIDEO_FRAME_DURATION_NSECS);
+
+    let pending = test_pending_audio(resume_timeline_nsecs, 1_900_000_000);
+    let ready_demux = ready_demux_watermark(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION));
+
+    let waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        ready_demux,
+        None,
+        false,
+        true,
+    );
+    let after_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+    );
+
+    assert_eq!(
+        after_timeout.target_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+    );
+    assert_eq!(
+        after_timeout.decoded_video_forward_nsecs,
+        Some(decoded_video_forward_nsecs)
+    );
+    assert!(!after_timeout.ready());
+    assert_eq!(
+        playback_resume_waterline_blocked_on(after_timeout),
+        PlaybackBlockReason::DecodedVideoQueue
+    );
+}
+
+#[test]
+fn rebuffer_resume_fallback_rejects_short_window_that_audio_clock_would_consume() {
+    let resume_timeline_nsecs = 9_120_000_000;
+    let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 7, 40_000_000);
+    let pending = test_pending_audio(
+        resume_timeline_nsecs + 238_000_000,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+    );
+    let ready_demux = ready_demux_watermark(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION));
+
+    let waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        ready_demux,
+        None,
+        false,
+        true,
+    );
+    let after_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+    );
+
+    assert_eq!(
+        after_timeout.target_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+    );
+    assert_eq!(after_timeout.decoded_video_forward_nsecs, Some(280_000_000));
+    assert!(!after_timeout.ready());
+}
+
+#[test]
+fn rebuffer_resume_fallback_waits_when_delayed_audio_start_consumes_low_water() {
+    let resume_timeline_nsecs = 4_360_000_000;
+    let delayed_audio_gap_nsecs = 344_000_000;
+    let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 13, 40_000_000);
+    let pending = test_pending_audio(
+        resume_timeline_nsecs + delayed_audio_gap_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+    );
+    let ready_demux = ready_demux_watermark(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION));
+
+    let waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        ready_demux,
+        None,
+        false,
+        true,
+    );
+    let after_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+    );
+
+    assert_eq!(after_timeout.decoded_video_forward_nsecs, Some(520_000_000));
+    assert_eq!(
+        after_timeout.delayed_audio_start_gap_nsecs,
+        Some(delayed_audio_gap_nsecs)
+    );
+    assert!(!after_timeout.ready());
+    assert_eq!(
+        playback_resume_waterline_blocked_on(after_timeout),
+        PlaybackBlockReason::DecodedVideoQueue
+    );
+}
+
+#[test]
+fn rebuffer_resume_fallback_accepts_delayed_audio_start_with_low_water_remaining() {
+    let resume_timeline_nsecs = 4_360_000_000;
+    let delayed_audio_gap_nsecs = 344_000_000;
+    let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 15, 40_000_000);
+    let pending = test_pending_audio(
+        resume_timeline_nsecs + delayed_audio_gap_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+    );
+    let ready_demux = ready_demux_watermark(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION));
+
+    let waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        ready_demux,
+        None,
+        false,
+        true,
+    );
+    let after_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+    );
+
+    assert_eq!(after_timeout.target_nsecs, 600_000_000);
+    assert_eq!(after_timeout.decoded_video_forward_nsecs, Some(600_000_000));
+    assert_eq!(
+        after_timeout.delayed_audio_start_gap_nsecs,
+        Some(delayed_audio_gap_nsecs)
+    );
+    assert!(after_timeout.ready());
+}
+
+#[test]
+fn rebuffer_resume_fallback_still_requires_ready_demux_reader() {
+    let resume_timeline_nsecs = 1_000_000_000;
+    let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 8, 100_000_000);
+    let pending = test_pending_audio(
+        resume_timeline_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+    );
+    let shallow_demux = ready_demux_watermark(500_000_000);
+
+    let waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        shallow_demux,
+        None,
+        false,
+        true,
+    );
+    let after_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+    );
+
+    assert_eq!(
+        after_timeout.target_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+    );
+    assert!(!after_timeout.ready());
+    assert_eq!(
+        playback_resume_waterline_blocked_on(after_timeout),
+        PlaybackBlockReason::DecodedVideoQueue
+    );
 }
 
 #[test]
@@ -1609,24 +2287,28 @@ fn video_decode_skips_nonref_frames_under_decode_pressure() {
         &queued,
         Some(1_000_000_000),
         true,
+        false,
     ));
     assert!(!video_decode_should_skip_nonref_for_pressure(
         PlaybackOutputState::Playing,
         &queued,
         Some(1_000_000_000),
         false,
+        false,
     ));
-    assert!(video_decode_should_skip_nonref_for_pressure(
+    assert!(!video_decode_should_skip_nonref_for_pressure(
         PlaybackOutputState::Rebuffering,
         &queued,
         Some(1_000_000_000),
         true,
+        false,
     ));
     assert!(video_decode_should_skip_nonref_for_pressure(
         PlaybackOutputState::Playing,
         &queued,
         Some(1_000_000_000),
         true,
+        false,
     ));
 
     queued.push_back(test_queued_video_frame(2_000_000_000));
@@ -1636,6 +2318,7 @@ fn video_decode_skips_nonref_frames_under_decode_pressure() {
         &queued,
         Some(1_000_000_000),
         true,
+        false,
     ));
 }
 
@@ -1650,6 +2333,7 @@ fn video_decode_skip_pressure_uses_short_vulkan_low_water() {
         &queued,
         Some(1_000_000_000),
         true,
+        false,
     ));
 
     queued.pop_back();
@@ -1659,6 +2343,29 @@ fn video_decode_skip_pressure_uses_short_vulkan_low_water() {
         PlaybackOutputState::Playing,
         &queued,
         Some(1_000_000_000),
+        true,
+        false,
+    ));
+}
+
+#[test]
+fn video_decode_skip_pressure_uses_vulkan_hysteresis_when_active() {
+    let mut queued = VecDeque::new();
+    queued.push_back(test_vulkan_queued_video_frame(1_000_000_000));
+    queued.push_back(test_vulkan_queued_video_frame(1_300_000_000));
+
+    assert!(!video_decode_should_skip_nonref_for_pressure(
+        PlaybackOutputState::Playing,
+        &queued,
+        Some(1_000_000_000),
+        true,
+        false,
+    ));
+    assert!(video_decode_should_skip_nonref_for_pressure(
+        PlaybackOutputState::Playing,
+        &queued,
+        Some(1_000_000_000),
+        true,
         true,
     ));
 }
@@ -1745,8 +2452,8 @@ fn playback_resume_waterline_requires_decoded_audio_and_demux_streams() {
     );
 
     let shallow_demux = DemuxReaderWatermark {
-        audio_forward_nsecs: Some(duration_nsecs(AUDIO_VIDEO_QUEUE_TARGET_DURATION) - 1),
-        selected_min_forward_nsecs: Some(duration_nsecs(AUDIO_VIDEO_QUEUE_TARGET_DURATION) - 1),
+        audio_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) - 1),
+        selected_min_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) - 1),
         ..ready_demux
     };
     let shallow_demux_waterline =
@@ -1918,19 +2625,19 @@ fn rebuffer_resume_sync_uses_current_audio_and_pending_audio() {
 #[test]
 fn rebuffer_resume_preserves_video_when_output_audio_covers_pending_gap() {
     let resume_timeline_nsecs = 1_010_000_000;
-    let output_audio_until_nsecs = 1_400_000_000;
+    let output_audio_until_nsecs = 1_500_000_000;
     let mut pending = PendingStartAudio::default();
     pending.push(
         DecodedAudio {
             samples: vec![0.0; 4],
-            duration_nsecs: 550_000_000,
+            duration_nsecs: 650_000_000,
         },
         output_audio_until_nsecs,
-        1_950_000_000,
+        2_150_000_000,
     );
     let mut queued = VecDeque::new();
     queued.push_back(test_queued_video_frame(1_000_000_000));
-    queued.push_back(test_queued_video_frame(1_840_000_000));
+    queued.push_back(test_queued_video_frame(2_050_000_000));
 
     assert_eq!(
         rebuffer_audio_clock_resume_decision(
@@ -1955,7 +2662,7 @@ fn rebuffer_resume_preserves_video_when_output_audio_covers_pending_gap() {
             resume_timeline_nsecs,
             Some(output_audio_until_nsecs),
         ),
-        Some(940_000_000)
+        Some(1_140_000_000)
     );
 
     let ready_demux = DemuxReaderWatermark {
@@ -2040,16 +2747,93 @@ fn rebuffer_resume_resets_to_decoded_video_when_anchor_is_uncovered() {
 #[test]
 fn rebuffer_resume_keeps_anchor_when_decoded_video_covers_it() {
     let pending = PendingStartAudio::default();
-    let queued = VecDeque::from([
-        test_queued_video_frame(1_360_000_000),
-        test_queued_video_frame(1_440_000_000),
-    ]);
+    let queued = test_queued_video_frames_with_duration(
+        1_360_000_000,
+        30,
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+    );
 
     assert_eq!(
         rebuffer_audio_clock_resume_decision(&queued, &pending, 1_370_000_000, None, true),
         Some(AudioClockResumeDecision {
             timeline_nsecs: 1_370_000_000,
             reset_audio_to_video: false,
+        })
+    );
+}
+
+#[test]
+fn rebuffer_resume_resets_to_video_when_anchor_window_is_short() {
+    let pending = test_pending_audio(1_370_000_000, 900_000_000);
+    let queued = VecDeque::from([
+        test_queued_video_frame(1_240_000_000),
+        test_queued_video_frame(1_280_000_000),
+        test_queued_video_frame(1_320_000_000),
+        test_queued_video_frame(1_360_000_000),
+        test_queued_video_frame(1_400_000_000),
+    ]);
+
+    assert_eq!(
+        rebuffer_audio_clock_resume_decision(
+            &queued,
+            &pending,
+            1_370_000_000,
+            Some(1_370_000_000),
+            true,
+        ),
+        Some(AudioClockResumeDecision {
+            timeline_nsecs: 1_240_000_000,
+            reset_audio_to_video: true,
+        })
+    );
+    assert_eq!(
+        decoded_audio_forward_nsecs_from(&pending, 1_240_000_000, None),
+        None
+    );
+}
+
+#[test]
+fn rebuffer_resume_waterline_accepts_delayed_audio_start_after_video_reset() {
+    let pending = test_pending_audio(1_370_000_000, 900_000_000);
+    let queued = test_queued_video_frames_with_duration(
+        1_240_000_000,
+        35,
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+    );
+
+    let waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        1_240_000_000,
+        ready_demux_watermark(1_500_000_000),
+        None,
+        false,
+        true,
+    );
+
+    assert!(waterline.ready());
+    assert_eq!(waterline.decoded_audio_forward_nsecs, Some(1_030_000_000));
+}
+
+#[test]
+fn rebuffer_resume_resets_when_output_audio_runs_past_decoded_video() {
+    let pending = PendingStartAudio::default();
+    let queued = VecDeque::from([
+        test_queued_video_frame(3_440_000_000),
+        test_queued_video_frame(3_480_000_000),
+    ]);
+
+    assert_eq!(
+        rebuffer_audio_clock_resume_decision(
+            &queued,
+            &pending,
+            3_441_636_173,
+            Some(3_940_000_000),
+            true,
+        ),
+        Some(AudioClockResumeDecision {
+            timeline_nsecs: 3_440_000_000,
+            reset_audio_to_video: true,
         })
     );
 }
@@ -2125,6 +2909,25 @@ fn audio_clock_video_frames_are_ready_with_small_present_lead() {
         &queue,
         985_000_000
     ));
+}
+
+#[test]
+fn audio_clock_video_wait_duration_tracks_present_deadline() {
+    let mut queue = VecDeque::new();
+    queue.push_back(test_queued_video_frame(1_000_000_000));
+
+    assert_eq!(
+        audio_clocked_video_wait_duration(&queue, 984_000_000),
+        Some(Duration::from_millis(1))
+    );
+    assert_eq!(
+        audio_clocked_video_wait_duration(&queue, 985_000_000),
+        Some(Duration::ZERO)
+    );
+    assert_eq!(
+        audio_clocked_video_wait_duration(&queue, 1_010_000_000),
+        Some(Duration::ZERO)
+    );
 }
 
 #[test]
@@ -2455,12 +3258,59 @@ fn video_decode_error_recovery_classifies_decoder_errors() {
     assert!(video_decode_error_is_recoverable(
         "FFmpeg 发送解码包失败：Invalid data found when processing input"
     ));
-    assert!(!video_decode_error_is_recoverable(
+    assert!(video_decode_error_is_recoverable(
         "FFmpeg 发送解码包失败：Cannot allocate memory"
+    ));
+    assert!(video_decode_error_is_recoverable(
+        "FFmpeg 接收解码帧失败：VK_ERROR_OUT_OF_DEVICE_MEMORY"
     ));
     assert!(!video_decode_error_is_recoverable(
         "FFmpeg 创建视频色彩转换器失败"
     ));
+}
+
+fn test_queued_video_frames_with_duration(
+    start_timeline_nsecs: u64,
+    frame_count: usize,
+    frame_duration_nsecs: u64,
+) -> VecDeque<QueuedVideoFrame> {
+    let mut queued = VecDeque::new();
+    for index in 0..frame_count {
+        let mut frame = test_queued_video_frame(
+            start_timeline_nsecs + u64::try_from(index).unwrap() * frame_duration_nsecs,
+        );
+        frame.duration_nsecs = frame_duration_nsecs;
+        queued.push_back(frame);
+    }
+    queued
+}
+
+fn test_pending_audio(start_timeline_nsecs: u64, duration_nsecs: u64) -> PendingStartAudio {
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs,
+        },
+        start_timeline_nsecs,
+        start_timeline_nsecs + duration_nsecs,
+    );
+    pending
+}
+
+fn ready_demux_watermark(forward_nsecs: u64) -> DemuxReaderWatermark {
+    DemuxReaderWatermark {
+        video_forward_nsecs: Some(forward_nsecs),
+        audio_forward_nsecs: Some(forward_nsecs),
+        selected_min_forward_nsecs: Some(forward_nsecs),
+        video_underrun: false,
+        audio_underrun: false,
+        video_idle: false,
+        audio_idle: false,
+        underrun: false,
+        idle: false,
+        forward_bytes: 1024,
+    }
 }
 
 fn test_queued_video_frame(timeline_nsecs: u64) -> QueuedVideoFrame {
@@ -2683,6 +3533,180 @@ fn pending_start_audio_pops_only_frames_covered_by_video() {
 }
 
 #[test]
+fn pending_audio_underrun_recovery_waits_for_video_window() {
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 500_000_000,
+        },
+        1_400_000_000,
+        1_900_000_000,
+    );
+
+    assert_eq!(
+        pending_audio_underrun_recovery_plan(&pending, 1_000_000_000, 0, None, None),
+        None
+    );
+}
+
+#[test]
+fn pending_audio_underrun_recovery_resets_to_next_audio_with_video_window() {
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 500_000_000,
+        },
+        1_400_000_000,
+        1_900_000_000,
+    );
+
+    assert_eq!(
+        pending_audio_underrun_recovery_plan(
+            &pending,
+            1_000_000_000,
+            0,
+            Some(1_400_000_000),
+            Some(1_900_000_000)
+        ),
+        Some(PendingAudioUnderrunRecoveryPlan {
+            audio_start_timeline_nsecs: 1_400_000_000,
+            audio_flush_until_timeline_nsecs: 1_900_000_000,
+            reset_audio_to_timeline_nsecs: Some(1_400_000_000),
+        })
+    );
+}
+
+#[test]
+fn pending_audio_underrun_recovery_waits_for_existing_audio_before_clock_reset() {
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 500_000_000,
+        },
+        1_400_000_000,
+        1_900_000_000,
+    );
+
+    assert_eq!(
+        pending_audio_underrun_recovery_plan(
+            &pending,
+            1_000_000_000,
+            50_000_000,
+            Some(1_400_000_000),
+            Some(1_900_000_000)
+        ),
+        None
+    );
+}
+
+#[test]
+fn pending_audio_underrun_recovery_uses_video_lead_when_available() {
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 900_000_000,
+        },
+        1_000_000_000,
+        1_900_000_000,
+    );
+
+    assert_eq!(
+        pending_audio_underrun_recovery_plan(
+            &pending,
+            1_000_000_000,
+            0,
+            Some(1_000_000_000),
+            Some(1_300_000_000),
+        ),
+        Some(PendingAudioUnderrunRecoveryPlan {
+            audio_start_timeline_nsecs: 1_000_000_000,
+            audio_flush_until_timeline_nsecs: 1_800_000_000,
+            reset_audio_to_timeline_nsecs: None,
+        })
+    );
+}
+
+#[test]
+fn pending_audio_underrun_recovery_resets_to_video_start_when_audio_leads_video() {
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 900_000_000,
+        },
+        1_000_000_000,
+        1_900_000_000,
+    );
+
+    assert_eq!(
+        pending_audio_underrun_recovery_plan(
+            &pending,
+            1_000_000_000,
+            0,
+            Some(1_400_000_000),
+            Some(1_900_000_000),
+        ),
+        Some(PendingAudioUnderrunRecoveryPlan {
+            audio_start_timeline_nsecs: 1_400_000_000,
+            audio_flush_until_timeline_nsecs: 1_900_000_000,
+            reset_audio_to_timeline_nsecs: Some(1_400_000_000),
+        })
+    );
+}
+
+#[test]
+fn pending_audio_underrun_recovery_waits_for_actual_video_window() {
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 900_000_000,
+        },
+        1_000_000_000,
+        1_900_000_000,
+    );
+
+    assert_eq!(
+        pending_audio_underrun_recovery_plan(
+            &pending,
+            1_000_000_000,
+            0,
+            Some(1_000_000_000),
+            Some(1_040_000_000),
+        ),
+        None
+    );
+}
+
+#[test]
+fn pending_audio_underrun_recovery_discards_stale_pending_audio_before_video_start() {
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 500_000_000,
+        },
+        1_000_000_000,
+        1_500_000_000,
+    );
+
+    assert_eq!(
+        discard_stale_pending_audio_before_recovery_start(
+            &mut pending,
+            1_800_000_000,
+            0,
+            Some(2_000_000_000)
+        ),
+        1
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
 fn audio_sample_len_rejects_invalid_sizes() {
     assert!(audio_sample_len(-1, FALLBACK_AUDIO_OUTPUT_CHANNELS).is_err());
     assert!(audio_sample_len(1024, 0).is_err());
@@ -2834,6 +3858,46 @@ fn fill_audio_output_converts_samples_and_outputs_silence_on_underrun() {
             .is_empty()
     );
     assert_eq!(shared.played_samples.load(Ordering::Relaxed), 3);
+    assert!(shared.underrun_active_for_test());
+}
+
+#[test]
+fn audio_clock_freezes_during_output_underrun_until_pending_recovers() {
+    let shared = test_audio_shared(4_800);
+    shared.reset_clock(1_000_000_000);
+    assert_eq!(
+        shared
+            .buffer
+            .lock()
+            .expect("audio output buffer poisoned")
+            .push_slice(&vec![0.0; 960]),
+        960
+    );
+    shared.set_queued_end_timeline_nsecs(1_010_000_000);
+
+    let mut output = [0.0f64; 1_920];
+    fill_audio_output(&mut output, &shared);
+
+    let frozen_timeline_nsecs = shared.played_timeline_nsecs();
+    assert!(frozen_timeline_nsecs.abs_diff(1_000_000_000) <= 1_000);
+    assert!(shared.underrun_active_for_test());
+
+    assert_eq!(
+        shared
+            .buffer
+            .lock()
+            .expect("audio output buffer poisoned")
+            .push_slice(&vec![0.0; 960]),
+        960
+    );
+    shared.set_queued_end_timeline_nsecs(2_000_000_000);
+    assert_eq!(shared.played_timeline_nsecs(), frozen_timeline_nsecs);
+
+    shared.clear_underrun_if_recovered_for_test(duration_nsecs(
+        AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
+    ));
+    assert!(!shared.underrun_active_for_test());
+    assert_ne!(shared.played_timeline_nsecs(), frozen_timeline_nsecs);
 }
 
 #[test]
@@ -3159,6 +4223,21 @@ fn http_ring_cache_read_at_returns_large_partial_buffer_without_waiting_for_full
         CacheReadResult::Data(HTTP_CACHE_PARTIAL_READ_MIN_BYTES)
     ));
     assert_eq!(&output[..HTTP_CACHE_PARTIAL_READ_MIN_BYTES], &cached);
+}
+
+#[test]
+fn http_ring_cache_read_at_returns_small_partial_buffer_without_waiting() {
+    let mut state = HttpRingCacheState::new(0);
+    let cached = vec![0x5a; HTTP_CACHE_PARTIAL_READ_MIN_BYTES / 2];
+    state.append_at(0, &cached);
+    let cache = HttpRingCache::from_state_for_test(state);
+    let mut output = vec![0; HTTP_CACHE_PARTIAL_READ_MIN_BYTES];
+
+    assert!(matches!(
+        cache.read_at_for_test(0, &mut output),
+        CacheReadResult::Data(read) if read == cached.len()
+    ));
+    assert_eq!(&output[..cached.len()], &cached);
 }
 
 #[test]

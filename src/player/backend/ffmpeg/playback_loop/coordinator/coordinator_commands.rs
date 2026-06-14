@@ -67,6 +67,7 @@ pub(super) fn service_playback_commands(
         context.pipeline.current_start_position_nsecs = context.session.start_position_nsecs();
         service_playback_seek_reset(PlaybackSeekResetContext {
             position_seconds,
+            seek_mode: pending_seek.mode,
             seek_generation: pending_seek.generation,
             session_id: context.session.id(),
             vo_queue: context.vo_queue,
@@ -106,6 +107,7 @@ fn service_track_selection_command(
     service_playback_generation_seek(PlaybackGenerationFlushContext {
         kind: PlaybackPositionResetKind::TrackSelection,
         position_seconds,
+        seek_mode: PlaybackSeekMode::Precise,
         seek_generation: pending_track_selection.generation,
         session_id: context.session.id(),
         vo_queue: context.vo_queue,

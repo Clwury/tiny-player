@@ -1,6 +1,8 @@
 use super::decode::DecodePacketAdmissionStatus;
+use super::demux_cache::DemuxPacketQueueSnapshot;
 use super::playback_pipeline_state::{DecoderInputSnapshot, PlaybackPipelineState};
 use super::video_decode_pipeline::VideoPacketAdmissionPressure;
+use super::video_decode_worker::{VideoDecodeWorkerSnapshot, VideoDecodeWorkerState};
 use super::*;
 
 const DEMUX_PACKET_PUMP_MAX_PACKETS_PER_TICK: usize = 16;
@@ -14,6 +16,7 @@ struct DemuxPacketPumpContext<'a> {
     session_id: PlaybackSessionId,
     demux_cache: &'a DemuxPacketCache,
     decoder_input: &'a DecoderInputSnapshot,
+    video_admission_pressure: VideoPacketAdmissionPressure,
     should_wait_for_demux: bool,
     video_output_waiting_for_demux: bool,
 }
@@ -55,8 +58,23 @@ impl DemuxPacketPump {
         demux_streams.rotate_left(demux_stream_rotation);
 
         let demux_read_started_at = Instant::now();
-        let (demux_read_result, demux_consumed_stream_offset) =
-            Self::poll_per_stream(context.demux_cache, &demux_streams);
+        let (demux_read_result, demux_consumed_stream_offset) = if let Some(lock_wait) =
+            demux_pump_cache_lock_wait(
+                context.should_wait_for_demux,
+                context.video_output_waiting_for_demux,
+                context.decoder_input,
+                context.video_admission_pressure,
+            ) {
+            context
+                .demux_cache
+                .read_available_packet_round_robin_with_cache_pause_signal(
+                    &demux_streams,
+                    lock_wait,
+                    demux_cache_pause_signal(&context),
+                )
+        } else {
+            context.demux_cache.poll_packet_round_robin(&demux_streams)
+        };
         let demux_read_elapsed = demux_read_started_at.elapsed();
         if demux_read_elapsed >= DEMUX_READ_WAIT_LOG_AFTER {
             self.log_wait(
@@ -119,12 +137,33 @@ impl DemuxPacketPump {
             session_id: context.session_id,
             demux_cache: context.demux_cache,
             decoder_input: &decoder_input,
+            video_admission_pressure: context.video_admission_pressure,
             should_wait_for_demux: context.should_wait_for_demux,
             video_output_waiting_for_demux: context.video_output_waiting_for_demux,
         });
         let mut packet = match demux_read_result {
             DemuxReadResult::Packet(packet) => packet,
-            DemuxReadResult::Eof => return DemuxPacketPumpResult::Eof,
+            DemuxReadResult::Eof => {
+                let demux_packet_snapshot = context.demux_cache.packet_queue_snapshot();
+                let blocked_cached_streams =
+                    eof_cached_backpressured_streams(&decoder_input, &demux_packet_snapshot);
+                if !blocked_cached_streams.is_empty() {
+                    tracing::debug!(
+                        session_id = ?context.session_id,
+                        blocked_cached_streams = ?blocked_cached_streams,
+                        demux_streams = ?decoder_input.demux_streams,
+                        demux_packet_queued = demux_packet_snapshot.total_packets,
+                        demux_packet_bytes = demux_packet_snapshot.total_bytes,
+                        demux_packet_streams = ?demux_packet_snapshot.streams,
+                        video_decode_blocked_on = ?decoder_input
+                            .video_decode_blocked_on
+                            .map(PlaybackBlockReason::as_str),
+                        "deferring FFmpeg demux EOF while selected streams remain backpressured"
+                    );
+                    return DemuxPacketPumpResult::Backpressured;
+                }
+                return DemuxPacketPumpResult::Eof;
+            }
             DemuxReadResult::WouldBlock => return DemuxPacketPumpResult::WouldBlock,
             DemuxReadResult::Interrupted => return DemuxPacketPumpResult::Interrupted,
             DemuxReadResult::Error(error) => return DemuxPacketPumpResult::Error(error),
@@ -178,30 +217,6 @@ impl DemuxPacketPump {
         }
     }
 
-    fn poll_per_stream(
-        demux_cache: &DemuxPacketCache,
-        demux_streams: &[c_int],
-    ) -> (DemuxReadResult, Option<usize>) {
-        let mut saw_would_block = false;
-        let mut saw_eof = false;
-        for (stream_offset, stream_index) in demux_streams.iter().copied().enumerate() {
-            match demux_cache.poll_packet(stream_index) {
-                DemuxReadResult::Packet(packet) => {
-                    return (DemuxReadResult::Packet(packet), Some(stream_offset));
-                }
-                DemuxReadResult::Eof => saw_eof = true,
-                DemuxReadResult::WouldBlock => saw_would_block = true,
-                DemuxReadResult::Interrupted => return (DemuxReadResult::Interrupted, None),
-                DemuxReadResult::Error(error) => return (DemuxReadResult::Error(error), None),
-            }
-        }
-        if saw_eof && !saw_would_block {
-            (DemuxReadResult::Eof, None)
-        } else {
-            (DemuxReadResult::WouldBlock, None)
-        }
-    }
-
     fn log_wait(
         &self,
         context: &DemuxPacketPumpContext<'_>,
@@ -227,6 +242,7 @@ impl DemuxPacketPump {
             video_decode_blocked_on,
             Some(
                 PlaybackBlockReason::PacketQueueFull
+                    | PlaybackBlockReason::DecodedVideoQueue
                     | PlaybackBlockReason::DecodedQueueFull
                     | PlaybackBlockReason::HwSurfacePool
             )
@@ -266,9 +282,151 @@ impl DemuxPacketPump {
     }
 }
 
+fn eof_cached_backpressured_streams(
+    decoder_input: &DecoderInputSnapshot,
+    demux_packet_snapshot: &DemuxPacketQueueSnapshot,
+) -> Vec<c_int> {
+    selected_decoder_streams(decoder_input)
+        .into_iter()
+        .flatten()
+        .filter(|stream_index| !decoder_input.demux_streams.contains(stream_index))
+        .filter(|stream_index| {
+            demux_stream_has_cached_packets(demux_packet_snapshot, *stream_index)
+        })
+        .collect()
+}
+
+fn selected_decoder_streams(decoder_input: &DecoderInputSnapshot) -> [Option<c_int>; 3] {
+    [
+        Some(decoder_input.video_stream_index),
+        decoder_input.audio_stream_index,
+        decoder_input.subtitle_stream_index,
+    ]
+}
+
+fn demux_stream_has_cached_packets(
+    demux_packet_snapshot: &DemuxPacketQueueSnapshot,
+    stream_index: c_int,
+) -> bool {
+    demux_packet_snapshot
+        .streams
+        .iter()
+        .any(|stream| stream.stream_index == stream_index && stream.queued_packets > 0)
+}
+
+#[cfg(test)]
+fn demux_pump_should_wait_for_cache_lock(
+    should_wait_for_demux: bool,
+    video_output_waiting_for_demux: bool,
+    decoder_input: &DecoderInputSnapshot,
+    video_admission_pressure: VideoPacketAdmissionPressure,
+) -> bool {
+    demux_pump_cache_lock_wait(
+        should_wait_for_demux,
+        video_output_waiting_for_demux,
+        decoder_input,
+        video_admission_pressure,
+    )
+    .is_some()
+}
+
+fn demux_pump_cache_lock_wait(
+    should_wait_for_demux: bool,
+    video_output_waiting_for_demux: bool,
+    decoder_input: &DecoderInputSnapshot,
+    video_admission_pressure: VideoPacketAdmissionPressure,
+) -> Option<Duration> {
+    if decoder_input.demux_streams.is_empty() || !decoder_input_accepts_video_packet(decoder_input)
+    {
+        return demux_pump_audio_cache_lock_wait(
+            should_wait_for_demux,
+            video_output_waiting_for_demux,
+            decoder_input,
+            video_admission_pressure,
+        );
+    }
+    if should_wait_for_demux
+        || video_output_waiting_for_demux
+        || output_queue_needs_decoder_input(video_admission_pressure.output_snapshot)
+    {
+        return Some(DEMUX_PACKET_CACHE_LOCK_WAIT);
+    }
+    if video_decoder_has_pending_work(decoder_input.video_decode_snapshot) {
+        return None;
+    }
+    None
+}
+
+fn demux_cache_pause_signal(context: &DemuxPacketPumpContext<'_>) -> bool {
+    context.video_output_waiting_for_demux
+        || context.video_admission_pressure.output_snapshot.rebuffering
+}
+
+fn demux_pump_audio_cache_lock_wait(
+    should_wait_for_demux: bool,
+    video_output_waiting_for_demux: bool,
+    decoder_input: &DecoderInputSnapshot,
+    video_admission_pressure: VideoPacketAdmissionPressure,
+) -> Option<Duration> {
+    if !decoder_input_accepts_audio_packet(decoder_input) {
+        return None;
+    }
+    if should_wait_for_demux
+        || video_output_waiting_for_demux
+        || output_queue_needs_decoder_input(video_admission_pressure.output_snapshot)
+    {
+        return Some(DEMUX_PACKET_CACHE_LOCK_WAIT);
+    }
+    None
+}
+
+fn decoder_input_accepts_video_packet(decoder_input: &DecoderInputSnapshot) -> bool {
+    decoder_input
+        .demux_streams
+        .contains(&decoder_input.video_stream_index)
+}
+
+fn decoder_input_accepts_audio_packet(decoder_input: &DecoderInputSnapshot) -> bool {
+    decoder_input
+        .audio_stream_index
+        .is_some_and(|stream_index| decoder_input.demux_streams.contains(&stream_index))
+}
+
+fn video_decoder_has_pending_work(snapshot: VideoDecodeWorkerSnapshot) -> bool {
+    snapshot.queued_frames > 0
+        || snapshot.pending_input_packets > 0
+        || snapshot.in_flight_packets > 0
+        || snapshot.completed_packets > 0
+        || matches!(
+            snapshot.state,
+            VideoDecodeWorkerState::Decoding
+                | VideoDecodeWorkerState::HaveFrame
+                | VideoDecodeWorkerState::OutputFull
+                | VideoDecodeWorkerState::Draining
+                | VideoDecodeWorkerState::Recovering
+        )
+}
+
+fn output_queue_needs_decoder_input(output_snapshot: PlaybackOutputSnapshot) -> bool {
+    if output_snapshot.first_video_frame_pending || output_snapshot.rebuffering {
+        return false;
+    }
+    if output_snapshot.queued_video_frames == 0 {
+        return true;
+    }
+    let queued_forward_nsecs = output_snapshot
+        .queued_video_forward_nsecs
+        .unwrap_or(output_snapshot.queued_video_duration_nsecs);
+    queued_forward_nsecs <= duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::backend::ffmpeg::playback_loop::{
+        demux_cache::DemuxStreamPacketQueueSnapshot,
+        video_decode_worker::{VideoDecodeWorkerSnapshot, VideoDecodeWorkerState},
+    };
 
     fn packet_for_stream(stream_index: c_int) -> AvPacket {
         let mut packet = AvPacket::new().expect("packet allocates");
@@ -311,6 +469,282 @@ mod tests {
         assert_eq!(
             pump.route_packet(&packet_for_stream(12), 10, Some(11), None),
             DemuxPacketRoute::Other
+        );
+    }
+
+    #[test]
+    fn demux_packet_pump_only_waits_for_cache_lock_when_output_waits_for_demux() {
+        let decoder_input = decoder_input_snapshot(vec![0], 0, None, None);
+        let pressure = VideoPacketAdmissionPressure {
+            output_snapshot: playback_output_snapshot_for_test(
+                10,
+                duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION) + 1,
+            ),
+            skip_nonref_for_pressure: false,
+            played_until_nsecs: Some(1_000_000_000),
+        };
+
+        assert!(!demux_pump_should_wait_for_cache_lock(
+            false,
+            false,
+            &decoder_input,
+            pressure
+        ));
+        assert!(demux_pump_should_wait_for_cache_lock(
+            true,
+            false,
+            &decoder_input,
+            pressure
+        ));
+        assert!(demux_pump_should_wait_for_cache_lock(
+            false,
+            true,
+            &decoder_input,
+            pressure
+        ));
+    }
+
+    #[test]
+    fn demux_packet_pump_waits_for_cache_lock_when_output_window_needs_packets() {
+        let decoder_input = decoder_input_snapshot(vec![0], 0, None, None);
+        let full_output = VideoPacketAdmissionPressure {
+            output_snapshot: playback_output_snapshot_for_test(
+                10,
+                duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION) + 1,
+            ),
+            skip_nonref_for_pressure: false,
+            played_until_nsecs: Some(1_000_000_000),
+        };
+        let draining_output = VideoPacketAdmissionPressure {
+            output_snapshot: playback_output_snapshot_for_test(
+                9,
+                duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION),
+            ),
+            skip_nonref_for_pressure: false,
+            played_until_nsecs: Some(1_000_000_000),
+        };
+        let empty_decoder_input = decoder_input_snapshot(Vec::new(), 0, None, None);
+
+        assert!(!demux_pump_should_wait_for_cache_lock(
+            false,
+            false,
+            &decoder_input,
+            full_output
+        ));
+        assert!(demux_pump_should_wait_for_cache_lock(
+            false,
+            false,
+            &decoder_input,
+            draining_output
+        ));
+        assert!(!demux_pump_should_wait_for_cache_lock(
+            false,
+            false,
+            &empty_decoder_input,
+            draining_output
+        ));
+    }
+
+    #[test]
+    fn demux_packet_pump_waits_for_cache_lock_for_audio_only_input_when_output_needs_packets() {
+        let decoder_input = decoder_input_snapshot(vec![2], 0, Some(2), None);
+        let draining_output = VideoPacketAdmissionPressure {
+            output_snapshot: playback_output_snapshot_for_test(
+                3,
+                duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
+            ),
+            skip_nonref_for_pressure: false,
+            played_until_nsecs: Some(1_000_000_000),
+        };
+
+        assert!(demux_pump_should_wait_for_cache_lock(
+            false,
+            false,
+            &decoder_input,
+            draining_output
+        ));
+    }
+
+    #[test]
+    fn demux_packet_pump_does_not_wait_for_audio_only_input_when_output_has_headroom() {
+        let decoder_input = decoder_input_snapshot(vec![2], 0, Some(2), None);
+        let full_output = VideoPacketAdmissionPressure {
+            output_snapshot: playback_output_snapshot_for_test(
+                10,
+                duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION) + 1,
+            ),
+            skip_nonref_for_pressure: false,
+            played_until_nsecs: Some(1_000_000_000),
+        };
+
+        assert!(!demux_pump_should_wait_for_cache_lock(
+            false,
+            false,
+            &decoder_input,
+            full_output
+        ));
+    }
+
+    #[test]
+    fn demux_packet_pump_waits_for_playback_need_when_video_decoder_has_pending_work() {
+        let mut decoder_input = decoder_input_snapshot(vec![0], 0, None, None);
+        decoder_input.video_decode_snapshot.state = VideoDecodeWorkerState::HaveFrame;
+        decoder_input.video_decode_snapshot.queued_frames = 7;
+        let full_output = VideoPacketAdmissionPressure {
+            output_snapshot: playback_output_snapshot_for_test(
+                12,
+                duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION) + 1,
+            ),
+            skip_nonref_for_pressure: false,
+            played_until_nsecs: Some(1_000_000_000),
+        };
+        let draining_output = VideoPacketAdmissionPressure {
+            output_snapshot: playback_output_snapshot_for_test(
+                3,
+                duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
+            ),
+            skip_nonref_for_pressure: false,
+            played_until_nsecs: Some(1_000_000_000),
+        };
+
+        assert!(!demux_pump_should_wait_for_cache_lock(
+            false,
+            false,
+            &decoder_input,
+            full_output
+        ));
+        assert!(demux_pump_should_wait_for_cache_lock(
+            false,
+            false,
+            &decoder_input,
+            draining_output
+        ));
+        assert!(demux_pump_should_wait_for_cache_lock(
+            true,
+            false,
+            &decoder_input,
+            draining_output
+        ));
+    }
+
+    #[test]
+    fn demux_packet_pump_waits_for_cache_lock_before_video_headroom_is_low() {
+        let decoder_input = decoder_input_snapshot(vec![0], 0, None, None);
+        let one_second_headroom = VideoPacketAdmissionPressure {
+            output_snapshot: playback_output_snapshot_for_test(
+                12,
+                duration_nsecs(Duration::from_millis(1_200)),
+            ),
+            skip_nonref_for_pressure: false,
+            played_until_nsecs: Some(1_000_000_000),
+        };
+
+        assert!(demux_pump_should_wait_for_cache_lock(
+            false,
+            false,
+            &decoder_input,
+            one_second_headroom
+        ));
+    }
+
+    fn decoder_input_snapshot(
+        demux_streams: Vec<c_int>,
+        video_stream_index: c_int,
+        audio_stream_index: Option<c_int>,
+        subtitle_stream_index: Option<c_int>,
+    ) -> DecoderInputSnapshot {
+        DecoderInputSnapshot {
+            demux_streams,
+            video_stream_index,
+            audio_stream_index,
+            subtitle_stream_index,
+            video_decode_snapshot: VideoDecodeWorkerSnapshot {
+                state: VideoDecodeWorkerState::NeedPacket,
+                queued_frames: 0,
+                queue_capacity: 48,
+                pending_input_packets: 0,
+                pending_input_capacity: 8,
+                in_flight_packets: 0,
+                command_queue_capacity: 8,
+                completed_packets: 0,
+            },
+            video_decode_blocked_on: Some(PlaybackBlockReason::DecodedVideoQueue),
+        }
+    }
+
+    fn playback_output_snapshot_for_test(
+        queued_video_frames: usize,
+        queued_video_forward_nsecs: u64,
+    ) -> PlaybackOutputSnapshot {
+        PlaybackOutputSnapshot {
+            state: PlaybackOutputState::Playing,
+            first_video_frame_pending: false,
+            rebuffering: false,
+            queued_video_frames,
+            queued_video_duration_nsecs: queued_video_forward_nsecs,
+            queued_video_range_nsecs: Some((
+                1_000_000_000,
+                1_000_000_000 + queued_video_forward_nsecs,
+            )),
+            queued_video_forward_nsecs: Some(queued_video_forward_nsecs),
+            video_output_low_water: queued_video_forward_nsecs
+                <= duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
+            pending_start_audio_frames: 0,
+            pending_start_audio_nsecs: 0,
+            video_output_rebuffer_anchor: None,
+        }
+    }
+
+    fn demux_packet_snapshot(
+        streams: Vec<(c_int, StreamCacheKind, usize)>,
+    ) -> DemuxPacketQueueSnapshot {
+        let streams = streams
+            .into_iter()
+            .map(
+                |(stream_index, kind, queued_packets)| DemuxStreamPacketQueueSnapshot {
+                    stream_index,
+                    kind,
+                    queued_packets,
+                    packet_limit: 2048,
+                    packet_queue_full: false,
+                    queued_bytes: queued_packets,
+                    forward_nsecs: None,
+                },
+            )
+            .collect::<Vec<_>>();
+        DemuxPacketQueueSnapshot {
+            total_packets: streams.iter().map(|stream| stream.queued_packets).sum(),
+            total_bytes: streams.iter().map(|stream| stream.queued_bytes).sum(),
+            memory_limit_bytes: 1024 * 1024,
+            streams,
+        }
+    }
+
+    #[test]
+    fn demux_packet_pump_defers_eof_for_cached_backpressured_streams() {
+        let decoder_input = decoder_input_snapshot(vec![1], 0, Some(1), None);
+        let demux_packet_snapshot = demux_packet_snapshot(vec![
+            (0, StreamCacheKind::Video, 104),
+            (1, StreamCacheKind::Audio, 0),
+        ]);
+
+        assert_eq!(
+            eof_cached_backpressured_streams(&decoder_input, &demux_packet_snapshot),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn demux_packet_pump_allows_eof_when_blocked_streams_have_no_cached_packets() {
+        let decoder_input = decoder_input_snapshot(vec![1], 0, Some(1), None);
+        let demux_packet_snapshot = demux_packet_snapshot(vec![
+            (0, StreamCacheKind::Video, 0),
+            (1, StreamCacheKind::Audio, 0),
+            (7, StreamCacheKind::Unknown, 3),
+        ]);
+
+        assert!(
+            eof_cached_backpressured_streams(&decoder_input, &demux_packet_snapshot).is_empty()
         );
     }
 }

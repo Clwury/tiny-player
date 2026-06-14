@@ -17,7 +17,8 @@ pub(super) unsafe extern "C" fn cached_avio_read_packet(
         return ffi::AVERROR(ffi::EINVAL);
     }
     let reader = unsafe { &mut *(opaque as *mut CachedAvioReader) };
-    let output = unsafe { slice::from_raw_parts_mut(buf, buf_size as usize) };
+    let output_len = (buf_size as usize).min(HTTP_CACHE_MAX_READ_CHUNK_BYTES);
+    let output = unsafe { slice::from_raw_parts_mut(buf, output_len) };
     match reader.cache.read_at(reader.read_pos, output) {
         CacheReadResult::Data(read) => {
             if read < output.len() {

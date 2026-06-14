@@ -1,9 +1,13 @@
-use super::audio_output_gate::{flush_pending_start_audio, push_decoded_audio_to_output};
+use super::audio_output_gate::{
+    DelayedAudioStartSilencePolicy, flush_pending_start_audio, push_decoded_audio_to_output,
+    recover_pending_start_audio_after_underrun,
+};
 use super::output_rebuffer::{
     AudioClockResumeDecision, PlaybackOutputState, PlaybackResumeWaterline, RebufferResumeAnchor,
     audio_output_buffered_until_for_resume, clear_video_output_rebuffer,
     enter_video_output_rebuffer, finish_video_output_rebuffer_if_ready,
-    should_block_for_demux_read, video_output_rebuffer_should_enter,
+    rebuffer_playback_resume_waterline_after_prolonged_wait, should_block_for_demux_read,
+    video_output_rebuffer_should_enter,
 };
 use super::pending_audio_queue::PendingStartAudio;
 use super::scheduled_video_queue::ScheduledVideoQueue;
@@ -21,6 +25,8 @@ pub(in crate::player::backend::ffmpeg) struct PlaybackOutputScheduler {
         Option<Instant>,
     pub(in crate::player::backend::ffmpeg::playback_loop) video_output_rebuffer_anchor:
         Option<RebufferResumeAnchor>,
+    syncing_started_at: Option<Instant>,
+    defer_pending_start_audio_flush_once: bool,
 }
 
 impl PlaybackOutputScheduler {
@@ -33,6 +39,8 @@ impl PlaybackOutputScheduler {
             playback_output_state,
             video_output_underrun_started_at: None,
             video_output_rebuffer_anchor: None,
+            syncing_started_at: Some(Instant::now()),
+            defer_pending_start_audio_flush_once: false,
         }
     }
 
@@ -56,8 +64,20 @@ impl PlaybackOutputScheduler {
         self.playback_output_state.rebuffering()
     }
 
+    /// True while the output is building up the decoded buffer to (re)start
+    /// playback (initial sync or rebuffer). During this phase the soft Vulkan
+    /// frame-pressure throttle is lifted so decode can reach the resume waterline.
+    pub(in crate::player::backend::ffmpeg) fn output_fill_phase(&self) -> bool {
+        self.playback_output_state.first_video_frame_pending()
+            || self.playback_output_state.rebuffering()
+    }
+
     pub(in crate::player::backend::ffmpeg) fn set_state(&mut self, state: PlaybackOutputState) {
         self.playback_output_state = state;
+        self.syncing_started_at = (state == PlaybackOutputState::Syncing).then(Instant::now);
+        if state != PlaybackOutputState::Playing {
+            self.defer_pending_start_audio_flush_once = false;
+        }
         self.sync_first_video_frame_pending();
     }
 
@@ -84,6 +104,7 @@ impl PlaybackOutputScheduler {
         &mut self,
         now: Instant,
         video_output_underflowing: bool,
+        output_underrun: bool,
         demux_cache_insufficient: bool,
         render_backlogged: bool,
         has_audio_output: bool,
@@ -96,6 +117,7 @@ impl PlaybackOutputScheduler {
             &mut self.video_output_underrun_started_at,
             now,
             video_output_underflowing,
+            output_underrun,
             demux_cache_insufficient,
             render_backlogged,
             has_audio_output,
@@ -116,6 +138,28 @@ impl PlaybackOutputScheduler {
             underrun_elapsed,
             decoded_video_forward_nsecs,
         );
+        // Reclaim Vulkan frame-pool budget held by decoded frames that end at/before
+        // the rebuffer anchor: the audio clock paused at the anchor and never runs
+        // backwards, so those frames can never be presented, yet they count against
+        // the frame-pressure budget without contributing to the resume waterline
+        // (which measures forward from the anchor). Skip when we will reset the audio
+        // clock back to the decoded-video front, since those frames are then kept.
+        if let Some(anchor) = self.video_output_rebuffer_anchor
+            && !anchor.reset_to_video_when_decoded_queue_misses_anchor
+        {
+            let dropped = self
+                .scheduled_video_queue
+                .discard_before(anchor.timeline_nsecs);
+            if dropped > 0 {
+                tracing::debug!(
+                    session_id = ?session_id,
+                    dropped_pre_anchor_frames = dropped,
+                    anchor_timeline_nsecs = anchor.timeline_nsecs,
+                    remaining_queued_frames = self.scheduled_video_queue.len(),
+                    "dropped pre-anchor decoded video frames to reclaim frame-pool budget on rebuffer entry"
+                );
+            }
+        }
         self.sync_first_video_frame_pending();
         true
     }
@@ -166,15 +210,43 @@ impl PlaybackOutputScheduler {
             .limit_reached(needs_subtitle_prefetch)
     }
 
+    pub(in crate::player::backend::ffmpeg) fn scheduled_video_queue_len(&self) -> usize {
+        self.scheduled_video_queue.len()
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn audio_clocked_video_wait_duration(
+        &self,
+        played_until_nsecs: u64,
+    ) -> Option<Duration> {
+        if self.playback_output_state.first_video_frame_pending()
+            || self.playback_output_state.rebuffering()
+        {
+            return None;
+        }
+        self.scheduled_video_queue
+            .audio_clock_wait_duration(played_until_nsecs)
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn pending_start_audio_backpressured(&self) -> bool {
+        if self.pending_start_audio.buffered_duration() < PENDING_START_AUDIO_BACKPRESSURE_DURATION
+        {
+            return false;
+        }
+        !self.playback_output_state.first_video_frame_pending()
+            || !self.scheduled_video_queue.is_empty()
+    }
+
     pub(in crate::player::backend::ffmpeg) fn video_decode_skip_nonref_for_pressure(
         &self,
         played_until_nsecs: Option<u64>,
         has_audio_output: bool,
+        skip_nonref_active: bool,
     ) -> bool {
         self.scheduled_video_queue.skip_nonref_for_pressure(
             self.playback_output_state,
             played_until_nsecs,
             has_audio_output,
+            skip_nonref_active,
         )
     }
 
@@ -194,7 +266,12 @@ impl PlaybackOutputScheduler {
         subtitle_pipeline: &mut SubtitlePipeline,
         buffered_reporter: &mut BufferedReporter,
     ) -> std::result::Result<(), String> {
-        if self.decoded_audio_can_push_directly(end_timeline_nsecs) {
+        let audio_snapshot = output.snapshot()?;
+        if self.decoded_audio_can_push_directly(
+            start_timeline_nsecs,
+            end_timeline_nsecs,
+            audio_snapshot.buffered_until_timeline_nsecs,
+        ) {
             push_decoded_audio_to_output(
                 output,
                 control,
@@ -237,17 +314,42 @@ impl PlaybackOutputScheduler {
         {
             return Ok(());
         }
+        if self.defer_pending_start_audio_flush_once {
+            self.defer_pending_start_audio_flush_once = false;
+            return Ok(());
+        }
+        let recovering_underrun = output.underrun_active();
+        if recover_pending_start_audio_after_underrun(
+            &mut self.pending_start_audio,
+            output,
+            control,
+            &mut self.scheduled_video_queue,
+            session_id,
+            vo_queue,
+            frame_presented,
+            position_reporter,
+            event_tx,
+            subtitle_pipeline,
+            buffered_reporter,
+        )? {
+            return Ok(());
+        }
+        if recovering_underrun {
+            return Ok(());
+        }
         let audio_snapshot = output.snapshot()?;
-        let audio_start_timeline_nsecs = audio_snapshot.played_timeline_nsecs;
+        let audio_start_timeline_nsecs =
+            audio_output_contiguous_start_timeline_nsecs(audio_snapshot);
         let audio_flush_until_timeline_nsecs = self
             .scheduled_video_queue
-            .audio_output_lead_until_nsecs()
+            .audio_output_lead_until_from_nsecs(audio_start_timeline_nsecs)
             .unwrap_or(audio_start_timeline_nsecs);
         flush_pending_start_audio(
             &mut self.pending_start_audio,
             output,
             audio_start_timeline_nsecs,
             audio_flush_until_timeline_nsecs,
+            DelayedAudioStartSilencePolicy::Allow,
             control,
             &mut self.scheduled_video_queue,
             session_id,
@@ -261,14 +363,40 @@ impl PlaybackOutputScheduler {
         .map(|_| ())
     }
 
-    fn decoded_audio_can_push_directly(&self, end_timeline_nsecs: u64) -> bool {
+    fn decoded_audio_can_push_directly(
+        &self,
+        start_timeline_nsecs: u64,
+        end_timeline_nsecs: u64,
+        audio_output_buffered_until_timeline_nsecs: u64,
+    ) -> bool {
         !self.playback_output_state.first_video_frame_pending()
             && !self.playback_output_state.rebuffering()
             && self.pending_start_audio.is_empty()
+            && start_timeline_nsecs >= audio_output_buffered_until_timeline_nsecs
             && self
                 .scheduled_video_queue
-                .audio_output_lead_until_nsecs()
+                .audio_output_lead_until_from_nsecs(start_timeline_nsecs)
                 .is_some_and(|limit| end_timeline_nsecs <= limit)
+    }
+
+    fn startup_sync_elapsed(&self) -> Option<Duration> {
+        (self.playback_output_state == PlaybackOutputState::Syncing)
+            .then(|| self.syncing_started_at.map(|started| started.elapsed()))
+            .flatten()
+    }
+
+    fn rebuffer_wait_elapsed(&self) -> Option<Duration> {
+        self.playback_output_state
+            .rebuffering()
+            .then(|| {
+                self.video_output_underrun_started_at
+                    .map(|started| started.elapsed())
+            })
+            .flatten()
+    }
+
+    fn defer_next_pending_start_audio_flush(&mut self) {
+        self.defer_pending_start_audio_flush_once = true;
     }
 
     #[cfg(test)]
@@ -311,6 +439,14 @@ impl PlaybackOutputScheduler {
         anchor: RebufferResumeAnchor,
     ) {
         self.video_output_rebuffer_anchor = Some(anchor);
+    }
+}
+
+fn audio_output_contiguous_start_timeline_nsecs(snapshot: AudioOutputSnapshot) -> u64 {
+    if snapshot.total_pending_nsecs > 0 {
+        snapshot.buffered_until_timeline_nsecs
+    } else {
+        snapshot.played_timeline_nsecs
     }
 }
 
@@ -367,6 +503,7 @@ pub(in crate::player::backend::ffmpeg) fn service_output_gate_resume_if_ready<F>
     fallback_timeline_nsecs: u64,
     current_start_position_nsecs: &mut u64,
     scheduler: &mut PlaybackScheduler,
+    output_resource_pressure: bool,
     mut demux_watermark: F,
 ) -> std::result::Result<OutputGateResumeStatus, String>
 where
@@ -430,23 +567,8 @@ where
     });
     let resume_audio_output_buffered_until_nsecs =
         audio_output_buffered_until_for_resume(resume_decision, audio_output_buffered_until_nsecs);
-    let dropped_resume_video_frames = output_scheduler
-        .scheduled_video_queue
-        .discard_before(resume_decision.timeline_nsecs);
-    if dropped_resume_video_frames > 0 {
-        tracing::debug!(
-            session_id = ?session_id,
-            dropped_resume_video_frames,
-            previous_audio_played_until,
-            rebuffer_anchor_timeline_nsecs = rebuffer_anchor.map(|anchor| anchor.timeline_nsecs),
-            resume_timeline_nsecs = resume_decision.timeline_nsecs,
-            reset_audio_to_video = resume_decision.reset_audio_to_video,
-            output_scheduler.playback_output_state = ?output_scheduler.playback_output_state,
-            "discarded decoded FFmpeg video before output gate resume"
-        );
-    }
 
-    let waterline = if output_scheduler
+    let mut waterline = if output_scheduler
         .playback_output_state
         .first_video_frame_pending()
     {
@@ -462,15 +584,121 @@ where
     } else {
         output_scheduler
             .scheduled_video_queue
-            .rebuffer_playback_resume_waterline(
+            .rebuffer_playback_resume_waterline_with_resource_pressure(
                 &output_scheduler.pending_start_audio,
                 resume_decision.timeline_nsecs,
                 demux_watermark(),
                 resume_audio_output_buffered_until_nsecs,
                 needs_prefetch,
                 true,
+                output_resource_pressure,
             )
     };
+    if output_scheduler
+        .playback_output_state
+        .first_video_frame_pending()
+        && !waterline.ready()
+        && waterline.decoded_ready()
+        && output_scheduler
+            .startup_sync_elapsed()
+            .is_some_and(|elapsed| elapsed >= VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER)
+    {
+        tracing::debug!(
+            session_id = ?session_id,
+            startup_wait_ms = output_scheduler
+                .startup_sync_elapsed()
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+            target_ms = waterline.target_nsecs as f64 / 1_000_000.0,
+            decoded_video_ms = ?waterline
+                .decoded_video_forward_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
+            decoded_audio_ms = ?waterline
+                .decoded_audio_forward_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
+            demux_min_ms = ?waterline
+                .demux_min_forward_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
+            demux_video_ms = ?waterline
+                .demux_video_forward_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
+            demux_audio_ms = ?waterline
+                .demux_audio_forward_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
+            "startup output gate demux waterline timed out; allowing decoded queues to start"
+        );
+        waterline.demux_ready = true;
+    }
+    if output_scheduler.playback_output_state.rebuffering()
+        && !waterline.ready()
+        && !waterline.demux_ready
+    {
+        // mpv-aligned resume gating: rebuffer resume keys off the *decoded output*
+        // queues, not the demuxer's instantaneous forward window. Once both the video
+        // and audio decoded queues are ready, release the demux gate immediately. The
+        // old logic instead returned `WaitingForDemux`, which makes the coordinator tick
+        // skip the demux pump (see coordinator_tick) — but the pump is exactly what feeds
+        // the decoder and advances the reader to clear a transient demux underrun. That
+        // "wait for demux while not pumping demux" is a self-perpetuating deadlock. The
+        // decoded buffer covers immediate playback and the demux supply self-heals; if it
+        // genuinely runs dry, the decoded buffer drains and rebuffer re-triggers normally.
+        // As a safety net, also release once stalled past the timeout with only a partial
+        // decoded window available.
+        let decoded_ready = waterline.decoded_ready();
+        let stalled_past_timeout = output_scheduler
+            .rebuffer_wait_elapsed()
+            .is_some_and(|elapsed| elapsed >= VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER);
+        if decoded_ready || stalled_past_timeout {
+            tracing::debug!(
+                session_id = ?session_id,
+                release_reason = if decoded_ready {
+                    "decoded_queues_ready"
+                } else {
+                    "stalled_timeout"
+                },
+                rebuffer_wait_ms = ?output_scheduler
+                    .rebuffer_wait_elapsed()
+                    .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+                decoded_video_ms = ?waterline
+                    .decoded_video_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                decoded_audio_ms = ?waterline
+                    .decoded_audio_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                demux_min_ms = ?waterline
+                    .demux_min_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                "releasing rebuffer demux gate (decoded queues ready or stalled past timeout)"
+            );
+            waterline.demux_ready = true;
+        }
+    }
+    if output_scheduler.playback_output_state.rebuffering() && !waterline.ready() {
+        let stalled_waterline = rebuffer_playback_resume_waterline_after_prolonged_wait(
+            waterline,
+            output_scheduler.rebuffer_wait_elapsed(),
+        );
+        if stalled_waterline.ready() {
+            tracing::debug!(
+                session_id = ?session_id,
+                rebuffer_wait_ms = ?output_scheduler
+                    .rebuffer_wait_elapsed()
+                    .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+                original_target_ms = waterline.target_nsecs as f64 / 1_000_000.0,
+                target_ms = stalled_waterline.target_nsecs as f64 / 1_000_000.0,
+                decoded_video_ms = ?stalled_waterline
+                    .decoded_video_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                decoded_audio_ms = ?stalled_waterline
+                    .decoded_audio_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                demux_min_ms = ?stalled_waterline
+                    .demux_min_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                "rebuffer output gate waited for stable decoded video target; resuming with available queues"
+            );
+        }
+        waterline = stalled_waterline;
+    }
     if waterline.ready()
         && output_scheduler
             .playback_output_state
@@ -516,9 +744,10 @@ where
         ) else {
             return Ok(OutputGateResumeStatus::Waiting);
         };
+        let audio_start_timeline_nsecs = first_video.timeline_nsecs;
         let audio_flush_until_timeline_nsecs = output_scheduler
             .scheduled_video_queue
-            .buffered_until_nsecs()
+            .buffered_until_from_nsecs(audio_start_timeline_nsecs)
             .unwrap_or_else(|| {
                 first_video
                     .timeline_nsecs
@@ -527,8 +756,9 @@ where
         flush_pending_start_audio(
             &mut output_scheduler.pending_start_audio,
             output,
-            first_video.timeline_nsecs,
+            audio_start_timeline_nsecs,
             audio_flush_until_timeline_nsecs,
+            DelayedAudioStartSilencePolicy::Allow,
             control,
             &mut output_scheduler.scheduled_video_queue,
             session_id,
@@ -539,24 +769,40 @@ where
             subtitle_pipeline,
             buffered_reporter,
         )?;
+        output_scheduler.defer_next_pending_start_audio_flush();
         return Ok(OutputGateResumeStatus::Resumed);
     }
     if waterline.ready()
         && output_scheduler.playback_output_state.rebuffering()
         && output_scheduler.finish_rebuffer_if_ready(waterline, session_id)
     {
-        if resume_decision.reset_audio_to_video {
+        // Keep pre-resume video while the restart waterline is still filling;
+        // dropping it early can prevent the decoded window from ever catching up.
+        discard_decoded_video_before_output_gate_resume_if_ready(
+            output_scheduler,
+            waterline,
+            resume_decision,
+            session_id,
+            previous_audio_played_until,
+            rebuffer_anchor,
+        );
+        let audio_start_timeline_nsecs = if resume_decision.reset_audio_to_video {
             output.reset_clock(resume_decision.timeline_nsecs);
-        }
+            resume_decision.timeline_nsecs
+        } else {
+            audio_output_contiguous_start_timeline_nsecs(audio_snapshot)
+                .max(resume_decision.timeline_nsecs)
+        };
         let audio_flush_until_timeline_nsecs = output_scheduler
             .scheduled_video_queue
-            .buffered_until_nsecs()
-            .unwrap_or(resume_decision.timeline_nsecs);
+            .buffered_until_from_nsecs(audio_start_timeline_nsecs)
+            .unwrap_or(audio_start_timeline_nsecs);
         flush_pending_start_audio(
             &mut output_scheduler.pending_start_audio,
             output,
-            resume_decision.timeline_nsecs,
+            audio_start_timeline_nsecs,
             audio_flush_until_timeline_nsecs,
+            DelayedAudioStartSilencePolicy::Skip,
             control,
             &mut output_scheduler.scheduled_video_queue,
             session_id,
@@ -567,6 +813,7 @@ where
             subtitle_pipeline,
             buffered_reporter,
         )?;
+        output_scheduler.defer_next_pending_start_audio_flush();
         control.set_output_rebuffer_paused(false);
         output_scheduler.set_state(PlaybackOutputState::Playing);
         return Ok(OutputGateResumeStatus::Resumed);
@@ -589,4 +836,149 @@ where
         return Ok(OutputGateResumeStatus::WaitingForDemux);
     }
     Ok(OutputGateResumeStatus::Waiting)
+}
+
+fn discard_decoded_video_before_output_gate_resume_if_ready(
+    output_scheduler: &mut PlaybackOutputScheduler,
+    waterline: PlaybackResumeWaterline,
+    resume_decision: AudioClockResumeDecision,
+    session_id: PlaybackSessionId,
+    previous_audio_played_until: u64,
+    rebuffer_anchor: Option<RebufferResumeAnchor>,
+) -> usize {
+    if !waterline.ready() {
+        return 0;
+    }
+    let dropped_resume_video_frames = output_scheduler
+        .scheduled_video_queue
+        .discard_before(resume_decision.timeline_nsecs);
+    if dropped_resume_video_frames > 0 {
+        tracing::debug!(
+            session_id = ?session_id,
+            dropped_resume_video_frames,
+            previous_audio_played_until,
+            rebuffer_anchor_timeline_nsecs = rebuffer_anchor.map(|anchor| anchor.timeline_nsecs),
+            resume_timeline_nsecs = resume_decision.timeline_nsecs,
+            reset_audio_to_video = resume_decision.reset_audio_to_video,
+            output_scheduler.playback_output_state = ?output_scheduler.playback_output_state,
+            "discarded decoded FFmpeg video before output gate resume"
+        );
+    }
+    dropped_resume_video_frames
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_queued_video_frame(timeline_nsecs: u64) -> QueuedVideoFrame {
+        QueuedVideoFrame {
+            frame: DecodedFrame {
+                size: RenderSize {
+                    width: 1,
+                    height: 1,
+                },
+                pts: Some(FramePts {
+                    nsecs: timeline_nsecs,
+                }),
+                key_frame: false,
+                pixels: FramePixels::Bgra8(vec![0, 0, 0, 255].into()),
+            },
+            timeline_nsecs,
+            duration_nsecs: DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+        }
+    }
+
+    fn resume_decision() -> AudioClockResumeDecision {
+        AudioClockResumeDecision {
+            timeline_nsecs: 4_608_000_000,
+            reset_audio_to_video: true,
+        }
+    }
+
+    fn waterline(decoded_video_ready: bool) -> PlaybackResumeWaterline {
+        PlaybackResumeWaterline {
+            target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            decoded_video_forward_nsecs: decoded_video_ready
+                .then_some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+            decoded_audio_forward_nsecs: Some(duration_nsecs(
+                VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+            )),
+            delayed_audio_start_gap_nsecs: None,
+            demux_video_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+            demux_audio_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+            demux_min_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+            decoded_video_ready,
+            decoded_audio_ready: true,
+            demux_ready: true,
+        }
+    }
+
+    #[test]
+    fn output_gate_keeps_pre_resume_video_until_waterline_ready() {
+        let mut scheduler = PlaybackOutputScheduler::new();
+        scheduler.set_state(PlaybackOutputState::Rebuffering);
+        scheduler.push_decoded_video_for_test(test_queued_video_frame(4_400_000_000));
+
+        let dropped = discard_decoded_video_before_output_gate_resume_if_ready(
+            &mut scheduler,
+            waterline(false),
+            resume_decision(),
+            PlaybackSessionId(1),
+            4_423_755_102,
+            None,
+        );
+
+        assert_eq!(dropped, 0);
+        assert_eq!(scheduler.scheduled_video_queue.len(), 1);
+        assert_eq!(
+            scheduler.scheduled_video_queue.range_nsecs(),
+            Some((
+                4_400_000_000,
+                4_400_000_000 + DEFAULT_VIDEO_FRAME_DURATION_NSECS
+            ))
+        );
+    }
+
+    #[test]
+    fn output_gate_discards_pre_resume_video_once_waterline_ready() {
+        let mut scheduler = PlaybackOutputScheduler::new();
+        scheduler.set_state(PlaybackOutputState::Rebuffering);
+        scheduler.push_decoded_video_for_test(test_queued_video_frame(4_400_000_000));
+
+        let dropped = discard_decoded_video_before_output_gate_resume_if_ready(
+            &mut scheduler,
+            waterline(true),
+            resume_decision(),
+            PlaybackSessionId(1),
+            4_423_755_102,
+            None,
+        );
+
+        assert_eq!(dropped, 1);
+        assert!(scheduler.scheduled_video_queue.is_empty());
+    }
+
+    #[test]
+    fn decoded_audio_direct_push_requires_video_coverage_at_audio_start() {
+        let mut scheduler = PlaybackOutputScheduler::new();
+        scheduler.set_state(PlaybackOutputState::Playing);
+        scheduler.push_decoded_video_for_test(test_queued_video_frame(8_840_000_000));
+
+        assert!(scheduler.decoded_audio_can_push_directly(
+            8_860_000_000,
+            9_100_000_000,
+            8_860_000_000
+        ));
+        assert!(!scheduler.decoded_audio_can_push_directly(
+            9_080_000_000,
+            9_120_000_000,
+            9_080_000_000
+        ));
+        assert!(!scheduler.decoded_audio_can_push_directly(
+            8_860_000_000,
+            9_100_000_000,
+            9_000_000_000
+        ));
+    }
 }

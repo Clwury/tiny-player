@@ -19,6 +19,7 @@ impl PlaybackPositionResetKind {
 pub(super) struct PlaybackGenerationFlushContext<'a> {
     pub(super) kind: PlaybackPositionResetKind,
     pub(super) position_seconds: f64,
+    pub(super) seek_mode: PlaybackSeekMode,
     pub(super) seek_generation: u64,
     pub(super) session_id: PlaybackSessionId,
     pub(super) vo_queue: &'a VideoOutputQueue,
@@ -39,6 +40,7 @@ pub(super) struct PlaybackPositionStateResetContext<'a> {
 
 pub(super) struct PlaybackSeekResetContext<'a> {
     pub(super) position_seconds: f64,
+    pub(super) seek_mode: PlaybackSeekMode,
     pub(super) seek_generation: u64,
     pub(super) session_id: PlaybackSessionId,
     pub(super) vo_queue: &'a VideoOutputQueue,
@@ -60,8 +62,13 @@ fn flush_playback_generation_for_position_reset(
     let generation = context.pipeline.advance_playback_generation();
     context.vo_queue.begin_session(context.session_id);
     context.pipeline.flush_playback_generation(generation)?;
+    if let Some(audio_output) = context.pipeline.audio_output.as_ref() {
+        audio_output.reset_clock(context.pipeline.current_start_position_nsecs);
+    }
+    context.pipeline.output_scheduler.reset(context.control);
     let demux_seek_result = context.demux_cache.seek(
         context.position_seconds,
+        context.seek_mode,
         context.session_id,
         context.seek_generation,
     );
@@ -69,6 +76,7 @@ fn flush_playback_generation_for_position_reset(
         session_id = ?context.session_id,
         reset_kind = context.kind.as_str(),
         position_seconds = context.position_seconds,
+        seek_mode = ?context.seek_mode,
         seek_generation = context.seek_generation,
         playback_generation = generation,
         current_start_position_nsecs = context.pipeline.current_start_position_nsecs,
@@ -153,6 +161,7 @@ pub(super) fn service_playback_seek_reset(
 ) -> std::result::Result<(), String> {
     let PlaybackSeekResetContext {
         position_seconds,
+        seek_mode,
         seek_generation,
         session_id,
         vo_queue,
@@ -165,6 +174,7 @@ pub(super) fn service_playback_seek_reset(
     service_playback_generation_seek(PlaybackGenerationFlushContext {
         kind: PlaybackPositionResetKind::Seek,
         position_seconds,
+        seek_mode,
         seek_generation,
         session_id,
         vo_queue,

@@ -22,10 +22,8 @@ struct ProgressTimelineRenderState {
     current_time: String,
     duration_time: String,
     played_fraction: f32,
-    buffered_fraction: f32,
     cached_seek_preview: Option<bool>,
     cache_ranges: Vec<(f32, f32)>,
-    byte_cache_ranges: Vec<(f32, f32)>,
 }
 
 impl PlaybackPage {
@@ -317,12 +315,22 @@ impl PlaybackPage {
             .or(self.timeline.position)
             .unwrap_or(0.0)
             + delta_seconds;
-        self.seek_to_position(position, window, cx);
+        self.seek_to_position_with_mode(position, PlaybackSeekMode::Fast, window, cx);
     }
 
     pub(super) fn seek_to_position(
         &mut self,
         position: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.seek_to_position_with_mode(position, PlaybackSeekMode::Precise, window, cx);
+    }
+
+    fn seek_to_position_with_mode(
+        &mut self,
+        position: f64,
+        seek_mode: PlaybackSeekMode,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -358,6 +366,7 @@ impl PlaybackPage {
         if let Some(backend) = self.video.owner_mut()
             && let Err(error) = backend.command(BackendCommand::Seek {
                 position_seconds: position,
+                mode: seek_mode,
             })
         {
             self.timeline.pending_seek_position = None;
@@ -821,7 +830,6 @@ impl PlaybackPage {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = theme::get(cx);
-        let has_cache_ranges = !state.cache_ranges.is_empty();
         let played_color = if state.cached_seek_preview == Some(false) {
             theme.warning
         } else {
@@ -833,46 +841,28 @@ impl PlaybackPage {
             None => theme.input_border_focused.opacity(0.7),
         };
 
-        let track = state
-            .byte_cache_ranges
-            .into_iter()
-            .fold(
-                div()
-                    .id("playback-progress-track")
-                    .relative()
-                    .flex_1()
-                    .h(px(28.0))
-                    .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_progress_drag))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_progress_drag))
-                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_progress_drag))
-                    .on_drag(ProgressBarDrag, |_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.new(|_| ProgressBarDrag)
-                    })
-                    .on_drag_move(cx.listener(Self::drag_progress))
-                    .child(progress_track_fill(theme.input_border.opacity(0.48), 1.0))
-                    .when(!has_cache_ranges, |this| {
-                        this.child(progress_track_fill(
-                            theme.muted_foreground.opacity(0.54),
-                            state.buffered_fraction,
-                        ))
-                    }),
-                |this, (start_fraction, end_fraction)| {
-                    this.child(progress_track_byte_range_fill(
-                        theme.muted_foreground.opacity(0.28),
-                        start_fraction,
-                        end_fraction,
-                    ))
-                },
-            )
+        let track = div()
+            .id("playback-progress-track")
+            .relative()
+            .flex_1()
+            .h(px(28.0))
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_progress_drag))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_progress_drag))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_progress_drag))
+            .on_drag(ProgressBarDrag, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| ProgressBarDrag)
+            })
+            .on_drag_move(cx.listener(Self::drag_progress))
+            .child(progress_track_fill(theme.input_border.opacity(0.48), 1.0))
             .children(
                 state
                     .cache_ranges
                     .into_iter()
                     .map(|(start_fraction, end_fraction)| {
-                        progress_track_range_fill(
-                            theme.muted_foreground.opacity(0.6),
+                        progress_track_seekable_range_fill(
+                            theme.muted_foreground.opacity(0.52),
                             start_fraction,
                             end_fraction,
                         )
@@ -926,8 +916,6 @@ impl PlaybackPage {
             .or(self.timeline.position)
             .unwrap_or(0.0);
         let played_fraction = progress_fraction(position, duration);
-        let buffered_fraction =
-            buffered_progress_fraction(self.timeline.buffered_until, position, duration);
         let cached_seek_preview = self.timeline.progress_drag_position.map(|target| {
             cached_seek_target(
                 self.timeline.cache_state.as_ref(),
@@ -937,8 +925,6 @@ impl PlaybackPage {
             )
         });
         let cache_ranges = cache_range_fractions(self.timeline.cache_state.as_ref(), duration);
-        let byte_cache_ranges =
-            byte_cache_range_fractions(self.timeline.cache_state.as_ref(), duration);
         let current_time = format_playback_time(position);
         let duration_time = format_playback_time(duration);
         let can_toggle_playback = self.can_toggle_playback();
@@ -994,10 +980,8 @@ impl PlaybackPage {
                     current_time,
                     duration_time,
                     played_fraction,
-                    buffered_fraction,
                     cached_seek_preview,
                     cache_ranges,
-                    byte_cache_ranges,
                 },
                 cx,
             ))
@@ -1016,24 +1000,7 @@ fn progress_track_fill(color: gpui::Hsla, width_fraction: f32) -> impl IntoEleme
         .bg(color)
 }
 
-fn progress_track_range_fill(
-    color: gpui::Hsla,
-    start_fraction: f32,
-    end_fraction: f32,
-) -> impl IntoElement {
-    let start_fraction = start_fraction.clamp(0.0, 1.0);
-    let end_fraction = end_fraction.clamp(start_fraction, 1.0);
-    div()
-        .absolute()
-        .left(relative(start_fraction))
-        .top(px(11.0))
-        .h(px(6.0))
-        .w(relative(end_fraction - start_fraction))
-        .rounded_full()
-        .bg(color)
-}
-
-fn progress_track_byte_range_fill(
+fn progress_track_seekable_range_fill(
     color: gpui::Hsla,
     start_fraction: f32,
     end_fraction: f32,
@@ -1046,6 +1013,7 @@ fn progress_track_byte_range_fill(
         .top(px(19.0))
         .h(px(3.0))
         .w(relative(end_fraction - start_fraction))
+        .min_w(px(2.0))
         .rounded_full()
         .bg(color)
 }

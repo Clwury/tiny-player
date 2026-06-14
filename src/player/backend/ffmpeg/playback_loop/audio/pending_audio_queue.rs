@@ -78,6 +78,16 @@ impl PendingStartAudio {
         self.frames.front().map(|frame| frame.start_timeline_nsecs)
     }
 
+    pub(in crate::player::backend::ffmpeg) fn first_start_at_or_after(
+        &self,
+        timeline_nsecs: u64,
+    ) -> Option<u64> {
+        self.frames
+            .iter()
+            .find(|frame| frame.start_timeline_nsecs >= timeline_nsecs)
+            .map(|frame| frame.start_timeline_nsecs)
+    }
+
     fn first_end_timeline_nsecs(&self) -> Option<u64> {
         self.frames.front().map(|frame| frame.end_timeline_nsecs)
     }
