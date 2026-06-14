@@ -203,9 +203,10 @@ fn video_output_rebuffer_resume_duration_from_timeline(
     else {
         return target_duration;
     };
-    // Resource pressure may cap excessive prebuffering, but resuming below
-    // low-water lets the audio clock consume the tiny video budget immediately.
-    let minimum_stable_duration = target_duration.min(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION);
+    // Resource pressure may cap excessive prebuffering, but sub-second resumes
+    // are too easy for the audio clock to consume before the decoder catches up.
+    let minimum_stable_duration =
+        target_duration.min(VIDEO_OUTPUT_REBUFFER_MIN_STABLE_RESUME_DURATION);
     target_duration.min(resource_budget_duration.max(minimum_stable_duration))
 }
 
@@ -564,21 +565,26 @@ pub(in crate::player::backend::ffmpeg) fn rebuffer_playback_resume_waterline_aft
     let Some(decoded_video_forward_nsecs) = waterline.decoded_video_forward_nsecs else {
         return waterline;
     };
-    let minimum_decoded_window_nsecs = duration_nsecs(
-        VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION.max(AUDIO_OUTPUT_VIDEO_LEAD_DURATION),
-    );
-    if decoded_video_forward_nsecs < minimum_decoded_window_nsecs {
-        return waterline;
-    }
-
-    // Once the rebuffer has stalled past the (longer) audio fallback window with video
-    // and demux both ready, stop waiting on the audio track: a structurally lagging or
-    // unavailable audio stream must not freeze playback forever. Resume on the stable
-    // decoded-video window and let the audio clock resynchronize (the resume decision
-    // resets audio to the video position). Below this window we still wait, so a merely
-    // delayed audio start is given a fair chance to arrive first.
+    // Once the rebuffer has stalled past the longer audio fallback window with video
+    // and demux both available, stop waiting on the audio track: a structurally lagging
+    // audio queue must not freeze playback forever. Above the standard stall timeout
+    // we still prefer a stable 1s decoded-video window, but after the audio-stall
+    // timeout a low-water video window is enough to resume and let the audio clock
+    // resynchronize through the output-gate resume path.
     let audio_stall_timed_out = rebuffer_wait_elapsed
         .is_some_and(|elapsed| elapsed >= VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER);
+    let minimum_decoded_window_nsecs =
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_MIN_STABLE_RESUME_DURATION);
+    let near_stable_decoded_window_nsecs =
+        minimum_decoded_window_nsecs.saturating_sub(DEFAULT_VIDEO_FRAME_DURATION_NSECS);
+    let low_water_decoded_window_nsecs = duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION);
+    let decoded_video_window_ready = decoded_video_forward_nsecs >= minimum_decoded_window_nsecs
+        || (waterline.decoded_audio_ready
+            && decoded_video_forward_nsecs >= near_stable_decoded_window_nsecs)
+        || (audio_stall_timed_out && decoded_video_forward_nsecs >= low_water_decoded_window_nsecs);
+    if !decoded_video_window_ready {
+        return waterline;
+    }
 
     if !audio_stall_timed_out
         && waterline.delayed_audio_start_gap_nsecs.is_some_and(|gap| {

@@ -1,15 +1,17 @@
 use super::decode::DecodePacketAdmissionStatus;
-use super::demux_cache::DemuxPacketQueueSnapshot;
+use super::demux_cache::{DemuxPacketCacheReadTiming, DemuxPacketQueueSnapshot};
 use super::playback_pipeline_state::{DecoderInputSnapshot, PlaybackPipelineState};
 use super::video_decode_pipeline::VideoPacketAdmissionPressure;
 use super::video_decode_worker::{VideoDecodeWorkerSnapshot, VideoDecodeWorkerState};
 use super::*;
 
 const DEMUX_PACKET_PUMP_MAX_PACKETS_PER_TICK: usize = 16;
+const DEMUX_PACKET_PUMP_MAX_SYNC_DURATION_PER_TICK: Duration = Duration::from_millis(4);
 
 #[derive(Default)]
 pub(super) struct DemuxPacketPump {
     stream_cursor: usize,
+    last_timing_log_at: Option<Instant>,
 }
 
 struct DemuxPacketPumpContext<'a> {
@@ -58,29 +60,47 @@ impl DemuxPacketPump {
         demux_streams.rotate_left(demux_stream_rotation);
 
         let demux_read_started_at = Instant::now();
-        let (demux_read_result, demux_consumed_stream_offset) = if let Some(lock_wait) =
-            demux_pump_cache_lock_wait(
+        let (demux_read_result, demux_consumed_stream_offset, demux_cache_timing) =
+            if let Some(lock_wait) = demux_pump_cache_lock_wait(
                 context.should_wait_for_demux,
                 context.video_output_waiting_for_demux,
                 context.decoder_input,
                 context.video_admission_pressure,
             ) {
-            context
-                .demux_cache
-                .read_available_packet_round_robin_with_cache_pause_signal(
-                    &demux_streams,
-                    lock_wait,
-                    demux_cache_pause_signal(&context),
-                )
-        } else {
-            context.demux_cache.poll_packet_round_robin(&demux_streams)
-        };
+                context
+                    .demux_cache
+                    .read_available_packet_round_robin_with_cache_pause_signal_and_timing(
+                        &demux_streams,
+                        lock_wait,
+                        demux_cache_pause_signal(&context),
+                    )
+            } else {
+                context
+                    .demux_cache
+                    .poll_packet_round_robin_with_timing(&demux_streams)
+            };
         let demux_read_elapsed = demux_read_started_at.elapsed();
+        self.trace_timing(
+            &context,
+            &demux_streams,
+            demux_read_elapsed,
+            demux_cache_timing,
+            &demux_read_result,
+        );
         if demux_read_elapsed >= DEMUX_READ_WAIT_LOG_AFTER {
             self.log_wait(
                 &context,
                 &demux_streams,
                 demux_read_elapsed,
+                demux_cache_timing,
+                &demux_read_result,
+            );
+        } else if self.should_log_timing(demux_cache_timing) {
+            self.log_timing(
+                &context,
+                &demux_streams,
+                demux_read_elapsed,
+                demux_cache_timing,
                 &demux_read_result,
             );
         }
@@ -100,10 +120,16 @@ impl DemuxPacketPump {
         &mut self,
         mut context: DemuxPacketPumpAdmissionContext<'_>,
     ) -> DemuxPacketPumpResult {
+        let started_at = Instant::now();
         let mut made_progress = false;
         for _ in 0..DEMUX_PACKET_PUMP_MAX_PACKETS_PER_TICK {
             match self.poll_and_admit_one(&mut context) {
-                DemuxPacketPumpResult::Progress => made_progress = true,
+                DemuxPacketPumpResult::Progress => {
+                    made_progress = true;
+                    if started_at.elapsed() >= DEMUX_PACKET_PUMP_MAX_SYNC_DURATION_PER_TICK {
+                        return DemuxPacketPumpResult::Progress;
+                    }
+                }
                 DemuxPacketPumpResult::Backpressured => {
                     return DemuxPacketPumpResult::Backpressured;
                 }
@@ -222,6 +248,7 @@ impl DemuxPacketPump {
         context: &DemuxPacketPumpContext<'_>,
         demux_streams: &[c_int],
         demux_read_elapsed: Duration,
+        demux_cache_timing: DemuxPacketCacheReadTiming,
         demux_read_result: &DemuxReadResult,
     ) {
         let result = match demux_read_result {
@@ -261,6 +288,14 @@ impl DemuxPacketPump {
             session_id = ?context.session_id,
             blocked_on = blocked_on.as_str(),
             waited_ms = demux_read_elapsed.as_secs_f64() * 1000.0,
+            cache_lock_wait_ms = demux_cache_timing.lock_wait.as_secs_f64() * 1000.0,
+            cache_try_lock_failures = demux_cache_timing.try_lock_failures,
+            cache_lock_timed_out = demux_cache_timing.lock_timed_out,
+            cache_data_wait_ms = demux_cache_timing.data_wait.as_secs_f64() * 1000.0,
+            cache_data_waits = demux_cache_timing.data_waits,
+            packet_ref_ms = demux_cache_timing.packet_ref.as_secs_f64() * 1000.0,
+            disk_read_ms = demux_cache_timing.disk_read.as_secs_f64() * 1000.0,
+            disk_reads = demux_cache_timing.disk_reads,
             result,
             video_output_waiting_for_demux = context.video_output_waiting_for_demux,
             should_wait_for_demux = context.should_wait_for_demux,
@@ -279,6 +314,90 @@ impl DemuxPacketPump {
             video_decode_completed_packets = video_decode_snapshot.completed_packets,
             "FFmpeg demux packet read wait completed"
         );
+    }
+
+    fn trace_timing(
+        &self,
+        context: &DemuxPacketPumpContext<'_>,
+        demux_streams: &[c_int],
+        demux_read_elapsed: Duration,
+        demux_cache_timing: DemuxPacketCacheReadTiming,
+        demux_read_result: &DemuxReadResult,
+    ) {
+        tracing::trace!(
+            session_id = ?context.session_id,
+            result = demux_read_result_name(demux_read_result),
+            total_ms = demux_read_elapsed.as_secs_f64() * 1000.0,
+            cache_lock_wait_ms = demux_cache_timing.lock_wait.as_secs_f64() * 1000.0,
+            cache_try_lock_failures = demux_cache_timing.try_lock_failures,
+            cache_lock_timed_out = demux_cache_timing.lock_timed_out,
+            cache_data_wait_ms = demux_cache_timing.data_wait.as_secs_f64() * 1000.0,
+            cache_data_waits = demux_cache_timing.data_waits,
+            packet_ref_ms = demux_cache_timing.packet_ref.as_secs_f64() * 1000.0,
+            disk_read_ms = demux_cache_timing.disk_read.as_secs_f64() * 1000.0,
+            disk_reads = demux_cache_timing.disk_reads,
+            video_output_waiting_for_demux = context.video_output_waiting_for_demux,
+            should_wait_for_demux = context.should_wait_for_demux,
+            demux_streams = ?demux_streams,
+            "FFmpeg demux packet pump timing"
+        );
+    }
+
+    fn should_log_timing(&mut self, timing: DemuxPacketCacheReadTiming) -> bool {
+        if !timing.lock_timed_out
+            && timing.try_lock_failures == 0
+            && timing.lock_wait < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
+            && timing.data_wait < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
+            && timing.packet_ref < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
+            && timing.disk_read < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
+        {
+            return false;
+        }
+        let now = Instant::now();
+        if self.last_timing_log_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < DEMUX_PUMP_TIMING_LOG_INTERVAL
+        }) {
+            return false;
+        }
+        self.last_timing_log_at = Some(now);
+        true
+    }
+
+    fn log_timing(
+        &self,
+        context: &DemuxPacketPumpContext<'_>,
+        demux_streams: &[c_int],
+        demux_read_elapsed: Duration,
+        demux_cache_timing: DemuxPacketCacheReadTiming,
+        demux_read_result: &DemuxReadResult,
+    ) {
+        tracing::debug!(
+            session_id = ?context.session_id,
+            result = demux_read_result_name(demux_read_result),
+            total_ms = demux_read_elapsed.as_secs_f64() * 1000.0,
+            cache_lock_wait_ms = demux_cache_timing.lock_wait.as_secs_f64() * 1000.0,
+            cache_try_lock_failures = demux_cache_timing.try_lock_failures,
+            cache_lock_timed_out = demux_cache_timing.lock_timed_out,
+            cache_data_wait_ms = demux_cache_timing.data_wait.as_secs_f64() * 1000.0,
+            cache_data_waits = demux_cache_timing.data_waits,
+            packet_ref_ms = demux_cache_timing.packet_ref.as_secs_f64() * 1000.0,
+            disk_read_ms = demux_cache_timing.disk_read.as_secs_f64() * 1000.0,
+            disk_reads = demux_cache_timing.disk_reads,
+            video_output_waiting_for_demux = context.video_output_waiting_for_demux,
+            should_wait_for_demux = context.should_wait_for_demux,
+            demux_streams = ?demux_streams,
+            "FFmpeg demux packet pump waited for cache lock/data"
+        );
+    }
+}
+
+fn demux_read_result_name(result: &DemuxReadResult) -> &'static str {
+    match result {
+        DemuxReadResult::Packet(_) => "packet",
+        DemuxReadResult::Eof => "eof",
+        DemuxReadResult::WouldBlock => "would_block",
+        DemuxReadResult::Interrupted => "interrupted",
+        DemuxReadResult::Error(_) => "error",
     }
 }
 

@@ -488,6 +488,134 @@ pub(in crate::player::backend::ffmpeg) enum OutputGateResumeStatus {
     Resumed,
 }
 
+#[derive(Clone, Copy, Default)]
+struct OutputGateResumeTiming {
+    audio_snapshot: Duration,
+    resume_decision: Duration,
+    demux_watermark: Duration,
+    waterline: Duration,
+    fallback: Duration,
+    resume_action: Duration,
+    wait_log: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct OutputGateResumeLogContext {
+    session_id: PlaybackSessionId,
+    started_at: Instant,
+    timing: OutputGateResumeTiming,
+    status: OutputGateResumeStatus,
+    output_state: PlaybackOutputState,
+    queued_video_frames: usize,
+    pending_audio_frames: usize,
+    waterline: Option<PlaybackResumeWaterline>,
+}
+
+fn output_gate_resume_log_context(
+    output_scheduler: &PlaybackOutputScheduler,
+    session_id: PlaybackSessionId,
+    started_at: Instant,
+    timing: OutputGateResumeTiming,
+    status: OutputGateResumeStatus,
+    waterline: Option<PlaybackResumeWaterline>,
+) -> OutputGateResumeLogContext {
+    OutputGateResumeLogContext {
+        session_id,
+        started_at,
+        timing,
+        status,
+        output_state: output_scheduler.playback_output_state,
+        queued_video_frames: output_scheduler.scheduled_video_queue.len(),
+        pending_audio_frames: output_scheduler.pending_start_audio.len(),
+        waterline,
+    }
+}
+
+fn finish_output_gate_resume_timing(context: OutputGateResumeLogContext) -> OutputGateResumeStatus {
+    let total = context.started_at.elapsed();
+    tracing::trace!(
+        session_id = ?context.session_id,
+        status = ?context.status,
+        output_state = ?context.output_state,
+        total_ms = total.as_secs_f64() * 1000.0,
+        audio_snapshot_ms = context.timing.audio_snapshot.as_secs_f64() * 1000.0,
+        resume_decision_ms = context.timing.resume_decision.as_secs_f64() * 1000.0,
+        demux_watermark_ms = context.timing.demux_watermark.as_secs_f64() * 1000.0,
+        waterline_ms = context.timing.waterline.as_secs_f64() * 1000.0,
+        fallback_ms = context.timing.fallback.as_secs_f64() * 1000.0,
+        resume_action_ms = context.timing.resume_action.as_secs_f64() * 1000.0,
+        wait_log_ms = context.timing.wait_log.as_secs_f64() * 1000.0,
+        queued_video_frames = context.queued_video_frames,
+        pending_audio_frames = context.pending_audio_frames,
+        waterline_ready = ?context.waterline.map(PlaybackResumeWaterline::ready),
+        decoded_ready = ?context.waterline.map(PlaybackResumeWaterline::decoded_ready),
+        target_ms = ?context.waterline.map(|waterline| waterline.target_nsecs as f64 / 1_000_000.0),
+        decoded_video_ms = ?context.waterline
+            .and_then(|waterline| waterline.decoded_video_forward_nsecs)
+            .map(|duration| duration as f64 / 1_000_000.0),
+        decoded_audio_ms = ?context.waterline
+            .and_then(|waterline| waterline.decoded_audio_forward_nsecs)
+            .map(|duration| duration as f64 / 1_000_000.0),
+        demux_min_ms = ?context.waterline
+            .and_then(|waterline| waterline.demux_min_forward_nsecs)
+            .map(|duration| duration as f64 / 1_000_000.0),
+        "FFmpeg output gate resume timing"
+    );
+    if total < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && context.timing.audio_snapshot < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && context.timing.resume_decision < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && context.timing.demux_watermark < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && context.timing.waterline < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && context.timing.fallback < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && context.timing.resume_action < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && context.timing.wait_log < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+    {
+        return context.status;
+    }
+    tracing::debug!(
+        session_id = ?context.session_id,
+        status = ?context.status,
+        output_state = ?context.output_state,
+        total_ms = total.as_secs_f64() * 1000.0,
+        audio_snapshot_ms = context.timing.audio_snapshot.as_secs_f64() * 1000.0,
+        resume_decision_ms = context.timing.resume_decision.as_secs_f64() * 1000.0,
+        demux_watermark_ms = context.timing.demux_watermark.as_secs_f64() * 1000.0,
+        waterline_ms = context.timing.waterline.as_secs_f64() * 1000.0,
+        fallback_ms = context.timing.fallback.as_secs_f64() * 1000.0,
+        resume_action_ms = context.timing.resume_action.as_secs_f64() * 1000.0,
+        wait_log_ms = context.timing.wait_log.as_secs_f64() * 1000.0,
+        queued_video_frames = context.queued_video_frames,
+        pending_audio_frames = context.pending_audio_frames,
+        waterline_ready = ?context.waterline.map(PlaybackResumeWaterline::ready),
+        decoded_ready = ?context.waterline.map(PlaybackResumeWaterline::decoded_ready),
+        target_ms = ?context.waterline.map(|waterline| waterline.target_nsecs as f64 / 1_000_000.0),
+        decoded_video_ms = ?context.waterline
+            .and_then(|waterline| waterline.decoded_video_forward_nsecs)
+            .map(|duration| duration as f64 / 1_000_000.0),
+        decoded_audio_ms = ?context.waterline
+            .and_then(|waterline| waterline.decoded_audio_forward_nsecs)
+            .map(|duration| duration as f64 / 1_000_000.0),
+        demux_min_ms = ?context.waterline
+            .and_then(|waterline| waterline.demux_min_forward_nsecs)
+            .map(|duration| duration as f64 / 1_000_000.0),
+        "FFmpeg output gate resume completed slowly"
+    );
+    context.status
+}
+
+fn timed_output_gate_demux_watermark<F>(
+    demux_watermark: &mut F,
+    timing: &mut OutputGateResumeTiming,
+) -> DemuxReaderWatermark
+where
+    F: FnMut() -> DemuxReaderWatermark,
+{
+    let started_at = Instant::now();
+    let watermark = demux_watermark();
+    timing.demux_watermark += started_at.elapsed();
+    watermark
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::player::backend::ffmpeg) fn service_output_gate_resume_if_ready<F>(
     output_scheduler: &mut PlaybackOutputScheduler,
@@ -509,22 +637,54 @@ pub(in crate::player::backend::ffmpeg) fn service_output_gate_resume_if_ready<F>
 where
     F: FnMut() -> DemuxReaderWatermark,
 {
+    let started_at = Instant::now();
+    let mut timing = OutputGateResumeTiming::default();
     let Some(output) = output else {
-        return Ok(OutputGateResumeStatus::Idle);
+        return Ok(finish_output_gate_resume_timing(
+            output_gate_resume_log_context(
+                output_scheduler,
+                session_id,
+                started_at,
+                timing,
+                OutputGateResumeStatus::Idle,
+                None,
+            ),
+        ));
     };
     if !output_scheduler
         .playback_output_state
         .first_video_frame_pending()
         && !output_scheduler.playback_output_state.rebuffering()
     {
-        return Ok(OutputGateResumeStatus::Idle);
+        return Ok(finish_output_gate_resume_timing(
+            output_gate_resume_log_context(
+                output_scheduler,
+                session_id,
+                started_at,
+                timing,
+                OutputGateResumeStatus::Idle,
+                None,
+            ),
+        ));
     }
     if output_scheduler.scheduled_video_queue.is_empty() {
-        return Ok(OutputGateResumeStatus::Idle);
+        return Ok(finish_output_gate_resume_timing(
+            output_gate_resume_log_context(
+                output_scheduler,
+                session_id,
+                started_at,
+                timing,
+                OutputGateResumeStatus::Idle,
+                None,
+            ),
+        ));
     }
 
     let needs_prefetch = subtitle_pipeline.needs_prefetch();
+    let stage_started_at = Instant::now();
     let audio_snapshot = output.snapshot()?;
+    timing.audio_snapshot = stage_started_at.elapsed();
+    let stage_started_at = Instant::now();
     let previous_audio_played_until = audio_snapshot.played_timeline_nsecs;
     let rebuffer_anchor = output_scheduler
         .playback_output_state
@@ -567,7 +727,11 @@ where
     });
     let resume_audio_output_buffered_until_nsecs =
         audio_output_buffered_until_for_resume(resume_decision, audio_output_buffered_until_nsecs);
+    timing.resume_decision = stage_started_at.elapsed();
 
+    let waterline_demux_watermark =
+        timed_output_gate_demux_watermark(&mut demux_watermark, &mut timing);
+    let stage_started_at = Instant::now();
     let mut waterline = if output_scheduler
         .playback_output_state
         .first_video_frame_pending()
@@ -577,7 +741,7 @@ where
             .initial_playback_resume_waterline(
                 &output_scheduler.pending_start_audio,
                 resume_decision.timeline_nsecs,
-                demux_watermark(),
+                waterline_demux_watermark,
                 needs_prefetch,
                 true,
             )
@@ -587,13 +751,15 @@ where
             .rebuffer_playback_resume_waterline_with_resource_pressure(
                 &output_scheduler.pending_start_audio,
                 resume_decision.timeline_nsecs,
-                demux_watermark(),
+                waterline_demux_watermark,
                 resume_audio_output_buffered_until_nsecs,
                 needs_prefetch,
                 true,
                 output_resource_pressure,
             )
     };
+    timing.waterline = stage_started_at.elapsed();
+    let stage_started_at = Instant::now();
     if output_scheduler
         .playback_output_state
         .first_video_frame_pending()
@@ -628,6 +794,8 @@ where
         );
         waterline.demux_ready = true;
     }
+    timing.fallback += stage_started_at.elapsed();
+    let stage_started_at = Instant::now();
     if output_scheduler.playback_output_state.rebuffering()
         && !waterline.ready()
         && !waterline.demux_ready
@@ -672,6 +840,8 @@ where
             waterline.demux_ready = true;
         }
     }
+    timing.fallback += stage_started_at.elapsed();
+    let stage_started_at = Instant::now();
     if output_scheduler.playback_output_state.rebuffering() && !waterline.ready() {
         let stalled_waterline = rebuffer_playback_resume_waterline_after_prolonged_wait(
             waterline,
@@ -699,11 +869,13 @@ where
         }
         waterline = stalled_waterline;
     }
+    timing.fallback += stage_started_at.elapsed();
     if waterline.ready()
         && output_scheduler
             .playback_output_state
             .first_video_frame_pending()
     {
+        let stage_started_at = Instant::now();
         output_scheduler.set_state(PlaybackOutputState::Ready);
         let Some(first_video) = present_first_queued_video_frame(
             output_scheduler,
@@ -742,7 +914,17 @@ where
                 );
             },
         ) else {
-            return Ok(OutputGateResumeStatus::Waiting);
+            timing.resume_action += stage_started_at.elapsed();
+            return Ok(finish_output_gate_resume_timing(
+                output_gate_resume_log_context(
+                    output_scheduler,
+                    session_id,
+                    started_at,
+                    timing,
+                    OutputGateResumeStatus::Waiting,
+                    Some(waterline),
+                ),
+            ));
         };
         let audio_start_timeline_nsecs = first_video.timeline_nsecs;
         let audio_flush_until_timeline_nsecs = output_scheduler
@@ -770,12 +952,23 @@ where
             buffered_reporter,
         )?;
         output_scheduler.defer_next_pending_start_audio_flush();
-        return Ok(OutputGateResumeStatus::Resumed);
+        timing.resume_action += stage_started_at.elapsed();
+        return Ok(finish_output_gate_resume_timing(
+            output_gate_resume_log_context(
+                output_scheduler,
+                session_id,
+                started_at,
+                timing,
+                OutputGateResumeStatus::Resumed,
+                Some(waterline),
+            ),
+        ));
     }
     if waterline.ready()
         && output_scheduler.playback_output_state.rebuffering()
         && output_scheduler.finish_rebuffer_if_ready(waterline, session_id)
     {
+        let stage_started_at = Instant::now();
         // Keep pre-resume video while the restart waterline is still filling;
         // dropping it early can prevent the decoded window from ever catching up.
         discard_decoded_video_before_output_gate_resume_if_ready(
@@ -816,10 +1009,21 @@ where
         output_scheduler.defer_next_pending_start_audio_flush();
         control.set_output_rebuffer_paused(false);
         output_scheduler.set_state(PlaybackOutputState::Playing);
-        return Ok(OutputGateResumeStatus::Resumed);
+        timing.resume_action += stage_started_at.elapsed();
+        return Ok(finish_output_gate_resume_timing(
+            output_gate_resume_log_context(
+                output_scheduler,
+                session_id,
+                started_at,
+                timing,
+                OutputGateResumeStatus::Resumed,
+                Some(waterline),
+            ),
+        ));
     }
     if !waterline.ready() {
-        let demux_watermark = demux_watermark();
+        let demux_watermark = timed_output_gate_demux_watermark(&mut demux_watermark, &mut timing);
+        let stage_started_at = Instant::now();
         output_scheduler
             .scheduled_video_queue
             .log_resume_waterline_wait(
@@ -831,11 +1035,30 @@ where
                 waterline,
                 demux_watermark,
             );
+        timing.wait_log += stage_started_at.elapsed();
     }
     if waterline.decoded_ready() && !waterline.demux_ready {
-        return Ok(OutputGateResumeStatus::WaitingForDemux);
+        return Ok(finish_output_gate_resume_timing(
+            output_gate_resume_log_context(
+                output_scheduler,
+                session_id,
+                started_at,
+                timing,
+                OutputGateResumeStatus::WaitingForDemux,
+                Some(waterline),
+            ),
+        ));
     }
-    Ok(OutputGateResumeStatus::Waiting)
+    Ok(finish_output_gate_resume_timing(
+        output_gate_resume_log_context(
+            output_scheduler,
+            session_id,
+            started_at,
+            timing,
+            OutputGateResumeStatus::Waiting,
+            Some(waterline),
+        ),
+    ))
 }
 
 fn discard_decoded_video_before_output_gate_resume_if_ready(

@@ -307,20 +307,40 @@ fn run_video_frame_prepare_worker(
     result_tx: mpsc::SyncSender<VideoFramePrepareResult>,
 ) {
     let mut video_converter = VideoFrameConverter::new(buffer_pool);
-    while let Ok(command) = command_rx.recv() {
+    loop {
+        let recv_started_at = Instant::now();
+        let command = match command_rx.recv() {
+            Ok(command) => command,
+            Err(_) => break,
+        };
+        let recv_wait = recv_started_at.elapsed();
+        log_video_frame_prepare_worker_recv_wait(&command, recv_wait);
         match command {
             VideoFramePrepareCommand::Prepare(input) => {
                 let generation = input.generation;
+                let timeline_nsecs = input.timeline_nsecs;
+                let duration_nsecs = input.duration_nsecs;
                 let started = Instant::now();
                 let result = prepare_video_frame(&mut video_converter, input);
-                if result_tx
-                    .send(VideoFramePrepareResult {
-                        generation,
-                        result,
-                        elapsed: started.elapsed(),
-                    })
-                    .is_err()
-                {
+                let prepare_elapsed = started.elapsed();
+                let result_ok = result.is_ok();
+                let send_started_at = Instant::now();
+                let send_result = result_tx.send(VideoFramePrepareResult {
+                    generation,
+                    result,
+                    elapsed: prepare_elapsed,
+                });
+                let send_elapsed = send_started_at.elapsed();
+                log_video_frame_prepare_worker_timing(VideoFramePrepareWorkerTiming {
+                    generation,
+                    timeline_nsecs,
+                    duration_nsecs,
+                    recv_wait,
+                    prepare_elapsed,
+                    send_elapsed,
+                    result_ok,
+                });
+                if send_result.is_err() {
                     break;
                 }
             }
@@ -344,6 +364,79 @@ fn prepare_video_frame(
         timeline_nsecs: input.timeline_nsecs,
         duration_nsecs: input.duration_nsecs,
     })
+}
+
+struct VideoFramePrepareWorkerTiming {
+    generation: u64,
+    timeline_nsecs: u64,
+    duration_nsecs: u64,
+    recv_wait: Duration,
+    prepare_elapsed: Duration,
+    send_elapsed: Duration,
+    result_ok: bool,
+}
+
+fn log_video_frame_prepare_worker_recv_wait(
+    command: &VideoFramePrepareCommand,
+    recv_wait: Duration,
+) {
+    tracing::trace!(
+        command = video_frame_prepare_command_kind(command),
+        generation = ?video_frame_prepare_command_generation(command),
+        recv_wait_ms = recv_wait.as_secs_f64() * 1000.0,
+        "FFmpeg video frame prepare worker command recv timing"
+    );
+    if recv_wait < WORKER_CHANNEL_RECV_WAIT_LOG_AFTER {
+        return;
+    }
+    tracing::debug!(
+        command = video_frame_prepare_command_kind(command),
+        generation = ?video_frame_prepare_command_generation(command),
+        recv_wait_ms = recv_wait.as_secs_f64() * 1000.0,
+        "FFmpeg video frame prepare worker waited for command"
+    );
+}
+
+fn video_frame_prepare_command_kind(command: &VideoFramePrepareCommand) -> &'static str {
+    match command {
+        VideoFramePrepareCommand::Prepare(_) => "prepare",
+        VideoFramePrepareCommand::Shutdown => "shutdown",
+    }
+}
+
+fn video_frame_prepare_command_generation(command: &VideoFramePrepareCommand) -> Option<u64> {
+    match command {
+        VideoFramePrepareCommand::Prepare(input) => Some(input.generation),
+        VideoFramePrepareCommand::Shutdown => None,
+    }
+}
+
+fn log_video_frame_prepare_worker_timing(timing: VideoFramePrepareWorkerTiming) {
+    tracing::trace!(
+        generation = timing.generation,
+        timeline_nsecs = timing.timeline_nsecs,
+        duration_nsecs = timing.duration_nsecs,
+        recv_wait_ms = timing.recv_wait.as_secs_f64() * 1000.0,
+        prepare_ms = timing.prepare_elapsed.as_secs_f64() * 1000.0,
+        result_send_block_ms = timing.send_elapsed.as_secs_f64() * 1000.0,
+        result_ok = timing.result_ok,
+        "FFmpeg video frame prepare worker timing"
+    );
+    if timing.prepare_elapsed < DECODE_PACKET_SLOW_LOG_AFTER
+        && timing.send_elapsed < WORKER_CHANNEL_SEND_WAIT_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        generation = timing.generation,
+        timeline_nsecs = timing.timeline_nsecs,
+        duration_nsecs = timing.duration_nsecs,
+        recv_wait_ms = timing.recv_wait.as_secs_f64() * 1000.0,
+        prepare_ms = timing.prepare_elapsed.as_secs_f64() * 1000.0,
+        result_send_block_ms = timing.send_elapsed.as_secs_f64() * 1000.0,
+        result_ok = timing.result_ok,
+        "FFmpeg video frame prepare worker completed slowly"
+    );
 }
 
 #[cfg(test)]

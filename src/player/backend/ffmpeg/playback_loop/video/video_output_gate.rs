@@ -8,6 +8,7 @@ use super::output_gate::{
 use super::output_rebuffer::PlaybackOutputState;
 use super::playback_block::PlaybackBlockReason;
 use super::*;
+use crate::player::render_host::VideoOutputQueueAdmission;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) enum AudioClockedVideoDrainStatus {
@@ -37,7 +38,10 @@ pub(in crate::player::backend::ffmpeg) fn admit_decoded_video_frame_to_vo(
     position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
 ) {
+    let started_at = Instant::now();
     let admission = vo_queue.admit_presented_frame(session_id, frame);
+    let admission_elapsed = started_at.elapsed();
+    log_vo_admission_timing(session_id, timeline_nsecs, admission_elapsed, admission);
     let backpressure = admission.before.render_backpressure;
     if admission.dropped_backlogged() {
         tracing::debug!(
@@ -82,6 +86,49 @@ pub(in crate::player::backend::ffmpeg) fn admit_decoded_video_frame_to_vo(
     }
     frame_presented.store(true, Ordering::Relaxed);
     position_reporter.report(timeline_nsecs, session_id, event_tx);
+}
+
+fn log_vo_admission_timing(
+    session_id: PlaybackSessionId,
+    timeline_nsecs: u64,
+    elapsed: Duration,
+    admission: VideoOutputQueueAdmission,
+) {
+    tracing::trace!(
+        session_id = ?session_id,
+        pts = timeline_nsecs,
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        result = ?admission.result,
+        before_queued_frames = admission.before.queued_frames,
+        after_queued_frames = admission.after.queued_frames,
+        vo_queue_capacity = admission.after.queue_capacity,
+        vo_dropped_frames = admission.after.dropped_frames,
+        replaced_pending_frame = admission.replaced_pending_frame,
+        render_backlogged = admission.before.render_backlogged(),
+        pending_render_requests = admission.before.render_backpressure.pending_requests,
+        render_last_ms = admission.before.render_backpressure.last_render_nsecs as f64 / 1_000_000.0,
+        render_avg_ms = admission.before.render_backpressure.average_render_nsecs as f64 / 1_000_000.0,
+        "FFmpeg VO admission timing"
+    );
+    if elapsed < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER {
+        return;
+    }
+    tracing::debug!(
+        session_id = ?session_id,
+        pts = timeline_nsecs,
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        result = ?admission.result,
+        before_queued_frames = admission.before.queued_frames,
+        after_queued_frames = admission.after.queued_frames,
+        vo_queue_capacity = admission.after.queue_capacity,
+        vo_dropped_frames = admission.after.dropped_frames,
+        replaced_pending_frame = admission.replaced_pending_frame,
+        render_backlogged = admission.before.render_backlogged(),
+        pending_render_requests = admission.before.render_backpressure.pending_requests,
+        render_last_ms = admission.before.render_backpressure.last_render_nsecs as f64 / 1_000_000.0,
+        render_avg_ms = admission.before.render_backpressure.average_render_nsecs as f64 / 1_000_000.0,
+        "FFmpeg VO admission completed slowly"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

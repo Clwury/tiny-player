@@ -68,7 +68,7 @@ fn drain_decode_pipelines_until_idle(
                 event_tx: context.event_tx,
                 vo_queue: context.vo_queue,
                 frame_presented: context.frame_presented,
-                demux_reader_watermark: || context.demux_cache.reader_watermark(),
+                demux_reader_watermark: || context.demux_cache.cached_reader_watermark(),
             })?;
         if decode_status.interrupted() {
             break;

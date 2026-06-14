@@ -218,15 +218,21 @@ impl AudioQueueShared {
     }
 
     fn snapshot(&self) -> std::result::Result<AudioQueueSnapshot, String> {
+        let started_at = Instant::now();
+        let lock_started_at = Instant::now();
         let state = self
             .state
             .lock()
             .map_err(|_| "系统音频解码队列已损坏".to_string())?;
-        Ok(AudioQueueSnapshot {
+        let lock_wait = lock_started_at.elapsed();
+        let snapshot = AudioQueueSnapshot {
             pending_nsecs: state.queued_duration_nsecs,
             frames: state.items.len(),
             generation: self.generation(),
-        })
+        };
+        drop(state);
+        log_audio_queue_snapshot_timing(started_at.elapsed(), lock_wait, snapshot);
+        Ok(snapshot)
     }
 
     fn clear(&self) {
@@ -300,7 +306,12 @@ impl AudioShared {
     }
 
     pub(super) fn reset_clock(&self, timeline_nsecs: u64) {
-        if let Ok(mut guard) = self.buffer.lock() {
+        let started_at = Instant::now();
+        let lock_started_at = Instant::now();
+        let lock_result = self.buffer.lock();
+        let lock_wait = lock_started_at.elapsed();
+        let buffer_cleared = lock_result.is_ok();
+        if let Ok(mut guard) = lock_result {
             guard.clear();
             self.ready.notify_all();
         }
@@ -312,6 +323,12 @@ impl AudioShared {
             .store(timeline_nsecs, Ordering::Relaxed);
         self.update_output_delay(Duration::ZERO);
         self.clear_underrun();
+        log_audio_shared_reset_clock_timing(
+            timeline_nsecs,
+            started_at.elapsed(),
+            lock_wait,
+            buffer_cleared,
+        );
     }
 
     pub(super) fn set_queued_end_timeline_nsecs(&self, timeline_nsecs: u64) {
@@ -416,11 +433,14 @@ impl AudioShared {
     }
 
     fn snapshot(&self) -> std::result::Result<AudioSharedSnapshot, String> {
+        let started_at = Instant::now();
+        let lock_started_at = Instant::now();
         let queued_samples = self
             .buffer
             .lock()
             .map_err(|_| "系统音频缓冲区已损坏".to_string())?
             .len();
+        let buffer_lock_wait = lock_started_at.elapsed();
         let queued_duration_nsecs = duration_nsecs(audio_samples_duration(
             queued_samples,
             self.sample_rate,
@@ -429,10 +449,17 @@ impl AudioShared {
         let output_delay_nsecs = self.output_delay_nsecs();
         let pending_nsecs = queued_duration_nsecs.saturating_add(output_delay_nsecs);
         let played_timeline_nsecs = self.played_timeline_nsecs_for_pending(queued_duration_nsecs);
-        Ok(AudioSharedSnapshot {
+        let snapshot = AudioSharedSnapshot {
             played_timeline_nsecs,
             pending_nsecs,
-        })
+        };
+        log_audio_shared_snapshot_timing(
+            started_at.elapsed(),
+            buffer_lock_wait,
+            queued_samples,
+            snapshot,
+        );
+        Ok(snapshot)
     }
 
     #[cfg(test)]
@@ -570,21 +597,45 @@ impl AudioOutput {
         end_timeline_nsecs: u64,
         control: &FfmpegControl,
     ) -> std::result::Result<AudioOutputPushResult, String> {
+        let started_at = Instant::now();
         if samples.is_empty() || end_timeline_nsecs <= start_timeline_nsecs {
+            log_audio_output_try_push_timed_timing(AudioOutputTryPushTimedTiming {
+                result: "queued_empty",
+                total: started_at.elapsed(),
+                queue_lock_wait: Duration::ZERO,
+                sample_count: samples.len(),
+                start_timeline_nsecs,
+                end_timeline_nsecs,
+                queued_frames: 0,
+                queued_duration: Duration::ZERO,
+            });
             return Ok(AudioOutputPushResult::Queued);
         }
 
         let generation = self.queue.generation();
         if control.should_interrupt() || !self.queue.is_current_generation(generation) {
+            log_audio_output_try_push_timed_timing(AudioOutputTryPushTimedTiming {
+                result: "interrupted",
+                total: started_at.elapsed(),
+                queue_lock_wait: Duration::ZERO,
+                sample_count: samples.len(),
+                start_timeline_nsecs,
+                end_timeline_nsecs,
+                queued_frames: 0,
+                queued_duration: Duration::ZERO,
+            });
             return Ok(AudioOutputPushResult::Interrupted { samples });
         }
 
         let duration_nsecs = end_timeline_nsecs.saturating_sub(start_timeline_nsecs);
+        let sample_count = samples.len();
+        let lock_started_at = Instant::now();
         let mut state = self
             .queue
             .state
             .lock()
             .map_err(|_| "系统音频解码队列已损坏".to_string())?;
+        let queue_lock_wait = lock_started_at.elapsed();
         if state.can_accept() {
             state.push(AudioQueueItem {
                 samples,
@@ -593,20 +644,57 @@ impl AudioOutput {
                 duration_nsecs,
                 generation,
             });
+            let queued_frames = state.items.len();
+            let queued_duration = state.pending_duration();
+            drop(state);
             self.queue.ready.notify_all();
+            log_audio_output_try_push_timed_timing(AudioOutputTryPushTimedTiming {
+                result: "queued",
+                total: started_at.elapsed(),
+                queue_lock_wait,
+                sample_count,
+                start_timeline_nsecs,
+                end_timeline_nsecs,
+                queued_frames,
+                queued_duration,
+            });
             return Ok(AudioOutputPushResult::Queued);
         }
 
+        let queued_frames = state.items.len();
+        let queued_duration = state.pending_duration();
+        drop(state);
+        log_audio_output_try_push_timed_timing(AudioOutputTryPushTimedTiming {
+            result: "would_block",
+            total: started_at.elapsed(),
+            queue_lock_wait,
+            sample_count,
+            start_timeline_nsecs,
+            end_timeline_nsecs,
+            queued_frames,
+            queued_duration,
+        });
         Ok(AudioOutputPushResult::WouldBlock {
             samples,
-            queued_frames: state.items.len(),
-            queued_duration: state.pending_duration(),
+            queued_frames,
+            queued_duration,
         })
     }
 
     pub(super) fn reset_clock(&self, timeline_nsecs: u64) {
+        let started_at = Instant::now();
+        let queue_started_at = Instant::now();
         self.queue.clear();
+        let queue_clear = queue_started_at.elapsed();
+        let shared_started_at = Instant::now();
         self.shared.reset_clock(timeline_nsecs);
+        let shared_reset = shared_started_at.elapsed();
+        log_audio_output_reset_clock_timing(
+            timeline_nsecs,
+            started_at.elapsed(),
+            queue_clear,
+            shared_reset,
+        );
     }
 
     pub(super) fn underrun_active(&self) -> bool {
@@ -649,16 +737,25 @@ impl AudioOutput {
     }
 
     pub(super) fn snapshot(&self) -> std::result::Result<AudioOutputSnapshot, String> {
+        let started_at = Instant::now();
+        let shared_started_at = Instant::now();
         let mut shared = self.shared.snapshot()?;
+        let mut shared_snapshot = shared_started_at.elapsed();
+        let queue_started_at = Instant::now();
         let queue = self.queue.snapshot()?;
+        let queue_snapshot = queue_started_at.elapsed();
         let total_pending_nsecs = shared.pending_nsecs.saturating_add(queue.pending_nsecs);
+        let mut underrun_recheck = Duration::ZERO;
         if self.shared.underrun_active.load(Ordering::Acquire) {
             self.shared.clear_underrun_if_recovered(total_pending_nsecs);
             if !self.shared.underrun_active.load(Ordering::Acquire) {
+                let recheck_started_at = Instant::now();
                 shared = self.shared.snapshot()?;
+                underrun_recheck = recheck_started_at.elapsed();
+                shared_snapshot += underrun_recheck;
             }
         }
-        Ok(AudioOutputSnapshot {
+        let snapshot = AudioOutputSnapshot {
             played_timeline_nsecs: shared.played_timeline_nsecs,
             buffered_until_timeline_nsecs: shared
                 .played_timeline_nsecs
@@ -668,8 +765,213 @@ impl AudioOutput {
             total_pending_nsecs,
             queue_frames: queue.frames,
             queue_generation: queue.generation,
-        })
+        };
+        log_audio_output_snapshot_timing(AudioOutputSnapshotTiming {
+            total: started_at.elapsed(),
+            shared_snapshot,
+            queue_snapshot,
+            underrun_recheck,
+            snapshot,
+        });
+        Ok(snapshot)
     }
+}
+
+struct AudioOutputTryPushTimedTiming {
+    result: &'static str,
+    total: Duration,
+    queue_lock_wait: Duration,
+    sample_count: usize,
+    start_timeline_nsecs: u64,
+    end_timeline_nsecs: u64,
+    queued_frames: usize,
+    queued_duration: Duration,
+}
+
+struct AudioOutputSnapshotTiming {
+    total: Duration,
+    shared_snapshot: Duration,
+    queue_snapshot: Duration,
+    underrun_recheck: Duration,
+    snapshot: AudioOutputSnapshot,
+}
+
+fn log_audio_output_try_push_timed_timing(timing: AudioOutputTryPushTimedTiming) {
+    tracing::trace!(
+        result = timing.result,
+        total_ms = timing.total.as_secs_f64() * 1000.0,
+        queue_lock_wait_ms = timing.queue_lock_wait.as_secs_f64() * 1000.0,
+        sample_count = timing.sample_count,
+        start_timeline_nsecs = timing.start_timeline_nsecs,
+        end_timeline_nsecs = timing.end_timeline_nsecs,
+        queued_frames = timing.queued_frames,
+        queued_ms = timing.queued_duration.as_secs_f64() * 1000.0,
+        "native audio output try_push_timed timing"
+    );
+    if timing.total < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+        && timing.queue_lock_wait < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        result = timing.result,
+        total_ms = timing.total.as_secs_f64() * 1000.0,
+        queue_lock_wait_ms = timing.queue_lock_wait.as_secs_f64() * 1000.0,
+        sample_count = timing.sample_count,
+        start_timeline_nsecs = timing.start_timeline_nsecs,
+        end_timeline_nsecs = timing.end_timeline_nsecs,
+        queued_frames = timing.queued_frames,
+        queued_ms = timing.queued_duration.as_secs_f64() * 1000.0,
+        "native audio output try_push_timed completed slowly"
+    );
+}
+
+fn log_audio_output_reset_clock_timing(
+    timeline_nsecs: u64,
+    total: Duration,
+    queue_clear: Duration,
+    shared_reset: Duration,
+) {
+    tracing::trace!(
+        timeline_nsecs,
+        total_ms = total.as_secs_f64() * 1000.0,
+        queue_clear_ms = queue_clear.as_secs_f64() * 1000.0,
+        shared_reset_ms = shared_reset.as_secs_f64() * 1000.0,
+        "native audio output reset_clock timing"
+    );
+    if total < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+        && queue_clear < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+        && shared_reset < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        timeline_nsecs,
+        total_ms = total.as_secs_f64() * 1000.0,
+        queue_clear_ms = queue_clear.as_secs_f64() * 1000.0,
+        shared_reset_ms = shared_reset.as_secs_f64() * 1000.0,
+        "native audio output reset_clock completed slowly"
+    );
+}
+
+fn log_audio_output_snapshot_timing(timing: AudioOutputSnapshotTiming) {
+    tracing::trace!(
+        total_ms = timing.total.as_secs_f64() * 1000.0,
+        shared_snapshot_ms = timing.shared_snapshot.as_secs_f64() * 1000.0,
+        queue_snapshot_ms = timing.queue_snapshot.as_secs_f64() * 1000.0,
+        underrun_recheck_ms = timing.underrun_recheck.as_secs_f64() * 1000.0,
+        played_timeline_nsecs = timing.snapshot.played_timeline_nsecs,
+        pending_ms = timing.snapshot.total_pending_nsecs as f64 / 1_000_000.0,
+        shared_pending_ms = timing.snapshot.shared_pending_nsecs as f64 / 1_000_000.0,
+        queue_pending_ms = timing.snapshot.queue_pending_nsecs as f64 / 1_000_000.0,
+        queue_frames = timing.snapshot.queue_frames,
+        queue_generation = timing.snapshot.queue_generation,
+        "native audio output snapshot timing"
+    );
+    if timing.total < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+        && timing.shared_snapshot < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+        && timing.queue_snapshot < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+        && timing.underrun_recheck < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        total_ms = timing.total.as_secs_f64() * 1000.0,
+        shared_snapshot_ms = timing.shared_snapshot.as_secs_f64() * 1000.0,
+        queue_snapshot_ms = timing.queue_snapshot.as_secs_f64() * 1000.0,
+        underrun_recheck_ms = timing.underrun_recheck.as_secs_f64() * 1000.0,
+        played_timeline_nsecs = timing.snapshot.played_timeline_nsecs,
+        pending_ms = timing.snapshot.total_pending_nsecs as f64 / 1_000_000.0,
+        shared_pending_ms = timing.snapshot.shared_pending_nsecs as f64 / 1_000_000.0,
+        queue_pending_ms = timing.snapshot.queue_pending_nsecs as f64 / 1_000_000.0,
+        queue_frames = timing.snapshot.queue_frames,
+        queue_generation = timing.snapshot.queue_generation,
+        "native audio output snapshot completed slowly"
+    );
+}
+
+fn log_audio_shared_snapshot_timing(
+    total: Duration,
+    buffer_lock_wait: Duration,
+    queued_samples: usize,
+    snapshot: AudioSharedSnapshot,
+) {
+    tracing::trace!(
+        total_ms = total.as_secs_f64() * 1000.0,
+        buffer_lock_wait_ms = buffer_lock_wait.as_secs_f64() * 1000.0,
+        queued_samples,
+        played_timeline_nsecs = snapshot.played_timeline_nsecs,
+        pending_ms = snapshot.pending_nsecs as f64 / 1_000_000.0,
+        "native audio shared snapshot timing"
+    );
+    if total < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+        && buffer_lock_wait < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        total_ms = total.as_secs_f64() * 1000.0,
+        buffer_lock_wait_ms = buffer_lock_wait.as_secs_f64() * 1000.0,
+        queued_samples,
+        played_timeline_nsecs = snapshot.played_timeline_nsecs,
+        pending_ms = snapshot.pending_nsecs as f64 / 1_000_000.0,
+        "native audio shared snapshot completed slowly"
+    );
+}
+
+fn log_audio_queue_snapshot_timing(
+    total: Duration,
+    lock_wait: Duration,
+    snapshot: AudioQueueSnapshot,
+) {
+    tracing::trace!(
+        total_ms = total.as_secs_f64() * 1000.0,
+        lock_wait_ms = lock_wait.as_secs_f64() * 1000.0,
+        pending_ms = snapshot.pending_nsecs as f64 / 1_000_000.0,
+        frames = snapshot.frames,
+        generation = snapshot.generation,
+        "native audio queue snapshot timing"
+    );
+    if total < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+        && lock_wait < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        total_ms = total.as_secs_f64() * 1000.0,
+        lock_wait_ms = lock_wait.as_secs_f64() * 1000.0,
+        pending_ms = snapshot.pending_nsecs as f64 / 1_000_000.0,
+        frames = snapshot.frames,
+        generation = snapshot.generation,
+        "native audio queue snapshot completed slowly"
+    );
+}
+
+fn log_audio_shared_reset_clock_timing(
+    timeline_nsecs: u64,
+    total: Duration,
+    buffer_lock_wait: Duration,
+    buffer_cleared: bool,
+) {
+    tracing::trace!(
+        timeline_nsecs,
+        total_ms = total.as_secs_f64() * 1000.0,
+        buffer_lock_wait_ms = buffer_lock_wait.as_secs_f64() * 1000.0,
+        buffer_cleared,
+        "native audio shared reset_clock timing"
+    );
+    if total < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+        && buffer_lock_wait < AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        timeline_nsecs,
+        total_ms = total.as_secs_f64() * 1000.0,
+        buffer_lock_wait_ms = buffer_lock_wait.as_secs_f64() * 1000.0,
+        buffer_cleared,
+        "native audio shared reset_clock completed slowly"
+    );
 }
 
 impl Drop for AudioOutput {

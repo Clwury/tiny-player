@@ -14,28 +14,72 @@ impl OutputQueueService {
         &mut self,
         context: OutputQueueServiceContext<'_>,
     ) -> std::result::Result<OutputQueueServiceStatus, String> {
-        service_output_queues_before_decoder_input(context)
+        let session_id = context.session_id;
+        let started_at = Instant::now();
+        let result = service_output_queues_before_decoder_input(context);
+        if let Ok(status) = result.as_ref() {
+            log_output_queue_service_timing(
+                session_id,
+                "before_decoder_input",
+                started_at.elapsed(),
+                Some(*status),
+            );
+        }
+        result
     }
 
     pub(super) fn after_decoder_input(
         &mut self,
         context: OutputQueueAfterDecoderInputContext<'_>,
     ) -> std::result::Result<(), String> {
-        service_output_queues_after_decoder_input(context)
+        let session_id = context.session_id;
+        let started_at = Instant::now();
+        let result = service_output_queues_after_decoder_input(context);
+        if result.is_ok() {
+            log_output_queue_service_timing(
+                session_id,
+                "after_decoder_input",
+                started_at.elapsed(),
+                None,
+            );
+        }
+        result
     }
 
     pub(super) fn after_decoder_input_backpressure_or_wait(
         &mut self,
         context: OutputQueueServiceContext<'_>,
     ) -> std::result::Result<OutputQueueServiceStatus, String> {
-        service_output_queues_after_decoder_input_backpressure_or_wait(context)
+        let session_id = context.session_id;
+        let started_at = Instant::now();
+        let result = service_output_queues_after_decoder_input_backpressure_or_wait(context);
+        if let Ok(status) = result.as_ref() {
+            log_output_queue_service_timing(
+                session_id,
+                "after_decoder_input_backpressure_or_wait",
+                started_at.elapsed(),
+                Some(*status),
+            );
+        }
+        result
     }
 
     pub(super) fn after_demux_would_block_or_wait(
         &mut self,
         context: OutputQueueServiceContext<'_>,
     ) -> std::result::Result<OutputQueueServiceStatus, String> {
-        service_output_queues_after_demux_would_block_or_wait(context)
+        let session_id = context.session_id;
+        let started_at = Instant::now();
+        let result = service_output_queues_after_demux_would_block_or_wait(context);
+        if let Ok(status) = result.as_ref() {
+            log_output_queue_service_timing(
+                session_id,
+                "after_demux_would_block_or_wait",
+                started_at.elapsed(),
+                Some(*status),
+            );
+        }
+        result
     }
 }
 
@@ -240,6 +284,31 @@ fn wait_after_output_queue_stall(
             playback_telemetry: &mut *context.playback_telemetry,
         },
         stall_reason,
+    );
+}
+
+fn log_output_queue_service_timing(
+    session_id: PlaybackSessionId,
+    phase: &'static str,
+    elapsed: Duration,
+    status: Option<OutputQueueServiceStatus>,
+) {
+    tracing::trace!(
+        session_id = ?session_id,
+        phase,
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        status = ?status,
+        "FFmpeg output queue service timing"
+    );
+    if elapsed < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER {
+        return;
+    }
+    tracing::debug!(
+        session_id = ?session_id,
+        phase,
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        status = ?status,
+        "FFmpeg output queue service completed slowly"
     );
 }
 

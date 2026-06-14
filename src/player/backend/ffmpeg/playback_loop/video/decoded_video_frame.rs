@@ -146,6 +146,108 @@ pub(super) fn log_prepared_video_frame_if_slow(
     );
 }
 
+#[derive(Clone, Copy, Default)]
+struct ReadyVideoDecodeOutputTiming {
+    service_worker: Duration,
+    retry_prepare_input: Duration,
+    poll_prepare_result: Duration,
+    admit_prepared_frame: Duration,
+    poll_decoded_frame: Duration,
+    enqueue_decoded_frame_prepare: Duration,
+    has_pending_prepare: Duration,
+    poll_packet_status: Duration,
+    decode_recovery: Duration,
+    iterations: u64,
+    prepared_results: u64,
+    decoded_frames: u64,
+    completed_packets: u64,
+}
+
+fn log_ready_video_decode_output_timing(
+    session_id: PlaybackSessionId,
+    total: Duration,
+    timing: ReadyVideoDecodeOutputTiming,
+    made_progress: bool,
+    video_decode_pipeline: &VideoDecodePipeline,
+    video_frame_prepare_worker: &VideoFramePrepareWorker,
+    output_scheduler: &PlaybackOutputScheduler,
+) {
+    let video_decode_snapshot = video_decode_pipeline.snapshot();
+    let prepare_snapshot = video_frame_prepare_worker.snapshot();
+    let output_snapshot = output_scheduler.snapshot();
+    tracing::trace!(
+        session_id = ?session_id,
+        total_ms = total.as_secs_f64() * 1000.0,
+        service_worker_ms = timing.service_worker.as_secs_f64() * 1000.0,
+        retry_prepare_input_ms = timing.retry_prepare_input.as_secs_f64() * 1000.0,
+        poll_prepare_result_ms = timing.poll_prepare_result.as_secs_f64() * 1000.0,
+        admit_prepared_frame_ms = timing.admit_prepared_frame.as_secs_f64() * 1000.0,
+        poll_decoded_frame_ms = timing.poll_decoded_frame.as_secs_f64() * 1000.0,
+        enqueue_decoded_frame_prepare_ms =
+            timing.enqueue_decoded_frame_prepare.as_secs_f64() * 1000.0,
+        has_pending_prepare_ms = timing.has_pending_prepare.as_secs_f64() * 1000.0,
+        poll_packet_status_ms = timing.poll_packet_status.as_secs_f64() * 1000.0,
+        decode_recovery_ms = timing.decode_recovery.as_secs_f64() * 1000.0,
+        iterations = timing.iterations,
+        prepared_results = timing.prepared_results,
+        decoded_frames = timing.decoded_frames,
+        completed_packets = timing.completed_packets,
+        made_progress,
+        video_decode_state = ?video_decode_snapshot.state,
+        video_decode_queued_frames = video_decode_snapshot.queued_frames,
+        video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+        video_prepare_state = ?prepare_snapshot.state,
+        video_prepare_in_flight_frames = prepare_snapshot.in_flight_frames,
+        video_prepare_completed_frames = prepare_snapshot.completed_frames,
+        queued_video_frames = output_snapshot.queued_video_frames,
+        queued_video_ms = output_snapshot.queued_video_duration_nsecs as f64 / 1_000_000.0,
+        output_state = ?output_snapshot.state,
+        "FFmpeg ready video decode output drain timing"
+    );
+    if total < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.service_worker < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.retry_prepare_input < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.poll_prepare_result < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.admit_prepared_frame < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.poll_decoded_frame < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.enqueue_decoded_frame_prepare < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.has_pending_prepare < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.poll_packet_status < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.decode_recovery < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        session_id = ?session_id,
+        total_ms = total.as_secs_f64() * 1000.0,
+        service_worker_ms = timing.service_worker.as_secs_f64() * 1000.0,
+        retry_prepare_input_ms = timing.retry_prepare_input.as_secs_f64() * 1000.0,
+        poll_prepare_result_ms = timing.poll_prepare_result.as_secs_f64() * 1000.0,
+        admit_prepared_frame_ms = timing.admit_prepared_frame.as_secs_f64() * 1000.0,
+        poll_decoded_frame_ms = timing.poll_decoded_frame.as_secs_f64() * 1000.0,
+        enqueue_decoded_frame_prepare_ms =
+            timing.enqueue_decoded_frame_prepare.as_secs_f64() * 1000.0,
+        has_pending_prepare_ms = timing.has_pending_prepare.as_secs_f64() * 1000.0,
+        poll_packet_status_ms = timing.poll_packet_status.as_secs_f64() * 1000.0,
+        decode_recovery_ms = timing.decode_recovery.as_secs_f64() * 1000.0,
+        iterations = timing.iterations,
+        prepared_results = timing.prepared_results,
+        decoded_frames = timing.decoded_frames,
+        completed_packets = timing.completed_packets,
+        made_progress,
+        video_decode_state = ?video_decode_snapshot.state,
+        video_decode_queued_frames = video_decode_snapshot.queued_frames,
+        video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+        video_prepare_state = ?prepare_snapshot.state,
+        video_prepare_in_flight_frames = prepare_snapshot.in_flight_frames,
+        video_prepare_completed_frames = prepare_snapshot.completed_frames,
+        queued_video_frames = output_snapshot.queued_video_frames,
+        queued_video_ms = output_snapshot.queued_video_duration_nsecs as f64 / 1_000_000.0,
+        output_state = ?output_snapshot.state,
+        "FFmpeg ready video decode output drain completed slowly"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::while_let_loop)]
 pub(super) fn drain_ready_video_decode_output<F>(
@@ -180,20 +282,30 @@ pub(super) fn drain_ready_video_decode_output<F>(
 where
     F: FnMut() -> DemuxReaderWatermark,
 {
+    let started_at = Instant::now();
+    let mut timing = ReadyVideoDecodeOutputTiming::default();
     let mut made_progress = false;
+    let stage_started_at = Instant::now();
     video_decode_pipeline.service_worker()?;
+    timing.service_worker = stage_started_at.elapsed();
     loop {
+        timing.iterations = timing.iterations.saturating_add(1);
         let Some(front_generation) = video_decode_pipeline.front_generation() else {
             break;
         };
 
-        if video_frame_prepare_worker.retry_pending_input()?
-            == VideoFramePrepareEnqueueResult::InputFull
-        {
+        let stage_started_at = Instant::now();
+        let retry_prepare_input = video_frame_prepare_worker.retry_pending_input()?;
+        timing.retry_prepare_input += stage_started_at.elapsed();
+        if retry_prepare_input == VideoFramePrepareEnqueueResult::InputFull {
             break;
         }
 
-        if let Some(prepare_result) = video_frame_prepare_worker.poll_result(front_generation)? {
+        let stage_started_at = Instant::now();
+        let prepare_result = video_frame_prepare_worker.poll_result(front_generation)?;
+        timing.poll_prepare_result += stage_started_at.elapsed();
+        if let Some(prepare_result) = prepare_result {
+            timing.prepared_results = timing.prepared_results.saturating_add(1);
             log_prepared_video_frame_if_slow(
                 &prepare_result,
                 session_id,
@@ -203,6 +315,7 @@ where
             made_progress = true;
             match prepare_result.result {
                 Ok(prepared_frame) => {
+                    let stage_started_at = Instant::now();
                     admit_prepared_video_frame(PreparedVideoFrameAdmissionContext {
                         prepared_frame,
                         decoded_video_frame_count: *decoded_video_frame_count,
@@ -219,7 +332,8 @@ where
                         subtitle_pipeline,
                         current_start_position_nsecs,
                         demux_reader_watermark: &mut demux_reader_watermark,
-                    })?
+                    })?;
+                    timing.admit_prepared_frame += stage_started_at.elapsed();
                 }
                 Err(error) => {
                     let realign_after_decode_recovery = video_decode_pipeline
@@ -254,8 +368,13 @@ where
             continue;
         }
 
-        if let Some(decoded_frame) = video_decode_pipeline.poll_frame(front_generation)? {
+        let stage_started_at = Instant::now();
+        let decoded_frame = video_decode_pipeline.poll_frame(front_generation)?;
+        timing.poll_decoded_frame += stage_started_at.elapsed();
+        if let Some(decoded_frame) = decoded_frame {
+            timing.decoded_frames = timing.decoded_frames.saturating_add(1);
             made_progress = true;
+            let stage_started_at = Instant::now();
             let frame_result = service_decoded_video_frame(
                 decoded_frame,
                 front_generation,
@@ -283,6 +402,7 @@ where
                 current_start_position_nsecs,
                 &mut demux_reader_watermark,
             );
+            timing.enqueue_decoded_frame_prepare += stage_started_at.elapsed();
             let queued_for_prepare = match frame_result {
                 Ok(queued_for_prepare) => queued_for_prepare,
                 Err(error) => {
@@ -321,17 +441,25 @@ where
             continue;
         }
 
-        if video_frame_prepare_worker.has_pending_for_generation(front_generation)? {
+        let stage_started_at = Instant::now();
+        let has_pending_prepare =
+            video_frame_prepare_worker.has_pending_for_generation(front_generation)?;
+        timing.has_pending_prepare += stage_started_at.elapsed();
+        if has_pending_prepare {
             break;
         }
 
-        let Some(status) = video_decode_pipeline.poll_packet_status(front_generation)? else {
+        let stage_started_at = Instant::now();
+        let packet_status = video_decode_pipeline.poll_packet_status(front_generation)?;
+        timing.poll_packet_status += stage_started_at.elapsed();
+        let Some(status) = packet_status else {
             break;
         };
         let pending_packet = video_decode_pipeline
             .pop_completed_packet()
             .expect("front video decode packet exists for status");
         made_progress = true;
+        timing.completed_packets = timing.completed_packets.saturating_add(1);
         if !status.drained && status.elapsed >= DECODE_PACKET_SLOW_LOG_AFTER {
             let video_decode_snapshot = video_decode_pipeline.snapshot();
             let audio_output_snapshot = audio_output.and_then(|output| output.snapshot().ok());
@@ -357,6 +485,7 @@ where
                 "FFmpeg video decode packet completed slowly"
             );
         }
+        let stage_started_at = Instant::now();
         service_video_decode_recovery_result(VideoDecodeRecoveryServiceContext {
             result: status.result,
             packet: &pending_packet.packet,
@@ -371,6 +500,16 @@ where
             dovi_pipeline,
             control,
         })?;
+        timing.decode_recovery += stage_started_at.elapsed();
     }
+    log_ready_video_decode_output_timing(
+        session_id,
+        started_at.elapsed(),
+        timing,
+        made_progress,
+        video_decode_pipeline,
+        video_frame_prepare_worker,
+        output_scheduler,
+    );
     Ok(made_progress)
 }

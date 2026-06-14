@@ -87,6 +87,65 @@ pub(super) fn service_decoded_audio_frame(
     Ok(())
 }
 
+#[derive(Clone, Copy, Default)]
+struct ReadyAudioDecodeOutputTiming {
+    pending_audio_backpressure: Duration,
+    poll_frame: Duration,
+    service_frame: Duration,
+    poll_packet_status: Duration,
+    packet_result: Duration,
+    iterations: u64,
+    decoded_frames: u64,
+    completed_packets: u64,
+}
+
+fn log_ready_audio_decode_output_timing(
+    session_id: PlaybackSessionId,
+    total: Duration,
+    timing: ReadyAudioDecodeOutputTiming,
+    made_progress: bool,
+) {
+    tracing::trace!(
+        session_id = ?session_id,
+        total_ms = total.as_secs_f64() * 1000.0,
+        pending_audio_backpressure_ms =
+            timing.pending_audio_backpressure.as_secs_f64() * 1000.0,
+        poll_frame_ms = timing.poll_frame.as_secs_f64() * 1000.0,
+        service_frame_ms = timing.service_frame.as_secs_f64() * 1000.0,
+        poll_packet_status_ms = timing.poll_packet_status.as_secs_f64() * 1000.0,
+        packet_result_ms = timing.packet_result.as_secs_f64() * 1000.0,
+        iterations = timing.iterations,
+        decoded_frames = timing.decoded_frames,
+        completed_packets = timing.completed_packets,
+        made_progress,
+        "FFmpeg ready audio decode output drain timing"
+    );
+    if total < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.pending_audio_backpressure < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.poll_frame < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.service_frame < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.poll_packet_status < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.packet_result < DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        session_id = ?session_id,
+        total_ms = total.as_secs_f64() * 1000.0,
+        pending_audio_backpressure_ms =
+            timing.pending_audio_backpressure.as_secs_f64() * 1000.0,
+        poll_frame_ms = timing.poll_frame.as_secs_f64() * 1000.0,
+        service_frame_ms = timing.service_frame.as_secs_f64() * 1000.0,
+        poll_packet_status_ms = timing.poll_packet_status.as_secs_f64() * 1000.0,
+        packet_result_ms = timing.packet_result.as_secs_f64() * 1000.0,
+        iterations = timing.iterations,
+        decoded_frames = timing.decoded_frames,
+        completed_packets = timing.completed_packets,
+        made_progress,
+        "FFmpeg ready audio decode output drain completed slowly"
+    );
+}
+
 #[allow(clippy::too_many_arguments, clippy::while_let_loop)]
 pub(super) fn drain_ready_audio_decode_output(
     mut audio_decode_pipeline: Option<&mut AudioDecodePipeline>,
@@ -104,16 +163,21 @@ pub(super) fn drain_ready_audio_decode_output(
     subtitle_pipeline: &mut SubtitlePipeline,
     buffered_reporter: &mut BufferedReporter,
 ) -> std::result::Result<bool, String> {
+    let started_at = Instant::now();
+    let mut timing = ReadyAudioDecodeOutputTiming::default();
     let mut made_progress = false;
     loop {
+        timing.iterations = timing.iterations.saturating_add(1);
         let Some(worker) = audio_decode_pipeline.as_deref_mut() else {
             break;
         };
         let Some(front_generation) = worker.front_generation() else {
             break;
         };
+        let stage_started_at = Instant::now();
         if output_scheduler.pending_start_audio_backpressured() {
             let Some(output) = audio_output else {
+                timing.pending_audio_backpressure += stage_started_at.elapsed();
                 break;
             };
             output_scheduler.flush_pending_start_audio_if_ready(
@@ -128,13 +192,20 @@ pub(super) fn drain_ready_audio_decode_output(
                 buffered_reporter,
             )?;
             if output_scheduler.pending_start_audio_backpressured() {
+                timing.pending_audio_backpressure += stage_started_at.elapsed();
                 break;
             }
         }
+        timing.pending_audio_backpressure += stage_started_at.elapsed();
         let audio_time_base = worker.info().time_base;
 
-        if let Some(decoded_frame) = worker.poll_frame(front_generation)? {
+        let stage_started_at = Instant::now();
+        let decoded_frame = worker.poll_frame(front_generation)?;
+        timing.poll_frame += stage_started_at.elapsed();
+        if let Some(decoded_frame) = decoded_frame {
             made_progress = true;
+            timing.decoded_frames = timing.decoded_frames.saturating_add(1);
+            let stage_started_at = Instant::now();
             service_decoded_audio_frame(
                 decoded_frame,
                 audio_time_base,
@@ -152,19 +223,24 @@ pub(super) fn drain_ready_audio_decode_output(
                 subtitle_pipeline,
                 buffered_reporter,
             )?;
+            timing.service_frame += stage_started_at.elapsed();
             if control.has_pending_seek() {
                 break;
             }
             continue;
         }
 
-        let Some(status) = worker.poll_packet_status(front_generation)? else {
+        let stage_started_at = Instant::now();
+        let packet_status = worker.poll_packet_status(front_generation)?;
+        timing.poll_packet_status += stage_started_at.elapsed();
+        let Some(status) = packet_status else {
             break;
         };
         let pending_packet = worker
             .pop_completed_packet()
             .expect("front audio decode packet exists for status");
         made_progress = true;
+        timing.completed_packets = timing.completed_packets.saturating_add(1);
         if !status.drained && status.elapsed >= DECODE_PACKET_SLOW_LOG_AFTER {
             let audio_decode_snapshot = worker.snapshot();
             let audio_output_snapshot = audio_output.and_then(|output| output.snapshot().ok());
@@ -193,8 +269,11 @@ pub(super) fn drain_ready_audio_decode_output(
                 "FFmpeg audio decode packet completed slowly"
             );
         }
+        let stage_started_at = Instant::now();
         status.result?;
+        timing.packet_result += stage_started_at.elapsed();
     }
+    log_ready_audio_decode_output_timing(session_id, started_at.elapsed(), timing, made_progress);
     Ok(made_progress)
 }
 

@@ -45,17 +45,8 @@ pub(super) struct PlaybackPipelineSnapshot {
 
 impl PlaybackPipelineSnapshot {
     pub(super) fn capture(context: PlaybackPipelineSnapshotContext<'_>) -> Self {
-        let (demux_packet_snapshot, demux_reader_watermark, demux_snapshot_unavailable) = context
-            .demux_cache
-            .try_monitor_snapshot()
-            .map(|(packet_snapshot, watermark)| (packet_snapshot, watermark, false))
-            .unwrap_or_else(|| {
-                (
-                    DemuxPacketQueueSnapshot::default(),
-                    DemuxReaderWatermark::default(),
-                    true,
-                )
-            });
+        let (demux_packet_snapshot, demux_reader_watermark, demux_snapshot_unavailable) =
+            context.demux_cache.monitor_snapshot();
         let demux_read_blocked_for = context.demux_cache.demux_read_blocked_for();
         let video_decode_snapshot = context.video_decode_pipeline.snapshot();
         let scheduled_video_queue_limit_reached = context

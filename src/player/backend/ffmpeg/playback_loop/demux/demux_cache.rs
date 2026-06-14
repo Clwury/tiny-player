@@ -6,14 +6,12 @@ const DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL: Duration = Duration::from_millis
 const DEMUX_STREAM_PACKET_QUEUE_LIMIT: usize = 2048;
 const DEMUX_SUBTITLE_PACKET_QUEUE_LIMIT: usize = 4096;
 const DEMUX_READ_SLOW_LOG_AFTER: Duration = Duration::from_millis(200);
-// Packet-cache read-ahead cap. Kept small (close to mpv's 1s demuxer-readahead) so the
-// demux producer actually reaches the cap and *pauses* between refills. With a large cap
-// (e.g. 5s) the per-stream forward window — held down by the lagging audio track at
-// ~3-4s — rarely reaches it, so the producer reads continuously and thrashes the single
-// cache mutex against the coordinator pump, starving the decoder. Deep buffering for
-// seeking / network resilience is provided by the byte-level HTTP/disk cache, not here.
-const DEMUX_PACKET_CACHE_MAX_READAHEAD: Duration = Duration::from_secs(3);
+// Packet-cache read-ahead cap. Kept far below deep byte-cache buffering so the demux
+// producer still parks between refills, but large enough to keep high-bitrate hardware
+// decode fed through short stalls in frame preparation.
+const DEMUX_PACKET_CACHE_MAX_READAHEAD: Duration = Duration::from_secs(4);
 const DEMUX_WOULD_BLOCK_DIAG_INTERVAL: Duration = Duration::from_millis(500);
+const DEMUX_PACKET_APPEND_TIMING_LOG_AFTER: Duration = Duration::from_millis(1);
 
 /// Read-ahead target for the demux PACKET cache.
 ///
@@ -40,6 +38,8 @@ fn demux_packet_cache_readahead_nsecs(
 /// wakes to read+append on *every* consumed packet, thrashing the lock against the pump
 /// and starving the decoder. Inject a band (when none is configured) so the producer
 /// parks between refills and the pump gets long uncontended windows to feed the decoder.
+/// Use a narrower default band than half the target so refill starts before a slow 4K
+/// decode path drains most of the demux window.
 fn demux_packet_cache_hysteresis_nsecs(
     cache_config: &PlaybackCacheConfig,
     readahead_nsecs: u64,
@@ -48,7 +48,7 @@ fn demux_packet_cache_hysteresis_nsecs(
     if configured > 0 {
         configured
     } else {
-        readahead_nsecs / 2
+        readahead_nsecs / 3
     }
 }
 
@@ -92,6 +92,18 @@ enum DemuxCacheLockWait {
     Bounded(Duration),
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct DemuxPacketCacheReadTiming {
+    pub(super) lock_wait: Duration,
+    pub(super) try_lock_failures: u64,
+    pub(super) lock_timed_out: bool,
+    pub(super) data_wait: Duration,
+    pub(super) data_waits: u64,
+    pub(super) packet_ref: Duration,
+    pub(super) disk_read: Duration,
+    pub(super) disk_reads: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct DemuxPacketQueueSnapshot {
     pub(super) total_packets: usize,
@@ -131,8 +143,24 @@ pub(in crate::player::backend::ffmpeg) struct DemuxReaderWatermark {
     pub(in crate::player::backend::ffmpeg) forward_bytes: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+struct DemuxPacketCacheMonitorSnapshot {
+    packet_queue: DemuxPacketQueueSnapshot,
+    reader_watermark: DemuxReaderWatermark,
+}
+
+impl DemuxPacketCacheMonitorSnapshot {
+    fn from_state(state: &DemuxPacketCacheState) -> Self {
+        Self {
+            packet_queue: state.packet_queue_snapshot(),
+            reader_watermark: state.reader_watermark(),
+        }
+    }
+}
+
 struct DemuxPacketCacheShared {
     state: Mutex<DemuxPacketCacheState>,
+    monitor_snapshot: Mutex<DemuxPacketCacheMonitorSnapshot>,
     ready: Condvar,
     control: Arc<FfmpegControl>,
     event_tx: Sender<BackendEvent>,
@@ -182,14 +210,46 @@ struct DemuxPacketCacheState {
     input_rate_samples: VecDeque<DemuxInputRateSample>,
     last_reported_buffered_until: Option<Option<f64>>,
     last_cache_state_emit_at: Option<Instant>,
+    last_emitted_cache_state: Option<PlaybackCacheState>,
     generation: u64,
     error: Option<String>,
     shutdown: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct DemuxPacketAppendTiming {
+    lock_wait: Duration,
+    lock_hold: Duration,
+    record_input_bytes: Duration,
+    skip_resume_overlap: Duration,
+    packet_index: Duration,
+    disk_write: Duration,
+    queue_insert: Duration,
+    maybe_start_reader_head: Duration,
+    trim: Duration,
+    refresh_readahead_hysteresis: Duration,
+    should_pause_demux: Duration,
+    refresh_cache_pause: Duration,
+    emit_state: Duration,
+    notify: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct DemuxPacketAppendOutcome {
     appended: bool,
     force_cache_state_report: bool,
+    timing: DemuxPacketAppendTiming,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CachePauseRefresh {
+    force_cache_state_report: bool,
+}
+
+struct CacheStateEmit {
+    session_id: PlaybackSessionId,
+    cache_state: PlaybackCacheState,
+    buffered_changed: Option<Option<f64>>,
 }
 
 #[derive(Clone, Copy)]
@@ -259,16 +319,31 @@ struct CachedDemuxPacket {
 }
 
 enum CachedDemuxPacketPayload {
-    Memory(AvPacket),
+    Memory(Arc<Mutex<AvPacket>>),
     Disk {
-        props: AvPacket,
+        props: Arc<Mutex<AvPacket>>,
+        offset: u64,
+        len: usize,
+    },
+}
+
+struct DemuxPacketReadSource {
+    stream_offset: usize,
+    payload: DemuxPacketReadPayload,
+}
+
+enum DemuxPacketReadPayload {
+    Memory(Arc<Mutex<AvPacket>>),
+    Disk {
+        file: Arc<File>,
+        props: Arc<Mutex<AvPacket>>,
         offset: u64,
         len: usize,
     },
 }
 
 struct DemuxPacketDiskCache {
-    file: File,
+    file: Arc<File>,
     path: PathBuf,
     next_offset: u64,
     max_bytes: u64,
@@ -326,8 +401,10 @@ impl DemuxPacketCache {
         if let Some(subtitle_stream) = subtitle_stream {
             state.set_stream_kind(subtitle_stream.index, StreamCacheKind::Subtitle);
         }
+        let monitor_snapshot = DemuxPacketCacheMonitorSnapshot::from_state(&state);
         let shared = Arc::new(DemuxPacketCacheShared {
             state: Mutex::new(state),
+            monitor_snapshot: Mutex::new(monitor_snapshot),
             ready: Condvar::new(),
             control,
             event_tx,
@@ -367,13 +444,27 @@ impl DemuxPacketCache {
         &self,
         stream_indices: &[c_int],
     ) -> (DemuxReadResult, Option<usize>) {
-        self.read_packet_round_robin_inner(stream_indices, true, DemuxCacheLockWait::None, false)
+        let (result, stream_offset, _) = self.read_packet_round_robin_inner(
+            stream_indices,
+            true,
+            DemuxCacheLockWait::None,
+            false,
+        );
+        (result, stream_offset)
     }
 
     pub(super) fn poll_packet_round_robin(
         &self,
         stream_indices: &[c_int],
     ) -> (DemuxReadResult, Option<usize>) {
+        let (result, stream_offset, _) = self.poll_packet_round_robin_with_timing(stream_indices);
+        (result, stream_offset)
+    }
+
+    pub(super) fn poll_packet_round_robin_with_timing(
+        &self,
+        stream_indices: &[c_int],
+    ) -> (DemuxReadResult, Option<usize>, DemuxPacketCacheReadTiming) {
         self.read_packet_round_robin_inner(stream_indices, false, DemuxCacheLockWait::None, false)
     }
 
@@ -390,12 +481,28 @@ impl DemuxPacketCache {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn read_available_packet_round_robin_with_cache_pause_signal(
         &self,
         stream_indices: &[c_int],
         lock_wait: Duration,
         cache_pause_signal: bool,
     ) -> (DemuxReadResult, Option<usize>) {
+        let (result, stream_offset, _) = self
+            .read_available_packet_round_robin_with_cache_pause_signal_and_timing(
+                stream_indices,
+                lock_wait,
+                cache_pause_signal,
+            );
+        (result, stream_offset)
+    }
+
+    pub(super) fn read_available_packet_round_robin_with_cache_pause_signal_and_timing(
+        &self,
+        stream_indices: &[c_int],
+        lock_wait: Duration,
+        cache_pause_signal: bool,
+    ) -> (DemuxReadResult, Option<usize>, DemuxPacketCacheReadTiming) {
         self.read_packet_round_robin_inner(
             stream_indices,
             false,
@@ -413,21 +520,20 @@ impl DemuxPacketCache {
         guard.packet_queue_snapshot()
     }
 
-    pub(super) fn reader_watermark(&self) -> DemuxReaderWatermark {
-        let guard = self
-            .shared
-            .state
-            .lock()
-            .expect("FFmpeg demux packet cache poisoned");
-        guard.reader_watermark()
+    pub(super) fn cached_reader_watermark(&self) -> DemuxReaderWatermark {
+        self.shared.cached_monitor_snapshot().reader_watermark
     }
 
-    pub(super) fn try_monitor_snapshot(
+    pub(super) fn monitor_snapshot(
         &self,
-    ) -> Option<(DemuxPacketQueueSnapshot, DemuxReaderWatermark)> {
-        let guard =
-            self.try_lock_state(DemuxCacheLockWait::Bounded(DEMUX_PACKET_CACHE_LOCK_WAIT))?;
-        Some((guard.packet_queue_snapshot(), guard.reader_watermark()))
+    ) -> (DemuxPacketQueueSnapshot, DemuxReaderWatermark, bool) {
+        let Some(guard) = self.try_lock_state(DemuxCacheLockWait::None) else {
+            let snapshot = self.shared.cached_monitor_snapshot();
+            return (snapshot.packet_queue, snapshot.reader_watermark, true);
+        };
+        let snapshot = DemuxPacketCacheMonitorSnapshot::from_state(&guard);
+        self.shared.store_monitor_snapshot(snapshot.clone());
+        (snapshot.packet_queue, snapshot.reader_watermark, false)
     }
 
     pub(super) fn demux_read_blocked_for(&self) -> Option<Duration> {
@@ -440,13 +546,15 @@ impl DemuxPacketCache {
         wait_for_data: bool,
         lock_wait: DemuxCacheLockWait,
         cache_pause_signal: bool,
-    ) -> (DemuxReadResult, Option<usize>) {
-        let mut guard = if wait_for_data {
-            self.lock_state_unbounded()
+    ) -> (DemuxReadResult, Option<usize>, DemuxPacketCacheReadTiming) {
+        let (mut guard, mut timing) = if wait_for_data {
+            let (guard, timing) = self.lock_state_unbounded_with_timing();
+            (guard, timing)
         } else {
-            match self.try_lock_state(lock_wait) {
-                Some(guard) => guard,
-                None => return (DemuxReadResult::WouldBlock, None),
+            let (guard, timing) = self.try_lock_state_with_timing(lock_wait);
+            match guard {
+                Some(guard) => (guard, timing),
+                None => return (DemuxReadResult::WouldBlock, None, timing),
             }
         };
         let mut logged_wait = false;
@@ -454,25 +562,35 @@ impl DemuxPacketCache {
         let mut next_stall_log_at = None;
         loop {
             if guard.shutdown || self.shared.control.should_stop() {
-                return (DemuxReadResult::Interrupted, None);
+                return (DemuxReadResult::Interrupted, None, timing);
             }
             if let Some(error) = guard.error.clone() {
-                return (DemuxReadResult::Error(error), None);
+                return (DemuxReadResult::Error(error), None, timing);
             }
-            if self.shared.refresh_cache_pause(&mut guard) {
+            if self
+                .shared
+                .refresh_cache_pause(&mut guard)
+                .force_cache_state_report
+            {
                 self.shared.emit_cache_state(&mut guard);
             }
-            let packet = match guard.take_packet_round_robin(stream_indices) {
+            let packet_source = match guard.take_packet_round_robin(stream_indices) {
                 Ok(packet) => packet,
-                Err(error) => return (DemuxReadResult::Error(error), None),
+                Err(error) => return (DemuxReadResult::Error(error), None, timing),
             };
-            if let Some((packet, stream_offset)) = packet {
+            if let Some(packet_source) = packet_source {
                 guard.refresh_readahead_hysteresis();
+                self.shared.refresh_monitor_snapshot(&guard);
                 if wait_for_data {
                     self.shared.emit_cache_state_after_read(&mut guard, true);
                 }
                 self.shared.ready.notify_all();
-                return (DemuxReadResult::Packet(packet), Some(stream_offset));
+                drop(guard);
+                let (packet, stream_offset) = match packet_source.packet_ref(&mut timing) {
+                    Ok(packet) => packet,
+                    Err(error) => return (DemuxReadResult::Error(error), None, timing),
+                };
+                return (DemuxReadResult::Packet(packet), Some(stream_offset), timing);
             }
             if guard.activate_detached_append_range() {
                 self.shared.ready.notify_all();
@@ -480,18 +598,21 @@ impl DemuxPacketCache {
             }
             if self.shared.control.is_cache_paused() && !guard.cache_pause_recovered() {
                 if !wait_for_data {
-                    return (DemuxReadResult::WouldBlock, None);
+                    return (DemuxReadResult::WouldBlock, None, timing);
                 }
+                let wait_started_at = Instant::now();
                 let (next_guard, _) = self
                     .shared
                     .ready
                     .wait_timeout(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL)
                     .expect("FFmpeg demux packet cache poisoned");
+                timing.data_wait += wait_started_at.elapsed();
+                timing.data_waits = timing.data_waits.saturating_add(1);
                 guard = next_guard;
                 continue;
             }
             if guard.read_range_eof() {
-                return (DemuxReadResult::Eof, None);
+                return (DemuxReadResult::Eof, None, timing);
             }
             if guard.demux_position_detached {
                 let session_id = guard.session_id;
@@ -519,7 +640,7 @@ impl DemuxPacketCache {
                 guard.log_would_block_diagnostic(stream_indices);
             }
             if !wait_for_data {
-                return (DemuxReadResult::WouldBlock, None);
+                return (DemuxReadResult::WouldBlock, None, timing);
             }
             let now = Instant::now();
             let wait_started = *wait_started_at.get_or_insert(now);
@@ -578,36 +699,75 @@ impl DemuxPacketCache {
                 );
                 next_stall_log_at = now.checked_add(DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL);
             }
+            let wait_started_at = Instant::now();
             let (next_guard, _) = self
                 .shared
                 .ready
                 .wait_timeout(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL)
                 .expect("FFmpeg demux packet cache poisoned");
+            timing.data_wait += wait_started_at.elapsed();
+            timing.data_waits = timing.data_waits.saturating_add(1);
             guard = next_guard;
         }
     }
 
-    fn lock_state_unbounded(&self) -> std::sync::MutexGuard<'_, DemuxPacketCacheState> {
-        self.shared
+    fn lock_state_unbounded_with_timing(
+        &self,
+    ) -> (
+        std::sync::MutexGuard<'_, DemuxPacketCacheState>,
+        DemuxPacketCacheReadTiming,
+    ) {
+        let started_at = Instant::now();
+        let guard = self
+            .shared
             .state
             .lock()
-            .expect("FFmpeg demux packet cache poisoned")
+            .expect("FFmpeg demux packet cache poisoned");
+        (
+            guard,
+            DemuxPacketCacheReadTiming {
+                lock_wait: started_at.elapsed(),
+                ..DemuxPacketCacheReadTiming::default()
+            },
+        )
     }
 
     fn try_lock_state(
         &self,
         lock_wait: DemuxCacheLockWait,
     ) -> Option<std::sync::MutexGuard<'_, DemuxPacketCacheState>> {
+        self.try_lock_state_with_timing(lock_wait).0
+    }
+
+    fn try_lock_state_with_timing(
+        &self,
+        lock_wait: DemuxCacheLockWait,
+    ) -> (
+        Option<std::sync::MutexGuard<'_, DemuxPacketCacheState>>,
+        DemuxPacketCacheReadTiming,
+    ) {
+        let started_at = Instant::now();
+        let mut timing = DemuxPacketCacheReadTiming::default();
         match lock_wait {
-            DemuxCacheLockWait::None => self.try_lock_state_once(),
+            DemuxCacheLockWait::None => {
+                let guard = self.try_lock_state_once(&mut timing);
+                timing.lock_wait = started_at.elapsed();
+                if guard.is_none() {
+                    timing.lock_timed_out = true;
+                }
+                (guard, timing)
+            }
             DemuxCacheLockWait::Bounded(lock_wait) => {
                 let deadline = Instant::now().checked_add(lock_wait);
                 loop {
-                    if let Some(guard) = self.try_lock_state_once() {
-                        return Some(guard);
+                    if let Some(guard) = self.try_lock_state_once(&mut timing) {
+                        timing.lock_wait = started_at.elapsed();
+                        return (Some(guard), timing);
                     }
                     if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
-                        return None;
+                        timing.lock_wait = started_at.elapsed();
+                        timing.lock_timed_out = true;
+                        return (None, timing);
                     }
                     thread::yield_now();
                 }
@@ -615,10 +775,16 @@ impl DemuxPacketCache {
         }
     }
 
-    fn try_lock_state_once(&self) -> Option<std::sync::MutexGuard<'_, DemuxPacketCacheState>> {
+    fn try_lock_state_once(
+        &self,
+        timing: &mut DemuxPacketCacheReadTiming,
+    ) -> Option<std::sync::MutexGuard<'_, DemuxPacketCacheState>> {
         match self.shared.state.try_lock() {
             Ok(guard) => Some(guard),
-            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                timing.try_lock_failures = timing.try_lock_failures.saturating_add(1);
+                None
+            }
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 panic!("FFmpeg demux packet cache poisoned")
             }
@@ -658,6 +824,8 @@ impl DemuxPacketCache {
                 let cache_state = guard.playback_cache_state(self.shared.control.is_cache_paused());
                 let buffered_changed = guard.take_buffered_changed_for_cache_state(&cache_state);
                 guard.record_cache_state_emit(Instant::now());
+                guard.record_emitted_cache_state(&cache_state);
+                self.shared.refresh_monitor_snapshot(&guard);
                 (
                     DemuxSeekResult::Cached,
                     false,
@@ -678,6 +846,8 @@ impl DemuxPacketCache {
                 let cache_state = guard.playback_cache_state(self.shared.control.is_cache_paused());
                 let buffered_changed = guard.take_buffered_changed_for_cache_state(&cache_state);
                 guard.record_cache_state_emit(Instant::now());
+                guard.record_emitted_cache_state(&cache_state);
+                self.shared.refresh_monitor_snapshot(&guard);
                 (
                     DemuxSeekResult::Requested,
                     guard.cache_pause_initial,
@@ -810,6 +980,115 @@ fn demux_cache_blocked_on(state: &DemuxPacketCacheState, cache_paused: bool) -> 
     }
 }
 
+fn log_demux_packet_append_timing(
+    session_id: PlaybackSessionId,
+    packet_stream_index: c_int,
+    packet_bytes: usize,
+    outcome: DemuxPacketAppendOutcome,
+    cache_pause_changed: bool,
+) {
+    let timing = outcome.timing;
+    let append_other = timing
+        .lock_hold
+        .saturating_sub(timing.disk_write)
+        .saturating_sub(timing.trim)
+        .saturating_sub(timing.emit_state);
+    let append_other_measured = [
+        timing.record_input_bytes,
+        timing.skip_resume_overlap,
+        timing.packet_index,
+        timing.queue_insert,
+        timing.maybe_start_reader_head,
+        timing.refresh_readahead_hysteresis,
+        timing.should_pause_demux,
+        timing.refresh_cache_pause,
+        timing.notify,
+    ]
+    .into_iter()
+    .fold(Duration::default(), |total, elapsed| {
+        total.saturating_add(elapsed)
+    });
+    let append_other_untracked = append_other.saturating_sub(append_other_measured);
+    tracing::trace!(
+        session_id = ?session_id,
+        stream_index = packet_stream_index,
+        packet_bytes,
+        appended = outcome.appended,
+        force_cache_state_report = outcome.force_cache_state_report,
+        cache_pause_changed,
+        append_lock_wait_ms = timing.lock_wait.as_secs_f64() * 1000.0,
+        append_lock_hold_ms = timing.lock_hold.as_secs_f64() * 1000.0,
+        append_disk_write_ms = timing.disk_write.as_secs_f64() * 1000.0,
+        append_trim_ms = timing.trim.as_secs_f64() * 1000.0,
+        append_emit_state_ms = timing.emit_state.as_secs_f64() * 1000.0,
+        append_other_ms = append_other.as_secs_f64() * 1000.0,
+        append_record_input_bytes_ms = timing.record_input_bytes.as_secs_f64() * 1000.0,
+        append_skip_resume_overlap_ms = timing.skip_resume_overlap.as_secs_f64() * 1000.0,
+        append_packet_index_ms = timing.packet_index.as_secs_f64() * 1000.0,
+        append_queue_insert_ms = timing.queue_insert.as_secs_f64() * 1000.0,
+        append_maybe_start_reader_head_ms =
+            timing.maybe_start_reader_head.as_secs_f64() * 1000.0,
+        append_refresh_readahead_hysteresis_ms =
+            timing.refresh_readahead_hysteresis.as_secs_f64() * 1000.0,
+        append_should_pause_demux_ms = timing.should_pause_demux.as_secs_f64() * 1000.0,
+        append_refresh_cache_pause_ms = timing.refresh_cache_pause.as_secs_f64() * 1000.0,
+        append_notify_ms = timing.notify.as_secs_f64() * 1000.0,
+        append_other_untracked_ms = append_other_untracked.as_secs_f64() * 1000.0,
+        "FFmpeg demux packet append timing"
+    );
+    if !demux_packet_append_timing_should_log(timing) {
+        return;
+    }
+    tracing::debug!(
+        session_id = ?session_id,
+        stream_index = packet_stream_index,
+        packet_bytes,
+        appended = outcome.appended,
+        force_cache_state_report = outcome.force_cache_state_report,
+        cache_pause_changed,
+        append_lock_wait_ms = timing.lock_wait.as_secs_f64() * 1000.0,
+        append_lock_hold_ms = timing.lock_hold.as_secs_f64() * 1000.0,
+        append_disk_write_ms = timing.disk_write.as_secs_f64() * 1000.0,
+        append_trim_ms = timing.trim.as_secs_f64() * 1000.0,
+        append_emit_state_ms = timing.emit_state.as_secs_f64() * 1000.0,
+        append_other_ms = append_other.as_secs_f64() * 1000.0,
+        append_record_input_bytes_ms = timing.record_input_bytes.as_secs_f64() * 1000.0,
+        append_skip_resume_overlap_ms = timing.skip_resume_overlap.as_secs_f64() * 1000.0,
+        append_packet_index_ms = timing.packet_index.as_secs_f64() * 1000.0,
+        append_queue_insert_ms = timing.queue_insert.as_secs_f64() * 1000.0,
+        append_maybe_start_reader_head_ms =
+            timing.maybe_start_reader_head.as_secs_f64() * 1000.0,
+        append_refresh_readahead_hysteresis_ms =
+            timing.refresh_readahead_hysteresis.as_secs_f64() * 1000.0,
+        append_should_pause_demux_ms = timing.should_pause_demux.as_secs_f64() * 1000.0,
+        append_refresh_cache_pause_ms = timing.refresh_cache_pause.as_secs_f64() * 1000.0,
+        append_notify_ms = timing.notify.as_secs_f64() * 1000.0,
+        append_other_untracked_ms = append_other_untracked.as_secs_f64() * 1000.0,
+        "FFmpeg demux packet append completed slowly"
+    );
+}
+
+fn demux_packet_append_timing_should_log(timing: DemuxPacketAppendTiming) -> bool {
+    [
+        timing.lock_wait,
+        timing.lock_hold,
+        timing.disk_write,
+        timing.trim,
+        timing.emit_state,
+        timing.record_input_bytes,
+        timing.skip_resume_overlap,
+        timing.packet_index,
+        timing.queue_insert,
+        timing.maybe_start_reader_head,
+        timing.refresh_readahead_hysteresis,
+        timing.should_pause_demux,
+        timing.refresh_cache_pause,
+        timing.notify,
+    ]
+    .into_iter()
+    .any(|elapsed| elapsed >= DEMUX_PACKET_APPEND_TIMING_LOG_AFTER)
+}
+
 impl Drop for DemuxPacketCache {
     fn drop(&mut self) {
         self.shutdown();
@@ -895,6 +1174,7 @@ impl DemuxPacketCacheState {
             input_rate_samples: VecDeque::new(),
             last_reported_buffered_until: None,
             last_cache_state_emit_at: None,
+            last_emitted_cache_state: None,
             generation: 0,
             error: None,
             shutdown: false,
@@ -946,37 +1226,61 @@ impl DemuxPacketCacheState {
     }
 
     fn append_packet(&mut self, mut packet: CachedDemuxPacket) -> DemuxPacketAppendOutcome {
+        let mut timing = DemuxPacketAppendTiming::default();
+        let record_input_started_at = Instant::now();
         self.record_input_bytes(packet.byte_len);
+        timing.record_input_bytes += record_input_started_at.elapsed();
         if let Some(demux_ts_nsecs) = packet.start_nsecs.or(packet.end_nsecs) {
             self.demux_ts_nsecs = Some(demux_ts_nsecs);
         }
+        let skip_resume_started_at = Instant::now();
         if self.should_skip_resume_overlap_packet(&packet) {
+            timing.skip_resume_overlap += skip_resume_started_at.elapsed();
             return DemuxPacketAppendOutcome {
                 appended: false,
                 force_cache_state_report: false,
+                timing,
             };
         }
+        timing.skip_resume_overlap += skip_resume_started_at.elapsed();
+        let packet_index_started_at = Instant::now();
         let packet_id = self.next_packet_id;
         self.next_packet_id = self.next_packet_id.saturating_add(1);
         let stream_index = packet.stream_index;
+        timing.packet_index += packet_index_started_at.elapsed();
         if self.disk_cache_writable
             && let Some(disk_cache) = self.disk_cache.as_mut()
-            && let Err(error) = packet.spill_to_disk(disk_cache)
         {
-            tracing::warn!(%error, "pausing FFmpeg demux packet disk cache writes");
-            self.disk_cache_writable = false;
+            let disk_write_started_at = Instant::now();
+            if let Err(error) = packet.spill_to_disk(disk_cache) {
+                tracing::warn!(%error, "pausing FFmpeg demux packet disk cache writes");
+                self.disk_cache_writable = false;
+            }
+            timing.disk_write += disk_write_started_at.elapsed();
         }
         let cleared_seek = self.seeking;
+        let queue_insert_started_at = Instant::now();
         self.cached_bytes = self.cached_bytes.saturating_add(packet.byte_len);
         self.append_packet_id_to_append_range(packet_id, stream_index);
         self.packets.insert(packet_id, packet);
+        timing.queue_insert += queue_insert_started_at.elapsed();
+        let maybe_start_reader_head_started_at = Instant::now();
         self.maybe_start_reader_head_for_appended_packet(packet_id, stream_index);
+        timing.maybe_start_reader_head += maybe_start_reader_head_started_at.elapsed();
         self.seeking = false;
+        let trim_started_at = Instant::now();
         let pruned = self.trim_to_limit();
+        timing.trim += trim_started_at.elapsed();
+        let hysteresis_started_at = Instant::now();
         self.refresh_readahead_hysteresis();
+        timing.refresh_readahead_hysteresis += hysteresis_started_at.elapsed();
+        let should_pause_started_at = Instant::now();
+        let should_pause_demux = self.should_pause_demux();
+        timing.should_pause_demux += should_pause_started_at.elapsed();
         DemuxPacketAppendOutcome {
             appended: true,
-            force_cache_state_report: cleared_seek || pruned || self.should_pause_demux(),
+            force_cache_state_report: cleared_seek || pruned || should_pause_demux,
+            timing,
         }
     }
 
@@ -1056,11 +1360,15 @@ impl DemuxPacketCacheState {
         false
     }
 
-    fn packet_ref(&self, packet_id: u64) -> std::result::Result<AvPacket, String> {
+    fn packet_read_source(
+        &self,
+        packet_id: u64,
+        stream_offset: usize,
+    ) -> std::result::Result<DemuxPacketReadSource, String> {
         let Some(packet) = self.packets.get(&packet_id) else {
             return Err("FFmpeg demux packet cache entry missing".to_string());
         };
-        packet.packet_ref(self.disk_cache.as_ref())
+        packet.read_source(self.disk_cache.as_ref(), stream_offset)
     }
 
     fn packet_end_nsecs(&self, packet_id: u64) -> Option<u64> {
@@ -1072,29 +1380,24 @@ impl DemuxPacketCacheState {
     fn take_packet_round_robin(
         &mut self,
         stream_indices: &[c_int],
-    ) -> std::result::Result<Option<(AvPacket, usize)>, String> {
+    ) -> std::result::Result<Option<DemuxPacketReadSource>, String> {
         for (stream_offset, stream_index) in stream_indices.iter().copied().enumerate() {
             let Some(packet_id) = self.next_packet_id_for_stream(stream_index) else {
                 continue;
             };
-            let packet = self.packet_ref(packet_id)?;
+            let packet = self.packet_read_source(packet_id, stream_offset)?;
             if let Some(end_nsecs) = self.packet_end_nsecs(packet_id) {
                 self.reader_nsecs = self.reader_nsecs.max(end_nsecs);
             }
             self.consume_packet_id(packet_id);
-            return Ok(Some((packet, stream_offset)));
+            return Ok(Some(packet));
         }
         Ok(None)
     }
 
     fn next_packet_id_for_stream(&self, stream_index: c_int) -> Option<PacketId> {
         let packet_id = self.reader_heads.get(&stream_index).copied()?;
-        self.read_range()
-            .stream_queues
-            .get(&stream_index)
-            .is_some_and(|queue| queue.iter().any(|candidate| *candidate == packet_id))
-            .then_some(packet_id)
-            .filter(|packet_id| self.packets.contains_key(packet_id))
+        self.packets.contains_key(&packet_id).then_some(packet_id)
     }
 
     fn consume_packet_id(&mut self, packet_id: PacketId) {
@@ -1304,21 +1607,8 @@ impl DemuxPacketCacheState {
         let Some(packet) = self.packets.get(&packet_id) else {
             return false;
         };
-        let Some(reader_head) = self.reader_heads.get(&packet.stream_index).copied() else {
-            return false;
-        };
-        let Some(queue) = self.read_range().stream_queues.get(&packet.stream_index) else {
-            return false;
-        };
-        queue
-            .iter()
-            .position(|candidate| *candidate == packet_id)
-            .is_some_and(|packet_position| {
-                queue
-                    .iter()
-                    .position(|candidate| *candidate == reader_head)
-                    .is_some_and(|reader_position| packet_position >= reader_position)
-            })
+        self.reader_heads.contains_key(&packet.stream_index)
+            && !self.consumed_packet_ids.contains(&packet_id)
     }
 
     fn stream_packet_queue_limit(&self, stream_index: c_int) -> usize {
@@ -2247,6 +2537,45 @@ impl DemuxPacketCacheState {
         }
     }
 
+    fn playback_cache_state_for_hot_append(&self, paused_for_cache: bool) -> PlaybackCacheState {
+        let Some(mut cache_state) = self.last_emitted_cache_state.clone() else {
+            return self.playback_cache_state(paused_for_cache);
+        };
+
+        let forward_window = self.selected_forward_timeline_window();
+        let cached_until_nsecs = forward_window
+            .is_none()
+            .then(|| self.cached_until_nsecs())
+            .flatten();
+        cache_state.demux.cache_end = forward_window
+            .map(|window| window.end_nsecs)
+            .or(cached_until_nsecs)
+            .map(nsecs_to_seconds);
+        cache_state.demux.reader_pts = Some(nsecs_to_seconds(
+            forward_window
+                .map(|window| window.reader_nsecs)
+                .unwrap_or(self.reader_nsecs),
+        ));
+        cache_state.demux.cache_duration = forward_window
+            .map(|window| nsecs_to_seconds(window.duration_nsecs()))
+            .or_else(|| ordered_duration_seconds(Some(self.reader_nsecs), cached_until_nsecs));
+        cache_state.demux.eof = self.effective_eof();
+        cache_state.demux.underrun = self.has_demux_underrun();
+        cache_state.demux.idle = self.effective_eof() || self.should_pause_demux();
+        cache_state.demux.seeking = self.seeking || self.seek_request.is_some();
+        cache_state.demux.total_bytes = u64::try_from(self.cached_bytes).unwrap_or(u64::MAX);
+        cache_state.demux.forward_bytes = u64::try_from(self.forward_bytes()).unwrap_or(u64::MAX);
+        cache_state.demux.file_cache_bytes =
+            self.disk_cache.as_ref().map(|cache| cache.next_offset);
+        cache_state.demux.raw_input_rate = self.raw_input_rate();
+        cache_state.demux.ts_last = self.demux_ts_nsecs.map(nsecs_to_seconds);
+        cache_state.demux.cached_seeks = self.cached_seeks;
+        cache_state.demux.low_level_seeks = self.low_level_seeks;
+        cache_state.paused_for_cache = paused_for_cache;
+        cache_state.buffering_percent = self.cache_buffering_percent;
+        cache_state
+    }
+
     fn take_buffered_changed_for_cache_state(
         &mut self,
         cache_state: &PlaybackCacheState,
@@ -2271,6 +2600,10 @@ impl DemuxPacketCacheState {
 
     fn record_cache_state_emit(&mut self, now: Instant) {
         self.last_cache_state_emit_at = Some(now);
+    }
+
+    fn record_emitted_cache_state(&mut self, cache_state: &PlaybackCacheState) {
+        self.last_emitted_cache_state = Some(cache_state.clone());
     }
 
     fn forward_bytes(&self) -> usize {
@@ -3219,6 +3552,40 @@ impl SeekableTimelineSegment {
     }
 }
 
+impl DemuxPacketReadSource {
+    fn packet_ref(
+        self,
+        timing: &mut DemuxPacketCacheReadTiming,
+    ) -> std::result::Result<(AvPacket, usize), String> {
+        let started_at = Instant::now();
+        let packet = match self.payload {
+            DemuxPacketReadPayload::Memory(packet) => {
+                let packet = packet
+                    .lock()
+                    .map_err(|_| "FFmpeg demux packet cache packet lock poisoned".to_string())?;
+                AvPacket::ref_from(&packet)?
+            }
+            DemuxPacketReadPayload::Disk {
+                file,
+                props,
+                offset,
+                len,
+            } => {
+                let disk_read_started_at = Instant::now();
+                let data = read_demux_packet_disk_payload(&file, offset, len)?;
+                timing.disk_read += disk_read_started_at.elapsed();
+                timing.disk_reads = timing.disk_reads.saturating_add(1);
+                let props = props
+                    .lock()
+                    .map_err(|_| "FFmpeg demux packet cache packet lock poisoned".to_string())?;
+                AvPacket::from_data_and_props(&data, &props)?
+            }
+        };
+        timing.packet_ref += started_at.elapsed();
+        Ok((packet, self.stream_offset))
+    }
+}
+
 impl CachedDemuxPacket {
     fn from_packet(
         packet: &AvPacket,
@@ -3229,7 +3596,9 @@ impl CachedDemuxPacket {
         end_nsecs: Option<u64>,
     ) -> std::result::Result<Self, String> {
         Ok(Self {
-            payload: CachedDemuxPacketPayload::Memory(AvPacket::ref_from(packet)?),
+            payload: CachedDemuxPacketPayload::Memory(Arc::new(Mutex::new(AvPacket::ref_from(
+                packet,
+            )?))),
             stream_index,
             timeline_anchor,
             recovery_point,
@@ -3239,38 +3608,66 @@ impl CachedDemuxPacket {
         })
     }
 
+    #[cfg(test)]
     fn packet_ref(
         &self,
         disk_cache: Option<&DemuxPacketDiskCache>,
     ) -> std::result::Result<AvPacket, String> {
-        match &self.payload {
-            CachedDemuxPacketPayload::Memory(packet) => AvPacket::ref_from(packet),
+        let mut timing = DemuxPacketCacheReadTiming::default();
+        self.read_source(disk_cache, 0)?
+            .packet_ref(&mut timing)
+            .map(|(packet, _)| packet)
+    }
+
+    fn read_source(
+        &self,
+        disk_cache: Option<&DemuxPacketDiskCache>,
+        stream_offset: usize,
+    ) -> std::result::Result<DemuxPacketReadSource, String> {
+        let payload = match &self.payload {
+            CachedDemuxPacketPayload::Memory(packet) => {
+                DemuxPacketReadPayload::Memory(Arc::clone(packet))
+            }
             CachedDemuxPacketPayload::Disk { props, offset, len } => {
                 let disk_cache = disk_cache
                     .ok_or_else(|| "FFmpeg demux packet disk cache unavailable".to_string())?;
-                disk_cache.read_packet(*offset, *len, props)
+                DemuxPacketReadPayload::Disk {
+                    file: Arc::clone(&disk_cache.file),
+                    props: Arc::clone(props),
+                    offset: *offset,
+                    len: *len,
+                }
             }
-        }
+        };
+        Ok(DemuxPacketReadSource {
+            stream_offset,
+            payload,
+        })
     }
 
     fn spill_to_disk(
         &mut self,
         disk_cache: &mut DemuxPacketDiskCache,
     ) -> std::result::Result<(), String> {
-        let CachedDemuxPacketPayload::Memory(packet) = &self.payload else {
-            return Ok(());
+        let packet = match &self.payload {
+            CachedDemuxPacketPayload::Memory(packet) => Arc::clone(packet),
+            CachedDemuxPacketPayload::Disk { .. } => return Ok(()),
         };
-        let Some(data) = packet.data() else {
-            return Ok(());
+        let (data, props) = {
+            let packet = packet
+                .lock()
+                .map_err(|_| "FFmpeg demux packet cache packet lock poisoned".to_string())?;
+            let Some(data) = packet.data() else {
+                return Ok(());
+            };
+            if data.is_empty() {
+                return Ok(());
+            }
+            (data.to_vec(), AvPacket::props_from(&packet)?)
         };
-        if data.is_empty() {
-            return Ok(());
-        }
-        let data = data.to_vec();
-        let props = AvPacket::props_from(packet)?;
         let offset = disk_cache.write_packet(&data)?;
         self.payload = CachedDemuxPacketPayload::Disk {
-            props,
+            props: Arc::new(Mutex::new(props)),
             offset,
             len: data.len(),
         };
@@ -3338,7 +3735,7 @@ impl DemuxPacketDiskCache {
             }
         }
         Some(Self {
-            file,
+            file: Arc::new(file),
             path,
             next_offset: 0,
             max_bytes,
@@ -3371,26 +3768,35 @@ impl DemuxPacketDiskCache {
         Ok(offset)
     }
 
+    #[cfg(test)]
     fn read_packet(
         &self,
         offset: u64,
         len: usize,
         props: &AvPacket,
     ) -> std::result::Result<AvPacket, String> {
-        let mut data = vec![0; len];
-        let mut read = 0;
-        while read < data.len() {
-            let read_now = self
-                .file
-                .read_at(&mut data[read..], offset.saturating_add(read as u64))
-                .map_err(|error| format!("读取 FFmpeg demux packet disk cache 失败：{error}"))?;
-            if read_now == 0 {
-                return Err("读取 FFmpeg demux packet disk cache 返回 0 字节".to_string());
-            }
-            read += read_now;
-        }
+        let data = read_demux_packet_disk_payload(&self.file, offset, len)?;
         AvPacket::from_data_and_props(&data, props)
     }
+}
+
+fn read_demux_packet_disk_payload(
+    file: &File,
+    offset: u64,
+    len: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut data = vec![0; len];
+    let mut read = 0;
+    while read < data.len() {
+        let read_now = file
+            .read_at(&mut data[read..], offset.saturating_add(read as u64))
+            .map_err(|error| format!("读取 FFmpeg demux packet disk cache 失败：{error}"))?;
+        if read_now == 0 {
+            return Err("读取 FFmpeg demux packet disk cache 返回 0 字节".to_string());
+        }
+        read += read_now;
+    }
+    Ok(data)
 }
 
 impl Drop for DemuxPacketDiskCache {
@@ -3781,6 +4187,24 @@ impl DemuxPacketCacheShared {
         })
     }
 
+    fn cached_monitor_snapshot(&self) -> DemuxPacketCacheMonitorSnapshot {
+        self.monitor_snapshot
+            .lock()
+            .expect("FFmpeg demux packet cache monitor snapshot poisoned")
+            .clone()
+    }
+
+    fn store_monitor_snapshot(&self, snapshot: DemuxPacketCacheMonitorSnapshot) {
+        *self
+            .monitor_snapshot
+            .lock()
+            .expect("FFmpeg demux packet cache monitor snapshot poisoned") = snapshot;
+    }
+
+    fn refresh_monitor_snapshot(&self, state: &DemuxPacketCacheState) {
+        self.store_monitor_snapshot(DemuxPacketCacheMonitorSnapshot::from_state(state));
+    }
+
     fn log_slow_demux_read(&self, elapsed: Duration, read_result: c_int) {
         let guard = self
             .state
@@ -3820,26 +4244,64 @@ impl DemuxPacketCacheShared {
         }
     }
 
-    fn emit_cache_state(&self, guard: &mut DemuxPacketCacheState) {
+    fn send_cache_state_emit(&self, emit: CacheStateEmit) {
+        self.send_cache_state_events(emit.session_id, emit.cache_state, emit.buffered_changed);
+    }
+
+    fn prepare_cache_state_emit(
+        &self,
+        guard: &mut DemuxPacketCacheState,
+        now: Instant,
+    ) -> CacheStateEmit {
         let cache_state = guard.playback_cache_state(self.control.is_cache_paused());
         let buffered_changed = guard.take_buffered_changed_for_cache_state(&cache_state);
-        guard.record_cache_state_emit(Instant::now());
-        self.send_cache_state_events(guard.session_id, cache_state, buffered_changed);
+        guard.record_cache_state_emit(now);
+        guard.record_emitted_cache_state(&cache_state);
+        self.refresh_monitor_snapshot(guard);
+        CacheStateEmit {
+            session_id: guard.session_id,
+            cache_state,
+            buffered_changed,
+        }
+    }
+
+    fn prepare_hot_append_cache_state_emit(
+        &self,
+        guard: &mut DemuxPacketCacheState,
+        now: Instant,
+    ) -> CacheStateEmit {
+        let cache_state = guard.playback_cache_state_for_hot_append(self.control.is_cache_paused());
+        let buffered_changed = guard.take_buffered_changed_for_cache_state(&cache_state);
+        guard.record_cache_state_emit(now);
+        guard.record_emitted_cache_state(&cache_state);
+        CacheStateEmit {
+            session_id: guard.session_id,
+            cache_state,
+            buffered_changed,
+        }
+    }
+
+    fn emit_cache_state(&self, guard: &mut DemuxPacketCacheState) {
+        let emit = self.prepare_cache_state_emit(guard, Instant::now());
+        self.send_cache_state_emit(emit);
     }
 
     fn emit_cache_state_after_append(
         &self,
         guard: &mut DemuxPacketCacheState,
         outcome: DemuxPacketAppendOutcome,
-    ) {
+    ) -> Option<CacheStateEmit> {
         let now = Instant::now();
-        if !outcome.force_cache_state_report && !guard.cache_state_report_due(now) {
-            return;
+        let first_report = guard.last_cache_state_emit_at.is_none();
+        // Ordinary append ticks are hot; leave interval-based full state reports to read/seek paths.
+        if !outcome.force_cache_state_report && !first_report {
+            return None;
         }
-        let cache_state = guard.playback_cache_state(self.control.is_cache_paused());
-        let buffered_changed = guard.take_buffered_changed_for_cache_state(&cache_state);
-        guard.record_cache_state_emit(now);
-        self.send_cache_state_events(guard.session_id, cache_state, buffered_changed);
+        if outcome.force_cache_state_report && !first_report {
+            Some(self.prepare_hot_append_cache_state_emit(guard, now))
+        } else {
+            Some(self.prepare_cache_state_emit(guard, now))
+        }
     }
 
     fn emit_cache_state_after_read(&self, guard: &mut DemuxPacketCacheState, force: bool) {
@@ -3847,10 +4309,8 @@ impl DemuxPacketCacheShared {
         if !force && !guard.cache_state_report_due(now) {
             return;
         }
-        let cache_state = guard.playback_cache_state(self.control.is_cache_paused());
-        let buffered_changed = guard.take_buffered_changed_for_cache_state(&cache_state);
-        guard.record_cache_state_emit(now);
-        self.send_cache_state_events(guard.session_id, cache_state, buffered_changed);
+        let emit = self.prepare_cache_state_emit(guard, now);
+        self.send_cache_state_emit(emit);
     }
 
     fn enter_initial_cache_pause_if_needed(&self) {
@@ -3872,12 +4332,12 @@ impl DemuxPacketCacheShared {
         if !cache_pause_signal || !guard.cache_pause_can_enter(true) {
             return;
         }
-        if self.enter_cache_pause(guard) {
+        if self.enter_cache_pause(guard).force_cache_state_report {
             self.emit_cache_state(guard);
         }
     }
 
-    fn enter_cache_pause(&self, guard: &mut DemuxPacketCacheState) -> bool {
+    fn enter_cache_pause(&self, guard: &mut DemuxPacketCacheState) -> CachePauseRefresh {
         let changed = self.control.set_cache_paused(true);
         let percent = guard.cache_pause_percent();
         if changed {
@@ -3906,7 +4366,6 @@ impl DemuxPacketCacheShared {
                 BackendEventKind::PausedForCacheChanged(true),
             ));
         }
-        let percent_changed = guard.cache_buffering_percent != percent;
         if guard.cache_buffering_percent != percent {
             guard.cache_buffering_percent = percent;
             let _ = self.event_tx.send(BackendEvent::new(
@@ -3920,10 +4379,12 @@ impl DemuxPacketCacheShared {
                 BackendEventKind::Pause(self.control.is_paused()),
             ));
         }
-        changed || percent_changed
+        CachePauseRefresh {
+            force_cache_state_report: changed,
+        }
     }
 
-    fn refresh_cache_pause(&self, guard: &mut DemuxPacketCacheState) -> bool {
+    fn refresh_cache_pause(&self, guard: &mut DemuxPacketCacheState) -> CachePauseRefresh {
         if !self.control.is_cache_paused() {
             if guard.cache_buffering_percent.is_some() {
                 guard.cache_buffering_percent = None;
@@ -3931,9 +4392,11 @@ impl DemuxPacketCacheShared {
                     guard.session_id,
                     BackendEventKind::CacheBufferingChanged(None),
                 ));
-                return true;
+                return CachePauseRefresh {
+                    force_cache_state_report: true,
+                };
             }
-            return false;
+            return CachePauseRefresh::default();
         }
 
         if guard.cache_pause_recovered() {
@@ -3974,7 +4437,9 @@ impl DemuxPacketCacheShared {
                     BackendEventKind::Pause(self.control.is_paused()),
                 ));
             }
-            return had_percent || changed;
+            return CachePauseRefresh {
+                force_cache_state_report: had_percent || changed,
+            };
         }
 
         let percent = guard.cache_pause_percent();
@@ -3984,9 +4449,8 @@ impl DemuxPacketCacheShared {
                 guard.session_id,
                 BackendEventKind::CacheBufferingChanged(percent),
             ));
-            return true;
         }
-        false
+        CachePauseRefresh::default()
     }
 
     fn should_skip_seek_request(&self, request: &DemuxSeekRequest) -> bool {
@@ -4113,19 +4577,45 @@ impl DemuxPacketCacheShared {
     }
 
     fn append_packet(&self, packet: CachedDemuxPacket) {
+        let packet_stream_index = packet.stream_index;
+        let packet_bytes = packet.byte_len;
+        let lock_wait_started_at = Instant::now();
         let mut guard = self
             .state
             .lock()
             .expect("FFmpeg demux packet cache poisoned");
+        let append_lock_wait = lock_wait_started_at.elapsed();
+        let append_lock_hold_started_at = Instant::now();
+        let session_id = guard.session_id;
         let mut append_outcome = guard.append_packet(packet);
-        let cache_pause_changed = self.refresh_cache_pause(&mut guard);
+        append_outcome.timing.lock_wait = append_lock_wait;
+        let refresh_cache_pause_started_at = Instant::now();
+        let cache_pause_refresh = self.refresh_cache_pause(&mut guard);
+        append_outcome.timing.refresh_cache_pause += refresh_cache_pause_started_at.elapsed();
+        let emit_state_started_at = Instant::now();
+        let mut cache_state_emit = None;
         if append_outcome.appended {
-            append_outcome.force_cache_state_report |= cache_pause_changed;
-            self.emit_cache_state_after_append(&mut guard, append_outcome);
-        } else if cache_pause_changed {
-            self.emit_cache_state(&mut guard);
+            append_outcome.force_cache_state_report |= cache_pause_refresh.force_cache_state_report;
+            cache_state_emit = self.emit_cache_state_after_append(&mut guard, append_outcome);
+        } else if cache_pause_refresh.force_cache_state_report {
+            cache_state_emit = Some(self.prepare_cache_state_emit(&mut guard, Instant::now()));
         }
+        append_outcome.timing.emit_state += emit_state_started_at.elapsed();
+        let notify_started_at = Instant::now();
         self.ready.notify_all();
+        append_outcome.timing.notify += notify_started_at.elapsed();
+        append_outcome.timing.lock_hold = append_lock_hold_started_at.elapsed();
+        drop(guard);
+        if let Some(emit) = cache_state_emit {
+            self.send_cache_state_emit(emit);
+        }
+        log_demux_packet_append_timing(
+            session_id,
+            packet_stream_index,
+            packet_bytes,
+            append_outcome,
+            cache_pause_refresh.force_cache_state_report,
+        );
     }
 
     fn mark_eof(&self) {
@@ -4204,7 +4694,7 @@ mod tests {
             (*packet.as_mut_ptr()).stream_index = stream_index;
         }
         CachedDemuxPacket {
-            payload: CachedDemuxPacketPayload::Memory(packet),
+            payload: CachedDemuxPacketPayload::Memory(Arc::new(Mutex::new(packet))),
             stream_index,
             timeline_anchor,
             recovery_point: keyframe,
@@ -4244,14 +4734,17 @@ mod tests {
         cache_config: PlaybackCacheConfig,
     ) -> (DemuxPacketCacheShared, Receiver<BackendEvent>) {
         let (event_tx, event_rx) = mpsc::channel();
+        let state = DemuxPacketCacheState::new(
+            0,
+            0,
+            ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+            PlaybackSessionId(1),
+            cache_config,
+        );
+        let monitor_snapshot = DemuxPacketCacheMonitorSnapshot::from_state(&state);
         let shared = DemuxPacketCacheShared {
-            state: Mutex::new(DemuxPacketCacheState::new(
-                0,
-                0,
-                ffi::AVCodecID::AV_CODEC_ID_MPEG4,
-                PlaybackSessionId(1),
-                cache_config,
-            )),
+            state: Mutex::new(state),
+            monitor_snapshot: Mutex::new(monitor_snapshot),
             ready: Condvar::new(),
             control,
             event_tx,
@@ -4796,7 +5289,7 @@ mod tests {
         shared.append_packet(cached_anchor(1_000_000_000, 1_020_000_000));
         let events = event_rx.try_iter().collect::<Vec<_>>();
         assert!(
-            events
+            !events
                 .iter()
                 .any(|event| matches!(&event.kind, BackendEventKind::CacheStateChanged(_)))
         );
@@ -4808,7 +5301,7 @@ mod tests {
     }
 
     #[test]
-    fn demux_packet_cache_throttles_continuous_append_cache_state_events() {
+    fn demux_packet_cache_skips_nonforced_append_cache_state_when_report_due() {
         let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
         let mut config = cache_config_for_test();
         config.demuxer_readahead_secs = 10.0;
@@ -4839,9 +5332,44 @@ mod tests {
         }
         shared.append_packet(cached_anchor(2_000_000_000, 3_000_000_000));
         assert!(
-            event_rx
+            !event_rx
                 .try_iter()
                 .any(|event| matches!(event.kind, BackendEventKind::CacheStateChanged(_)))
+        );
+    }
+
+    #[test]
+    fn demux_packet_cache_append_percent_change_does_not_force_cache_state() {
+        let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+        let mut config = cache_config_for_test();
+        config.cache_pause = true;
+        config.cache_pause_wait = 10.0;
+        config.demuxer_readahead_secs = 20.0;
+        let (shared, event_rx) = shared_with_config_for_test(control, config);
+
+        {
+            let mut guard = shared
+                .state
+                .lock()
+                .expect("FFmpeg demux packet cache poisoned");
+            shared.enter_cache_pause(&mut guard);
+            guard.last_cache_state_emit_at = Some(Instant::now());
+        }
+        let _ = event_rx.try_iter().collect::<Vec<_>>();
+
+        shared.append_packet(cached_anchor(0, 1_000_000_000));
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                BackendEventKind::CacheBufferingChanged(Some(10))
+            )
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(&event.kind, BackendEventKind::CacheStateChanged(_)))
         );
     }
 
@@ -6308,6 +6836,47 @@ mod tests {
                 end: 3.0,
             }]
         );
+    }
+
+    #[test]
+    fn demux_packet_cache_state_materializes_disk_packet_after_reader_advance() {
+        let temp_dir = tempfile::tempdir().expect("temp dir creates");
+        let mut config = cache_config_for_test();
+        config.disk_cache = true;
+        config.cache_dir = Some(temp_dir.path().to_path_buf());
+        config.unlink_files = CacheUnlinkPolicy::Never;
+        let mut packet = AvPacket::from_data_and_props(
+            b"packet-payload",
+            &AvPacket::new().expect("packet allocates"),
+        )
+        .expect("packet has data");
+        unsafe {
+            (*packet.as_mut_ptr()).stream_index = 0;
+        }
+        let cached =
+            CachedDemuxPacket::from_packet(&packet, 0, true, true, Some(0), Some(1_000_000_000))
+                .expect("packet caches");
+        let mut state = DemuxPacketCacheState::new(
+            0,
+            0,
+            ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+            PlaybackSessionId(1),
+            config,
+        );
+        state.append_packet(cached);
+        let mut timing = DemuxPacketCacheReadTiming::default();
+
+        let source = state
+            .take_packet_round_robin(&[0])
+            .expect("packet source reads")
+            .expect("packet source exists");
+
+        assert_eq!(state.read_index, 1);
+        drop(state);
+        let (restored, stream_offset) = source.packet_ref(&mut timing).expect("packet restores");
+        assert_eq!(stream_offset, 0);
+        assert_eq!(restored.data(), Some(&b"packet-payload"[..]));
+        assert_eq!(timing.disk_reads, 1);
     }
 
     #[test]

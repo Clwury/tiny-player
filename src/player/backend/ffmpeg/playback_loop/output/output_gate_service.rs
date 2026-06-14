@@ -53,8 +53,13 @@ pub(super) struct OutputGateServiceContext<'a> {
 fn service_output_gate_or_wait(
     mut context: OutputGateServiceContext<'_>,
 ) -> std::result::Result<OutputGateServiceStatus, String> {
+    let started_at = Instant::now();
+    let mut timing = OutputGateServiceTiming::default();
+    let stage_started_at = Instant::now();
     let status = output_gate_service_status(&mut context)?;
+    timing.status = stage_started_at.elapsed();
     let current_start_position_nsecs = context.pipeline.current_start_position_nsecs;
+    let stage_started_at = Instant::now();
     let video_decode_snapshot = context.pipeline.video_decode_pipeline.snapshot();
     let output_resource_pressure = video_output_resource_pressure(
         context
@@ -76,7 +81,9 @@ fn service_output_gate_or_wait(
             ),
         context.pipeline.output_scheduler.output_fill_phase(),
     );
-    match service_output_gate_resume_if_ready(
+    timing.resource_pressure = stage_started_at.elapsed();
+    let stage_started_at = Instant::now();
+    let resume_status = service_output_gate_resume_if_ready(
         &mut context.pipeline.output_scheduler,
         context.pipeline.audio_output.as_ref(),
         context.control,
@@ -91,21 +98,33 @@ fn service_output_gate_or_wait(
         &mut context.pipeline.current_start_position_nsecs,
         &mut context.pipeline.scheduler,
         output_resource_pressure,
-        || context.demux_cache.reader_watermark(),
-    )? {
-        OutputGateResumeStatus::Resumed => Ok(OutputGateServiceStatus {
+        || context.demux_cache.cached_reader_watermark(),
+    )?;
+    timing.resume = stage_started_at.elapsed();
+    let service_status = match resume_status {
+        OutputGateResumeStatus::Resumed => OutputGateServiceStatus {
             outcome: OutputGateServiceOutcome::Continue,
             ..status
-        }),
+        },
         OutputGateResumeStatus::WaitingForDemux => {
+            let stage_started_at = Instant::now();
             wait_after_output_gate_stall(&mut context, "output_gate_demux_wait");
-            Ok(OutputGateServiceStatus {
+            timing.wait = stage_started_at.elapsed();
+            OutputGateServiceStatus {
                 outcome: OutputGateServiceOutcome::Continue,
                 ..status
-            })
+            }
         }
-        OutputGateResumeStatus::Idle | OutputGateResumeStatus::Waiting => Ok(status),
-    }
+        OutputGateResumeStatus::Idle | OutputGateResumeStatus::Waiting => status,
+    };
+    log_output_gate_service_timing(
+        context.session_id,
+        started_at.elapsed(),
+        timing,
+        resume_status,
+        service_status,
+    );
+    Ok(service_status)
 }
 
 fn output_gate_service_status(
@@ -132,8 +151,10 @@ fn output_gate_service_status(
         .snapshot_for_played_until(played_until_nsecs);
     let output_underflowing = output_snapshot.underflowing()
         || audio_output_starving(output_snapshot, audio_output_snapshot);
-    let demux_cache_insufficient =
-        !demux_reader_ready_for_output(context.demux_cache.reader_watermark(), has_audio_output);
+    let demux_cache_insufficient = !demux_reader_ready_for_output(
+        context.demux_cache.cached_reader_watermark(),
+        has_audio_output,
+    );
     context
         .pipeline
         .output_scheduler
@@ -191,6 +212,59 @@ fn wait_after_output_gate_stall(
             playback_telemetry: &mut *context.playback_telemetry,
         },
         stall_reason,
+    );
+}
+
+#[derive(Clone, Copy, Default)]
+struct OutputGateServiceTiming {
+    status: Duration,
+    resource_pressure: Duration,
+    resume: Duration,
+    wait: Duration,
+}
+
+fn log_output_gate_service_timing(
+    session_id: PlaybackSessionId,
+    total: Duration,
+    timing: OutputGateServiceTiming,
+    resume_status: OutputGateResumeStatus,
+    status: OutputGateServiceStatus,
+) {
+    tracing::trace!(
+        session_id = ?session_id,
+        total_ms = total.as_secs_f64() * 1000.0,
+        status_ms = timing.status.as_secs_f64() * 1000.0,
+        resource_pressure_ms = timing.resource_pressure.as_secs_f64() * 1000.0,
+        resume_ms = timing.resume.as_secs_f64() * 1000.0,
+        wait_ms = timing.wait.as_secs_f64() * 1000.0,
+        resume_status = ?resume_status,
+        outcome = ?status.outcome,
+        should_wait_for_demux = status.should_wait_for_demux,
+        video_output_waiting_for_demux = status.video_output_waiting_for_demux,
+        played_until_nsecs = ?status.played_until_nsecs,
+        "FFmpeg output gate service timing"
+    );
+    if total < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.status < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.resource_pressure < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.resume < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+        && timing.wait < OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        session_id = ?session_id,
+        total_ms = total.as_secs_f64() * 1000.0,
+        status_ms = timing.status.as_secs_f64() * 1000.0,
+        resource_pressure_ms = timing.resource_pressure.as_secs_f64() * 1000.0,
+        resume_ms = timing.resume.as_secs_f64() * 1000.0,
+        wait_ms = timing.wait.as_secs_f64() * 1000.0,
+        resume_status = ?resume_status,
+        outcome = ?status.outcome,
+        should_wait_for_demux = status.should_wait_for_demux,
+        video_output_waiting_for_demux = status.video_output_waiting_for_demux,
+        played_until_nsecs = ?status.played_until_nsecs,
+        "FFmpeg output gate service completed slowly"
     );
 }
 

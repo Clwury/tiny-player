@@ -534,68 +534,281 @@ fn run_video_decode_worker(
             return;
         }
     };
-    while let Ok(command) = command_rx.recv() {
+    loop {
+        let recv_started_at = Instant::now();
+        let command = match command_rx.recv() {
+            Ok(command) => command,
+            Err(_) => break,
+        };
+        let recv_wait = recv_started_at.elapsed();
+        let command_kind = video_decode_command_kind(&command);
+        let command_generation = video_decode_command_generation(&command);
+        log_video_decode_worker_recv_wait(command_kind, command_generation, recv_wait);
         match command {
             VideoDecodeCommand::Decode { generation, packet } => {
                 let started = Instant::now();
                 let mut decoded_frames = 0u64;
+                let mut frame_send_elapsed = Duration::ZERO;
+                let packet_pts = packet.best_timestamp();
+                let packet_bytes = packet.byte_len();
                 let result = decoder.decode_packet(packet.as_ptr(), &mut frame, |frame| {
                     decoded_frames = decoded_frames.saturating_add(1);
                     let frame =
                         FfmpegFrameRef::new_ref(frame).map_err(|error| error.to_string())?;
-                    result_tx
-                        .send(VideoDecodeResult::Frame {
-                            generation,
-                            frame: VideoDecodedFrame { frame },
-                        })
+                    let send_started_at = Instant::now();
+                    let send_result = result_tx.send(VideoDecodeResult::Frame {
+                        generation,
+                        frame: VideoDecodedFrame { frame },
+                    });
+                    frame_send_elapsed += send_started_at.elapsed();
+                    send_result
                         .map_err(|_| "FFmpeg video decode result receiver stopped".to_string())
                 });
-                if result_tx
-                    .send(VideoDecodeResult::PacketDone {
-                        generation,
-                        result,
-                        decoded_frames,
-                        elapsed: started.elapsed(),
-                    })
-                    .is_err()
-                {
+                let total_elapsed = started.elapsed();
+                let decode_elapsed = total_elapsed.saturating_sub(frame_send_elapsed);
+                let result_ok = result.is_ok();
+                let packet_done_send_started_at = Instant::now();
+                let packet_done_send_result = result_tx.send(VideoDecodeResult::PacketDone {
+                    generation,
+                    result,
+                    decoded_frames,
+                    elapsed: total_elapsed,
+                });
+                let packet_done_send_elapsed = packet_done_send_started_at.elapsed();
+                log_video_decode_worker_decode_timing(VideoDecodeWorkerDecodeTiming {
+                    generation,
+                    packet_pts,
+                    packet_bytes,
+                    recv_wait,
+                    total_elapsed,
+                    decode_elapsed,
+                    frame_send_elapsed,
+                    packet_done_send_elapsed,
+                    decoded_frames,
+                    result_ok,
+                });
+                if packet_done_send_result.is_err() {
                     break;
                 }
             }
             VideoDecodeCommand::FlushBuffers { generation } => {
+                let started = Instant::now();
                 decoder.flush_buffers();
+                let flush_elapsed = started.elapsed();
                 frame.unref();
-                if result_tx
-                    .send(VideoDecodeResult::Flushed { generation })
-                    .is_err()
-                {
+                let send_started_at = Instant::now();
+                let send_result = result_tx.send(VideoDecodeResult::Flushed { generation });
+                let send_elapsed = send_started_at.elapsed();
+                log_video_decode_worker_control_timing(
+                    "flush_buffers",
+                    Some(generation),
+                    recv_wait,
+                    flush_elapsed,
+                    send_elapsed,
+                );
+                if send_result.is_err() {
                     break;
                 }
             }
             VideoDecodeCommand::Drain { generation } => {
+                let started = Instant::now();
+                let mut frame_send_elapsed = Duration::ZERO;
                 let result = decoder.flush(&mut frame, |frame| {
                     let frame =
                         FfmpegFrameRef::new_ref(frame).map_err(|error| error.to_string())?;
-                    result_tx
-                        .send(VideoDecodeResult::Frame {
-                            generation,
-                            frame: VideoDecodedFrame { frame },
-                        })
+                    let send_started_at = Instant::now();
+                    let send_result = result_tx.send(VideoDecodeResult::Frame {
+                        generation,
+                        frame: VideoDecodedFrame { frame },
+                    });
+                    frame_send_elapsed += send_started_at.elapsed();
+                    send_result
                         .map_err(|_| "FFmpeg video decode result receiver stopped".to_string())
                 });
-                if result_tx
-                    .send(VideoDecodeResult::Drained { generation, result })
-                    .is_err()
-                {
+                let total_elapsed = started.elapsed();
+                let flush_elapsed = total_elapsed.saturating_sub(frame_send_elapsed);
+                let send_started_at = Instant::now();
+                let send_result = result_tx.send(VideoDecodeResult::Drained { generation, result });
+                let send_elapsed = send_started_at.elapsed();
+                log_video_decode_worker_drain_timing(
+                    generation,
+                    recv_wait,
+                    total_elapsed,
+                    flush_elapsed,
+                    frame_send_elapsed,
+                    send_elapsed,
+                );
+                if send_result.is_err() {
                     break;
                 }
             }
             VideoDecodeCommand::SetSkipNonref(enabled) => {
+                let started = Instant::now();
                 decoder.set_skip_nonref_frames(enabled);
+                log_video_decode_worker_control_timing(
+                    "set_skip_nonref",
+                    None,
+                    recv_wait,
+                    started.elapsed(),
+                    Duration::ZERO,
+                );
             }
             VideoDecodeCommand::Shutdown => break,
         }
     }
+}
+
+struct VideoDecodeWorkerDecodeTiming {
+    generation: u64,
+    packet_pts: Option<i64>,
+    packet_bytes: usize,
+    recv_wait: Duration,
+    total_elapsed: Duration,
+    decode_elapsed: Duration,
+    frame_send_elapsed: Duration,
+    packet_done_send_elapsed: Duration,
+    decoded_frames: u64,
+    result_ok: bool,
+}
+
+fn video_decode_command_kind(command: &VideoDecodeCommand) -> &'static str {
+    match command {
+        VideoDecodeCommand::Decode { .. } => "decode",
+        VideoDecodeCommand::FlushBuffers { .. } => "flush_buffers",
+        VideoDecodeCommand::Drain { .. } => "drain",
+        VideoDecodeCommand::SetSkipNonref(_) => "set_skip_nonref",
+        VideoDecodeCommand::Shutdown => "shutdown",
+    }
+}
+
+fn video_decode_command_generation(command: &VideoDecodeCommand) -> Option<u64> {
+    match command {
+        VideoDecodeCommand::Decode { generation, .. }
+        | VideoDecodeCommand::FlushBuffers { generation }
+        | VideoDecodeCommand::Drain { generation } => Some(*generation),
+        VideoDecodeCommand::SetSkipNonref(_) | VideoDecodeCommand::Shutdown => None,
+    }
+}
+
+fn log_video_decode_worker_recv_wait(
+    command_kind: &'static str,
+    generation: Option<u64>,
+    recv_wait: Duration,
+) {
+    tracing::trace!(
+        command = command_kind,
+        generation,
+        recv_wait_ms = recv_wait.as_secs_f64() * 1000.0,
+        "FFmpeg video decode worker command recv timing"
+    );
+    if recv_wait < WORKER_CHANNEL_RECV_WAIT_LOG_AFTER {
+        return;
+    }
+    tracing::debug!(
+        command = command_kind,
+        generation,
+        recv_wait_ms = recv_wait.as_secs_f64() * 1000.0,
+        "FFmpeg video decode worker waited for command"
+    );
+}
+
+fn log_video_decode_worker_decode_timing(timing: VideoDecodeWorkerDecodeTiming) {
+    tracing::trace!(
+        generation = timing.generation,
+        packet_pts = ?timing.packet_pts,
+        packet_bytes = timing.packet_bytes,
+        recv_wait_ms = timing.recv_wait.as_secs_f64() * 1000.0,
+        total_ms = timing.total_elapsed.as_secs_f64() * 1000.0,
+        decode_ms = timing.decode_elapsed.as_secs_f64() * 1000.0,
+        frame_send_block_ms = timing.frame_send_elapsed.as_secs_f64() * 1000.0,
+        packet_done_send_block_ms = timing.packet_done_send_elapsed.as_secs_f64() * 1000.0,
+        decoded_frames = timing.decoded_frames,
+        result_ok = timing.result_ok,
+        "FFmpeg video decode worker packet timing"
+    );
+    if timing.total_elapsed < DECODE_PACKET_SLOW_LOG_AFTER
+        && timing.frame_send_elapsed < WORKER_CHANNEL_SEND_WAIT_LOG_AFTER
+        && timing.packet_done_send_elapsed < WORKER_CHANNEL_SEND_WAIT_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        generation = timing.generation,
+        packet_pts = ?timing.packet_pts,
+        packet_bytes = timing.packet_bytes,
+        recv_wait_ms = timing.recv_wait.as_secs_f64() * 1000.0,
+        total_ms = timing.total_elapsed.as_secs_f64() * 1000.0,
+        decode_ms = timing.decode_elapsed.as_secs_f64() * 1000.0,
+        frame_send_block_ms = timing.frame_send_elapsed.as_secs_f64() * 1000.0,
+        packet_done_send_block_ms = timing.packet_done_send_elapsed.as_secs_f64() * 1000.0,
+        decoded_frames = timing.decoded_frames,
+        result_ok = timing.result_ok,
+        "FFmpeg video decode worker packet completed slowly"
+    );
+}
+
+fn log_video_decode_worker_control_timing(
+    command: &'static str,
+    generation: Option<u64>,
+    recv_wait: Duration,
+    work_elapsed: Duration,
+    send_elapsed: Duration,
+) {
+    tracing::trace!(
+        command,
+        generation,
+        recv_wait_ms = recv_wait.as_secs_f64() * 1000.0,
+        work_ms = work_elapsed.as_secs_f64() * 1000.0,
+        send_block_ms = send_elapsed.as_secs_f64() * 1000.0,
+        "FFmpeg video decode worker control command timing"
+    );
+    if work_elapsed < DECODE_PACKET_SLOW_LOG_AFTER
+        && send_elapsed < WORKER_CHANNEL_SEND_WAIT_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        command,
+        generation,
+        recv_wait_ms = recv_wait.as_secs_f64() * 1000.0,
+        work_ms = work_elapsed.as_secs_f64() * 1000.0,
+        send_block_ms = send_elapsed.as_secs_f64() * 1000.0,
+        "FFmpeg video decode worker control command completed slowly"
+    );
+}
+
+fn log_video_decode_worker_drain_timing(
+    generation: u64,
+    recv_wait: Duration,
+    total_elapsed: Duration,
+    flush_elapsed: Duration,
+    frame_send_elapsed: Duration,
+    drained_send_elapsed: Duration,
+) {
+    tracing::trace!(
+        generation,
+        recv_wait_ms = recv_wait.as_secs_f64() * 1000.0,
+        total_ms = total_elapsed.as_secs_f64() * 1000.0,
+        flush_ms = flush_elapsed.as_secs_f64() * 1000.0,
+        frame_send_block_ms = frame_send_elapsed.as_secs_f64() * 1000.0,
+        drained_send_block_ms = drained_send_elapsed.as_secs_f64() * 1000.0,
+        "FFmpeg video decode worker drain timing"
+    );
+    if total_elapsed < DECODE_PACKET_SLOW_LOG_AFTER
+        && frame_send_elapsed < WORKER_CHANNEL_SEND_WAIT_LOG_AFTER
+        && drained_send_elapsed < WORKER_CHANNEL_SEND_WAIT_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        generation,
+        recv_wait_ms = recv_wait.as_secs_f64() * 1000.0,
+        total_ms = total_elapsed.as_secs_f64() * 1000.0,
+        flush_ms = flush_elapsed.as_secs_f64() * 1000.0,
+        frame_send_block_ms = frame_send_elapsed.as_secs_f64() * 1000.0,
+        drained_send_block_ms = drained_send_elapsed.as_secs_f64() * 1000.0,
+        "FFmpeg video decode worker drain completed slowly"
+    );
 }
 
 #[cfg(test)]

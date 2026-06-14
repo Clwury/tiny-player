@@ -72,6 +72,8 @@ fn service_decoder_input_once(
     service: &mut DecoderInputService,
     context: &mut DecoderInputServiceContext<'_>,
 ) -> DecoderInputServiceStatus {
+    let service_started_at = Instant::now();
+    let retry_started_at = Instant::now();
     let retry_status = match context
         .pipeline
         .retry_pending_decoder_inputs(context.session_id)
@@ -79,7 +81,22 @@ fn service_decoder_input_once(
         Ok(status) => status,
         Err(error) => return DecoderInputServiceStatus::Error(error),
     };
+    let retry_elapsed = retry_started_at.elapsed();
+    if !decoder_input_should_pump_after_retry(retry_status) {
+        let status = DecoderInputServiceStatus::Progress;
+        log_decoder_input_timing(
+            context.session_id,
+            service_started_at.elapsed(),
+            retry_elapsed,
+            Duration::ZERO,
+            retry_status,
+            "skipped_after_retry_progress",
+            &status,
+        );
+        return status;
+    }
 
+    let pump_started_at = Instant::now();
     let result = service
         .demux_packet_pump
         .poll_and_admit_packet(DemuxPacketPumpAdmissionContext {
@@ -90,7 +107,23 @@ fn service_decoder_input_once(
             should_wait_for_demux: context.should_wait_for_demux,
             video_output_waiting_for_demux: context.video_output_waiting_for_demux,
         });
-    decoder_input_status_after_retry(retry_status, result)
+    let pump_elapsed = pump_started_at.elapsed();
+    let pump_result = demux_packet_pump_result_name(&result);
+    let status = decoder_input_status_after_retry(retry_status, result);
+    log_decoder_input_timing(
+        context.session_id,
+        service_started_at.elapsed(),
+        retry_elapsed,
+        pump_elapsed,
+        retry_status,
+        pump_result,
+        &status,
+    );
+    status
+}
+
+fn decoder_input_should_pump_after_retry(retry_status: DecodeInputRetryStatus) -> bool {
+    !retry_status.made_progress()
 }
 
 fn decoder_input_status_after_retry(
@@ -128,6 +161,54 @@ fn decoder_input_status_from_pump(result: DemuxPacketPumpResult) -> DecoderInput
     }
 }
 
+fn demux_packet_pump_result_name(result: &DemuxPacketPumpResult) -> &'static str {
+    match result {
+        DemuxPacketPumpResult::Progress => "progress",
+        DemuxPacketPumpResult::Backpressured => "backpressured",
+        DemuxPacketPumpResult::Eof => "eof",
+        DemuxPacketPumpResult::WouldBlock => "would_block",
+        DemuxPacketPumpResult::Interrupted => "interrupted",
+        DemuxPacketPumpResult::Error(_) => "error",
+    }
+}
+
+fn log_decoder_input_timing(
+    session_id: PlaybackSessionId,
+    total: Duration,
+    retry_elapsed: Duration,
+    pump_elapsed: Duration,
+    retry_status: DecodeInputRetryStatus,
+    pump_result: &'static str,
+    status: &DecoderInputServiceStatus,
+) {
+    tracing::trace!(
+        session_id = ?session_id,
+        total_ms = total.as_secs_f64() * 1000.0,
+        retry_pending_input_ms = retry_elapsed.as_secs_f64() * 1000.0,
+        demux_packet_pump_ms = pump_elapsed.as_secs_f64() * 1000.0,
+        retry_status = ?retry_status,
+        pump_result,
+        status = ?status,
+        "FFmpeg decoder input service timing"
+    );
+    if total < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER
+        && retry_elapsed < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER
+        && pump_elapsed < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        session_id = ?session_id,
+        total_ms = total.as_secs_f64() * 1000.0,
+        retry_pending_input_ms = retry_elapsed.as_secs_f64() * 1000.0,
+        demux_packet_pump_ms = pump_elapsed.as_secs_f64() * 1000.0,
+        retry_status = ?retry_status,
+        pump_result,
+        status = ?status,
+        "FFmpeg decoder input service completed slowly"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +231,19 @@ mod tests {
             decoder_input_status_from_pump(DemuxPacketPumpResult::Error("decode".to_string())),
             DecoderInputServiceStatus::Error("decode".to_string())
         );
+    }
+
+    #[test]
+    fn decoder_input_service_yields_after_retry_progress() {
+        assert!(!decoder_input_should_pump_after_retry(
+            DecodeInputRetryStatus::Queued
+        ));
+        assert!(decoder_input_should_pump_after_retry(
+            DecodeInputRetryStatus::Idle
+        ));
+        assert!(decoder_input_should_pump_after_retry(
+            DecodeInputRetryStatus::Backpressured
+        ));
     }
 
     #[test]

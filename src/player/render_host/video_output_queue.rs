@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use super::{DecodedFrame, FrameBufferPool, PlaybackSessionId, RenderSize, VulkanDecodeDevice};
@@ -11,6 +12,7 @@ pub struct VideoOutputQueue {
 }
 
 const VIDEO_OUTPUT_QUEUE_CAPACITY: usize = 3;
+const VIDEO_OUTPUT_QUEUE_TIMING_LOG_AFTER: Duration = Duration::from_millis(3);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VideoOutputQueueSnapshot {
@@ -178,18 +180,35 @@ impl VideoOutputQueue {
         session_id: PlaybackSessionId,
         frame: DecodedFrame,
     ) -> VideoOutputQueueAdmission {
+        let started_at = Instant::now();
+        let before_started_at = Instant::now();
         let before = self.snapshot();
+        let before_snapshot = before_started_at.elapsed();
+        let push_started_at = Instant::now();
         let result = self.push_with_policy(
             session_id,
             frame,
             VideoOutputQueuePushPolicy::DropBackloggedNonKey,
         );
-        VideoOutputQueueAdmission {
+        let push = push_started_at.elapsed();
+        let after_started_at = Instant::now();
+        let after = self.snapshot();
+        let after_snapshot = after_started_at.elapsed();
+        let admission = VideoOutputQueueAdmission {
             before,
-            after: self.snapshot(),
+            after,
             result,
             replaced_pending_frame: before.queued_frames > 0,
-        }
+        };
+        log_video_output_queue_admit_timing(VideoOutputQueueAdmitTiming {
+            session_id,
+            total: started_at.elapsed(),
+            before_snapshot,
+            push,
+            after_snapshot,
+            admission,
+        });
+        admission
     }
 
     pub fn push_with_policy(
@@ -198,8 +217,25 @@ impl VideoOutputQueue {
         frame: DecodedFrame,
         policy: VideoOutputQueuePushPolicy,
     ) -> VideoOutputQueuePushResult {
+        let started_at = Instant::now();
+        let lock_started_at = Instant::now();
         let mut state = self.inner.lock().expect("video output queue poisoned");
+        let lock_wait = lock_started_at.elapsed();
         if state.active_session_id != session_id {
+            let active_session_id = state.active_session_id;
+            let queued_frames = state.frames.len();
+            let dropped_frames = state.dropped_frames;
+            drop(state);
+            log_video_output_queue_push_timing(VideoOutputQueuePushTiming {
+                session_id,
+                active_session_id,
+                policy,
+                result: VideoOutputQueuePushResult::InactiveSession,
+                total: started_at.elapsed(),
+                lock_wait,
+                queued_frames,
+                dropped_frames,
+            });
             return VideoOutputQueuePushResult::InactiveSession;
         }
         if matches!(policy, VideoOutputQueuePushPolicy::DropBackloggedNonKey)
@@ -208,6 +244,20 @@ impl VideoOutputQueue {
             && state.render_backpressure.should_drop_non_key_frame()
         {
             state.dropped_frames = state.dropped_frames.saturating_add(1);
+            let active_session_id = state.active_session_id;
+            let queued_frames = state.frames.len();
+            let dropped_frames = state.dropped_frames;
+            drop(state);
+            log_video_output_queue_push_timing(VideoOutputQueuePushTiming {
+                session_id,
+                active_session_id,
+                policy,
+                result: VideoOutputQueuePushResult::DroppedBacklogged,
+                total: started_at.elapsed(),
+                lock_wait,
+                queued_frames,
+                dropped_frames,
+            });
             return VideoOutputQueuePushResult::DroppedBacklogged;
         }
         if state.current_size != Some(frame.size) {
@@ -229,11 +279,39 @@ impl VideoOutputQueue {
                     result = VideoOutputQueuePushResult::ReplacedPending;
                 }
                 VideoOutputQueuePushPolicy::WouldBlock => {
+                    let active_session_id = state.active_session_id;
+                    let queued_frames = state.frames.len();
+                    let dropped_frames = state.dropped_frames;
+                    drop(state);
+                    log_video_output_queue_push_timing(VideoOutputQueuePushTiming {
+                        session_id,
+                        active_session_id,
+                        policy,
+                        result: VideoOutputQueuePushResult::WouldBlock,
+                        total: started_at.elapsed(),
+                        lock_wait,
+                        queued_frames,
+                        dropped_frames,
+                    });
                     return VideoOutputQueuePushResult::WouldBlock;
                 }
             }
         }
         state.frames.push_back(frame);
+        let active_session_id = state.active_session_id;
+        let queued_frames = state.frames.len();
+        let dropped_frames = state.dropped_frames;
+        drop(state);
+        log_video_output_queue_push_timing(VideoOutputQueuePushTiming {
+            session_id,
+            active_session_id,
+            policy,
+            result,
+            total: started_at.elapsed(),
+            lock_wait,
+            queued_frames,
+            dropped_frames,
+        });
         result
     }
 
@@ -251,14 +329,20 @@ impl VideoOutputQueue {
     }
 
     pub fn snapshot(&self) -> VideoOutputQueueSnapshot {
+        let started_at = Instant::now();
+        let lock_started_at = Instant::now();
         let state = self.inner.lock().expect("video output queue poisoned");
-        VideoOutputQueueSnapshot {
+        let lock_wait = lock_started_at.elapsed();
+        let snapshot = VideoOutputQueueSnapshot {
             active_session_id: state.active_session_id,
             queued_frames: state.frames.len(),
             queue_capacity: VIDEO_OUTPUT_QUEUE_CAPACITY,
             dropped_frames: state.dropped_frames,
             render_backpressure: state.render_backpressure,
-        }
+        };
+        drop(state);
+        log_video_output_queue_snapshot_timing(started_at.elapsed(), lock_wait, snapshot);
+        snapshot
     }
 
     pub fn take_size_change(&self) -> Option<(PlaybackSessionId, RenderSize)> {
@@ -299,6 +383,132 @@ impl VideoOutputQueue {
             ..VideoOutputQueueState::default()
         };
     }
+}
+
+#[derive(Clone, Copy)]
+struct VideoOutputQueueAdmitTiming {
+    session_id: PlaybackSessionId,
+    total: Duration,
+    before_snapshot: Duration,
+    push: Duration,
+    after_snapshot: Duration,
+    admission: VideoOutputQueueAdmission,
+}
+
+#[derive(Clone, Copy)]
+struct VideoOutputQueuePushTiming {
+    session_id: PlaybackSessionId,
+    active_session_id: PlaybackSessionId,
+    policy: VideoOutputQueuePushPolicy,
+    result: VideoOutputQueuePushResult,
+    total: Duration,
+    lock_wait: Duration,
+    queued_frames: usize,
+    dropped_frames: u64,
+}
+
+fn log_video_output_queue_admit_timing(timing: VideoOutputQueueAdmitTiming) {
+    tracing::trace!(
+        session_id = ?timing.session_id,
+        total_ms = timing.total.as_secs_f64() * 1000.0,
+        before_snapshot_ms = timing.before_snapshot.as_secs_f64() * 1000.0,
+        push_ms = timing.push.as_secs_f64() * 1000.0,
+        after_snapshot_ms = timing.after_snapshot.as_secs_f64() * 1000.0,
+        result = ?timing.admission.result,
+        before_queued_frames = timing.admission.before.queued_frames,
+        after_queued_frames = timing.admission.after.queued_frames,
+        dropped_frames = timing.admission.after.dropped_frames,
+        render_backlogged = timing.admission.before.render_backlogged(),
+        "VO queue admission timing"
+    );
+    if timing.total < VIDEO_OUTPUT_QUEUE_TIMING_LOG_AFTER
+        && timing.before_snapshot < VIDEO_OUTPUT_QUEUE_TIMING_LOG_AFTER
+        && timing.push < VIDEO_OUTPUT_QUEUE_TIMING_LOG_AFTER
+        && timing.after_snapshot < VIDEO_OUTPUT_QUEUE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        session_id = ?timing.session_id,
+        total_ms = timing.total.as_secs_f64() * 1000.0,
+        before_snapshot_ms = timing.before_snapshot.as_secs_f64() * 1000.0,
+        push_ms = timing.push.as_secs_f64() * 1000.0,
+        after_snapshot_ms = timing.after_snapshot.as_secs_f64() * 1000.0,
+        result = ?timing.admission.result,
+        before_queued_frames = timing.admission.before.queued_frames,
+        after_queued_frames = timing.admission.after.queued_frames,
+        dropped_frames = timing.admission.after.dropped_frames,
+        render_backlogged = timing.admission.before.render_backlogged(),
+        "VO queue admission completed slowly"
+    );
+}
+
+fn log_video_output_queue_push_timing(timing: VideoOutputQueuePushTiming) {
+    tracing::trace!(
+        session_id = ?timing.session_id,
+        active_session_id = ?timing.active_session_id,
+        policy = ?timing.policy,
+        result = ?timing.result,
+        total_ms = timing.total.as_secs_f64() * 1000.0,
+        lock_wait_ms = timing.lock_wait.as_secs_f64() * 1000.0,
+        queued_frames = timing.queued_frames,
+        dropped_frames = timing.dropped_frames,
+        "VO queue push timing"
+    );
+    if timing.total < VIDEO_OUTPUT_QUEUE_TIMING_LOG_AFTER
+        && timing.lock_wait < VIDEO_OUTPUT_QUEUE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        session_id = ?timing.session_id,
+        active_session_id = ?timing.active_session_id,
+        policy = ?timing.policy,
+        result = ?timing.result,
+        total_ms = timing.total.as_secs_f64() * 1000.0,
+        lock_wait_ms = timing.lock_wait.as_secs_f64() * 1000.0,
+        queued_frames = timing.queued_frames,
+        dropped_frames = timing.dropped_frames,
+        "VO queue push completed slowly"
+    );
+}
+
+fn log_video_output_queue_snapshot_timing(
+    total: Duration,
+    lock_wait: Duration,
+    snapshot: VideoOutputQueueSnapshot,
+) {
+    tracing::trace!(
+        active_session_id = ?snapshot.active_session_id,
+        total_ms = total.as_secs_f64() * 1000.0,
+        lock_wait_ms = lock_wait.as_secs_f64() * 1000.0,
+        queued_frames = snapshot.queued_frames,
+        queue_capacity = snapshot.queue_capacity,
+        dropped_frames = snapshot.dropped_frames,
+        render_backlogged = snapshot.render_backlogged(),
+        pending_render_requests = snapshot.render_backpressure.pending_requests,
+        render_last_ms = snapshot.render_backpressure.last_render_nsecs as f64 / 1_000_000.0,
+        render_avg_ms = snapshot.render_backpressure.average_render_nsecs as f64 / 1_000_000.0,
+        "VO queue snapshot timing"
+    );
+    if total < VIDEO_OUTPUT_QUEUE_TIMING_LOG_AFTER
+        && lock_wait < VIDEO_OUTPUT_QUEUE_TIMING_LOG_AFTER
+    {
+        return;
+    }
+    tracing::debug!(
+        active_session_id = ?snapshot.active_session_id,
+        total_ms = total.as_secs_f64() * 1000.0,
+        lock_wait_ms = lock_wait.as_secs_f64() * 1000.0,
+        queued_frames = snapshot.queued_frames,
+        queue_capacity = snapshot.queue_capacity,
+        dropped_frames = snapshot.dropped_frames,
+        render_backlogged = snapshot.render_backlogged(),
+        pending_render_requests = snapshot.render_backpressure.pending_requests,
+        render_last_ms = snapshot.render_backpressure.last_render_nsecs as f64 / 1_000_000.0,
+        render_avg_ms = snapshot.render_backpressure.average_render_nsecs as f64 / 1_000_000.0,
+        "VO queue snapshot completed slowly"
+    );
 }
 
 #[cfg(test)]

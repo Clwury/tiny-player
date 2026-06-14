@@ -1775,7 +1775,7 @@ fn video_output_rebuffer_requires_stable_decoded_queue_target() {
 }
 
 #[test]
-fn video_output_rebuffer_resume_fits_vulkan_resource_pressure_budget() {
+fn video_output_rebuffer_resume_keeps_stable_floor_under_vulkan_resource_pressure() {
     let frame_duration_nsecs = 25_000_000;
     let mut queued = VecDeque::new();
     for index in 0..VULKAN_VIDEO_OUTPUT_RESOURCE_PRESSURE_FRAMES.saturating_sub(2) {
@@ -1791,11 +1791,7 @@ fn video_output_rebuffer_resume_fits_vulkan_resource_pressure_budget() {
         video_output_rebuffer_resume_duration_with_resource_pressure(&queued, false, true);
 
     assert_eq!(unpressured_duration, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
-    assert!(pressured_duration < VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
-    assert_eq!(
-        duration_nsecs(pressured_duration),
-        frame_duration_nsecs * u64::try_from(queued.len()).unwrap()
-    );
+    assert_eq!(pressured_duration, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
 
     let resume_timeline_nsecs = queued.front().unwrap().timeline_nsecs;
     let target_nsecs = duration_nsecs(pressured_duration);
@@ -1833,11 +1829,37 @@ fn video_output_rebuffer_resume_fits_vulkan_resource_pressure_budget() {
     );
 
     assert_eq!(waterline.target_nsecs, target_nsecs);
+    assert_eq!(
+        waterline.decoded_video_forward_nsecs,
+        Some(frame_duration_nsecs * u64::try_from(queued.len()).unwrap())
+    );
+    assert!(!waterline.ready());
+
+    for index in queued.len()..40 {
+        let mut frame = test_vulkan_queued_video_frame(
+            1_000_000_000 + u64::try_from(index).unwrap() * frame_duration_nsecs,
+        );
+        frame.duration_nsecs = frame_duration_nsecs;
+        queued.push_back(frame);
+    }
+
+    let waterline = rebuffer_playback_resume_waterline_with_resource_pressure(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        ready_demux,
+        None,
+        false,
+        true,
+        true,
+    );
+
+    assert_eq!(waterline.target_nsecs, target_nsecs);
     assert!(waterline.ready());
 }
 
 #[test]
-fn video_output_rebuffer_resume_budget_uses_resume_timeline_under_resource_pressure() {
+fn video_output_rebuffer_resume_rejects_subsecond_resume_timeline_budget() {
     let first_timeline_nsecs = 18_550_000_000;
     let resume_timeline_nsecs = 18_551_651_321;
     let frame_duration_nsecs = 20_000_000;
@@ -1892,16 +1914,19 @@ fn video_output_rebuffer_resume_budget_uses_resume_timeline_under_resource_press
         true,
     );
 
-    assert_eq!(waterline.target_nsecs, resume_budget_nsecs);
+    assert_eq!(
+        waterline.target_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+    );
     assert_eq!(
         waterline.decoded_video_forward_nsecs,
         Some(resume_budget_nsecs)
     );
-    assert!(waterline.ready());
+    assert!(!waterline.ready());
 }
 
 #[test]
-fn video_output_rebuffer_resume_keeps_low_water_floor_under_resource_pressure() {
+fn video_output_rebuffer_resume_keeps_stable_floor_under_resource_pressure() {
     let frame_duration_nsecs = 50_000_000;
     let mut queued = VecDeque::new();
     let mut frame = test_vulkan_queued_video_frame(1_000_000_000);
@@ -1911,21 +1936,21 @@ fn video_output_rebuffer_resume_keeps_low_water_floor_under_resource_pressure() 
     let pressured_duration =
         video_output_rebuffer_resume_duration_with_resource_pressure(&queued, false, true);
 
-    assert_eq!(pressured_duration, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION);
+    assert_eq!(pressured_duration, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
 
     let mut pending = PendingStartAudio::default();
     pending.push(
         DecodedAudio {
             samples: vec![0.0; 4],
-            duration_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
+            duration_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
         },
         1_000_000_000,
-        1_000_000_000 + duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
+        1_000_000_000 + duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
     );
     let ready_demux = DemuxReaderWatermark {
-        video_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)),
-        audio_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)),
-        selected_min_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)),
+        video_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+        audio_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+        selected_min_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
         video_underrun: false,
         audio_underrun: false,
         video_idle: false,
@@ -1948,7 +1973,7 @@ fn video_output_rebuffer_resume_keeps_low_water_floor_under_resource_pressure() 
 
     assert_eq!(
         waterline.target_nsecs,
-        duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
     );
     assert_eq!(
         waterline.decoded_video_forward_nsecs,
@@ -1960,7 +1985,7 @@ fn video_output_rebuffer_resume_keeps_low_water_floor_under_resource_pressure() 
         PlaybackBlockReason::DecodedVideoQueue
     );
 
-    for index in 1..5 {
+    for index in 1..20 {
         let mut frame = test_vulkan_queued_video_frame(
             1_000_000_000 + u64::try_from(index).unwrap() * frame_duration_nsecs,
         );
@@ -2018,7 +2043,7 @@ fn rebuffer_resume_fallback_waits_for_stable_target_before_timeout() {
 }
 
 #[test]
-fn rebuffer_resume_fallback_uses_available_decoded_window_after_timeout() {
+fn rebuffer_resume_fallback_rejects_subsecond_decoded_window_after_timeout() {
     let resume_timeline_nsecs = 1_000_000_000;
     let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 8, 100_000_000);
     let pending = test_pending_audio(
@@ -2041,8 +2066,89 @@ fn rebuffer_resume_fallback_uses_available_decoded_window_after_timeout() {
         Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
     );
 
-    assert_eq!(after_timeout.target_nsecs, 800_000_000);
+    assert_eq!(
+        after_timeout.target_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+    );
     assert_eq!(after_timeout.decoded_video_forward_nsecs, Some(800_000_000));
+    assert!(!after_timeout.ready());
+}
+
+#[test]
+fn rebuffer_resume_fallback_accepts_low_water_video_after_audio_stall_timeout() {
+    let resume_timeline_nsecs = 13_080_000_000;
+    let decoded_video_forward_nsecs = 800_000_000;
+    let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 20, 40_000_000);
+    let pending = test_pending_audio(resume_timeline_nsecs + 200_000_000, 1_024_000_000);
+    let demux_after_stalled_release = ready_demux_watermark(720_000_000);
+    let audio_output_buffered_until_nsecs = resume_timeline_nsecs + 71_995_464;
+
+    let mut waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        demux_after_stalled_release,
+        Some(audio_output_buffered_until_nsecs),
+        false,
+        true,
+    );
+    assert_eq!(
+        waterline.decoded_video_forward_nsecs,
+        Some(decoded_video_forward_nsecs)
+    );
+    assert_eq!(waterline.decoded_audio_forward_nsecs, Some(71_995_464));
+    assert!(!waterline.ready());
+
+    // The output gate releases the demux side after the stalled timeout so the
+    // decoder can keep moving; the prolonged-wait fallback must still be the
+    // thing that decides when the output side can leave rebuffering.
+    waterline.demux_ready = true;
+    let at_standard_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+    );
+    assert!(!at_standard_timeout.ready());
+
+    let after_audio_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER),
+    );
+
+    assert_eq!(
+        after_audio_timeout.target_nsecs,
+        decoded_video_forward_nsecs
+    );
+    assert!(after_audio_timeout.ready());
+    assert!(after_audio_timeout.decoded_video_ready);
+    assert!(after_audio_timeout.decoded_audio_ready);
+}
+
+#[test]
+fn rebuffer_resume_fallback_accepts_one_frame_short_decoded_window_when_audio_ready() {
+    let resume_timeline_nsecs = 1_000_000_000;
+    let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 24, 40_000_000);
+    let pending = test_pending_audio(
+        resume_timeline_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+    );
+    let ready_demux = ready_demux_watermark(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION));
+
+    let waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        resume_timeline_nsecs,
+        ready_demux,
+        None,
+        false,
+        true,
+    );
+    let after_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
+        waterline,
+        Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+    );
+
+    assert_eq!(after_timeout.decoded_video_forward_nsecs, Some(960_000_000));
+    assert_eq!(after_timeout.target_nsecs, 960_000_000);
     assert!(after_timeout.ready());
 }
 
@@ -2198,7 +2304,7 @@ fn rebuffer_resume_fallback_waits_when_delayed_audio_start_consumes_low_water() 
 fn rebuffer_resume_fallback_accepts_delayed_audio_start_with_low_water_remaining() {
     let resume_timeline_nsecs = 4_360_000_000;
     let delayed_audio_gap_nsecs = 344_000_000;
-    let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 15, 40_000_000);
+    let queued = test_queued_video_frames_with_duration(resume_timeline_nsecs, 25, 40_000_000);
     let pending = test_pending_audio(
         resume_timeline_nsecs + delayed_audio_gap_nsecs,
         duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
@@ -2219,8 +2325,14 @@ fn rebuffer_resume_fallback_accepts_delayed_audio_start_with_low_water_remaining
         Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
     );
 
-    assert_eq!(after_timeout.target_nsecs, 600_000_000);
-    assert_eq!(after_timeout.decoded_video_forward_nsecs, Some(600_000_000));
+    assert_eq!(
+        after_timeout.target_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+    );
+    assert_eq!(
+        after_timeout.decoded_video_forward_nsecs,
+        Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION))
+    );
     assert_eq!(
         after_timeout.delayed_audio_start_gap_nsecs,
         Some(delayed_audio_gap_nsecs)
