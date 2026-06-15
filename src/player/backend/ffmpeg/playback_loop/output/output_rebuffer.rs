@@ -611,6 +611,32 @@ pub(in crate::player::backend::ffmpeg) fn rebuffer_playback_resume_waterline_aft
     waterline
 }
 
+pub(in crate::player::backend::ffmpeg) fn rebuffer_playback_resume_waterline_after_cache_pause(
+    mut waterline: PlaybackResumeWaterline,
+    rebuffer_wait_elapsed: Option<Duration>,
+    cache_paused: bool,
+) -> PlaybackResumeWaterline {
+    if waterline.ready()
+        || !cache_paused
+        || !waterline.decoded_ready()
+        || rebuffer_wait_elapsed
+            .is_none_or(|elapsed| elapsed < VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER)
+        || !rebuffer_cache_pause_demux_fallback_ready(waterline)
+    {
+        return waterline;
+    }
+
+    waterline.demux_ready = true;
+    waterline
+}
+
+fn rebuffer_cache_pause_demux_fallback_ready(waterline: PlaybackResumeWaterline) -> bool {
+    waterline.demux_ready
+        || waterline.demux_min_forward_nsecs.is_some_and(|duration| {
+            duration >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
+        })
+}
+
 pub(in crate::player::backend::ffmpeg) fn initial_playback_resume_waterline(
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
     pending_audio: &PendingStartAudio,
@@ -867,4 +893,108 @@ pub(in crate::player::backend::ffmpeg) fn clear_video_output_rebuffer(
     }
     *output_state = PlaybackOutputState::Syncing;
     control.set_output_rebuffer_paused(false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rebuffer_waterline(
+        decoded_video_forward_nsecs: u64,
+        decoded_audio_forward_nsecs: u64,
+        demux_forward_nsecs: u64,
+        demux_ready: bool,
+    ) -> PlaybackResumeWaterline {
+        PlaybackResumeWaterline {
+            target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            decoded_video_forward_nsecs: Some(decoded_video_forward_nsecs),
+            decoded_audio_forward_nsecs: Some(decoded_audio_forward_nsecs),
+            delayed_audio_start_gap_nsecs: None,
+            demux_video_forward_nsecs: Some(demux_forward_nsecs),
+            demux_audio_forward_nsecs: Some(demux_forward_nsecs),
+            demux_min_forward_nsecs: Some(demux_forward_nsecs),
+            decoded_video_ready: decoded_video_forward_nsecs
+                >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            decoded_audio_ready: decoded_audio_forward_nsecs
+                >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            demux_ready,
+        }
+    }
+
+    #[test]
+    fn prolonged_rebuffer_wait_does_not_relax_demux_waterline() {
+        let waterline = rebuffer_waterline(
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) * 2,
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
+            0,
+            false,
+        );
+
+        let waterline = rebuffer_playback_resume_waterline_after_prolonged_wait(
+            waterline,
+            Some(VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER),
+        );
+
+        assert!(!waterline.ready());
+        assert!(!waterline.demux_ready);
+        assert!(!waterline.decoded_audio_ready);
+        assert_eq!(waterline.demux_min_forward_nsecs, Some(0));
+    }
+
+    #[test]
+    fn cache_pause_rebuffer_wait_keeps_waiting_with_empty_demux_window() {
+        let waterline = rebuffer_waterline(
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            0,
+            false,
+        );
+
+        let waterline = rebuffer_playback_resume_waterline_after_cache_pause(
+            waterline,
+            Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+            true,
+        );
+
+        assert!(!waterline.ready());
+        assert!(!waterline.demux_ready);
+    }
+
+    #[test]
+    fn cache_pause_rebuffer_wait_allows_low_water_demux_window_to_resume() {
+        let waterline = rebuffer_waterline(
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
+            false,
+        );
+
+        let waterline = rebuffer_playback_resume_waterline_after_cache_pause(
+            waterline,
+            Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+            true,
+        );
+
+        assert!(waterline.ready());
+        assert!(waterline.demux_ready);
+    }
+
+    #[test]
+    fn cache_pause_rebuffer_wait_keeps_demux_waterline_without_cache_pause() {
+        let waterline = rebuffer_waterline(
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            0,
+            false,
+        );
+
+        let waterline = rebuffer_playback_resume_waterline_after_cache_pause(
+            waterline,
+            Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+            false,
+        );
+
+        assert!(!waterline.ready());
+        assert!(!waterline.demux_ready);
+    }
 }

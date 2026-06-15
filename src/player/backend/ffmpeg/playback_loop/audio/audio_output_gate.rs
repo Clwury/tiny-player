@@ -163,6 +163,13 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
     let mut queued_audio_frames = 0usize;
     let mut queued_audio_until_nsecs = audio_start_timeline_nsecs;
     while let Some(mut frame) = pending_audio.pop_front_until(audio_flush_until_timeline_nsecs) {
+        if !frame.trim_before(
+            audio_start_timeline_nsecs,
+            output.sample_rate(),
+            output.channels(),
+        ) {
+            continue;
+        }
         let buffered_until_nsecs = frame.end_timeline_nsecs;
         match output.try_push_timed(
             frame.samples,
@@ -240,6 +247,13 @@ fn queue_delayed_audio_start_silence(
     control: &FfmpegControl,
     session_id: PlaybackSessionId,
 ) -> std::result::Result<DelayedAudioStartSilenceStatus, String> {
+    if pending_audio
+        .buffered_until_from(audio_start_timeline_nsecs)
+        .is_some_and(|buffered_until| buffered_until > audio_start_timeline_nsecs)
+    {
+        return Ok(DelayedAudioStartSilenceStatus::NotNeeded);
+    }
+
     let Some(first_audio_start_nsecs) =
         pending_audio.first_start_at_or_after(audio_start_timeline_nsecs)
     else {

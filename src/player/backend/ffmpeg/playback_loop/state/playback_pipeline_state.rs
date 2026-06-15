@@ -391,9 +391,13 @@ fn audio_input_suppressed_until_output_resume_state(
     first_video_frame_pending: bool,
     pending_start_audio_duration: Duration,
 ) -> bool {
+    // Total pending-start audio duration is not the same as audio coverage from
+    // the eventual resume timeline. During seeks/track switches, preroll can
+    // leave a gap before the first queued video frame; keep feeding audio until
+    // the pending-start queue reaches its real backpressure limit.
     has_audio_decode_pipeline
         && (output_rebuffering || first_video_frame_pending)
-        && pending_start_audio_duration >= VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
+        && pending_start_audio_duration >= PENDING_START_AUDIO_BACKPRESSURE_DURATION
 }
 
 fn decoder_input_streams_for_state(
@@ -474,24 +478,36 @@ mod tests {
     }
 
     #[test]
-    fn audio_input_suppression_waits_until_audio_covers_resume_waterline() {
-        assert!(audio_input_suppressed_until_output_resume_state(
+    fn audio_input_suppression_waits_until_pending_start_audio_backpressure() {
+        assert!(!audio_input_suppressed_until_output_resume_state(
             true,
             true,
             false,
             VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
         ));
-        assert!(audio_input_suppressed_until_output_resume_state(
+        assert!(!audio_input_suppressed_until_output_resume_state(
             true,
             false,
             true,
             VIDEO_OUTPUT_REBUFFER_RESUME_DURATION + Duration::from_millis(1)
         ));
+        assert!(audio_input_suppressed_until_output_resume_state(
+            true,
+            true,
+            false,
+            PENDING_START_AUDIO_BACKPRESSURE_DURATION
+        ));
+        assert!(audio_input_suppressed_until_output_resume_state(
+            true,
+            false,
+            true,
+            PENDING_START_AUDIO_BACKPRESSURE_DURATION + Duration::from_millis(1)
+        ));
         assert!(!audio_input_suppressed_until_output_resume_state(
             true,
             true,
             false,
-            VIDEO_OUTPUT_REBUFFER_RESUME_DURATION - Duration::from_millis(1)
+            PENDING_START_AUDIO_BACKPRESSURE_DURATION - Duration::from_millis(1)
         ));
     }
 

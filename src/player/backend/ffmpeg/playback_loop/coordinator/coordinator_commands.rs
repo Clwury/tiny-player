@@ -103,6 +103,20 @@ fn service_track_selection_command(
     position_seconds: f64,
     pending_track_selection: PendingTrackSelection,
 ) -> std::result::Result<(), String> {
+    let selected_tracks = pending_track_selection.selected_tracks.clone();
+    let demux_audio_stream = select_audio_stream_for_selection_from_catalog(
+        &selected_tracks,
+        context.stream_catalog,
+        false,
+    )?;
+    let demux_subtitle_stream = select_subtitle_stream_for_selection_from_catalog(
+        &selected_tracks,
+        context.stream_catalog,
+    )?;
+    context
+        .demux_cache
+        .set_selected_streams(demux_audio_stream, demux_subtitle_stream);
+
     context.pipeline.current_start_position_nsecs = context.session.start_position_nsecs();
     service_playback_generation_seek(PlaybackGenerationFlushContext {
         kind: PlaybackPositionResetKind::TrackSelection,
@@ -113,14 +127,14 @@ fn service_track_selection_command(
         vo_queue: context.vo_queue,
         demux_cache: context.demux_cache,
         pipeline: context.pipeline,
-        selected_tracks: Some(&pending_track_selection.selected_tracks),
+        selected_tracks: Some(&selected_tracks),
         control: context.control,
     })?;
 
     context.pipeline.audio_decode_pipeline = None;
     let track_switch_pipeline_state = service_track_switch_pipelines(
         context.source,
-        pending_track_selection.selected_tracks,
+        selected_tracks,
         context.stream_catalog,
         context.pipeline.audio_output.take(),
         Arc::clone(context.control),

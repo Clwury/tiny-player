@@ -873,11 +873,12 @@ impl PlaybackPage {
             .child(
                 div()
                     .absolute()
-                    .top(px(7.0))
+                    .top(px(9.0))
                     .left(relative(state.played_fraction))
-                    .ml(-px(6.0))
-                    .size(px(14.0))
-                    .rounded_full()
+                    .ml(-px(2.0))
+                    .w(px(4.0))
+                    .h(px(10.0))
+                    .rounded(px(2.0))
                     .bg(theme.foreground)
                     .border_1()
                     .border_color(thumb_border_color),

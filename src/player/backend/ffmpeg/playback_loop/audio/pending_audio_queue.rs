@@ -14,6 +14,43 @@ pub(in crate::player::backend::ffmpeg) struct PendingStartAudioFrame {
     pub(in crate::player::backend::ffmpeg) end_timeline_nsecs: u64,
 }
 
+impl PendingStartAudioFrame {
+    pub(in crate::player::backend::ffmpeg) fn trim_before(
+        &mut self,
+        timeline_nsecs: u64,
+        sample_rate: c_int,
+        channels: c_int,
+    ) -> bool {
+        if timeline_nsecs <= self.start_timeline_nsecs {
+            return true;
+        }
+        if timeline_nsecs >= self.end_timeline_nsecs {
+            return false;
+        }
+
+        let drop_samples = samples_for_duration(
+            timeline_nsecs.saturating_sub(self.start_timeline_nsecs),
+            sample_rate,
+            channels,
+        );
+        let Ok(mut drop_samples) = usize::try_from(drop_samples) else {
+            return false;
+        };
+        if channels > 0 {
+            let channels = usize::try_from(channels).unwrap_or(1);
+            drop_samples = drop_samples.saturating_sub(drop_samples % channels);
+        }
+        if drop_samples >= self.samples.len() {
+            return false;
+        }
+        if drop_samples > 0 {
+            self.samples.drain(..drop_samples);
+        }
+        self.start_timeline_nsecs = timeline_nsecs;
+        true
+    }
+}
+
 impl PendingStartAudio {
     pub(in crate::player::backend::ffmpeg) fn push(
         &mut self,
@@ -66,7 +103,7 @@ impl PendingStartAudio {
         while self
             .frames
             .front()
-            .is_some_and(|frame| frame.start_timeline_nsecs < timeline_nsecs)
+            .is_some_and(|frame| frame.end_timeline_nsecs <= timeline_nsecs)
         {
             self.pop_front();
             dropped = dropped.saturating_add(1);

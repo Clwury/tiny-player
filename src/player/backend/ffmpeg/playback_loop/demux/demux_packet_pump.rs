@@ -293,6 +293,14 @@ impl DemuxPacketPump {
             cache_lock_timed_out = demux_cache_timing.lock_timed_out,
             cache_data_wait_ms = demux_cache_timing.data_wait.as_secs_f64() * 1000.0,
             cache_data_waits = demux_cache_timing.data_waits,
+            cache_take_packet_ms = demux_cache_timing.take_packet.as_secs_f64() * 1000.0,
+            cache_advance_reader_head_ms =
+                demux_cache_timing.advance_reader_head.as_secs_f64() * 1000.0,
+            cache_refresh_reader_tracking_ms =
+                demux_cache_timing.refresh_reader_tracking.as_secs_f64() * 1000.0,
+            cache_trim_ms = demux_cache_timing.trim.as_secs_f64() * 1000.0,
+            cache_forward_bytes_ms = demux_cache_timing.forward_bytes.as_secs_f64() * 1000.0,
+            cache_forward_window_ms = demux_cache_timing.forward_window.as_secs_f64() * 1000.0,
             packet_ref_ms = demux_cache_timing.packet_ref.as_secs_f64() * 1000.0,
             disk_read_ms = demux_cache_timing.disk_read.as_secs_f64() * 1000.0,
             disk_reads = demux_cache_timing.disk_reads,
@@ -333,6 +341,14 @@ impl DemuxPacketPump {
             cache_lock_timed_out = demux_cache_timing.lock_timed_out,
             cache_data_wait_ms = demux_cache_timing.data_wait.as_secs_f64() * 1000.0,
             cache_data_waits = demux_cache_timing.data_waits,
+            cache_take_packet_ms = demux_cache_timing.take_packet.as_secs_f64() * 1000.0,
+            cache_advance_reader_head_ms =
+                demux_cache_timing.advance_reader_head.as_secs_f64() * 1000.0,
+            cache_refresh_reader_tracking_ms =
+                demux_cache_timing.refresh_reader_tracking.as_secs_f64() * 1000.0,
+            cache_trim_ms = demux_cache_timing.trim.as_secs_f64() * 1000.0,
+            cache_forward_bytes_ms = demux_cache_timing.forward_bytes.as_secs_f64() * 1000.0,
+            cache_forward_window_ms = demux_cache_timing.forward_window.as_secs_f64() * 1000.0,
             packet_ref_ms = demux_cache_timing.packet_ref.as_secs_f64() * 1000.0,
             disk_read_ms = demux_cache_timing.disk_read.as_secs_f64() * 1000.0,
             disk_reads = demux_cache_timing.disk_reads,
@@ -348,6 +364,12 @@ impl DemuxPacketPump {
             && timing.try_lock_failures == 0
             && timing.lock_wait < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
             && timing.data_wait < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
+            && timing.take_packet < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
+            && timing.advance_reader_head < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
+            && timing.refresh_reader_tracking < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
+            && timing.trim < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
+            && timing.forward_bytes < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
+            && timing.forward_window < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
             && timing.packet_ref < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
             && timing.disk_read < DEMUX_CACHE_LOCK_TIMING_LOG_AFTER
         {
@@ -380,6 +402,14 @@ impl DemuxPacketPump {
             cache_lock_timed_out = demux_cache_timing.lock_timed_out,
             cache_data_wait_ms = demux_cache_timing.data_wait.as_secs_f64() * 1000.0,
             cache_data_waits = demux_cache_timing.data_waits,
+            cache_take_packet_ms = demux_cache_timing.take_packet.as_secs_f64() * 1000.0,
+            cache_advance_reader_head_ms =
+                demux_cache_timing.advance_reader_head.as_secs_f64() * 1000.0,
+            cache_refresh_reader_tracking_ms =
+                demux_cache_timing.refresh_reader_tracking.as_secs_f64() * 1000.0,
+            cache_trim_ms = demux_cache_timing.trim.as_secs_f64() * 1000.0,
+            cache_forward_bytes_ms = demux_cache_timing.forward_bytes.as_secs_f64() * 1000.0,
+            cache_forward_window_ms = demux_cache_timing.forward_window.as_secs_f64() * 1000.0,
             packet_ref_ms = demux_cache_timing.packet_ref.as_secs_f64() * 1000.0,
             disk_read_ms = demux_cache_timing.disk_read.as_secs_f64() * 1000.0,
             disk_reads = demux_cache_timing.disk_reads,

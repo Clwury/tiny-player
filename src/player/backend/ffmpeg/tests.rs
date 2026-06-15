@@ -3540,6 +3540,54 @@ fn pending_start_audio_discards_frames_before_first_video() {
 }
 
 #[test]
+fn pending_start_audio_keeps_frame_overlapping_playback_start() {
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 32_000_000,
+        },
+        576_000_000,
+        608_000_000,
+    );
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 32_000_000,
+        },
+        608_000_000,
+        640_000_000,
+    );
+
+    assert_eq!(pending.discard_before(576_018_171), 0);
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending.first_start_timeline_nsecs(), Some(576_000_000));
+    assert_eq!(pending.forward_duration_from(576_018_171), Some(63_981_829));
+}
+
+#[test]
+fn pending_start_audio_trims_overlapping_frame_to_playback_start() {
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.0; 64],
+            duration_nsecs: 32_000_000,
+        },
+        576_000_000,
+        608_000_000,
+    );
+
+    let mut frame = pending
+        .pop_front_until(608_000_000)
+        .expect("covered frame pops");
+    assert!(frame.trim_before(592_000_000, 1_000, 2));
+
+    assert_eq!(frame.start_timeline_nsecs, 592_000_000);
+    assert_eq!(frame.end_timeline_nsecs, 608_000_000);
+    assert_eq!(frame.samples.len(), 32);
+}
+
+#[test]
 fn pending_start_audio_reports_first_start_timeline() {
     let mut pending = PendingStartAudio::default();
     assert_eq!(pending.first_start_timeline_nsecs(), None);

@@ -86,6 +86,7 @@ fn service_output_gate_or_wait(
     let resume_status = service_output_gate_resume_if_ready(
         &mut context.pipeline.output_scheduler,
         context.pipeline.audio_output.as_ref(),
+        Some(context.demux_cache),
         context.control,
         context.session_id,
         context.vo_queue,
@@ -108,14 +109,13 @@ fn service_output_gate_or_wait(
         },
         OutputGateResumeStatus::WaitingForDemux => {
             let stage_started_at = Instant::now();
-            wait_after_output_gate_stall(&mut context, "output_gate_demux_wait");
+            observe_output_gate_stall(&mut context, "output_gate_demux_wait");
             timing.wait = stage_started_at.elapsed();
-            OutputGateServiceStatus {
-                outcome: OutputGateServiceOutcome::Continue,
-                ..status
-            }
+            output_gate_service_status_after_resume(status, resume_status)
         }
-        OutputGateResumeStatus::Idle | OutputGateResumeStatus::Waiting => status,
+        OutputGateResumeStatus::Idle | OutputGateResumeStatus::Waiting => {
+            output_gate_service_status_after_resume(status, resume_status)
+        }
     };
     log_output_gate_service_timing(
         context.session_id,
@@ -125,6 +125,21 @@ fn service_output_gate_or_wait(
         service_status,
     );
     Ok(service_status)
+}
+
+fn output_gate_service_status_after_resume(
+    status: OutputGateServiceStatus,
+    resume_status: OutputGateResumeStatus,
+) -> OutputGateServiceStatus {
+    match resume_status {
+        OutputGateResumeStatus::Resumed => OutputGateServiceStatus {
+            outcome: OutputGateServiceOutcome::Continue,
+            ..status
+        },
+        OutputGateResumeStatus::Idle
+        | OutputGateResumeStatus::Waiting
+        | OutputGateResumeStatus::WaitingForDemux => status,
+    }
 }
 
 fn output_gate_service_status(
@@ -194,12 +209,12 @@ fn audio_output_starving(
         && audio_output_snapshot.is_some_and(|snapshot| snapshot.total_pending_nsecs == 0)
 }
 
-fn wait_after_output_gate_stall(
+fn observe_output_gate_stall(
     context: &mut OutputGateServiceContext<'_>,
     stall_reason: &'static str,
 ) {
-    context.playback_wait.wait_after_stall(
-        PlaybackPipelineWaitContext {
+    context.playback_wait.observe_stall(
+        &mut PlaybackPipelineWaitContext {
             session_id: context.session_id,
             demux_cache: context.demux_cache,
             video_decode_pipeline: &context.pipeline.video_decode_pipeline,
@@ -290,6 +305,26 @@ mod tests {
             }
             .should_continue()
         );
+    }
+
+    #[test]
+    fn output_gate_demux_wait_allows_decoder_input_pump() {
+        let status = OutputGateServiceStatus {
+            outcome: OutputGateServiceOutcome::Ready,
+            should_wait_for_demux: true,
+            video_output_waiting_for_demux: false,
+            played_until_nsecs: Some(1_000_000_000),
+            has_audio_output: true,
+        };
+
+        let status = output_gate_service_status_after_resume(
+            status,
+            OutputGateResumeStatus::WaitingForDemux,
+        );
+
+        assert_eq!(status.outcome, OutputGateServiceOutcome::Ready);
+        assert!(status.should_wait_for_demux);
+        assert!(!status.should_continue());
     }
 
     #[test]

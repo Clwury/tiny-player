@@ -475,6 +475,7 @@ where
     match service_output_gate_resume_if_ready(
         output_scheduler,
         Some(output),
+        None,
         control,
         session_id,
         vo_queue,
