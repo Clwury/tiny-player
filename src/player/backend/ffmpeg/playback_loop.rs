@@ -491,7 +491,10 @@ fn select_audio_stream_for_selection(
     };
     input
         .stream_by_index(stream_index, ffi::AVMediaType::AVMEDIA_TYPE_AUDIO)
-        .map(Some)
+        .map(|stream| {
+            log_selected_audio_stream(selected_tracks, stream);
+            Some(stream)
+        })
         .or_else(|error| {
             if allow_audio_decoder_failure {
                 tracing::warn!(%error, "FFmpeg selected audio stream unavailable");
@@ -512,7 +515,10 @@ fn select_audio_stream_for_selection_from_catalog(
     };
     catalog
         .stream_by_index(stream_index, ffi::AVMediaType::AVMEDIA_TYPE_AUDIO)
-        .map(Some)
+        .map(|stream| {
+            log_selected_audio_stream(selected_tracks, stream);
+            Some(stream)
+        })
         .or_else(|error| {
             if allow_audio_decoder_failure {
                 tracing::warn!(%error, "FFmpeg selected audio stream unavailable");
@@ -521,6 +527,48 @@ fn select_audio_stream_for_selection_from_catalog(
                 Err(format!("FFmpeg 选择指定音频流失败：{error}"))
             }
         })
+}
+
+fn log_selected_audio_stream(
+    selected_tracks: &crate::player::PlaybackTrackSelection,
+    stream: StreamInfo,
+) {
+    let codec_name = ffmpeg_codec_name(stream.codec_id);
+    let (sample_rate, channels) = stream_audio_params(stream);
+    tracing::debug!(
+        default_audio_stream_index = ?selected_tracks.default_audio_stream_index,
+        requested_audio_stream_index = ?selected_tracks.audio_stream_index,
+        ffmpeg_audio_stream_index = stream.index,
+        audio_codec = %codec_name,
+        audio_sample_rate = ?sample_rate,
+        audio_channels = ?channels,
+        audio_time_base_num = stream.time_base.num,
+        audio_time_base_den = stream.time_base.den,
+        "selected FFmpeg audio stream"
+    );
+}
+
+fn ffmpeg_codec_name(codec_id: ffi::AVCodecID) -> String {
+    let name = unsafe { ffi::avcodec_get_name(codec_id) };
+    if name.is_null() {
+        return format!("{codec_id:?}");
+    }
+    unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn stream_audio_params(stream: StreamInfo) -> (Option<c_int>, Option<c_int>) {
+    let codecpar = unsafe { (*stream.stream).codecpar };
+    if codecpar.is_null() {
+        return (None, None);
+    }
+    let sample_rate = unsafe { (*codecpar).sample_rate };
+    let channels = unsafe { (*codecpar).ch_layout.nb_channels };
+    (
+        (sample_rate > 0).then_some(sample_rate),
+        (channels > 0).then_some(channels),
+    )
 }
 
 fn select_subtitle_stream(

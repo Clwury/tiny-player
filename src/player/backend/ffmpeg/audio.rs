@@ -29,6 +29,23 @@ pub(super) enum AudioOutputPushResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AudioClockMode {
+    SyncingVideo,
+    AudioStarted,
+    UnderrunRecovery,
+}
+
+impl AudioClockMode {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::SyncingVideo => "syncing_video",
+            Self::AudioStarted => "audio_started",
+            Self::UnderrunRecovery => "underrun_recovery",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct AudioOutputSnapshot {
     pub(super) played_timeline_nsecs: u64,
     pub(super) buffered_until_timeline_nsecs: u64,
@@ -63,6 +80,7 @@ pub(super) struct AudioShared {
     underrun_count: AtomicU64,
     underrun_active: AtomicBool,
     underrun_timeline_nsecs: AtomicU64,
+    misaligned_audio_buffer_count: AtomicU64,
     last_callback_nsecs: AtomicU64,
     clock_start: Instant,
     sample_rate: c_int,
@@ -83,6 +101,33 @@ struct AudioQueueItem {
     end_timeline_nsecs: u64,
     duration_nsecs: u64,
     generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AudioQueueWriteProgress {
+    samples: usize,
+    duration_nsecs: u64,
+}
+
+#[derive(Debug)]
+struct AudioQueueWriteError {
+    message: String,
+    progress: AudioQueueWriteProgress,
+}
+
+impl AudioQueueWriteError {
+    fn new(message: impl Into<String>, progress: AudioQueueWriteProgress) -> Self {
+        Self {
+            message: message.into(),
+            progress,
+        }
+    }
+}
+
+impl std::fmt::Display for AudioQueueWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 pub(super) struct AudioQueueShared {
@@ -171,7 +216,7 @@ impl AudioQueueState {
 
     fn can_accept(&self) -> bool {
         self.queued_duration_nsecs == 0
-            || self.queued_duration_nsecs < duration_nsecs(AUDIO_DECODE_QUEUE_LIMIT_DURATION)
+            || self.queued_duration_nsecs < duration_nsecs(AUDIO_OUTPUT_QUEUE_LIMIT_DURATION)
     }
 
     fn push(&mut self, item: AudioQueueItem) {
@@ -297,6 +342,7 @@ impl AudioShared {
             underrun_count: AtomicU64::new(0),
             underrun_active: AtomicBool::new(false),
             underrun_timeline_nsecs: AtomicU64::new(0),
+            misaligned_audio_buffer_count: AtomicU64::new(0),
             last_callback_nsecs: AtomicU64::new(0),
             clock_start: Instant::now(),
             sample_rate,
@@ -316,7 +362,7 @@ impl AudioShared {
             self.ready.notify_all();
         }
         self.played_samples.store(
-            samples_for_duration(timeline_nsecs, self.sample_rate, self.channels),
+            audio_elements_for_duration_floor(timeline_nsecs, self.sample_rate, self.channels),
             Ordering::Relaxed,
         );
         self.queued_end_timeline_nsecs
@@ -343,7 +389,7 @@ impl AudioShared {
             .lock()
             .map_err(|_| "系统音频缓冲区已损坏".to_string())?
             .len();
-        Ok(audio_samples_duration(
+        Ok(audio_elements_duration(
             queued_samples,
             self.sample_rate,
             self.channels,
@@ -441,7 +487,7 @@ impl AudioShared {
             .map_err(|_| "系统音频缓冲区已损坏".to_string())?
             .len();
         let buffer_lock_wait = lock_started_at.elapsed();
-        let queued_duration_nsecs = duration_nsecs(audio_samples_duration(
+        let queued_duration_nsecs = duration_nsecs(audio_elements_duration(
             queued_samples,
             self.sample_rate,
             self.channels,
@@ -590,20 +636,46 @@ impl AudioOutput {
         self.channels
     }
 
+    pub(super) fn misaligned_audio_buffer_count(&self) -> u64 {
+        self.shared
+            .misaligned_audio_buffer_count
+            .load(Ordering::Relaxed)
+    }
+
     pub(super) fn try_push_timed(
         &self,
-        samples: Vec<f32>,
+        mut samples: Vec<f32>,
         start_timeline_nsecs: u64,
         end_timeline_nsecs: u64,
         control: &FfmpegControl,
     ) -> std::result::Result<AudioOutputPushResult, String> {
         let started_at = Instant::now();
+        let original_sample_count = samples.len();
+        let aligned_sample_count =
+            align_audio_elements_to_frame_boundary(original_sample_count, self.channels);
+        if aligned_sample_count < original_sample_count {
+            samples.truncate(aligned_sample_count);
+            let misaligned_audio_buffer_count = self
+                .shared
+                .misaligned_audio_buffer_count
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            tracing::warn!(
+                original_sample_count,
+                aligned_sample_count,
+                dropped_audio_elements = original_sample_count.saturating_sub(aligned_sample_count),
+                channels = self.channels,
+                misaligned_audio_buffer_count,
+                "truncated misaligned interleaved audio buffer before native output queue"
+            );
+        }
         if samples.is_empty() || end_timeline_nsecs <= start_timeline_nsecs {
             log_audio_output_try_push_timed_timing(AudioOutputTryPushTimedTiming {
                 result: "queued_empty",
                 total: started_at.elapsed(),
                 queue_lock_wait: Duration::ZERO,
                 sample_count: samples.len(),
+                misaligned_audio_buffer_count: self.misaligned_audio_buffer_count(),
                 start_timeline_nsecs,
                 end_timeline_nsecs,
                 queued_frames: 0,
@@ -619,6 +691,7 @@ impl AudioOutput {
                 total: started_at.elapsed(),
                 queue_lock_wait: Duration::ZERO,
                 sample_count: samples.len(),
+                misaligned_audio_buffer_count: self.misaligned_audio_buffer_count(),
                 start_timeline_nsecs,
                 end_timeline_nsecs,
                 queued_frames: 0,
@@ -653,6 +726,7 @@ impl AudioOutput {
                 total: started_at.elapsed(),
                 queue_lock_wait,
                 sample_count,
+                misaligned_audio_buffer_count: self.misaligned_audio_buffer_count(),
                 start_timeline_nsecs,
                 end_timeline_nsecs,
                 queued_frames,
@@ -669,6 +743,7 @@ impl AudioOutput {
             total: started_at.elapsed(),
             queue_lock_wait,
             sample_count,
+            misaligned_audio_buffer_count: self.misaligned_audio_buffer_count(),
             start_timeline_nsecs,
             end_timeline_nsecs,
             queued_frames,
@@ -771,6 +846,7 @@ impl AudioOutput {
             shared_snapshot,
             queue_snapshot,
             underrun_recheck,
+            misaligned_audio_buffer_count: self.misaligned_audio_buffer_count(),
             snapshot,
         });
         Ok(snapshot)
@@ -782,6 +858,7 @@ struct AudioOutputTryPushTimedTiming {
     total: Duration,
     queue_lock_wait: Duration,
     sample_count: usize,
+    misaligned_audio_buffer_count: u64,
     start_timeline_nsecs: u64,
     end_timeline_nsecs: u64,
     queued_frames: usize,
@@ -793,6 +870,7 @@ struct AudioOutputSnapshotTiming {
     shared_snapshot: Duration,
     queue_snapshot: Duration,
     underrun_recheck: Duration,
+    misaligned_audio_buffer_count: u64,
     snapshot: AudioOutputSnapshot,
 }
 
@@ -802,6 +880,7 @@ fn log_audio_output_try_push_timed_timing(timing: AudioOutputTryPushTimedTiming)
         total_ms = timing.total.as_secs_f64() * 1000.0,
         queue_lock_wait_ms = timing.queue_lock_wait.as_secs_f64() * 1000.0,
         sample_count = timing.sample_count,
+        misaligned_audio_buffer_count = timing.misaligned_audio_buffer_count,
         start_timeline_nsecs = timing.start_timeline_nsecs,
         end_timeline_nsecs = timing.end_timeline_nsecs,
         queued_frames = timing.queued_frames,
@@ -818,6 +897,7 @@ fn log_audio_output_try_push_timed_timing(timing: AudioOutputTryPushTimedTiming)
         total_ms = timing.total.as_secs_f64() * 1000.0,
         queue_lock_wait_ms = timing.queue_lock_wait.as_secs_f64() * 1000.0,
         sample_count = timing.sample_count,
+        misaligned_audio_buffer_count = timing.misaligned_audio_buffer_count,
         start_timeline_nsecs = timing.start_timeline_nsecs,
         end_timeline_nsecs = timing.end_timeline_nsecs,
         queued_frames = timing.queued_frames,
@@ -860,6 +940,7 @@ fn log_audio_output_snapshot_timing(timing: AudioOutputSnapshotTiming) {
         shared_snapshot_ms = timing.shared_snapshot.as_secs_f64() * 1000.0,
         queue_snapshot_ms = timing.queue_snapshot.as_secs_f64() * 1000.0,
         underrun_recheck_ms = timing.underrun_recheck.as_secs_f64() * 1000.0,
+        misaligned_audio_buffer_count = timing.misaligned_audio_buffer_count,
         played_timeline_nsecs = timing.snapshot.played_timeline_nsecs,
         pending_ms = timing.snapshot.total_pending_nsecs as f64 / 1_000_000.0,
         shared_pending_ms = timing.snapshot.shared_pending_nsecs as f64 / 1_000_000.0,
@@ -880,6 +961,7 @@ fn log_audio_output_snapshot_timing(timing: AudioOutputSnapshotTiming) {
         shared_snapshot_ms = timing.shared_snapshot.as_secs_f64() * 1000.0,
         queue_snapshot_ms = timing.queue_snapshot.as_secs_f64() * 1000.0,
         underrun_recheck_ms = timing.underrun_recheck.as_secs_f64() * 1000.0,
+        misaligned_audio_buffer_count = timing.misaligned_audio_buffer_count,
         played_timeline_nsecs = timing.snapshot.played_timeline_nsecs,
         pending_ms = timing.snapshot.total_pending_nsecs as f64 / 1_000_000.0,
         shared_pending_ms = timing.snapshot.shared_pending_nsecs as f64 / 1_000_000.0,
@@ -1009,10 +1091,19 @@ fn run_audio_queue_worker(shared: Arc<AudioShared>, queue: Arc<AudioQueueShared>
         let generation = item.generation;
         let samples = item.samples.len();
         let duration_nsecs = item.duration_nsecs;
-        if let Err(error) = write_audio_queue_item(&shared, &queue, item) {
-            tracing::warn!(%error, "FFmpeg audio queue worker failed to write decoded audio");
+        let progress = match write_audio_queue_item(&shared, &queue, item) {
+            Ok(progress) => progress,
+            Err(error) => {
+                let progress = error.progress;
+                tracing::warn!(%error, "FFmpeg audio queue worker failed to write decoded audio");
+                progress
+            }
+        };
+        let remaining_samples = samples.saturating_sub(progress.samples);
+        let remaining_duration_nsecs = duration_nsecs.saturating_sub(progress.duration_nsecs);
+        if remaining_samples > 0 || remaining_duration_nsecs > 0 {
+            queue.finish_item(generation, remaining_samples, remaining_duration_nsecs);
         }
-        queue.finish_item(generation, samples, duration_nsecs);
     }
 }
 
@@ -1020,21 +1111,22 @@ fn write_audio_queue_item(
     shared: &AudioShared,
     queue: &AudioQueueShared,
     item: AudioQueueItem,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<AudioQueueWriteProgress, AudioQueueWriteError> {
     let mut offset = 0;
     let total_samples = item.samples.len();
+    let mut progress = AudioQueueWriteProgress::default();
     let mut wait_started_at = None;
     let mut next_wait_log_at = None;
 
     while offset < item.samples.len() {
         if shared.control.should_interrupt() || !queue.is_current_generation(item.generation) {
-            return Ok(());
+            return Ok(progress);
         }
 
         let mut guard = shared
             .buffer
             .lock()
-            .map_err(|_| "系统音频缓冲区已损坏".to_string())?;
+            .map_err(|_| AudioQueueWriteError::new("系统音频缓冲区已损坏", progress))?;
         while guard.available_capacity() == 0
             && !shared.control.should_interrupt()
             && queue.is_current_generation(item.generation)
@@ -1042,7 +1134,7 @@ fn write_audio_queue_item(
             let (next_guard, _) = shared
                 .ready
                 .wait_timeout(guard, SCHEDULER_POLL_INTERVAL)
-                .map_err(|_| "系统音频缓冲区已损坏".to_string())?;
+                .map_err(|_| AudioQueueWriteError::new("系统音频缓冲区已损坏", progress))?;
             guard = next_guard;
 
             let now = Instant::now();
@@ -1062,29 +1154,45 @@ fn write_audio_queue_item(
         }
 
         if shared.control.should_interrupt() || !queue.is_current_generation(item.generation) {
-            return Ok(());
+            return Ok(progress);
         }
 
         let capacity = guard.available_capacity();
         if capacity == 0 {
             continue;
         }
+        let previous_offset = offset;
         let end = (offset + capacity).min(item.samples.len());
         let written = guard.push_slice(&item.samples[offset..end]);
         offset += written;
-        if total_samples > 0 {
-            shared.set_queued_end_timeline_nsecs(interpolated_audio_timeline_nsecs(
+        drop(guard);
+
+        if total_samples > 0 && written > 0 {
+            let previous_timeline_nsecs = interpolated_audio_timeline_nsecs(
+                item.start_timeline_nsecs,
+                item.end_timeline_nsecs,
+                previous_offset,
+                total_samples,
+            );
+            let current_timeline_nsecs = interpolated_audio_timeline_nsecs(
                 item.start_timeline_nsecs,
                 item.end_timeline_nsecs,
                 offset,
                 total_samples,
-            ));
+            );
+            shared.set_queued_end_timeline_nsecs(current_timeline_nsecs);
+            let written_duration_nsecs =
+                current_timeline_nsecs.saturating_sub(previous_timeline_nsecs);
+            queue.finish_item(item.generation, written, written_duration_nsecs);
+            progress.samples = progress.samples.saturating_add(written);
+            progress.duration_nsecs = progress
+                .duration_nsecs
+                .saturating_add(written_duration_nsecs);
         }
         shared.ready.notify_all();
-        drop(guard);
     }
 
-    Ok(())
+    Ok(progress)
 }
 
 struct AudioDeviceCandidate {
@@ -1283,6 +1391,15 @@ fn fill_audio_output_samples<T>(
         for sample in data.iter_mut() {
             *sample = T::from_sample(0.0);
         }
+        tracing::trace!(
+            callback_index,
+            output_samples = data.len(),
+            silence_fill_reason = "paused",
+            clock_mode = AudioClockMode::AudioStarted.as_str(),
+            misaligned_audio_buffer_count =
+                shared.misaligned_audio_buffer_count.load(Ordering::Relaxed),
+            "native audio output callback filled silence while paused"
+        );
         shared.update_output_delay(Duration::ZERO);
         shared.ready.notify_all();
         return;
@@ -1308,7 +1425,7 @@ fn fill_audio_output_samples<T>(
 
     if played > 0 {
         shared.played_samples.fetch_add(played, Ordering::Relaxed);
-        let played_duration = audio_samples_duration(
+        let played_duration = audio_elements_duration(
             usize::try_from(played).unwrap_or(usize::MAX),
             shared.sample_rate,
             shared.channels,
@@ -1323,11 +1440,12 @@ fn fill_audio_output_samples<T>(
     }
     let underrun_samples = output_samples.saturating_sub(usize::try_from(played).unwrap_or(0));
     if underrun_samples > 0 {
-        let queued_duration_after_nsecs = duration_nsecs(audio_samples_duration(
+        let queued_duration_after_nsecs = duration_nsecs(audio_elements_duration(
             queued_samples_after,
             shared.sample_rate,
             shared.channels,
         ));
+        let audio_gap_frames = audio_frames_for_elements(underrun_samples, shared.channels);
         let underrun_timeline_nsecs =
             shared.played_timeline_nsecs_from_pending(queued_duration_after_nsecs);
         let underrun_started = shared.mark_underrun(underrun_timeline_nsecs);
@@ -1340,12 +1458,17 @@ fn fill_audio_output_samples<T>(
                 callback_index,
                 underrun_count = underrun_index,
                 underrun_samples,
+                audio_gap_frames,
                 played_samples = played,
                 output_samples,
                 queued_samples_before,
                 queued_samples_after,
                 underrun_started,
                 underrun_timeline_nsecs,
+                silence_fill_reason = "underrun",
+                clock_mode = AudioClockMode::UnderrunRecovery.as_str(),
+                misaligned_audio_buffer_count =
+                    shared.misaligned_audio_buffer_count.load(Ordering::Relaxed),
                 "native audio output callback filled silence after underrun"
             );
         }
@@ -1402,29 +1525,45 @@ pub(super) fn audio_sample_len(
     samples: c_int,
     channels: c_int,
 ) -> std::result::Result<usize, String> {
-    if samples < 0 || channels <= 0 {
+    audio_elements_for_frames_checked(samples, channels)
+}
+
+pub(super) fn audio_elements_for_frames_checked(
+    frames: c_int,
+    channels: c_int,
+) -> std::result::Result<usize, String> {
+    if frames < 0 || channels <= 0 {
         return Err("音频帧尺寸无效".to_string());
     }
-    usize::try_from(samples)
+    usize::try_from(frames)
         .ok()
-        .and_then(|samples| samples.checked_mul(usize::try_from(channels).ok()?))
+        .and_then(|frames| frames.checked_mul(usize::try_from(channels).ok()?))
         .ok_or_else(|| "音频帧过大".to_string())
 }
 
+#[cfg(test)]
 pub(super) fn audio_samples_duration(
     samples: usize,
     sample_rate: c_int,
     channels: c_int,
 ) -> Duration {
-    if samples == 0 || sample_rate <= 0 || channels <= 0 {
+    audio_elements_duration(samples, sample_rate, channels)
+}
+
+pub(super) fn audio_elements_duration(
+    elements: usize,
+    sample_rate: c_int,
+    channels: c_int,
+) -> Duration {
+    duration_for_audio_frames(audio_frames_for_elements(elements, channels), sample_rate)
+}
+
+pub(super) fn duration_for_audio_frames(frames: u64, sample_rate: c_int) -> Duration {
+    if frames == 0 || sample_rate <= 0 {
         return Duration::ZERO;
     }
 
-    let denominator = (sample_rate as u128).saturating_mul(channels as u128);
-    if denominator == 0 {
-        return Duration::ZERO;
-    }
-    let nanos = (samples as u128).saturating_mul(1_000_000_000) / denominator;
+    let nanos = (frames as u128).saturating_mul(1_000_000_000) / sample_rate as u128;
     Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
@@ -1444,22 +1583,178 @@ fn interpolated_audio_timeline_nsecs(
     start_timeline_nsecs.saturating_add(u64::try_from(written_duration).unwrap_or(u64::MAX))
 }
 
+#[cfg(test)]
 pub(super) fn samples_for_duration(
     timeline_nsecs: u64,
     sample_rate: c_int,
     channels: c_int,
 ) -> u64 {
-    if timeline_nsecs == 0 || sample_rate <= 0 || channels <= 0 {
+    audio_elements_for_duration_floor(timeline_nsecs, sample_rate, channels)
+}
+
+pub(super) fn audio_elements_for_duration_floor(
+    timeline_nsecs: u64,
+    sample_rate: c_int,
+    channels: c_int,
+) -> u64 {
+    audio_elements_for_frames(
+        audio_frames_for_duration_floor(timeline_nsecs, sample_rate),
+        channels,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn audio_elements_for_duration_round(
+    timeline_nsecs: u64,
+    sample_rate: c_int,
+    channels: c_int,
+) -> u64 {
+    audio_elements_for_frames(
+        audio_frames_for_duration_round(timeline_nsecs, sample_rate),
+        channels,
+    )
+}
+
+pub(super) fn audio_frames_for_duration_floor(timeline_nsecs: u64, sample_rate: c_int) -> u64 {
+    if timeline_nsecs == 0 || sample_rate <= 0 {
         return 0;
     }
 
-    let samples = (timeline_nsecs as u128)
-        .saturating_mul(sample_rate as u128)
-        .saturating_mul(channels as u128)
-        / 1_000_000_000;
-    u64::try_from(samples).unwrap_or(u64::MAX)
+    let frames = (timeline_nsecs as u128).saturating_mul(sample_rate as u128) / 1_000_000_000;
+    u64::try_from(frames).unwrap_or(u64::MAX)
+}
+
+pub(super) fn audio_frames_for_duration_round(timeline_nsecs: u64, sample_rate: c_int) -> u64 {
+    if timeline_nsecs == 0 || sample_rate <= 0 {
+        return 0;
+    }
+
+    let numerator = (timeline_nsecs as u128).saturating_mul(sample_rate as u128);
+    let frames = numerator.saturating_add(500_000_000) / 1_000_000_000;
+    u64::try_from(frames).unwrap_or(u64::MAX)
+}
+
+pub(super) fn audio_elements_for_frames(frames: u64, channels: c_int) -> u64 {
+    if frames == 0 || channels <= 0 {
+        return 0;
+    }
+
+    frames.saturating_mul(channels as u64)
+}
+
+pub(super) fn audio_frames_for_elements(elements: usize, channels: c_int) -> u64 {
+    if elements == 0 || channels <= 0 {
+        return 0;
+    }
+
+    u64::try_from(elements / usize::try_from(channels).unwrap_or(usize::MAX)).unwrap_or(u64::MAX)
+}
+
+pub(super) fn align_audio_elements_to_frame_boundary(elements: usize, channels: c_int) -> usize {
+    if elements == 0 || channels <= 0 {
+        return 0;
+    }
+
+    let channels = usize::try_from(channels).unwrap_or(usize::MAX);
+    elements.saturating_sub(elements % channels)
 }
 
 pub(super) fn zeroed_channel_layout() -> ffi::AVChannelLayout {
     unsafe { std::mem::zeroed() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_output_queue_uses_short_output_backpressure_limit() {
+        let mut state = AudioQueueState::new();
+
+        assert!(state.can_accept());
+
+        state.queued_duration_nsecs = duration_nsecs(AUDIO_OUTPUT_QUEUE_LIMIT_DURATION) - 1;
+        assert!(state.can_accept());
+
+        state.queued_duration_nsecs = duration_nsecs(AUDIO_OUTPUT_QUEUE_LIMIT_DURATION);
+        assert!(!state.can_accept());
+    }
+
+    #[test]
+    fn audio_output_queue_keeps_eac3_recovery_margin() {
+        let mut state = AudioQueueState::new();
+        state.queued_duration_nsecs = duration_nsecs(
+            AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION.saturating_add(Duration::from_millis(32)),
+        );
+
+        assert!(state.can_accept());
+    }
+
+    #[test]
+    fn audio_queue_write_progress_removes_in_flight_pending_duration() {
+        let sample_rate = 48_000;
+        let channels = 2;
+        let samples = vec![0.25; 8];
+        let duration_nsecs = duration_nsecs(audio_elements_duration(
+            samples.len(),
+            sample_rate,
+            channels,
+        ));
+        let start_timeline_nsecs = 1_000_000_000u64;
+        let end_timeline_nsecs = start_timeline_nsecs.saturating_add(duration_nsecs);
+        let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
+        let shared = AudioShared::new(samples.len(), sample_rate, channels, Arc::clone(&control));
+        let queue = AudioQueueShared::new(control);
+        {
+            let mut state = queue.state.lock().unwrap();
+            state.queued_samples = samples.len();
+            state.queued_duration_nsecs = duration_nsecs;
+        }
+
+        let progress = write_audio_queue_item(
+            &shared,
+            &queue,
+            AudioQueueItem {
+                samples,
+                start_timeline_nsecs,
+                end_timeline_nsecs,
+                duration_nsecs,
+                generation: queue.generation(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(progress.samples, 8);
+        assert_eq!(progress.duration_nsecs, duration_nsecs);
+        assert_eq!(queue.snapshot().unwrap().pending_nsecs, 0);
+    }
+
+    #[test]
+    fn delayed_start_silence_uses_aligned_interleaved_elements_for_stereo_gaps() {
+        let first_gap_frames = audio_frames_for_duration_round(22_780_000, 44_100);
+        let first_gap_elements = audio_elements_for_frames(first_gap_frames, 2);
+        let second_gap_frames = audio_frames_for_duration_round(24_780_000, 44_100);
+        let second_gap_elements = audio_elements_for_frames(second_gap_frames, 2);
+
+        assert_eq!(first_gap_frames, 1_005);
+        assert_eq!(first_gap_elements, 2_010);
+        assert_eq!(first_gap_elements % 2, 0);
+        assert_eq!(second_gap_frames, 1_093);
+        assert_eq!(second_gap_elements, 2_186);
+        assert_eq!(second_gap_elements % 2, 0);
+    }
+
+    #[test]
+    fn audio_element_helpers_keep_interleaved_buffers_frame_aligned() {
+        assert_eq!(align_audio_elements_to_frame_boundary(2_009, 2), 2_008);
+        assert_eq!(align_audio_elements_to_frame_boundary(2_185, 2), 2_184);
+        assert_eq!(
+            audio_elements_for_duration_floor(22_780_000, 44_100, 2),
+            2_008
+        );
+        assert_eq!(
+            audio_elements_for_duration_round(22_780_000, 44_100, 2),
+            2_010
+        );
+    }
 }

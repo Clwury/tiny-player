@@ -40,6 +40,7 @@ impl PlaybackTrack {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PlaybackTrackSelection {
     pub audio_stream_index: Option<usize>,
+    pub default_audio_stream_index: Option<usize>,
     pub subtitle_stream_index: Option<usize>,
     pub subtitle_external_url: Option<String>,
     pub subtitle_codec: Option<String>,

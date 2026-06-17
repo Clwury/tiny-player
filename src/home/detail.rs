@@ -750,27 +750,25 @@ fn playback_track_selection(
     source: &crate::emby::MediaSource,
     subtitle_tracks: &[PlaybackTrack],
 ) -> PlaybackTrackSelection {
-    let audio_stream_index = source
-        .audio_streams()
-        .into_iter()
-        .find_map(|stream| {
-            stream
-                .index
-                .and_then(|index| usize::try_from(index).ok())
-                .filter(|_| stream.is_default.unwrap_or(false))
-        })
-        .or_else(|| {
-            source
-                .audio_streams()
-                .into_iter()
-                .find_map(|stream| stream.index.and_then(|index| usize::try_from(index).ok()))
-        });
+    let default_audio_stream_index = source.audio_streams().into_iter().find_map(|stream| {
+        stream
+            .index
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|_| stream.is_default.unwrap_or(false))
+    });
+    let audio_stream_index = default_audio_stream_index.or_else(|| {
+        source
+            .audio_streams()
+            .into_iter()
+            .find_map(|stream| stream.index.and_then(|index| usize::try_from(index).ok()))
+    });
     let selected_subtitle = detail
         .selected_subtitle_index()
         .and_then(|index| subtitle_tracks.get(index));
 
     let mut selection = PlaybackTrackSelection {
         audio_stream_index,
+        default_audio_stream_index,
         ..Default::default()
     };
     selection.set_subtitle_track(selected_subtitle);

@@ -28,7 +28,7 @@ impl PendingStartAudioFrame {
             return false;
         }
 
-        let drop_samples = samples_for_duration(
+        let drop_samples = audio_elements_for_duration_floor(
             timeline_nsecs.saturating_sub(self.start_timeline_nsecs),
             sample_rate,
             channels,
@@ -36,10 +36,7 @@ impl PendingStartAudioFrame {
         let Ok(mut drop_samples) = usize::try_from(drop_samples) else {
             return false;
         };
-        if channels > 0 {
-            let channels = usize::try_from(channels).unwrap_or(1);
-            drop_samples = drop_samples.saturating_sub(drop_samples % channels);
-        }
+        drop_samples = align_audio_elements_to_frame_boundary(drop_samples, channels);
         if drop_samples >= self.samples.len() {
             return false;
         }

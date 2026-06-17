@@ -124,6 +124,7 @@ pub(super) fn service_playback_tick(
     let video_admission_pressure = context.pipeline.video_packet_admission_pressure(
         output_gate_status.played_until_nsecs,
         output_gate_status.has_audio_output,
+        context.vo_queue.snapshot(),
     );
     let stage_started_at = Instant::now();
     let decoder_input_outcome =

@@ -1155,6 +1155,77 @@ fn timestamp_mapper_synthesizes_repeated_video_timestamps() {
 }
 
 #[test]
+fn timestamp_mapper_keeps_aac_millisecond_timestamps_sample_contiguous() {
+    let mut mapper = TimestampMapper::new(Some(0), 0, None);
+    let time_base = ffi::AVRational { num: 1, den: 1_000 };
+    let aac_frame_duration_nsecs = 23_219_954;
+
+    assert_eq!(
+        mapper.map_contiguous(
+            0,
+            time_base,
+            aac_frame_duration_nsecs,
+            PENDING_AUDIO_CONTINUITY_TOLERANCE
+        ),
+        MappedTimestamp {
+            timeline_nsecs: 0,
+            sink_nsecs: 0,
+        }
+    );
+    assert_eq!(
+        mapper.map_contiguous(
+            23,
+            time_base,
+            aac_frame_duration_nsecs,
+            PENDING_AUDIO_CONTINUITY_TOLERANCE
+        ),
+        MappedTimestamp {
+            timeline_nsecs: 23_219_954,
+            sink_nsecs: 23_219_954,
+        }
+    );
+    assert_eq!(
+        mapper.map_contiguous(
+            46,
+            time_base,
+            aac_frame_duration_nsecs,
+            PENDING_AUDIO_CONTINUITY_TOLERANCE
+        ),
+        MappedTimestamp {
+            timeline_nsecs: 46_439_908,
+            sink_nsecs: 46_439_908,
+        }
+    );
+}
+
+#[test]
+fn timestamp_mapper_keeps_large_audio_timestamp_gap() {
+    let mut mapper = TimestampMapper::new(Some(0), 0, None);
+    let time_base = ffi::AVRational { num: 1, den: 1_000 };
+    let aac_frame_duration_nsecs = 23_219_954;
+
+    mapper.map_contiguous(
+        0,
+        time_base,
+        aac_frame_duration_nsecs,
+        PENDING_AUDIO_CONTINUITY_TOLERANCE,
+    );
+
+    assert_eq!(
+        mapper.map_contiguous(
+            100,
+            time_base,
+            aac_frame_duration_nsecs,
+            PENDING_AUDIO_CONTINUITY_TOLERANCE
+        ),
+        MappedTimestamp {
+            timeline_nsecs: 100_000_000,
+            sink_nsecs: 100_000_000,
+        }
+    );
+}
+
+#[test]
 fn timestamp_mapper_keeps_missing_timestamps_at_seek_target() {
     let mut mapper = TimestampMapper::new(Some(0), 10_000_000_000, Some(40_000_000));
     let time_base = ffi::AVRational { num: 1, den: 1_000 };
@@ -1380,6 +1451,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         true,
         false,
         true,
+        false,
         PlaybackOutputState::Playing,
     ));
     assert!(underrun_started_at.is_none());
@@ -1392,6 +1464,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         true,
         false,
         true,
+        false,
         PlaybackOutputState::Playing,
     ));
     assert_eq!(underrun_started_at, Some(now));
@@ -1404,6 +1477,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         true,
         false,
         true,
+        false,
         PlaybackOutputState::Playing,
     ));
     assert!(video_output_rebuffer_should_enter(
@@ -1414,6 +1488,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         true,
         false,
         true,
+        false,
         PlaybackOutputState::Playing,
     ));
     assert!(!video_output_rebuffer_should_enter(
@@ -1424,6 +1499,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         true,
         false,
         true,
+        false,
         PlaybackOutputState::Rebuffering,
     ));
     assert_eq!(underrun_started_at, Some(now));
@@ -1436,6 +1512,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         true,
         false,
         true,
+        false,
         PlaybackOutputState::Playing,
     ));
 
@@ -1447,6 +1524,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         true,
         true,
         true,
+        false,
         PlaybackOutputState::Playing,
     ));
     assert!(underrun_started_at.is_none());
@@ -1459,6 +1537,7 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         true,
         false,
         true,
+        false,
         PlaybackOutputState::Playing,
     ));
     assert!(underrun_started_at.is_none());
@@ -1477,6 +1556,7 @@ fn video_output_rebuffer_waits_for_demux_cache_insufficient() {
         false,
         false,
         true,
+        false,
         PlaybackOutputState::Playing,
     ));
     assert!(underrun_started_at.is_none());
@@ -1495,9 +1575,53 @@ fn video_output_rebuffer_enters_on_output_underrun_even_when_demux_ready() {
         false,
         false,
         true,
+        false,
         PlaybackOutputState::Playing,
     ));
     assert_eq!(underrun_started_at, Some(now));
+}
+
+#[test]
+fn video_output_rebuffer_allows_fast_pending_audio_recovery_on_underrun() {
+    let now = Instant::now();
+    let mut underrun_started_at = None;
+
+    assert!(!video_output_rebuffer_should_enter(
+        &mut underrun_started_at,
+        now,
+        true,
+        true,
+        false,
+        false,
+        true,
+        true,
+        PlaybackOutputState::Playing,
+    ));
+    assert_eq!(underrun_started_at, Some(now));
+
+    assert!(!video_output_rebuffer_should_enter(
+        &mut underrun_started_at,
+        now + VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER - Duration::from_millis(1),
+        true,
+        true,
+        false,
+        false,
+        true,
+        true,
+        PlaybackOutputState::Playing,
+    ));
+
+    assert!(video_output_rebuffer_should_enter(
+        &mut underrun_started_at,
+        now + VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER,
+        true,
+        true,
+        false,
+        false,
+        true,
+        true,
+        PlaybackOutputState::Playing,
+    ));
 }
 
 #[test]
@@ -1513,6 +1637,7 @@ fn video_output_rebuffer_keeps_wait_timer_while_rebuffering() {
         true,
         false,
         true,
+        false,
         PlaybackOutputState::Rebuffering,
     ));
     assert_eq!(underrun_started_at, Some(now));
@@ -1531,6 +1656,7 @@ fn video_output_rebuffer_enters_immediately_after_output_underrun() {
         true,
         false,
         true,
+        false,
         PlaybackOutputState::Playing,
     ));
     assert_eq!(underrun_started_at, Some(now));
@@ -1593,6 +1719,7 @@ fn output_scheduler_enters_rebuffer_and_updates_first_frame_gate() {
         true,
         false,
         true,
+        false,
         &control,
         None,
         PlaybackSessionId(7),
@@ -1652,7 +1779,7 @@ fn output_scheduler_snapshot_reports_decoded_output_watermarks() {
 #[test]
 fn output_scheduler_backpressures_large_pending_start_audio() {
     let mut scheduler = PlaybackOutputScheduler::new();
-    scheduler.set_state(PlaybackOutputState::Playing);
+    scheduler.set_state(PlaybackOutputState::Rebuffering);
 
     assert!(!scheduler.pending_start_audio_backpressured());
 
@@ -1663,6 +1790,92 @@ fn output_scheduler_backpressures_large_pending_start_audio() {
         },
         1_000_000_000,
         1_000_000_000 + duration_nsecs(PENDING_START_AUDIO_BACKPRESSURE_DURATION),
+    );
+
+    assert!(scheduler.pending_start_audio_backpressured());
+}
+
+#[test]
+fn output_scheduler_allows_one_playing_pending_audio_frame_below_steady_limit() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+    let duration_nsecs =
+        duration_nsecs(AUDIO_OUTPUT_DELAY_LIMIT.saturating_add(AUDIO_OUTPUT_VIDEO_LEAD_DURATION))
+            - 1;
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs,
+        },
+        1_000_000_000,
+        1_000_000_000 + duration_nsecs,
+    );
+
+    assert!(!scheduler.pending_start_audio_backpressured());
+}
+
+#[test]
+fn output_scheduler_backpressures_playing_pending_audio_at_steady_limit() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+    let duration_nsecs =
+        duration_nsecs(AUDIO_OUTPUT_DELAY_LIMIT.saturating_add(AUDIO_OUTPUT_VIDEO_LEAD_DURATION));
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs,
+        },
+        1_000_000_000,
+        1_000_000_000 + duration_nsecs,
+    );
+
+    assert!(scheduler.pending_start_audio_backpressured());
+}
+
+#[test]
+fn output_scheduler_allows_only_one_playing_frame_to_cross_steady_limit() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+    let limit_nsecs =
+        duration_nsecs(AUDIO_OUTPUT_DELAY_LIMIT.saturating_add(AUDIO_OUTPUT_VIDEO_LEAD_DURATION));
+    let first_duration_nsecs = limit_nsecs - 1;
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: first_duration_nsecs,
+        },
+        1_000_000_000,
+        1_000_000_000 + first_duration_nsecs,
+    );
+
+    assert!(!scheduler.pending_start_audio_backpressured());
+
+    let second_start_nsecs = 1_000_000_000 + first_duration_nsecs;
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 40_000_000,
+        },
+        second_start_nsecs,
+        second_start_nsecs + 40_000_000,
+    );
+
+    assert!(scheduler.snapshot().pending_start_audio_nsecs > limit_nsecs);
+    assert!(scheduler.pending_start_audio_backpressured());
+}
+
+#[test]
+fn output_scheduler_backpressures_extreme_playing_pending_audio() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+    let duration_nsecs = duration_nsecs(Duration::from_secs(86));
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs,
+        },
+        1_000_000_000,
+        1_000_000_000 + duration_nsecs,
     );
 
     assert!(scheduler.pending_start_audio_backpressured());
@@ -2399,6 +2612,7 @@ fn video_decode_skips_nonref_frames_under_decode_pressure() {
         &queued,
         Some(1_000_000_000),
         true,
+        None,
         false,
     ));
     assert!(!video_decode_should_skip_nonref_for_pressure(
@@ -2406,6 +2620,7 @@ fn video_decode_skips_nonref_frames_under_decode_pressure() {
         &queued,
         Some(1_000_000_000),
         false,
+        None,
         false,
     ));
     assert!(!video_decode_should_skip_nonref_for_pressure(
@@ -2413,6 +2628,7 @@ fn video_decode_skips_nonref_frames_under_decode_pressure() {
         &queued,
         Some(1_000_000_000),
         true,
+        None,
         false,
     ));
     assert!(video_decode_should_skip_nonref_for_pressure(
@@ -2420,6 +2636,7 @@ fn video_decode_skips_nonref_frames_under_decode_pressure() {
         &queued,
         Some(1_000_000_000),
         true,
+        None,
         false,
     ));
 
@@ -2430,6 +2647,7 @@ fn video_decode_skips_nonref_frames_under_decode_pressure() {
         &queued,
         Some(1_000_000_000),
         true,
+        None,
         false,
     ));
 }
@@ -2445,6 +2663,7 @@ fn video_decode_skip_pressure_uses_short_vulkan_low_water() {
         &queued,
         Some(1_000_000_000),
         true,
+        None,
         false,
     ));
 
@@ -2456,6 +2675,32 @@ fn video_decode_skip_pressure_uses_short_vulkan_low_water() {
         &queued,
         Some(1_000_000_000),
         true,
+        None,
+        false,
+    ));
+}
+
+#[test]
+fn video_decode_skip_pressure_uses_audio_low_water_for_vulkan_catchup() {
+    let mut queued = VecDeque::new();
+    queued.push_back(test_vulkan_queued_video_frame(1_000_000_000));
+    queued.push_back(test_vulkan_queued_video_frame(1_300_000_000));
+
+    assert!(video_decode_should_skip_nonref_for_pressure(
+        PlaybackOutputState::Playing,
+        &queued,
+        Some(1_000_000_000),
+        true,
+        Some(duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION) - 1),
+        false,
+    ));
+
+    assert!(!video_decode_should_skip_nonref_for_pressure(
+        PlaybackOutputState::Playing,
+        &queued,
+        Some(1_000_000_000),
+        true,
+        Some(duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION)),
         false,
     ));
 }
@@ -2471,6 +2716,7 @@ fn video_decode_skip_pressure_uses_vulkan_hysteresis_when_active() {
         &queued,
         Some(1_000_000_000),
         true,
+        None,
         false,
     ));
     assert!(video_decode_should_skip_nonref_for_pressure(
@@ -2478,6 +2724,7 @@ fn video_decode_skip_pressure_uses_vulkan_hysteresis_when_active() {
         &queued,
         Some(1_000_000_000),
         true,
+        None,
         true,
     ));
 }
@@ -3512,6 +3759,7 @@ fn pending_start_audio_buffers_decoded_audio_until_first_video() {
 
     assert_eq!(pending.len(), 2);
     assert_eq!(pending.queued_samples(), 10);
+    assert_eq!(pending.buffered_duration(), Duration::from_millis(50));
 }
 
 #[test]

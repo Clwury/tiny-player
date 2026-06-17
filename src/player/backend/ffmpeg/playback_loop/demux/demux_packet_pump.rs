@@ -158,7 +158,9 @@ impl DemuxPacketPump {
         &mut self,
         context: &mut DemuxPacketPumpAdmissionContext<'_>,
     ) -> DemuxPacketPumpResult {
-        let decoder_input = context.pipeline.decoder_input_snapshot();
+        let decoder_input = context
+            .pipeline
+            .decoder_input_snapshot(context.video_admission_pressure.output_resource_pressure);
         let demux_read_result = self.poll_packet(DemuxPacketPumpContext {
             session_id: context.session_id,
             demux_cache: context.demux_cache,
@@ -631,6 +633,7 @@ mod tests {
             ),
             skip_nonref_for_pressure: false,
             played_until_nsecs: Some(1_000_000_000),
+            output_resource_pressure: false,
         };
 
         assert!(!demux_pump_should_wait_for_cache_lock(
@@ -663,6 +666,7 @@ mod tests {
             ),
             skip_nonref_for_pressure: false,
             played_until_nsecs: Some(1_000_000_000),
+            output_resource_pressure: false,
         };
         let draining_output = VideoPacketAdmissionPressure {
             output_snapshot: playback_output_snapshot_for_test(
@@ -671,6 +675,7 @@ mod tests {
             ),
             skip_nonref_for_pressure: false,
             played_until_nsecs: Some(1_000_000_000),
+            output_resource_pressure: false,
         };
         let empty_decoder_input = decoder_input_snapshot(Vec::new(), 0, None, None);
 
@@ -704,6 +709,7 @@ mod tests {
             ),
             skip_nonref_for_pressure: false,
             played_until_nsecs: Some(1_000_000_000),
+            output_resource_pressure: false,
         };
 
         assert!(demux_pump_should_wait_for_cache_lock(
@@ -724,6 +730,7 @@ mod tests {
             ),
             skip_nonref_for_pressure: false,
             played_until_nsecs: Some(1_000_000_000),
+            output_resource_pressure: false,
         };
 
         assert!(!demux_pump_should_wait_for_cache_lock(
@@ -746,6 +753,7 @@ mod tests {
             ),
             skip_nonref_for_pressure: false,
             played_until_nsecs: Some(1_000_000_000),
+            output_resource_pressure: false,
         };
         let draining_output = VideoPacketAdmissionPressure {
             output_snapshot: playback_output_snapshot_for_test(
@@ -754,6 +762,7 @@ mod tests {
             ),
             skip_nonref_for_pressure: false,
             played_until_nsecs: Some(1_000_000_000),
+            output_resource_pressure: false,
         };
 
         assert!(!demux_pump_should_wait_for_cache_lock(
@@ -786,6 +795,7 @@ mod tests {
             ),
             skip_nonref_for_pressure: false,
             played_until_nsecs: Some(1_000_000_000),
+            output_resource_pressure: false,
         };
 
         assert!(demux_pump_should_wait_for_cache_lock(

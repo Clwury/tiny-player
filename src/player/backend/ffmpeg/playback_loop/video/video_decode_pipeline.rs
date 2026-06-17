@@ -27,6 +27,7 @@ pub(super) struct VideoPacketAdmissionPressure {
     pub(super) output_snapshot: PlaybackOutputSnapshot,
     pub(super) skip_nonref_for_pressure: bool,
     pub(super) played_until_nsecs: Option<u64>,
+    pub(super) output_resource_pressure: bool,
 }
 
 #[derive(Default)]

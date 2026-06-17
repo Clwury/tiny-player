@@ -1,7 +1,8 @@
 use super::audio_decode_worker::AudioDecodeWorkerSnapshot;
 use super::demux_cache::DemuxPacketQueueSnapshot;
 use super::playback_block::{
-    video_decode_block_reason_with_output_queue, video_output_resource_pressure,
+    VideoOutputResourcePressure, video_decode_block_reason_with_output_queue,
+    video_output_resource_pressure,
 };
 use super::subtitle_decode_worker::SubtitleDecodeWorkerSnapshot;
 use super::video_decode_worker::VideoDecodeWorkerSnapshot;
@@ -14,6 +15,7 @@ const PLAYBACK_PIPELINE_SNAPSHOT_LOG_INTERVAL: Duration = Duration::from_millis(
 pub(super) struct PlaybackPipelineSnapshotContext<'a> {
     pub(super) demux_cache: &'a DemuxPacketCache,
     pub(super) video_decode_pipeline: &'a VideoDecodePipeline,
+    pub(super) video_frame_duration_nsecs: u64,
     pub(super) video_frame_prepare_worker: Option<&'a VideoFramePrepareWorker>,
     pub(super) audio_decode_pipeline: Option<&'a AudioDecodePipeline>,
     pub(super) subtitle_pipeline: &'a SubtitlePipeline,
@@ -49,6 +51,13 @@ impl PlaybackPipelineSnapshot {
             context.demux_cache.monitor_snapshot();
         let demux_read_blocked_for = context.demux_cache.demux_read_blocked_for();
         let video_decode_snapshot = context.video_decode_pipeline.snapshot();
+        let vo_snapshot = context.vo_queue.snapshot();
+        let audio_output_snapshot = context
+            .audio_output
+            .and_then(|output| output.snapshot().ok());
+        let output_snapshot = context.output_scheduler.snapshot_for_played_until(
+            audio_output_snapshot.map(|snapshot| snapshot.played_timeline_nsecs),
+        );
         let scheduled_video_queue_limit_reached = context
             .output_scheduler
             .scheduled_video_queue_limit_reached(context.subtitle_pipeline.needs_prefetch());
@@ -57,14 +66,21 @@ impl PlaybackPipelineSnapshot {
                 video_decode_snapshot,
                 context.video_decode_pipeline.info(),
             ),
-            video_output_resource_pressure(
-                context.output_scheduler.scheduled_video_queue_len(),
-                video_decode_snapshot.queued_frames,
-                video_decode_snapshot.in_flight_packets,
-                context.video_decode_pipeline.info().hardware_accelerated,
+            video_output_resource_pressure(VideoOutputResourcePressure {
+                scheduled_video_frames: context.output_scheduler.scheduled_video_queue_len(),
+                decoded_video_frames: video_decode_snapshot.queued_frames,
+                in_flight_video_packets: video_decode_snapshot.in_flight_packets,
+                hardware_accelerated: context.video_decode_pipeline.info().hardware_accelerated,
                 scheduled_video_queue_limit_reached,
-                context.output_scheduler.output_fill_phase(),
-            ),
+                fill_phase_for_output_start: context.output_scheduler.output_fill_phase(),
+                video_frame_duration_nsecs: context.video_frame_duration_nsecs,
+                vo_queue_capacity: vo_snapshot.queue_capacity,
+                vo_queued_frames: vo_snapshot.queued_frames,
+                queued_video_forward_nsecs: output_snapshot.queued_video_forward_nsecs,
+                audio_output_pending_nsecs: audio_output_snapshot
+                    .map(|snapshot| snapshot.total_pending_nsecs),
+                render_backlogged: vo_snapshot.render_backlogged(),
+            }),
         );
         let video_frame_prepare_snapshot = context
             .video_frame_prepare_worker
@@ -79,13 +95,6 @@ impl PlaybackPipelineSnapshot {
         let subtitle_decode_snapshot = context.subtitle_pipeline.snapshot();
         let subtitle_decode_blocked_on =
             subtitle_decode_snapshot.and_then(SubtitlePipeline::block_reason_for);
-        let vo_snapshot = context.vo_queue.snapshot();
-        let audio_output_snapshot = context
-            .audio_output
-            .and_then(|output| output.snapshot().ok());
-        let output_snapshot = context.output_scheduler.snapshot_for_played_until(
-            audio_output_snapshot.map(|snapshot| snapshot.played_timeline_nsecs),
-        );
         let blocked_reasons = Self::resolve_block_reasons(
             vo_snapshot,
             video_decode_blocked_on,

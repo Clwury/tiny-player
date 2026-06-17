@@ -216,6 +216,7 @@ impl ScheduledVideoQueue {
         output_state: PlaybackOutputState,
         played_until_nsecs: Option<u64>,
         has_audio_output: bool,
+        audio_output_pending_nsecs: Option<u64>,
         skip_nonref_active: bool,
     ) -> bool {
         video_decode_should_skip_nonref_for_pressure(
@@ -223,6 +224,7 @@ impl ScheduledVideoQueue {
             &self.frames,
             played_until_nsecs,
             has_audio_output,
+            audio_output_pending_nsecs,
             skip_nonref_active,
         )
     }

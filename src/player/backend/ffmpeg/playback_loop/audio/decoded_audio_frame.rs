@@ -28,7 +28,13 @@ pub(super) fn service_decoded_audio_frame(
     };
 
     let raw_timestamp = decoded_frame.raw_timestamp;
-    let timestamp = audio_clock.map(raw_timestamp, audio_time_base);
+    let audio = decoded_frame.audio;
+    let timestamp = audio_clock.map_contiguous(
+        raw_timestamp,
+        audio_time_base,
+        audio.duration_nsecs,
+        PENDING_AUDIO_CONTINUITY_TOLERANCE,
+    );
     if timestamp.timeline_nsecs < current_start_position_nsecs {
         *dropped_audio_frames_before_start_count =
             (*dropped_audio_frames_before_start_count).saturating_add(1);
@@ -55,7 +61,6 @@ pub(super) fn service_decoded_audio_frame(
         return Ok(());
     }
 
-    let audio = decoded_frame.audio;
     let buffered_until_nsecs = timestamp
         .timeline_nsecs
         .saturating_add(audio.duration_nsecs);

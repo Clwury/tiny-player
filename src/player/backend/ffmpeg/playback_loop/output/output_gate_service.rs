@@ -1,6 +1,5 @@
 use super::output_gate::{OutputGateResumeStatus, service_output_gate_resume_if_ready};
 use super::output_rebuffer::demux_reader_ready_for_output;
-use super::playback_block::video_output_resource_pressure;
 use super::playback_snapshot::PlaybackPipelineTelemetry;
 use super::playback_wait_service::{PlaybackPipelineWaitContext, PlaybackPipelineWaitService};
 use super::*;
@@ -30,6 +29,7 @@ pub(super) struct OutputGateServiceStatus {
     pub(super) video_output_waiting_for_demux: bool,
     pub(super) played_until_nsecs: Option<u64>,
     pub(super) has_audio_output: bool,
+    pub(super) output_resource_pressure: bool,
 }
 
 impl OutputGateServiceStatus {
@@ -60,27 +60,7 @@ fn service_output_gate_or_wait(
     timing.status = stage_started_at.elapsed();
     let current_start_position_nsecs = context.pipeline.current_start_position_nsecs;
     let stage_started_at = Instant::now();
-    let video_decode_snapshot = context.pipeline.video_decode_pipeline.snapshot();
-    let output_resource_pressure = video_output_resource_pressure(
-        context
-            .pipeline
-            .output_scheduler
-            .scheduled_video_queue_len(),
-        video_decode_snapshot.queued_frames,
-        video_decode_snapshot.in_flight_packets,
-        context
-            .pipeline
-            .video_decode_pipeline
-            .info()
-            .hardware_accelerated,
-        context
-            .pipeline
-            .output_scheduler
-            .scheduled_video_queue_limit_reached(
-                context.pipeline.subtitle_pipeline.needs_prefetch(),
-            ),
-        context.pipeline.output_scheduler.output_fill_phase(),
-    );
+    let output_resource_pressure = status.output_resource_pressure;
     timing.resource_pressure = stage_started_at.elapsed();
     let stage_started_at = Instant::now();
     let resume_status = service_output_gate_resume_if_ready(
@@ -166,6 +146,10 @@ fn output_gate_service_status(
         .snapshot_for_played_until(played_until_nsecs);
     let output_underflowing = output_snapshot.underflowing()
         || audio_output_starving(output_snapshot, audio_output_snapshot);
+    let pending_audio_recoverable = context
+        .pipeline
+        .output_scheduler
+        .pending_start_audio_can_recover_output(audio_output_snapshot);
     let demux_cache_insufficient = !demux_reader_ready_for_output(
         context.demux_cache.cached_reader_watermark(),
         has_audio_output,
@@ -180,6 +164,7 @@ fn output_gate_service_status(
             demux_cache_insufficient,
             render_backlogged,
             has_audio_output,
+            pending_audio_recoverable,
             context.control,
             context.pipeline.audio_output.as_ref(),
             context.session_id,
@@ -190,6 +175,11 @@ fn output_gate_service_status(
         .output_scheduler
         .snapshot()
         .should_wait_for_demux();
+    let output_resource_pressure = context.pipeline.video_output_resource_pressure_for(
+        output_snapshot,
+        vo_snapshot,
+        audio_output_snapshot.map(|snapshot| snapshot.total_pending_nsecs),
+    );
 
     Ok(OutputGateServiceStatus {
         outcome: OutputGateServiceOutcome::Ready,
@@ -197,6 +187,7 @@ fn output_gate_service_status(
         video_output_waiting_for_demux: output_snapshot.waiting_for_demux(),
         played_until_nsecs,
         has_audio_output,
+        output_resource_pressure,
     })
 }
 
@@ -218,6 +209,7 @@ fn observe_output_gate_stall(
             session_id: context.session_id,
             demux_cache: context.demux_cache,
             video_decode_pipeline: &context.pipeline.video_decode_pipeline,
+            video_frame_duration_nsecs: context.pipeline.video_frame_duration_nsecs,
             video_frame_prepare_worker: Some(&context.pipeline.video_frame_prepare_worker),
             audio_decode_pipeline: context.pipeline.audio_decode_pipeline.as_ref(),
             subtitle_pipeline: &context.pipeline.subtitle_pipeline,
@@ -295,6 +287,7 @@ mod tests {
             video_output_waiting_for_demux: false,
             played_until_nsecs: None,
             has_audio_output: true,
+            output_resource_pressure: false,
         };
 
         assert!(status.should_continue());
@@ -315,6 +308,7 @@ mod tests {
             video_output_waiting_for_demux: false,
             played_until_nsecs: Some(1_000_000_000),
             has_audio_output: true,
+            output_resource_pressure: false,
         };
 
         let status = output_gate_service_status_after_resume(

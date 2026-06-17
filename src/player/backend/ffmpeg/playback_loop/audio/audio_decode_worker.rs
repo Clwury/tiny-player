@@ -604,3 +604,57 @@ fn run_audio_decode_worker(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn worker_for_test() -> AudioDecodeWorker {
+        let (command_tx, _command_rx) = mpsc::sync_channel(1);
+        let (_result_tx, result_rx) = mpsc::sync_channel(1);
+        AudioDecodeWorker {
+            command_tx,
+            result_rx,
+            handle: None,
+            info: AudioDecodeWorkerInfo {
+                stream_index: 1,
+                time_base: ffi::AVRational { num: 1, den: 1000 },
+                output_rate: 48_000,
+                output_channels: 2,
+            },
+            decoded_frames: VecDeque::new(),
+            completed_packets: VecDeque::new(),
+            decoded_duration_nsecs: 0,
+            decoded_duration_limit_nsecs: duration_nsecs(AUDIO_DECODE_QUEUE_LIMIT_DURATION),
+            in_flight_packets: 0,
+            flush_generation: None,
+            flush_command_sent: false,
+            drain_generation: None,
+            drain_command_sent: false,
+            drain_frames: Vec::new(),
+            completed_drains: VecDeque::new(),
+            draining: false,
+            recovering: false,
+            eof: false,
+        }
+    }
+
+    #[test]
+    fn decoded_audio_queue_limit_is_one_second() {
+        let worker = worker_for_test();
+
+        assert_eq!(
+            worker.snapshot().duration_limit_nsecs,
+            duration_nsecs(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn decoded_audio_queue_reports_full_at_limit() {
+        let mut worker = worker_for_test();
+        worker.decoded_duration_nsecs = duration_nsecs(AUDIO_DECODE_QUEUE_LIMIT_DURATION);
+
+        assert!(worker.output_full());
+        assert_eq!(worker.state(), AudioDecodeWorkerState::OutputFull);
+    }
+}

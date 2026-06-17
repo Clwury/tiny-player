@@ -163,6 +163,7 @@ fn wait_after_output_drain_stall(context: &mut OutputDrainContext<'_>, stall_rea
             session_id: context.session_id,
             demux_cache: context.demux_cache,
             video_decode_pipeline: &context.pipeline.video_decode_pipeline,
+            video_frame_duration_nsecs: context.pipeline.video_frame_duration_nsecs,
             video_frame_prepare_worker: Some(&context.pipeline.video_frame_prepare_worker),
             audio_decode_pipeline: context.pipeline.audio_decode_pipeline.as_ref(),
             subtitle_pipeline: &context.pipeline.subtitle_pipeline,

@@ -200,6 +200,7 @@ pub(super) struct TimestampMapper {
     start_position_nsecs: u64,
     fallback_step_nsecs: u64,
     last_timeline_nsecs: Option<u64>,
+    last_contiguous_end_nsecs: Option<u64>,
 }
 
 impl TimestampMapper {
@@ -214,6 +215,7 @@ impl TimestampMapper {
             start_position_nsecs,
             fallback_step_nsecs: fallback_step_nsecs.unwrap_or(1),
             last_timeline_nsecs: None,
+            last_contiguous_end_nsecs: None,
         }
     }
 
@@ -236,6 +238,30 @@ impl TimestampMapper {
             timeline_nsecs,
             sink_nsecs: timeline_nsecs.saturating_sub(self.start_position_nsecs),
         }
+    }
+
+    pub(super) fn map_contiguous(
+        &mut self,
+        timestamp: i64,
+        time_base: ffi::AVRational,
+        frame_duration_nsecs: u64,
+        continuity_tolerance: Duration,
+    ) -> MappedTimestamp {
+        let previous_end_nsecs = self.last_contiguous_end_nsecs;
+        let mut mapped = self.map(timestamp, time_base);
+        if let Some(previous_end_nsecs) = previous_end_nsecs {
+            let drift_nsecs = mapped.timeline_nsecs.abs_diff(previous_end_nsecs);
+            if drift_nsecs <= duration_nsecs(continuity_tolerance) {
+                mapped.timeline_nsecs = previous_end_nsecs;
+                mapped.sink_nsecs = mapped
+                    .timeline_nsecs
+                    .saturating_sub(self.start_position_nsecs);
+                self.last_timeline_nsecs = Some(mapped.timeline_nsecs);
+            }
+        }
+        self.last_contiguous_end_nsecs =
+            Some(mapped.timeline_nsecs.saturating_add(frame_duration_nsecs));
+        mapped
     }
 
     pub(super) fn timeline_origin_nsecs(&self) -> Option<u64> {

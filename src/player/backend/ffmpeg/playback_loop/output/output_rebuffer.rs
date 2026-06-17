@@ -81,6 +81,7 @@ pub(in crate::player::backend::ffmpeg) fn video_output_rebuffer_should_enter(
     demux_cache_insufficient: bool,
     render_backlogged: bool,
     has_audio_output: bool,
+    pending_audio_recoverable: bool,
     output_state: PlaybackOutputState,
 ) -> bool {
     if output_state.rebuffering() {
@@ -96,6 +97,10 @@ pub(in crate::player::backend::ffmpeg) fn video_output_rebuffer_should_enter(
     }
 
     let started_at = underrun_started_at.get_or_insert(now);
+    if output_underrun && !demux_cache_insufficient && pending_audio_recoverable {
+        return now.saturating_duration_since(*started_at)
+            >= VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER;
+    }
     output_underrun
         || now.saturating_duration_since(*started_at) >= VIDEO_OUTPUT_REBUFFER_ENTER_AFTER
 }
@@ -134,6 +139,7 @@ pub(in crate::player::backend::ffmpeg) fn video_decode_should_skip_nonref_for_pr
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
     played_until_nsecs: Option<u64>,
     has_audio_output: bool,
+    audio_output_pending_nsecs: Option<u64>,
     skip_nonref_active: bool,
 ) -> bool {
     if !has_audio_output || output_state.first_video_frame_pending() {
@@ -157,8 +163,15 @@ pub(in crate::player::backend::ffmpeg) fn video_decode_should_skip_nonref_for_pr
         } else {
             low_water_duration
         };
-    queued_video_forward_nsecs_from(queued_video_frames, played_until_nsecs)
-        .is_none_or(|forward_nsecs| forward_nsecs <= duration_nsecs(pressure_duration))
+    let audio_output_low_water = audio_output_pending_nsecs
+        .is_some_and(|pending| pending < duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION));
+    queued_video_forward_nsecs_from(queued_video_frames, played_until_nsecs).is_none_or(
+        |forward_nsecs| {
+            forward_nsecs <= duration_nsecs(pressure_duration)
+                || (audio_output_low_water
+                    && forward_nsecs <= duration_nsecs(VIDEO_DECODE_SKIP_NONREF_LOW_WATER_DURATION))
+        },
+    )
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ pub(super) struct PlaybackPipelineWaitContext<'a> {
     pub(super) session_id: PlaybackSessionId,
     pub(super) demux_cache: &'a DemuxPacketCache,
     pub(super) video_decode_pipeline: &'a VideoDecodePipeline,
+    pub(super) video_frame_duration_nsecs: u64,
     pub(super) video_frame_prepare_worker: Option<&'a VideoFramePrepareWorker>,
     pub(super) audio_decode_pipeline: Option<&'a AudioDecodePipeline>,
     pub(super) subtitle_pipeline: &'a SubtitlePipeline,
@@ -38,6 +39,7 @@ impl PlaybackPipelineWaitService {
         let snapshot = PlaybackPipelineSnapshot::capture(PlaybackPipelineSnapshotContext {
             demux_cache: context.demux_cache,
             video_decode_pipeline: context.video_decode_pipeline,
+            video_frame_duration_nsecs: context.video_frame_duration_nsecs,
             video_frame_prepare_worker: context.video_frame_prepare_worker,
             audio_decode_pipeline: context.audio_decode_pipeline,
             subtitle_pipeline: context.subtitle_pipeline,

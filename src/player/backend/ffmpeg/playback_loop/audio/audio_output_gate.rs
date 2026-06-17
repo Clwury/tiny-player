@@ -1,4 +1,4 @@
-use super::pending_audio_queue::PendingStartAudio;
+use super::pending_audio_queue::{PendingStartAudio, PendingStartAudioFrame};
 use super::playback_block::PlaybackBlockReason;
 use super::scheduled_video_queue::ScheduledVideoQueue;
 use super::video_output_gate::{AudioClockedVideoDrainStatus, admit_decoded_video_frame_to_vo};
@@ -119,6 +119,7 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
     output: &AudioOutput,
     audio_start_timeline_nsecs: u64,
     audio_flush_until_timeline_nsecs: u64,
+    clock_mode: AudioClockMode,
     delayed_audio_start_silence: DelayedAudioStartSilencePolicy,
     control: &FfmpegControl,
     queued_video_frames: &mut ScheduledVideoQueue,
@@ -151,6 +152,7 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
             output,
             audio_start_timeline_nsecs,
             audio_flush_until_timeline_nsecs,
+            clock_mode,
             control,
             session_id,
         )? {
@@ -163,13 +165,15 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
     let mut queued_audio_frames = 0usize;
     let mut queued_audio_until_nsecs = audio_start_timeline_nsecs;
     while let Some(mut frame) = pending_audio.pop_front_until(audio_flush_until_timeline_nsecs) {
+        let trim_before_timeline_nsecs = audio_start_timeline_nsecs.max(queued_audio_until_nsecs);
         if !frame.trim_before(
-            audio_start_timeline_nsecs,
+            trim_before_timeline_nsecs,
             output.sample_rate(),
             output.channels(),
         ) {
             continue;
         }
+        merge_small_pending_audio_gap(&mut frame, queued_audio_until_nsecs, clock_mode, session_id);
         let buffered_until_nsecs = frame.end_timeline_nsecs;
         match output.try_push_timed(
             frame.samples,
@@ -211,6 +215,7 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
                     queued_audio_ms = queued_duration.as_secs_f64() * 1000.0,
                     pending_audio_frames = pending_audio.len(),
                     pending_audio_ms = pending_audio.buffered_duration().as_secs_f64() * 1000.0,
+                    clock_mode = clock_mode.as_str(),
                     audio_start_timeline_nsecs,
                     audio_flush_until_timeline_nsecs,
                     "audio output queue full while flushing pending FFmpeg audio"
@@ -231,6 +236,7 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
             queued_audio_until_nsecs,
             pending_audio_frames = pending_audio.len(),
             pending_audio_ms = pending_audio.buffered_duration().as_secs_f64() * 1000.0,
+            clock_mode = clock_mode.as_str(),
             audio_start_timeline_nsecs,
             audio_flush_until_timeline_nsecs,
             "queued buffered FFmpeg audio covered by decoded video"
@@ -239,11 +245,41 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
     Ok(made_progress)
 }
 
+fn merge_small_pending_audio_gap(
+    frame: &mut PendingStartAudioFrame,
+    contiguous_timeline_nsecs: u64,
+    clock_mode: AudioClockMode,
+    session_id: PlaybackSessionId,
+) {
+    if frame.start_timeline_nsecs <= contiguous_timeline_nsecs {
+        return;
+    }
+    let gap_nsecs = frame
+        .start_timeline_nsecs
+        .saturating_sub(contiguous_timeline_nsecs);
+    if gap_nsecs > duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE) {
+        return;
+    }
+
+    let original_start_timeline_nsecs = frame.start_timeline_nsecs;
+    frame.start_timeline_nsecs = contiguous_timeline_nsecs;
+    tracing::trace!(
+        session_id = ?session_id,
+        original_start_timeline_nsecs,
+        merged_start_timeline_nsecs = contiguous_timeline_nsecs,
+        small_audio_gap_nsecs = gap_nsecs,
+        clock_mode = clock_mode.as_str(),
+        silence_fill_reason = "not_filled_small_gap",
+        "merged small pending FFmpeg audio gap without inserting silence"
+    );
+}
+
 fn queue_delayed_audio_start_silence(
     pending_audio: &PendingStartAudio,
     output: &AudioOutput,
     audio_start_timeline_nsecs: u64,
     audio_flush_until_timeline_nsecs: u64,
+    clock_mode: AudioClockMode,
     control: &FfmpegControl,
     session_id: PlaybackSessionId,
 ) -> std::result::Result<DelayedAudioStartSilenceStatus, String> {
@@ -272,9 +308,9 @@ fn queue_delayed_audio_start_silence(
         return Ok(DelayedAudioStartSilenceStatus::NotNeeded);
     }
 
-    let silence_samples = usize::try_from(samples_for_duration(
-        gap_nsecs,
-        output.sample_rate(),
+    let audio_gap_frames = audio_frames_for_duration_round(gap_nsecs, output.sample_rate());
+    let silence_samples = usize::try_from(audio_elements_for_frames(
+        audio_gap_frames,
         output.channels(),
     ))
     .map_err(|_| "延迟音频启动静音缓冲区过大".to_string())?;
@@ -295,6 +331,10 @@ fn queue_delayed_audio_start_silence(
                 first_audio_start_nsecs,
                 delayed_audio_start_silence_ms = gap_nsecs as f64 / 1_000_000.0,
                 silence_samples,
+                audio_gap_frames,
+                silence_fill_reason = "delayed_audio_start",
+                clock_mode = clock_mode.as_str(),
+                misaligned_audio_buffer_count = output.misaligned_audio_buffer_count(),
                 "queued silence before delayed FFmpeg audio start"
             );
             Ok(DelayedAudioStartSilenceStatus::Queued)
@@ -312,6 +352,10 @@ fn queue_delayed_audio_start_silence(
                 audio_start_timeline_nsecs,
                 first_audio_start_nsecs,
                 delayed_audio_start_silence_ms = gap_nsecs as f64 / 1_000_000.0,
+                audio_gap_frames,
+                silence_fill_reason = "delayed_audio_start",
+                clock_mode = clock_mode.as_str(),
+                misaligned_audio_buffer_count = output.misaligned_audio_buffer_count(),
                 "audio output queue full while queuing delayed-start silence"
             );
             Ok(DelayedAudioStartSilenceStatus::Blocked)
@@ -386,6 +430,7 @@ pub(in crate::player::backend::ffmpeg) fn recover_pending_start_audio_after_unde
         output,
         plan.audio_start_timeline_nsecs,
         plan.audio_flush_until_timeline_nsecs,
+        AudioClockMode::UnderrunRecovery,
         DelayedAudioStartSilencePolicy::Skip,
         control,
         queued_video_frames,
@@ -654,4 +699,48 @@ where
         return Ok(AudioClockedVideoDrainStatus::Drained);
     }
     Ok(AudioClockedVideoDrainStatus::WaitingAudio { made_progress })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_audio_frame(start_timeline_nsecs: u64) -> PendingStartAudioFrame {
+        PendingStartAudioFrame {
+            samples: vec![0.0; 4],
+            start_timeline_nsecs,
+            end_timeline_nsecs: start_timeline_nsecs.saturating_add(20_000_000),
+        }
+    }
+
+    #[test]
+    fn merge_small_pending_audio_gap_moves_start_without_silence() {
+        let mut frame = pending_audio_frame(1_004_000_000);
+
+        merge_small_pending_audio_gap(
+            &mut frame,
+            1_000_000_000,
+            AudioClockMode::AudioStarted,
+            PlaybackSessionId(1),
+        );
+
+        assert_eq!(frame.start_timeline_nsecs, 1_000_000_000);
+        assert_eq!(frame.end_timeline_nsecs, 1_024_000_000);
+        assert_eq!(frame.samples.len(), 4);
+    }
+
+    #[test]
+    fn merge_small_pending_audio_gap_leaves_large_gap_for_clock_policy() {
+        let mut frame = pending_audio_frame(1_006_000_000);
+
+        merge_small_pending_audio_gap(
+            &mut frame,
+            1_000_000_000,
+            AudioClockMode::AudioStarted,
+            PlaybackSessionId(1),
+        );
+
+        assert_eq!(frame.start_timeline_nsecs, 1_006_000_000);
+        assert_eq!(frame.end_timeline_nsecs, 1_026_000_000);
+    }
 }

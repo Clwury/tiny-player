@@ -3,7 +3,8 @@ use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
 use super::decoded_audio_frame::process_audio_decode_drain_result;
 use super::drain_phase::{PlaybackDrainPhase, PlaybackDrainResults};
 use super::playback_block::{
-    video_decode_block_reason_with_output_queue, video_output_resource_pressure,
+    VideoOutputResourcePressure, video_decode_block_reason_with_output_queue,
+    video_output_resource_pressure,
 };
 use super::video_decode_drain_frame_processor::{
     VideoDecodeDrainFrameProcessor, VideoDecodeDrainProcessStatus,
@@ -11,6 +12,7 @@ use super::video_decode_drain_frame_processor::{
 use super::video_decode_pipeline::{VideoPacketAdmissionContext, VideoPacketAdmissionPressure};
 use super::video_decode_worker::{VideoDecodeDrainResult, VideoDecodeWorkerSnapshot};
 use super::*;
+use crate::player::render_host::VideoOutputQueueSnapshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DecoderInputStreamState {
@@ -211,24 +213,17 @@ impl PlaybackPipelineState {
         self.video_decode_pipeline.info().stream_index
     }
 
-    pub(super) fn decoder_input_snapshot(&self) -> DecoderInputSnapshot {
+    pub(super) fn decoder_input_snapshot(
+        &self,
+        output_resource_pressure: bool,
+    ) -> DecoderInputSnapshot {
         let video_decode_snapshot = self.video_decode_pipeline.snapshot();
-        let scheduled_video_queue_limit_reached = self
-            .output_scheduler
-            .scheduled_video_queue_limit_reached(self.subtitle_pipeline.needs_prefetch());
         let video_decode_blocked_on = video_decode_block_reason_with_output_queue(
             VideoDecodePipeline::block_reason_for(
                 video_decode_snapshot,
                 self.video_decode_pipeline.info(),
             ),
-            video_output_resource_pressure(
-                self.output_scheduler.scheduled_video_queue_len(),
-                video_decode_snapshot.queued_frames,
-                video_decode_snapshot.in_flight_packets,
-                self.video_decode_pipeline.info().hardware_accelerated,
-                scheduled_video_queue_limit_reached,
-                self.output_scheduler.output_fill_phase(),
-            ),
+            output_resource_pressure,
         );
         let video_stream_index = self.video_decode_stream_index();
         let audio_input_suppressed = self.audio_input_suppressed_until_output_resume();
@@ -289,18 +284,58 @@ impl PlaybackPipelineState {
         &self,
         played_until_nsecs: Option<u64>,
         has_audio_output: bool,
+        vo_snapshot: VideoOutputQueueSnapshot,
     ) -> VideoPacketAdmissionPressure {
+        let output_snapshot = self
+            .output_scheduler
+            .snapshot_for_played_until(played_until_nsecs);
+        let audio_output_pending_nsecs = self
+            .audio_output
+            .as_ref()
+            .and_then(|output| output.snapshot().ok())
+            .map(|snapshot| snapshot.total_pending_nsecs);
+        let output_resource_pressure = self.video_output_resource_pressure_for(
+            output_snapshot,
+            vo_snapshot,
+            audio_output_pending_nsecs,
+        );
         VideoPacketAdmissionPressure {
-            output_snapshot: self
-                .output_scheduler
-                .snapshot_for_played_until(played_until_nsecs),
+            output_snapshot,
             skip_nonref_for_pressure: self.output_scheduler.video_decode_skip_nonref_for_pressure(
                 played_until_nsecs,
                 has_audio_output,
+                audio_output_pending_nsecs,
                 self.video_decode_skip_nonref_active,
             ),
             played_until_nsecs,
+            output_resource_pressure,
         }
+    }
+
+    pub(super) fn video_output_resource_pressure_for(
+        &self,
+        output_snapshot: PlaybackOutputSnapshot,
+        vo_snapshot: VideoOutputQueueSnapshot,
+        audio_output_pending_nsecs: Option<u64>,
+    ) -> bool {
+        let video_decode_snapshot = self.video_decode_pipeline.snapshot();
+        let scheduled_video_queue_limit_reached = self
+            .output_scheduler
+            .scheduled_video_queue_limit_reached(self.subtitle_pipeline.needs_prefetch());
+        video_output_resource_pressure(VideoOutputResourcePressure {
+            scheduled_video_frames: self.output_scheduler.scheduled_video_queue_len(),
+            decoded_video_frames: video_decode_snapshot.queued_frames,
+            in_flight_video_packets: video_decode_snapshot.in_flight_packets,
+            hardware_accelerated: self.video_decode_pipeline.info().hardware_accelerated,
+            scheduled_video_queue_limit_reached,
+            fill_phase_for_output_start: self.output_scheduler.output_fill_phase(),
+            video_frame_duration_nsecs: self.video_frame_duration_nsecs,
+            vo_queue_capacity: vo_snapshot.queue_capacity,
+            vo_queued_frames: vo_snapshot.queued_frames,
+            queued_video_forward_nsecs: output_snapshot.queued_video_forward_nsecs,
+            audio_output_pending_nsecs,
+            render_backlogged: vo_snapshot.render_backlogged(),
+        })
     }
 
     pub(super) fn admit_video_demux_packet(
