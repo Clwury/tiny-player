@@ -4,7 +4,16 @@ use super::video_output_gate::{
     AudioClockedVideoDrainStatus, service_audio_clocked_video_drain_step,
     service_video_clocked_video_queue,
 };
-use super::*;
+use std::sync::{atomic::AtomicBool, mpsc::Sender};
+
+use crate::player::{
+    backend::BackendEvent,
+    render_host::{PlaybackSessionId, VideoOutputQueue},
+};
+
+use super::{
+    AudioOutput, AudioOutputDrainStatus, DemuxPacketCache, FfmpegControl, PlaybackPipelineState,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OutputDrainStatus {
@@ -188,7 +197,7 @@ fn output_drain_stop_or_seek_status(control: &FfmpegControl) -> Option<OutputDra
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::OutputDrainStatus;
 
     #[test]
     fn output_drain_statuses_are_distinct() {

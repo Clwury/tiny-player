@@ -1,3 +1,16 @@
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+    },
+    time::{Duration, Instant},
+};
+
+use crate::player::{
+    backend::BackendEvent,
+    render_host::{DecodedFrame, PlaybackSessionId, VideoOutputQueue, VideoOutputQueueAdmission},
+};
+
 use super::audio_output_gate::{
     DelayedAudioStartSilencePolicy, drain_audio_clocked_decoded_video_step,
     flush_pending_start_audio, service_audio_clocked_video_queue,
@@ -7,8 +20,11 @@ use super::output_gate::{
 };
 use super::output_rebuffer::PlaybackOutputState;
 use super::playback_block::PlaybackBlockReason;
-use super::*;
-use crate::player::render_host::VideoOutputQueueAdmission;
+use super::{
+    AudioClockMode, AudioOutput, BufferedReporter, DemuxReaderWatermark, FFMPEG_FRAME_COUNT,
+    FfmpegControl, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PlaybackScheduler,
+    PositionReporter, QueuedVideoFrame, SubtitlePipeline, nsecs_to_seconds,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) enum AudioClockedVideoDrainStatus {
@@ -692,7 +708,7 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::AudioClockedVideoDrainStatus;
 
     #[test]
     fn audio_clocked_video_drain_status_tracks_progress() {

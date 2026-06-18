@@ -1,5 +1,5 @@
 use super::playback_wait_service::PlaybackPipelineWaitService;
-use super::*;
+use super::{FfmpegControl, PlaybackOutputScheduler, PlaybackScheduler};
 
 #[derive(Default)]
 pub(super) struct PlaybackCoordinatorGateService;
@@ -53,7 +53,7 @@ fn coordinator_should_wait_for_pause(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::PlaybackCoordinatorGateStatus;
 
     #[test]
     fn coordinator_gate_status_reports_continue() {

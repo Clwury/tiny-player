@@ -1,5 +1,9 @@
-use super::*;
-use crate::player::backend::ffmpeg::worker::{PendingSeek, PendingTrackSelection};
+use crate::player::{
+    backend::ffmpeg::worker::{PendingSeek, PendingTrackSelection},
+    render_host::PlaybackSessionId,
+};
+
+use super::{FfmpegControl, PlaybackSession};
 
 pub(super) fn begin_track_switch(
     session: &mut PlaybackSession,
@@ -42,7 +46,12 @@ fn begin_position_reset(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::player::{
+        backend::{PlaybackSeekMode, ffmpeg::worker::PendingSeek},
+        render_host::PlaybackSessionId,
+    };
+
+    use super::{FfmpegControl, PlaybackSession, begin_seek};
 
     #[test]
     fn begin_seek_preserves_user_pause_while_clearing_cache_pause() {

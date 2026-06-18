@@ -1,7 +1,20 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::mpsc::{self, Receiver},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+
+use crate::player::{
+    dovi::DoviFrameMetadata,
+    render_host::{DecodedFrame, FrameBufferPool, FramePts},
+};
 
 use super::video_decode_worker::VideoDecodedFrame;
-use super::*;
+use super::{
+    DECODE_PACKET_SLOW_LOG_AFTER, PlaybackBlockReason, VideoFrameConvertContext,
+    VideoFrameConverter, WORKER_CHANNEL_RECV_WAIT_LOG_AFTER, WORKER_CHANNEL_SEND_WAIT_LOG_AFTER,
+};
 
 const VIDEO_FRAME_PREPARE_COMMAND_QUEUE_CAPACITY: usize = 3;
 const VIDEO_FRAME_PREPARE_PENDING_INPUT_QUEUE_CAPACITY: usize = 3;
@@ -442,7 +455,18 @@ fn log_video_frame_prepare_worker_timing(timing: VideoFramePrepareWorkerTiming) 
 #[cfg(test)]
 mod tests {
     use super::super::video_decode_worker::VideoDecodedFrame;
-    use super::*;
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        os::raw::c_int,
+        sync::mpsc,
+    };
+
+    use ffmpeg_sys_next as ffi;
+
+    use crate::player::render_host::{FfmpegFrameRef, FramePts, RenderSize};
+
+    use super::super::{AvFrame, DEFAULT_VIDEO_FRAME_DURATION_NSECS, VideoFrameConvertContext};
+    use super::{VideoFramePrepareEnqueueResult, VideoFramePrepareInput, VideoFramePrepareWorker};
 
     fn test_worker() -> VideoFramePrepareWorker {
         let (command_tx, _command_rx) = mpsc::sync_channel(1);

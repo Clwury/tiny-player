@@ -1,8 +1,52 @@
 use super::avio::{CacheRestartRequest, CachedInputSource, HttpCacheRangeKind};
 use super::worker::{FfmpegCommand, PendingSeek, PendingTrackSelection, drain_playback_commands};
-use super::*;
-use crate::player::backend::PlaybackCacheTimeRange;
-use playback_loop::{
+use super::{
+    AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
+    AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AUDIO_VIDEO_QUEUE_LIMIT_DURATION,
+    AUDIO_VIDEO_QUEUE_TARGET_DURATION, AudioBuffer, AudioShared, AvFrame, AvPacket, BackendEvent,
+    BackendEventKind, BufferedReporter, ByteCacheState, CacheReadResult,
+    DECODED_VIDEO_QUEUE_LIMIT_FRAMES, DEFAULT_VIDEO_FRAME_DURATION_NSECS, DecodedAudio,
+    FALLBACK_AUDIO_OUTPUT_CHANNELS, FfmpegBackend, FfmpegControl, FfmpegPlaybackInput,
+    HTTP_CACHE_CHUNK_SIZE, HTTP_CACHE_PARTIAL_READ_MIN_BYTES, HTTP_CACHE_RANGE_REQUEST_BYTES,
+    HTTP_CACHE_RANGE_REQUEST_TIMEOUT, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
+    HTTP_CACHE_SMALL_RANGE_REQUEST_TIMEOUT, HTTP_RING_CACHE_CAPACITY, HttpContentRange,
+    HttpRingCache, HttpRingCacheState, InputProbeProfile, MappedTimestamp,
+    PENDING_AUDIO_CONTINUITY_TOLERANCE, PENDING_START_AUDIO_BACKPRESSURE_DURATION,
+    PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION, PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION,
+    PgsFrameMergeBitstreamFilter, PlaybackCacheByteRange, PlaybackCacheConfig, PlaybackCacheMode,
+    PlaybackCacheState, PlaybackScheduler, PlaybackSeekMode, PositionReporter, QueuedVideoFrame,
+    StreamInfo, TimestampMapper, VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER,
+    VIDEO_OUTPUT_REBUFFER_ENTER_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER,
+    VIDEO_OUTPUT_START_PREBUFFER_DURATION, VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER,
+    VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION, VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION,
+    VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VULKAN_DECODED_VIDEO_QUEUE_TARGET_FRAMES,
+    VULKAN_VIDEO_OUTPUT_RESOURCE_PRESSURE_FRAMES, WaitStatus, audio_sample_len,
+    audio_samples_duration, content_len_from_content_range, content_range_from_headers,
+    dovi_packet_timeline_nsecs, duration_nsecs, ffmpeg_http_headers, ffmpeg_raw_video_format,
+    fill_audio_output, frame_decode_error_flags, frame_is_corrupt, has_annex_b_start_code,
+    http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
+    http_cache_request_headers_for_log, http_cache_response_headers_for_log,
+    optional_buffered_value_changed, queued_video_duration, queued_video_limit_duration,
+    queued_video_limit_frames, queued_video_limit_reached, queued_video_target_duration,
+    queued_video_target_frames, queued_video_target_reached, reqwest_header_pairs,
+    samples_for_duration, should_cache_http_url,
+};
+use std::{
+    collections::VecDeque,
+    mem,
+    os::raw::c_int,
+    ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use super::playback_loop::{
     AudioClockResumeDecision, DecodedVideoFrameStartAction, DemuxReaderWatermark,
     PendingAudioUnderrunRecoveryPlan, PendingStartAudio, PlaybackBlockReason,
     PlaybackOutputScheduler, PlaybackOutputState, RebufferResumeAnchor,
@@ -27,6 +71,16 @@ use playback_loop::{
     video_output_rebuffer_resume_duration_with_resource_pressure,
     video_output_rebuffer_resume_reached, video_output_rebuffer_should_enter,
 };
+use crate::player::{
+    backend::{BackendSubtitleCue, DemuxCacheState, PlaybackCacheTimeRange},
+    render_host::{
+        DecodedFrame, FfmpegAvBufferRef, FfmpegFrameRef, FrameColor, FramePixels, FramePts,
+        PlaybackSessionId, RawVideoChromaSite, RawVideoFormat, RawVideoRange, RenderSize,
+        VideoOutputQueue, VulkanDecodeDevice, VulkanDecodeQueue, VulkanDecodeQueues,
+        VulkanVideoFrame,
+    },
+};
+use ffmpeg_sys_next as ffi;
 
 #[test]
 fn timestamp_mapper_uses_stream_start_when_available() {

@@ -1,4 +1,17 @@
-use super::*;
+use std::{
+    collections::VecDeque,
+    os::raw::c_int,
+    sync::mpsc::{self, Receiver},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+
+use ffmpeg_sys_next as ffi;
+
+use super::{
+    AUDIO_DECODE_QUEUE_LIMIT_DURATION, AudioResampler, AvFrame, AvPacket, DecodedAudio, Decoder,
+    duration_nsecs, frame_best_effort_timestamp,
+};
 
 const AUDIO_DECODE_COMMAND_QUEUE_CAPACITY: usize = 4;
 const AUDIO_DECODE_RESULT_QUEUE_CAPACITY: usize = 128;
@@ -607,7 +620,14 @@ fn run_audio_decode_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{collections::VecDeque, sync::mpsc, time::Duration};
+
+    use ffmpeg_sys_next as ffi;
+
+    use super::{
+        AUDIO_DECODE_QUEUE_LIMIT_DURATION, AudioDecodeWorker, AudioDecodeWorkerInfo,
+        AudioDecodeWorkerState, duration_nsecs,
+    };
 
     fn worker_for_test() -> AudioDecodeWorker {
         let (command_tx, _command_rx) = mpsc::sync_channel(1);

@@ -1,4 +1,12 @@
-use super::*;
+use std::{
+    ffi::CString,
+    os::raw::{c_char, c_int, c_void},
+    ptr,
+};
+
+use ffmpeg_sys_next as ffi;
+
+use super::{AvPacket, StreamInfo, ffmpeg_error};
 
 #[repr(C)]
 struct AvBitStreamFilter {

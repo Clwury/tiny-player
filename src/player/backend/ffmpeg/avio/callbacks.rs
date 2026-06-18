@@ -1,7 +1,12 @@
-use super::{
-    cache::{CacheReadResult, HttpCacheRangeKind, HttpRingCache},
-    *,
+use std::{
+    os::raw::{c_int, c_void},
+    slice,
 };
+
+use ffmpeg_sys_next as ffi;
+
+use super::super::HTTP_CACHE_MAX_READ_CHUNK_BYTES;
+use super::cache::{CacheReadResult, HttpCacheRangeKind, HttpRingCache};
 
 pub(super) struct CachedAvioReader {
     pub(super) cache: HttpRingCache,

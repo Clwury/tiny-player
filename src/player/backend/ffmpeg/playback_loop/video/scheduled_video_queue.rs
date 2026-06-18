@@ -1,3 +1,7 @@
+use std::{collections::VecDeque, time::Duration};
+
+use crate::player::render_host::PlaybackSessionId;
+
 use super::super::{
     queued_video_duration, queued_video_limit_duration, queued_video_limit_frames,
     queued_video_limit_reached, queued_video_target_duration, queued_video_target_frames,
@@ -10,7 +14,11 @@ use super::output_rebuffer::{
     video_decode_should_skip_nonref_for_pressure,
 };
 use super::pending_audio_queue::PendingStartAudio;
-use super::*;
+use super::{
+    AUDIO_CLOCK_VIDEO_PRESENT_LEAD, AUDIO_OUTPUT_VIDEO_LEAD_DURATION, DemuxReaderWatermark,
+    LATE_VIDEO_DROP_TOLERANCE, PlaybackScheduler, QueuedVideoFrame,
+    VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION, duration_nsecs,
+};
 
 #[derive(Default)]
 pub(in crate::player::backend::ffmpeg) struct ScheduledVideoQueue {

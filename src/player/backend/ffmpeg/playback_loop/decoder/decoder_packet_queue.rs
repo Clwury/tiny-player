@@ -1,4 +1,4 @@
-use super::*;
+use std::collections::VecDeque;
 
 pub(super) struct DecoderPacketQueues<P, const PENDING_CAPACITY: usize> {
     pending_input: VecDeque<P>,
@@ -71,7 +71,7 @@ impl<P, const PENDING_CAPACITY: usize> DecoderPacketQueues<P, PENDING_CAPACITY> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::DecoderPacketQueues;
 
     #[test]
     fn decoder_packet_queues_preserve_pending_fifo_order() {

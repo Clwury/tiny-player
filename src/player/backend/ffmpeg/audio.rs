@@ -1,4 +1,27 @@
-use super::*;
+use std::{
+    collections::VecDeque,
+    env,
+    os::raw::c_int,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+
+use cpal::{
+    FromSample, Sample, SizedSample,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
+use ffmpeg_sys_next as ffi;
+
+use super::{
+    AUDIO_BUFFER_SECONDS, AUDIO_CALLBACK_GAP_LOG_AFTER, AUDIO_OUTPUT_DELAY_LIMIT,
+    AUDIO_OUTPUT_QUEUE_LIMIT_DURATION, AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER,
+    AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AUDIO_QUEUE_WAIT_LOG_AFTER, FfmpegControl,
+    SCHEDULER_POLL_INTERVAL, duration_nsecs,
+};
 
 pub(super) struct AudioOutput {
     shared: Arc<AudioShared>,
@@ -1665,7 +1688,18 @@ pub(super) fn zeroed_channel_layout() -> ffi::AVChannelLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{sync::Arc, time::Duration};
+
+    use crate::player::render_host::PlaybackSessionId;
+
+    use super::{
+        AUDIO_OUTPUT_QUEUE_LIMIT_DURATION, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AudioQueueItem,
+        AudioQueueShared, AudioQueueState, AudioShared, FfmpegControl,
+        align_audio_elements_to_frame_boundary, audio_elements_duration,
+        audio_elements_for_duration_floor, audio_elements_for_duration_round,
+        audio_elements_for_frames, audio_frames_for_duration_round, duration_nsecs,
+        write_audio_queue_item,
+    };
 
     #[test]
     fn audio_output_queue_uses_short_output_backpressure_limit() {

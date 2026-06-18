@@ -1,3 +1,5 @@
+use std::{io::Read, sync::Arc, time::Duration};
+
 use super::{
     cache::{CacheAppendPermit, CacheAppendResult, CacheRestartRequest, HttpRingCacheShared},
     http::{
@@ -5,7 +7,6 @@ use super::{
         http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
         http_cache_read_timed_out,
     },
-    *,
 };
 
 enum HttpDownloadOutcome {
@@ -444,7 +445,8 @@ fn transient_http_error_message(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::cache::{CacheRestartRequest, HttpCacheRangeKind};
+    use super::{side_request_remaining_bytes, transient_http_error_message};
 
     #[test]
     fn side_request_remaining_bytes_stops_at_side_range_boundary() {

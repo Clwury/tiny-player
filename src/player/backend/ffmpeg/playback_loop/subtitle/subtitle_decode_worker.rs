@@ -1,4 +1,19 @@
-use super::*;
+use std::{
+    collections::VecDeque,
+    os::raw::c_int,
+    sync::mpsc::{self, Receiver},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+
+use ffmpeg_sys_next as ffi;
+
+use crate::player::backend::BackendSubtitleCue;
+
+use super::{
+    AvPacket, DecodedSubtitleCue, Decoder, PgsFrameMergeBitstreamFilter, StreamInfo,
+    decoded_subrip_packet_cue, subtitle_cue_timeline_nsecs, timestamp_to_nsecs,
+};
 
 const SUBTITLE_DECODE_COMMAND_QUEUE_CAPACITY: usize = 4;
 const SUBTITLE_DECODE_RESULT_QUEUE_CAPACITY: usize = 32;

@@ -329,7 +329,7 @@ impl std::error::Error for BackendError {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{BackendError, PlaybackCacheConfig, PlaybackCacheMode};
 
     #[test]
     fn backend_error_displays_user_facing_messages() {

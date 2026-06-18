@@ -1,4 +1,12 @@
-use super::*;
+use std::sync::Arc;
+
+use crate::player::{PlaybackTrackSelection, render_host::RenderSize};
+
+use super::{
+    AudioDecodePipeline, AudioOutput, FfmpegControl, FfmpegPlaybackInput, StreamCatalog,
+    StreamInfo, SubtitlePipeline, open_audio_decoder,
+    select_audio_stream_for_selection_from_catalog,
+};
 
 pub(super) struct TrackSwitchPipelineState {
     pub(super) audio_stream: Option<StreamInfo>,
@@ -9,7 +17,7 @@ pub(super) struct TrackSwitchPipelineState {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn service_track_switch_pipelines(
     source: &mut FfmpegPlaybackInput,
-    selected_tracks: crate::player::PlaybackTrackSelection,
+    selected_tracks: PlaybackTrackSelection,
     stream_catalog: &StreamCatalog,
     previous_audio_output: Option<AudioOutput>,
     control: Arc<FfmpegControl>,

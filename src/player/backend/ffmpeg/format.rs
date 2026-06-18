@@ -1,5 +1,17 @@
 use super::avio::{CachedAvio, CachedInputSource, input_format_options};
-use super::*;
+use std::{
+    ffi::CString,
+    os::raw::{c_int, c_void},
+    ptr,
+    sync::Arc,
+};
+
+use ffmpeg_sys_next as ffi;
+
+use super::{
+    FfmpegControl, HttpRingCache, InputProbeProfile, ffmpeg_error, ffmpeg_interrupt_callback,
+    nsecs_to_timestamp, seconds_to_nsecs, stream_frame_duration_nsecs, timestamp_to_nsecs,
+};
 
 pub(super) struct FormatContext {
     ptr: *mut ffi::AVFormatContext,

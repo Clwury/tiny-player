@@ -1,3 +1,15 @@
+use std::{
+    sync::{atomic::AtomicBool, mpsc::Sender},
+    time::{Duration, Instant},
+};
+
+use crate::player::{
+    backend::BackendEvent,
+    render_host::{PlaybackSessionId, VideoOutputQueue},
+};
+
+#[cfg(test)]
+use super::QueuedVideoFrame;
 use super::audio_output_gate::{
     DelayedAudioStartSilencePolicy, flush_pending_start_audio,
     pending_audio_underrun_recovery_plan, push_decoded_audio_to_output,
@@ -14,7 +26,14 @@ use super::output_rebuffer::{
 use super::pending_audio_queue::PendingStartAudio;
 use super::scheduled_video_queue::ScheduledVideoQueue;
 use super::video_output_gate::{present_first_queued_video_frame, present_video_frame_to_vo};
-use super::*;
+use super::{
+    AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AudioClockMode, AudioOutput,
+    AudioOutputSnapshot, BufferedReporter, DecodedAudio, DemuxPacketCache, DemuxReaderWatermark,
+    FfmpegControl, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PENDING_AUDIO_CONTINUITY_TOLERANCE,
+    PENDING_START_AUDIO_BACKPRESSURE_DURATION, PLAYING_PENDING_AUDIO_FORCE_RECOVERY_DURATION,
+    PLAYING_PENDING_AUDIO_HARD_RESET_DURATION, PlaybackScheduler, PositionReporter,
+    SubtitlePipeline, VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, duration_nsecs, nsecs_to_seconds,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PendingStartAudioPressureLevel {
@@ -1607,7 +1626,25 @@ fn discard_decoded_video_before_output_gate_resume_if_ready(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::time::Duration;
+
+    use crate::player::render_host::{
+        DecodedFrame, FramePixels, FramePts, PlaybackSessionId, RenderSize,
+    };
+
+    use super::super::{
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS, QueuedVideoFrame, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    };
+    use super::{
+        AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AudioClockResumeDecision,
+        AudioOutputSnapshot, DecodedAudio, PLAYING_PENDING_AUDIO_FORCE_RECOVERY_DURATION,
+        PLAYING_PENDING_AUDIO_HARD_RESET_DURATION, PendingStartAudioPressureLevel,
+        PlaybackOutputScheduler, PlaybackOutputState, PlaybackResumeWaterline,
+        audio_output_contiguous_start_timeline_nsecs, audio_output_flush_until_timeline_nsecs,
+        discard_decoded_video_before_output_gate_resume_if_ready, duration_nsecs,
+        initial_delayed_audio_start_timeline_nsecs, playing_pending_audio_limit_duration,
+        playing_pending_audio_pressure_clear_duration,
+    };
 
     fn test_queued_video_frame(timeline_nsecs: u64) -> QueuedVideoFrame {
         QueuedVideoFrame {

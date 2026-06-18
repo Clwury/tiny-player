@@ -1,3 +1,12 @@
+use std::{collections::VecDeque, os::raw::c_int, sync::mpsc::Sender};
+
+use ffmpeg_sys_next as ffi;
+
+use crate::player::{
+    backend::{BackendEvent, BackendSubtitleCue},
+    render_host::{PlaybackSessionId, RenderSize},
+};
+
 use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
 use super::decoder_packet_queue::DecoderPacketQueues;
 use super::subtitle_decode_worker::{
@@ -5,7 +14,13 @@ use super::subtitle_decode_worker::{
     SubtitleDecodePacketStatus, SubtitleDecodeWorker, SubtitleDecodeWorkerSnapshot,
     SubtitleDecodeWorkerState,
 };
-use super::*;
+use super::{
+    AudioOutput, AvPacket, DECODE_PACKET_SLOW_LOG_AFTER, Decoder, FfmpegControl,
+    FfmpegPlaybackInput, PlaybackBlockReason, PlaybackGeneration, StreamCatalog, StreamInfo,
+    TimestampMapper, load_external_subtitle_cue_list, open_subtitle_decoder, push_subtitle_cue,
+    refresh_playback_timeline_origin, select_subtitle_stream_for_selection_from_catalog,
+    subtitle_cue_queue_from_external, trim_overlapping_subtitle_cues_at, update_subtitle_overlay,
+};
 
 const SUBTITLE_DECODE_PENDING_INPUT_QUEUE_CAPACITY: usize = 16;
 
@@ -439,7 +454,10 @@ fn subtitle_needs_prefetch(stream: Option<StreamInfo>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        PlaybackBlockReason, SUBTITLE_DECODE_PENDING_INPUT_QUEUE_CAPACITY,
+        SubtitleDecodeWorkerSnapshot, SubtitleDecodeWorkerState, SubtitlePipeline,
+    };
 
     fn snapshot(
         state: SubtitleDecodeWorkerState,

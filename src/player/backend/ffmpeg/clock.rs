@@ -1,4 +1,25 @@
-use super::*;
+use std::{
+    collections::VecDeque,
+    os::raw::c_int,
+    time::{Duration, Instant},
+};
+
+#[cfg(test)]
+use std::thread;
+
+use ffmpeg_sys_next as ffi;
+
+use crate::player::render_host::{DecodedFrame, FramePixels, FramePts};
+
+use super::{
+    AUDIO_VIDEO_QUEUE_LIMIT_DURATION, AUDIO_VIDEO_QUEUE_TARGET_DURATION,
+    DECODED_VIDEO_QUEUE_LIMIT_FRAMES, DECODED_VIDEO_QUEUE_TARGET_FRAMES,
+    PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION, PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION,
+    VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION, VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION,
+    VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VULKAN_DECODED_VIDEO_QUEUE_TARGET_FRAMES,
+};
+#[cfg(test)]
+use super::{FfmpegControl, SCHEDULER_POLL_INTERVAL};
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

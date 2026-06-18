@@ -1,3 +1,14 @@
+use std::{
+    os::raw::c_int,
+    sync::{atomic::AtomicBool, mpsc::Sender},
+    time::Duration,
+};
+
+use crate::player::{
+    backend::BackendEvent,
+    render_host::{PlaybackSessionId, VideoOutputQueue, VideoOutputQueueSnapshot},
+};
+
 use super::audio_decode_worker::AudioDecodePacketResult;
 use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
 use super::decoded_audio_frame::process_audio_decode_drain_result;
@@ -11,8 +22,13 @@ use super::video_decode_drain_frame_processor::{
 };
 use super::video_decode_pipeline::{VideoPacketAdmissionContext, VideoPacketAdmissionPressure};
 use super::video_decode_worker::{VideoDecodeDrainResult, VideoDecodeWorkerSnapshot};
-use super::*;
-use crate::player::render_host::VideoOutputQueueSnapshot;
+use super::{
+    AudioDecodePipeline, AudioOutput, AvPacket, BufferedReporter, DoviPipeline, FfmpegControl,
+    PENDING_START_AUDIO_BACKPRESSURE_DURATION, PlaybackBlockReason, PlaybackGeneration,
+    PlaybackOutputScheduler, PlaybackOutputSnapshot, PlaybackScheduler, PositionReporter,
+    StreamInfo, SubtitleDecodeContext, SubtitlePipeline, TimestampMapper, VideoDecodePipeline,
+    VideoDecodeRecovery, VideoFramePrepareWorker,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DecoderInputStreamState {
@@ -459,7 +475,15 @@ fn push_decoder_input_stream_if_open(streams: &mut Vec<c_int>, stream: DecoderIn
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{os::raw::c_int, time::Duration};
+
+    use super::super::decode::DecodeInputRetryStatus;
+    use super::super::{PlaybackBlockReason, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION};
+    use super::{
+        DecoderInputStreamState, PENDING_START_AUDIO_BACKPRESSURE_DURATION,
+        audio_input_suppressed_until_output_resume_state, decoder_block_reason_blocks_packet_input,
+        decoder_input_retry_status_from_streams, decoder_input_streams_for_state,
+    };
 
     fn stream(stream_index: c_int, packet_input_blocked: bool) -> DecoderInputStreamState {
         DecoderInputStreamState {

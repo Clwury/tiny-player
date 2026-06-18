@@ -142,7 +142,11 @@ pub(in crate::player::backend::ffmpeg) fn video_decode_block_reason_with_output_
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AUDIO_VIDEO_QUEUE_TARGET_DURATION,
+        PlaybackBlockReason, VideoOutputResourcePressure, duration_nsecs,
+        video_decode_block_reason_with_output_queue, video_output_resource_pressure,
+    };
 
     fn pressure_for_test(
         scheduled_video_frames: usize,

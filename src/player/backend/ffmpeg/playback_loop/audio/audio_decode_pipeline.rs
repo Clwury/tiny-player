@@ -4,7 +4,11 @@ use super::audio_decode_worker::{
 };
 use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
 use super::decoder_packet_queue::DecoderPacketQueues;
-use super::*;
+use std::os::raw::c_int;
+
+use crate::player::render_host::PlaybackSessionId;
+
+use super::{AvPacket, Decoder, PlaybackBlockReason, PlaybackGeneration};
 
 const AUDIO_DECODE_PENDING_INPUT_QUEUE_CAPACITY: usize = 16;
 
@@ -244,7 +248,10 @@ impl AudioDecodePacketQueues {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AUDIO_DECODE_PENDING_INPUT_QUEUE_CAPACITY, AudioDecodePipeline, AudioDecodeWorkerSnapshot,
+        AudioDecodeWorkerState, PlaybackBlockReason,
+    };
 
     fn snapshot(
         state: AudioDecodeWorkerState,

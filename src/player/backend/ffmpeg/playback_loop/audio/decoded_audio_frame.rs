@@ -1,6 +1,23 @@
+use std::{
+    sync::{atomic::AtomicBool, mpsc::Sender},
+    time::{Duration, Instant},
+};
+
+use ffmpeg_sys_next as ffi;
+
+use crate::player::{
+    backend::BackendEvent,
+    render_host::{PlaybackSessionId, VideoOutputQueue},
+};
+
 use super::audio_decode_pipeline::AudioDecodePipeline;
 use super::audio_decode_worker::{AudioDecodePacketResult, AudioDecodedFrame};
-use super::*;
+use super::{
+    AudioOutput, BufferedReporter, DECODE_PACKET_SLOW_LOG_AFTER,
+    DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER, FfmpegControl,
+    PENDING_AUDIO_CONTINUITY_TOLERANCE, PlaybackOutputScheduler, PositionReporter,
+    SubtitlePipeline, TimestampMapper,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn service_decoded_audio_frame(

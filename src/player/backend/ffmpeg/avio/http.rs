@@ -1,4 +1,13 @@
-use super::*;
+use std::{ffi::CString, ptr, time::Duration};
+
+use ffmpeg_sys_next as ffi;
+
+use super::super::{
+    FFMPEG_FAST_ANALYZE_DURATION_US, FFMPEG_FAST_PROBE_SIZE, FFMPEG_SUBTITLE_ANALYZE_DURATION_US,
+    FFMPEG_SUBTITLE_PROBE_SIZE, HTTP_CACHE_RANGE_REQUEST_TIMEOUT,
+    HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES, HTTP_CACHE_SMALL_RANGE_REQUEST_TIMEOUT,
+    InputProbeProfile, ffmpeg_error,
+};
 
 pub(in crate::player::backend::ffmpeg) fn input_format_options(
     http_headers: &[(String, String)],

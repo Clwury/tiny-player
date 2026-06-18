@@ -1,10 +1,22 @@
+use ffmpeg_sys_next as ffi;
+
+use crate::player::{
+    dovi::{DoviFrameMetadata, DoviRpuStripResult, HevcStreamFormat, strip_dovi_rpu_nalus},
+    render_host::PlaybackSessionId,
+};
+
 use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
 use super::decoder_packet_queue::DecoderPacketQueues;
 use super::video_decode_worker::{
     VideoDecodeDrainResult, VideoDecodeEnqueueResult, VideoDecodePacketStatus, VideoDecodeWorker,
     VideoDecodeWorkerInfo, VideoDecodeWorkerSnapshot, VideoDecodeWorkerState, VideoDecodedFrame,
 };
-use super::*;
+use super::{
+    AvPacket, CORRUPT_VIDEO_FRAME_RECOVERY_ERROR, Decoder, DoviPipeline, PlaybackBlockReason,
+    PlaybackGeneration, PlaybackOutputSnapshot, StreamInfo,
+    VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, packet_is_video_recovery_point,
+    packet_is_video_seek_point,
+};
 
 const VIDEO_DECODE_PENDING_INPUT_QUEUE_CAPACITY: usize = 8;
 
@@ -861,7 +873,15 @@ fn video_decode_error_is_resource_pressure(error: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use ffmpeg_sys_next as ffi;
+
+    use crate::player::render_host::RenderSize;
+
+    use super::super::{VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VideoFrameConvertContext};
+    use super::{
+        PlaybackBlockReason, VIDEO_DECODE_PENDING_INPUT_QUEUE_CAPACITY, VideoDecodePipeline,
+        VideoDecodeWorkerInfo, VideoDecodeWorkerSnapshot, VideoDecodeWorkerState,
+    };
 
     fn snapshot(
         state: VideoDecodeWorkerState,

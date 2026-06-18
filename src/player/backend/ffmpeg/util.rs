@@ -1,4 +1,6 @@
-use super::*;
+use std::{ffi::CStr, os::raw::c_int};
+
+use ffmpeg_sys_next as ffi;
 
 pub(super) fn ffmpeg_error(error: c_int) -> String {
     let mut buffer = [0i8; 256];

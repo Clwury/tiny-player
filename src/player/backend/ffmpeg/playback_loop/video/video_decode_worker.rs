@@ -1,4 +1,23 @@
-use super::*;
+use std::{
+    collections::VecDeque,
+    os::raw::c_int,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+
+use ffmpeg_sys_next as ffi;
+
+use crate::player::render_host::{FfmpegFrameRef, RenderSize, VulkanDecodeDevice};
+
+use super::{
+    AvFrame, AvPacket, DECODE_PACKET_SLOW_LOG_AFTER, Decoder,
+    VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VideoFrameConvertContext,
+    WORKER_CHANNEL_RECV_WAIT_LOG_AFTER, WORKER_CHANNEL_SEND_WAIT_LOG_AFTER,
+};
 
 const VIDEO_DECODE_COMMAND_QUEUE_CAPACITY: usize = 4;
 const SOFTWARE_DECODED_VIDEO_QUEUE_CAPACITY: usize = 24;
@@ -813,7 +832,17 @@ fn log_video_decode_worker_drain_timing(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{collections::VecDeque, os::raw::c_int, sync::mpsc, time::Duration};
+
+    use ffmpeg_sys_next as ffi;
+
+    use crate::player::render_host::{FfmpegFrameRef, RenderSize};
+
+    use super::{
+        AvFrame, SOFTWARE_DECODED_VIDEO_QUEUE_CAPACITY, VideoDecodeCommand, VideoDecodeResult,
+        VideoDecodeWorker, VideoDecodeWorkerInfo, VideoDecodeWorkerState, VideoDecodedFrame,
+        VideoFrameConvertContext,
+    };
 
     fn test_worker() -> (VideoDecodeWorker, mpsc::SyncSender<VideoDecodeResult>) {
         let (worker, result_tx, _command_rx) = test_worker_with_command_rx();

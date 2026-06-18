@@ -1,9 +1,39 @@
-use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::mpsc;
+use std::{
+    collections::VecDeque,
+    env,
+    fs::{File, OpenOptions},
+    os::unix::fs::FileExt,
+    path::PathBuf,
+    sync::{Arc, Condvar, Mutex, mpsc::Sender},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
+use crate::player::backend::{
+    BackendEvent, BackendEventKind, ByteCacheState, CacheUnlinkPolicy, DemuxCacheState,
+    PlaybackCacheByteRange, PlaybackCacheConfig, PlaybackCacheMode, PlaybackCacheState,
+};
+#[cfg(test)]
+use crate::player::render_host::PlaybackSessionId;
+
+use super::super::{
+    FfmpegControl, HTTP_CACHE_CHUNK_SIZE, HTTP_CACHE_CONTENT_LEN_WAIT,
+    HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR, HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR,
+    HTTP_CACHE_PARTIAL_READ_MIN_BYTES, HTTP_CACHE_PREFETCH_PAUSE_LOG_AFTER,
+    HTTP_CACHE_PREFETCH_PAUSE_LOG_INTERVAL, HTTP_CACHE_PROGRESS_REPORT_THRESHOLD,
+    HTTP_CACHE_SIDE_DOWNLOAD_WORKERS, HTTP_CACHE_STALL_LOG_AFTER, HTTP_CACHE_STALL_LOG_INTERVAL,
+    HTTP_CACHE_WAIT_INTERVAL,
+};
+#[cfg(test)]
+use super::super::{
+    HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS, HTTP_CACHE_DEFAULT_READAHEAD_SECONDS,
+    HTTP_CACHE_PROBE_READ_WAIT, HTTP_CACHE_RANGE_REQUEST_BYTES, HTTP_RING_CACHE_CAPACITY,
+};
 use super::{
     download::{http_ring_cache_download_loop, http_ring_cache_side_download_loop},
     http::reqwest_header_pairs,
-    *,
 };
 
 #[derive(Clone)]
@@ -2538,7 +2568,18 @@ fn http_stream_cache_status_changed(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+
+    use crate::player::{
+        backend::{BackendEventKind, ByteCacheState, CacheUnlinkPolicy, PlaybackCacheState},
+        render_host::PlaybackSessionId,
+    };
+
+    use super::{
+        CacheReadResult, CacheRestartRequest, FfmpegControl, HTTP_CACHE_RANGE_REQUEST_BYTES,
+        HttpCacheConfig, HttpCacheRangeKind, HttpDiskCache, HttpRingCache, HttpRingCacheShared,
+        HttpRingCacheState,
+    };
 
     #[test]
     fn http_cache_state_queues_tail_side_download_without_active_restart() {

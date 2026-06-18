@@ -2,7 +2,21 @@ use super::output_gate::{OutputGateResumeStatus, service_output_gate_resume_if_r
 use super::output_rebuffer::demux_reader_ready_for_output;
 use super::playback_snapshot::PlaybackPipelineTelemetry;
 use super::playback_wait_service::{PlaybackPipelineWaitContext, PlaybackPipelineWaitService};
-use super::*;
+use std::{
+    sync::{atomic::AtomicBool, mpsc::Sender},
+    time::{Duration, Instant},
+};
+
+use crate::player::{
+    backend::BackendEvent,
+    render_host::{PlaybackSessionId, VideoOutputQueue},
+};
+
+use super::{
+    AudioOutput, AudioOutputSnapshot, DemuxPacketCache, FfmpegControl,
+    OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PlaybackOutputSnapshot, PlaybackOutputState,
+    PlaybackPipelineState,
+};
 
 #[derive(Default)]
 pub(super) struct OutputGateService;
@@ -277,7 +291,11 @@ fn log_output_gate_service_timing(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AudioOutputSnapshot, OutputGateResumeStatus, OutputGateServiceOutcome,
+        OutputGateServiceStatus, PlaybackOutputSnapshot, PlaybackOutputState,
+        audio_output_starving, output_gate_service_status_after_resume,
+    };
 
     #[test]
     fn output_gate_service_status_reports_continue() {

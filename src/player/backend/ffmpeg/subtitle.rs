@@ -1,4 +1,13 @@
-use super::*;
+use std::{collections::VecDeque, ffi::CStr, os::raw::c_char, slice, time::Duration};
+
+use ffmpeg_sys_next as ffi;
+
+use crate::player::{
+    backend::{BackendSubtitleBitmap, BackendSubtitleCue},
+    render_host::{RenderSize, render_image_from_bgra},
+};
+
+use super::reqwest_header_pairs;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct DecodedSubtitleCue {
@@ -666,9 +675,18 @@ fn normalize_newlines(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::ffi::CString;
     use std::ptr;
+
+    use ffmpeg_sys_next as ffi;
+
+    use crate::player::render_host::RenderSize;
+
+    use super::{
+        ass_dialogue_text, decode_external_subtitle_text, decoded_subrip_packet_cue,
+        decoded_subtitle_cues, normalize_subtitle_text, parse_external_subtitle_text,
+        strip_ass_override_tags, text_subtitle_cue,
+    };
 
     #[test]
     fn ass_dialogue_text_extracts_final_field() {

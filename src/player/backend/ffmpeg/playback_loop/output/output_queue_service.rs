@@ -4,7 +4,20 @@ use super::video_output_gate::{
     service_audio_clocked_video_queue_if_playing, service_decode_backpressure_step,
     service_video_clocked_video_queue_if_no_audio,
 };
-use super::*;
+use std::{
+    sync::{atomic::AtomicBool, mpsc::Sender},
+    time::{Duration, Instant},
+};
+
+use crate::player::{
+    backend::BackendEvent,
+    render_host::{PlaybackSessionId, VideoOutputQueue},
+};
+
+use super::{
+    DemuxPacketCache, FfmpegControl, PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER,
+    PlaybackPipelineState,
+};
 
 #[derive(Default)]
 pub(super) struct OutputQueueService;
@@ -316,7 +329,7 @@ fn log_output_queue_service_timing(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::OutputQueueServiceStatus;
 
     #[test]
     fn output_queue_service_status_reports_continue() {

@@ -1,8 +1,20 @@
+use std::sync::{atomic::AtomicBool, mpsc::Sender};
+
+use crate::player::{
+    backend::BackendEvent,
+    render_host::{PlaybackSessionId, VideoOutputQueue},
+};
+
 use super::pending_audio_queue::{PendingStartAudio, PendingStartAudioFrame};
 use super::playback_block::PlaybackBlockReason;
 use super::scheduled_video_queue::ScheduledVideoQueue;
 use super::video_output_gate::{AudioClockedVideoDrainStatus, admit_decoded_video_frame_to_vo};
-use super::*;
+use super::{
+    AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AudioClockMode,
+    AudioOutput, AudioOutputPushResult, BufferedReporter, DecodedAudio, FfmpegControl,
+    PENDING_AUDIO_CONTINUITY_TOLERANCE, PositionReporter, SubtitlePipeline,
+    audio_elements_for_frames, audio_frames_for_duration_round, duration_nsecs,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) struct PendingAudioUnderrunRecoveryPlan {
@@ -703,7 +715,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::player::render_host::PlaybackSessionId;
+
+    use super::super::AudioClockMode;
+    use super::super::pending_audio_queue::PendingStartAudioFrame;
+    use super::merge_small_pending_audio_gap;
 
     fn pending_audio_frame(start_timeline_nsecs: u64) -> PendingStartAudioFrame {
         PendingStartAudioFrame {

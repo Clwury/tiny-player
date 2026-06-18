@@ -1,4 +1,17 @@
-use super::*;
+use std::{collections::VecDeque, slice};
+
+use ffmpeg_sys_next as ffi;
+
+use crate::player::{
+    dovi::{DoviFrameMetadata, DoviRpuExtractor, HevcStreamFormat},
+    ffmpeg_dovi::FfmpegDoviMetadata,
+    render_host::FramePts,
+};
+
+use super::{
+    AvPacket, RPU_MATCH_TOLERANCE, RPU_QUEUE_CAPACITY, StreamInfo, duration_nsecs, pts_distance,
+    timestamp_to_nsecs,
+};
 
 pub(super) fn dovi_metadata_from_frame(frame: *mut ffi::AVFrame) -> Option<DoviFrameMetadata> {
     if has_ffmpeg_dovi_metadata(frame) {
@@ -420,7 +433,12 @@ fn starts_with_annex_b_start_code(data: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::player::{dovi::DoviFrameMetadata, render_host::FramePts};
+
+    use super::{
+        DoviMetadataEntry, DoviMetadataQueue, DoviMetadataState, dovi_config_is_profile5,
+        dovi_metadata_from_rpu_buffer,
+    };
 
     #[test]
     fn dovi_state_reuses_last_profile5_metadata_when_frame_metadata_is_missing() {

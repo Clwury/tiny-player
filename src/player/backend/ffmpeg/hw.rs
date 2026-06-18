@@ -1,5 +1,13 @@
-use super::*;
+use std::{env, os::raw::c_int, ptr, sync::Arc};
+
 use crate::player::ffmpeg_vulkan as vulkan_ffi;
+use crate::player::render_host::{
+    FfmpegAvBufferRef, RawVideoFormat, VulkanDecodeDevice, VulkanDecodeQueue, VulkanDecodeQueues,
+    VulkanVideoPlane,
+};
+use ffmpeg_sys_next as ffi;
+
+use super::ffmpeg_error;
 
 const TINY_HWDEC_ENV: &str = "TINY_HWDEC";
 const VULKAN_EXTRA_HW_FRAMES: c_int = 24;
@@ -288,7 +296,10 @@ pub(super) fn vulkan_frame_planes(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        HardwareDecodeMode, VK_QUEUE_GRAPHICS_BIT, VK_QUEUE_TRANSFER_BIT, VulkanDecodeQueue,
+        find_queue, vulkan_ffi,
+    };
 
     #[test]
     fn hardware_decode_mode_parses_disabled_values() {

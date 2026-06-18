@@ -1,4 +1,9 @@
-use super::*;
+use std::{collections::VecDeque, os::raw::c_int, time::Duration};
+
+use super::{
+    DecodedAudio, PENDING_AUDIO_CONTINUITY_TOLERANCE, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    align_audio_elements_to_frame_boundary, audio_elements_for_duration_floor, duration_nsecs,
+};
 
 #[derive(Default)]
 pub(in crate::player::backend::ffmpeg) struct PendingStartAudio {

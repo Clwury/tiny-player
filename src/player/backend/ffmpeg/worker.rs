@@ -1,4 +1,21 @@
-use super::*;
+use std::{
+    os::raw::{c_int, c_void},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    thread::{self, JoinHandle},
+};
+
+use crate::player::render_host::{PlaybackSessionId, VideoOutputQueue};
+
+use super::{
+    BackendError, BackendEvent, BackendEventKind, PLAYBACK_VOLUME_SCALE, PlaybackCacheConfig,
+    PlaybackSeekMode, Result, normalize_playback_volume,
+};
+#[cfg(test)]
+use super::{DEFAULT_PLAYBACK_VOLUME, SCHEDULER_POLL_INTERVAL};
 
 pub(super) struct FfmpegWorker {
     control: Arc<FfmpegControl>,

@@ -1,9 +1,19 @@
+use std::sync::{atomic::AtomicBool, mpsc::Sender};
+
+use crate::player::{
+    backend::BackendEvent,
+    render_host::{PlaybackSessionId, VideoOutputQueue},
+};
+
 use super::video_frame_prepare_worker::PreparedVideoFrame;
 use super::video_output_gate::{
     DecodedVideoAdmissionStatus, service_audio_clocked_decoded_video_frame,
     service_audio_clocked_drain_decoded_video_frame, service_video_clocked_decoded_video_frame,
 };
-use super::*;
+use super::{
+    AudioOutput, BufferedReporter, DemuxReaderWatermark, FfmpegControl, PlaybackOutputScheduler,
+    PlaybackScheduler, PositionReporter, SubtitlePipeline,
+};
 
 pub(super) fn admit_prepared_video_frame<F>(
     context: PreparedVideoFrameAdmissionContext<'_, F>,

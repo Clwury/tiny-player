@@ -1,10 +1,32 @@
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
+
+use crate::player::render_host::PlaybackSessionId;
+
 use super::pending_audio_queue::PendingStartAudio;
 use super::playback_block::PlaybackBlockReason;
 use super::scheduled_video_queue::{
     ScheduledVideoQueue, queued_video_buffered_until_from_nsecs, queued_video_forward_nsecs_from,
     queued_video_range_nsecs,
 };
-use super::*;
+use super::{
+    AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AUDIO_OUTPUT_VIDEO_LEAD_DURATION,
+    AUDIO_VIDEO_REBUFFER_DRIFT_RESET_THRESHOLD, AudioOutput, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+    DemuxReaderWatermark, FfmpegControl, PENDING_AUDIO_CONTINUITY_TOLERANCE, QueuedVideoFrame,
+    VIDEO_DECODE_SKIP_NONREF_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER,
+    VIDEO_OUTPUT_REBUFFER_ENTER_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
+    VIDEO_OUTPUT_REBUFFER_MIN_STABLE_RESUME_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER, VIDEO_OUTPUT_START_PREBUFFER_DURATION,
+    VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER, duration_nsecs, queued_video_duration,
+    queued_video_frames_have_vulkan, queued_video_limit_duration, queued_video_target_duration,
+};
+#[cfg(test)]
+use super::{
+    VIDEO_OUTPUT_REBUFFER_RESUME_FRAMES, VIDEO_OUTPUT_START_PREBUFFER_FRAMES,
+    queued_video_target_frames,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) enum PlaybackOutputState {
@@ -72,6 +94,35 @@ struct DelayedStartDecodedAudioForward {
     gap_nsecs: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RebufferAudioAnchorResetContext {
+    reset_to_video_when_decoded_queue_misses_anchor: bool,
+    first_video_nsecs: u64,
+    played_until_nsecs: u64,
+    decoded_video_buffered_until_nsecs: Option<u64>,
+    audio_output_buffered_until_nsecs: Option<u64>,
+    stable_resume_nsecs: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VideoOutputRebufferEntryContext {
+    underrun_started_at: Option<Instant>,
+    now: Instant,
+    video_output_underflowing: bool,
+    output_underrun: bool,
+    demux_cache_insufficient: bool,
+    render_backlogged: bool,
+    has_audio_output: bool,
+    pending_audio_recoverable: bool,
+    output_state: PlaybackOutputState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoOutputRebufferEntryDecision {
+    underrun_started_at: Option<Instant>,
+    should_enter: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::player::backend::ffmpeg) fn video_output_rebuffer_should_enter(
     underrun_started_at: &mut Option<Instant>,
@@ -84,25 +135,55 @@ pub(in crate::player::backend::ffmpeg) fn video_output_rebuffer_should_enter(
     pending_audio_recoverable: bool,
     output_state: PlaybackOutputState,
 ) -> bool {
-    if output_state.rebuffering() {
-        return false;
+    let decision = video_output_rebuffer_entry_decision(VideoOutputRebufferEntryContext {
+        underrun_started_at: *underrun_started_at,
+        now,
+        video_output_underflowing,
+        output_underrun,
+        demux_cache_insufficient,
+        render_backlogged,
+        has_audio_output,
+        pending_audio_recoverable,
+        output_state,
+    });
+    *underrun_started_at = decision.underrun_started_at;
+    decision.should_enter
+}
+
+fn video_output_rebuffer_entry_decision(
+    context: VideoOutputRebufferEntryContext,
+) -> VideoOutputRebufferEntryDecision {
+    if context.output_state.rebuffering() {
+        return VideoOutputRebufferEntryDecision {
+            underrun_started_at: context.underrun_started_at,
+            should_enter: false,
+        };
     }
-    if !video_output_underflowing
-        || render_backlogged
-        || !has_audio_output
-        || (!demux_cache_insufficient && !output_underrun)
+    if !context.video_output_underflowing
+        || context.render_backlogged
+        || !context.has_audio_output
+        || (!context.demux_cache_insufficient && !context.output_underrun)
     {
-        *underrun_started_at = None;
-        return false;
+        return VideoOutputRebufferEntryDecision {
+            underrun_started_at: None,
+            should_enter: false,
+        };
     }
 
-    let started_at = underrun_started_at.get_or_insert(now);
-    if output_underrun && !demux_cache_insufficient && pending_audio_recoverable {
-        return now.saturating_duration_since(*started_at)
-            >= VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER;
+    let started_at = context.underrun_started_at.unwrap_or(context.now);
+    let underrun_elapsed = context.now.saturating_duration_since(started_at);
+    let should_enter = if context.output_underrun
+        && !context.demux_cache_insufficient
+        && context.pending_audio_recoverable
+    {
+        underrun_elapsed >= VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER
+    } else {
+        context.output_underrun || underrun_elapsed >= VIDEO_OUTPUT_REBUFFER_ENTER_AFTER
+    };
+    VideoOutputRebufferEntryDecision {
+        underrun_started_at: Some(started_at),
+        should_enter,
     }
-    output_underrun
-        || now.saturating_duration_since(*started_at) >= VIDEO_OUTPUT_REBUFFER_ENTER_AFTER
 }
 
 pub(in crate::player::backend::ffmpeg) fn demux_reader_ready_for_output(
@@ -364,16 +445,14 @@ pub(in crate::player::backend::ffmpeg) fn rebuffer_audio_clock_resume_decision(
     if reset_to_video_when_decoded_queue_misses_anchor && first_video_nsecs < played_until_nsecs {
         let decoded_video_buffered_until_nsecs =
             queued_video_buffered_until_from_nsecs(queued_video_frames, played_until_nsecs);
-        let decoded_video_anchor_forward_nsecs = decoded_video_buffered_until_nsecs
-            .map(|buffered_until| buffered_until.saturating_sub(played_until_nsecs));
-        let decoded_video_anchor_window_unstable =
-            decoded_video_anchor_forward_nsecs.is_none_or(|duration| {
-                duration < duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
-            });
-        let output_audio_runs_past_decoded_video = audio_output_buffered_until_nsecs
-            .zip(decoded_video_buffered_until_nsecs)
-            .is_some_and(|(audio_until, video_until)| audio_until > video_until);
-        if decoded_video_anchor_window_unstable || output_audio_runs_past_decoded_video {
+        if rebuffer_audio_anchor_reset_required(RebufferAudioAnchorResetContext {
+            reset_to_video_when_decoded_queue_misses_anchor,
+            first_video_nsecs,
+            played_until_nsecs,
+            decoded_video_buffered_until_nsecs,
+            audio_output_buffered_until_nsecs,
+            stable_resume_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+        }) {
             return Some(AudioClockResumeDecision {
                 timeline_nsecs: first_video_nsecs,
                 reset_audio_to_video: true,
@@ -407,6 +486,26 @@ pub(in crate::player::backend::ffmpeg) fn rebuffer_audio_clock_resume_decision(
             reset_audio_to_video: false,
         })
     }
+}
+
+fn rebuffer_audio_anchor_reset_required(context: RebufferAudioAnchorResetContext) -> bool {
+    if !context.reset_to_video_when_decoded_queue_misses_anchor
+        || context.first_video_nsecs >= context.played_until_nsecs
+    {
+        return false;
+    }
+
+    let decoded_video_anchor_forward_nsecs = context
+        .decoded_video_buffered_until_nsecs
+        .map(|buffered_until| buffered_until.saturating_sub(context.played_until_nsecs));
+    let decoded_video_anchor_window_unstable = decoded_video_anchor_forward_nsecs
+        .is_none_or(|duration| duration < context.stable_resume_nsecs);
+    let output_audio_runs_past_decoded_video = context
+        .audio_output_buffered_until_nsecs
+        .zip(context.decoded_video_buffered_until_nsecs)
+        .is_some_and(|(audio_until, video_until)| audio_until > video_until);
+
+    decoded_video_anchor_window_unstable || output_audio_runs_past_decoded_video
 }
 
 pub(in crate::player::backend::ffmpeg) fn initial_audio_clock_resume_decision(
@@ -910,7 +1009,14 @@ pub(in crate::player::backend::ffmpeg) fn clear_video_output_rebuffer(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        PlaybackResumeWaterline, RebufferAudioAnchorResetContext,
+        VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
+        VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER,
+        duration_nsecs, rebuffer_audio_anchor_reset_required,
+        rebuffer_playback_resume_waterline_after_cache_pause,
+        rebuffer_playback_resume_waterline_after_prolonged_wait,
+    };
 
     fn rebuffer_waterline(
         decoded_video_forward_nsecs: u64,
@@ -932,6 +1038,48 @@ mod tests {
                 >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
             demux_ready,
         }
+    }
+
+    fn anchor_reset_context(
+        decoded_video_buffered_until_nsecs: Option<u64>,
+        audio_output_buffered_until_nsecs: Option<u64>,
+    ) -> RebufferAudioAnchorResetContext {
+        RebufferAudioAnchorResetContext {
+            reset_to_video_when_decoded_queue_misses_anchor: true,
+            first_video_nsecs: 1_000_000_000,
+            played_until_nsecs: 2_000_000_000,
+            decoded_video_buffered_until_nsecs,
+            audio_output_buffered_until_nsecs,
+            stable_resume_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+        }
+    }
+
+    #[test]
+    fn rebuffer_audio_anchor_reset_requires_stable_decoded_video_window() {
+        assert!(rebuffer_audio_anchor_reset_required(anchor_reset_context(
+            Some(2_500_000_000),
+            None,
+        )));
+        assert!(!rebuffer_audio_anchor_reset_required(anchor_reset_context(
+            Some(3_000_000_000),
+            None,
+        )));
+    }
+
+    #[test]
+    fn rebuffer_audio_anchor_reset_when_output_audio_runs_past_decoded_video() {
+        assert!(rebuffer_audio_anchor_reset_required(anchor_reset_context(
+            Some(3_250_000_000),
+            Some(3_500_000_000),
+        )));
+    }
+
+    #[test]
+    fn rebuffer_audio_anchor_reset_respects_disabled_anchor_policy() {
+        let mut context = anchor_reset_context(None, None);
+        context.reset_to_video_when_decoded_queue_misses_anchor = false;
+
+        assert!(!rebuffer_audio_anchor_reset_required(context));
     }
 
     #[test]

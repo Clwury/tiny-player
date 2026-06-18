@@ -1,4 +1,15 @@
-use super::*;
+use std::{ffi::CStr, mem, os::raw::c_int, ptr, slice, sync::Arc};
+
+use ffmpeg_sys_next as ffi;
+
+use crate::player::render_host::{FrameBufferPool, PooledBytes, RenderSize, VulkanDecodeDevice};
+
+use super::audio::{audio_sample_len, frame_sample_format, zeroed_channel_layout};
+use super::subtitle::{DecodedSubtitleCue, decoded_subtitle_cues};
+use super::{
+    FALLBACK_AUDIO_OUTPUT_CHANNELS, HardwareDecodeMode, StreamInfo, VideoHwDecodeContext,
+    ffmpeg_error, frame_size, video_frame_len,
+};
 
 pub(super) struct Decoder {
     ptr: *mut ffi::AVCodecContext,
@@ -1035,7 +1046,12 @@ pub(super) struct DecodedAudio {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use ffmpeg_sys_next as ffi;
+
+    use super::{
+        AvPacket, packet_is_video_recovery_point, packet_is_video_seek_point,
+        video_error_recognition,
+    };
 
     fn packet_from_data(data: &[u8]) -> AvPacket {
         let props = AvPacket::new().expect("packet props allocate");
