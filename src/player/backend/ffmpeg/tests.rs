@@ -3,11 +3,11 @@ use super::worker::{FfmpegCommand, PendingSeek, PendingTrackSelection, drain_pla
 use super::{
     AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
     AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AUDIO_VIDEO_QUEUE_LIMIT_DURATION,
-    AUDIO_VIDEO_QUEUE_TARGET_DURATION, AudioBuffer, AudioShared, AvFrame, AvPacket, BackendEvent,
-    BackendEventKind, BufferedReporter, ByteCacheState, CacheReadResult,
-    DECODED_VIDEO_QUEUE_LIMIT_FRAMES, DEFAULT_VIDEO_FRAME_DURATION_NSECS, DecodedAudio,
-    FALLBACK_AUDIO_OUTPUT_CHANNELS, FfmpegBackend, FfmpegControl, FfmpegPlaybackInput,
-    HTTP_CACHE_CHUNK_SIZE, HTTP_CACHE_PARTIAL_READ_MIN_BYTES, HTTP_CACHE_RANGE_REQUEST_BYTES,
+    AUDIO_VIDEO_QUEUE_TARGET_DURATION, AvFrame, AvPacket, BackendEvent, BackendEventKind,
+    BufferedReporter, ByteCacheState, CacheReadResult, DECODED_VIDEO_QUEUE_LIMIT_FRAMES,
+    DEFAULT_VIDEO_FRAME_DURATION_NSECS, DecodedAudio, FALLBACK_AUDIO_OUTPUT_CHANNELS,
+    FfmpegBackend, FfmpegControl, FfmpegPlaybackInput, HTTP_CACHE_CHUNK_SIZE,
+    HTTP_CACHE_PARTIAL_READ_MIN_BYTES, HTTP_CACHE_RANGE_REQUEST_BYTES,
     HTTP_CACHE_RANGE_REQUEST_TIMEOUT, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
     HTTP_CACHE_SMALL_RANGE_REQUEST_TIMEOUT, HTTP_RING_CACHE_CAPACITY, HttpContentRange,
     HttpRingCache, HttpRingCacheState, InputProbeProfile, MappedTimestamp,
@@ -22,15 +22,15 @@ use super::{
     VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION, VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION,
     VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VULKAN_DECODED_VIDEO_QUEUE_TARGET_FRAMES,
     VULKAN_VIDEO_OUTPUT_RESOURCE_PRESSURE_FRAMES, WaitStatus, audio_sample_len,
-    audio_samples_duration, content_len_from_content_range, content_range_from_headers,
-    dovi_packet_timeline_nsecs, duration_nsecs, ffmpeg_http_headers, ffmpeg_raw_video_format,
-    fill_audio_output, frame_decode_error_flags, frame_is_corrupt, has_annex_b_start_code,
-    http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
+    content_len_from_content_range, content_range_from_headers, dovi_packet_timeline_nsecs,
+    duration_nsecs, ffmpeg_http_headers, ffmpeg_raw_video_format, frame_decode_error_flags,
+    frame_is_corrupt, has_annex_b_start_code, http_cache_range_header,
+    http_cache_range_request_len, http_cache_range_request_timeout,
     http_cache_request_headers_for_log, http_cache_response_headers_for_log,
     optional_buffered_value_changed, queued_video_duration, queued_video_limit_duration,
     queued_video_limit_frames, queued_video_limit_reached, queued_video_target_duration,
     queued_video_target_frames, queued_video_target_reached, reqwest_header_pairs,
-    samples_for_duration, should_cache_http_url,
+    should_cache_http_url,
 };
 use std::{
     collections::VecDeque,
@@ -4179,92 +4179,6 @@ fn audio_sample_len_rejects_invalid_sizes() {
 }
 
 #[test]
-fn audio_ring_buffer_reuses_fixed_capacity_and_wraps() {
-    let mut buffer = AudioBuffer::with_capacity(4);
-
-    assert_eq!(buffer.push_slice(&[1.0, 2.0, 3.0]), 3);
-    assert_eq!(buffer.pop_sample(), Some(1.0));
-    assert_eq!(buffer.pop_sample(), Some(2.0));
-    assert_eq!(buffer.push_slice(&[4.0, 5.0, 6.0]), 3);
-    assert_eq!(buffer.push_slice(&[7.0]), 0);
-
-    assert_eq!(buffer.pop_sample(), Some(3.0));
-    assert_eq!(buffer.pop_sample(), Some(4.0));
-    assert_eq!(buffer.pop_sample(), Some(5.0));
-    assert_eq!(buffer.pop_sample(), Some(6.0));
-    assert_eq!(buffer.pop_sample(), None);
-}
-
-#[test]
-fn audio_samples_duration_accounts_for_interleaved_channels() {
-    assert_eq!(
-        audio_samples_duration(96_000, 48_000, FALLBACK_AUDIO_OUTPUT_CHANNELS),
-        Duration::from_secs(1)
-    );
-    assert_eq!(
-        audio_samples_duration(0, 48_000, FALLBACK_AUDIO_OUTPUT_CHANNELS),
-        Duration::ZERO
-    );
-    assert_eq!(audio_samples_duration(1024, 0, 2), Duration::ZERO);
-    assert_eq!(audio_samples_duration(1024, 48_000, 0), Duration::ZERO);
-}
-
-#[test]
-fn samples_for_duration_accounts_for_interleaved_channels() {
-    assert_eq!(
-        samples_for_duration(1_000_000_000, 48_000, FALLBACK_AUDIO_OUTPUT_CHANNELS),
-        96_000
-    );
-    assert_eq!(samples_for_duration(0, 48_000, 2), 0);
-    assert_eq!(samples_for_duration(1_000_000_000, 0, 2), 0);
-    assert_eq!(samples_for_duration(1_000_000_000, 48_000, 0), 0);
-}
-
-fn test_audio_shared(max_samples: usize) -> AudioShared {
-    AudioShared::new(
-        max_samples,
-        48_000,
-        FALLBACK_AUDIO_OUTPUT_CHANNELS,
-        Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
-    )
-}
-
-#[test]
-fn audio_clock_uses_queued_end_minus_pending_audio() {
-    let shared = test_audio_shared(960);
-    shared.reset_clock(1_000_000_000);
-    assert_eq!(
-        shared
-            .buffer
-            .lock()
-            .expect("audio output buffer poisoned")
-            .push_slice(&vec![0.0; 960]),
-        960
-    );
-    shared.set_queued_end_timeline_nsecs(1_010_000_000);
-
-    assert_eq!(shared.played_timeline_nsecs(), 1_000_000_000);
-}
-
-#[test]
-fn audio_clock_subtracts_output_device_delay() {
-    let shared = test_audio_shared(960);
-    shared.reset_clock(1_000_000_000);
-    assert_eq!(
-        shared
-            .buffer
-            .lock()
-            .expect("audio output buffer poisoned")
-            .push_slice(&vec![0.0; 960]),
-        960
-    );
-    shared.set_queued_end_timeline_nsecs(1_010_000_000);
-    shared.set_output_delay_for_test(Duration::from_millis(20));
-
-    assert_eq!(shared.played_timeline_nsecs(), 980_000_000);
-}
-
-#[test]
 fn dovi_packet_timeline_uses_stream_start_when_available() {
     let time_base = ffi::AVRational { num: 1, den: 1_000 };
     let mut first_packet_nsecs = None;
@@ -4294,120 +4208,6 @@ fn dovi_packet_timeline_uses_first_packet_when_stream_start_is_missing() {
         dovi_packet_timeline_nsecs(&mut first_packet_nsecs, None, 1_500, time_base),
         Some(250_000_000)
     );
-}
-
-#[test]
-fn fill_audio_output_converts_samples_and_outputs_silence_on_underrun() {
-    let shared = test_audio_shared(8);
-    assert_eq!(
-        shared
-            .buffer
-            .lock()
-            .expect("audio output buffer poisoned")
-            .push_slice(&[-1.0, 0.0, 1.0]),
-        3
-    );
-    let mut output = [0.0f64; 4];
-
-    fill_audio_output(&mut output, &shared);
-
-    assert_eq!(output, [-1.0, 0.0, 1.0, 0.0]);
-    assert!(
-        shared
-            .buffer
-            .lock()
-            .expect("audio output buffer poisoned")
-            .is_empty()
-    );
-    assert_eq!(shared.played_samples.load(Ordering::Relaxed), 3);
-    assert!(shared.underrun_active_for_test());
-}
-
-#[test]
-fn audio_clock_freezes_during_output_underrun_until_pending_recovers() {
-    let shared = test_audio_shared(4_800);
-    shared.reset_clock(1_000_000_000);
-    assert_eq!(
-        shared
-            .buffer
-            .lock()
-            .expect("audio output buffer poisoned")
-            .push_slice(&vec![0.0; 960]),
-        960
-    );
-    shared.set_queued_end_timeline_nsecs(1_010_000_000);
-
-    let mut output = [0.0f64; 1_920];
-    fill_audio_output(&mut output, &shared);
-
-    let frozen_timeline_nsecs = shared.played_timeline_nsecs();
-    assert!(frozen_timeline_nsecs.abs_diff(1_000_000_000) <= 1_000);
-    assert!(shared.underrun_active_for_test());
-
-    assert_eq!(
-        shared
-            .buffer
-            .lock()
-            .expect("audio output buffer poisoned")
-            .push_slice(&vec![0.0; 960]),
-        960
-    );
-    shared.set_queued_end_timeline_nsecs(2_000_000_000);
-    assert_eq!(shared.played_timeline_nsecs(), frozen_timeline_nsecs);
-
-    shared.clear_underrun_if_recovered_for_test(duration_nsecs(
-        AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
-    ));
-    assert!(!shared.underrun_active_for_test());
-    assert_ne!(shared.played_timeline_nsecs(), frozen_timeline_nsecs);
-}
-
-#[test]
-fn fill_audio_output_applies_playback_volume() {
-    let shared = test_audio_shared(8);
-    shared.control.set_volume(0.25);
-    assert_eq!(
-        shared
-            .buffer
-            .lock()
-            .expect("audio output buffer poisoned")
-            .push_slice(&[-1.0, 0.5, 1.0]),
-        3
-    );
-    let mut output = [0.0f64; 3];
-
-    fill_audio_output(&mut output, &shared);
-
-    assert_eq!(output, [-0.25, 0.125, 0.25]);
-    assert_eq!(shared.played_samples.load(Ordering::Relaxed), 3);
-}
-
-#[test]
-fn fill_audio_output_preserves_buffer_while_paused() {
-    let shared = test_audio_shared(8);
-    shared.control.set_user_paused(true);
-    assert_eq!(
-        shared
-            .buffer
-            .lock()
-            .expect("audio output buffer poisoned")
-            .push_slice(&[-1.0, 0.0, 1.0]),
-        3
-    );
-    let mut output = [0.5f64; 4];
-
-    fill_audio_output(&mut output, &shared);
-
-    assert_eq!(output, [0.0, 0.0, 0.0, 0.0]);
-    assert_eq!(
-        shared
-            .buffer
-            .lock()
-            .expect("audio output buffer poisoned")
-            .len(),
-        3
-    );
-    assert_eq!(shared.played_samples.load(Ordering::Relaxed), 0);
 }
 
 #[test]

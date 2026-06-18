@@ -27,10 +27,6 @@ pub use backend::FfmpegBackend;
 
 #[cfg(test)]
 use audio::audio_sample_len;
-#[cfg(test)]
-use audio::{
-    AudioBuffer, AudioShared, audio_samples_duration, fill_audio_output, samples_for_duration,
-};
 use audio::{
     AudioClockMode, AudioOutput, AudioOutputDrainStatus, AudioOutputPushResult,
     AudioOutputSnapshot, align_audio_elements_to_frame_boundary, audio_elements_for_duration_floor,
