@@ -1,7 +1,10 @@
 use ffmpeg_sys_next as ffi;
 
 use crate::player::{
-    dovi::{DoviFrameMetadata, DoviRpuStripResult, HevcStreamFormat, strip_dovi_rpu_nalus},
+    dovi::{
+        DoviFrameMetadata, DoviRpuNalInspection, HevcStreamFormat, inspect_dovi_rpu_nalus,
+        strip_dovi_rpu_nalus,
+    },
     render_host::PlaybackSessionId,
 };
 
@@ -376,7 +379,7 @@ impl VideoDecodePipeline {
         }
 
         log_video_decode_packet_if_needed(packet, codec_id, *video_packet_count, recovery);
-        let stripped_video_packet = strip_hevc_dovi_rpu_decode_packet(
+        let dovi_packet_rewrite = inspect_hevc_dovi_rpu_decode_packet(
             packet,
             codec_id,
             HevcDecodePacketLogContext {
@@ -385,20 +388,21 @@ impl VideoDecodePipeline {
                 recovery_waiting: recovery.waiting_for_keyframe(),
             },
         )?;
-        if let Some(metadata) = stripped_video_packet
-            .as_ref()
-            .and_then(|packet| packet.metadata.clone())
-        {
+        if let Some(metadata) = dovi_packet_rewrite.metadata().cloned() {
             tracing::trace!(
                 pts = ?packet.best_timestamp(),
                 profile = metadata.profile,
                 profile5 = metadata.is_profile5(),
                 rpu_bytes = metadata.rpu_payload.len(),
-                "using stripped Dolby Vision RPU metadata for FFmpeg packet"
+                "using Dolby Vision RPU metadata side channel for FFmpeg packet"
             );
             dovi_pipeline.observe_video_packet_metadata(packet, context.video_stream, metadata);
         } else {
             dovi_pipeline.observe_video_packet(packet, context.video_stream);
+        }
+
+        if dovi_packet_rewrite.drop_decode_packet() {
+            return Ok(DecodePacketAdmissionStatus::Dropped);
         }
 
         let skip_nonref_for_pressure = context.skip_nonref_for_pressure;
@@ -422,17 +426,8 @@ impl VideoDecodePipeline {
             );
         }
 
-        if stripped_video_packet
-            .as_ref()
-            .is_some_and(|stripped| stripped.packet.byte_len() == 0)
-        {
-            return Ok(DecodePacketAdmissionStatus::Dropped);
-        }
-
         let generation = playback_generation.advance();
-        let decode_packet = stripped_video_packet
-            .as_ref()
-            .map_or(packet, |stripped| &stripped.packet);
+        let decode_packet = dovi_packet_rewrite.decode_packet(packet);
         let pending_packet = PendingVideoDecodePacket {
             generation,
             packet: AvPacket::ref_from(decode_packet)?,
@@ -564,18 +559,20 @@ impl VideoDecodePacketQueues {
     }
 }
 
-fn strip_hevc_dovi_rpu_decode_packet(
+const HEVC_DOVI_STRIPPED_DECODE_REWRITE_ENABLED: bool = false;
+
+fn inspect_hevc_dovi_rpu_decode_packet(
     packet: &AvPacket,
     codec_id: ffi::AVCodecID,
     log_context: HevcDecodePacketLogContext,
-) -> std::result::Result<Option<StrippedDoviDecodePacket>, String> {
+) -> std::result::Result<DoviDecodePacketRewrite, String> {
     if codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
-        return Ok(None);
+        return Ok(DoviDecodePacketRewrite::UseOriginal { metadata: None });
     }
     let Some(data) = packet.data() else {
-        return Ok(None);
+        return Ok(DoviDecodePacketRewrite::UseOriginal { metadata: None });
     };
-    let Some(stripped) = strip_dovi_rpu_nalus(data) else {
+    let Some(inspection) = inspect_dovi_rpu_nalus(data) else {
         if should_debug_hevc_decode_packet_without_rpu(log_context) {
             tracing::debug!(
                 packet_count = log_context.video_packet_count,
@@ -585,7 +582,7 @@ fn strip_hevc_dovi_rpu_decode_packet(
                 first_video_frame_pending = log_context.first_video_frame_pending,
                 recovery_waiting = log_context.recovery_waiting,
                 original_nals = %hevc_nal_summary(data, None),
-                "HEVC decode packet has no stripped Dolby Vision RPU NALs"
+                "HEVC decode packet has no Dolby Vision RPU NALs"
             );
         } else if should_trace_hevc_decode_packet_nals(packet, log_context) {
             tracing::trace!(
@@ -596,31 +593,37 @@ fn strip_hevc_dovi_rpu_decode_packet(
                 first_video_frame_pending = log_context.first_video_frame_pending,
                 recovery_waiting = log_context.recovery_waiting,
                 original_nals = %hevc_nal_summary(data, None),
-                "HEVC decode packet has no stripped Dolby Vision RPU NALs"
+                "HEVC decode packet has no Dolby Vision RPU NALs"
             );
         }
-        return Ok(None);
+        return Ok(DoviDecodePacketRewrite::UseOriginal { metadata: None });
     };
 
-    if should_debug_stripped_hevc_dovi_packet(log_context, &stripped) {
+    let metadata = inspection.metadata.clone();
+    let stripped_decode_action = hevc_dovi_decode_action_for_inspection(&inspection);
+    let decode_packet_action = dovi_decode_packet_action_name(
+        stripped_decode_action,
+        HEVC_DOVI_STRIPPED_DECODE_REWRITE_ENABLED,
+    );
+    if should_debug_dovi_rpu_inspection(log_context, &inspection) {
         tracing::debug!(
             packet_count = log_context.video_packet_count,
             pts = ?packet.best_timestamp(),
             keyframe = packet.is_key(),
             packet_bytes = packet.byte_len(),
-            stripped_packet_bytes = stripped.data.len(),
-            stripped_bytes = stripped.stripped_bytes,
-            nal_count = stripped.nal_count,
-            stripped_nal_count = stripped.stripped_nal_count,
-            stream_format = ?stripped.stream_format,
-            rpu_metadata = stripped.metadata.is_some(),
-            rpu_profile = ?stripped.metadata.as_ref().map(|metadata| metadata.profile),
-            rpu_profile5 = ?stripped.metadata.as_ref().map(DoviFrameMetadata::is_profile5),
+            stripped_bytes = inspection.stripped_bytes,
+            nal_count = inspection.nal_count,
+            kept_nal_count = inspection.kept_nal_count,
+            stripped_nal_count = inspection.stripped_nal_count,
+            stream_format = ?inspection.stream_format,
+            rpu_metadata = metadata.is_some(),
+            rpu_profile = ?metadata.as_ref().map(|metadata| metadata.profile),
+            rpu_profile5 = ?metadata.as_ref().map(DoviFrameMetadata::is_profile5),
             first_video_frame_pending = log_context.first_video_frame_pending,
             recovery_waiting = log_context.recovery_waiting,
-            original_nals = %hevc_nal_summary(data, Some(stripped.stream_format)),
-            stripped_nals = %hevc_nal_summary(&stripped.data, Some(stripped.stream_format)),
-            "stripped Dolby Vision RPU NALs before HEVC decode"
+            decode_packet_action,
+            original_nals = %hevc_nal_summary(data, Some(inspection.stream_format)),
+            "inspected Dolby Vision RPU NALs for HEVC decode"
         );
     } else if should_trace_hevc_decode_packet_nals(packet, log_context) {
         tracing::trace!(
@@ -628,31 +631,117 @@ fn strip_hevc_dovi_rpu_decode_packet(
             pts = ?packet.best_timestamp(),
             keyframe = packet.is_key(),
             packet_bytes = packet.byte_len(),
-            stripped_packet_bytes = stripped.data.len(),
-            stripped_bytes = stripped.stripped_bytes,
-            nal_count = stripped.nal_count,
-            stripped_nal_count = stripped.stripped_nal_count,
-            stream_format = ?stripped.stream_format,
-            rpu_metadata = stripped.metadata.is_some(),
-            rpu_profile = ?stripped.metadata.as_ref().map(|metadata| metadata.profile),
-            rpu_profile5 = ?stripped.metadata.as_ref().map(DoviFrameMetadata::is_profile5),
-            original_nals = %hevc_nal_summary(data, Some(stripped.stream_format)),
-            stripped_nals = %hevc_nal_summary(&stripped.data, Some(stripped.stream_format)),
-            "stripped Dolby Vision RPU NALs before HEVC decode"
+            stripped_bytes = inspection.stripped_bytes,
+            nal_count = inspection.nal_count,
+            kept_nal_count = inspection.kept_nal_count,
+            stripped_nal_count = inspection.stripped_nal_count,
+            stream_format = ?inspection.stream_format,
+            rpu_metadata = metadata.is_some(),
+            rpu_profile = ?metadata.as_ref().map(|metadata| metadata.profile),
+            rpu_profile5 = ?metadata.as_ref().map(DoviFrameMetadata::is_profile5),
+            decode_packet_action,
+            original_nals = %hevc_nal_summary(data, Some(inspection.stream_format)),
+            "inspected Dolby Vision RPU NALs for HEVC decode"
         );
     }
 
-    AvPacket::from_data_and_props(&stripped.data, packet).map(|packet| {
-        Some(StrippedDoviDecodePacket {
-            packet,
-            metadata: stripped.metadata,
-        })
-    })
+    match stripped_decode_action {
+        StrippedHevcDoviDecodeAction::DropMetadataOnly => {
+            Ok(DoviDecodePacketRewrite::DropMetadataOnly { metadata })
+        }
+        StrippedHevcDoviDecodeAction::PassthroughUnparsedMetadataOnly => {
+            Ok(DoviDecodePacketRewrite::UseOriginal { metadata })
+        }
+        StrippedHevcDoviDecodeAction::DecodeStripped
+            if HEVC_DOVI_STRIPPED_DECODE_REWRITE_ENABLED =>
+        {
+            if let Some(stripped) = strip_dovi_rpu_nalus(data) {
+                AvPacket::from_data_and_props(&stripped.data, packet).map(|packet| {
+                    DoviDecodePacketRewrite::Decode {
+                        packet,
+                        metadata: stripped.metadata,
+                    }
+                })
+            } else {
+                Ok(DoviDecodePacketRewrite::UseOriginal { metadata })
+            }
+        }
+        StrippedHevcDoviDecodeAction::DecodeStripped => {
+            Ok(DoviDecodePacketRewrite::UseOriginal { metadata })
+        }
+    }
 }
 
-struct StrippedDoviDecodePacket {
-    packet: AvPacket,
-    metadata: Option<DoviFrameMetadata>,
+enum DoviDecodePacketRewrite {
+    UseOriginal {
+        metadata: Option<DoviFrameMetadata>,
+    },
+    Decode {
+        packet: AvPacket,
+        metadata: Option<DoviFrameMetadata>,
+    },
+    DropMetadataOnly {
+        metadata: Option<DoviFrameMetadata>,
+    },
+}
+
+impl DoviDecodePacketRewrite {
+    fn metadata(&self) -> Option<&DoviFrameMetadata> {
+        match self {
+            Self::UseOriginal { metadata }
+            | Self::Decode { metadata, .. }
+            | Self::DropMetadataOnly { metadata } => metadata.as_ref(),
+        }
+    }
+
+    fn drop_decode_packet(&self) -> bool {
+        matches!(self, Self::DropMetadataOnly { .. })
+    }
+
+    fn decode_packet<'a>(&'a self, original: &'a AvPacket) -> &'a AvPacket {
+        match self {
+            Self::Decode { packet, .. } => packet,
+            Self::UseOriginal { .. } => original,
+            Self::DropMetadataOnly { .. } => {
+                unreachable!("metadata-only Dolby Vision packets are not decoded")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StrippedHevcDoviDecodeAction {
+    DecodeStripped,
+    DropMetadataOnly,
+    PassthroughUnparsedMetadataOnly,
+}
+
+fn hevc_dovi_decode_action_for_inspection(
+    inspection: &DoviRpuNalInspection,
+) -> StrippedHevcDoviDecodeAction {
+    if inspection.kept_nal_count > 0 {
+        return StrippedHevcDoviDecodeAction::DecodeStripped;
+    }
+
+    if inspection.metadata.is_some() {
+        StrippedHevcDoviDecodeAction::DropMetadataOnly
+    } else {
+        StrippedHevcDoviDecodeAction::PassthroughUnparsedMetadataOnly
+    }
+}
+
+fn dovi_decode_packet_action_name(
+    stripped_action: StrippedHevcDoviDecodeAction,
+    stripped_decode_rewrite_enabled: bool,
+) -> &'static str {
+    match (stripped_action, stripped_decode_rewrite_enabled) {
+        (StrippedHevcDoviDecodeAction::DropMetadataOnly, _) => "drop_metadata_only",
+        (StrippedHevcDoviDecodeAction::PassthroughUnparsedMetadataOnly, _) => {
+            "passthrough_unparsed_metadata_only"
+        }
+        (StrippedHevcDoviDecodeAction::DecodeStripped, true) => "decode_stripped",
+        (StrippedHevcDoviDecodeAction::DecodeStripped, false) => "use_original",
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -666,11 +755,11 @@ fn should_debug_hevc_decode_packet_without_rpu(context: HevcDecodePacketLogConte
     context.recovery_waiting
 }
 
-fn should_debug_stripped_hevc_dovi_packet(
+fn should_debug_dovi_rpu_inspection(
     context: HevcDecodePacketLogContext,
-    stripped: &DoviRpuStripResult,
+    inspection: &DoviRpuNalInspection,
 ) -> bool {
-    context.recovery_waiting || stripped.metadata.is_none()
+    context.recovery_waiting || inspection.metadata.is_none()
 }
 
 fn should_trace_hevc_decode_packet_nals(
@@ -879,8 +968,10 @@ mod tests {
 
     use super::super::{VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VideoFrameConvertContext};
     use super::{
-        PlaybackBlockReason, VIDEO_DECODE_PENDING_INPUT_QUEUE_CAPACITY, VideoDecodePipeline,
-        VideoDecodeWorkerInfo, VideoDecodeWorkerSnapshot, VideoDecodeWorkerState,
+        DoviFrameMetadata, DoviRpuNalInspection, HevcStreamFormat, PlaybackBlockReason,
+        StrippedHevcDoviDecodeAction, VIDEO_DECODE_PENDING_INPUT_QUEUE_CAPACITY,
+        VideoDecodePipeline, VideoDecodeWorkerInfo, VideoDecodeWorkerSnapshot,
+        VideoDecodeWorkerState, hevc_dovi_decode_action_for_inspection,
     };
 
     fn snapshot(
@@ -971,6 +1062,53 @@ mod tests {
                 &hardware,
             ),
             Some(PlaybackBlockReason::HwSurfacePool)
+        );
+    }
+
+    fn dovi_inspection(
+        kept_nal_count: usize,
+        metadata: Option<DoviFrameMetadata>,
+    ) -> DoviRpuNalInspection {
+        DoviRpuNalInspection {
+            metadata,
+            stream_format: HevcStreamFormat::ByteStream,
+            nal_count: kept_nal_count.saturating_add(1),
+            kept_nal_count,
+            stripped_nal_count: 1,
+            stripped_bytes: 32,
+        }
+    }
+
+    fn dovi_metadata() -> DoviFrameMetadata {
+        DoviFrameMetadata {
+            profile: 5,
+            profile5: true,
+            rpu_nalu: vec![0x7c, 0x01],
+            rpu_payload: vec![0xaa],
+        }
+    }
+
+    #[test]
+    fn unparsed_rpu_only_packet_uses_original_decode_packet() {
+        assert_eq!(
+            hevc_dovi_decode_action_for_inspection(&dovi_inspection(0, None)),
+            StrippedHevcDoviDecodeAction::PassthroughUnparsedMetadataOnly
+        );
+    }
+
+    #[test]
+    fn parsed_rpu_only_packet_still_drops() {
+        assert_eq!(
+            hevc_dovi_decode_action_for_inspection(&dovi_inspection(0, Some(dovi_metadata()))),
+            StrippedHevcDoviDecodeAction::DropMetadataOnly
+        );
+    }
+
+    #[test]
+    fn mixed_dovi_packet_keeps_decode_action() {
+        assert_eq!(
+            hevc_dovi_decode_action_for_inspection(&dovi_inspection(1, None)),
+            StrippedHevcDoviDecodeAction::DecodeStripped
         );
     }
 }

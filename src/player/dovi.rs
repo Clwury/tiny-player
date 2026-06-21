@@ -106,8 +106,36 @@ pub struct DoviRpuStripResult {
     pub metadata: Option<DoviFrameMetadata>,
     pub stream_format: HevcStreamFormat,
     pub nal_count: usize,
+    pub kept_nal_count: usize,
     pub stripped_nal_count: usize,
     pub stripped_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoviRpuNalInspection {
+    pub metadata: Option<DoviFrameMetadata>,
+    pub stream_format: HevcStreamFormat,
+    pub nal_count: usize,
+    pub kept_nal_count: usize,
+    pub stripped_nal_count: usize,
+    pub stripped_bytes: usize,
+}
+
+impl From<&DoviRpuStripResult> for DoviRpuNalInspection {
+    fn from(stripped: &DoviRpuStripResult) -> Self {
+        Self {
+            metadata: stripped.metadata.clone(),
+            stream_format: stripped.stream_format,
+            nal_count: stripped.nal_count,
+            kept_nal_count: stripped.kept_nal_count,
+            stripped_nal_count: stripped.stripped_nal_count,
+            stripped_bytes: stripped.stripped_bytes,
+        }
+    }
+}
+
+pub fn inspect_dovi_rpu_nalus(data: &[u8]) -> Option<DoviRpuNalInspection> {
+    strip_dovi_rpu_nalus(data).map(|stripped| DoviRpuNalInspection::from(&stripped))
 }
 
 pub fn strip_dovi_rpu_nalus(data: &[u8]) -> Option<DoviRpuStripResult> {
@@ -151,6 +179,7 @@ fn strip_annex_b_dovi_rpu_nalus(data: &[u8]) -> Option<DoviRpuStripResult> {
     let mut offset = 0;
     let mut copied_until = 0;
     let mut nal_count = 0usize;
+    let mut kept_nal_count = 0usize;
     let mut stripped_nal_count = 0usize;
     let mut stripped_bytes = 0usize;
     let mut metadata = None;
@@ -170,6 +199,9 @@ fn strip_annex_b_dovi_rpu_nalus(data: &[u8]) -> Option<DoviRpuStripResult> {
             stripped_nal_count = stripped_nal_count.saturating_add(1);
             stripped_bytes = stripped_bytes.saturating_add(next.saturating_sub(start.offset));
         } else {
+            if nalu_type(nalu).is_some() {
+                kept_nal_count = kept_nal_count.saturating_add(1);
+            }
             result.extend_from_slice(&data[copied_until..next]);
         }
         copied_until = next;
@@ -185,6 +217,7 @@ fn strip_annex_b_dovi_rpu_nalus(data: &[u8]) -> Option<DoviRpuStripResult> {
         metadata,
         stream_format: HevcStreamFormat::ByteStream,
         nal_count,
+        kept_nal_count,
         stripped_nal_count,
         stripped_bytes,
     })
@@ -236,6 +269,7 @@ fn strip_length_prefixed_dovi_rpu_nalus(
     let mut offset = 0;
     let mut result = Vec::with_capacity(data.len());
     let mut nal_count = 0usize;
+    let mut kept_nal_count = 0usize;
     let mut stripped_nal_count = 0usize;
     let mut stripped_bytes = 0usize;
     let mut metadata = None;
@@ -264,6 +298,9 @@ fn strip_length_prefixed_dovi_rpu_nalus(
             stripped_nal_count = stripped_nal_count.saturating_add(1);
             stripped_bytes = stripped_bytes.saturating_add(nalu_end.saturating_sub(offset));
         } else {
+            if nalu_type(nalu).is_some() {
+                kept_nal_count = kept_nal_count.saturating_add(1);
+            }
             result.extend_from_slice(&data[offset..nalu_end]);
         }
         offset = nalu_end;
@@ -277,6 +314,7 @@ fn strip_length_prefixed_dovi_rpu_nalus(
         metadata,
         stream_format: HevcStreamFormat::LengthPrefixed { length_size },
         nal_count,
+        kept_nal_count,
         stripped_nal_count,
         stripped_bytes,
     })
@@ -312,6 +350,9 @@ fn metadata_from_nalu(nalu: &[u8]) -> Result<Option<DoviFrameMetadata>> {
 }
 
 fn nalu_type(nalu: &[u8]) -> Option<u8> {
+    if nalu.len() < 2 {
+        return None;
+    }
     nalu.first().map(|header| (header >> 1) & 0x3f)
 }
 
@@ -506,6 +547,7 @@ mod tests {
     fn detects_hevc_nalu_type() {
         assert_eq!(nalu_type(&[0x7c, 0x01]), Some(62));
         assert_eq!(nalu_type(&[0x26, 0x01]), Some(19));
+        assert_eq!(nalu_type(&[0x7c]), None);
         assert_eq!(nalu_type(&[]), None);
     }
 
@@ -519,6 +561,7 @@ mod tests {
 
         assert_eq!(stripped.stream_format, HevcStreamFormat::ByteStream);
         assert_eq!(stripped.nal_count, 3);
+        assert_eq!(stripped.kept_nal_count, 2);
         assert_eq!(stripped.stripped_nal_count, 1);
         assert_eq!(
             stripped.data,
@@ -540,6 +583,7 @@ mod tests {
             HevcStreamFormat::LengthPrefixed { length_size: 4 }
         );
         assert_eq!(stripped.nal_count, 3);
+        assert_eq!(stripped.kept_nal_count, 2);
         assert_eq!(stripped.stripped_nal_count, 1);
         assert_eq!(
             stripped.data,
@@ -566,6 +610,7 @@ mod tests {
             HevcStreamFormat::LengthPrefixed { length_size: 4 }
         );
         assert_eq!(stripped.stripped_nal_count, 1);
+        assert_eq!(stripped.kept_nal_count, 1);
         assert_eq!(metadata.profile, 5);
         assert!(metadata.is_profile5());
         assert_eq!(metadata.rpu_payload, payload);
@@ -584,11 +629,66 @@ mod tests {
             HevcStreamFormat::LengthPrefixed { length_size: 4 }
         );
         assert_eq!(stripped.nal_count, 2);
+        assert_eq!(stripped.kept_nal_count, 1);
         assert_eq!(stripped.stripped_nal_count, 1);
         assert_eq!(
             stripped.data,
             vec![0, 0, 0, 7, 0x02, 0x01, 0, 0, 1, 0x26, 0x01]
         );
+    }
+
+    #[test]
+    fn strip_annex_b_rpu_only_reports_no_kept_nals() {
+        let data = [0xaa, 0xbb, 0, 0, 0, 1, 0x7c, 0x01, 0xcc, 0xdd];
+
+        let stripped = strip_dovi_rpu_nalus(&data).unwrap();
+
+        assert_eq!(stripped.stream_format, HevcStreamFormat::ByteStream);
+        assert_eq!(stripped.nal_count, 1);
+        assert_eq!(stripped.kept_nal_count, 0);
+        assert_eq!(stripped.stripped_nal_count, 1);
+        assert_eq!(stripped.data, vec![0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn strip_length_prefixed_rpu_only_reports_no_kept_nals() {
+        let data = [0, 0, 0, 3, 0x7c, 0x01, 0xcc];
+
+        let stripped = strip_dovi_rpu_nalus(&data).unwrap();
+
+        assert_eq!(
+            stripped.stream_format,
+            HevcStreamFormat::LengthPrefixed { length_size: 4 }
+        );
+        assert_eq!(stripped.nal_count, 1);
+        assert_eq!(stripped.kept_nal_count, 0);
+        assert_eq!(stripped.stripped_nal_count, 1);
+        assert!(stripped.data.is_empty());
+    }
+
+    #[test]
+    fn strip_mixed_annex_b_keeps_non_rpu_nals() {
+        let data = [0, 0, 1, 0x7c, 0x01, 0xaa, 0, 0, 1, 0x26, 0x01, 0xbb];
+
+        let stripped = strip_dovi_rpu_nalus(&data).unwrap();
+
+        assert_eq!(stripped.stream_format, HevcStreamFormat::ByteStream);
+        assert_eq!(stripped.nal_count, 2);
+        assert_eq!(stripped.kept_nal_count, 1);
+        assert_eq!(stripped.stripped_nal_count, 1);
+        assert_eq!(stripped.data, vec![0, 0, 1, 0x26, 0x01, 0xbb]);
+    }
+
+    #[test]
+    fn inspect_dovi_rpu_nalus_reports_counts_without_decode_packet_data() {
+        let data = [0, 0, 1, 0x7c, 0x01, 0xaa, 0, 0, 1, 0x26, 0x01, 0xbb];
+
+        let inspection = inspect_dovi_rpu_nalus(&data).unwrap();
+
+        assert_eq!(inspection.stream_format, HevcStreamFormat::ByteStream);
+        assert_eq!(inspection.nal_count, 2);
+        assert_eq!(inspection.kept_nal_count, 1);
+        assert_eq!(inspection.stripped_nal_count, 1);
     }
 
     #[test]
