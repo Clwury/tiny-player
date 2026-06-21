@@ -8,7 +8,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::{
     DemuxPacketDiskCache, DemuxPacketQueueSnapshot, DemuxPacketRangeView, DemuxPacketReadSource,
     DemuxReaderWatermark, DemuxSeekRequest, DemuxSelectedStreams, DemuxStreamPacketQueueSnapshot,
     PacketId, PlaybackCacheConfig, PlaybackCacheMode, PlaybackCacheState, PlaybackCacheTimeRange,
-    PlaybackSeekMode, PlaybackSessionId, RangeId, SeekableTimelineSegment, StreamCacheKind,
+    PlaybackSeekMode, PlaybackSessionId, RangeId, SeekableTimelineSummary, StreamCacheKind,
     StreamCacheRangeState, StreamCacheState, StreamForwardState, StreamForwardWindow,
     demux_packet_cache_hysteresis_nsecs, demux_packet_cache_readahead_nsecs,
     demux_packet_disk_cache_enabled, nsecs_to_seconds, optional_buffered_value_changed,

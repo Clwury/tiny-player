@@ -271,6 +271,7 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
             match service_playback_tick(PlaybackTickContext {
                 session_id: session.id(),
                 demux_cache: &demux_cache,
+                http_cache: http_cache.as_ref(),
                 services: &mut pipeline_services,
                 pipeline: &mut pipeline,
                 control: &control,

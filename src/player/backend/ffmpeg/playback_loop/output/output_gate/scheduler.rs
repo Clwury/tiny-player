@@ -26,6 +26,7 @@ impl PlaybackOutputScheduler {
             defer_pending_start_audio_flush_once: false,
             pending_start_audio_pressure_level: PendingStartAudioPressureLevel::Normal,
             initial_delayed_audio_start_timeline_nsecs: None,
+            initial_audio_gap_at_video_start_timeline_nsecs: None,
         }
     }
 
@@ -34,6 +35,7 @@ impl PlaybackOutputScheduler {
         self.pending_start_audio.clear();
         self.pending_start_audio_pressure_level = PendingStartAudioPressureLevel::Normal;
         self.initial_delayed_audio_start_timeline_nsecs = None;
+        self.initial_audio_gap_at_video_start_timeline_nsecs = None;
         clear_video_output_rebuffer(&mut self.playback_output_state, control);
         self.set_state(PlaybackOutputState::Syncing);
         self.video_output_underrun_started_at = None;
@@ -65,6 +67,9 @@ impl PlaybackOutputScheduler {
         if state != PlaybackOutputState::Ready {
             self.initial_delayed_audio_start_timeline_nsecs = None;
         }
+        if !state.first_video_frame_pending() {
+            self.initial_audio_gap_at_video_start_timeline_nsecs = None;
+        }
         if state != PlaybackOutputState::Playing {
             self.defer_pending_start_audio_flush_once = false;
             self.pending_start_audio_pressure_level = PendingStartAudioPressureLevel::Normal;
@@ -95,8 +100,10 @@ impl PlaybackOutputScheduler {
         &mut self,
         now: Instant,
         video_output_underflowing: bool,
+        queued_video_forward_nsecs: Option<u64>,
         output_underrun: bool,
         demux_cache_insufficient: bool,
+        demux_min_forward_nsecs: Option<u64>,
         render_backlogged: bool,
         has_audio_output: bool,
         pending_audio_recoverable: bool,
@@ -109,8 +116,10 @@ impl PlaybackOutputScheduler {
             &mut self.video_output_underrun_started_at,
             now,
             video_output_underflowing,
+            queued_video_forward_nsecs,
             output_underrun,
             demux_cache_insufficient,
+            demux_min_forward_nsecs,
             render_backlogged,
             has_audio_output,
             pending_audio_recoverable,

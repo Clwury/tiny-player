@@ -14,7 +14,7 @@ use super::output_gate_service::OutputGateServiceContext;
 use super::output_queue_service::{OutputQueueAfterDecoderInputContext, OutputQueueServiceContext};
 use super::playback_services::PlaybackPipelineServices;
 use super::{
-    DemuxPacketCache, FfmpegControl, PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER,
+    DemuxPacketCache, FfmpegControl, HttpRingCache, PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER,
     PLAYBACK_COORDINATOR_TICK_TIMING_LOG_AFTER, PlaybackPipelineState,
 };
 
@@ -28,6 +28,7 @@ pub(super) enum PlaybackTickStatus {
 pub(super) struct PlaybackTickContext<'a> {
     pub(super) session_id: PlaybackSessionId,
     pub(super) demux_cache: &'a DemuxPacketCache,
+    pub(super) http_cache: Option<&'a HttpRingCache>,
     pub(super) services: &'a mut PlaybackPipelineServices,
     pub(super) pipeline: &'a mut PlaybackPipelineState,
     pub(super) control: &'a FfmpegControl,
@@ -114,6 +115,7 @@ pub(super) fn service_playback_tick(
             .service_or_wait(OutputGateServiceContext {
                 session_id: context.session_id,
                 demux_cache: context.demux_cache,
+                http_cache: context.http_cache,
                 pipeline: &mut *context.pipeline,
                 control: context.control,
                 event_tx: context.event_tx,

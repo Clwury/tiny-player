@@ -52,7 +52,7 @@ use model::{
     DemuxCacheLockWait, DemuxCachedRange, DemuxCachedSeekHit, DemuxInputRateSample,
     DemuxPacketAppendOutcome, DemuxPacketAppendTiming, DemuxPacketCacheThreadInput,
     DemuxPacketRangeView, DemuxPacketReadSource, DemuxPacketTimeline, DemuxSeekRequest,
-    DemuxSelectedStreams, PacketId, RangeId, SeekableTimelineSegment, StreamCacheRangeState,
+    DemuxSelectedStreams, PacketId, RangeId, SeekableTimelineSummary, StreamCacheRangeState,
     StreamForwardState, StreamForwardWindow, ordered_duration_seconds,
 };
 pub(super) use model::{DemuxPacketCacheInput, DemuxReadResult, DemuxSeekResult};

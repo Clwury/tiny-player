@@ -193,6 +193,12 @@ pub(in crate::player::backend::ffmpeg) fn http_cache_range_request_len(
         .saturating_add(1)
 }
 
+pub(in crate::player::backend::ffmpeg) fn http_cache_playback_range_request_bytes(
+    configured_request_bytes: u64,
+) -> u64 {
+    configured_request_bytes.max(1)
+}
+
 pub(in crate::player::backend::ffmpeg) fn http_cache_range_request_timeout(
     request_len: u64,
 ) -> Duration {

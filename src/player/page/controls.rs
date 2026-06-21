@@ -1279,6 +1279,7 @@ mod tests {
                 idle: true,
                 raw_input_rate: Some(1536),
                 byte_level_seeks: 3,
+                ..ByteCacheState::default()
             }),
             paused_for_cache: true,
             buffering_percent: Some(42),

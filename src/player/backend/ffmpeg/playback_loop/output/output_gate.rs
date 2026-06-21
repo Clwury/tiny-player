@@ -16,9 +16,11 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) use super::au
     recover_pending_start_audio_after_underrun,
 };
 pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) use super::output_rebuffer::{
-    AudioClockResumeDecision, PlaybackOutputState, PlaybackResumeWaterline, RebufferResumeAnchor,
-    audio_output_buffered_until_for_resume, clear_video_output_rebuffer,
-    enter_video_output_rebuffer, finish_video_output_rebuffer_if_ready,
+    AudioClockResumeDecision, InitialOutputSyncDecision, PlaybackOutputState,
+    PlaybackResumeWaterline, RebufferResumeAnchor, audio_output_buffered_until_for_resume,
+    clear_video_output_rebuffer, enter_video_output_rebuffer,
+    finish_video_output_rebuffer_if_ready,
+    initial_playback_resume_waterline_after_stale_audio_preroll_wait,
     rebuffer_playback_resume_waterline_after_cache_pause,
     rebuffer_playback_resume_waterline_after_prolonged_wait, should_block_for_demux_read,
     video_output_rebuffer_should_enter,
@@ -31,7 +33,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) use super::vi
 pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) use super::{
     AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AudioClockMode, AudioOutput,
     AudioOutputSnapshot, BufferedReporter, DecodedAudio, DemuxPacketCache, DemuxReaderWatermark,
-    FfmpegControl, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PENDING_AUDIO_CONTINUITY_TOLERANCE,
+    FfmpegControl, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER,
     PENDING_START_AUDIO_BACKPRESSURE_DURATION, PLAYING_PENDING_AUDIO_FORCE_RECOVERY_DURATION,
     PLAYING_PENDING_AUDIO_HARD_RESET_DURATION, PlaybackScheduler, PositionReporter,
     SubtitlePipeline, VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, duration_nsecs, nsecs_to_seconds,
@@ -94,6 +96,7 @@ pub(in crate::player::backend::ffmpeg) struct PlaybackOutputScheduler {
     defer_pending_start_audio_flush_once: bool,
     pending_start_audio_pressure_level: PendingStartAudioPressureLevel,
     initial_delayed_audio_start_timeline_nsecs: Option<u64>,
+    initial_audio_gap_at_video_start_timeline_nsecs: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

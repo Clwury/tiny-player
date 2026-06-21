@@ -25,10 +25,9 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use packet::{
 };
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use range::{
     ArchivedStreamPruneCandidate, DemuxCachedRange, DemuxCachedSeekHit, DemuxPacketRangeView,
+    SeekableTimelineSummary,
 };
-pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use seekable::{
-    SeekableTimelineSegment, ordered_duration_seconds,
-};
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use seekable::ordered_duration_seconds;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use stream_window::{
     StreamCacheRangeState, StreamForwardState, StreamForwardWindow,
 };

@@ -198,10 +198,10 @@ impl DemuxPacketCacheState {
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn mark_eof(&mut self) {
         self.seeking = false;
-        if let Some(range) = self.detached_append_range_mut() {
-            range.is_eof = true;
+        if let Some(range_id) = self.detached_append_range_id() {
+            self.set_range_eof(range_id, true);
         } else {
-            self.read_range_mut().is_eof = true;
+            self.set_range_eof(self.read_range_id, true);
         }
     }
 

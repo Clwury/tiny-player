@@ -35,8 +35,8 @@ use audio::{
 #[cfg(test)]
 use avio::{
     CacheReadResult, HttpContentRange, HttpRingCacheState, content_len_from_content_range,
-    content_range_from_headers, ffmpeg_http_headers, http_cache_range_header,
-    http_cache_range_request_len, http_cache_range_request_timeout,
+    content_range_from_headers, ffmpeg_http_headers, http_cache_playback_range_request_bytes,
+    http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
     http_cache_request_headers_for_log, http_cache_response_headers_for_log, should_cache_http_url,
 };
 use avio::{HttpRingCache, reqwest_header_pairs};

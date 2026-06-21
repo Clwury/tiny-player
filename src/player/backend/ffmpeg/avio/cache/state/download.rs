@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    ByteRingBuffer, HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR,
-    HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR, HttpCacheRangeKind, HttpRingCacheState,
-    InputRateSample, RetainedCacheRange,
+    ByteRingBuffer, CacheRestartRequest, HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR,
+    HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
+    HttpCacheRangeKind, HttpRingCacheState, InputRateSample, RetainedCacheRange,
 };
 
 impl HttpRingCacheState {
@@ -45,12 +45,8 @@ impl HttpRingCacheState {
         self.buffer.append(data);
         self.next_offset = offset.saturating_add(data.len() as u64);
         self.maybe_queue_playback_continuation();
-        self.trim_to_capacity(self.config.memory_capacity);
-        self.trim_retained_ranges_to_capacity(
-            self.config
-                .memory_capacity
-                .saturating_sub(self.buffer.len()),
-        );
+        self.trim_to_capacity(self.active_memory_capacity());
+        self.trim_retained_ranges_to_capacity(self.retained_capacity_with_side_reserve(false));
         true
     }
 
@@ -149,11 +145,8 @@ impl HttpRingCacheState {
             self.retained_ranges.remove(range_index);
         }
         self.maybe_queue_playback_continuation();
-        self.trim_retained_ranges_to_capacity(
-            self.config
-                .memory_capacity
-                .saturating_sub(self.buffer.len()),
-        );
+        self.trim_to_capacity(self.active_memory_capacity());
+        self.trim_retained_ranges_to_capacity(self.retained_capacity_with_side_reserve(false));
         tracing::debug!(
             offset,
             next_offset,
@@ -163,11 +156,31 @@ impl HttpRingCacheState {
         Some(next_offset)
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg) fn append_retained_at(
         &mut self,
         offset: u64,
         data: &[u8],
         range_kind: HttpCacheRangeKind,
+    ) -> bool {
+        self.append_retained_at_preserving(offset, data, range_kind, &[])
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn append_retained_at_protected(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        request: CacheRestartRequest,
+    ) -> bool {
+        self.append_retained_at_preserving(offset, data, request.range_kind, &[request])
+    }
+
+    fn append_retained_at_preserving(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        range_kind: HttpCacheRangeKind,
+        protected: &[CacheRestartRequest],
     ) -> bool {
         if data.is_empty() {
             return true;
@@ -175,6 +188,7 @@ impl HttpRingCacheState {
         let input_len = data.len();
         let original_offset = offset;
         self.record_input_bytes(input_len);
+        self.trim_to_capacity(self.active_memory_capacity());
         if self.disk_cache_writable
             && let Some(disk_cache) = self.disk_cache.as_mut()
             && let Err(error) = disk_cache.write_at(offset, data)
@@ -209,10 +223,9 @@ impl HttpRingCacheState {
                     range_kind,
                     last_used_generation,
                 });
-                self.trim_retained_ranges_to_capacity(
-                    self.config
-                        .memory_capacity
-                        .saturating_sub(self.buffer.len()),
+                self.trim_retained_ranges_to_capacity_preserving(
+                    self.retained_capacity_with_side_reserve(!protected.is_empty()),
+                    protected,
                 );
                 tracing::debug!(
                     offset = original_offset,
@@ -254,10 +267,9 @@ impl HttpRingCacheState {
             range.next_offset = offset.saturating_add(data.len() as u64);
             range.last_used_generation = generation;
         }
-        self.trim_retained_ranges_to_capacity(
-            self.config
-                .memory_capacity
-                .saturating_sub(self.buffer.len()),
+        self.trim_retained_ranges_to_capacity_preserving(
+            self.retained_capacity_with_side_reserve(!protected.is_empty()),
+            protected,
         );
         true
     }
@@ -334,12 +346,21 @@ impl HttpRingCacheState {
         &mut self,
         capacity: usize,
     ) {
+        self.trim_retained_ranges_to_capacity_preserving(capacity, &[]);
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn trim_retained_ranges_to_capacity_preserving(
+        &mut self,
+        capacity: usize,
+        protected: &[CacheRestartRequest],
+    ) {
         let mut retained_bytes = self.retained_memory_bytes();
         while retained_bytes > capacity {
             let Some(range_index) = self
                 .retained_ranges
                 .iter()
                 .enumerate()
+                .filter(|(_, range)| !retained_range_protected(range, protected))
                 .min_by_key(|(_, range)| range.last_used_generation)
                 .map(|(index, _)| index)
             else {
@@ -373,7 +394,7 @@ impl HttpRingCacheState {
         &mut self,
         offset: u64,
     ) -> usize {
-        self.trim_to_capacity(self.config.memory_capacity);
+        self.trim_to_capacity(self.active_memory_capacity());
         if self.active_range_kind == HttpCacheRangeKind::Playback
             && !self.offset_in_active_range(self.reader_offset)
             && (self.cached_range_contains(self.reader_offset)
@@ -399,14 +420,13 @@ impl HttpRingCacheState {
 
         let buffered_ahead = usize::try_from(buffered_ahead).unwrap_or(usize::MAX);
         let target = usize::try_from(target).unwrap_or(usize::MAX);
-        self.config
-            .memory_capacity
+        self.active_memory_capacity()
             .min(target)
             .saturating_sub(buffered_ahead)
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn target_readahead_bytes(&self) -> u64 {
-        let memory_capacity = self.config.memory_capacity as u64;
+        let memory_capacity = self.active_memory_capacity() as u64;
         let by_seconds = self
             .content_len
             .zip(self.duration_seconds)
@@ -434,4 +454,61 @@ impl HttpRingCacheState {
             target.saturating_sub(hysteresis_bytes).min(target)
         }
     }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn side_retain_reserve_bytes(
+        &self,
+    ) -> usize {
+        let target = usize::try_from(HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES).unwrap_or(usize::MAX);
+        target.min(self.config.memory_capacity / 8)
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn active_memory_capacity(&self) -> usize {
+        if self.active_range_kind == HttpCacheRangeKind::Playback {
+            if self.config.memory_capacity == 0 {
+                return 0;
+            }
+            self.config
+                .memory_capacity
+                .saturating_sub(self.side_retain_reserve_bytes())
+                .max(1)
+        } else {
+            self.config.memory_capacity
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn retained_capacity_with_side_reserve(
+        &self,
+        protected: bool,
+    ) -> usize {
+        let memory_capacity = if protected {
+            self.config
+                .memory_capacity
+                .saturating_add(self.side_retain_reserve_bytes())
+        } else {
+            self.config.memory_capacity
+        };
+        memory_capacity.saturating_sub(self.buffer.len())
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn side_range_request_bytes(
+        &self,
+        range_kind: HttpCacheRangeKind,
+    ) -> u64 {
+        let configured = self.config.range_request_bytes.max(1);
+        match range_kind {
+            HttpCacheRangeKind::Playback | HttpCacheRangeKind::TailMetadataProbe => configured.min(
+                u64::try_from(self.side_retain_reserve_bytes())
+                    .unwrap_or(u64::MAX)
+                    .max(1),
+            ),
+        }
+    }
+}
+
+fn retained_range_protected(range: &RetainedCacheRange, protected: &[CacheRestartRequest]) -> bool {
+    protected.iter().any(|request| {
+        request.range_kind == range.range_kind
+            && request.offset >= range.base_offset
+            && request.offset < range.next_offset
+    })
 }

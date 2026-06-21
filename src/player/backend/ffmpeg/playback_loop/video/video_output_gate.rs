@@ -21,9 +21,9 @@ use super::output_gate::{
 use super::output_rebuffer::PlaybackOutputState;
 use super::playback_block::PlaybackBlockReason;
 use super::{
-    AudioClockMode, AudioOutput, BufferedReporter, DemuxReaderWatermark, FFMPEG_FRAME_COUNT,
-    FfmpegControl, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PlaybackScheduler,
-    PositionReporter, QueuedVideoFrame, SubtitlePipeline, nsecs_to_seconds,
+    AudioClockMode, AudioOutput, AudioOutputSnapshot, BufferedReporter, DemuxReaderWatermark,
+    FFMPEG_FRAME_COUNT, FfmpegControl, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER,
+    PlaybackScheduler, PositionReporter, QueuedVideoFrame, SubtitlePipeline, nsecs_to_seconds,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,10 +418,23 @@ pub(in crate::player::backend::ffmpeg) fn queue_decoded_video_frame(
     timeline_nsecs: u64,
     duration_nsecs: u64,
     report_buffered_on_queue: bool,
+    audio_snapshot: Option<AudioOutputSnapshot>,
     session_id: PlaybackSessionId,
     event_tx: &Sender<BackendEvent>,
     buffered_reporter: &mut BufferedReporter,
 ) {
+    let before_queue_len = output_scheduler.scheduled_video_queue.len();
+    let before_queue_duration_nsecs = output_scheduler.scheduled_video_queue.duration_nsecs();
+    let before_queue_range = output_scheduler.scheduled_video_queue.range_nsecs();
+    let previous_frame_timing = output_scheduler.scheduled_video_queue.back_timing_nsecs();
+    let previous_expected_next_nsecs =
+        previous_frame_timing.map(|(pts, duration)| pts.saturating_add(duration));
+    let previous_gap_nsecs = previous_expected_next_nsecs
+        .map(|expected| i128::from(timeline_nsecs).saturating_sub(i128::from(expected)));
+    let inserted_after_tail = previous_frame_timing.is_none_or(|(pts, _)| pts <= timeline_nsecs);
+    let output_state = output_scheduler.playback_output_state;
+    let first_video_frame_pending = output_scheduler.first_video_frame_pending;
+
     output_scheduler
         .scheduled_video_queue
         .push_queued(QueuedVideoFrame {
@@ -429,6 +442,25 @@ pub(in crate::player::backend::ffmpeg) fn queue_decoded_video_frame(
             timeline_nsecs,
             duration_nsecs,
         });
+    log_decoded_video_frame_queue_admission(
+        session_id,
+        timeline_nsecs,
+        duration_nsecs,
+        report_buffered_on_queue,
+        output_state,
+        first_video_frame_pending,
+        before_queue_len,
+        before_queue_duration_nsecs,
+        before_queue_range,
+        previous_frame_timing,
+        previous_expected_next_nsecs,
+        previous_gap_nsecs,
+        inserted_after_tail,
+        output_scheduler.scheduled_video_queue.len(),
+        output_scheduler.scheduled_video_queue.duration_nsecs(),
+        output_scheduler.scheduled_video_queue.range_nsecs(),
+        audio_snapshot,
+    );
     if report_buffered_on_queue {
         buffered_reporter.report_video_timeline_nsecs(
             timeline_nsecs.saturating_add(duration_nsecs),
@@ -436,6 +468,65 @@ pub(in crate::player::backend::ffmpeg) fn queue_decoded_video_frame(
             event_tx,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_decoded_video_frame_queue_admission(
+    session_id: PlaybackSessionId,
+    timeline_nsecs: u64,
+    duration_nsecs: u64,
+    report_buffered_on_queue: bool,
+    output_state: PlaybackOutputState,
+    first_video_frame_pending: bool,
+    before_queue_len: usize,
+    before_queue_duration_nsecs: u64,
+    before_queue_range: Option<(u64, u64)>,
+    previous_frame_timing: Option<(u64, u64)>,
+    previous_expected_next_nsecs: Option<u64>,
+    previous_gap_nsecs: Option<i128>,
+    inserted_after_tail: bool,
+    after_queue_len: usize,
+    after_queue_duration_nsecs: u64,
+    after_queue_range: Option<(u64, u64)>,
+    audio_snapshot: Option<AudioOutputSnapshot>,
+) {
+    let previous_frame_pts_nsecs = previous_frame_timing.map(|(pts, _)| pts);
+    let previous_frame_duration_nsecs = previous_frame_timing.map(|(_, duration)| duration);
+    tracing::debug!(
+        session_id = ?session_id,
+        pts = timeline_nsecs,
+        duration_nsecs,
+        duration_ms = duration_nsecs as f64 / 1_000_000.0,
+        report_buffered_on_queue,
+        output_state = ?output_state,
+        first_video_frame_pending,
+        inserted_after_tail,
+        previous_frame_pts_nsecs,
+        previous_frame_duration_nsecs,
+        previous_expected_next_nsecs,
+        previous_gap_nsecs,
+        previous_gap_ms = previous_gap_nsecs.map(|gap| gap as f64 / 1_000_000.0),
+        before_queue_frames = before_queue_len,
+        before_queue_ms = before_queue_duration_nsecs as f64 / 1_000_000.0,
+        before_queue_range = ?before_queue_range,
+        after_queue_frames = after_queue_len,
+        after_queue_ms = after_queue_duration_nsecs as f64 / 1_000_000.0,
+        after_queue_range = ?after_queue_range,
+        audio_played_timeline_nsecs = audio_snapshot.map(|snapshot| snapshot.played_timeline_nsecs),
+        audio_buffered_until_timeline_nsecs =
+            audio_snapshot.map(|snapshot| snapshot.buffered_until_timeline_nsecs),
+        audio_pending_ms =
+            audio_snapshot.map(|snapshot| snapshot.total_pending_nsecs as f64 / 1_000_000.0),
+        audio_queue_ms =
+            audio_snapshot.map(|snapshot| snapshot.queue_pending_nsecs as f64 / 1_000_000.0),
+        video_minus_audio_ms = audio_snapshot.map(|snapshot| {
+            (i128::from(timeline_nsecs)
+                .saturating_sub(i128::from(snapshot.played_timeline_nsecs)))
+                as f64
+                / 1_000_000.0
+        }),
+        "admitted decoded FFmpeg video frame into scheduled queue"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -484,6 +575,7 @@ where
         timeline_nsecs,
         duration_nsecs,
         true,
+        output.snapshot().ok(),
         session_id,
         event_tx,
         buffered_reporter,
@@ -597,6 +689,7 @@ pub(in crate::player::backend::ffmpeg) fn service_audio_clocked_drain_decoded_vi
         timeline_nsecs,
         duration_nsecs,
         true,
+        output.snapshot().ok(),
         session_id,
         event_tx,
         buffered_reporter,
@@ -687,6 +780,7 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
         timeline_nsecs,
         duration_nsecs,
         false,
+        None,
         session_id,
         event_tx,
         buffered_reporter,

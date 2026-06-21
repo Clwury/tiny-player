@@ -24,8 +24,8 @@ use super::{
     VULKAN_VIDEO_OUTPUT_RESOURCE_PRESSURE_FRAMES, WaitStatus, audio_sample_len,
     content_len_from_content_range, content_range_from_headers, dovi_packet_timeline_nsecs,
     duration_nsecs, ffmpeg_http_headers, ffmpeg_raw_video_format, frame_decode_error_flags,
-    frame_is_corrupt, has_annex_b_start_code, http_cache_range_header,
-    http_cache_range_request_len, http_cache_range_request_timeout,
+    frame_is_corrupt, has_annex_b_start_code, http_cache_playback_range_request_bytes,
+    http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
     http_cache_request_headers_for_log, http_cache_response_headers_for_log,
     optional_buffered_value_changed, queued_video_duration, queued_video_limit_duration,
     queued_video_limit_frames, queued_video_limit_reached, queued_video_target_duration,
@@ -48,8 +48,8 @@ use std::{
 
 use super::playback_loop::{
     AudioClockResumeDecision, DecodedVideoFrameStartAction, DemuxReaderWatermark,
-    PendingAudioUnderrunRecoveryPlan, PendingStartAudio, PlaybackBlockReason,
-    PlaybackOutputScheduler, PlaybackOutputState, RebufferResumeAnchor,
+    InitialOutputSyncDecision, PendingAudioUnderrunRecoveryPlan, PendingStartAudio,
+    PlaybackBlockReason, PlaybackOutputScheduler, PlaybackOutputState, RebufferResumeAnchor,
     VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VideoDecodeRecovery,
     admit_decoded_video_frame_to_vo, audio_clock_resume_decision,
     audio_clock_resume_timeline_nsecs, audio_clocked_video_wait_duration,
@@ -57,8 +57,9 @@ use super::playback_loop::{
     decoded_video_frame_start_action, decoded_video_start_prebuffer_reached,
     demux_reader_ready_for_output, discard_queued_video_before,
     discard_stale_pending_audio_before_recovery_start, initial_audio_clock_resume_decision,
-    initial_probe_profile, pending_audio_underrun_recovery_plan, playback_read_finished,
-    playback_resume_waterline, playback_resume_waterline_blocked_on, pop_audio_clocked_video_frame,
+    initial_output_sync_decision, initial_playback_resume_waterline, initial_probe_profile,
+    pending_audio_underrun_recovery_plan, playback_read_finished, playback_resume_waterline,
+    playback_resume_waterline_blocked_on, pop_audio_clocked_video_frame,
     pop_audio_clocked_video_frame_with_policy, push_queued_video_frame,
     queued_video_buffered_until_nsecs, queued_video_frame_ready_for_audio_clock,
     rebase_subtitle_cues_to_timeline_origin, rebuffer_audio_clock_resume_decision,
@@ -553,6 +554,7 @@ fn ffmpeg_backend_maps_http_raw_input_rate_into_unified_cache_state() {
                     idle: false,
                     raw_input_rate: Some(123_456),
                     byte_level_seeks: 2,
+                    ..ByteCacheState::default()
                 }),
                 ..PlaybackCacheState::default()
             }),
@@ -611,6 +613,7 @@ fn ffmpeg_backend_byte_cache_update_does_not_replace_authoritative_demux_state()
                     idle: false,
                     raw_input_rate: Some(64 * 1024),
                     byte_level_seeks: 3,
+                    ..ByteCacheState::default()
                 }),
                 ..PlaybackCacheState::default()
             }),
@@ -660,6 +663,7 @@ fn ffmpeg_backend_byte_cache_update_uses_byte_state_as_metric_source() {
                     idle: false,
                     raw_input_rate: Some(96 * 1024),
                     byte_level_seeks: 4,
+                    ..ByteCacheState::default()
                 }),
                 ..PlaybackCacheState::default()
             }),
@@ -712,6 +716,7 @@ fn ffmpeg_backend_byte_cache_update_does_not_extend_demux_seekable_ranges() {
                     idle: false,
                     raw_input_rate: Some(64 * 1024),
                     byte_level_seeks: 1,
+                    ..ByteCacheState::default()
                 }),
                 ..PlaybackCacheState::default()
             }),
@@ -766,6 +771,7 @@ fn ffmpeg_backend_byte_cache_update_can_clear_stale_raw_input_rate() {
                     idle: true,
                     raw_input_rate: None,
                     byte_level_seeks: 3,
+                    ..ByteCacheState::default()
                 }),
                 ..PlaybackCacheState::default()
             }),
@@ -909,6 +915,7 @@ fn ffmpeg_backend_demux_cache_update_preserves_latest_byte_cache_state() {
         idle: false,
         raw_input_rate: Some(32 * 1024),
         byte_level_seeks: 5,
+        ..ByteCacheState::default()
     });
     backend.cache_state.demux.raw_input_rate = Some(32 * 1024);
     backend.cache_state.demux.byte_level_seeks = 5;
@@ -961,6 +968,7 @@ fn ffmpeg_backend_prefers_byte_cache_raw_rate_over_demux_estimate() {
         idle: false,
         raw_input_rate: Some(32 * 1024),
         byte_level_seeks: 5,
+        ..ByteCacheState::default()
     });
     backend.cache_state.demux.raw_input_rate = Some(32 * 1024);
     backend.cache_state.demux.byte_level_seeks = 5;
@@ -1496,13 +1504,18 @@ fn queued_video_limit_uses_vulkan_frame_cap() {
 fn video_output_rebuffer_enters_after_underrun_grace() {
     let mut underrun_started_at = None;
     let now = Instant::now();
+    let queued_video_still_buffered =
+        Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) * 2);
+    let demux_forward_empty = Some(0);
 
     assert!(!video_output_rebuffer_should_enter(
         &mut underrun_started_at,
         now,
         false,
+        queued_video_still_buffered,
         false,
         true,
+        demux_forward_empty,
         false,
         true,
         false,
@@ -1514,8 +1527,10 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         &mut underrun_started_at,
         now,
         true,
+        queued_video_still_buffered,
         false,
         true,
+        demux_forward_empty,
         false,
         true,
         false,
@@ -1527,8 +1542,10 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER - Duration::from_millis(1),
         true,
+        queued_video_still_buffered,
         false,
         true,
+        demux_forward_empty,
         false,
         true,
         false,
@@ -1538,8 +1555,10 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         true,
+        queued_video_still_buffered,
         false,
         true,
+        demux_forward_empty,
         false,
         true,
         false,
@@ -1549,8 +1568,10 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         true,
+        queued_video_still_buffered,
         false,
         true,
+        demux_forward_empty,
         false,
         true,
         false,
@@ -1562,8 +1583,10 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         true,
+        queued_video_still_buffered,
         false,
         true,
+        demux_forward_empty,
         false,
         true,
         false,
@@ -1574,8 +1597,10 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         true,
+        queued_video_still_buffered,
         false,
         true,
+        demux_forward_empty,
         true,
         true,
         false,
@@ -1587,8 +1612,10 @@ fn video_output_rebuffer_enters_after_underrun_grace() {
         &mut underrun_started_at,
         now,
         false,
+        queued_video_still_buffered,
         false,
         true,
+        demux_forward_empty,
         false,
         true,
         false,
@@ -1606,8 +1633,10 @@ fn video_output_rebuffer_waits_for_demux_cache_insufficient() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         true,
+        Some(0),
         false,
         false,
+        None,
         false,
         true,
         false,
@@ -1625,8 +1654,10 @@ fn video_output_rebuffer_enters_on_output_underrun_even_when_demux_ready() {
         &mut underrun_started_at,
         now,
         true,
+        None,
         true,
         false,
+        None,
         false,
         true,
         false,
@@ -1644,8 +1675,10 @@ fn video_output_rebuffer_allows_fast_pending_audio_recovery_on_underrun() {
         &mut underrun_started_at,
         now,
         true,
+        None,
         true,
         false,
+        None,
         false,
         true,
         true,
@@ -1657,8 +1690,10 @@ fn video_output_rebuffer_allows_fast_pending_audio_recovery_on_underrun() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER - Duration::from_millis(1),
         true,
+        None,
         true,
         false,
+        None,
         false,
         true,
         true,
@@ -1669,8 +1704,10 @@ fn video_output_rebuffer_allows_fast_pending_audio_recovery_on_underrun() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER,
         true,
+        None,
         true,
         false,
+        None,
         false,
         true,
         true,
@@ -1687,8 +1724,10 @@ fn video_output_rebuffer_keeps_wait_timer_while_rebuffering() {
         &mut underrun_started_at,
         now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         false,
+        None,
         false,
         true,
+        Some(0),
         false,
         true,
         false,
@@ -1706,14 +1745,66 @@ fn video_output_rebuffer_enters_immediately_after_output_underrun() {
         &mut underrun_started_at,
         now,
         true,
+        None,
         true,
         true,
+        Some(0),
         false,
         true,
         false,
         PlaybackOutputState::Playing,
     ));
     assert_eq!(underrun_started_at, Some(now));
+}
+
+#[test]
+fn video_output_rebuffer_enters_immediately_when_demux_empty_and_video_near_drain() {
+    let now = Instant::now();
+    let mut underrun_started_at = None;
+
+    assert!(video_output_rebuffer_should_enter(
+        &mut underrun_started_at,
+        now,
+        false,
+        Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) / 2),
+        false,
+        true,
+        Some(0),
+        false,
+        true,
+        false,
+        PlaybackOutputState::Playing,
+    ));
+    assert_eq!(underrun_started_at, Some(now));
+}
+
+#[test]
+fn output_scheduler_enters_rebuffer_before_video_queue_drains() {
+    let control = FfmpegControl::new(PlaybackSessionId::default());
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(1_000_000_000));
+    let now = Instant::now();
+
+    assert!(scheduler.maybe_enter_video_output_rebuffer(
+        now,
+        false,
+        Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) / 2),
+        false,
+        true,
+        Some(0),
+        false,
+        true,
+        false,
+        &control,
+        None,
+        PlaybackSessionId(7),
+        Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) / 2),
+    ));
+
+    let snapshot = scheduler.snapshot();
+    assert_eq!(snapshot.state, PlaybackOutputState::Rebuffering);
+    assert!(control.is_output_rebuffer_paused());
 }
 
 #[test]
@@ -1769,8 +1860,10 @@ fn output_scheduler_enters_rebuffer_and_updates_first_frame_gate() {
     assert!(scheduler.maybe_enter_video_output_rebuffer(
         started_at + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
         true,
+        Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) * 2),
         false,
         true,
+        Some(0),
         false,
         true,
         false,
@@ -2982,6 +3075,19 @@ fn initial_resume_keeps_video_start_for_small_audio_offset() {
     let queued = VecDeque::from([test_queued_video_frame(1_000_000_000)]);
 
     assert_eq!(
+        initial_output_sync_decision(&queued, &pending, 1_000_000_000),
+        Some(InitialOutputSyncDecision {
+            video_resume_timeline_nsecs: 1_000_000_000,
+            audio_start_timeline_nsecs: Some(1_004_000_000),
+            delayed_audio_start_timeline_nsecs: None,
+            drop_audio_before_timeline_nsecs: None,
+            stale_audio_preroll_until_nsecs: None,
+            stale_audio_preroll_gap_nsecs: None,
+            allow_initial_audio_gap_at_video_start: false,
+            reset_audio_to_video: false,
+        })
+    );
+    assert_eq!(
         initial_audio_clock_resume_decision(&queued, &pending, 1_000_000_000),
         Some(AudioClockResumeDecision {
             timeline_nsecs: 1_000_000_000,
@@ -2991,7 +3097,7 @@ fn initial_resume_keeps_video_start_for_small_audio_offset() {
 }
 
 #[test]
-fn initial_resume_uses_audio_start_for_large_audio_offset() {
+fn initial_resume_uses_video_start_and_delays_audio_for_large_audio_offset() {
     let mut pending = PendingStartAudio::default();
     pending.push(
         DecodedAudio {
@@ -3004,12 +3110,209 @@ fn initial_resume_uses_audio_start_for_large_audio_offset() {
     let queued = VecDeque::from([test_queued_video_frame(1_000_000_000)]);
 
     assert_eq!(
-        initial_audio_clock_resume_decision(&queued, &pending, 1_000_000_000),
-        Some(AudioClockResumeDecision {
-            timeline_nsecs: 1_020_000_000,
+        initial_output_sync_decision(&queued, &pending, 1_000_000_000),
+        Some(InitialOutputSyncDecision {
+            video_resume_timeline_nsecs: 1_000_000_000,
+            audio_start_timeline_nsecs: Some(1_020_000_000),
+            delayed_audio_start_timeline_nsecs: Some(1_020_000_000),
+            drop_audio_before_timeline_nsecs: None,
+            stale_audio_preroll_until_nsecs: None,
+            stale_audio_preroll_gap_nsecs: None,
+            allow_initial_audio_gap_at_video_start: false,
             reset_audio_to_video: false,
         })
     );
+    assert_eq!(
+        initial_audio_clock_resume_decision(&queued, &pending, 1_000_000_000),
+        Some(AudioClockResumeDecision {
+            timeline_nsecs: 1_000_000_000,
+            reset_audio_to_video: false,
+        })
+    );
+}
+
+#[test]
+fn initial_resume_skips_small_stale_audio_preroll_gap_before_first_video() {
+    let video_start_nsecs = 424_000_000_000;
+    let audio_start_nsecs = 422_399_983_688;
+    let audio_duration_nsecs = 1_535_986_356;
+    let audio_buffered_until_nsecs = audio_start_nsecs + audio_duration_nsecs;
+    let queued = test_queued_video_frames_with_duration(
+        video_start_nsecs,
+        31,
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+    );
+    let pending = test_pending_audio(audio_start_nsecs, audio_duration_nsecs);
+    let sync_decision = initial_output_sync_decision(&queued, &pending, video_start_nsecs).unwrap();
+
+    assert_eq!(
+        sync_decision,
+        InitialOutputSyncDecision {
+            video_resume_timeline_nsecs: video_start_nsecs,
+            audio_start_timeline_nsecs: Some(audio_start_nsecs),
+            delayed_audio_start_timeline_nsecs: None,
+            drop_audio_before_timeline_nsecs: Some(video_start_nsecs),
+            stale_audio_preroll_until_nsecs: Some(audio_buffered_until_nsecs),
+            stale_audio_preroll_gap_nsecs: Some(video_start_nsecs - audio_buffered_until_nsecs),
+            allow_initial_audio_gap_at_video_start: true,
+            reset_audio_to_video: false,
+        }
+    );
+
+    let waterline = initial_playback_resume_waterline(
+        &queued,
+        &pending,
+        sync_decision.video_resume_timeline_nsecs,
+        sync_decision.delayed_audio_start_timeline_nsecs,
+        sync_decision.allow_initial_audio_gap_at_video_start,
+        ready_demux_watermark(12_000_000_000),
+        false,
+        true,
+    );
+
+    assert!(waterline.ready());
+    assert!(waterline.decoded_video_ready);
+    assert!(waterline.decoded_audio_ready);
+    assert_eq!(waterline.decoded_audio_forward_nsecs, None);
+    assert_eq!(waterline.delayed_audio_start_gap_nsecs, None);
+}
+
+#[test]
+fn initial_resume_keeps_audio_preroll_that_covers_first_video() {
+    let video_start_nsecs = 1_000_000_000;
+    let audio_start_nsecs = 999_980_000;
+    let audio_duration_nsecs = 80_000_000;
+    let queued = VecDeque::from([test_queued_video_frame(video_start_nsecs)]);
+    let pending = test_pending_audio(audio_start_nsecs, audio_duration_nsecs);
+
+    assert_eq!(
+        initial_output_sync_decision(&queued, &pending, video_start_nsecs),
+        Some(InitialOutputSyncDecision {
+            video_resume_timeline_nsecs: video_start_nsecs,
+            audio_start_timeline_nsecs: Some(audio_start_nsecs),
+            delayed_audio_start_timeline_nsecs: None,
+            drop_audio_before_timeline_nsecs: None,
+            stale_audio_preroll_until_nsecs: None,
+            stale_audio_preroll_gap_nsecs: None,
+            allow_initial_audio_gap_at_video_start: false,
+            reset_audio_to_video: false,
+        })
+    );
+}
+
+#[test]
+fn initial_resume_drops_large_stale_audio_preroll_without_immediate_audio_ready() {
+    let video_start_nsecs = 1_000_000_000;
+    let audio_start_nsecs = 800_000_000;
+    let audio_duration_nsecs = 50_000_000;
+    let audio_buffered_until_nsecs = audio_start_nsecs + audio_duration_nsecs;
+    let queued = test_queued_video_frames_with_duration(
+        video_start_nsecs,
+        31,
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+    );
+    let pending = test_pending_audio(audio_start_nsecs, audio_duration_nsecs);
+    let sync_decision = initial_output_sync_decision(&queued, &pending, video_start_nsecs).unwrap();
+
+    assert_eq!(
+        sync_decision,
+        InitialOutputSyncDecision {
+            video_resume_timeline_nsecs: video_start_nsecs,
+            audio_start_timeline_nsecs: Some(audio_start_nsecs),
+            delayed_audio_start_timeline_nsecs: None,
+            drop_audio_before_timeline_nsecs: Some(video_start_nsecs),
+            stale_audio_preroll_until_nsecs: Some(audio_buffered_until_nsecs),
+            stale_audio_preroll_gap_nsecs: Some(video_start_nsecs - audio_buffered_until_nsecs),
+            allow_initial_audio_gap_at_video_start: false,
+            reset_audio_to_video: false,
+        }
+    );
+
+    let waterline = initial_playback_resume_waterline(
+        &queued,
+        &pending,
+        sync_decision.video_resume_timeline_nsecs,
+        sync_decision.delayed_audio_start_timeline_nsecs,
+        sync_decision.allow_initial_audio_gap_at_video_start,
+        ready_demux_watermark(12_000_000_000),
+        false,
+        true,
+    );
+
+    assert!(waterline.decoded_video_ready);
+    assert!(!waterline.decoded_audio_ready);
+    assert!(!waterline.ready());
+}
+
+#[test]
+fn rebuffer_resume_does_not_skip_stale_audio_preroll_gap() {
+    let video_start_nsecs = 1_000_000_000;
+    let queued = test_queued_video_frames_with_duration(
+        video_start_nsecs,
+        31,
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+    );
+    let pending = test_pending_audio(800_000_000, 50_000_000);
+    let waterline = rebuffer_playback_resume_waterline(
+        &queued,
+        &pending,
+        video_start_nsecs,
+        ready_demux_watermark(12_000_000_000),
+        None,
+        false,
+        true,
+    );
+
+    assert!(waterline.decoded_video_ready);
+    assert!(!waterline.decoded_audio_ready);
+    assert!(!waterline.ready());
+}
+
+#[test]
+fn initial_waterline_delays_audio_without_waiting_for_video_at_audio_start() {
+    let video_start_nsecs = 177_600_000_000;
+    let audio_start_nsecs = 186_303_979_167;
+    let queued = test_queued_video_frames_with_duration(
+        video_start_nsecs,
+        31,
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+    );
+    let pending = test_pending_audio(audio_start_nsecs, 1_514_671_164);
+    let sync_decision = initial_output_sync_decision(&queued, &pending, video_start_nsecs).unwrap();
+
+    assert_eq!(
+        sync_decision,
+        InitialOutputSyncDecision {
+            video_resume_timeline_nsecs: video_start_nsecs,
+            audio_start_timeline_nsecs: Some(audio_start_nsecs),
+            delayed_audio_start_timeline_nsecs: Some(audio_start_nsecs),
+            drop_audio_before_timeline_nsecs: None,
+            stale_audio_preroll_until_nsecs: None,
+            stale_audio_preroll_gap_nsecs: None,
+            allow_initial_audio_gap_at_video_start: false,
+            reset_audio_to_video: false,
+        }
+    );
+
+    let waterline = initial_playback_resume_waterline(
+        &queued,
+        &pending,
+        sync_decision.video_resume_timeline_nsecs,
+        sync_decision.delayed_audio_start_timeline_nsecs,
+        sync_decision.allow_initial_audio_gap_at_video_start,
+        ready_demux_watermark(12_000_000_000),
+        false,
+        true,
+    );
+
+    assert!(waterline.ready());
+    assert!(waterline.decoded_video_ready);
+    assert!(waterline.decoded_audio_ready);
+    assert_eq!(
+        waterline.delayed_audio_start_gap_nsecs,
+        Some(audio_start_nsecs - video_start_nsecs)
+    );
+    assert!(waterline.decoded_video_forward_nsecs.unwrap() < audio_start_nsecs - video_start_nsecs);
 }
 
 #[test]
@@ -4329,11 +4632,11 @@ fn http_cache_request_header_log_includes_effective_headers() {
 fn http_cache_range_header_limits_request_size() {
     assert_eq!(
         http_cache_range_header(0, None, HTTP_CACHE_RANGE_REQUEST_BYTES),
-        "bytes=0-33554431"
+        format!("bytes=0-{}", HTTP_CACHE_RANGE_REQUEST_BYTES - 1)
     );
     assert_eq!(
         http_cache_range_header(128, None, HTTP_CACHE_RANGE_REQUEST_BYTES),
-        "bytes=128-33554559"
+        format!("bytes=128-{}", 128 + HTTP_CACHE_RANGE_REQUEST_BYTES - 1)
     );
     assert_eq!(
         http_cache_range_header(
@@ -4356,6 +4659,9 @@ fn http_cache_range_header_limits_request_size() {
 
 #[test]
 fn http_cache_range_request_timeout_is_short_for_small_tail_ranges() {
+    let playback_request_bytes =
+        http_cache_playback_range_request_bytes(HTTP_CACHE_RANGE_REQUEST_BYTES);
+    assert_eq!(playback_request_bytes, HTTP_CACHE_RANGE_REQUEST_BYTES);
     assert_eq!(
         http_cache_range_request_len(
             10_675_366_349,
@@ -4370,6 +4676,10 @@ fn http_cache_range_request_timeout_is_short_for_small_tail_ranges() {
     );
     assert_eq!(
         http_cache_range_request_timeout(HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES + 1),
+        HTTP_CACHE_RANGE_REQUEST_TIMEOUT
+    );
+    assert_eq!(
+        http_cache_range_request_timeout(playback_request_bytes),
         HTTP_CACHE_RANGE_REQUEST_TIMEOUT
     );
 }
@@ -4746,6 +5056,24 @@ fn http_ring_cache_state_reports_recent_raw_input_rate() {
 }
 
 #[test]
+fn http_ring_cache_state_reports_active_forward_diagnostics() {
+    let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(1_000));
+
+    state.append_at(0, b"abcdef");
+    state.append_at(6, b"ghij");
+    state.set_reader_offset(4);
+
+    let status = state.stream_cache_status_for_test();
+
+    assert_eq!(status.active_forward_bytes, 6);
+    assert_eq!(status.active_forward_est_seconds, Some(0.6));
+    assert_eq!(
+        status.range_request_bytes_effective,
+        HTTP_CACHE_RANGE_REQUEST_BYTES
+    );
+}
+
+#[test]
 fn http_ring_cache_state_uses_content_length_hint_for_progress() {
     let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(100));
 
@@ -4822,21 +5150,17 @@ fn http_ring_cache_state_refuses_append_when_capacity_is_unread() {
 #[test]
 fn http_ring_cache_state_limits_prefetch_window_from_reader() {
     let mut state = HttpRingCacheState::new(100);
+    let active_capacity =
+        HTTP_RING_CACHE_CAPACITY - usize::try_from(HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES).unwrap();
 
-    assert_eq!(
-        state.append_capacity_from(100 + HTTP_RING_CACHE_CAPACITY as u64),
-        0
-    );
+    assert_eq!(state.append_capacity_from(100 + active_capacity as u64), 0);
 
     let mut state = HttpRingCacheState::new(100);
-    assert_eq!(
-        state.append_capacity_from(99 + HTTP_RING_CACHE_CAPACITY as u64),
-        1
-    );
+    assert_eq!(state.append_capacity_from(99 + active_capacity as u64), 1);
 
     state.set_reader_offset(200);
     assert_eq!(
-        state.append_capacity_from(100 + HTTP_RING_CACHE_CAPACITY as u64),
+        state.append_capacity_from(100 + active_capacity as u64),
         100
     );
 }
@@ -4847,9 +5171,9 @@ fn http_ring_cache_state_pauses_prefetch_until_hysteresis_resume() {
         .with_content_len_hint(Some(10_000));
     state.set_duration_seconds_for_test(100.0);
 
-    assert_eq!(state.append_capacity_from(1_000), 0);
-    assert_eq!(state.append_capacity_from(999), 0);
-    assert_eq!(state.append_capacity_from(800), 200);
+    assert_eq!(state.append_capacity_from(875), 0);
+    assert_eq!(state.append_capacity_from(874), 0);
+    assert_eq!(state.append_capacity_from(675), 200);
 }
 
 #[test]

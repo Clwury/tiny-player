@@ -194,8 +194,9 @@ impl DemuxPacketCache {
                 guard.refresh_readahead_hysteresis();
                 self.shared
                     .refresh_monitor_snapshot_with_timing(&guard, &mut timing);
+                let seekable_changed = guard.seekable_ranges_changed_since_last_emit();
                 self.shared
-                    .emit_cache_state_after_read(&mut guard, wait_for_data);
+                    .emit_cache_state_after_read(&mut guard, wait_for_data || seekable_changed);
                 self.shared.ready.notify_all();
                 drop(guard);
                 let (packet, stream_offset) = match packet_source.packet_ref(&mut timing) {

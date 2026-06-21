@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    os::raw::c_int,
+};
 
 use super::{DemuxCachedRange, DemuxPacketCacheState, RangeId};
 
@@ -62,13 +65,6 @@ impl DemuxPacketCacheState {
         self.ranges.get(&range_id)
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn detached_append_range_mut(
-        &mut self,
-    ) -> Option<&mut DemuxCachedRange> {
-        let range_id = self.detached_append_range_id()?;
-        self.ranges.get_mut(&range_id)
-    }
-
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn start_new_current_range(
         &mut self,
         is_bof: bool,
@@ -81,6 +77,7 @@ impl DemuxPacketCacheState {
                 global_order: VecDeque::new(),
                 stream_queues: BTreeMap::new(),
                 sparse_stream_pruned_until_nsecs: BTreeMap::new(),
+                stream_boundaries: BTreeMap::new(),
                 is_bof,
                 is_eof: false,
                 last_used_generation: self.generation,
@@ -106,6 +103,7 @@ impl DemuxPacketCacheState {
                 global_order: VecDeque::new(),
                 stream_queues: BTreeMap::new(),
                 sparse_stream_pruned_until_nsecs: BTreeMap::new(),
+                stream_boundaries: BTreeMap::new(),
                 is_bof: false,
                 is_eof: false,
                 last_used_generation: self.generation,
@@ -182,6 +180,37 @@ impl DemuxPacketCacheState {
             if let Some(packet) = self.packets.remove(&packet_id) {
                 self.cached_bytes = self.cached_bytes.saturating_sub(packet.byte_len);
             }
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn mark_read_stream_bof(
+        &mut self,
+        stream_index: c_int,
+        is_bof: bool,
+    ) {
+        let range = self.read_range_mut();
+        range.ensure_stream_boundary(stream_index).is_bof = is_bof;
+        if !is_bof {
+            range.is_bof = false;
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_range_eof(
+        &mut self,
+        range_id: RangeId,
+        is_eof: bool,
+    ) {
+        let mut stream_indices = self.stream_kinds.keys().copied().collect::<BTreeSet<_>>();
+        if let Some(range) = self.ranges.get(&range_id) {
+            stream_indices.extend(range.stream_queues.keys().copied());
+        }
+
+        let Some(range) = self.ranges.get_mut(&range_id) else {
+            return;
+        };
+        range.is_eof = is_eof;
+        for stream_index in stream_indices {
+            range.ensure_stream_boundary(stream_index).is_eof = is_eof;
         }
     }
 

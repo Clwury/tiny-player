@@ -177,10 +177,12 @@ pub(super) use output_gate::{PlaybackOutputScheduler, PlaybackOutputSnapshot};
 pub(super) use output_rebuffer::PlaybackOutputState;
 #[cfg(test)]
 pub(super) use output_rebuffer::{
-    AudioClockResumeDecision, RebufferResumeAnchor, audio_clock_resume_decision,
-    audio_clock_resume_timeline_nsecs, audio_output_buffered_until_for_resume,
-    decoded_audio_forward_nsecs_from, decoded_video_start_prebuffer_reached,
-    demux_reader_ready_for_output, initial_audio_clock_resume_decision, playback_resume_waterline,
+    AudioClockResumeDecision, InitialOutputSyncDecision, RebufferResumeAnchor,
+    audio_clock_resume_decision, audio_clock_resume_timeline_nsecs,
+    audio_output_buffered_until_for_resume, decoded_audio_forward_nsecs_from,
+    decoded_video_start_prebuffer_reached, demux_reader_ready_for_output,
+    initial_audio_clock_resume_decision, initial_output_sync_decision,
+    initial_playback_resume_waterline, playback_resume_waterline,
     playback_resume_waterline_blocked_on, rebuffer_audio_clock_resume_decision,
     rebuffer_playback_resume_waterline, rebuffer_playback_resume_waterline_after_prolonged_wait,
     rebuffer_playback_resume_waterline_with_resource_pressure, should_block_for_demux_read,

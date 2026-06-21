@@ -6,9 +6,9 @@ pub(in crate::player::backend::ffmpeg::avio::cache) use crate::player::backend::
 use super::HTTP_RING_CACHE_CAPACITY;
 pub(in crate::player::backend::ffmpeg::avio::cache) use super::{
     ByteRingBuffer, CacheRestartRequest, HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR,
-    HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR, HttpCacheConfig, HttpCacheRangeKind, HttpDiskCache,
-    HttpPlaybackBufferRange, HttpRingCacheState, InputRateSample, RetainedCacheRange,
-    http_stream_cache_status_changed,
+    HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
+    HttpCacheConfig, HttpCacheRangeKind, HttpDiskCache, HttpPlaybackBufferRange,
+    HttpRingCacheState, InputRateSample, RetainedCacheRange, http_stream_cache_status_changed,
 };
 
 pub(in crate::player::backend::ffmpeg::avio::cache) use progress::{
@@ -135,12 +135,8 @@ impl HttpRingCacheState {
         }
 
         self.config = config;
-        self.trim_to_capacity(self.config.memory_capacity);
-        self.trim_retained_ranges_to_capacity(
-            self.config
-                .memory_capacity
-                .saturating_sub(self.buffer.len()),
-        );
+        self.trim_to_capacity(self.active_memory_capacity());
+        self.trim_retained_ranges_to_capacity(self.retained_capacity_with_side_reserve(false));
         self.last_reported_status = None;
     }
 

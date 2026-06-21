@@ -19,8 +19,9 @@ use super::{
     VIDEO_OUTPUT_REBUFFER_ENTER_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
     VIDEO_OUTPUT_REBUFFER_MIN_STABLE_RESUME_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
     VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER, VIDEO_OUTPUT_START_PREBUFFER_DURATION,
-    VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER, duration_nsecs, queued_video_duration,
-    queued_video_frames_have_vulkan, queued_video_limit_duration, queued_video_target_duration,
+    VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER,
+    duration_nsecs, queued_video_duration, queued_video_frames_have_vulkan,
+    queued_video_limit_duration, queued_video_target_duration,
 };
 #[cfg(test)]
 use super::{
@@ -50,6 +51,29 @@ impl PlaybackOutputState {
 pub(in crate::player::backend::ffmpeg) struct AudioClockResumeDecision {
     pub(in crate::player::backend::ffmpeg) timeline_nsecs: u64,
     pub(in crate::player::backend::ffmpeg) reset_audio_to_video: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) struct InitialOutputSyncDecision {
+    pub(in crate::player::backend::ffmpeg) video_resume_timeline_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg) audio_start_timeline_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) delayed_audio_start_timeline_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) drop_audio_before_timeline_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) stale_audio_preroll_until_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) stale_audio_preroll_gap_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) allow_initial_audio_gap_at_video_start: bool,
+    pub(in crate::player::backend::ffmpeg) reset_audio_to_video: bool,
+}
+
+impl InitialOutputSyncDecision {
+    pub(in crate::player::backend::ffmpeg) fn audio_clock_resume_decision(
+        self,
+    ) -> AudioClockResumeDecision {
+        AudioClockResumeDecision {
+            timeline_nsecs: self.video_resume_timeline_nsecs,
+            reset_audio_to_video: self.reset_audio_to_video,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +110,8 @@ impl PlaybackResumeWaterline {
 pub(in crate::player::backend::ffmpeg) struct PlaybackResumeWaterlineOptions {
     audio_output_buffered_until_nsecs: Option<u64>,
     allow_delayed_audio_start: bool,
+    initial_delayed_audio_start_timeline_nsecs: Option<u64>,
+    allow_initial_audio_gap_at_video_start: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,8 +135,10 @@ struct VideoOutputRebufferEntryContext {
     underrun_started_at: Option<Instant>,
     now: Instant,
     video_output_underflowing: bool,
+    queued_video_forward_nsecs: Option<u64>,
     output_underrun: bool,
     demux_cache_insufficient: bool,
+    demux_min_forward_nsecs: Option<u64>,
     render_backlogged: bool,
     has_audio_output: bool,
     pending_audio_recoverable: bool,
@@ -128,8 +156,10 @@ pub(in crate::player::backend::ffmpeg) fn video_output_rebuffer_should_enter(
     underrun_started_at: &mut Option<Instant>,
     now: Instant,
     video_output_underflowing: bool,
+    queued_video_forward_nsecs: Option<u64>,
     output_underrun: bool,
     demux_cache_insufficient: bool,
+    demux_min_forward_nsecs: Option<u64>,
     render_backlogged: bool,
     has_audio_output: bool,
     pending_audio_recoverable: bool,
@@ -139,8 +169,10 @@ pub(in crate::player::backend::ffmpeg) fn video_output_rebuffer_should_enter(
         underrun_started_at: *underrun_started_at,
         now,
         video_output_underflowing,
+        queued_video_forward_nsecs,
         output_underrun,
         demux_cache_insufficient,
+        demux_min_forward_nsecs,
         render_backlogged,
         has_audio_output,
         pending_audio_recoverable,
@@ -157,6 +189,23 @@ fn video_output_rebuffer_entry_decision(
         return VideoOutputRebufferEntryDecision {
             underrun_started_at: context.underrun_started_at,
             should_enter: false,
+        };
+    }
+    let demux_forward_low_water = context.demux_min_forward_nsecs.is_none_or(|duration| {
+        duration <= duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
+    });
+    let queued_video_near_drain = context
+        .queued_video_forward_nsecs
+        .is_none_or(|duration| duration <= duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION));
+    if !context.render_backlogged
+        && context.has_audio_output
+        && context.demux_cache_insufficient
+        && demux_forward_low_water
+        && queued_video_near_drain
+    {
+        return VideoOutputRebufferEntryDecision {
+            underrun_started_at: Some(context.underrun_started_at.unwrap_or(context.now)),
+            should_enter: true,
         };
     }
     if !context.video_output_underflowing
@@ -508,26 +557,73 @@ fn rebuffer_audio_anchor_reset_required(context: RebufferAudioAnchorResetContext
     decoded_video_anchor_window_unstable || output_audio_runs_past_decoded_video
 }
 
+pub(in crate::player::backend::ffmpeg) fn initial_output_sync_decision(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    pending_audio: &PendingStartAudio,
+    played_until_nsecs: u64,
+) -> Option<InitialOutputSyncDecision> {
+    let first_video = queued_video_frames.front()?;
+    let first_video_nsecs = first_video.timeline_nsecs;
+    let first_audio_nsecs = pending_audio.first_start_timeline_nsecs();
+    let gap_tolerance_nsecs = duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE);
+    let mut delayed_audio_start_timeline_nsecs = first_audio_nsecs
+        .filter(|audio_start| *audio_start > first_video_nsecs.saturating_add(gap_tolerance_nsecs));
+    let mut drop_audio_before_timeline_nsecs = None;
+    let mut stale_audio_preroll_until_nsecs = None;
+    let mut stale_audio_preroll_gap_nsecs = None;
+    let mut allow_initial_audio_gap_at_video_start = false;
+
+    if let Some(first_audio_nsecs) =
+        first_audio_nsecs.filter(|audio_start| *audio_start < first_video_nsecs)
+    {
+        let pending_audio_buffered_until_nsecs = pending_audio
+            .buffered_until_from(first_audio_nsecs)
+            .unwrap_or(first_audio_nsecs);
+        if pending_audio_buffered_until_nsecs < first_video_nsecs {
+            drop_audio_before_timeline_nsecs = Some(first_video_nsecs);
+            stale_audio_preroll_until_nsecs = Some(pending_audio_buffered_until_nsecs);
+            let preroll_gap_nsecs =
+                first_video_nsecs.saturating_sub(pending_audio_buffered_until_nsecs);
+            stale_audio_preroll_gap_nsecs = Some(preroll_gap_nsecs);
+
+            delayed_audio_start_timeline_nsecs = pending_audio
+                .first_start_at_or_after(first_video_nsecs)
+                .filter(|audio_start| {
+                    let delayed_gap_nsecs = audio_start.saturating_sub(first_video_nsecs);
+                    delayed_gap_nsecs > gap_tolerance_nsecs
+                        && delayed_gap_nsecs <= duration_nsecs(AUDIO_OUTPUT_VIDEO_LEAD_DURATION)
+                });
+
+            let stale_preroll_gap_tolerance_nsecs = first_video
+                .duration_nsecs
+                .saturating_mul(2)
+                .max(100_000_000)
+                .saturating_add(gap_tolerance_nsecs);
+            allow_initial_audio_gap_at_video_start = delayed_audio_start_timeline_nsecs.is_none()
+                && preroll_gap_nsecs <= stale_preroll_gap_tolerance_nsecs;
+        }
+    }
+
+    Some(InitialOutputSyncDecision {
+        video_resume_timeline_nsecs: first_video_nsecs.max(played_until_nsecs),
+        audio_start_timeline_nsecs: first_audio_nsecs,
+        delayed_audio_start_timeline_nsecs,
+        drop_audio_before_timeline_nsecs,
+        stale_audio_preroll_until_nsecs,
+        stale_audio_preroll_gap_nsecs,
+        allow_initial_audio_gap_at_video_start,
+        reset_audio_to_video: false,
+    })
+}
+
+#[cfg(test)]
 pub(in crate::player::backend::ffmpeg) fn initial_audio_clock_resume_decision(
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
     pending_audio: &PendingStartAudio,
     played_until_nsecs: u64,
 ) -> Option<AudioClockResumeDecision> {
-    let first_video_nsecs = queued_video_frames.front()?.timeline_nsecs;
-    let first_audio_nsecs = pending_audio
-        .first_start_timeline_nsecs()
-        .unwrap_or(first_video_nsecs);
-    let gap_tolerance_nsecs = duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE);
-    let timeline_nsecs =
-        if first_audio_nsecs > first_video_nsecs.saturating_add(gap_tolerance_nsecs) {
-            first_audio_nsecs
-        } else {
-            first_video_nsecs
-        };
-    Some(AudioClockResumeDecision {
-        timeline_nsecs: timeline_nsecs.max(played_until_nsecs),
-        reset_audio_to_video: false,
-    })
+    initial_output_sync_decision(queued_video_frames, pending_audio, played_until_nsecs)
+        .map(InitialOutputSyncDecision::audio_clock_resume_decision)
 }
 
 pub(in crate::player::backend::ffmpeg) fn audio_output_buffered_until_for_resume(
@@ -658,6 +754,7 @@ pub(in crate::player::backend::ffmpeg) fn rebuffer_playback_resume_waterline_wit
         PlaybackResumeWaterlineOptions {
             audio_output_buffered_until_nsecs,
             allow_delayed_audio_start: audio_output_buffered_until_nsecs.is_none(),
+            ..PlaybackResumeWaterlineOptions::default()
         },
     )
 }
@@ -745,14 +842,36 @@ pub(in crate::player::backend::ffmpeg) fn rebuffer_playback_resume_waterline_aft
 fn rebuffer_cache_pause_demux_fallback_ready(waterline: PlaybackResumeWaterline) -> bool {
     waterline.demux_ready
         || waterline.demux_min_forward_nsecs.is_some_and(|duration| {
-            duration >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
+            duration >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
         })
 }
 
+pub(in crate::player::backend::ffmpeg) fn initial_playback_resume_waterline_after_stale_audio_preroll_wait(
+    mut waterline: PlaybackResumeWaterline,
+    sync_decision: Option<InitialOutputSyncDecision>,
+    startup_sync_elapsed: Option<Duration>,
+) -> PlaybackResumeWaterline {
+    if waterline.ready()
+        || waterline.decoded_audio_ready
+        || !waterline.decoded_video_ready
+        || startup_sync_elapsed
+            .is_none_or(|elapsed| elapsed < VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER)
+        || sync_decision.is_none_or(|decision| decision.stale_audio_preroll_gap_nsecs.is_none())
+    {
+        return waterline;
+    }
+
+    waterline.decoded_audio_ready = true;
+    waterline
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(in crate::player::backend::ffmpeg) fn initial_playback_resume_waterline(
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
     pending_audio: &PendingStartAudio,
     resume_timeline_nsecs: u64,
+    delayed_audio_start_timeline_nsecs: Option<u64>,
+    allow_initial_audio_gap_at_video_start: bool,
     demux_watermark: DemuxReaderWatermark,
     needs_prefetch: bool,
     has_audio_output: bool,
@@ -767,7 +886,11 @@ pub(in crate::player::backend::ffmpeg) fn initial_playback_resume_waterline(
             needs_prefetch,
         )),
         has_audio_output,
-        PlaybackResumeWaterlineOptions::default(),
+        PlaybackResumeWaterlineOptions {
+            initial_delayed_audio_start_timeline_nsecs: delayed_audio_start_timeline_nsecs,
+            allow_initial_audio_gap_at_video_start,
+            ..PlaybackResumeWaterlineOptions::default()
+        },
     )
 }
 
@@ -790,8 +913,21 @@ pub(in crate::player::backend::ffmpeg) fn playback_resume_waterline_with_target(
             options.audio_output_buffered_until_nsecs,
         )
     });
+    let initial_delayed_decoded_audio_forward_nsecs = (has_audio_output
+        && direct_decoded_audio_forward_nsecs.flatten().is_none())
+    .then(|| {
+        let delayed_audio_start_timeline_nsecs =
+            options.initial_delayed_audio_start_timeline_nsecs?;
+        let delayed_start_gap_nsecs =
+            delayed_audio_start_timeline_nsecs.saturating_sub(audio_start_timeline_nsecs);
+        (delayed_start_gap_nsecs > duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE))
+            .then_some(delayed_start_gap_nsecs)?
+            .checked_add(pending_audio.forward_duration_from(delayed_audio_start_timeline_nsecs)?)
+    })
+    .flatten();
     let delayed_decoded_audio_forward = (has_audio_output
         && direct_decoded_audio_forward_nsecs.flatten().is_none()
+        && initial_delayed_decoded_audio_forward_nsecs.is_none()
         && options.allow_delayed_audio_start)
         .then(|| {
             delayed_start_decoded_audio_forward_from(pending_audio, audio_start_timeline_nsecs)
@@ -799,10 +935,22 @@ pub(in crate::player::backend::ffmpeg) fn playback_resume_waterline_with_target(
         .flatten();
     let decoded_audio_forward_nsecs = direct_decoded_audio_forward_nsecs
         .flatten()
+        .or(initial_delayed_decoded_audio_forward_nsecs)
         .or_else(|| delayed_decoded_audio_forward.map(|delayed| delayed.forward_nsecs));
-    let delayed_audio_start_gap_nsecs = delayed_decoded_audio_forward
-        .map(|delayed| delayed.gap_nsecs)
+    let initial_audio_gap_at_video_start_ready = has_audio_output
+        && options.allow_initial_audio_gap_at_video_start
+        && direct_decoded_audio_forward_nsecs.flatten().is_none()
+        && initial_delayed_decoded_audio_forward_nsecs.is_none()
+        && delayed_decoded_audio_forward.is_none();
+    let initial_delayed_audio_start_gap_nsecs = options
+        .initial_delayed_audio_start_timeline_nsecs
+        .map(|timeline| timeline.saturating_sub(audio_start_timeline_nsecs))
         .filter(|gap| *gap > duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE));
+    let delayed_audio_start_gap_nsecs = initial_delayed_audio_start_gap_nsecs.or_else(|| {
+        delayed_decoded_audio_forward
+            .map(|delayed| delayed.gap_nsecs)
+            .filter(|gap| *gap > duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE))
+    });
     let demux_min_forward_nsecs = if has_audio_output {
         demux_watermark
             .video_forward_nsecs
@@ -812,14 +960,17 @@ pub(in crate::player::backend::ffmpeg) fn playback_resume_waterline_with_target(
         demux_watermark.video_forward_nsecs
     }
     .or(demux_watermark.selected_min_forward_nsecs);
+    let initial_video_clock_until_delayed_audio = initial_delayed_audio_start_gap_nsecs.is_some();
     let decoded_video_ready = decoded_video_forward_nsecs.is_some_and(|duration| {
         duration >= target_nsecs
-            && delayed_audio_start_gap_nsecs.is_none_or(|gap| {
-                duration.saturating_sub(gap)
-                    >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
-            })
+            && (initial_video_clock_until_delayed_audio
+                || delayed_audio_start_gap_nsecs.is_none_or(|gap| {
+                    duration.saturating_sub(gap)
+                        >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
+                }))
     });
     let decoded_audio_ready = !has_audio_output
+        || initial_audio_gap_at_video_start_ready
         || decoded_audio_forward_nsecs.is_some_and(|duration| duration >= target_nsecs);
     let demux_underrun = demux_watermark.underrun
         || demux_watermark.video_underrun
@@ -1009,12 +1160,15 @@ pub(in crate::player::backend::ffmpeg) fn clear_video_output_rebuffer(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        PlaybackResumeWaterline, RebufferAudioAnchorResetContext,
+        InitialOutputSyncDecision, PlaybackResumeWaterline, RebufferAudioAnchorResetContext,
         VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
         VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER,
-        duration_nsecs, rebuffer_audio_anchor_reset_required,
-        rebuffer_playback_resume_waterline_after_cache_pause,
+        VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, duration_nsecs,
+        initial_playback_resume_waterline_after_stale_audio_preroll_wait,
+        rebuffer_audio_anchor_reset_required, rebuffer_playback_resume_waterline_after_cache_pause,
         rebuffer_playback_resume_waterline_after_prolonged_wait,
     };
 
@@ -1054,6 +1208,22 @@ mod tests {
         }
     }
 
+    fn stale_preroll_sync_decision(
+        stale_audio_preroll_gap_nsecs: Option<u64>,
+    ) -> InitialOutputSyncDecision {
+        InitialOutputSyncDecision {
+            video_resume_timeline_nsecs: 1_000_000_000,
+            audio_start_timeline_nsecs: Some(800_000_000),
+            delayed_audio_start_timeline_nsecs: None,
+            drop_audio_before_timeline_nsecs: Some(1_000_000_000),
+            stale_audio_preroll_until_nsecs: stale_audio_preroll_gap_nsecs
+                .map(|gap| 1_000_000_000u64.saturating_sub(gap)),
+            stale_audio_preroll_gap_nsecs,
+            allow_initial_audio_gap_at_video_start: false,
+            reset_audio_to_video: false,
+        }
+    }
+
     #[test]
     fn rebuffer_audio_anchor_reset_requires_stable_decoded_video_window() {
         assert!(rebuffer_audio_anchor_reset_required(anchor_reset_context(
@@ -1080,6 +1250,38 @@ mod tests {
         context.reset_to_video_when_decoded_queue_misses_anchor = false;
 
         assert!(!rebuffer_audio_anchor_reset_required(context));
+    }
+
+    #[test]
+    fn stale_initial_audio_preroll_fallback_does_not_forge_audio_forward() {
+        let waterline = rebuffer_waterline(
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            0,
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            true,
+        );
+
+        let before_timeout = initial_playback_resume_waterline_after_stale_audio_preroll_wait(
+            waterline,
+            Some(stale_preroll_sync_decision(Some(150_000_000))),
+            Some(Duration::ZERO),
+        );
+        assert!(!before_timeout.decoded_audio_ready);
+
+        let without_stale_marker = initial_playback_resume_waterline_after_stale_audio_preroll_wait(
+            waterline,
+            Some(stale_preroll_sync_decision(None)),
+            Some(VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER),
+        );
+        assert!(!without_stale_marker.decoded_audio_ready);
+
+        let after_timeout = initial_playback_resume_waterline_after_stale_audio_preroll_wait(
+            waterline,
+            Some(stale_preroll_sync_decision(Some(150_000_000))),
+            Some(VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER),
+        );
+        assert!(after_timeout.decoded_audio_ready);
+        assert_eq!(after_timeout.decoded_audio_forward_nsecs, Some(0));
     }
 
     #[test]
@@ -1122,11 +1324,30 @@ mod tests {
     }
 
     #[test]
-    fn cache_pause_rebuffer_wait_allows_low_water_demux_window_to_resume() {
+    fn cache_pause_rebuffer_wait_keeps_waiting_with_low_water_demux_window() {
         let waterline = rebuffer_waterline(
             duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
             duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
             duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
+            false,
+        );
+
+        let waterline = rebuffer_playback_resume_waterline_after_cache_pause(
+            waterline,
+            Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+            true,
+        );
+
+        assert!(!waterline.ready());
+        assert!(!waterline.demux_ready);
+    }
+
+    #[test]
+    fn cache_pause_rebuffer_wait_allows_stable_demux_window_to_resume() {
+        let waterline = rebuffer_waterline(
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
             false,
         );
 

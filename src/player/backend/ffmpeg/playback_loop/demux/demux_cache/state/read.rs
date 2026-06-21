@@ -66,7 +66,15 @@ impl DemuxPacketCacheState {
         let advance_started_at = Instant::now();
         self.advance_reader_head_over_packet(packet_id);
         timing.advance_reader_head += advance_started_at.elapsed();
-        self.read_range_mut().is_bof = false;
+        if let Some(stream_index) = self
+            .packets
+            .get(&packet_id)
+            .map(|packet| packet.stream_index)
+        {
+            self.mark_read_stream_bof(stream_index, false);
+        } else {
+            self.read_range_mut().is_bof = false;
+        }
         self.update_forward_cache_after_consumed_packet(packet_id);
         if self.trim_after_read_needed() {
             let trim_started_at = Instant::now();

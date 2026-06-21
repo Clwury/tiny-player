@@ -144,6 +144,7 @@ impl DemuxPacketCacheState {
 
     fn append_packet_id_to_append_range(&mut self, packet_id: PacketId, stream_index: c_int) {
         let range = self.append_range_mut();
+        range.ensure_stream_boundary(stream_index);
         range.global_order.push_back(packet_id);
         range
             .stream_queues

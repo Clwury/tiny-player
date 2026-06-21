@@ -1,14 +1,15 @@
 use super::{
     AtomicBool, AudioClockMode, AudioClockResumeDecision, AudioOutput, BackendEvent,
     BufferedReporter, DelayedAudioStartSilencePolicy, DemuxPacketCache, DemuxReaderWatermark,
-    Duration, FfmpegControl, Instant, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER,
-    PlaybackOutputScheduler, PlaybackOutputState, PlaybackResumeWaterline, PlaybackScheduler,
-    PlaybackSessionId, PositionReporter, Sender, SubtitlePipeline,
-    VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, VideoOutputQueue,
+    Duration, FfmpegControl, InitialOutputSyncDecision, Instant,
+    OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PlaybackOutputScheduler, PlaybackOutputState,
+    PlaybackResumeWaterline, PlaybackScheduler, PlaybackSessionId, PositionReporter, Sender,
+    SubtitlePipeline, VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, VideoOutputQueue,
     audio_output_buffered_until_for_resume, audio_output_contiguous_start_timeline_nsecs,
     discard_decoded_video_before_output_gate_resume_if_ready, flush_pending_start_audio,
-    initial_delayed_audio_start_timeline_nsecs, nsecs_to_seconds, present_first_queued_video_frame,
-    rebuffer_playback_resume_waterline_after_cache_pause,
+    initial_delayed_audio_start_timeline_nsecs,
+    initial_playback_resume_waterline_after_stale_audio_preroll_wait, nsecs_to_seconds,
+    present_first_queued_video_frame, rebuffer_playback_resume_waterline_after_cache_pause,
     rebuffer_playback_resume_waterline_after_prolonged_wait,
     service_initial_video_clock_until_audio_start, timed_output_gate_demux_watermark,
 };
@@ -221,16 +222,29 @@ where
     } else {
         None
     };
-    let resume_decision = if output_scheduler
+    let first_video_frame_pending = output_scheduler
         .playback_output_state
-        .first_video_frame_pending()
-    {
-        output_scheduler
+        .first_video_frame_pending();
+    let mut initial_sync_decision = None;
+    let resume_decision = if first_video_frame_pending {
+        let sync_decision = output_scheduler
             .scheduled_video_queue
-            .initial_audio_clock_resume_decision(
+            .initial_output_sync_decision(
                 &output_scheduler.pending_start_audio,
                 previous_audio_played_until,
             )
+            .unwrap_or(InitialOutputSyncDecision {
+                video_resume_timeline_nsecs: fallback_timeline_nsecs,
+                audio_start_timeline_nsecs: None,
+                delayed_audio_start_timeline_nsecs: None,
+                drop_audio_before_timeline_nsecs: None,
+                stale_audio_preroll_until_nsecs: None,
+                stale_audio_preroll_gap_nsecs: None,
+                allow_initial_audio_gap_at_video_start: false,
+                reset_audio_to_video: false,
+            });
+        initial_sync_decision = Some(sync_decision);
+        sync_decision.audio_clock_resume_decision()
     } else {
         output_scheduler
             .scheduled_video_queue
@@ -241,27 +255,102 @@ where
                 rebuffer_anchor
                     .is_some_and(|anchor| anchor.reset_to_video_when_decoded_queue_misses_anchor),
             )
-    }
-    .unwrap_or(AudioClockResumeDecision {
-        timeline_nsecs: fallback_timeline_nsecs,
-        reset_audio_to_video: false,
-    });
+            .unwrap_or(AudioClockResumeDecision {
+                timeline_nsecs: fallback_timeline_nsecs,
+                reset_audio_to_video: false,
+            })
+    };
     let resume_audio_output_buffered_until_nsecs =
         audio_output_buffered_until_for_resume(resume_decision, audio_output_buffered_until_nsecs);
+    if let Some(sync_decision) = initial_sync_decision {
+        let first_video_timeline_nsecs = output_scheduler
+            .scheduled_video_queue
+            .range_nsecs()
+            .map(|(start, _)| start);
+        let pending_audio_buffered_until_nsecs =
+            sync_decision
+                .audio_start_timeline_nsecs
+                .and_then(|audio_start| {
+                    output_scheduler
+                        .pending_start_audio
+                        .buffered_until_from(audio_start)
+                });
+        let audio_minus_video_ms = first_video_timeline_nsecs
+            .zip(sync_decision.audio_start_timeline_nsecs)
+            .map(|(video_start, audio_start)| {
+                (audio_start as i128 - video_start as i128) as f64 / 1_000_000.0
+            });
+        let sync_reason = if sync_decision.delayed_audio_start_timeline_nsecs.is_some() {
+            "initial_video_clock_until_delayed_audio"
+        } else if sync_decision.allow_initial_audio_gap_at_video_start {
+            "initial_skip_audio_preroll_before_video"
+        } else if sync_decision.stale_audio_preroll_gap_nsecs.is_some() {
+            "initial_wait_after_audio_preroll_gap"
+        } else {
+            "initial_audio_video_start"
+        };
+        tracing::debug!(
+            session_id = ?session_id,
+            first_video_timeline_nsecs = ?first_video_timeline_nsecs,
+            first_audio_timeline_nsecs = ?sync_decision.audio_start_timeline_nsecs,
+            pending_audio_buffered_until_nsecs = ?pending_audio_buffered_until_nsecs,
+            video_resume_timeline_nsecs = sync_decision.video_resume_timeline_nsecs,
+            delayed_audio_start_timeline_nsecs =
+                ?sync_decision.delayed_audio_start_timeline_nsecs,
+            audio_minus_video_ms = ?audio_minus_video_ms,
+            stale_audio_preroll_until_nsecs = ?sync_decision.stale_audio_preroll_until_nsecs,
+            stale_audio_preroll_gap_ms = ?sync_decision
+                .stale_audio_preroll_gap_nsecs
+                .map(|gap| gap as f64 / 1_000_000.0),
+            drop_audio_before_timeline_nsecs =
+                ?sync_decision.drop_audio_before_timeline_nsecs,
+            allow_initial_audio_gap_at_video_start =
+                sync_decision.allow_initial_audio_gap_at_video_start,
+            waterline_timeline_nsecs = sync_decision.video_resume_timeline_nsecs,
+            sync_reason,
+            "FFmpeg output gate initial sync decision"
+        );
+        if sync_decision.allow_initial_audio_gap_at_video_start {
+            output_scheduler.initial_audio_gap_at_video_start_timeline_nsecs =
+                Some(sync_decision.video_resume_timeline_nsecs);
+        }
+        if let Some(drop_audio_before_timeline_nsecs) =
+            sync_decision.drop_audio_before_timeline_nsecs
+        {
+            let dropped_audio_frames = output_scheduler
+                .pending_start_audio
+                .discard_before(drop_audio_before_timeline_nsecs);
+            if dropped_audio_frames > 0 {
+                tracing::debug!(
+                    session_id = ?session_id,
+                    dropped_audio_frames,
+                    drop_audio_before_timeline_nsecs,
+                    stale_audio_preroll_until_nsecs =
+                        ?sync_decision.stale_audio_preroll_until_nsecs,
+                    stale_audio_preroll_gap_ms = ?sync_decision
+                        .stale_audio_preroll_gap_nsecs
+                        .map(|gap| gap as f64 / 1_000_000.0),
+                    "discarded stale initial FFmpeg audio preroll before video start"
+                );
+            }
+        }
+    }
     timing.resume_decision = stage_started_at.elapsed();
 
     let waterline_demux_watermark =
         timed_output_gate_demux_watermark(&mut demux_watermark, &mut timing);
     let stage_started_at = Instant::now();
-    let mut waterline = if output_scheduler
-        .playback_output_state
-        .first_video_frame_pending()
-    {
+    let mut waterline = if first_video_frame_pending {
+        let sync_decision = initial_sync_decision.expect("initial sync decision exists");
         output_scheduler
             .scheduled_video_queue
             .initial_playback_resume_waterline(
                 &output_scheduler.pending_start_audio,
-                resume_decision.timeline_nsecs,
+                sync_decision.video_resume_timeline_nsecs,
+                sync_decision.delayed_audio_start_timeline_nsecs,
+                sync_decision.allow_initial_audio_gap_at_video_start
+                    || output_scheduler.initial_audio_gap_at_video_start_timeline_nsecs
+                        == Some(sync_decision.video_resume_timeline_nsecs),
                 waterline_demux_watermark,
                 needs_prefetch,
                 true,
@@ -280,6 +369,37 @@ where
             )
     };
     timing.waterline = stage_started_at.elapsed();
+    let stage_started_at = Instant::now();
+    if first_video_frame_pending && !waterline.ready() {
+        let stale_preroll_waterline =
+            initial_playback_resume_waterline_after_stale_audio_preroll_wait(
+                waterline,
+                initial_sync_decision,
+                output_scheduler.startup_sync_elapsed(),
+            );
+        if !waterline.decoded_audio_ready && stale_preroll_waterline.decoded_audio_ready {
+            tracing::debug!(
+                session_id = ?session_id,
+                startup_wait_ms = output_scheduler
+                    .startup_sync_elapsed()
+                    .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+                target_ms = waterline.target_nsecs as f64 / 1_000_000.0,
+                decoded_video_ms = ?waterline
+                    .decoded_video_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                decoded_audio_ms = ?waterline
+                    .decoded_audio_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                demux_ready = waterline.demux_ready,
+                stale_audio_preroll_gap_ms = ?initial_sync_decision
+                    .and_then(|decision| decision.stale_audio_preroll_gap_nsecs)
+                    .map(|gap| gap as f64 / 1_000_000.0),
+                "startup output gate stale audio preroll timed out; allowing video-clocked start"
+            );
+        }
+        waterline = stale_preroll_waterline;
+    }
+    timing.fallback += stage_started_at.elapsed();
     let stage_started_at = Instant::now();
     if output_scheduler
         .playback_output_state
@@ -378,11 +498,10 @@ where
     }
     timing.fallback += stage_started_at.elapsed();
     if waterline.ready()
-        && output_scheduler
-            .playback_output_state
-            .first_video_frame_pending()
+        && first_video_frame_pending
+        && let Some(sync_decision) = initial_sync_decision
         && let Some(delayed_audio_start_timeline_nsecs) =
-            initial_delayed_audio_start_timeline_nsecs(output_scheduler, resume_decision)
+            initial_delayed_audio_start_timeline_nsecs(output_scheduler, sync_decision)
     {
         let stage_started_at = Instant::now();
         let status = service_initial_video_clock_until_audio_start(
@@ -412,11 +531,7 @@ where
             ),
         ));
     }
-    if waterline.ready()
-        && output_scheduler
-            .playback_output_state
-            .first_video_frame_pending()
-    {
+    if waterline.ready() && first_video_frame_pending {
         let stage_started_at = Instant::now();
         output_scheduler.set_state(PlaybackOutputState::Ready);
         let Some(first_video) = present_first_queued_video_frame(

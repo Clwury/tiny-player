@@ -4,6 +4,8 @@ use gpui::RenderImage;
 
 use crate::player::render_host::{PlaybackSessionId, RenderSize};
 
+const NETWORK_CACHE_PAUSE_WAIT_SECONDS: f64 = 3.0;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackVideoInfo {
     pub decoder: String,
@@ -126,7 +128,7 @@ impl Default for PlaybackCacheConfig {
             demuxer_donate_buffer: true,
             http_cache_max_bytes: 500 * 1024 * 1024,
             http_cache_chunk_bytes: 1024 * 1024,
-            http_cache_range_request_bytes: 32 * 1024 * 1024,
+            http_cache_range_request_bytes: 64 * 1024 * 1024,
             cache_pause: true,
             cache_pause_initial: false,
             cache_pause_wait: 1.0,
@@ -168,6 +170,12 @@ impl PlaybackCacheConfig {
             } else {
                 PlaybackCacheMode::Disabled
             };
+        }
+        if input_cacheable && self.cache_pause_wait == Self::default().cache_pause_wait {
+            self.cache_pause_wait = NETWORK_CACHE_PAUSE_WAIT_SECONDS;
+        }
+        if input_cacheable && self.cache_pause {
+            self.cache_pause_initial = true;
         }
         self
     }
@@ -251,7 +259,7 @@ pub struct DemuxCacheState {
     pub streams: Vec<StreamCacheState>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ByteCacheState {
     pub ranges: Vec<PlaybackCacheByteRange>,
     pub reader_fraction: Option<f64>,
@@ -261,6 +269,9 @@ pub struct ByteCacheState {
     pub disk_cache_enabled: bool,
     pub idle: bool,
     pub raw_input_rate: Option<u64>,
+    pub active_forward_bytes: u64,
+    pub active_forward_est_seconds: Option<f64>,
+    pub range_request_bytes_effective: u64,
     pub byte_level_seeks: u64,
 }
 
@@ -329,7 +340,9 @@ impl std::error::Error for BackendError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendError, PlaybackCacheConfig, PlaybackCacheMode};
+    use super::{
+        BackendError, NETWORK_CACHE_PAUSE_WAIT_SECONDS, PlaybackCacheConfig, PlaybackCacheMode,
+    };
 
     #[test]
     fn backend_error_displays_user_facing_messages() {
@@ -405,8 +418,8 @@ mod tests {
         let local = PlaybackCacheConfig::default().resolved_for_cacheable_input(false);
 
         assert!(!network.demuxer_cache_wait);
-        assert!(!network.cache_pause_initial);
-        assert_eq!(network.cache_pause_wait, 1.0);
+        assert!(network.cache_pause_initial);
+        assert_eq!(network.cache_pause_wait, NETWORK_CACHE_PAUSE_WAIT_SECONDS);
         assert_eq!(network.demuxer_readahead_secs, 1.0);
         assert_eq!(network.demuxer_hysteresis_secs, 0.0);
         assert_eq!(network.demuxer_max_bytes, 150 * 1024 * 1024);

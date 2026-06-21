@@ -4,8 +4,8 @@ use super::{
     cache::{CacheAppendPermit, CacheAppendResult, CacheRestartRequest, HttpRingCacheShared},
     http::{
         content_len_from_content_range, content_len_from_response, content_range_from_headers,
-        http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
-        http_cache_read_timed_out,
+        http_cache_playback_range_request_bytes, http_cache_range_header,
+        http_cache_range_request_len, http_cache_range_request_timeout, http_cache_read_timed_out,
     },
 };
 
@@ -146,7 +146,7 @@ fn download_http_cache_range(
         return Ok(HttpDownloadOutcome::Eof);
     }
 
-    let range_request_bytes = shared.range_request_bytes();
+    let range_request_bytes = http_cache_playback_range_request_bytes(shared.range_request_bytes());
     let range = http_cache_range_header(offset, known_content_len, range_request_bytes);
     let range_len = http_cache_range_request_len(offset, known_content_len, range_request_bytes);
     let request_timeout = http_cache_range_request_timeout(range_len);
@@ -154,6 +154,7 @@ fn download_http_cache_range(
         offset,
         range = %range,
         range_len,
+        range_request_bytes_effective = range_request_bytes,
         request_timeout_ms = request_timeout.as_millis(),
         "requesting HTTP stream cache range"
     );
@@ -277,7 +278,7 @@ fn download_http_side_cache_range(
         return Ok(HttpDownloadOutcome::Eof);
     }
 
-    let range_request_bytes = shared.range_request_bytes();
+    let range_request_bytes = shared.side_range_request_bytes(request);
     let Some(request_bytes) =
         side_request_remaining_bytes(request, offset, known_content_len, range_request_bytes)
     else {
@@ -291,6 +292,7 @@ fn download_http_side_cache_range(
         request_offset = request.offset,
         range = %range,
         range_len,
+        range_request_bytes_effective = range_request_bytes,
         request_timeout_ms = request_timeout.as_millis(),
         range_kind = ?request.range_kind,
         "requesting HTTP side cache range"

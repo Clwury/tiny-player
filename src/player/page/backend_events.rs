@@ -357,6 +357,7 @@ mod tests {
             idle,
             raw_input_rate: None,
             byte_level_seeks: 0,
+            ..ByteCacheState::default()
         }
     }
 

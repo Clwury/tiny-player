@@ -102,7 +102,7 @@ impl DemuxPacketCacheState {
         target_nsecs: u64,
         mode: PlaybackSeekMode,
     ) -> Option<DemuxCachedSeekHit> {
-        let eager_seekable_until = self.range_cached_seekable_until(range, target_nsecs)?;
+        let seek_target = self.range_cached_seek_target(range, target_nsecs)?;
         let cached_seek_preroll_nsecs = match mode {
             PlaybackSeekMode::Precise => self.cached_seek_preroll_nsecs,
             PlaybackSeekMode::Fast => 0,
@@ -114,34 +114,52 @@ impl DemuxPacketCacheState {
             DemuxPacketRangeView {
                 global_order: &range.global_order,
                 stream_queues: &range.stream_queues,
-                is_bof: range.is_bof,
-                is_eof: range.is_eof,
+                is_bof: seek_target.is_bof,
+                is_eof: seek_target.is_eof,
             },
-            target_nsecs,
+            seek_target.target_nsecs,
         )?;
-        hit.buffered_until_nsecs = hit.buffered_until_nsecs.min(eager_seekable_until);
+        hit.buffered_until_nsecs = hit
+            .buffered_until_nsecs
+            .min(seek_target.seekable_until_nsecs);
         Some(hit)
     }
 
-    fn range_cached_seekable_until(
+    fn range_cached_seek_target(
         &self,
         range: &DemuxCachedRange,
         target_nsecs: u64,
-    ) -> Option<u64> {
-        let ranges = self.range_seekable_timeline_ranges(range);
-        let first = ranges.first().copied()?;
-        let last = ranges.last().copied()?;
+    ) -> Option<RangeCachedSeekTarget> {
+        let summary = self.range_seekable_timeline_summary(range);
+        let first = summary.ranges.first().copied()?;
+        let last = summary.ranges.last().copied()?;
 
         if target_nsecs < first.0 {
-            return range.is_bof.then_some(first.1);
+            return summary.is_bof.then_some(RangeCachedSeekTarget {
+                target_nsecs: first.0,
+                seekable_until_nsecs: first.1,
+                is_bof: summary.is_bof,
+                is_eof: summary.is_eof,
+            });
         }
         if target_nsecs > last.1 {
-            return range.is_eof.then_some(last.1);
+            return summary.is_eof.then_some(RangeCachedSeekTarget {
+                target_nsecs: last.1,
+                seekable_until_nsecs: last.1,
+                is_bof: summary.is_bof,
+                is_eof: summary.is_eof,
+            });
         }
-        ranges
+        summary
+            .ranges
             .into_iter()
             .find(|(start, end)| *start <= target_nsecs && target_nsecs <= *end)
-            .map(|(_, end)| end)
+            .map(|(_, end)| RangeCachedSeekTarget {
+                target_nsecs,
+                seekable_until_nsecs: end,
+                is_bof: summary.is_bof,
+                is_eof: summary.is_eof,
+            })
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn activate_range_for_read(
@@ -185,7 +203,7 @@ impl DemuxPacketCacheState {
         self.seeking = true;
         self.low_level_seeks = self.low_level_seeks.saturating_add(1);
         self.demux_ts_nsecs = None;
-        self.read_range_mut().is_eof = false;
+        self.set_range_eof(self.read_range_id, false);
         self.hysteresis_active = false;
     }
 
@@ -261,4 +279,11 @@ impl DemuxPacketCacheState {
     ) -> Option<DemuxSeekRequest> {
         self.seek_request.take()
     }
+}
+
+struct RangeCachedSeekTarget {
+    target_nsecs: u64,
+    seekable_until_nsecs: u64,
+    is_bof: bool,
+    is_eof: bool,
 }

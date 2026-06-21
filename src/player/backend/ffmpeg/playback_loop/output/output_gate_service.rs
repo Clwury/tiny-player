@@ -8,14 +8,16 @@ use std::{
 };
 
 use crate::player::{
-    backend::BackendEvent,
+    backend::{BackendEvent, ByteCacheState},
     render_host::{PlaybackSessionId, VideoOutputQueue},
 };
 
 use super::{
-    AudioOutput, AudioOutputSnapshot, DemuxPacketCache, FfmpegControl,
-    OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PlaybackOutputSnapshot, PlaybackOutputState,
-    PlaybackPipelineState,
+    AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AudioOutput, AudioOutputSnapshot, DemuxPacketCache,
+    FfmpegControl, HttpRingCache, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER,
+    PlaybackOutputSnapshot, PlaybackOutputState, PlaybackPipelineState,
+    VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    duration_nsecs,
 };
 
 #[derive(Default)]
@@ -55,6 +57,7 @@ impl OutputGateServiceStatus {
 pub(super) struct OutputGateServiceContext<'a> {
     pub(super) session_id: PlaybackSessionId,
     pub(super) demux_cache: &'a DemuxPacketCache,
+    pub(super) http_cache: Option<&'a HttpRingCache>,
     pub(super) pipeline: &'a mut PlaybackPipelineState,
     pub(super) control: &'a FfmpegControl,
     pub(super) event_tx: &'a Sender<BackendEvent>,
@@ -163,10 +166,23 @@ fn output_gate_service_status(
     let pending_audio_recoverable = context
         .pipeline
         .output_scheduler
-        .pending_start_audio_can_recover_output(audio_output_snapshot);
-    let demux_cache_insufficient = !demux_reader_ready_for_output(
-        context.demux_cache.cached_reader_watermark(),
-        has_audio_output,
+        .pending_start_audio_can_recover_output(audio_output_snapshot)
+        || audio_output_underrun_can_recover(
+            output_underrun,
+            output_snapshot,
+            audio_output_snapshot,
+        );
+    let demux_watermark = context.demux_cache.cached_reader_watermark();
+    let demux_cache_insufficient =
+        !demux_reader_ready_for_output(demux_watermark, has_audio_output);
+    let byte_cache_low_water = context
+        .http_cache
+        .map(HttpRingCache::playback_byte_cache_status)
+        .is_some_and(byte_cache_active_forward_low_water);
+    let (forward_cache_insufficient, forward_cache_min_nsecs) = output_forward_cache_gate(
+        demux_cache_insufficient,
+        demux_watermark.selected_min_forward_nsecs,
+        byte_cache_low_water,
     );
     context
         .pipeline
@@ -174,8 +190,10 @@ fn output_gate_service_status(
         .maybe_enter_video_output_rebuffer(
             Instant::now(),
             output_underflowing,
+            output_snapshot.queued_video_forward_nsecs,
             output_underrun,
-            demux_cache_insufficient,
+            forward_cache_insufficient,
+            forward_cache_min_nsecs,
             render_backlogged,
             has_audio_output,
             pending_audio_recoverable,
@@ -203,6 +221,51 @@ fn output_gate_service_status(
         has_audio_output,
         output_resource_pressure,
     })
+}
+
+fn byte_cache_active_forward_low_water(status: ByteCacheState) -> bool {
+    if status.idle || status.content_length.is_none() {
+        return false;
+    }
+    if status.active_forward_bytes == 0 {
+        return true;
+    }
+    status
+        .active_forward_est_seconds
+        .is_some_and(|seconds| seconds <= VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION.as_secs_f64())
+}
+
+fn output_forward_cache_gate(
+    demux_cache_insufficient: bool,
+    demux_min_forward_nsecs: Option<u64>,
+    byte_cache_low_water: bool,
+) -> (bool, Option<u64>) {
+    let byte_cache_low_water = demux_cache_insufficient && byte_cache_low_water;
+    (
+        demux_cache_insufficient,
+        if byte_cache_low_water {
+            Some(0)
+        } else {
+            demux_min_forward_nsecs
+        },
+    )
+}
+
+fn audio_output_underrun_can_recover(
+    output_underrun: bool,
+    output_snapshot: PlaybackOutputSnapshot,
+    audio_output_snapshot: Option<AudioOutputSnapshot>,
+) -> bool {
+    output_underrun
+        && matches!(output_snapshot.state, PlaybackOutputState::Playing)
+        && output_snapshot
+            .queued_video_forward_nsecs
+            .is_some_and(|duration| {
+                duration >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+            })
+        && audio_output_snapshot.is_some_and(|snapshot| {
+            snapshot.total_pending_nsecs >= duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION)
+        })
 }
 
 fn audio_output_starving(
@@ -292,10 +355,14 @@ fn log_output_gate_service_timing(
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioOutputSnapshot, OutputGateResumeStatus, OutputGateServiceOutcome,
-        OutputGateServiceStatus, PlaybackOutputSnapshot, PlaybackOutputState,
-        audio_output_starving, output_gate_service_status_after_resume,
+        AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AudioOutputSnapshot, OutputGateResumeStatus,
+        OutputGateServiceOutcome, OutputGateServiceStatus, PlaybackOutputSnapshot,
+        PlaybackOutputState, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
+        VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, audio_output_starving,
+        audio_output_underrun_can_recover, byte_cache_active_forward_low_water, duration_nsecs,
+        output_forward_cache_gate, output_gate_service_status_after_resume,
     };
+    use crate::player::backend::ByteCacheState;
 
     #[test]
     fn output_gate_service_status_reports_continue() {
@@ -337,6 +404,60 @@ mod tests {
         assert_eq!(status.outcome, OutputGateServiceOutcome::Ready);
         assert!(status.should_wait_for_demux);
         assert!(!status.should_continue());
+    }
+
+    #[test]
+    fn byte_cache_low_water_tracks_active_forward_window() {
+        assert!(byte_cache_active_forward_low_water(ByteCacheState {
+            content_length: Some(1_000),
+            active_forward_bytes: 0,
+            ..ByteCacheState::default()
+        }));
+        assert!(byte_cache_active_forward_low_water(ByteCacheState {
+            content_length: Some(1_000),
+            active_forward_bytes: 1,
+            active_forward_est_seconds: Some(
+                VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION.as_secs_f64()
+            ),
+            ..ByteCacheState::default()
+        }));
+        assert!(!byte_cache_active_forward_low_water(ByteCacheState {
+            content_length: Some(1_000),
+            active_forward_bytes: 1,
+            active_forward_est_seconds: Some(
+                VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION.as_secs_f64() + 0.001
+            ),
+            ..ByteCacheState::default()
+        }));
+        assert!(!byte_cache_active_forward_low_water(ByteCacheState {
+            idle: true,
+            content_length: Some(1_000),
+            active_forward_bytes: 0,
+            ..ByteCacheState::default()
+        }));
+        assert!(!byte_cache_active_forward_low_water(ByteCacheState {
+            content_length: None,
+            active_forward_bytes: 0,
+            ..ByteCacheState::default()
+        }));
+    }
+
+    #[test]
+    fn byte_cache_low_water_is_gated_by_demux_packet_cache() {
+        let demux_min_forward_nsecs = Some(1_000_000_000);
+
+        assert_eq!(
+            output_forward_cache_gate(false, demux_min_forward_nsecs, true),
+            (false, demux_min_forward_nsecs)
+        );
+        assert_eq!(
+            output_forward_cache_gate(true, demux_min_forward_nsecs, false),
+            (true, demux_min_forward_nsecs)
+        );
+        assert_eq!(
+            output_forward_cache_gate(true, demux_min_forward_nsecs, true),
+            (true, Some(0))
+        );
     }
 
     #[test]
@@ -391,6 +512,73 @@ mod tests {
                 ..playing_with_video
             },
             Some(underrun_audio)
+        ));
+    }
+
+    #[test]
+    fn audio_output_underrun_recovery_requires_decoded_video_and_audio_pending() {
+        let playing_with_video = PlaybackOutputSnapshot {
+            state: PlaybackOutputState::Playing,
+            first_video_frame_pending: false,
+            rebuffering: false,
+            queued_video_frames: 50,
+            queued_video_duration_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            queued_video_range_nsecs: Some((
+                0,
+                duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            )),
+            queued_video_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+            video_output_low_water: false,
+            pending_start_audio_frames: 0,
+            pending_start_audio_nsecs: 0,
+            video_output_rebuffer_anchor: None,
+        };
+        let recovered_audio = AudioOutputSnapshot {
+            played_timeline_nsecs: 0,
+            buffered_until_timeline_nsecs: duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION),
+            shared_pending_nsecs: duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION),
+            queue_pending_nsecs: 0,
+            total_pending_nsecs: duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION),
+            queue_frames: 0,
+            queue_generation: 1,
+        };
+
+        assert!(audio_output_underrun_can_recover(
+            true,
+            playing_with_video,
+            Some(recovered_audio)
+        ));
+        assert!(!audio_output_underrun_can_recover(
+            false,
+            playing_with_video,
+            Some(recovered_audio)
+        ));
+        assert!(!audio_output_underrun_can_recover(
+            true,
+            PlaybackOutputSnapshot {
+                queued_video_forward_nsecs: Some(
+                    duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) - 1
+                ),
+                ..playing_with_video
+            },
+            Some(recovered_audio)
+        ));
+        assert!(!audio_output_underrun_can_recover(
+            true,
+            playing_with_video,
+            Some(AudioOutputSnapshot {
+                total_pending_nsecs: duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION) - 1,
+                ..recovered_audio
+            })
+        ));
+        assert!(!audio_output_underrun_can_recover(
+            true,
+            PlaybackOutputSnapshot {
+                state: PlaybackOutputState::Rebuffering,
+                rebuffering: true,
+                ..playing_with_video
+            },
+            Some(recovered_audio)
         ));
     }
 }

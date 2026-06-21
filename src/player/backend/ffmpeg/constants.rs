@@ -75,7 +75,7 @@ pub(super) const PLAYBACK_VOLUME_SCALE: u32 = 10_000;
 pub(super) const HTTP_RING_CACHE_CAPACITY: usize = 500 * 1024 * 1024;
 pub(super) const HTTP_CACHE_CHUNK_SIZE: usize = 1024 * 1024;
 #[cfg(test)]
-pub(super) const HTTP_CACHE_RANGE_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
+pub(super) const HTTP_CACHE_RANGE_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) const HTTP_CACHE_SIDE_DOWNLOAD_WORKERS: usize = 2;
 pub(super) const HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR: u64 = 1;
 pub(super) const HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR: u64 = 2;

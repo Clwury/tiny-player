@@ -5,7 +5,6 @@ use std::{
 
 use super::{
     CachedDemuxPacket, DemuxCachedSeekHit, DemuxPacketCacheState, DemuxPacketRangeView, PacketId,
-    SeekableTimelineSegment,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,9 +194,13 @@ impl DemuxPacketCacheState {
         timeline_anchor_stream_index: c_int,
         cached_seek_preroll_nsecs: u64,
         stream_queues: &BTreeMap<c_int, VecDeque<u64>>,
+        close_open_segment: bool,
     ) -> Vec<(u64, u64)> {
         let mut ranges = Vec::new();
-        let mut segment = SeekableTimelineSegment::default();
+        let mut segment_start_nsecs = None;
+        let mut segment_end_nsecs = None;
+        let mut current_block: Option<VideoSeekBlock> = None;
+        let mut previous_recovery_start_nsecs = None;
 
         for packet_id in Self::timeline_anchor_packet_ids_in_packet_range(
             packets,
@@ -212,45 +215,120 @@ impl DemuxPacketCacheState {
             };
             let end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
 
-            if segment
-                .end_nsecs
-                .is_some_and(|end_nsecs| start_nsecs > end_nsecs)
-            {
-                segment.finish_into(&mut ranges);
-                segment = SeekableTimelineSegment::default();
-            }
+            if packet.recovery_point {
+                if let Some(block) = current_block.take() {
+                    let gap = start_nsecs > block.end_nsecs;
+                    Self::close_video_seek_block(
+                        block,
+                        cached_seek_preroll_nsecs,
+                        &mut segment_start_nsecs,
+                        &mut segment_end_nsecs,
+                    );
+                    if gap {
+                        Self::finish_video_seek_segment(
+                            &mut ranges,
+                            &mut segment_start_nsecs,
+                            &mut segment_end_nsecs,
+                        );
+                        previous_recovery_start_nsecs = None;
+                    }
+                }
 
-            segment.push_packet(
-                start_nsecs,
-                end_nsecs,
-                packet.recovery_point,
-                cached_seek_preroll_nsecs,
-            );
+                current_block = Some(VideoSeekBlock {
+                    start_nsecs,
+                    end_nsecs,
+                    previous_recovery_start_nsecs,
+                });
+                previous_recovery_start_nsecs = Some(start_nsecs);
+            } else if let Some(block) = current_block.as_mut() {
+                if start_nsecs > block.end_nsecs {
+                    Self::finish_video_seek_segment(
+                        &mut ranges,
+                        &mut segment_start_nsecs,
+                        &mut segment_end_nsecs,
+                    );
+                    current_block = None;
+                    previous_recovery_start_nsecs = None;
+                } else {
+                    block.end_nsecs = block.end_nsecs.max(end_nsecs);
+                }
+            }
         }
 
-        segment.finish_into(&mut ranges);
+        if close_open_segment && let Some(block) = current_block {
+            Self::close_video_seek_block(
+                block,
+                cached_seek_preroll_nsecs,
+                &mut segment_start_nsecs,
+                &mut segment_end_nsecs,
+            );
+        }
+        Self::finish_video_seek_segment(
+            &mut ranges,
+            &mut segment_start_nsecs,
+            &mut segment_end_nsecs,
+        );
         ranges
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn stream_timeline_ranges_in_packet_queue(
-        packets: &HashMap<u64, CachedDemuxPacket>,
-        queue: &VecDeque<u64>,
-    ) -> Vec<(u64, u64)> {
-        let mut include_all = |_| true;
-        Self::stream_timeline_ranges_in_packet_queue_filtered(packets, queue, &mut include_all)
+    fn close_video_seek_block(
+        block: VideoSeekBlock,
+        cached_seek_preroll_nsecs: u64,
+        segment_start_nsecs: &mut Option<u64>,
+        segment_end_nsecs: &mut Option<u64>,
+    ) {
+        let Some(seek_start_nsecs) =
+            Self::video_seek_block_start_nsecs(block, cached_seek_preroll_nsecs)
+        else {
+            return;
+        };
+        *segment_start_nsecs = Some(segment_start_nsecs.unwrap_or(seek_start_nsecs));
+        *segment_end_nsecs = Some(
+            segment_end_nsecs
+                .unwrap_or(block.end_nsecs)
+                .max(block.end_nsecs),
+        );
     }
 
-    fn stream_timeline_ranges_in_packet_queue_filtered(
+    fn video_seek_block_start_nsecs(
+        block: VideoSeekBlock,
+        cached_seek_preroll_nsecs: u64,
+    ) -> Option<u64> {
+        if cached_seek_preroll_nsecs == 0 {
+            return Some(block.start_nsecs);
+        }
+        block.previous_recovery_start_nsecs.map(|previous_start| {
+            if previous_start == 0 {
+                block.start_nsecs
+            } else {
+                block
+                    .start_nsecs
+                    .max(previous_start.saturating_add(cached_seek_preroll_nsecs))
+            }
+        })
+    }
+
+    fn finish_video_seek_segment(
+        ranges: &mut Vec<(u64, u64)>,
+        segment_start_nsecs: &mut Option<u64>,
+        segment_end_nsecs: &mut Option<u64>,
+    ) {
+        if let Some((start_nsecs, end_nsecs)) = segment_start_nsecs.zip(*segment_end_nsecs)
+            && end_nsecs > start_nsecs
+        {
+            ranges.push((start_nsecs, end_nsecs));
+        }
+        *segment_start_nsecs = None;
+        *segment_end_nsecs = None;
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn stream_seek_range_in_packet_queue(
         packets: &HashMap<u64, CachedDemuxPacket>,
         queue: &VecDeque<u64>,
-        include_packet: &mut impl FnMut(PacketId) -> bool,
-    ) -> Vec<(u64, u64)> {
-        let mut ranges = Vec::new();
-        let mut current = None;
+    ) -> Option<(u64, u64)> {
+        let mut seek_start_nsecs = None;
+        let mut seek_end_nsecs = None;
         for packet_id in queue {
-            if !include_packet(*packet_id) {
-                continue;
-            }
             let Some(packet) = packets.get(packet_id) else {
                 continue;
             };
@@ -261,50 +339,18 @@ impl DemuxPacketCacheState {
             if end_nsecs <= start_nsecs {
                 continue;
             }
-            match current {
-                Some((current_start, current_end)) if start_nsecs <= current_end => {
-                    current = Some((current_start, current_end.max(end_nsecs)));
-                }
-                Some(previous) => {
-                    ranges.push(previous);
-                    current = Some((start_nsecs, end_nsecs));
-                }
-                None => {
-                    current = Some((start_nsecs, end_nsecs));
-                }
-            }
+            seek_start_nsecs = Some(seek_start_nsecs.unwrap_or(start_nsecs).min(start_nsecs));
+            seek_end_nsecs = Some(seek_end_nsecs.unwrap_or(end_nsecs).max(end_nsecs));
         }
-        if let Some(range) = current {
-            ranges.push(range);
-        }
-        ranges
+        seek_start_nsecs.zip(seek_end_nsecs)
     }
+}
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn intersect_timeline_ranges(
-        left: &[(u64, u64)],
-        right: &[(u64, u64)],
-    ) -> Vec<(u64, u64)> {
-        let mut ranges = Vec::new();
-        let mut left_index = 0;
-        let mut right_index = 0;
-
-        while left_index < left.len() && right_index < right.len() {
-            let (left_start, left_end) = left[left_index];
-            let (right_start, right_end) = right[right_index];
-            let start = left_start.max(right_start);
-            let end = left_end.min(right_end);
-            if end > start {
-                ranges.push((start, end));
-            }
-            if left_end <= right_end {
-                left_index += 1;
-            } else {
-                right_index += 1;
-            }
-        }
-
-        ranges
-    }
+#[derive(Clone, Copy)]
+struct VideoSeekBlock {
+    start_nsecs: u64,
+    end_nsecs: u64,
+    previous_recovery_start_nsecs: Option<u64>,
 }
 
 #[cfg(test)]

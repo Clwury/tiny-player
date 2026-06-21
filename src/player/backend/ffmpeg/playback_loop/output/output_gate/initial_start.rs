@@ -1,16 +1,15 @@
 use super::OutputGateResumeStatus;
 use super::{
-    AtomicBool, AudioClockMode, AudioClockResumeDecision, AudioOutput, BackendEvent,
-    BufferedReporter, DelayedAudioStartSilencePolicy, FfmpegControl,
-    PENDING_AUDIO_CONTINUITY_TOLERANCE, PlaybackOutputScheduler, PlaybackOutputState,
-    PlaybackScheduler, PlaybackSessionId, PositionReporter, Sender, SubtitlePipeline,
-    VideoOutputQueue, duration_nsecs, flush_pending_start_audio, nsecs_to_seconds,
-    present_video_frame_to_vo,
+    AtomicBool, AudioClockMode, AudioOutput, BackendEvent, BufferedReporter,
+    DelayedAudioStartSilencePolicy, FfmpegControl, InitialOutputSyncDecision,
+    PlaybackOutputScheduler, PlaybackOutputState, PlaybackScheduler, PlaybackSessionId,
+    PositionReporter, Sender, SubtitlePipeline, VideoOutputQueue, flush_pending_start_audio,
+    nsecs_to_seconds, present_video_frame_to_vo,
 };
 
 pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn initial_delayed_audio_start_timeline_nsecs(
     output_scheduler: &PlaybackOutputScheduler,
-    resume_decision: AudioClockResumeDecision,
+    sync_decision: InitialOutputSyncDecision,
 ) -> Option<u64> {
     if let Some(audio_start_timeline_nsecs) =
         output_scheduler.initial_delayed_audio_start_timeline_nsecs
@@ -23,15 +22,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn initial_de
     {
         return None;
     }
-
-    let (first_video_timeline_nsecs, _) = output_scheduler.scheduled_video_queue.range_nsecs()?;
-    let first_audio_timeline_nsecs = output_scheduler
-        .pending_start_audio
-        .first_start_timeline_nsecs()?;
-    let gap_tolerance_nsecs = duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE);
-    (first_audio_timeline_nsecs > first_video_timeline_nsecs.saturating_add(gap_tolerance_nsecs)
-        && resume_decision.timeline_nsecs >= first_audio_timeline_nsecs)
-        .then_some(first_audio_timeline_nsecs)
+    sync_decision.delayed_audio_start_timeline_nsecs
 }
 
 #[allow(clippy::too_many_arguments)]

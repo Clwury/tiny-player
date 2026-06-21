@@ -246,6 +246,23 @@ mod tests {
     }
 
     #[test]
+    fn cache_range_fractions_ignores_forward_cache_without_seekable_ranges() {
+        let state = PlaybackCacheState {
+            demux: DemuxCacheState {
+                cache_end: Some(45.0),
+                reader_pts: Some(30.0),
+                ..DemuxCacheState::default()
+            },
+            ..PlaybackCacheState::default()
+        };
+
+        assert_eq!(
+            cache_range_fractions(Some(&state), 100.0),
+            Vec::<(f32, f32)>::new()
+        );
+    }
+
+    #[test]
     fn cached_seek_target_uses_seekable_ranges_before_buffered_fallback() {
         let state = PlaybackCacheState {
             demux: DemuxCacheState {

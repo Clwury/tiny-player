@@ -29,6 +29,8 @@ impl DemuxPacketCacheShared {
         let mut cache_state_emit = None;
         if append_outcome.appended {
             append_outcome.force_cache_state_report |= cache_pause_refresh.force_cache_state_report;
+            append_outcome.force_cache_state_report |=
+                guard.seekable_ranges_changed_since_last_emit();
             cache_state_emit = self.emit_cache_state_after_append(&mut guard, append_outcome);
         } else if cache_pause_refresh.force_cache_state_report {
             cache_state_emit = Some(self.prepare_cache_state_emit(&mut guard, Instant::now()));

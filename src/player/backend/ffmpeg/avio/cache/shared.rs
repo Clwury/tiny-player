@@ -139,6 +139,9 @@ impl HttpRingCache {
                         content_len = ?guard.content_len,
                         "HTTP stream cache read returning partial data at content end"
                     );
+                    let status = guard.take_stream_cache_status_report();
+                    drop(guard);
+                    self.shared.send_stream_cache_status(status);
                     return CacheReadResult::Data(total);
                 }
                 tracing::debug!(
@@ -155,6 +158,9 @@ impl HttpRingCache {
                 guard.set_reader_offset(offset.saturating_add(total as u64));
                 self.shared.ready.notify_all();
                 if total == output.len() || total >= HTTP_CACHE_PARTIAL_READ_MIN_BYTES {
+                    let status = guard.take_stream_cache_status_report();
+                    drop(guard);
+                    self.shared.send_stream_cache_status(status);
                     return CacheReadResult::Data(total);
                 }
                 continue;
@@ -169,6 +175,9 @@ impl HttpRingCache {
                     next_offset = guard.next_offset,
                     "HTTP stream cache read returning currently available partial data"
                 );
+                let status = guard.take_stream_cache_status_report();
+                drop(guard);
+                self.shared.send_stream_cache_status(status);
                 return CacheReadResult::Data(total);
             }
             if current_offset < guard.base_offset || current_offset > guard.next_offset {
@@ -203,6 +212,9 @@ impl HttpRingCache {
                         next_offset = guard.next_offset,
                         "HTTP stream cache read returning partial data at range EOF"
                     );
+                    let status = guard.take_stream_cache_status_report();
+                    drop(guard);
+                    self.shared.send_stream_cache_status(status);
                     return CacheReadResult::Data(total);
                 }
                 tracing::debug!(
@@ -231,6 +243,9 @@ impl HttpRingCache {
                     cached_bytes = guard.cached_bytes(),
                     content_len = ?guard.content_len,
                     active_range_kind = ?guard.active_range_kind,
+                    active_forward_bytes = guard.active_forward_bytes(),
+                    active_forward_est_seconds = ?guard.active_forward_est_seconds(guard.raw_input_rate()),
+                    range_request_bytes_effective = guard.range_request_bytes_effective(),
                     prefetch_paused = guard.prefetch_paused,
                     restart_pending = guard.restart_request.is_some(),
                     eof = guard.eof,
@@ -254,6 +269,9 @@ impl HttpRingCache {
                         cached_bytes = guard.cached_bytes(),
                         content_len = ?guard.content_len,
                         active_range_kind = ?guard.active_range_kind,
+                        active_forward_bytes = guard.active_forward_bytes(),
+                        active_forward_est_seconds = ?guard.active_forward_est_seconds(guard.raw_input_rate()),
+                        range_request_bytes_effective = guard.range_request_bytes_effective(),
                         prefetch_paused = guard.prefetch_paused,
                         restart_pending = guard.restart_request.is_some(),
                         eof = guard.eof,
@@ -420,6 +438,15 @@ impl HttpRingCache {
         guard.duration_seconds =
             duration_seconds.filter(|duration| duration.is_finite() && *duration > 0.0);
         self.shared.ready.notify_all();
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn playback_byte_cache_status(&self) -> ByteCacheState {
+        let guard = self
+            .shared
+            .state
+            .lock()
+            .expect("HTTP stream cache poisoned");
+        guard.stream_cache_status()
     }
 
     #[cfg(test)]
@@ -625,6 +652,16 @@ impl HttpRingCacheShared {
             .range_request_bytes
     }
 
+    pub(in crate::player::backend::ffmpeg::avio) fn side_range_request_bytes(
+        &self,
+        request: CacheRestartRequest,
+    ) -> u64 {
+        self.state
+            .lock()
+            .expect("HTTP stream cache poisoned")
+            .side_range_request_bytes(request.range_kind)
+    }
+
     pub(in crate::player::backend::ffmpeg::avio) fn wait_for_append_capacity(
         &self,
         offset: u64,
@@ -797,7 +834,7 @@ impl HttpRingCacheShared {
             if !guard.side_download_active.contains(&request) {
                 return CacheAppendResult::Stopped;
             }
-            if !guard.append_retained_at(offset, data, request.range_kind) {
+            if !guard.append_retained_at_protected(offset, data, request) {
                 return CacheAppendResult::Restart(offset);
             }
             guard.take_stream_cache_status_report()

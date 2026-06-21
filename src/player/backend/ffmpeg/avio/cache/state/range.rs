@@ -163,12 +163,10 @@ impl HttpRingCacheState {
             .iter()
             .chain(self.side_download_active.iter())
             .any(|request| {
+                let request_bytes = self.side_range_request_bytes(request.range_kind);
                 request.range_kind == range_kind
                     && request.offset <= offset
-                    && offset
-                        < request
-                            .offset
-                            .saturating_add(self.config.range_request_bytes)
+                    && offset < request.offset.saturating_add(request_bytes)
                     && self
                         .content_len
                         .is_none_or(|content_len| request.offset < content_len)
@@ -198,11 +196,9 @@ impl HttpRingCacheState {
             .iter()
             .chain(self.side_download_active.iter())
             .any(|request| {
+                let request_bytes = self.side_range_request_bytes(request.range_kind);
                 offset >= request.offset
-                    && offset
-                        < request
-                            .offset
-                            .saturating_add(self.config.range_request_bytes)
+                    && offset < request.offset.saturating_add(request_bytes)
                     && self
                         .content_len
                         .is_none_or(|content_len| offset < content_len)

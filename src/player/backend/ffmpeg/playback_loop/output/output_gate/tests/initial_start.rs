@@ -1,5 +1,5 @@
 use super::super::{
-    AUDIO_OUTPUT_DELAY_LIMIT, AudioClockResumeDecision, DecodedAudio, PlaybackOutputScheduler,
+    AUDIO_OUTPUT_DELAY_LIMIT, DecodedAudio, InitialOutputSyncDecision, PlaybackOutputScheduler,
     PlaybackOutputState, audio_output_contiguous_start_timeline_nsecs,
     audio_output_flush_until_timeline_nsecs, duration_nsecs,
     initial_delayed_audio_start_timeline_nsecs,
@@ -42,8 +42,14 @@ fn initial_delayed_audio_start_detects_video_clock_gap() {
     assert_eq!(
         initial_delayed_audio_start_timeline_nsecs(
             &scheduler,
-            AudioClockResumeDecision {
-                timeline_nsecs: 1_022_780_000,
+            InitialOutputSyncDecision {
+                video_resume_timeline_nsecs: 1_000_000_000,
+                audio_start_timeline_nsecs: Some(1_022_780_000),
+                delayed_audio_start_timeline_nsecs: Some(1_022_780_000),
+                drop_audio_before_timeline_nsecs: None,
+                stale_audio_preroll_until_nsecs: None,
+                stale_audio_preroll_gap_nsecs: None,
+                allow_initial_audio_gap_at_video_start: false,
                 reset_audio_to_video: false,
             },
         ),
@@ -66,8 +72,14 @@ fn initial_delayed_audio_start_ignores_small_continuity_gap() {
     assert_eq!(
         initial_delayed_audio_start_timeline_nsecs(
             &scheduler,
-            AudioClockResumeDecision {
-                timeline_nsecs: 1_000_000_000,
+            InitialOutputSyncDecision {
+                video_resume_timeline_nsecs: 1_000_000_000,
+                audio_start_timeline_nsecs: Some(1_000_001_000),
+                delayed_audio_start_timeline_nsecs: None,
+                drop_audio_before_timeline_nsecs: None,
+                stale_audio_preroll_until_nsecs: None,
+                stale_audio_preroll_gap_nsecs: None,
+                allow_initial_audio_gap_at_video_start: false,
                 reset_audio_to_video: false,
             },
         ),

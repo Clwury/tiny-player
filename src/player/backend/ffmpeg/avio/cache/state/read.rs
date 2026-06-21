@@ -41,7 +41,7 @@ impl HttpRingCacheState {
     pub(in crate::player::backend::ffmpeg) fn set_reader_offset(&mut self, offset: u64) {
         self.reader_offset = offset;
         if self.offset_in_active_range(offset) {
-            self.trim_to_capacity(self.config.memory_capacity);
+            self.trim_to_capacity(self.active_memory_capacity());
         }
     }
 

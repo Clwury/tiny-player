@@ -7,8 +7,8 @@ use super::super::{
     queued_video_limit_reached, queued_video_target_duration, queued_video_target_frames,
 };
 use super::output_rebuffer::{
-    AudioClockResumeDecision, PlaybackOutputState, PlaybackResumeWaterline,
-    initial_audio_clock_resume_decision, initial_playback_resume_waterline,
+    AudioClockResumeDecision, InitialOutputSyncDecision, PlaybackOutputState,
+    PlaybackResumeWaterline, initial_output_sync_decision, initial_playback_resume_waterline,
     log_playback_resume_waterline_wait, rebuffer_audio_clock_resume_decision,
     rebuffer_playback_resume_waterline_with_resource_pressure,
     video_decode_should_skip_nonref_for_pressure,
@@ -166,6 +166,12 @@ impl ScheduledVideoQueue {
         queued_video_range_nsecs(&self.frames)
     }
 
+    pub(in crate::player::backend::ffmpeg) fn back_timing_nsecs(&self) -> Option<(u64, u64)> {
+        self.frames
+            .back()
+            .map(|frame| (frame.timeline_nsecs, frame.duration_nsecs))
+    }
+
     pub(in crate::player::backend::ffmpeg) fn buffered_until_from_nsecs(
         &self,
         timeline_nsecs: u64,
@@ -262,12 +268,12 @@ impl ScheduledVideoQueue {
         discard_queued_video_before(&mut self.frames, timeline_nsecs)
     }
 
-    pub(in crate::player::backend::ffmpeg) fn initial_audio_clock_resume_decision(
+    pub(in crate::player::backend::ffmpeg) fn initial_output_sync_decision(
         &self,
         pending_audio: &PendingStartAudio,
         played_until_nsecs: u64,
-    ) -> Option<AudioClockResumeDecision> {
-        initial_audio_clock_resume_decision(&self.frames, pending_audio, played_until_nsecs)
+    ) -> Option<InitialOutputSyncDecision> {
+        initial_output_sync_decision(&self.frames, pending_audio, played_until_nsecs)
     }
 
     pub(in crate::player::backend::ffmpeg) fn rebuffer_audio_clock_resume_decision(
@@ -286,10 +292,13 @@ impl ScheduledVideoQueue {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::player::backend::ffmpeg) fn initial_playback_resume_waterline(
         &self,
         pending_audio: &PendingStartAudio,
         resume_timeline_nsecs: u64,
+        delayed_audio_start_timeline_nsecs: Option<u64>,
+        allow_initial_audio_gap_at_video_start: bool,
         demux_watermark: DemuxReaderWatermark,
         needs_prefetch: bool,
         has_audio_output: bool,
@@ -298,6 +307,8 @@ impl ScheduledVideoQueue {
             &self.frames,
             pending_audio,
             resume_timeline_nsecs,
+            delayed_audio_start_timeline_nsecs,
+            allow_initial_audio_gap_at_video_start,
             demux_watermark,
             needs_prefetch,
             has_audio_output,

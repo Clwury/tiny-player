@@ -24,8 +24,8 @@ use callbacks::{CachedAvioReader, cached_avio_read_packet, cached_avio_seek};
 #[cfg(test)]
 pub(super) use http::{
     HttpContentRange, content_len_from_content_range, content_range_from_headers,
-    ffmpeg_http_headers, http_cache_range_header, http_cache_range_request_len,
-    http_cache_range_request_timeout,
+    ffmpeg_http_headers, http_cache_playback_range_request_bytes, http_cache_range_header,
+    http_cache_range_request_len, http_cache_range_request_timeout,
 };
 #[cfg(test)]
 pub(super) use http::{http_cache_request_headers_for_log, http_cache_response_headers_for_log};

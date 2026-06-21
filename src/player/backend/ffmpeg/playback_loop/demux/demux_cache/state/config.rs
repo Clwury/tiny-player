@@ -45,6 +45,7 @@ impl DemuxPacketCacheState {
                 global_order: VecDeque::new(),
                 stream_queues: BTreeMap::new(),
                 sparse_stream_pruned_until_nsecs: BTreeMap::new(),
+                stream_boundaries: BTreeMap::new(),
                 is_bof: reader_nsecs == 0,
                 is_eof: false,
                 last_used_generation: 0,

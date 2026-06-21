@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     os::raw::c_int,
 };
 
@@ -7,7 +7,7 @@ use super::{
     ArchivedStreamPruneCandidate, CachedDemuxPacket, DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT,
     DEMUX_PACKET_READ_TRIM_STEP_LIMIT, DEMUX_STREAM_PACKET_QUEUE_LIMIT,
     DEMUX_SUBTITLE_PACKET_QUEUE_LIMIT, DemuxCachedRange, DemuxPacketCacheState, PacketId, RangeId,
-    SeekableTimelineSegment, StreamCacheKind,
+    StreamCacheKind,
 };
 
 impl DemuxPacketCacheState {
@@ -304,23 +304,17 @@ impl DemuxPacketCacheState {
         queue: &VecDeque<PacketId>,
     ) -> Option<u64> {
         if stream_index == self.timeline_anchor_stream_index {
-            let mut segment = SeekableTimelineSegment::default();
-            let mut ranges = Vec::new();
-            for packet_id in queue {
-                let Some(packet) = self.packets.get(packet_id) else {
-                    continue;
-                };
-                if !packet.timeline_anchor {
-                    continue;
-                }
-                let Some(start_nsecs) = packet.start_nsecs else {
-                    continue;
-                };
-                let end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
-                segment.push_packet(start_nsecs, end_nsecs, packet.recovery_point, 0);
-            }
-            segment.finish_into(&mut ranges);
-            return ranges.first().map(|(start_nsecs, _)| *start_nsecs);
+            let mut stream_queues = BTreeMap::new();
+            stream_queues.insert(stream_index, queue.clone());
+            return Self::seekable_timeline_ranges_in_packet_range(
+                &self.packets,
+                self.timeline_anchor_stream_index,
+                0,
+                &stream_queues,
+                false,
+            )
+            .first()
+            .map(|(start_nsecs, _)| *start_nsecs);
         }
 
         queue.iter().find_map(|packet_id| {
@@ -404,6 +398,7 @@ impl DemuxPacketCacheState {
         })
         .flatten();
         range.is_bof = false;
+        range.ensure_stream_boundary(stream_index).is_bof = false;
         if let Some(pruned_until_nsecs) = sparse_pruned_until_nsecs {
             range
                 .sparse_stream_pruned_until_nsecs

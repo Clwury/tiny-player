@@ -1,8 +1,9 @@
 use crate::player::backend::ByteCacheState;
 
 use super::{
-    HttpPlaybackBufferRange, HttpRingCacheState, http_stream_cache_status_changed,
-    merge_playback_buffer_ranges, merged_cached_byte_len, playback_buffer_range,
+    HttpCacheRangeKind, HttpPlaybackBufferRange, HttpRingCacheState,
+    http_stream_cache_status_changed, merge_playback_buffer_ranges, merged_cached_byte_len,
+    playback_buffer_range,
 };
 
 impl HttpRingCacheState {
@@ -24,6 +25,8 @@ impl HttpRingCacheState {
         let download_fraction = content_len
             .filter(|content_len| *content_len > 0)
             .map(|content_len| self.next_offset.min(content_len) as f64 / content_len as f64);
+        let raw_input_rate = self.raw_input_rate();
+        let active_forward_bytes = self.active_forward_bytes();
         ByteCacheState {
             ranges: ranges.into_iter().map(Into::into).collect(),
             reader_fraction,
@@ -32,9 +35,44 @@ impl HttpRingCacheState {
             content_length: content_len,
             disk_cache_enabled: self.disk_cache_writable,
             idle: self.cache_idle(),
-            raw_input_rate: self.raw_input_rate(),
+            raw_input_rate,
+            active_forward_bytes,
+            active_forward_est_seconds: self.active_forward_est_seconds(raw_input_rate),
+            range_request_bytes_effective: self.range_request_bytes_effective(),
             byte_level_seeks: self.byte_level_seeks,
         }
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn active_forward_bytes(&self) -> u64 {
+        if self.active_range_kind != HttpCacheRangeKind::Playback {
+            return 0;
+        }
+        self.next_offset.saturating_sub(self.reader_offset)
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn active_forward_est_seconds(
+        &self,
+        raw_input_rate: Option<u64>,
+    ) -> Option<f64> {
+        let bytes_per_second = raw_input_rate
+            .filter(|rate| *rate > 0)
+            .or_else(|| self.media_bitrate_bytes_per_second());
+        bytes_per_second.map(|rate| self.active_forward_bytes() as f64 / rate as f64)
+    }
+
+    fn media_bitrate_bytes_per_second(&self) -> Option<u64> {
+        let (content_len, duration) = self.content_len.zip(self.duration_seconds)?;
+        let bytes_per_second = content_len as f64 / duration;
+        bytes_per_second
+            .is_finite()
+            .then(|| bytes_per_second.round() as u64)
+            .filter(|rate| *rate > 0)
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn range_request_bytes_effective(
+        &self,
+    ) -> u64 {
+        self.config.range_request_bytes.max(1)
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn cache_idle(&self) -> bool {

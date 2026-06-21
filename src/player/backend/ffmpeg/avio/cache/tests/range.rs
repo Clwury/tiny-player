@@ -1,7 +1,9 @@
 use super::super::{
-    CacheRestartRequest, HTTP_CACHE_RANGE_REQUEST_BYTES, HttpCacheConfig, HttpCacheRangeKind,
-    HttpRingCacheState,
+    ByteRingBuffer, CacheRestartRequest, HTTP_CACHE_RANGE_REQUEST_BYTES,
+    HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES, HttpCacheConfig, HttpCacheRangeKind, HttpRingCacheState,
+    RetainedCacheRange,
 };
+use crate::player::backend::PlaybackCacheByteRange;
 
 #[test]
 fn http_cache_state_queues_tail_side_download_without_active_restart() {
@@ -49,6 +51,25 @@ fn http_cache_state_queues_playback_read_miss_without_active_restart() {
     );
     assert!(state.side_download_may_produce(500));
 }
+
+#[test]
+fn http_cache_state_keeps_side_range_requests_small() {
+    let config = HttpCacheConfig {
+        range_request_bytes: HTTP_CACHE_RANGE_REQUEST_BYTES,
+        ..HttpCacheConfig::for_test(500 * 1024 * 1024)
+    };
+    let state = HttpRingCacheState::new_with_config(0, config);
+
+    assert_eq!(
+        state.side_range_request_bytes(HttpCacheRangeKind::Playback),
+        HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES
+    );
+    assert_eq!(
+        state.side_range_request_bytes(HttpCacheRangeKind::TailMetadataProbe),
+        HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES
+    );
+}
+
 #[test]
 fn http_cache_state_proactively_queues_next_playback_range() {
     let config = HttpCacheConfig {
@@ -246,6 +267,10 @@ fn http_cache_state_queues_multiple_side_downloads_and_suppresses_duplicates() {
                 range_kind: HttpCacheRangeKind::TailMetadataProbe,
             },
             CacheRestartRequest {
+                offset: 1_000 + HTTP_CACHE_RANGE_REQUEST_BYTES / 2,
+                range_kind: HttpCacheRangeKind::TailMetadataProbe,
+            },
+            CacheRestartRequest {
                 offset: 1_000 + HTTP_CACHE_RANGE_REQUEST_BYTES + 1,
                 range_kind: HttpCacheRangeKind::TailMetadataProbe,
             },
@@ -277,9 +302,137 @@ fn http_cache_state_uses_configured_side_download_range_request_budget() {
                 range_kind: HttpCacheRangeKind::Playback,
             },
             CacheRestartRequest {
+                offset: 1_500,
+                range_kind: HttpCacheRangeKind::Playback,
+            },
+            CacheRestartRequest {
                 offset: 2_025,
                 range_kind: HttpCacheRangeKind::Playback,
             },
         ]
     );
+}
+
+#[test]
+fn http_cache_state_preserves_protected_side_range_when_active_is_full() {
+    let mut state =
+        HttpRingCacheState::new_with_cache_capacity(0, 16).with_content_len_hint(Some(1_000));
+    assert!(state.append_at(0, b"abcdefghijklmnop"));
+    let request = CacheRestartRequest {
+        offset: 900,
+        range_kind: HttpCacheRangeKind::Playback,
+    };
+    state.side_download_active.push(request);
+
+    assert!(state.append_retained_at_protected(900, b"xy", request));
+
+    let mut output = [0; 2];
+    assert_eq!(state.copy_available(900, &mut output), Some(2));
+    assert_eq!(&output, b"xy");
+    assert_eq!(state.base_offset, 0);
+    assert_eq!(state.next_offset, 16);
+}
+
+#[test]
+fn http_cache_state_trims_active_backbuffer_before_preserving_side_range() {
+    let mut state =
+        HttpRingCacheState::new_with_cache_capacity(0, 16).with_content_len_hint(Some(1_000));
+    assert!(state.append_at(0, b"abcdefghijklmnop"));
+    state.reader_offset = 4;
+    let request = CacheRestartRequest {
+        offset: 900,
+        range_kind: HttpCacheRangeKind::Playback,
+    };
+    state.side_download_active.push(request);
+
+    assert!(state.append_retained_at_protected(900, b"xy", request));
+
+    assert_eq!(state.base_offset, 2);
+    assert_eq!(state.next_offset, 16);
+    let mut output = [0; 2];
+    assert_eq!(state.copy_available(900, &mut output), Some(2));
+    assert_eq!(&output, b"xy");
+    assert_eq!(state.copy_available(0, &mut output), None);
+}
+
+#[test]
+fn http_cache_state_retained_trim_does_not_remove_protected_side_range() {
+    let mut state =
+        HttpRingCacheState::new_with_cache_capacity(0, 16).with_content_len_hint(Some(1_000));
+    assert!(state.append_at(0, b"abcdefghijklmnop"));
+    let mut old_buffer = ByteRingBuffer::new(16);
+    old_buffer.append(b"old");
+    state.retained_ranges.push_back(RetainedCacheRange {
+        buffer: old_buffer,
+        base_offset: 100,
+        next_offset: 103,
+        range_kind: HttpCacheRangeKind::TailMetadataProbe,
+        last_used_generation: 0,
+    });
+    let request = CacheRestartRequest {
+        offset: 900,
+        range_kind: HttpCacheRangeKind::Playback,
+    };
+    state.side_download_active.push(request);
+
+    assert!(state.append_retained_at_protected(900, b"xy", request));
+
+    let mut output = [0; 3];
+    assert_eq!(state.copy_available(100, &mut output), None);
+    let mut side_output = [0; 2];
+    assert_eq!(state.copy_available(900, &mut side_output), Some(2));
+    assert_eq!(&side_output, b"xy");
+}
+
+#[test]
+fn http_cache_state_prefetch_leaves_side_reserve() {
+    let mut state =
+        HttpRingCacheState::new_with_cache_capacity(0, 16).with_content_len_hint(Some(1_000));
+
+    assert_eq!(state.append_capacity_from(13), 1);
+    assert_eq!(state.append_capacity_from(14), 0);
+    assert!(state.prefetch_paused);
+}
+
+#[test]
+fn http_cache_state_status_reflects_active_trim_and_protected_side_range() {
+    let mut state =
+        HttpRingCacheState::new_with_cache_capacity(0, 16).with_content_len_hint(Some(100));
+    assert!(state.append_at(0, b"abcdefghijklmnop"));
+    state.reader_offset = 4;
+    let request = CacheRestartRequest {
+        offset: 90,
+        range_kind: HttpCacheRangeKind::TailMetadataProbe,
+    };
+    state.side_download_active.push(request);
+
+    assert!(state.append_retained_at_protected(90, b"xy", request));
+
+    assert_eq!(
+        state.stream_cache_status_for_test().ranges,
+        vec![
+            PlaybackCacheByteRange {
+                start_fraction: 0.02,
+                end_fraction: 0.16,
+            },
+            PlaybackCacheByteRange {
+                start_fraction: 0.9,
+                end_fraction: 0.92,
+            },
+        ]
+    );
+}
+
+#[test]
+fn http_cache_state_estimates_active_forward_seconds_from_media_bitrate() {
+    let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(1_000));
+    state.set_duration_seconds_for_test(100.0);
+    assert!(state.append_at(0, b"abcdefghij"));
+    state.input_rate_samples.clear();
+    state.set_reader_offset(4);
+
+    let status = state.stream_cache_status_for_test();
+
+    assert_eq!(status.active_forward_bytes, 6);
+    assert_eq!(status.active_forward_est_seconds, Some(0.6));
 }
