@@ -62,7 +62,6 @@ impl DemuxPacketCacheState {
             self.appended_packet_may_reach_readahead(stream_index, packet_forward_end_nsecs);
         let memory_pressure = self.memory_pressure();
         let backbuffer_pressure = self.backbuffer_pressure();
-        let queue_pressure = self.stream_packet_queue_full();
         let run_pause_maintenance = self.append_maintenance_due(
             cleared_seek || readahead_reached || memory_pressure || backbuffer_pressure,
         );
@@ -75,22 +74,18 @@ impl DemuxPacketCacheState {
         } else {
             false
         };
-        let should_pause_demux = if cleared_seek
-            || readahead_reached
-            || queue_pressure
-            || run_pause_maintenance
-            || pruned
-        {
-            let hysteresis_started_at = Instant::now();
-            self.refresh_readahead_hysteresis();
-            timing.refresh_readahead_hysteresis += hysteresis_started_at.elapsed();
-            let should_pause_started_at = Instant::now();
-            let should_pause_demux = self.should_pause_demux();
-            timing.should_pause_demux += should_pause_started_at.elapsed();
-            should_pause_demux
-        } else {
-            false
-        };
+        let should_pause_demux =
+            if cleared_seek || readahead_reached || run_pause_maintenance || pruned {
+                let hysteresis_started_at = Instant::now();
+                self.refresh_readahead_hysteresis();
+                timing.refresh_readahead_hysteresis += hysteresis_started_at.elapsed();
+                let should_pause_started_at = Instant::now();
+                let should_pause_demux = self.should_pause_demux();
+                timing.should_pause_demux += should_pause_started_at.elapsed();
+                should_pause_demux
+            } else {
+                false
+            };
         DemuxPacketAppendOutcome {
             appended: true,
             force_cache_state_report: cleared_seek || pruned || should_pause_demux,

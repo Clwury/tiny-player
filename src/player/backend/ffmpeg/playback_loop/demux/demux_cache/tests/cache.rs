@@ -25,12 +25,13 @@ use crate::player::{
 use super::super::DEMUX_PACKET_CACHE_MEMORY_BYTES;
 use super::{
     AvPacket, CachedDemuxPacket, CachedDemuxPacketPayload, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
-    DEMUX_PACKET_CACHE_MAX_READAHEAD, DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL,
+    DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS, DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL,
     DEMUX_STREAM_PACKET_QUEUE_LIMIT, DemuxPacketCache, DemuxPacketCacheMonitorSnapshot,
     DemuxPacketCacheReadTiming, DemuxPacketCacheShared, DemuxPacketCacheState,
     DemuxPacketDiskCache, DemuxPacketTimeline, DemuxReadResult, DemuxSeekRequest,
     DemuxSelectedStreams, FfmpegControl, StreamInfo, demux_cache_blocked_on,
-    demux_packet_cache_readahead_nsecs, duration_nsecs, seconds_to_nsecs,
+    demux_packet_cache_hysteresis_nsecs, demux_packet_cache_readahead_nsecs, duration_nsecs,
+    seconds_to_nsecs,
 };
 
 fn cached_anchor(start_nsecs: u64, end_nsecs: u64) -> CachedDemuxPacket {
@@ -267,11 +268,12 @@ fn demux_packet_cache_state_allows_zero_cache_secs_to_use_demux_readahead() {
 }
 
 #[test]
-fn demux_packet_cache_state_caps_readahead_below_cache_secs_when_cache_is_active() {
+fn demux_packet_cache_state_caps_readahead_with_configured_packet_limit() {
     let config = PlaybackCacheConfig {
         mode: PlaybackCacheMode::Enabled,
-        cache_secs: 30.0,
+        cache_secs: 120.0,
         demuxer_readahead_secs: 2.0,
+        demuxer_packet_max_readahead_secs: 30.0,
         ..PlaybackCacheConfig::default()
     };
 
@@ -283,13 +285,28 @@ fn demux_packet_cache_state_caps_readahead_below_cache_secs_when_cache_is_active
         config,
     );
 
-    // The packet read-ahead is capped (deep buffering lives in the byte cache) so
-    // the producer pauses and releases the cache mutex instead of hot-looping
-    // toward cache_secs and starving the pump.
-    assert_eq!(
-        state.readahead_nsecs,
-        duration_nsecs(DEMUX_PACKET_CACHE_MAX_READAHEAD)
+    assert_eq!(state.readahead_nsecs, 30_000_000_000);
+}
+
+#[test]
+fn demux_packet_cache_state_can_disable_packet_readahead_time_cap() {
+    let config = PlaybackCacheConfig {
+        mode: PlaybackCacheMode::Enabled,
+        cache_secs: 120.0,
+        demuxer_readahead_secs: 2.0,
+        demuxer_packet_max_readahead_secs: 0.0,
+        ..PlaybackCacheConfig::default()
+    };
+
+    let state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        config,
     );
+
+    assert_eq!(state.readahead_nsecs, 120_000_000_000);
 }
 
 #[test]
@@ -328,6 +345,7 @@ fn demux_packet_cache_state_applies_live_cache_config() {
         mode: PlaybackCacheMode::Disabled,
         cache_secs: 3.0,
         demuxer_readahead_secs: 2.0,
+        demuxer_packet_max_readahead_secs: 1.5,
         demuxer_hysteresis_secs: 0.5,
         demuxer_max_bytes: 1024,
         demuxer_max_back_bytes: 2048,
@@ -340,7 +358,7 @@ fn demux_packet_cache_state_applies_live_cache_config() {
 
     assert_eq!(state.memory_limit_bytes, 1024);
     assert_eq!(state.backbuffer_limit_bytes, 0);
-    assert_eq!(state.readahead_nsecs, 2_000_000_000);
+    assert_eq!(state.readahead_nsecs, 1_500_000_000);
     assert_eq!(state.hysteresis_nsecs, 500_000_000);
     assert!(!state.donate_backbuffer);
     assert!(!state.cache_pause_enabled);
@@ -1262,7 +1280,7 @@ fn demux_packet_cache_round_robin_polls_selected_stream_queues_only() {
 }
 
 #[test]
-fn demux_packet_cache_pauses_on_per_stream_packet_queue_limit() {
+fn demux_packet_cache_reports_per_stream_packet_queue_limit_without_pausing() {
     let mut config = cache_config_for_test();
     config.demuxer_readahead_secs = 3600.0;
     config.demuxer_max_bytes = 0;
@@ -1289,8 +1307,8 @@ fn demux_packet_cache_pauses_on_per_stream_packet_queue_limit() {
     assert_eq!(video_queue.packet_limit, DEMUX_STREAM_PACKET_QUEUE_LIMIT);
     assert!(video_queue.packet_queue_full);
     assert!(state.stream_packet_queue_full());
-    assert!(state.should_pause_demux());
-    assert_eq!(demux_cache_blocked_on(&state, false), "packet_queue_full");
+    assert!(!state.should_pause_demux());
+    assert_eq!(demux_cache_blocked_on(&state, false), "demux_cache");
 }
 
 #[test]
@@ -4494,10 +4512,10 @@ fn demux_packet_disk_cache_can_leave_file_for_inspection() {
 }
 
 #[test]
-fn demux_packet_cache_readahead_is_capped_below_cache_secs() {
+fn demux_packet_cache_readahead_defaults_to_cache_secs_when_cache_is_active() {
     // With the cache active, effective_readahead_secs() inflates to cache_secs
-    // (up to an hour). The packet read-ahead must be capped so the producer pauses
-    // and releases the cache mutex to the pump instead of hot-looping toward it.
+    // (up to an hour). This matches mpv: the deep packet prefetch target is then
+    // bounded by demuxer_max_bytes instead of an extra time cap.
     let cached = PlaybackCacheConfig {
         demuxer_readahead_secs: 1.0,
         cache_secs: 3600.0,
@@ -4505,10 +4523,10 @@ fn demux_packet_cache_readahead_is_capped_below_cache_secs() {
     };
     assert_eq!(
         demux_packet_cache_readahead_nsecs(&cached, true),
-        duration_nsecs(DEMUX_PACKET_CACHE_MAX_READAHEAD)
+        seconds_to_nsecs(3600.0)
     );
 
-    // A configured read-ahead below the cap is respected verbatim.
+    // A local/cache-inactive input still uses the explicit demuxer readahead.
     let small = PlaybackCacheConfig {
         demuxer_readahead_secs: 2.0,
         ..PlaybackCacheConfig::default()
@@ -4516,5 +4534,40 @@ fn demux_packet_cache_readahead_is_capped_below_cache_secs() {
     assert_eq!(
         demux_packet_cache_readahead_nsecs(&small, false),
         seconds_to_nsecs(2.0)
+    );
+
+    // A non-zero override can still cap packet prefetch for diagnostics or
+    // constrained environments.
+    let capped = PlaybackCacheConfig {
+        demuxer_readahead_secs: 1.0,
+        cache_secs: 120.0,
+        demuxer_packet_max_readahead_secs: 30.0,
+        ..PlaybackCacheConfig::default()
+    };
+    assert_eq!(
+        demux_packet_cache_readahead_nsecs(&capped, true),
+        seconds_to_nsecs(30.0)
+    );
+}
+
+#[test]
+fn demux_packet_cache_auto_hysteresis_is_capped_for_large_readahead() {
+    let config = PlaybackCacheConfig {
+        demuxer_hysteresis_secs: 0.0,
+        ..PlaybackCacheConfig::default()
+    };
+
+    assert_eq!(
+        demux_packet_cache_hysteresis_nsecs(&config, seconds_to_nsecs(60.0)),
+        duration_nsecs(DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS)
+    );
+
+    let configured = PlaybackCacheConfig {
+        demuxer_hysteresis_secs: 12.0,
+        ..PlaybackCacheConfig::default()
+    };
+    assert_eq!(
+        demux_packet_cache_hysteresis_nsecs(&configured, seconds_to_nsecs(60.0)),
+        seconds_to_nsecs(12.0)
     );
 }

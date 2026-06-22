@@ -1,12 +1,9 @@
-use std::os::raw::c_int;
-
 use crate::player::backend::StreamCacheKind;
 
 use super::packet::CachedDemuxPacket;
 
 #[derive(Clone, Copy)]
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct StreamForwardWindow {
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_index: c_int,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) kind: StreamCacheKind,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) reader_nsecs: u64,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) end_nsecs: u64,

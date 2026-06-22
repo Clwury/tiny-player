@@ -15,8 +15,6 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn demux_cach
         "demux_seek"
     } else if state.has_demux_underrun() {
         "demux_cache_underrun"
-    } else if state.stream_packet_queue_full() {
-        "packet_queue_full"
     } else if state.should_pause_demux() {
         "demux_packet_cache_full"
     } else {

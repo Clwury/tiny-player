@@ -244,11 +244,6 @@ impl DemuxPacketCacheState {
         if self.memory_limit_bytes > 0 && self.forward_bytes() >= self.memory_limit_bytes {
             return true;
         }
-        if self.append_queue_forward_packet_count(window.stream_index)
-            >= self.stream_packet_queue_limit(window.stream_index)
-        {
-            return true;
-        }
         let forward_duration = window.duration_nsecs();
         if forward_duration >= self.readahead_nsecs {
             return true;
@@ -311,7 +306,6 @@ impl DemuxPacketCacheState {
 
             match state.reader_nsecs.zip(state.end_nsecs) {
                 Some((reader_nsecs, end_nsecs)) => windows.push(StreamForwardWindow {
-                    stream_index: *stream_index,
                     kind: *kind,
                     reader_nsecs,
                     end_nsecs,
@@ -319,7 +313,6 @@ impl DemuxPacketCacheState {
                 }),
                 None if state.packet_count > 0 || !self.read_range_eof() => {
                     windows.push(StreamForwardWindow {
-                        stream_index: *stream_index,
                         kind: *kind,
                         reader_nsecs: self.reader_nsecs,
                         end_nsecs: self.reader_nsecs,
@@ -529,7 +522,6 @@ impl DemuxPacketCacheState {
                 let reader_nsecs = state.reader_nsecs.unwrap_or(self.reader_nsecs);
                 let end_nsecs = state.cache_end_nsecs.unwrap_or(reader_nsecs);
                 let window = StreamForwardWindow {
-                    stream_index,
                     kind,
                     reader_nsecs,
                     end_nsecs,

@@ -98,6 +98,7 @@ pub struct PlaybackCacheConfig {
     pub disk_cache_max_bytes: u64,
     pub cache_secs: f64,
     pub demuxer_readahead_secs: f64,
+    pub demuxer_packet_max_readahead_secs: f64,
     pub demuxer_hysteresis_secs: f64,
     pub demuxer_max_bytes: u64,
     pub demuxer_max_back_bytes: u64,
@@ -122,6 +123,7 @@ impl Default for PlaybackCacheConfig {
             disk_cache_max_bytes: 4 * 1024 * 1024 * 1024,
             cache_secs: 1000.0 * 60.0 * 60.0,
             demuxer_readahead_secs: 1.0,
+            demuxer_packet_max_readahead_secs: 0.0,
             demuxer_hysteresis_secs: 0.0,
             demuxer_max_bytes: 150 * 1024 * 1024,
             demuxer_max_back_bytes: 50 * 1024 * 1024,
@@ -145,6 +147,10 @@ impl PlaybackCacheConfig {
         self.demuxer_readahead_secs = valid_non_negative_or(
             self.demuxer_readahead_secs,
             Self::default().demuxer_readahead_secs,
+        );
+        self.demuxer_packet_max_readahead_secs = valid_non_negative_or(
+            self.demuxer_packet_max_readahead_secs,
+            Self::default().demuxer_packet_max_readahead_secs,
         );
         self.demuxer_hysteresis_secs = valid_non_negative_or(self.demuxer_hysteresis_secs, 0.0);
         self.disk_cache_max_bytes = self.disk_cache_max_bytes.max(1);
@@ -397,6 +403,16 @@ mod tests {
     }
 
     #[test]
+    fn cache_config_defaults_to_uncapped_packet_readahead() {
+        assert_eq!(
+            PlaybackCacheConfig::default()
+                .normalized()
+                .demuxer_packet_max_readahead_secs,
+            0.0
+        );
+    }
+
+    #[test]
     fn cache_config_resolves_auto_mode_from_input_cacheability() {
         let network = PlaybackCacheConfig::default().resolved_for_cacheable_input(true);
         let local = PlaybackCacheConfig::default().resolved_for_cacheable_input(false);
@@ -421,6 +437,7 @@ mod tests {
         assert!(network.cache_pause_initial);
         assert_eq!(network.cache_pause_wait, NETWORK_CACHE_PAUSE_WAIT_SECONDS);
         assert_eq!(network.demuxer_readahead_secs, 1.0);
+        assert_eq!(network.demuxer_packet_max_readahead_secs, 0.0);
         assert_eq!(network.demuxer_hysteresis_secs, 0.0);
         assert_eq!(network.demuxer_max_bytes, 150 * 1024 * 1024);
         assert_eq!(network.demuxer_max_back_bytes, 50 * 1024 * 1024);
@@ -431,6 +448,7 @@ mod tests {
         assert!(!local.cache_pause_initial);
         assert_eq!(local.cache_pause_wait, 1.0);
         assert_eq!(local.demuxer_readahead_secs, 1.0);
+        assert_eq!(local.demuxer_packet_max_readahead_secs, 0.0);
         assert_eq!(local.demuxer_hysteresis_secs, 0.0);
         assert!(local.demuxer_donate_buffer);
         assert_eq!(local.effective_readahead_secs(false), 1.0);

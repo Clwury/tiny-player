@@ -30,6 +30,7 @@ impl DemuxPacketCacheState {
             .expect("FFmpeg demux packet cache read range missing")
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn append_range(
         &self,
     ) -> &DemuxCachedRange {

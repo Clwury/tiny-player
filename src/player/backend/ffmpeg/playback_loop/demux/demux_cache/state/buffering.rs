@@ -10,9 +10,6 @@ impl DemuxPacketCacheState {
         if self.selected_eager_stream_needs_packet() {
             return false;
         }
-        if self.stream_packet_queue_full() {
-            return true;
-        }
         if self.memory_limit_bytes > 0 && self.forward_bytes() >= self.memory_limit_bytes {
             return true;
         }

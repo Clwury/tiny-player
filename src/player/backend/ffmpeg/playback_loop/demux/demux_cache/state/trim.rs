@@ -48,6 +48,7 @@ impl DemuxPacketCacheState {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn stream_packet_queue_full(
         &self,
     ) -> bool {
@@ -69,29 +70,6 @@ impl DemuxPacketCacheState {
                 };
                 queued_packets >= self.stream_packet_queue_limit(*stream_index)
             })
-    }
-
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn append_queue_forward_packet_count(
-        &self,
-        stream_index: c_int,
-    ) -> usize {
-        if self.append_range_id == self.read_range_id {
-            return self
-                .forward_streams
-                .get(&stream_index)
-                .map(|state| state.packet_count)
-                .unwrap_or_default();
-        }
-        self.append_range()
-            .stream_queues
-            .get(&stream_index)
-            .map(|queue| {
-                queue
-                    .iter()
-                    .filter(|packet_id| self.packets.contains_key(packet_id))
-                    .count()
-            })
-            .unwrap_or_default()
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn trim_to_limit(

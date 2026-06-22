@@ -8,10 +8,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_P
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_STREAM_PACKET_QUEUE_LIMIT: usize = 2048;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_SUBTITLE_PACKET_QUEUE_LIMIT: usize = 4096;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_READ_SLOW_LOG_AFTER: Duration = Duration::from_millis(200);
-// Packet-cache read-ahead cap. Kept far below deep byte-cache buffering so the demux
-// producer still parks between refills, but large enough to keep high-bitrate hardware
-// decode fed through short stalls in frame preparation and transient network dips.
-pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_CACHE_MAX_READAHEAD: Duration = Duration::from_secs(12);
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS: Duration = Duration::from_secs(5);
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_WOULD_BLOCK_DIAG_INTERVAL: Duration = Duration::from_millis(500);
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_APPEND_TIMING_LOG_AFTER: Duration = Duration::from_millis(1);
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_APPEND_MAINTENANCE_INTERVAL: usize = 16;
@@ -20,18 +17,21 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_P
 
 /// Read-ahead target for the demux PACKET cache.
 ///
-/// Only a few seconds of demuxed packets are needed to keep the decoder fed; deep
-/// buffering for seeking and network resilience is provided by the byte-level
-/// HTTP/disk cache. This is intentionally NOT inflated to `cache_secs`: an unbounded
-/// packet read-ahead makes the demux producer thread hot-loop without ever pausing,
-/// monopolizing the cache mutex and starving the coordinator pump that feeds the
-/// decoder (decode then collapses below realtime, causing perpetual rebuffering).
+/// Seekable ranges require demuxed packets, so the default follows mpv's network
+/// cache behavior: cache-active inputs target `cache_secs` and stop primarily on
+/// `demuxer_max_bytes`. A non-zero packet cap is still available as an override;
+/// 0 disables the extra time cap.
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn demux_packet_cache_readahead_nsecs(
     cache_config: &PlaybackCacheConfig,
     cache_active: bool,
 ) -> u64 {
-    seconds_to_nsecs(cache_config.effective_readahead_secs(cache_active))
-        .min(duration_nsecs(DEMUX_PACKET_CACHE_MAX_READAHEAD))
+    let target = seconds_to_nsecs(cache_config.effective_readahead_secs(cache_active));
+    let max_readahead = seconds_to_nsecs(cache_config.demuxer_packet_max_readahead_secs);
+    if max_readahead == 0 {
+        target
+    } else {
+        target.min(max_readahead)
+    }
 }
 
 /// Hysteresis band for the demux PACKET cache read-ahead.
@@ -43,8 +43,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn demux_pack
 /// wakes to read+append on every consumed packet, thrashing the lock against the pump
 /// and starving the decoder. Inject a band (when none is configured) so the producer
 /// parks between refills and the pump gets long uncontended windows to feed the decoder.
-/// Use a narrower default band than half the target so refill starts before a slow 4K
-/// decode path drains most of the demux window.
+/// Cap the automatic band so larger seekable-range windows resume prefetching early.
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn demux_packet_cache_hysteresis_nsecs(
     cache_config: &PlaybackCacheConfig,
     readahead_nsecs: u64,
@@ -53,6 +52,6 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn demux_pack
     if configured > 0 {
         configured
     } else {
-        readahead_nsecs / 3
+        (readahead_nsecs / 3).min(duration_nsecs(DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS))
     }
 }
