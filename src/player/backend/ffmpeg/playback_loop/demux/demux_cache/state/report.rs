@@ -346,20 +346,10 @@ impl DemuxPacketCacheState {
                 .partial_cmp(&right.start)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let mut merged: Vec<PlaybackCacheTimeRange> = Vec::new();
-        for range in ranges {
-            if range.end < range.start {
-                continue;
-            }
-            if let Some(last) = merged.last_mut()
-                && range.start <= last.end
-            {
-                last.end = last.end.max(range.end);
-                continue;
-            }
-            merged.push(range);
-        }
-        merged
+        ranges
+            .into_iter()
+            .filter(|range| range.end >= range.start)
+            .collect()
     }
 
     fn collect_seekable_time_ranges(
@@ -387,16 +377,15 @@ impl DemuxPacketCacheState {
         range: &DemuxCachedRange,
     ) -> SeekableTimelineSummary {
         let timeline_boundary = range.stream_boundary(self.timeline_anchor_stream_index);
-        let mut ranges = Self::seekable_timeline_ranges_in_packet_range(
+        let Some((mut start, mut end)) = Self::seekable_timeline_range_in_packet_range(
             &self.packets,
             self.timeline_anchor_stream_index,
             0,
             &range.stream_queues,
             timeline_boundary.is_eof,
-        );
-        if ranges.is_empty() {
+        ) else {
             return SeekableTimelineSummary::default();
-        }
+        };
 
         let mut audio_ranges = Vec::new();
         let mut is_bof = timeline_boundary.is_bof;
@@ -422,31 +411,23 @@ impl DemuxPacketCacheState {
             }
         }
         if !audio_ranges.is_empty() {
-            let last_range_index = ranges.len().saturating_sub(1);
-            ranges = ranges
-                .into_iter()
-                .enumerate()
-                .filter_map(|(range_index, (mut start, mut end))| {
-                    for (boundary, (audio_start, audio_end)) in &audio_ranges {
-                        start = if is_bof && boundary.is_bof && range_index == 0 {
-                            start.min(*audio_start)
-                        } else if !boundary.is_bof {
-                            start.max(*audio_start)
-                        } else {
-                            start
-                        };
-                        end = if is_eof && boundary.is_eof && range_index == last_range_index {
-                            end.max(*audio_end)
-                        } else if !boundary.is_eof {
-                            end.min(*audio_end)
-                        } else {
-                            end
-                        };
-                    }
-                    (end > start).then_some((start, end))
-                })
-                .collect();
-            if ranges.is_empty() {
+            for (boundary, (audio_start, audio_end)) in &audio_ranges {
+                start = if is_bof && boundary.is_bof {
+                    start.min(*audio_start)
+                } else if !boundary.is_bof {
+                    start.max(*audio_start)
+                } else {
+                    start
+                };
+                end = if is_eof && boundary.is_eof {
+                    end.max(*audio_end)
+                } else if !boundary.is_eof {
+                    end.min(*audio_end)
+                } else {
+                    end
+                };
+            }
+            if end <= start {
                 return SeekableTimelineSummary::default();
             }
         }
@@ -457,21 +438,15 @@ impl DemuxPacketCacheState {
             .copied()
             .max()
         {
-            ranges = ranges
-                .into_iter()
-                .filter_map(|(start, end)| {
-                    let start = start.max(pruned_until_nsecs);
-                    (end > start).then_some((start, end))
-                })
-                .collect();
+            start = start.max(pruned_until_nsecs);
         }
 
-        if ranges.is_empty() {
+        if end <= start {
             return SeekableTimelineSummary::default();
         }
 
         SeekableTimelineSummary {
-            ranges,
+            ranges: vec![(start, end)],
             is_bof,
             is_eof,
         }

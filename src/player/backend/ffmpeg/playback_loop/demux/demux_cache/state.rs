@@ -2,6 +2,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::{
     ArchivedStreamPruneCandidate, CachedDemuxPacket, DEMUX_CACHE_LOCK_TIMING_LOG_AFTER,
     DEMUX_PACKET_APPEND_MAINTENANCE_INTERVAL, DEMUX_PACKET_APPEND_TRIM_INTERVAL,
     DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT, DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL,
+    DEMUX_PACKET_READ_TRIM_INTERVAL, DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_BYTES,
     DEMUX_PACKET_READ_TRIM_STEP_LIMIT, DEMUX_STREAM_PACKET_QUEUE_LIMIT,
     DEMUX_SUBTITLE_PACKET_QUEUE_LIMIT, DemuxCacheState, DemuxCachedRange, DemuxCachedSeekHit,
     DemuxInputRateSample, DemuxPacketAppendOutcome, DemuxPacketAppendTiming,

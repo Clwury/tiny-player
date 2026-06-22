@@ -196,9 +196,26 @@ impl DemuxPacketCacheState {
         stream_queues: &BTreeMap<c_int, VecDeque<u64>>,
         close_open_segment: bool,
     ) -> Vec<(u64, u64)> {
-        let mut ranges = Vec::new();
-        let mut segment_start_nsecs = None;
-        let mut segment_end_nsecs = None;
+        Self::seekable_timeline_range_in_packet_range(
+            packets,
+            timeline_anchor_stream_index,
+            cached_seek_preroll_nsecs,
+            stream_queues,
+            close_open_segment,
+        )
+        .into_iter()
+        .collect()
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_timeline_range_in_packet_range(
+        packets: &HashMap<u64, CachedDemuxPacket>,
+        timeline_anchor_stream_index: c_int,
+        cached_seek_preroll_nsecs: u64,
+        stream_queues: &BTreeMap<c_int, VecDeque<u64>>,
+        close_open_segment: bool,
+    ) -> Option<(u64, u64)> {
+        let mut seek_start_nsecs = None;
+        let mut seek_end_nsecs = None;
         let mut current_block: Option<VideoSeekBlock> = None;
         let mut previous_recovery_start_nsecs = None;
 
@@ -217,41 +234,24 @@ impl DemuxPacketCacheState {
 
             if packet.recovery_point {
                 if let Some(block) = current_block.take() {
-                    let gap = start_nsecs > block.end_nsecs;
                     Self::close_video_seek_block(
                         block,
                         cached_seek_preroll_nsecs,
-                        &mut segment_start_nsecs,
-                        &mut segment_end_nsecs,
+                        &mut seek_start_nsecs,
+                        &mut seek_end_nsecs,
                     );
-                    if gap {
-                        Self::finish_video_seek_segment(
-                            &mut ranges,
-                            &mut segment_start_nsecs,
-                            &mut segment_end_nsecs,
-                        );
-                        previous_recovery_start_nsecs = None;
-                    }
                 }
 
                 current_block = Some(VideoSeekBlock {
-                    start_nsecs,
-                    end_nsecs,
+                    min_nsecs: start_nsecs,
+                    max_nsecs: end_nsecs,
+                    recovery_start_nsecs: start_nsecs,
                     previous_recovery_start_nsecs,
                 });
                 previous_recovery_start_nsecs = Some(start_nsecs);
             } else if let Some(block) = current_block.as_mut() {
-                if start_nsecs > block.end_nsecs {
-                    Self::finish_video_seek_segment(
-                        &mut ranges,
-                        &mut segment_start_nsecs,
-                        &mut segment_end_nsecs,
-                    );
-                    current_block = None;
-                    previous_recovery_start_nsecs = None;
-                } else {
-                    block.end_nsecs = block.end_nsecs.max(end_nsecs);
-                }
+                block.min_nsecs = block.min_nsecs.min(start_nsecs);
+                block.max_nsecs = block.max_nsecs.max(end_nsecs);
             }
         }
 
@@ -259,35 +259,28 @@ impl DemuxPacketCacheState {
             Self::close_video_seek_block(
                 block,
                 cached_seek_preroll_nsecs,
-                &mut segment_start_nsecs,
-                &mut segment_end_nsecs,
+                &mut seek_start_nsecs,
+                &mut seek_end_nsecs,
             );
         }
-        Self::finish_video_seek_segment(
-            &mut ranges,
-            &mut segment_start_nsecs,
-            &mut segment_end_nsecs,
-        );
-        ranges
+        seek_start_nsecs
+            .zip(seek_end_nsecs)
+            .filter(|(start_nsecs, end_nsecs)| end_nsecs > start_nsecs)
     }
 
     fn close_video_seek_block(
         block: VideoSeekBlock,
         cached_seek_preroll_nsecs: u64,
-        segment_start_nsecs: &mut Option<u64>,
-        segment_end_nsecs: &mut Option<u64>,
+        seek_start_out: &mut Option<u64>,
+        seek_end_out: &mut Option<u64>,
     ) {
-        let Some(seek_start_nsecs) =
+        let Some(block_seek_start_nsecs) =
             Self::video_seek_block_start_nsecs(block, cached_seek_preroll_nsecs)
         else {
             return;
         };
-        *segment_start_nsecs = Some(segment_start_nsecs.unwrap_or(seek_start_nsecs));
-        *segment_end_nsecs = Some(
-            segment_end_nsecs
-                .unwrap_or(block.end_nsecs)
-                .max(block.end_nsecs),
-        );
+        *seek_start_out = Some(seek_start_out.unwrap_or(block_seek_start_nsecs));
+        *seek_end_out = Some(seek_end_out.unwrap_or(block.max_nsecs).max(block.max_nsecs));
     }
 
     fn video_seek_block_start_nsecs(
@@ -295,31 +288,17 @@ impl DemuxPacketCacheState {
         cached_seek_preroll_nsecs: u64,
     ) -> Option<u64> {
         if cached_seek_preroll_nsecs == 0 {
-            return Some(block.start_nsecs);
+            return Some(block.min_nsecs);
         }
         block.previous_recovery_start_nsecs.map(|previous_start| {
             if previous_start == 0 {
-                block.start_nsecs
+                block.min_nsecs
             } else {
                 block
-                    .start_nsecs
+                    .recovery_start_nsecs
                     .max(previous_start.saturating_add(cached_seek_preroll_nsecs))
             }
         })
-    }
-
-    fn finish_video_seek_segment(
-        ranges: &mut Vec<(u64, u64)>,
-        segment_start_nsecs: &mut Option<u64>,
-        segment_end_nsecs: &mut Option<u64>,
-    ) {
-        if let Some((start_nsecs, end_nsecs)) = segment_start_nsecs.zip(*segment_end_nsecs)
-            && end_nsecs > start_nsecs
-        {
-            ranges.push((start_nsecs, end_nsecs));
-        }
-        *segment_start_nsecs = None;
-        *segment_end_nsecs = None;
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn stream_seek_range_in_packet_queue(
@@ -348,8 +327,9 @@ impl DemuxPacketCacheState {
 
 #[derive(Clone, Copy)]
 struct VideoSeekBlock {
-    start_nsecs: u64,
-    end_nsecs: u64,
+    min_nsecs: u64,
+    max_nsecs: u64,
+    recovery_start_nsecs: u64,
     previous_recovery_start_nsecs: Option<u64>,
 }
 

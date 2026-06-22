@@ -76,7 +76,7 @@ impl DemuxPacketCacheState {
             self.read_range_mut().is_bof = false;
         }
         self.update_forward_cache_after_consumed_packet(packet_id);
-        if self.trim_after_read_needed() {
+        if self.read_trim_due() {
             let trim_started_at = Instant::now();
             self.trim_to_limit_for_read();
             timing.trim += trim_started_at.elapsed();
@@ -228,7 +228,9 @@ impl DemuxPacketCacheState {
         self.rebuild_forward_cache();
     }
 
-    fn refresh_read_index_from_reader_head_positions(&mut self) {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn refresh_read_index_from_reader_head_positions(
+        &mut self,
+    ) {
         self.read_index = self
             .reader_head_positions
             .values()

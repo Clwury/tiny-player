@@ -238,4 +238,6 @@ pub(super) const VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS: u64 = 240;
 // Low-level seeks already snap backward to a keyframe; keep this small so seek-forward
 // shortcuts do not spend several seconds decoding and dropping HEVC preroll frames.
 pub(super) const HEVC_SEEK_PREROLL_NSECS: u64 = 1_000_000_000;
-pub(super) const HEVC_CACHED_SEEK_PREROLL_NSECS: u64 = 5_000_000_000;
+// Cached seeks follow mpv's HR cache behavior: start at the nearest cached
+// recovery point and let precise decode discard frames up to the target.
+pub(super) const HEVC_CACHED_SEEK_PREROLL_NSECS: u64 = 0;

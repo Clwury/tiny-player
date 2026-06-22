@@ -5,6 +5,7 @@ use std::{
 
 use super::{
     ArchivedStreamPruneCandidate, CachedDemuxPacket, DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT,
+    DEMUX_PACKET_READ_TRIM_INTERVAL, DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_BYTES,
     DEMUX_PACKET_READ_TRIM_STEP_LIMIT, DEMUX_STREAM_PACKET_QUEUE_LIMIT,
     DEMUX_SUBTITLE_PACKET_QUEUE_LIMIT, DemuxCachedRange, DemuxPacketCacheState, PacketId, RangeId,
     StreamCacheKind,
@@ -29,6 +30,35 @@ impl DemuxPacketCacheState {
         &self,
     ) -> bool {
         self.backward_bytes() > self.effective_backbuffer_limit()
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn read_trim_due(
+        &mut self,
+    ) -> bool {
+        if !self.trim_after_read_needed() {
+            self.read_trim_pressure_packets = 0;
+            return false;
+        }
+
+        self.read_trim_pressure_packets = self.read_trim_pressure_packets.saturating_add(1);
+        if self.read_trim_memory_overrun()
+            || self.read_trim_pressure_packets >= DEMUX_PACKET_READ_TRIM_INTERVAL
+        {
+            self.read_trim_pressure_packets = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn read_trim_memory_overrun(&self) -> bool {
+        if self.memory_limit_bytes == 0 || self.cached_bytes <= self.memory_limit_bytes {
+            return false;
+        }
+        let slack = (self.memory_limit_bytes / 16)
+            .max(64 * 1024)
+            .min(DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_BYTES);
+        self.cached_bytes > self.memory_limit_bytes.saturating_add(slack)
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn stream_packet_queue_limit(
@@ -93,7 +123,6 @@ impl DemuxPacketCacheState {
     fn trim_to_limit_with_step_limit(&mut self, max_steps: Option<usize>) -> bool {
         let mut pruned = false;
         let mut steps = 0usize;
-        let mut active_range_pruned = false;
         while self.backward_bytes() > self.effective_backbuffer_limit() {
             if max_steps.is_some_and(|limit| steps >= limit) {
                 break;
@@ -105,14 +134,10 @@ impl DemuxPacketCacheState {
             }
             if self.prune_active_stream_prefix() {
                 pruned = true;
-                active_range_pruned = true;
                 steps = steps.saturating_add(1);
                 continue;
             }
             break;
-        }
-        if active_range_pruned {
-            self.refresh_reader_tracking();
         }
         pruned
     }
@@ -385,15 +410,51 @@ impl DemuxPacketCacheState {
                 .or_insert(pruned_until_nsecs);
         }
         let removed_packet_ids = removed.iter().copied().collect::<HashSet<_>>();
+        if range.id == self.read_range_id {
+            self.adjust_reader_head_positions_after_prune(range, &removed_packet_ids);
+        }
         range
             .global_order
             .retain(|packet_id| !removed_packet_ids.contains(packet_id));
+        if range.id == self.read_range_id && range.global_order.is_empty() {
+            self.clear_reader_tracking();
+        }
         for packet_id in removed {
             self.consumed_packet_ids.remove(&packet_id);
             if let Some(packet) = self.packets.remove(&packet_id) {
                 self.cached_bytes = self.cached_bytes.saturating_sub(packet.byte_len);
             }
         }
+    }
+
+    fn adjust_reader_head_positions_after_prune(
+        &mut self,
+        range: &DemuxCachedRange,
+        removed_packet_ids: &HashSet<PacketId>,
+    ) {
+        if removed_packet_ids.is_empty() || self.reader_head_positions.is_empty() {
+            return;
+        }
+
+        let reader_head_positions = self.reader_head_positions.clone();
+        let mut removed_before_head = BTreeMap::new();
+        for (position, packet_id) in range.global_order.iter().copied().enumerate() {
+            if !removed_packet_ids.contains(&packet_id) {
+                continue;
+            }
+            for (stream_index, head_position) in &reader_head_positions {
+                if position < *head_position {
+                    *removed_before_head.entry(*stream_index).or_insert(0usize) += 1;
+                }
+            }
+        }
+
+        for (stream_index, removed_before) in removed_before_head {
+            if let Some(position) = self.reader_head_positions.get_mut(&stream_index) {
+                *position = position.saturating_sub(removed_before);
+            }
+        }
+        self.refresh_read_index_from_reader_head_positions();
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn backward_bytes(
