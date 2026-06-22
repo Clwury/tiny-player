@@ -177,7 +177,7 @@ fn output_gate_service_status(
         !demux_reader_ready_for_output(demux_watermark, has_audio_output);
     let byte_cache_low_water = context
         .http_cache
-        .map(HttpRingCache::playback_byte_cache_status)
+        .and_then(HttpRingCache::try_playback_byte_cache_status)
         .is_some_and(byte_cache_active_forward_low_water);
     let (forward_cache_insufficient, forward_cache_min_nsecs) = output_forward_cache_gate(
         demux_cache_insufficient,

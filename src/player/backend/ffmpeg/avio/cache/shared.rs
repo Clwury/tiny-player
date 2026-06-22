@@ -1,7 +1,7 @@
 #[cfg(test)]
 use std::sync::mpsc;
 use std::{
-    sync::{Arc, Condvar, Mutex, mpsc::Sender},
+    sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, mpsc::Sender},
     thread,
     time::Instant,
 };
@@ -18,9 +18,9 @@ use super::{
     HTTP_CACHE_PREFETCH_PAUSE_LOG_AFTER, HTTP_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
     HTTP_CACHE_SIDE_DOWNLOAD_WORKERS, HTTP_CACHE_STALL_LOG_AFTER, HTTP_CACHE_STALL_LOG_INTERVAL,
     HTTP_CACHE_WAIT_INTERVAL, HttpCacheConfig, HttpCacheRangeKind, HttpRingCache,
-    HttpRingCacheShared, HttpRingCacheState, http_ring_cache_download_loop,
-    http_ring_cache_side_download_loop, playback_cache_state_from_http_status,
-    reqwest_header_pairs,
+    HttpRingCacheShared, HttpRingCacheState, RetainedPlaybackSpliceSource,
+    http_ring_cache_download_loop, http_ring_cache_side_download_loop,
+    playback_cache_state_from_http_status, reqwest_header_pairs,
 };
 
 impl HttpRingCache {
@@ -440,13 +440,15 @@ impl HttpRingCache {
         self.shared.ready.notify_all();
     }
 
-    pub(in crate::player::backend::ffmpeg) fn playback_byte_cache_status(&self) -> ByteCacheState {
-        let guard = self
-            .shared
-            .state
-            .lock()
-            .expect("HTTP stream cache poisoned");
-        guard.stream_cache_status()
+    pub(in crate::player::backend::ffmpeg) fn try_playback_byte_cache_status(
+        &self,
+    ) -> Option<ByteCacheState> {
+        let guard = match self.shared.state.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return None,
+            Err(TryLockError::Poisoned(_)) => panic!("HTTP stream cache poisoned"),
+        };
+        Some(guard.stream_cache_status())
     }
 
     #[cfg(test)]
@@ -662,6 +664,19 @@ impl HttpRingCacheShared {
             .side_range_request_bytes(request.range_kind)
     }
 
+    fn finish_retained_playback_splice_without_state_lock<'a>(
+        &'a self,
+        guard: MutexGuard<'a, HttpRingCacheState>,
+        offset: u64,
+        source: RetainedPlaybackSpliceSource,
+    ) -> (MutexGuard<'a, HttpRingCacheState>, Option<u64>) {
+        drop(guard);
+        let data = source.copy_data();
+        let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+        let next_offset = guard.finish_retained_playback_splice(offset, source, data);
+        (guard, next_offset)
+    }
+
     pub(in crate::player::backend::ffmpeg::avio) fn wait_for_append_capacity(
         &self,
         offset: u64,
@@ -679,9 +694,14 @@ impl HttpRingCacheShared {
                 self.ready.notify_all();
                 return CacheAppendPermit::Restart(request.offset);
             }
-            if let Some(next_offset) = guard.splice_retained_playback_at_active_end(offset) {
-                self.ready.notify_all();
-                return CacheAppendPermit::Restart(next_offset);
+            if let Some(source) = guard.take_retained_playback_splice_source(offset) {
+                let (next_guard, next_offset) =
+                    self.finish_retained_playback_splice_without_state_lock(guard, offset, source);
+                guard = next_guard;
+                if let Some(next_offset) = next_offset {
+                    self.ready.notify_all();
+                    return CacheAppendPermit::Restart(next_offset);
+                }
             }
             let capacity = guard.append_capacity_from(offset);
             if capacity > 0 {
@@ -755,9 +775,14 @@ impl HttpRingCacheShared {
                 self.ready.notify_all();
                 return CacheAppendPermit::Restart(request.offset);
             }
-            if let Some(next_offset) = guard.splice_retained_playback_at_active_end(offset) {
-                self.ready.notify_all();
-                return CacheAppendPermit::Restart(next_offset);
+            if let Some(source) = guard.take_retained_playback_splice_source(offset) {
+                let (next_guard, next_offset) =
+                    self.finish_retained_playback_splice_without_state_lock(guard, offset, source);
+                guard = next_guard;
+                if let Some(next_offset) = next_offset {
+                    self.ready.notify_all();
+                    return CacheAppendPermit::Restart(next_offset);
+                }
             }
             let capacity = guard.append_capacity_from(offset);
             let status = (capacity == 0)

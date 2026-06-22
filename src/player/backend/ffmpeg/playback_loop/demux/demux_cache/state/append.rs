@@ -4,9 +4,9 @@ use std::{
 };
 
 use super::{
-    CachedDemuxPacket, DEMUX_PACKET_APPEND_MAINTENANCE_INTERVAL, DemuxInputRateSample,
-    DemuxPacketAppendOutcome, DemuxPacketAppendTiming, DemuxPacketCacheState, PacketId,
-    StreamCacheKind,
+    CachedDemuxPacket, DEMUX_PACKET_APPEND_MAINTENANCE_INTERVAL, DEMUX_PACKET_APPEND_TRIM_INTERVAL,
+    DemuxInputRateSample, DemuxPacketAppendOutcome, DemuxPacketAppendTiming, DemuxPacketCacheState,
+    PacketId, StreamCacheKind,
 };
 
 impl DemuxPacketCacheState {
@@ -65,7 +65,7 @@ impl DemuxPacketCacheState {
         let run_pause_maintenance = self.append_maintenance_due(
             cleared_seek || readahead_reached || memory_pressure || backbuffer_pressure,
         );
-        let trim_due = cleared_seek || memory_pressure || backbuffer_pressure;
+        let trim_due = cleared_seek || self.append_trim_due(memory_pressure || backbuffer_pressure);
         let pruned = if trim_due {
             let trim_started_at = Instant::now();
             let pruned = self.trim_to_limit_for_append();
@@ -102,6 +102,21 @@ impl DemuxPacketCacheState {
             self.append_maintenance_packets = 0;
         }
         due
+    }
+
+    fn append_trim_due(&mut self, pressure: bool) -> bool {
+        if !pressure {
+            self.append_trim_pressure_packets = 0;
+            return false;
+        }
+        self.append_trim_pressure_packets = self.append_trim_pressure_packets.saturating_add(1);
+        if self.append_trim_pressure_packets == 1
+            || self.append_trim_pressure_packets >= DEMUX_PACKET_APPEND_TRIM_INTERVAL
+        {
+            self.append_trim_pressure_packets = 1;
+            return true;
+        }
+        false
     }
 
     fn appended_packet_may_reach_readahead(

@@ -420,7 +420,7 @@ fn demux_packet_cache_append_trims_backbuffer_incrementally() {
     let outcome = state.append_packet(cached_anchor(8_000_000_000, 9_000_000_000));
 
     assert!(outcome.force_cache_state_report);
-    assert_eq!(state.backward_bytes(), 4 * 1024);
+    assert_eq!(state.backward_bytes(), 5 * 1024);
     assert!(state.backward_bytes() > state.effective_backbuffer_limit());
 
     assert!(state.trim_to_limit());
@@ -863,27 +863,23 @@ fn demux_packet_cache_buffered_changed_is_derived_from_cache_state_end() {
         guard.last_cache_state_emit_at =
             Some(Instant::now() - DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL);
     }
-    shared.append_packet(cached_packet(
-        0,
-        true,
-        Some(1_000_000_000),
-        Some(1_020_000_000),
-    ));
+    shared.append_packet(cached_anchor(1_000_000_000, 2_000_000_000));
     let events = event_rx.try_iter().collect::<Vec<_>>();
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(&event.kind, BackendEventKind::CacheStateChanged(_)))
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(&event.kind, BackendEventKind::BufferedChanged(_)))
-    );
+    let cache_end = events.iter().find_map(|event| match &event.kind {
+        BackendEventKind::CacheStateChanged(state) => state.demux.cache_end,
+        _ => None,
+    });
+    let buffered_until = events.iter().find_map(|event| match &event.kind {
+        BackendEventKind::BufferedChanged(buffered_until) => buffered_until.to_owned(),
+        _ => None,
+    });
+
+    assert_eq!(cache_end, Some(2.0));
+    assert_eq!(buffered_until, cache_end);
 }
 
 #[test]
-fn demux_packet_cache_skips_nonforced_append_cache_state_when_report_due() {
+fn demux_packet_cache_coalesces_nonforced_append_cache_state_until_report_due() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let mut config = cache_config_for_test();
     config.demuxer_readahead_secs = 10.0;
@@ -924,14 +920,14 @@ fn demux_packet_cache_skips_nonforced_append_cache_state_when_report_due() {
         Some(3_000_000_000),
     ));
     assert!(
-        !event_rx
+        event_rx
             .try_iter()
             .any(|event| matches!(event.kind, BackendEventKind::CacheStateChanged(_)))
     );
 }
 
 #[test]
-fn demux_packet_cache_forced_append_state_refreshes_seekable_ranges() {
+fn demux_packet_cache_append_report_due_refreshes_seekable_ranges() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let mut config = cache_config_for_test();
     config.cache_secs = 1.0;
@@ -964,6 +960,15 @@ fn demux_packet_cache_forced_append_state_refreshes_seekable_ranges() {
     );
 
     shared.append_packet(cached_packet(1, false, Some(0), Some(2_000_000_000)));
+    let _ = event_rx.try_iter().collect::<Vec<_>>();
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        guard.last_cache_state_emit_at =
+            Some(Instant::now() - DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL);
+    }
     shared.append_packet(cached_anchor(2_000_000_000, 3_000_000_000));
     let events = event_rx.try_iter().collect::<Vec<_>>();
     let cache_state = events.iter().rev().find_map(|event| match &event.kind {
@@ -2964,11 +2969,11 @@ fn demux_packet_cache_state_forward_growth_reclaims_donated_backbuffer() {
     close_seek_range(&mut state, 6_000_000_000);
 
     assert_eq!(state.forward_bytes(), 2 * 1024);
-    assert_eq!(state.backward_bytes(), 2 * 1024);
+    assert_eq!(state.backward_bytes(), 3 * 1024);
     assert_eq!(
         state.playback_cache_state(false).demux.seekable_ranges,
         vec![PlaybackCacheTimeRange {
-            start: 2.0,
+            start: 1.0,
             end: 6.0,
         }]
     );

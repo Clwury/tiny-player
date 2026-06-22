@@ -43,5 +43,5 @@ pub(in crate::player::backend::ffmpeg) use model::{
 };
 pub(in crate::player::backend::ffmpeg::avio::cache) use model::{
     HttpCacheConfig, HttpCachedByteRange, HttpDiskCache, HttpPlaybackBufferRange, InputRateSample,
-    RetainedCacheRange,
+    RetainedCacheRange, RetainedPlaybackSpliceSource,
 };

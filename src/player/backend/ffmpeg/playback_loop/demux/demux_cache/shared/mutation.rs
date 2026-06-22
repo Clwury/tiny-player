@@ -25,22 +25,25 @@ impl DemuxPacketCacheShared {
         let refresh_cache_pause_started_at = Instant::now();
         let cache_pause_refresh = self.refresh_cache_pause_after_append(&mut guard);
         append_outcome.timing.refresh_cache_pause += refresh_cache_pause_started_at.elapsed();
-        let emit_state_started_at = Instant::now();
-        let mut cache_state_emit = None;
+        let first_cache_state_report = guard.last_cache_state_emit_at.is_none();
+        let cache_state_report_due = guard.cache_state_report_due(Instant::now());
         if append_outcome.appended {
             append_outcome.force_cache_state_report |= cache_pause_refresh.force_cache_state_report;
-            append_outcome.force_cache_state_report |=
-                guard.seekable_ranges_changed_since_last_emit();
-            cache_state_emit = self.emit_cache_state_after_append(&mut guard, append_outcome);
-        } else if cache_pause_refresh.force_cache_state_report {
-            cache_state_emit = Some(self.prepare_cache_state_emit(&mut guard, Instant::now()));
         }
-        append_outcome.timing.emit_state += emit_state_started_at.elapsed();
+        let force_cache_state_report = append_outcome.force_cache_state_report
+            || (!append_outcome.appended && cache_pause_refresh.force_cache_state_report);
+        let should_emit_cache_state =
+            force_cache_state_report || first_cache_state_report || cache_state_report_due;
         let notify_started_at = Instant::now();
         self.ready.notify_all();
         append_outcome.timing.notify += notify_started_at.elapsed();
         append_outcome.timing.lock_hold = append_lock_hold_started_at.elapsed();
         drop(guard);
+        let emit_state_started_at = Instant::now();
+        let cache_state_emit = should_emit_cache_state
+            .then(|| self.prepare_cache_state_emit_after_append(force_cache_state_report))
+            .flatten();
+        append_outcome.timing.emit_state += emit_state_started_at.elapsed();
         if let Some(emit) = cache_state_emit {
             self.send_cache_state_emit(emit);
         }

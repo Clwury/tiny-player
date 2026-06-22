@@ -18,6 +18,7 @@ use super::{
 
 const DEMUX_PACKET_PUMP_MAX_PACKETS_PER_TICK: usize = 16;
 const DEMUX_PACKET_PUMP_MAX_SYNC_DURATION_PER_TICK: Duration = Duration::from_millis(4);
+const DEMUX_PACKET_CACHE_LOW_WATER_LOCK_WAIT: Duration = Duration::from_millis(20);
 
 #[derive(Default)]
 pub(super) struct DemuxPacketPump {
@@ -492,6 +493,21 @@ fn demux_pump_should_wait_for_cache_lock(
     .is_some()
 }
 
+#[cfg(test)]
+fn demux_pump_cache_lock_wait_for_test(
+    should_wait_for_demux: bool,
+    video_output_waiting_for_demux: bool,
+    decoder_input: &DecoderInputSnapshot,
+    video_admission_pressure: VideoPacketAdmissionPressure,
+) -> Option<Duration> {
+    demux_pump_cache_lock_wait(
+        should_wait_for_demux,
+        video_output_waiting_for_demux,
+        decoder_input,
+        video_admission_pressure,
+    )
+}
+
 fn demux_pump_cache_lock_wait(
     should_wait_for_demux: bool,
     video_output_waiting_for_demux: bool,
@@ -509,8 +525,11 @@ fn demux_pump_cache_lock_wait(
     }
     if should_wait_for_demux
         || video_output_waiting_for_demux
-        || output_queue_needs_decoder_input(video_admission_pressure.output_snapshot)
+        || output_queue_low_water_needs_decoder_input(video_admission_pressure.output_snapshot)
     {
+        return Some(DEMUX_PACKET_CACHE_LOW_WATER_LOCK_WAIT);
+    }
+    if output_queue_needs_decoder_input(video_admission_pressure.output_snapshot) {
         return Some(DEMUX_PACKET_CACHE_LOCK_WAIT);
     }
     if video_decoder_has_pending_work(decoder_input.video_decode_snapshot) {
@@ -521,6 +540,10 @@ fn demux_pump_cache_lock_wait(
 
 fn demux_cache_pause_signal(context: &DemuxPacketPumpContext<'_>) -> bool {
     context.video_output_waiting_for_demux
+        || context
+            .video_admission_pressure
+            .output_snapshot
+            .video_output_low_water
         || context.video_admission_pressure.output_snapshot.rebuffering
 }
 
@@ -535,11 +558,34 @@ fn demux_pump_audio_cache_lock_wait(
     }
     if should_wait_for_demux
         || video_output_waiting_for_demux
-        || output_queue_needs_decoder_input(video_admission_pressure.output_snapshot)
+        || output_queue_low_water_needs_decoder_input(video_admission_pressure.output_snapshot)
     {
+        return Some(DEMUX_PACKET_CACHE_LOW_WATER_LOCK_WAIT);
+    }
+    if output_queue_needs_decoder_input(video_admission_pressure.output_snapshot) {
         return Some(DEMUX_PACKET_CACHE_LOCK_WAIT);
     }
     None
+}
+
+fn output_queue_low_water_needs_decoder_input(output_snapshot: PlaybackOutputSnapshot) -> bool {
+    if output_snapshot.first_video_frame_pending {
+        return false;
+    }
+    output_snapshot.video_output_low_water || output_snapshot.queued_video_frames == 0
+}
+
+fn output_queue_needs_decoder_input(output_snapshot: PlaybackOutputSnapshot) -> bool {
+    if output_snapshot.first_video_frame_pending || output_snapshot.rebuffering {
+        return false;
+    }
+    if output_snapshot.queued_video_frames == 0 {
+        return true;
+    }
+    let queued_forward_nsecs = output_snapshot
+        .queued_video_forward_nsecs
+        .unwrap_or(output_snapshot.queued_video_duration_nsecs);
+    queued_forward_nsecs <= duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION)
 }
 
 fn decoder_input_accepts_video_packet(decoder_input: &DecoderInputSnapshot) -> bool {
@@ -569,19 +615,6 @@ fn video_decoder_has_pending_work(snapshot: VideoDecodeWorkerSnapshot) -> bool {
         )
 }
 
-fn output_queue_needs_decoder_input(output_snapshot: PlaybackOutputSnapshot) -> bool {
-    if output_snapshot.first_video_frame_pending || output_snapshot.rebuffering {
-        return false;
-    }
-    if output_snapshot.queued_video_frames == 0 {
-        return true;
-    }
-    let queued_forward_nsecs = output_snapshot
-        .queued_video_forward_nsecs
-        .unwrap_or(output_snapshot.queued_video_duration_nsecs);
-    queued_forward_nsecs <= duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION)
-}
-
 #[cfg(test)]
 mod tests {
     use crate::player::backend::{
@@ -596,9 +629,11 @@ mod tests {
     use super::super::output_rebuffer::PlaybackOutputState;
     use super::super::playback_pipeline_state::DecoderInputSnapshot;
     use super::{
-        AUDIO_VIDEO_QUEUE_LIMIT_DURATION, AvPacket, DemuxPacketPump, DemuxPacketRoute,
+        AUDIO_VIDEO_QUEUE_LIMIT_DURATION, AvPacket, DEMUX_PACKET_CACHE_LOCK_WAIT,
+        DEMUX_PACKET_CACHE_LOW_WATER_LOCK_WAIT, DemuxPacketPump, DemuxPacketRoute,
         PlaybackBlockReason, PlaybackOutputSnapshot, VideoPacketAdmissionPressure,
-        demux_pump_should_wait_for_cache_lock, duration_nsecs, eof_cached_backpressured_streams,
+        demux_pump_cache_lock_wait_for_test, demux_pump_should_wait_for_cache_lock, duration_nsecs,
+        eof_cached_backpressured_streams,
     };
     use std::os::raw::c_int;
     use std::time::Duration;
@@ -721,6 +756,10 @@ mod tests {
             &empty_decoder_input,
             draining_output
         ));
+        assert_eq!(
+            demux_pump_cache_lock_wait_for_test(false, false, &decoder_input, draining_output),
+            Some(DEMUX_PACKET_CACHE_LOCK_WAIT)
+        );
     }
 
     #[test]
@@ -742,6 +781,10 @@ mod tests {
             &decoder_input,
             draining_output
         ));
+        assert_eq!(
+            demux_pump_cache_lock_wait_for_test(false, false, &decoder_input, draining_output),
+            Some(DEMUX_PACKET_CACHE_LOW_WATER_LOCK_WAIT)
+        );
     }
 
     #[test]

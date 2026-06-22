@@ -82,6 +82,7 @@ impl DemuxPacketCacheState {
             cache_buffering_percent: None,
             cached_bytes: 0,
             append_maintenance_packets: 0,
+            append_trim_pressure_packets: 0,
             reader_nsecs,
             session_id,
             seek_request: None,

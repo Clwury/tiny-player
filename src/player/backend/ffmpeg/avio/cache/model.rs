@@ -106,6 +106,12 @@ pub(in crate::player::backend::ffmpeg::avio::cache) struct RetainedCacheRange {
     pub(in crate::player::backend::ffmpeg::avio::cache) last_used_generation: u64,
 }
 
+pub(in crate::player::backend::ffmpeg::avio::cache) struct RetainedPlaybackSpliceSource {
+    pub(in crate::player::backend::ffmpeg::avio::cache) range: RetainedCacheRange,
+    pub(in crate::player::backend::ffmpeg::avio::cache) copy_offset: usize,
+    pub(in crate::player::backend::ffmpeg::avio::cache) copy_len: usize,
+}
+
 #[derive(Clone, Copy)]
 pub(in crate::player::backend::ffmpeg::avio::cache) struct InputRateSample {
     pub(in crate::player::backend::ffmpeg::avio::cache) at: Instant,

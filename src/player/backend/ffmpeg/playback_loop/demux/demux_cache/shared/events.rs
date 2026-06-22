@@ -1,8 +1,8 @@
-use std::time::Instant;
+use std::{sync::TryLockError, time::Instant};
 
 use super::{
-    BackendEvent, BackendEventKind, CacheStateEmit, DemuxPacketAppendOutcome,
-    DemuxPacketCacheShared, DemuxPacketCacheState, PlaybackCacheState, PlaybackSessionId,
+    BackendEvent, BackendEventKind, CacheStateEmit, DemuxPacketCacheShared, DemuxPacketCacheState,
+    PlaybackCacheState, PlaybackSessionId,
 };
 
 impl DemuxPacketCacheShared {
@@ -48,26 +48,35 @@ impl DemuxPacketCacheShared {
         }
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn prepare_cache_state_emit_after_append(
+        &self,
+        force: bool,
+    ) -> Option<CacheStateEmit> {
+        let now = Instant::now();
+        let mut guard = if force {
+            self.state
+                .lock()
+                .expect("FFmpeg demux packet cache poisoned")
+        } else {
+            match self.state.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => return None,
+                Err(TryLockError::Poisoned(_)) => panic!("FFmpeg demux packet cache poisoned"),
+            }
+        };
+        let first_report = guard.last_cache_state_emit_at.is_none();
+        if !force && !first_report && !guard.cache_state_report_due(now) {
+            return None;
+        }
+        Some(self.prepare_cache_state_emit(&mut guard, now))
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn emit_cache_state(
         &self,
         guard: &mut DemuxPacketCacheState,
     ) {
         let emit = self.prepare_cache_state_emit(guard, Instant::now());
         self.send_cache_state_emit(emit);
-    }
-
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn emit_cache_state_after_append(
-        &self,
-        guard: &mut DemuxPacketCacheState,
-        outcome: DemuxPacketAppendOutcome,
-    ) -> Option<CacheStateEmit> {
-        let now = Instant::now();
-        let first_report = guard.last_cache_state_emit_at.is_none();
-        // Ordinary append ticks are hot; leave interval-based full state reports to read/seek paths.
-        if !outcome.force_cache_state_report && !first_report {
-            return None;
-        }
-        Some(self.prepare_cache_state_emit(guard, now))
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn emit_cache_state_after_read(

@@ -4,7 +4,17 @@ use super::{
     ByteRingBuffer, CacheRestartRequest, HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR,
     HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
     HttpCacheRangeKind, HttpRingCacheState, InputRateSample, RetainedCacheRange,
+    RetainedPlaybackSpliceSource,
 };
+
+impl RetainedPlaybackSpliceSource {
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn copy_data(&self) -> Vec<u8> {
+        let mut data = vec![0; self.copy_len];
+        let copied = self.range.buffer.copy_at(self.copy_offset, &mut data);
+        data.truncate(copied);
+        data
+    }
+}
 
 impl HttpRingCacheState {
     pub(in crate::player::backend::ffmpeg) fn append_at(
@@ -95,7 +105,8 @@ impl HttpRingCacheState {
             .min(continuation_offset)
     }
 
-    pub(in crate::player::backend::ffmpeg::avio::cache) fn splice_retained_playback_at_active_end(
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg) fn splice_retained_playback_at_active_end(
         &mut self,
         offset: u64,
     ) -> Option<u64> {
@@ -151,6 +162,100 @@ impl HttpRingCacheState {
             offset,
             next_offset,
             copied,
+            "spliced proactive HTTP playback range into active stream cache"
+        );
+        Some(next_offset)
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn take_retained_playback_splice_source(
+        &mut self,
+        offset: u64,
+    ) -> Option<RetainedPlaybackSpliceSource> {
+        if self.active_range_kind != HttpCacheRangeKind::Playback || offset != self.next_offset {
+            return None;
+        }
+        let range_index = self.retained_ranges.iter().position(|range| {
+            range.range_kind == HttpCacheRangeKind::Playback
+                && offset >= range.base_offset
+                && offset < range.next_offset
+        })?;
+        let range = self.retained_ranges.get(range_index)?;
+        let copy_offset = usize::try_from(offset.saturating_sub(range.base_offset)).ok()?;
+        let copy_len = usize::try_from(range.next_offset.saturating_sub(offset)).ok()?;
+        if copy_len == 0 {
+            return None;
+        }
+
+        let max_capacity = self.buffer.max_capacity();
+        if copy_len > max_capacity {
+            return None;
+        }
+        self.trim_to_capacity(max_capacity.saturating_sub(copy_len));
+        if self.buffer.len().saturating_add(copy_len) > max_capacity {
+            return None;
+        }
+
+        let range = self.retained_ranges.remove(range_index)?;
+        Some(RetainedPlaybackSpliceSource {
+            range,
+            copy_offset,
+            copy_len,
+        })
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn restore_retained_playback_splice_source(
+        &mut self,
+        source: RetainedPlaybackSpliceSource,
+    ) {
+        self.retained_ranges.push_back(source.range);
+        self.trim_retained_ranges_to_capacity(self.retained_capacity_with_side_reserve(false));
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn finish_retained_playback_splice(
+        &mut self,
+        offset: u64,
+        source: RetainedPlaybackSpliceSource,
+        data: Vec<u8>,
+    ) -> Option<u64> {
+        let source_offset = source
+            .range
+            .base_offset
+            .saturating_add(source.copy_offset as u64);
+        if data.len() != source.copy_len
+            || source_offset != offset
+            || self.active_range_kind != HttpCacheRangeKind::Playback
+            || offset != self.next_offset
+        {
+            self.restore_retained_playback_splice_source(source);
+            return None;
+        }
+        let max_capacity = self.buffer.max_capacity();
+        if data.len() > max_capacity {
+            self.restore_retained_playback_splice_source(source);
+            return None;
+        }
+        self.trim_to_capacity(max_capacity.saturating_sub(data.len()));
+        if self.buffer.len().saturating_add(data.len()) > max_capacity {
+            self.restore_retained_playback_splice_source(source);
+            return None;
+        }
+
+        let next_offset = offset.saturating_add(data.len() as u64);
+        self.buffer.append(&data);
+        self.next_offset = next_offset;
+        self.active_request_start_offset = offset;
+        if source.copy_offset > 0 {
+            let mut range = source.range;
+            range.last_used_generation = self.next_retained_access_generation();
+            self.retained_ranges.push_back(range);
+        }
+        self.maybe_queue_playback_continuation();
+        self.trim_to_capacity(self.active_memory_capacity());
+        self.trim_retained_ranges_to_capacity(self.retained_capacity_with_side_reserve(false));
+        tracing::debug!(
+            offset,
+            next_offset,
+            copied = data.len(),
             "spliced proactive HTTP playback range into active stream cache"
         );
         Some(next_offset)

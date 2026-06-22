@@ -6,8 +6,8 @@ use crate::player::{
 };
 
 use super::super::{
-    FfmpegControl, HTTP_CACHE_RANGE_REQUEST_BYTES, HttpCacheRangeKind, HttpRingCacheShared,
-    HttpRingCacheState,
+    CacheAppendPermit, FfmpegControl, HTTP_CACHE_RANGE_REQUEST_BYTES, HttpCacheRangeKind,
+    HttpRingCache, HttpRingCacheShared, HttpRingCacheState,
 };
 
 #[test]
@@ -75,6 +75,49 @@ fn http_cache_shared_reports_idle_after_last_side_download_finishes() {
         })
     ));
 }
+
+#[test]
+fn http_cache_playback_status_skips_busy_state_lock() {
+    let cache = HttpRingCache::from_state_for_test(
+        HttpRingCacheState::new(0).with_content_len_hint(Some(1_000)),
+    );
+    {
+        let mut guard = cache.shared.state.lock().expect("state locks");
+        assert!(guard.append_at(0, b"abcdef"));
+    }
+    assert!(cache.try_playback_byte_cache_status().is_some());
+
+    let _guard = cache.shared.state.lock().expect("state locks");
+
+    assert!(cache.try_playback_byte_cache_status().is_none());
+}
+
+#[test]
+fn http_cache_shared_splices_retained_playback_range_on_capacity_check() {
+    let cache = HttpRingCache::from_state_for_test(
+        HttpRingCacheState::new(0).with_content_len_hint(Some(64)),
+    );
+    {
+        let mut guard = cache.shared.state.lock().expect("state locks");
+        assert!(guard.append_at(0, b"abcdef"));
+        assert!(guard.append_retained_at(6, b"ghijkl", HttpCacheRangeKind::Playback));
+    }
+
+    match cache.shared.append_capacity_now(6) {
+        CacheAppendPermit::Restart(next_offset) => assert_eq!(next_offset, 12),
+        CacheAppendPermit::Ready(_) => panic!("expected retained playback splice restart"),
+        CacheAppendPermit::Full => panic!("expected retained playback splice restart"),
+        CacheAppendPermit::Stopped => panic!("expected retained playback splice restart"),
+    }
+
+    let mut output = [0; 12];
+    let mut guard = cache.shared.state.lock().expect("state locks");
+    assert_eq!(guard.copy_available(0, &mut output), Some(12));
+    assert_eq!(&output, b"abcdefghijkl");
+    assert_eq!(guard.next_offset, 12);
+    assert!(guard.retained_ranges.is_empty());
+}
+
 #[test]
 fn http_cache_shared_dispatches_multiple_side_downloads_to_active_set() {
     let (event_tx, _) = mpsc::channel();
