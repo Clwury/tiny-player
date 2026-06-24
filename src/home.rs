@@ -168,6 +168,7 @@ impl HomeContent {
         }
         if let Some(detail) = &mut self.series_detail {
             detail.episodes_carousel.sync_previous_offset();
+            detail.people_carousel.sync_previous_offset();
         }
     }
 }

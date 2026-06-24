@@ -19,6 +19,11 @@ pub(super) const DETAIL_EPISODE_CARD_WIDTH_PX: f32 = 220.0;
 pub(super) const DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX: f32 = 124.0;
 pub(super) const DETAIL_EPISODE_CARD_PADDING_PX: f32 = 4.0;
 pub(super) const DETAIL_EPISODE_CARD_GAP_PX: f32 = 16.0;
+pub(super) const DETAIL_PERSON_CARD_WIDTH_PX: f32 = 140.0;
+pub(super) const DETAIL_PERSON_CARD_IMAGE_WIDTH_PX: f32 = 140.0;
+pub(super) const DETAIL_PERSON_CARD_IMAGE_HEIGHT_PX: f32 = 210.0;
+pub(super) const DETAIL_PERSON_CARD_PADDING_PX: f32 = 4.0;
+pub(super) const DETAIL_PERSON_CARD_GAP_PX: f32 = 16.0;
 pub(super) const HOME_SIDEBAR_WIDTH_PX: f32 = 252.0;
 pub(super) const HOME_MAIN_SCROLLBAR_WIDTH_PX: f32 = 12.0;
 const HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX: f32 = 48.0;
@@ -34,6 +39,13 @@ const DETAIL_EPISODE_CARD_STEP_PX: f32 =
 const DETAIL_EPISODE_SCROLL_CARD_COUNT: f32 = 3.0;
 const DETAIL_EPISODE_SCROLL_STEP_PX: f32 =
     DETAIL_EPISODE_CARD_STEP_PX * DETAIL_EPISODE_SCROLL_CARD_COUNT;
+const DETAIL_PERSON_CARD_OUTER_WIDTH_PX: f32 =
+    DETAIL_PERSON_CARD_WIDTH_PX + DETAIL_PERSON_CARD_PADDING_PX * 2.0;
+const DETAIL_PERSON_CARD_STEP_PX: f32 =
+    DETAIL_PERSON_CARD_OUTER_WIDTH_PX + DETAIL_PERSON_CARD_GAP_PX;
+const DETAIL_PERSON_SCROLL_CARD_COUNT: f32 = 5.0;
+const DETAIL_PERSON_SCROLL_STEP_PX: f32 =
+    DETAIL_PERSON_CARD_STEP_PX * DETAIL_PERSON_SCROLL_CARD_COUNT;
 
 pub(super) fn home_main_content_width(window: &Window) -> f32 {
     let window_width = f32::from(window.bounds().size.width);
@@ -549,6 +561,91 @@ impl HomeContent {
             .episodes_carousel
             .set_scroll_offset(offset, max_offset)
         {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn set_series_people_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        let Some(detail) = &mut self.series_detail else {
+            return;
+        };
+        if detail.people_carousel.set_hovered(hovered) {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn set_series_people_controls_hovered(
+        &mut self,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(detail) = &mut self.series_detail else {
+            return;
+        };
+        if detail.people_carousel.set_controls_hovered(hovered) {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn scroll_series_people_left(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = self
+            .series_detail
+            .as_ref()
+            .map(|detail| {
+                detail.people_carousel.scroll_offset(f32::INFINITY) - DETAIL_PERSON_SCROLL_STEP_PX
+            })
+            .unwrap_or(0.0);
+        self.set_series_people_scroll_offset(offset, window, cx);
+    }
+
+    pub(super) fn scroll_series_people_right(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let offset = self
+            .series_detail
+            .as_ref()
+            .map(|detail| {
+                detail.people_carousel.scroll_offset(f32::INFINITY) + DETAIL_PERSON_SCROLL_STEP_PX
+            })
+            .unwrap_or(DETAIL_PERSON_SCROLL_STEP_PX);
+        self.set_series_people_scroll_offset(offset, window, cx);
+    }
+
+    fn set_series_people_scroll_offset(
+        &mut self,
+        offset: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport_width = home_main_content_width(window);
+        let max_offset = self
+            .series_detail
+            .as_ref()
+            .and_then(|detail| detail.item.as_ref())
+            .and_then(|item| item.people.as_ref())
+            .map(|people| {
+                max_carousel_scroll_offset_for(
+                    people.len(),
+                    viewport_width,
+                    DETAIL_PERSON_CARD_WIDTH_PX,
+                    DETAIL_PERSON_CARD_PADDING_PX,
+                    DETAIL_PERSON_CARD_GAP_PX,
+                )
+            })
+            .unwrap_or(0.0);
+        let Some(detail) = &mut self.series_detail else {
+            return;
+        };
+
+        if detail.people_carousel.set_scroll_offset(offset, max_offset) {
             cx.notify();
         }
     }

@@ -46,6 +46,7 @@ pub(crate) struct SeriesDetailState {
     pub(crate) open_select: Option<SeriesDetailSelectKind>,
     pub(crate) episodes_request_season_id: Option<String>,
     pub(crate) episodes_carousel: super::super::carousel::CarouselState,
+    pub(crate) people_carousel: super::super::carousel::CarouselState,
 }
 
 impl SeriesDetailState {
@@ -89,6 +90,7 @@ impl SeriesDetailState {
             open_select: None,
             episodes_request_season_id: None,
             episodes_carousel: Default::default(),
+            people_carousel: Default::default(),
         }
     }
 
@@ -418,6 +420,7 @@ mod tests {
             parent_backdrop_image_tags: None,
             series_primary_image_tag: None,
             media_sources: None,
+            people: None,
         }
     }
 
@@ -455,6 +458,7 @@ mod tests {
             open_select: None,
             episodes_request_season_id: None,
             episodes_carousel: Default::default(),
+            people_carousel: Default::default(),
         };
 
         detail.choose_episode_from_loaded_episodes();

@@ -143,6 +143,7 @@ pub struct MediaItem {
     pub parent_backdrop_image_tags: Option<Vec<String>>,
     pub series_primary_image_tag: Option<String>,
     pub media_sources: Option<Vec<MediaSource>>,
+    pub people: Option<Vec<MediaPerson>>,
 }
 
 impl MediaItem {
@@ -179,6 +180,39 @@ impl MediaItem {
             Some(episode) => format!("E{episode}: {}", self.name),
             None => self.name.clone(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaPerson {
+    pub name: Option<String>,
+    pub id: Option<String>,
+    pub role: Option<String>,
+    #[serde(rename = "Type")]
+    pub person_type: Option<String>,
+    pub primary_image_tag: Option<String>,
+}
+
+impl MediaPerson {
+    pub fn display_name(&self) -> String {
+        non_empty_string(self.name.as_deref()).unwrap_or_else(|| "未知人员".to_string())
+    }
+
+    pub fn role_label(&self) -> String {
+        non_empty_string(self.role.as_deref()).unwrap_or_else(|| "暂无角色".to_string())
+    }
+
+    pub fn type_label(&self) -> String {
+        non_empty_string(self.person_type.as_deref()).unwrap_or_else(|| "未知类型".to_string())
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        non_empty_str(self.id.as_deref())
+    }
+
+    pub fn primary_image_tag(&self) -> Option<&str> {
+        non_empty_str(self.primary_image_tag.as_deref())
     }
 }
 
@@ -298,6 +332,14 @@ fn first_non_empty_tag(tags: Option<&[String]>) -> Option<&str> {
     })
 }
 
+fn non_empty_str(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn non_empty_string(value: Option<&str>) -> Option<String> {
+    non_empty_str(value).map(ToString::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::server::{CachedServer, Protocol, ServerEndpoint};
@@ -386,16 +428,39 @@ mod tests {
                 "Primary": "primary-tag",
                 "Logo": "logo-tag"
             },
-            "BackdropImageTags": ["backdrop-tag"]
+            "BackdropImageTags": ["backdrop-tag"],
+            "People": [
+                {
+                    "Name": "张三",
+                    "Id": "56058",
+                    "Role": "陈平安",
+                    "Type": "Actor",
+                    "PrimaryImageTag": "person-primary"
+                },
+                {
+                    "Name": "李四",
+                    "Id": "56059",
+                    "Type": "Director",
+                    "PrimaryImageTag": null
+                }
+            ]
         }
         "#;
 
         let item: MediaItem = serde_json::from_str(json).unwrap();
+        let people = item.people.as_deref().unwrap();
 
         assert_eq!(item.item_type.as_deref(), Some("Series"));
         assert_eq!(item.logo_image_tag(), Some("logo-tag"));
         assert_eq!(item.backdrop_image_tag(), Some("backdrop-tag"));
         assert_eq!(item.genres.as_deref().unwrap(), ["动画", "动作"]);
+        assert_eq!(people[0].display_name(), "张三");
+        assert_eq!(people[0].role_label(), "陈平安");
+        assert_eq!(people[0].type_label(), "Actor");
+        assert_eq!(people[0].id(), Some("56058"));
+        assert_eq!(people[0].primary_image_tag(), Some("person-primary"));
+        assert_eq!(people[1].role_label(), "暂无角色");
+        assert_eq!(people[1].primary_image_tag(), None);
     }
 
     #[test]

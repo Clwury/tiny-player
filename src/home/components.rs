@@ -9,15 +9,16 @@ use gpui::{
 use image::{Frame, imageops::FilterType};
 
 use crate::{
-    emby::{MediaItem, ResumeItem, UserItem},
+    emby::{MediaItem, MediaPerson, ResumeItem, UserItem},
     theme,
 };
 
 use super::carousel::{
     DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX, DETAIL_EPISODE_CARD_PADDING_PX,
-    DETAIL_EPISODE_CARD_WIDTH_PX, HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX,
-    HOME_ITEM_CARD_WIDTH_PX, USER_VIEW_CARD_IMAGE_HEIGHT_PX, USER_VIEW_CARD_PADDING_PX,
-    USER_VIEW_CARD_WIDTH_PX,
+    DETAIL_EPISODE_CARD_WIDTH_PX, DETAIL_PERSON_CARD_IMAGE_HEIGHT_PX,
+    DETAIL_PERSON_CARD_IMAGE_WIDTH_PX, DETAIL_PERSON_CARD_PADDING_PX, DETAIL_PERSON_CARD_WIDTH_PX,
+    HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
+    USER_VIEW_CARD_IMAGE_HEIGHT_PX, USER_VIEW_CARD_PADDING_PX, USER_VIEW_CARD_WIDTH_PX,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -410,6 +411,86 @@ fn episode_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl I
                 path,
                 DETAIL_EPISODE_CARD_WIDTH_PX,
                 DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX,
+            ))
+        })
+        .when(!has_image, |this| {
+            this.flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("暂无图片")
+        })
+}
+
+pub(super) fn person_card<T>(
+    person: &MediaPerson,
+    image_path: Option<PathBuf>,
+    cx: &Context<T>,
+) -> gpui::Div {
+    let theme = theme::get(cx);
+
+    div()
+        .flex()
+        .flex_none()
+        .flex_col()
+        .items_center()
+        .gap_2()
+        .rounded_lg()
+        .p(px(DETAIL_PERSON_CARD_PADDING_PX))
+        .hover(move |style| style.bg(theme.secondary_hover))
+        .child(person_card_image(image_path, cx))
+        .child(
+            div()
+                .w(px(DETAIL_PERSON_CARD_WIDTH_PX))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .text_center()
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(person.display_name()),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(person.role_label()),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(person.type_label()),
+                ),
+        )
+}
+
+fn person_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl IntoElement {
+    let theme = theme::get(cx);
+    let has_image = image_path.is_some();
+
+    div()
+        .relative()
+        .w(px(DETAIL_PERSON_CARD_IMAGE_WIDTH_PX))
+        .h(px(DETAIL_PERSON_CARD_IMAGE_HEIGHT_PX))
+        .overflow_hidden()
+        .rounded_lg()
+        .bg(theme.input_background)
+        .when_some(image_path, |this, path| {
+            this.child(cover_img(
+                path,
+                DETAIL_PERSON_CARD_IMAGE_WIDTH_PX,
+                DETAIL_PERSON_CARD_IMAGE_HEIGHT_PX,
             ))
         })
         .when(!has_image, |this| {
