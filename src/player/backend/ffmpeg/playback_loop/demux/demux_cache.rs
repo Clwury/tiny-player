@@ -23,9 +23,9 @@ use super::{
     DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL, DEMUX_PACKET_CACHE_STALL_LOG_AFTER,
     DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL, DEMUX_PACKET_CACHE_WAIT_INTERVAL, FfmpegControl,
     FormatContext, StreamInfo, TimestampMapper, duration_nsecs, ffmpeg_error, nsecs_to_seconds,
-    optional_buffered_value_changed, packet_duration_nsecs, packet_is_video_seek_point,
-    playback_buffered_near_duration, preroll_seek_position_seconds, seconds_to_nsecs,
-    video_cached_seek_preroll_nsecs, video_seek_preroll_nsecs,
+    optional_buffered_value_changed, packet_duration_nsecs, packet_is_video_recovery_point,
+    packet_is_video_seek_point, playback_buffered_near_duration, preroll_seek_position_seconds,
+    seconds_to_nsecs, video_cached_seek_preroll_nsecs, video_seek_preroll_nsecs,
 };
 
 #[path = "demux_cache/cache.rs"]
@@ -49,11 +49,12 @@ mod telemetry;
 use model::CachedDemuxPacketPayload;
 use model::{
     ArchivedStreamPruneCandidate, CachePauseRefresh, CacheStateEmit, CachedDemuxPacket,
-    DemuxCacheLockWait, DemuxCachedRange, DemuxCachedSeekHit, DemuxInputRateSample,
-    DemuxPacketAppendOutcome, DemuxPacketAppendTiming, DemuxPacketCacheThreadInput,
-    DemuxPacketRangeView, DemuxPacketReadSource, DemuxPacketTimeline, DemuxSeekRequest,
-    DemuxSelectedStreams, PacketId, RangeId, SeekableTimelineSummary, StreamCacheRangeState,
-    StreamForwardState, StreamForwardWindow, ordered_duration_seconds,
+    DemuxCacheLockWait, DemuxCacheReportSnapshot, DemuxCachedRange, DemuxCachedSeekHit,
+    DemuxInputRateSample, DemuxPacketAppendOutcome, DemuxPacketAppendTiming,
+    DemuxPacketCacheThreadInput, DemuxPacketRangeView, DemuxPacketReadSource, DemuxPacketTimeline,
+    DemuxSeekRequest, DemuxSelectedStreams, DemuxStreamReaderRealignResult, PacketId, RangeId,
+    SeekableTimelineSummary, StreamCacheRangeState, StreamForwardState, StreamForwardWindow,
+    ordered_duration_seconds,
 };
 pub(super) use model::{DemuxPacketCacheInput, DemuxReadResult, DemuxSeekResult};
 use policy::*;
@@ -94,6 +95,7 @@ struct DemuxPacketCacheState {
     consumed_packet_ids: HashSet<PacketId>,
     reader_heads: BTreeMap<c_int, PacketId>,
     reader_head_positions: BTreeMap<c_int, usize>,
+    reader_head_generations: BTreeMap<c_int, u64>,
     forward_streams: BTreeMap<c_int, StreamForwardState>,
     reader_forward_bytes: usize,
     read_range_id: RangeId,
@@ -104,6 +106,7 @@ struct DemuxPacketCacheState {
     stream_kinds: BTreeMap<c_int, StreamCacheKind>,
     selected_streams: DemuxSelectedStreams,
     cached_seek_preroll_nsecs: u64,
+    cached_seek_requires_safe_point: bool,
     memory_limit_bytes: usize,
     backbuffer_limit_bytes: usize,
     donate_backbuffer: bool,
@@ -123,6 +126,8 @@ struct DemuxPacketCacheState {
     seek_request: Option<DemuxSeekRequest>,
     demux_position_detached: bool,
     resume_append_skip_until_nsecs: Option<u64>,
+    low_level_append_guard_target_nsecs: Option<u64>,
+    low_level_append_blocked_packet_generations: HashMap<PacketId, u64>,
     seeking: bool,
     demux_ts_nsecs: Option<u64>,
     cached_seeks: u64,
@@ -130,7 +135,8 @@ struct DemuxPacketCacheState {
     input_rate_samples: VecDeque<DemuxInputRateSample>,
     last_reported_buffered_until: Option<Option<f64>>,
     last_cache_state_emit_at: Option<Instant>,
-    last_emitted_cache_state: Option<PlaybackCacheState>,
+    last_emitted_seekable_ranges: Option<Vec<PlaybackCacheTimeRange>>,
+    cache_state_emit_dirty: bool,
     generation: u64,
     error: Option<String>,
     shutdown: bool,

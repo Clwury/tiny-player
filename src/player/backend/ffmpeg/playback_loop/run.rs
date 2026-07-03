@@ -15,18 +15,25 @@ use crate::player::{
     render_host::VideoOutputQueue,
 };
 
+use super::playback_pipeline_state::CachedSeekRecoveryFallbackAction;
+use super::playback_reset_service::{PlaybackSeekResetContext, service_playback_seek_reset};
+use super::video_decode_pipeline::{
+    HevcDecodeChainFallbackLoopAction, HevcDecodeChainFallbackReason,
+};
 use super::{
     AudioDecodePipeline, AudioOutput, BufferedReporter, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
-    DemuxPacketCache, DemuxPacketCacheInput, DoviPipeline,
+    DemuxPacketCache, DemuxPacketCacheInput, DemuxReaderWatermark, DoviPipeline,
     END_OF_PLAYBACK_READ_ERROR_TOLERANCE_SECONDS, FfmpegCommand, FfmpegControl,
     FfmpegPlaybackInput, OpenedPlaybackInput, PlaybackCommandContext, PlaybackCommandServiceStatus,
     PlaybackCoordinatorGateContext, PlaybackEofDrainContext, PlaybackEofDrainStatus,
     PlaybackGeneration, PlaybackOutputScheduler, PlaybackPipelineServices, PlaybackPipelineState,
     PlaybackScheduler, PlaybackSession, PlaybackTickContext, PlaybackTickStatus, PositionReporter,
-    StreamInfo, SubtitlePipeline, TimestampMapper, VideoDecodePipeline, VideoDecodeRecovery,
-    VideoDecodeWorkerInfo, VideoFramePrepareWorker, open_playback_input_with_fallback,
-    preroll_seek_position_seconds, service_playback_commands, service_playback_eof_drain,
-    service_playback_tick, should_cache_http_url, video_seek_preroll_nsecs,
+    StreamInfo, SubtitlePipeline, TimestampMapper, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    VideoDecodePipeline, VideoDecodeRecovery, VideoDecodeWorkerInfo, VideoFramePrepareWorker,
+    duration_nsecs, nsecs_to_seconds, open_playback_input_with_fallback,
+    preroll_seek_position_seconds, service_hevc_startup_stall_watchdog_if_due,
+    service_playback_commands, service_playback_eof_drain, service_playback_tick,
+    should_cache_http_url, video_seek_preroll_nsecs,
 };
 
 fn frame_rate_from_duration(frame_duration_nsecs: Option<u64>) -> Option<f64> {
@@ -220,6 +227,9 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
         current_start_position_nsecs,
         video_packet_count: 0,
         video_decode_skip_nonref_active: false,
+        cached_seek_recovery_watchdog: None,
+        cached_seek_recovery_attempt: None,
+        rebuffer_audio_realign_attempt: None,
     };
     pipeline.buffered_reporter.reset_to(
         source.start_position_seconds.max(0.0),
@@ -255,6 +265,32 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
                 PlaybackCommandServiceStatus::Stopped => break,
             }
 
+            if service_cached_seek_recovery_fallback_if_needed(
+                &mut session,
+                &control,
+                &demux_cache,
+                &mut pipeline,
+                &video_output_queue,
+                &event_tx,
+                emit_playback_buffered_events,
+            )? {
+                continue;
+            }
+
+            if service_hevc_startup_stall_watchdog_due_if_needed(
+                &mut session,
+                &control,
+                &demux_cache,
+                &mut pipeline,
+                &video_output_queue,
+                &event_tx,
+                emit_playback_buffered_events,
+                "coordinator_gate_enter",
+            )? {
+                continue;
+            }
+
+            let playback_loop_deadline = pipeline.playback_loop_deadline();
             if pipeline_services
                 .coordinator_gate
                 .service(PlaybackCoordinatorGateContext {
@@ -262,13 +298,37 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
                     output_scheduler: &pipeline.output_scheduler,
                     scheduler: &mut pipeline.scheduler,
                     playback_wait: &pipeline_services.wait,
+                    playback_loop_deadline,
                 })
                 .should_continue()
             {
+                if service_hevc_startup_stall_watchdog_due_if_needed(
+                    &mut session,
+                    &control,
+                    &demux_cache,
+                    &mut pipeline,
+                    &video_output_queue,
+                    &event_tx,
+                    emit_playback_buffered_events,
+                    "coordinator_gate_continue",
+                )? {
+                    continue;
+                }
+                if service_cached_seek_recovery_fallback_if_needed(
+                    &mut session,
+                    &control,
+                    &demux_cache,
+                    &mut pipeline,
+                    &video_output_queue,
+                    &event_tx,
+                    emit_playback_buffered_events,
+                )? {
+                    continue;
+                }
                 continue;
             }
 
-            match service_playback_tick(PlaybackTickContext {
+            let tick_status = service_playback_tick(PlaybackTickContext {
                 session_id: session.id(),
                 demux_cache: &demux_cache,
                 http_cache: http_cache.as_ref(),
@@ -278,8 +338,58 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
                 event_tx: &event_tx,
                 vo_queue: &video_output_queue,
                 frame_presented: &frame_presented,
-            })? {
+            })?;
+            if matches!(tick_status, PlaybackTickStatus::ForceRebufferAudioRealign) {
+                if service_rebuffer_audio_realign_seek_if_needed(
+                    &mut session,
+                    &control,
+                    &demux_cache,
+                    &mut pipeline,
+                    &video_output_queue,
+                    &event_tx,
+                    emit_playback_buffered_events,
+                )? {
+                    continue;
+                }
+                tracing::debug!(
+                    session_id = ?session.id(),
+                    "playback tick requested rebuffer audio realign without pending request"
+                );
+                continue;
+            }
+            if matches!(tick_status, PlaybackTickStatus::ForceLowLevelSeek) {
+                if service_cached_seek_recovery_fallback_if_needed(
+                    &mut session,
+                    &control,
+                    &demux_cache,
+                    &mut pipeline,
+                    &video_output_queue,
+                    &event_tx,
+                    emit_playback_buffered_events,
+                )? {
+                    continue;
+                }
+                tracing::debug!(
+                    session_id = ?session.id(),
+                    "playback tick requested forced low-level seek without pending fallback"
+                );
+                continue;
+            }
+            if service_cached_seek_recovery_fallback_if_needed(
+                &mut session,
+                &control,
+                &demux_cache,
+                &mut pipeline,
+                &video_output_queue,
+                &event_tx,
+                emit_playback_buffered_events,
+            )? {
+                continue;
+            }
+            match tick_status {
                 PlaybackTickStatus::Continue => continue,
+                PlaybackTickStatus::ForceLowLevelSeek => continue,
+                PlaybackTickStatus::ForceRebufferAudioRealign => continue,
                 PlaybackTickStatus::Eof | PlaybackTickStatus::Stopped => break,
             }
         }
@@ -302,6 +412,684 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
             PlaybackEofDrainStatus::SeekPending => continue 'playback_coordinator,
         }
     }
+}
+
+fn rebuffer_audio_realign_requires_low_level_seek(
+    attempts: u8,
+    queued_video_covers_target: bool,
+) -> bool {
+    attempts > 1 && !queued_video_covers_target
+}
+
+fn rebuffer_audio_realign_can_preserve_video_queue(
+    attempts: u8,
+    queued_video_covers_target: bool,
+    audio_stream_available: bool,
+) -> bool {
+    audio_stream_available
+        && (!rebuffer_audio_realign_requires_low_level_seek(attempts, queued_video_covers_target)
+            || queued_video_covers_target)
+}
+
+fn service_rebuffer_audio_realign_seek_if_needed(
+    session: &mut PlaybackSession,
+    control: &FfmpegControl,
+    demux_cache: &DemuxPacketCache,
+    pipeline: &mut PlaybackPipelineState,
+    vo_queue: &VideoOutputQueue,
+    event_tx: &Sender<BackendEvent>,
+    emit_playback_buffered_events: bool,
+) -> std::result::Result<bool, String> {
+    let Some(request) = pipeline
+        .output_scheduler
+        .take_rebuffer_audio_realign_request()
+    else {
+        return Ok(false);
+    };
+    let attempts = pipeline.observe_rebuffer_audio_realign_attempt(request.target_timeline_nsecs);
+    let position_seconds = nsecs_to_seconds(request.target_timeline_nsecs);
+    let audio_stream_index = pipeline.audio_stream.map(|stream| stream.index);
+    let output_snapshot = pipeline.output_scheduler.snapshot();
+    let audio_output_snapshot = pipeline
+        .audio_output
+        .as_ref()
+        .and_then(|output| output.snapshot().ok());
+    let queued_video_covers_target =
+        output_snapshot
+            .queued_video_range_nsecs
+            .is_some_and(|(start, end)| {
+                start <= request.target_timeline_nsecs && request.target_timeline_nsecs < end
+            });
+    let force_low_level_seek =
+        rebuffer_audio_realign_requires_low_level_seek(attempts, queued_video_covers_target);
+    let can_preserve_video_queue = rebuffer_audio_realign_can_preserve_video_queue(
+        attempts,
+        queued_video_covers_target,
+        audio_stream_index.is_some(),
+    );
+    let first_video_after_anchor_gap_ms = (i128::from(request.first_video_timeline_nsecs)
+        - i128::from(request.anchor_timeline_nsecs))
+        as f64
+        / 1_000_000.0;
+    let far_ahead_audio_delta_ms = (i128::from(request.far_ahead_audio_timeline_nsecs)
+        - i128::from(request.target_timeline_nsecs)) as f64
+        / 1_000_000.0;
+    tracing::debug!(
+        session_id = ?session.id(),
+        position_seconds,
+        target_timeline_nsecs = request.target_timeline_nsecs,
+        reason = request.reason,
+        anchor_timeline_nsecs = request.anchor_timeline_nsecs,
+        first_video_timeline_nsecs = request.first_video_timeline_nsecs,
+        first_video_after_anchor_gap_ms,
+        far_ahead_audio_timeline_nsecs = request.far_ahead_audio_timeline_nsecs,
+        far_ahead_audio_delta_ms,
+        far_ahead_drop_count = request.far_ahead_drop_count,
+        attempts,
+        force_low_level_seek,
+        can_preserve_video_queue,
+        audio_stream_index = ?audio_stream_index,
+        queued_video_frames = output_snapshot.queued_video_frames,
+        queued_video_ms = output_snapshot.queued_video_duration_nsecs as f64 / 1_000_000.0,
+        queued_video_range = ?output_snapshot.queued_video_range_nsecs,
+        queued_video_covers_target,
+        queued_video_forward_ms = ?output_snapshot
+            .queued_video_forward_nsecs
+            .map(|duration| duration as f64 / 1_000_000.0),
+        queued_video_contiguous_forward_ms = ?output_snapshot
+            .queued_video_contiguous_forward_nsecs
+            .map(|duration| duration as f64 / 1_000_000.0),
+        queued_video_largest_gap_ms = ?output_snapshot
+            .queued_video_largest_gap_nsecs
+            .map(|gap| gap as f64 / 1_000_000.0),
+        output_state = ?output_snapshot.state,
+        output_first_video_frame_pending = output_snapshot.first_video_frame_pending,
+        output_rebuffering = output_snapshot.rebuffering,
+        output_rebuffer_anchor = ?output_snapshot.video_output_rebuffer_anchor,
+        audio_output_pending_ms = ?audio_output_snapshot
+            .map(|snapshot| snapshot.total_pending_nsecs as f64 / 1_000_000.0),
+        audio_output_queue_ms = ?audio_output_snapshot
+            .map(|snapshot| snapshot.queue_pending_nsecs as f64 / 1_000_000.0),
+        pending_start_audio_ms = output_snapshot.pending_start_audio_nsecs as f64 / 1_000_000.0,
+        "evaluating FFmpeg rebuffer audio realign recovery path"
+    );
+
+    if can_preserve_video_queue && let Some(audio_stream_index) = audio_stream_index {
+        let reader_realign = demux_cache.realign_stream_reader_to_timeline(
+            audio_stream_index,
+            request.target_timeline_nsecs,
+            request.reason,
+        );
+        if reader_realign.is_none() && !queued_video_covers_target {
+            tracing::debug!(
+                session_id = ?session.id(),
+                target_timeline_nsecs = request.target_timeline_nsecs,
+                attempts,
+                queued_video_covers_target,
+                audio_stream_index,
+                "FFmpeg rebuffer audio realign reader reposition unavailable"
+            );
+        } else {
+            let generation = pipeline.advance_playback_generation();
+            if let Some(audio_decode_pipeline) = pipeline.audio_decode_pipeline.as_mut() {
+                audio_decode_pipeline.flush_buffers(generation)?;
+            }
+            pipeline.audio_clock = TimestampMapper::new(
+                pipeline.audio_stream.and_then(|stream| stream.start_nsecs),
+                request.target_timeline_nsecs,
+                None,
+            );
+            if let Some(audio_output) = pipeline.audio_output.as_ref() {
+                audio_output.reset_clock(request.target_timeline_nsecs);
+            }
+            pipeline
+                .output_scheduler
+                .reset_audio_after_rebuffer_realign(
+                    request.target_timeline_nsecs,
+                    session.id(),
+                    request.reason,
+                );
+            pipeline.clear_rebuffer_audio_realign_attempt();
+            control.set_cache_paused(false);
+            tracing::debug!(
+                session_id = ?session.id(),
+                target_timeline_nsecs = request.target_timeline_nsecs,
+                reason = request.reason,
+                anchor_timeline_nsecs = request.anchor_timeline_nsecs,
+                first_video_timeline_nsecs = request.first_video_timeline_nsecs,
+                first_video_after_anchor_gap_ms,
+                far_ahead_audio_timeline_nsecs = request.far_ahead_audio_timeline_nsecs,
+                far_ahead_audio_delta_ms,
+                far_ahead_drop_count = request.far_ahead_drop_count,
+                attempts,
+                queued_video_frames = output_snapshot.queued_video_frames,
+                queued_video_ms = output_snapshot.queued_video_duration_nsecs as f64 / 1_000_000.0,
+                queued_video_range = ?output_snapshot.queued_video_range_nsecs,
+                queued_video_covers_target,
+                audio_stream_index,
+                reader_realign = ?reader_realign,
+                playback_generation = generation,
+                "handled FFmpeg rebuffer audio realign while preserving video queue"
+            );
+            return Ok(true);
+        }
+    }
+
+    control.set_cache_paused(false);
+    let seek_generation = control.request_seek();
+    session.reset_to(session.id(), position_seconds);
+    pipeline.current_start_position_nsecs = session.start_position_nsecs();
+    tracing::debug!(
+        session_id = ?session.id(),
+        position_seconds,
+        target_timeline_nsecs = request.target_timeline_nsecs,
+        reason = request.reason,
+        anchor_timeline_nsecs = request.anchor_timeline_nsecs,
+        first_video_timeline_nsecs = request.first_video_timeline_nsecs,
+        first_video_after_anchor_gap_ms,
+        far_ahead_audio_timeline_nsecs = request.far_ahead_audio_timeline_nsecs,
+        far_ahead_audio_delta_ms,
+        far_ahead_drop_count = request.far_ahead_drop_count,
+        attempts,
+        force_low_level_seek,
+        can_preserve_video_queue,
+        seek_generation,
+        audio_stream_index = ?audio_stream_index,
+        queued_video_frames = output_snapshot.queued_video_frames,
+        queued_video_ms = output_snapshot.queued_video_duration_nsecs as f64 / 1_000_000.0,
+        queued_video_range = ?output_snapshot.queued_video_range_nsecs,
+        queued_video_covers_target,
+        audio_output_pending_ms = ?audio_output_snapshot
+            .map(|snapshot| snapshot.total_pending_nsecs as f64 / 1_000_000.0),
+        "handling FFmpeg rebuffer audio realign with playback seek reset"
+    );
+    let demux_seek_result = service_playback_seek_reset(PlaybackSeekResetContext {
+        position_seconds,
+        seek_mode: crate::player::backend::PlaybackSeekMode::Precise,
+        seek_generation,
+        force_low_level_seek,
+        low_level_seek_reason: force_low_level_seek.then_some(request.reason),
+        session_id: session.id(),
+        vo_queue,
+        demux_cache,
+        pipeline,
+        emit_playback_buffered_events,
+        control,
+        event_tx,
+    })?;
+    tracing::debug!(
+        session_id = ?session.id(),
+        position_seconds,
+        target_timeline_nsecs = request.target_timeline_nsecs,
+        reason = request.reason,
+        attempts,
+        force_low_level_seek,
+        seek_generation,
+        ?demux_seek_result,
+        "handled FFmpeg rebuffer audio realign with playback seek reset"
+    );
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn service_hevc_startup_stall_watchdog_due_if_needed(
+    session: &mut PlaybackSession,
+    control: &FfmpegControl,
+    demux_cache: &DemuxPacketCache,
+    pipeline: &mut PlaybackPipelineState,
+    vo_queue: &VideoOutputQueue,
+    event_tx: &Sender<BackendEvent>,
+    emit_playback_buffered_events: bool,
+    checkpoint: &'static str,
+) -> std::result::Result<bool, String> {
+    if control.is_user_paused() {
+        return Ok(false);
+    }
+    let Some(tick_status) = service_hevc_startup_stall_watchdog_if_due(
+        session.id(),
+        pipeline,
+        demux_cache.cached_reader_watermark(),
+        checkpoint,
+    )?
+    else {
+        return Ok(false);
+    };
+    if matches!(tick_status, PlaybackTickStatus::ForceLowLevelSeek) {
+        if service_cached_seek_recovery_fallback_if_needed(
+            session,
+            control,
+            demux_cache,
+            pipeline,
+            vo_queue,
+            event_tx,
+            emit_playback_buffered_events,
+        )? {
+            return Ok(true);
+        }
+        tracing::debug!(
+            session_id = ?session.id(),
+            checkpoint,
+            "HEVC startup watchdog requested forced low-level seek without pending fallback"
+        );
+    }
+    Ok(true)
+}
+
+fn service_cached_seek_recovery_fallback_if_needed(
+    session: &mut PlaybackSession,
+    control: &FfmpegControl,
+    demux_cache: &DemuxPacketCache,
+    pipeline: &mut PlaybackPipelineState,
+    vo_queue: &VideoOutputQueue,
+    event_tx: &Sender<BackendEvent>,
+    emit_playback_buffered_events: bool,
+) -> std::result::Result<bool, String> {
+    if control.is_user_paused() {
+        return Ok(false);
+    }
+    if let Some(fallback) = pipeline.take_cached_seek_recovery_fallback(session.id()) {
+        let position_seconds = nsecs_to_seconds(fallback.target_nsecs);
+        control.set_cache_paused(false);
+        match fallback.action {
+            CachedSeekRecoveryFallbackAction::SoftRecover => {
+                let requeued_probe_packets =
+                    pipeline.soft_recover_cached_seek_hevc_decode_chain(session.id())?;
+                pipeline.begin_cached_seek_recovery_watchdog(fallback.target_nsecs, session.id());
+                tracing::debug!(
+                    session_id = ?session.id(),
+                    position_seconds,
+                    target_nsecs = fallback.target_nsecs,
+                    reason = fallback.reason.as_str(),
+                    requeued_probe_packets,
+                    "handled HEVC cached seek recovery fallback with soft decode recovery"
+                );
+                return Ok(true);
+            }
+            CachedSeekRecoveryFallbackAction::ReopenSoftware => {
+                let reopened_software = pipeline
+                    .video_decode_pipeline
+                    .reopen_software_decoder(pipeline.video_stream)?;
+                if reopened_software {
+                    let playback_video_info = playback_video_info_from_worker(
+                        pipeline.video_stream,
+                        pipeline.video_decode_pipeline.info(),
+                    );
+                    let _ = event_tx.send(BackendEvent::new(
+                        session.id(),
+                        BackendEventKind::PlaybackInfoChanged(playback_video_info),
+                    ));
+                    let requeued_probe_packets = pipeline
+                        .video_decode_pipeline
+                        .requeue_hevc_startup_probe_packets(
+                            &mut pipeline.playback_generation,
+                            session.id(),
+                        )?;
+                    if requeued_probe_packets > 0 {
+                        session.reset_to(session.id(), position_seconds);
+                        pipeline.current_start_position_nsecs = session.start_position_nsecs();
+                        pipeline.output_scheduler.reset(control);
+                        pipeline.video_decode_recovery.reset();
+                        pipeline.dovi_pipeline.reset();
+                        pipeline.begin_cached_seek_recovery_watchdog(
+                            fallback.target_nsecs,
+                            session.id(),
+                        );
+                        tracing::debug!(
+                            session_id = ?session.id(),
+                            position_seconds,
+                            target_nsecs = fallback.target_nsecs,
+                            reason = fallback.reason.as_str(),
+                            requeued_probe_packets,
+                            "handled HEVC cached seek recovery fallback by requeuing probe packets on software decoder"
+                        );
+                        return Ok(true);
+                    }
+                    session.reset_to(session.id(), position_seconds);
+                    pipeline.current_start_position_nsecs = session.start_position_nsecs();
+                    pipeline.output_scheduler.reset(control);
+                    pipeline.video_decode_recovery.reset_for_timeline_start(
+                        pipeline.video_stream.codec_id,
+                        pipeline.current_start_position_nsecs,
+                    );
+                    pipeline.dovi_pipeline.reset();
+                    pipeline
+                        .begin_cached_seek_recovery_watchdog(fallback.target_nsecs, session.id());
+                    tracing::warn!(
+                        session_id = ?session.id(),
+                        position_seconds,
+                        target_nsecs = fallback.target_nsecs,
+                        reason = fallback.reason.as_str(),
+                        requeued_probe_packets,
+                        "HEVC cached seek software reopen had no probe packets; continuing without low-level seek"
+                    );
+                    return Ok(true);
+                }
+            }
+            CachedSeekRecoveryFallbackAction::LowLevelSeek => {}
+        }
+        let demux_watermark = demux_cache.cached_reader_watermark();
+        let low_level_seek_required = matches!(
+            fallback.action,
+            CachedSeekRecoveryFallbackAction::LowLevelSeek
+        );
+        if !low_level_seek_required
+            && !demux_reader_unusable_for_hevc_low_level_seek(demux_watermark)
+        {
+            pipeline.begin_cached_seek_recovery_watchdog(fallback.target_nsecs, session.id());
+            tracing::debug!(
+                session_id = ?session.id(),
+                position_seconds,
+                target_nsecs = fallback.target_nsecs,
+                reason = fallback.reason.as_str(),
+                action = fallback.action.as_str(),
+                hevc_boundary_reset_required = true,
+                reset_path = "forced_low_level",
+                demux_video_forward_nsecs = ?demux_watermark.video_forward_nsecs,
+                demux_selected_min_forward_nsecs = ?demux_watermark.selected_min_forward_nsecs,
+                demux_underrun = demux_watermark.underrun,
+                demux_video_underrun = demux_watermark.video_underrun,
+                "deferring HEVC cached seek recovery low-level seek while demux reader is still usable"
+            );
+            return Ok(true);
+        }
+        let seek_generation = control.request_seek();
+        session.reset_to(session.id(), position_seconds);
+        pipeline.current_start_position_nsecs = session.start_position_nsecs();
+        tracing::debug!(
+            session_id = ?session.id(),
+            position_seconds,
+            target_nsecs = fallback.target_nsecs,
+            reason = fallback.reason.as_str(),
+            action = fallback.action.as_str(),
+            seek_generation,
+            hevc_boundary_reset_required = true,
+            reset_path = "forced_low_level",
+            demux_video_forward_nsecs = ?demux_watermark.video_forward_nsecs,
+            demux_selected_min_forward_nsecs = ?demux_watermark.selected_min_forward_nsecs,
+            "handling HEVC cached seek recovery fallback with low-level seek"
+        );
+        let demux_seek_result = service_playback_seek_reset(PlaybackSeekResetContext {
+            position_seconds,
+            seek_mode: crate::player::backend::PlaybackSeekMode::Precise,
+            seek_generation,
+            force_low_level_seek: true,
+            low_level_seek_reason: Some(fallback.reason.as_str()),
+            session_id: session.id(),
+            vo_queue,
+            demux_cache,
+            pipeline,
+            emit_playback_buffered_events,
+            control,
+            event_tx,
+        })?;
+        tracing::debug!(
+            session_id = ?session.id(),
+            position_seconds,
+            target_nsecs = fallback.target_nsecs,
+            reason = fallback.reason.as_str(),
+            action = fallback.action.as_str(),
+            seek_generation,
+            hevc_boundary_reset_required = true,
+            reset_path = "forced_low_level",
+            ?demux_seek_result,
+            "handled HEVC cached seek recovery fallback with low-level seek"
+        );
+        return Ok(true);
+    }
+    let Some(fallback) = pipeline
+        .video_decode_pipeline
+        .take_hevc_decode_chain_fallback()
+    else {
+        return Ok(false);
+    };
+    let position_seconds = nsecs_to_seconds(fallback.target_nsecs);
+    control.set_cache_paused(false);
+
+    let loop_action = pipeline
+        .video_decode_pipeline
+        .hevc_decode_chain_fallback_loop_action(fallback);
+    if loop_action == HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek {
+        pipeline.video_decode_recovery.reset();
+        pipeline
+            .video_decode_pipeline
+            .reset_hevc_decode_chain_watchdog();
+        pipeline
+            .video_decode_pipeline
+            .remember_hevc_decode_chain_fallback(fallback);
+        tracing::warn!(
+            session_id = ?session.id(),
+            target_nsecs = fallback.target_nsecs,
+            reason = fallback.reason.as_str(),
+            "suppressing repeated HEVC decode chain fallback low-level seek on software decoder"
+        );
+        return Ok(true);
+    }
+
+    let should_reopen_software = pipeline.video_decode_pipeline.info().hardware_accelerated
+        && (hevc_decode_chain_fallback_reopens_software(fallback.reason)
+            || loop_action == HevcDecodeChainFallbackLoopAction::ForceSoftware);
+    let mut requeued_probe_packets = 0usize;
+    if should_reopen_software {
+        let reopened_software = pipeline
+            .video_decode_pipeline
+            .reopen_software_decoder(pipeline.video_stream)?;
+        if reopened_software {
+            let playback_video_info = playback_video_info_from_worker(
+                pipeline.video_stream,
+                pipeline.video_decode_pipeline.info(),
+            );
+            let _ = event_tx.send(BackendEvent::new(
+                session.id(),
+                BackendEventKind::PlaybackInfoChanged(playback_video_info),
+            ));
+            tracing::debug!(
+                session_id = ?session.id(),
+                reason = fallback.reason.as_str(),
+                "reopened FFmpeg HEVC decoder in software mode after repeated startup recovery failure"
+            );
+            requeued_probe_packets = pipeline
+                .video_decode_pipeline
+                .requeue_hevc_startup_probe_packets(
+                    &mut pipeline.playback_generation,
+                    session.id(),
+                )?;
+            if requeued_probe_packets > 0 {
+                session.reset_to(session.id(), position_seconds);
+                pipeline.current_start_position_nsecs = session.start_position_nsecs();
+                pipeline.output_scheduler.reset(control);
+                pipeline.video_decode_recovery.reset();
+                pipeline.dovi_pipeline.reset();
+                pipeline
+                    .video_decode_pipeline
+                    .remember_hevc_decode_chain_fallback(fallback);
+                tracing::debug!(
+                    session_id = ?session.id(),
+                    position_seconds,
+                    target_nsecs = fallback.target_nsecs,
+                    reason = fallback.reason.as_str(),
+                    requeued_probe_packets,
+                    "handled HEVC decode chain fallback by requeuing startup probe packets on software decoder"
+                );
+                return Ok(true);
+            }
+            session.reset_to(session.id(), position_seconds);
+            pipeline.current_start_position_nsecs = session.start_position_nsecs();
+            pipeline.output_scheduler.reset(control);
+            pipeline.video_decode_recovery.reset_for_timeline_start(
+                pipeline.video_stream.codec_id,
+                pipeline.current_start_position_nsecs,
+            );
+            pipeline.dovi_pipeline.reset();
+            pipeline
+                .video_decode_pipeline
+                .remember_hevc_decode_chain_fallback(fallback);
+            tracing::warn!(
+                session_id = ?session.id(),
+                position_seconds,
+                target_nsecs = fallback.target_nsecs,
+                reason = fallback.reason.as_str(),
+                requeued_probe_packets,
+                "HEVC startup probe packets unavailable after software decoder reopen; continuing without low-level seek"
+            );
+            return Ok(true);
+        }
+    }
+    let demux_watermark = demux_cache.cached_reader_watermark();
+    let output_snapshot = pipeline.output_scheduler.snapshot();
+    let startup_or_post_seek =
+        output_snapshot.first_video_frame_pending || output_snapshot.video_bootstrap_after_seek;
+    if hevc_decode_chain_fallback_should_suppress_low_level_seek(
+        fallback.reason,
+        fallback.target_nsecs,
+        requeued_probe_packets,
+        demux_watermark,
+        startup_or_post_seek,
+    ) {
+        pipeline.video_decode_recovery.reset();
+        pipeline
+            .video_decode_pipeline
+            .reset_hevc_decode_chain_watchdog();
+        pipeline
+            .video_decode_pipeline
+            .remember_hevc_decode_chain_fallback(fallback);
+        tracing::warn!(
+            session_id = ?session.id(),
+            reason = fallback.reason.as_str(),
+            target_ms = fallback.target_nsecs as f64 / 1_000_000.0,
+            probe_packets = requeued_probe_packets,
+            demux_forward_ms = ?demux_watermark
+                .video_forward_nsecs
+                .or(demux_watermark.selected_min_forward_nsecs)
+                .map(|duration| duration as f64 / 1_000_000.0),
+            startup_or_post_seek,
+            queued_video_ms = output_snapshot.queued_video_duration_nsecs as f64 / 1_000_000.0,
+            "hevc_low_level_seek_suppressed"
+        );
+        return Ok(true);
+    }
+    let boundary_reset_required =
+        hevc_decode_chain_fallback_requires_boundary_reset(fallback.reason);
+    if !boundary_reset_required && !demux_reader_unusable_for_hevc_low_level_seek(demux_watermark) {
+        pipeline
+            .video_decode_pipeline
+            .remember_hevc_decode_chain_fallback(fallback);
+        tracing::debug!(
+            session_id = ?session.id(),
+            position_seconds,
+            target_nsecs = fallback.target_nsecs,
+            reason = fallback.reason.as_str(),
+            hevc_boundary_reset_required = boundary_reset_required,
+            reset_path = "forced_low_level",
+            demux_video_forward_nsecs = ?demux_watermark.video_forward_nsecs,
+            demux_selected_min_forward_nsecs = ?demux_watermark.selected_min_forward_nsecs,
+            demux_underrun = demux_watermark.underrun,
+            demux_video_underrun = demux_watermark.video_underrun,
+            "deferring HEVC decode chain low-level seek while demux reader is still usable"
+        );
+        return Ok(true);
+    }
+    let seek_generation = control.request_seek();
+    session.reset_to(session.id(), position_seconds);
+    pipeline.current_start_position_nsecs = session.start_position_nsecs();
+    pipeline
+        .video_decode_pipeline
+        .remember_hevc_decode_chain_fallback(fallback);
+    let force_low_level_seek = !boundary_reset_required;
+    let reset_path = if boundary_reset_required {
+        "cached_then_low_level"
+    } else {
+        "forced_low_level"
+    };
+    tracing::debug!(
+        session_id = ?session.id(),
+        position_seconds,
+        target_nsecs = fallback.target_nsecs,
+        reason = fallback.reason.as_str(),
+        seek_generation,
+        hevc_boundary_reset_required = boundary_reset_required,
+        reset_path,
+        demux_video_forward_nsecs = ?demux_watermark.video_forward_nsecs,
+        demux_selected_min_forward_nsecs = ?demux_watermark.selected_min_forward_nsecs,
+        demux_underrun = demux_watermark.underrun,
+        demux_video_underrun = demux_watermark.video_underrun,
+        "handling HEVC decode chain recovery fallback with boundary reset"
+    );
+    let demux_seek_result = service_playback_seek_reset(PlaybackSeekResetContext {
+        position_seconds,
+        seek_mode: crate::player::backend::PlaybackSeekMode::Precise,
+        seek_generation,
+        force_low_level_seek,
+        low_level_seek_reason: Some(fallback.reason.as_str()),
+        session_id: session.id(),
+        vo_queue,
+        demux_cache,
+        pipeline,
+        emit_playback_buffered_events,
+        control,
+        event_tx,
+    })?;
+    tracing::debug!(
+        session_id = ?session.id(),
+        position_seconds,
+        target_nsecs = fallback.target_nsecs,
+        reason = fallback.reason.as_str(),
+        seek_generation,
+        hevc_boundary_reset_required = boundary_reset_required,
+        reset_path,
+        ?demux_seek_result,
+        "handled HEVC decode chain recovery fallback with boundary reset"
+    );
+    Ok(true)
+}
+
+fn hevc_decode_chain_fallback_reopens_software(reason: HevcDecodeChainFallbackReason) -> bool {
+    matches!(
+        reason,
+        HevcDecodeChainFallbackReason::ZeroOutputRebuffer
+            | HevcDecodeChainFallbackReason::StartupInFlightStall
+            | HevcDecodeChainFallbackReason::RecoveryWaitRebuffer
+            | HevcDecodeChainFallbackReason::PostFallbackRebufferUnderfill
+    )
+}
+
+fn hevc_decode_chain_fallback_requires_boundary_reset(
+    reason: HevcDecodeChainFallbackReason,
+) -> bool {
+    reason.requires_boundary_reset()
+}
+
+fn demux_reader_unusable_for_hevc_low_level_seek(watermark: DemuxReaderWatermark) -> bool {
+    let video_forward_empty = watermark.video_forward_nsecs.unwrap_or_default() == 0;
+    let selected_forward_empty = watermark.selected_min_forward_nsecs.unwrap_or_default() == 0;
+    watermark.video_underrun && video_forward_empty && selected_forward_empty
+}
+
+fn demux_reader_healthy_for_hevc_low_level_seek_suppression(
+    watermark: DemuxReaderWatermark,
+) -> bool {
+    let video_forward_nsecs = watermark
+        .video_forward_nsecs
+        .or(watermark.selected_min_forward_nsecs)
+        .unwrap_or_default();
+    !watermark.video_underrun
+        && video_forward_nsecs >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+}
+
+fn hevc_decode_chain_fallback_should_suppress_low_level_seek(
+    reason: HevcDecodeChainFallbackReason,
+    target_nsecs: u64,
+    probe_packets: usize,
+    demux_watermark: DemuxReaderWatermark,
+    startup_or_post_seek: bool,
+) -> bool {
+    matches!(
+        reason,
+        HevcDecodeChainFallbackReason::ZeroOutputRebuffer
+            | HevcDecodeChainFallbackReason::RecoveryWaitRebuffer
+    ) && target_nsecs == 0
+        && probe_packets == 0
+        && startup_or_post_seek
+        && demux_reader_healthy_for_hevc_low_level_seek_suppression(demux_watermark)
 }
 
 #[cfg(test)]
@@ -330,4 +1118,163 @@ pub(super) fn playback_buffered_near_duration(
 
     duration_seconds > 0.0
         && buffered_until_seconds + END_OF_PLAYBACK_READ_ERROR_TOLERANCE_SECONDS >= duration_seconds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DemuxReaderWatermark, HevcDecodeChainFallbackReason,
+        demux_reader_unusable_for_hevc_low_level_seek, hevc_decode_chain_fallback_reopens_software,
+        hevc_decode_chain_fallback_requires_boundary_reset,
+        hevc_decode_chain_fallback_should_suppress_low_level_seek,
+        rebuffer_audio_realign_can_preserve_video_queue,
+        rebuffer_audio_realign_requires_low_level_seek,
+    };
+
+    #[test]
+    fn hevc_startup_zero_output_hard_fallbacks_to_software() {
+        assert!(hevc_decode_chain_fallback_reopens_software(
+            HevcDecodeChainFallbackReason::ZeroOutputRebuffer
+        ));
+    }
+
+    #[test]
+    fn hevc_startup_in_flight_stall_fallbacks_to_software() {
+        assert!(hevc_decode_chain_fallback_reopens_software(
+            HevcDecodeChainFallbackReason::StartupInFlightStall
+        ));
+    }
+
+    #[test]
+    fn hevc_recovery_wait_rebuffer_reopens_software_decoder_when_hardware() {
+        assert!(hevc_decode_chain_fallback_reopens_software(
+            HevcDecodeChainFallbackReason::RecoveryWaitRebuffer
+        ));
+    }
+
+    #[test]
+    fn repeated_rebuffer_audio_realign_preserves_covering_video_queue() {
+        assert!(!rebuffer_audio_realign_requires_low_level_seek(2, true));
+        assert!(rebuffer_audio_realign_requires_low_level_seek(2, false));
+        assert!(!rebuffer_audio_realign_requires_low_level_seek(1, false));
+    }
+
+    #[test]
+    fn rebuffer_audio_realign_service_keeps_covering_video_queue_on_audio_only_realign() {
+        assert!(rebuffer_audio_realign_can_preserve_video_queue(
+            2, true, true
+        ));
+        assert!(!rebuffer_audio_realign_requires_low_level_seek(2, true));
+        assert!(!rebuffer_audio_realign_can_preserve_video_queue(
+            2, false, true
+        ));
+        assert!(!rebuffer_audio_realign_can_preserve_video_queue(
+            2, true, false
+        ));
+    }
+
+    #[test]
+    fn hevc_decode_chain_hard_fallbacks_require_boundary_reset() {
+        for reason in [
+            HevcDecodeChainFallbackReason::ZeroOutputRebuffer,
+            HevcDecodeChainFallbackReason::StartupInFlightStall,
+            HevcDecodeChainFallbackReason::RecoveryWaitRebuffer,
+            HevcDecodeChainFallbackReason::PostFallbackRebufferUnderfill,
+            HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
+        ] {
+            assert!(hevc_decode_chain_fallback_requires_boundary_reset(reason));
+        }
+    }
+
+    #[test]
+    fn hevc_decode_chain_boundary_reset_bypasses_forward_cache_deferral() {
+        let demux_watermark = DemuxReaderWatermark {
+            video_forward_nsecs: Some(1_000_000_000),
+            selected_min_forward_nsecs: Some(1_000_000_000),
+            video_underrun: false,
+            underrun: false,
+            ..DemuxReaderWatermark::default()
+        };
+
+        assert!(hevc_decode_chain_fallback_requires_boundary_reset(
+            HevcDecodeChainFallbackReason::ZeroOutputRebuffer
+        ));
+        assert!(!demux_reader_unusable_for_hevc_low_level_seek(
+            demux_watermark
+        ));
+    }
+
+    #[test]
+    fn hevc_low_level_seek_waits_while_demux_reader_has_video_forward_cache() {
+        assert!(!demux_reader_unusable_for_hevc_low_level_seek(
+            DemuxReaderWatermark {
+                video_forward_nsecs: Some(1_000_000_000),
+                selected_min_forward_nsecs: Some(1_000_000_000),
+                video_underrun: false,
+                underrun: false,
+                ..DemuxReaderWatermark::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn hevc_low_level_seek_requires_video_reader_underrun() {
+        assert!(demux_reader_unusable_for_hevc_low_level_seek(
+            DemuxReaderWatermark {
+                video_forward_nsecs: Some(0),
+                selected_min_forward_nsecs: Some(0),
+                video_underrun: true,
+                underrun: true,
+                ..DemuxReaderWatermark::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn hevc_low_level_seek_ignores_audio_only_underrun_with_video_forward_cache() {
+        assert!(!demux_reader_unusable_for_hevc_low_level_seek(
+            DemuxReaderWatermark {
+                video_forward_nsecs: Some(2_000_000_000),
+                audio_forward_nsecs: Some(0),
+                selected_min_forward_nsecs: Some(0),
+                audio_underrun: true,
+                underrun: true,
+                ..DemuxReaderWatermark::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn hevc_recovery_wait_zero_target_suppresses_low_level_seek_when_demux_is_healthy() {
+        assert!(hevc_decode_chain_fallback_should_suppress_low_level_seek(
+            HevcDecodeChainFallbackReason::RecoveryWaitRebuffer,
+            0,
+            0,
+            DemuxReaderWatermark {
+                video_forward_nsecs: Some(2_000_000_000),
+                selected_min_forward_nsecs: Some(2_000_000_000),
+                video_underrun: false,
+                underrun: false,
+                ..DemuxReaderWatermark::default()
+            },
+            true,
+        ));
+    }
+
+    #[test]
+    fn hevc_recovery_wait_zero_target_does_not_suppress_after_probe_requeue() {
+        assert!(!hevc_decode_chain_fallback_should_suppress_low_level_seek(
+            HevcDecodeChainFallbackReason::RecoveryWaitRebuffer,
+            0,
+            1,
+            DemuxReaderWatermark {
+                video_forward_nsecs: Some(2_000_000_000),
+                selected_min_forward_nsecs: Some(2_000_000_000),
+                video_underrun: false,
+                underrun: false,
+                ..DemuxReaderWatermark::default()
+            },
+            true,
+        ));
+    }
 }

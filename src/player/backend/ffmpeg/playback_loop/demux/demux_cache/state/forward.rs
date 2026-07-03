@@ -1,17 +1,70 @@
-use std::{collections::BTreeMap, os::raw::c_int};
+use std::{
+    collections::{BTreeMap, HashMap},
+    os::raw::c_int,
+};
 
 use super::{DemuxPacketCacheState, PacketId, StreamForwardState};
 
 impl DemuxPacketCacheState {
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn active_packet_is_forward(
         &self,
         packet_id: PacketId,
     ) -> bool {
+        let packet_positions = self
+            .read_range()
+            .global_order
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, packet_id)| (packet_id, index))
+            .collect::<HashMap<_, _>>();
+        self.active_packet_is_forward_with_positions(packet_id, &packet_positions)
+    }
+
+    fn active_packet_is_forward_with_positions(
+        &self,
+        packet_id: PacketId,
+        packet_positions: &HashMap<PacketId, usize>,
+    ) -> bool {
         let Some(packet) = self.packets.get(&packet_id) else {
             return false;
         };
-        self.reader_heads.contains_key(&packet.stream_index)
+        let Some(reader_head) = self.next_packet_id_for_stream(packet.stream_index) else {
+            return false;
+        };
+        let Some(reader_head_position) = self
+            .reader_head_positions
+            .get(&packet.stream_index)
+            .copied()
+            .or_else(|| packet_positions.get(&reader_head).copied())
+        else {
+            return false;
+        };
+        let Some(packet_position) = packet_positions.get(&packet_id).copied() else {
+            return false;
+        };
+        packet_position >= reader_head_position
             && !self.consumed_packet_ids.contains(&packet_id)
+            && self.packet_readable_in_current_generation(packet_id)
+    }
+
+    fn appended_packet_is_forward(&self, packet_id: PacketId, packet_position: usize) -> bool {
+        let Some(packet) = self.packets.get(&packet_id) else {
+            return false;
+        };
+        let Some(reader_head) = self.next_packet_id_for_stream(packet.stream_index) else {
+            return false;
+        };
+        let Some(reader_head_position) = self.reader_head_positions.get(&packet.stream_index)
+        else {
+            return false;
+        };
+        let at_or_after_reader_head =
+            reader_head == packet_id || packet_position >= *reader_head_position;
+        at_or_after_reader_head
+            && !self.consumed_packet_ids.contains(&packet_id)
+            && self.packet_readable_in_current_generation(packet_id)
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn clear_reader_tracking(
@@ -21,6 +74,7 @@ impl DemuxPacketCacheState {
         self.consumed_packet_ids.clear();
         self.reader_heads.clear();
         self.reader_head_positions.clear();
+        self.reader_head_generations.clear();
         self.clear_forward_cache();
     }
 
@@ -34,9 +88,17 @@ impl DemuxPacketCacheState {
     ) {
         let mut forward_streams = BTreeMap::new();
         let mut reader_forward_bytes = 0usize;
+        let packet_positions = self
+            .read_range()
+            .global_order
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, packet_id)| (packet_id, index))
+            .collect::<HashMap<_, _>>();
         for (stream_index, queue) in &self.read_range().stream_queues {
             for packet_id in queue {
-                if !self.active_packet_is_forward(*packet_id) {
+                if !self.active_packet_is_forward_with_positions(*packet_id, &packet_positions) {
                     continue;
                 }
                 let Some(packet) = self.packets.get(packet_id) else {
@@ -56,8 +118,11 @@ impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn update_forward_cache_after_appended_packet(
         &mut self,
         packet_id: PacketId,
+        packet_position: usize,
     ) {
-        if self.append_range_id != self.read_range_id || !self.active_packet_is_forward(packet_id) {
+        if self.append_range_id != self.read_range_id
+            || !self.appended_packet_is_forward(packet_id, packet_position)
+        {
             return;
         }
         let Some(packet) = self.packets.get(&packet_id) else {
@@ -84,7 +149,7 @@ impl DemuxPacketCacheState {
         let stream_index = packet.stream_index;
         let byte_len = packet.byte_len;
         let packet_end_nsecs = packet.end_nsecs.or(packet.start_nsecs);
-        let next_head = self.reader_heads.get(&stream_index).copied();
+        let next_head = self.next_packet_id_for_stream(stream_index);
         let next_head_times = next_head.and_then(|head| {
             self.packets
                 .get(&head)
@@ -122,9 +187,17 @@ impl DemuxPacketCacheState {
     fn rebuild_forward_cache_for_stream(&mut self, stream_index: c_int) {
         let mut state = StreamForwardState::default();
         let mut found = false;
+        let packet_positions = self
+            .read_range()
+            .global_order
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, packet_id)| (packet_id, index))
+            .collect::<HashMap<_, _>>();
         if let Some(queue) = self.read_range().stream_queues.get(&stream_index) {
             for packet_id in queue {
-                if !self.active_packet_is_forward(*packet_id) {
+                if !self.active_packet_is_forward_with_positions(*packet_id, &packet_positions) {
                     continue;
                 }
                 let Some(packet) = self.packets.get(packet_id) else {

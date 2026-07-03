@@ -4,9 +4,9 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::{
     DemuxPacketCache, DemuxPacketCacheInput, DemuxPacketCacheMonitorSnapshot,
     DemuxPacketCacheReadTiming, DemuxPacketCacheShared, DemuxPacketCacheState,
     DemuxPacketCacheThreadInput, DemuxPacketQueueSnapshot, DemuxReadResult, DemuxReaderWatermark,
-    DemuxSeekResult, DemuxSelectedStreams, FfmpegControl, PlaybackCacheConfig, PlaybackSeekMode,
-    PlaybackSessionId, StreamInfo, demux_cache_blocked_on, nsecs_to_seconds,
-    run_demux_packet_cache, seconds_to_nsecs,
+    DemuxSeekResult, DemuxSelectedStreams, DemuxStreamReaderRealignResult, FfmpegControl,
+    PlaybackCacheConfig, PlaybackSeekMode, PlaybackSessionId, StreamInfo, demux_cache_blocked_on,
+    nsecs_to_seconds, run_demux_packet_cache, seconds_to_nsecs,
 };
 
 #[path = "cache/control.rs"]

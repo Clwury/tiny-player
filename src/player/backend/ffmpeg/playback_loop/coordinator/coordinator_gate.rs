@@ -1,4 +1,4 @@
-use super::playback_wait_service::PlaybackPipelineWaitService;
+use super::playback_wait_service::{PlaybackLoopDeadline, PlaybackPipelineWaitService};
 use super::{FfmpegControl, PlaybackOutputScheduler, PlaybackScheduler};
 
 #[derive(Default)]
@@ -21,6 +21,7 @@ pub(super) struct PlaybackCoordinatorGateContext<'a> {
     pub(super) output_scheduler: &'a PlaybackOutputScheduler,
     pub(super) scheduler: &'a mut PlaybackScheduler,
     pub(super) playback_wait: &'a PlaybackPipelineWaitService,
+    pub(super) playback_loop_deadline: PlaybackLoopDeadline,
 }
 
 impl PlaybackCoordinatorGateService {
@@ -29,9 +30,23 @@ impl PlaybackCoordinatorGateService {
         context: PlaybackCoordinatorGateContext<'_>,
     ) -> PlaybackCoordinatorGateStatus {
         if coordinator_should_wait_for_pause(context.control, context.output_scheduler) {
+            let watchdog_remaining = if context.control.is_user_paused() {
+                PlaybackLoopDeadline::default()
+            } else {
+                context.playback_loop_deadline
+            };
+            let watchdog_remaining = watchdog_remaining
+                .with_rebuffer_empty_audio_output_watchdog_delay(
+                    context
+                        .output_scheduler
+                        .rebuffer_empty_audio_output_watchdog_delay(),
+                );
             context
                 .playback_wait
-                .wait_poll_interval_and_delay_scheduler(context.scheduler);
+                .wait_poll_interval_and_delay_scheduler_until(
+                    context.scheduler,
+                    watchdog_remaining,
+                );
             return PlaybackCoordinatorGateStatus::Continue;
         }
 

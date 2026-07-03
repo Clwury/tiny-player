@@ -7,13 +7,14 @@ use std::{
 
 use crate::player::{
     dovi::DoviFrameMetadata,
-    render_host::{DecodedFrame, FrameBufferPool, FramePts},
+    render_host::{DecodedFrame, FrameBufferPool, FramePts, PlaybackSessionId},
 };
 
 use super::video_decode_worker::VideoDecodedFrame;
 use super::{
-    DECODE_PACKET_SLOW_LOG_AFTER, PlaybackBlockReason, VideoFrameConvertContext,
-    VideoFrameConverter, WORKER_CHANNEL_RECV_WAIT_LOG_AFTER, WORKER_CHANNEL_SEND_WAIT_LOG_AFTER,
+    DECODE_PACKET_SLOW_LOG_AFTER, PlaybackBlockReason, PlaybackOutputSnapshot, PlaybackOutputState,
+    VideoFrameConvertContext, VideoFrameConverter, WORKER_CHANNEL_RECV_WAIT_LOG_AFTER,
+    WORKER_CHANNEL_SEND_WAIT_LOG_AFTER,
 };
 
 const VIDEO_FRAME_PREPARE_COMMAND_QUEUE_CAPACITY: usize = 3;
@@ -32,6 +33,7 @@ pub(super) struct VideoFramePrepareWorker {
 
 pub(super) struct VideoFramePrepareInput {
     pub(super) generation: u64,
+    pub(super) diagnostic: VideoFramePrepareDiagnosticContext,
     pub(super) frame: VideoDecodedFrame,
     pub(super) frame_pts: FramePts,
     pub(super) timeline_nsecs: u64,
@@ -41,9 +43,47 @@ pub(super) struct VideoFramePrepareInput {
 }
 
 pub(super) struct PreparedVideoFrame {
+    pub(super) generation: u64,
     pub(super) frame: DecodedFrame,
     pub(super) timeline_nsecs: u64,
     pub(super) duration_nsecs: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct VideoFramePrepareDiagnosticContext {
+    pub(super) session_id: PlaybackSessionId,
+    pub(super) decoded_video_frame_count: u64,
+    pub(super) force_completion_log: bool,
+    pub(super) force_completion_reason: &'static str,
+    pub(super) output_state: PlaybackOutputState,
+    pub(super) output_first_video_frame_pending: bool,
+    pub(super) output_rebuffering: bool,
+    pub(super) queued_video_frames: usize,
+    pub(super) queued_video_range_nsecs: Option<(u64, u64)>,
+    pub(super) pending_start_audio_nsecs: u64,
+}
+
+impl VideoFramePrepareDiagnosticContext {
+    pub(super) fn from_output_snapshot(
+        session_id: PlaybackSessionId,
+        decoded_video_frame_count: u64,
+        force_completion_log: bool,
+        force_completion_reason: &'static str,
+        output_snapshot: PlaybackOutputSnapshot,
+    ) -> Self {
+        Self {
+            session_id,
+            decoded_video_frame_count,
+            force_completion_log,
+            force_completion_reason,
+            output_state: output_snapshot.state,
+            output_first_video_frame_pending: output_snapshot.first_video_frame_pending,
+            output_rebuffering: output_snapshot.rebuffering,
+            queued_video_frames: output_snapshot.queued_video_frames,
+            queued_video_range_nsecs: output_snapshot.queued_video_range_nsecs,
+            pending_start_audio_nsecs: output_snapshot.pending_start_audio_nsecs,
+        }
+    }
 }
 
 pub(super) struct VideoFramePrepareResult {
@@ -120,6 +160,24 @@ impl VideoFramePrepareWorker {
     ) -> std::result::Result<VideoFramePrepareEnqueueResult, String> {
         self.pump_available_results()?;
         if input.generation < self.generation_floor {
+            tracing::debug!(
+                session_id = ?input.diagnostic.session_id,
+                generation = input.generation,
+                generation_floor = self.generation_floor,
+                timeline_nsecs = input.timeline_nsecs,
+                duration_nsecs = input.duration_nsecs,
+                frame_pts_nsecs = input.frame_pts.nsecs,
+                decoded_video_frame_count = input.diagnostic.decoded_video_frame_count,
+                output_state = ?input.diagnostic.output_state,
+                output_first_video_frame_pending =
+                    input.diagnostic.output_first_video_frame_pending,
+                output_rebuffering = input.diagnostic.output_rebuffering,
+                queued_video_frames = input.diagnostic.queued_video_frames,
+                queued_video_range = ?input.diagnostic.queued_video_range_nsecs,
+                force_completion_log = input.diagnostic.force_completion_log,
+                force_completion_reason = input.diagnostic.force_completion_reason,
+                "dropped stale FFmpeg video frame prepare input below generation floor"
+            );
             return Ok(VideoFramePrepareEnqueueResult::Queued);
         }
         if !self.pending_inputs.is_empty() {
@@ -200,6 +258,17 @@ impl VideoFramePrepareWorker {
     }
 
     pub(super) fn flush_generation(&mut self, generation: u64) {
+        let pending_input_frames = self.pending_inputs.len();
+        let completed_frames = self.completed.len();
+        let in_flight_frames = self.in_flight_frames();
+        tracing::debug!(
+            generation,
+            previous_generation_floor = self.generation_floor,
+            pending_input_frames,
+            completed_frames,
+            in_flight_frames,
+            "flushing FFmpeg video frame prepare worker generation"
+        );
         self.generation_floor = self.generation_floor.max(generation);
         self.pending_inputs.clear();
         self.completed.clear();
@@ -331,6 +400,7 @@ fn run_video_frame_prepare_worker(
         match command {
             VideoFramePrepareCommand::Prepare(input) => {
                 let generation = input.generation;
+                let diagnostic = input.diagnostic;
                 let timeline_nsecs = input.timeline_nsecs;
                 let duration_nsecs = input.duration_nsecs;
                 let started = Instant::now();
@@ -346,12 +416,14 @@ fn run_video_frame_prepare_worker(
                 let send_elapsed = send_started_at.elapsed();
                 log_video_frame_prepare_worker_timing(VideoFramePrepareWorkerTiming {
                     generation,
+                    diagnostic,
                     timeline_nsecs,
                     duration_nsecs,
                     recv_wait,
                     prepare_elapsed,
                     send_elapsed,
                     result_ok,
+                    result_send_ok: send_result.is_ok(),
                 });
                 if send_result.is_err() {
                     break;
@@ -366,6 +438,7 @@ fn prepare_video_frame(
     video_converter: &mut VideoFrameConverter,
     input: VideoFramePrepareInput,
 ) -> std::result::Result<PreparedVideoFrame, String> {
+    let generation = input.generation;
     let mut frame = video_converter.convert_with_context(
         &input.convert_context,
         input.frame.as_mut_ptr(),
@@ -373,6 +446,7 @@ fn prepare_video_frame(
     )?;
     frame.pts = Some(input.frame_pts);
     Ok(PreparedVideoFrame {
+        generation,
         frame,
         timeline_nsecs: input.timeline_nsecs,
         duration_nsecs: input.duration_nsecs,
@@ -381,12 +455,14 @@ fn prepare_video_frame(
 
 struct VideoFramePrepareWorkerTiming {
     generation: u64,
+    diagnostic: VideoFramePrepareDiagnosticContext,
     timeline_nsecs: u64,
     duration_nsecs: u64,
     recv_wait: Duration,
     prepare_elapsed: Duration,
     send_elapsed: Duration,
     result_ok: bool,
+    result_send_ok: bool,
 }
 
 fn log_video_frame_prepare_worker_recv_wait(
@@ -425,29 +501,71 @@ fn video_frame_prepare_command_generation(command: &VideoFramePrepareCommand) ->
 }
 
 fn log_video_frame_prepare_worker_timing(timing: VideoFramePrepareWorkerTiming) {
+    let diagnostic = timing.diagnostic;
     tracing::trace!(
+        session_id = ?diagnostic.session_id,
         generation = timing.generation,
+        decoded_video_frame_count = diagnostic.decoded_video_frame_count,
         timeline_nsecs = timing.timeline_nsecs,
         duration_nsecs = timing.duration_nsecs,
         recv_wait_ms = timing.recv_wait.as_secs_f64() * 1000.0,
         prepare_ms = timing.prepare_elapsed.as_secs_f64() * 1000.0,
         result_send_block_ms = timing.send_elapsed.as_secs_f64() * 1000.0,
         result_ok = timing.result_ok,
+        result_send_ok = timing.result_send_ok,
+        output_state = ?diagnostic.output_state,
+        output_first_video_frame_pending = diagnostic.output_first_video_frame_pending,
+        output_rebuffering = diagnostic.output_rebuffering,
+        queued_video_frames = diagnostic.queued_video_frames,
+        queued_video_range = ?diagnostic.queued_video_range_nsecs,
+        pending_start_audio_ms = diagnostic.pending_start_audio_nsecs as f64 / 1_000_000.0,
         "FFmpeg video frame prepare worker timing"
     );
+    if diagnostic.force_completion_log {
+        tracing::debug!(
+            session_id = ?diagnostic.session_id,
+            generation = timing.generation,
+            decoded_video_frame_count = diagnostic.decoded_video_frame_count,
+            force_completion_reason = diagnostic.force_completion_reason,
+            timeline_nsecs = timing.timeline_nsecs,
+            duration_nsecs = timing.duration_nsecs,
+            recv_wait_ms = timing.recv_wait.as_secs_f64() * 1000.0,
+            prepare_ms = timing.prepare_elapsed.as_secs_f64() * 1000.0,
+            result_send_block_ms = timing.send_elapsed.as_secs_f64() * 1000.0,
+            result_ok = timing.result_ok,
+            result_send_ok = timing.result_send_ok,
+            output_state = ?diagnostic.output_state,
+            output_first_video_frame_pending = diagnostic.output_first_video_frame_pending,
+            output_rebuffering = diagnostic.output_rebuffering,
+            queued_video_frames = diagnostic.queued_video_frames,
+            queued_video_range = ?diagnostic.queued_video_range_nsecs,
+            pending_start_audio_ms = diagnostic.pending_start_audio_nsecs as f64 / 1_000_000.0,
+            "FFmpeg video frame prepare worker completed diagnostic frame"
+        );
+        return;
+    }
     if timing.prepare_elapsed < DECODE_PACKET_SLOW_LOG_AFTER
         && timing.send_elapsed < WORKER_CHANNEL_SEND_WAIT_LOG_AFTER
     {
         return;
     }
     tracing::debug!(
+        session_id = ?diagnostic.session_id,
         generation = timing.generation,
+        decoded_video_frame_count = diagnostic.decoded_video_frame_count,
         timeline_nsecs = timing.timeline_nsecs,
         duration_nsecs = timing.duration_nsecs,
         recv_wait_ms = timing.recv_wait.as_secs_f64() * 1000.0,
         prepare_ms = timing.prepare_elapsed.as_secs_f64() * 1000.0,
         result_send_block_ms = timing.send_elapsed.as_secs_f64() * 1000.0,
         result_ok = timing.result_ok,
+        result_send_ok = timing.result_send_ok,
+        output_state = ?diagnostic.output_state,
+        output_first_video_frame_pending = diagnostic.output_first_video_frame_pending,
+        output_rebuffering = diagnostic.output_rebuffering,
+        queued_video_frames = diagnostic.queued_video_frames,
+        queued_video_range = ?diagnostic.queued_video_range_nsecs,
+        pending_start_audio_ms = diagnostic.pending_start_audio_nsecs as f64 / 1_000_000.0,
         "FFmpeg video frame prepare worker completed slowly"
     );
 }
@@ -463,9 +581,11 @@ mod tests {
 
     use ffmpeg_sys_next as ffi;
 
-    use crate::player::render_host::{FfmpegFrameRef, FramePts, RenderSize};
+    use crate::player::render_host::{FfmpegFrameRef, FramePts, PlaybackSessionId, RenderSize};
 
-    use super::super::{AvFrame, DEFAULT_VIDEO_FRAME_DURATION_NSECS, VideoFrameConvertContext};
+    use super::super::{
+        AvFrame, DEFAULT_VIDEO_FRAME_DURATION_NSECS, PlaybackOutputState, VideoFrameConvertContext,
+    };
     use super::{VideoFramePrepareEnqueueResult, VideoFramePrepareInput, VideoFramePrepareWorker};
 
     fn test_worker() -> VideoFramePrepareWorker {
@@ -499,6 +619,18 @@ mod tests {
 
         VideoFramePrepareInput {
             generation,
+            diagnostic: super::VideoFramePrepareDiagnosticContext {
+                session_id: PlaybackSessionId::default(),
+                decoded_video_frame_count: generation,
+                force_completion_log: false,
+                force_completion_reason: "test",
+                output_state: PlaybackOutputState::Syncing,
+                output_first_video_frame_pending: true,
+                output_rebuffering: false,
+                queued_video_frames: 0,
+                queued_video_range_nsecs: None,
+                pending_start_audio_nsecs: 0,
+            },
             frame: VideoDecodedFrame::new_for_test(frame),
             frame_pts: FramePts { nsecs: generation },
             timeline_nsecs: generation,

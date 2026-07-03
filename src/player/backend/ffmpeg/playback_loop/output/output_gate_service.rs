@@ -2,10 +2,14 @@ use super::output_gate::{OutputGateResumeStatus, service_output_gate_resume_if_r
 use super::output_rebuffer::demux_reader_ready_for_output;
 use super::playback_snapshot::PlaybackPipelineTelemetry;
 use super::playback_wait_service::{PlaybackPipelineWaitContext, PlaybackPipelineWaitService};
+use super::video_decode_pipeline::HevcPostFallbackRebufferObservation;
 use std::{
+    os::raw::c_int,
     sync::{atomic::AtomicBool, mpsc::Sender},
     time::{Duration, Instant},
 };
+
+use ffmpeg_sys_next as ffi;
 
 use crate::player::{
     backend::{BackendEvent, ByteCacheState},
@@ -19,6 +23,8 @@ use super::{
     VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
     duration_nsecs,
 };
+
+const HEVC_POST_FALLBACK_AUDIO_READY_NSECS: u64 = 250_000_000;
 
 #[derive(Default)]
 pub(super) struct OutputGateService;
@@ -80,6 +86,17 @@ fn service_output_gate_or_wait(
     let output_resource_pressure = status.output_resource_pressure;
     timing.resource_pressure = stage_started_at.elapsed();
     let stage_started_at = Instant::now();
+    let audio_decode_snapshot = context
+        .pipeline
+        .audio_decode_pipeline
+        .as_ref()
+        .map(|pipeline| pipeline.snapshot());
+    let video_decode_snapshot = context.pipeline.video_decode_pipeline.snapshot();
+    let (demux_packet_snapshot, _, _) = context.demux_cache.monitor_snapshot();
+    let demux_audio_cached_packets = demux_audio_cached_packets_for_stream(
+        &demux_packet_snapshot,
+        context.pipeline.audio_stream.map(|stream| stream.index),
+    );
     let resume_status = service_output_gate_resume_if_ready(
         &mut context.pipeline.output_scheduler,
         context.pipeline.audio_output.as_ref(),
@@ -96,6 +113,21 @@ fn service_output_gate_or_wait(
         &mut context.pipeline.current_start_position_nsecs,
         &mut context.pipeline.scheduler,
         output_resource_pressure,
+        audio_decode_snapshot
+            .map(|snapshot| snapshot.queued_duration_nsecs)
+            .unwrap_or_default(),
+        audio_decode_snapshot
+            .map(|snapshot| snapshot.in_flight_packets)
+            .unwrap_or_default(),
+        demux_audio_cached_packets,
+        Some(demux_packet_snapshot.read_index),
+        video_decode_snapshot.pending_input_packets,
+        video_decode_snapshot,
+        context.pipeline.video_stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        context
+            .pipeline
+            .video_decode_pipeline
+            .hevc_decode_chain_stats(),
         || context.demux_cache.cached_reader_watermark(),
     )?;
     timing.resume = stage_started_at.elapsed();
@@ -122,6 +154,18 @@ fn service_output_gate_or_wait(
         service_status,
     );
     Ok(service_status)
+}
+
+fn demux_audio_cached_packets_for_stream(
+    demux_packet_snapshot: &super::demux_cache::DemuxPacketQueueSnapshot,
+    audio_stream_index: Option<c_int>,
+) -> Option<usize> {
+    let audio_stream_index = audio_stream_index?;
+    demux_packet_snapshot
+        .streams
+        .iter()
+        .find(|stream| stream.stream_index == audio_stream_index)
+        .map(|stream| stream.queued_packets)
 }
 
 fn output_gate_service_status_after_resume(
@@ -161,6 +205,15 @@ fn output_gate_service_status(
         .pipeline
         .output_scheduler
         .snapshot_for_played_until(played_until_nsecs);
+    context
+        .pipeline
+        .output_scheduler
+        .clear_audio_gap_recovery_if_audio_ready(
+            audio_output_snapshot,
+            played_until_nsecs,
+            context.session_id,
+            "output_gate_status",
+        );
     let output_underflowing = output_snapshot.underflowing()
         || audio_output_starving(output_snapshot, audio_output_snapshot);
     let pending_audio_recoverable = context
@@ -184,7 +237,7 @@ fn output_gate_service_status(
         demux_watermark.selected_min_forward_nsecs,
         byte_cache_low_water,
     );
-    context
+    let entered_rebuffer = context
         .pipeline
         .output_scheduler
         .maybe_enter_video_output_rebuffer(
@@ -195,13 +248,52 @@ fn output_gate_service_status(
             forward_cache_insufficient,
             forward_cache_min_nsecs,
             render_backlogged,
+            vo_snapshot.queued_frames,
             has_audio_output,
             pending_audio_recoverable,
             context.control,
             context.pipeline.audio_output.as_ref(),
+            audio_output_snapshot.map(|snapshot| snapshot.total_pending_nsecs),
             context.session_id,
             output_snapshot.queued_video_forward_nsecs,
         );
+    if entered_rebuffer {
+        if audio_output_snapshot.is_some_and(|snapshot| snapshot.total_pending_nsecs == 0) {
+            context
+                .pipeline
+                .output_scheduler
+                .observe_audio_output_underrun_for_rebuffer(Instant::now(), context.session_id);
+        }
+        context.pipeline.restore_video_decode_skip_nonref_default(
+            Some(context.session_id),
+            "video_rebuffer_entry",
+        )?;
+    }
+    let post_rebuffer_snapshot = context
+        .pipeline
+        .output_scheduler
+        .snapshot_for_played_until(played_until_nsecs);
+    let decoded_audio_ready_nsecs = audio_output_snapshot
+        .map(|snapshot| snapshot.total_pending_nsecs)
+        .unwrap_or_default()
+        .max(post_rebuffer_snapshot.pending_start_audio_nsecs);
+    let post_fallback_target_nsecs = post_rebuffer_snapshot
+        .video_output_rebuffer_anchor
+        .map(|anchor| anchor.timeline_nsecs)
+        .or(played_until_nsecs)
+        .unwrap_or(context.pipeline.current_start_position_nsecs);
+    context
+        .pipeline
+        .video_decode_pipeline
+        .observe_hevc_post_fallback_rebuffer_underfill(HevcPostFallbackRebufferObservation {
+            session_id: context.session_id,
+            codec_id: context.pipeline.video_stream.codec_id,
+            now: Instant::now(),
+            output_snapshot: post_rebuffer_snapshot,
+            demux_watermark,
+            audio_ready: decoded_audio_ready_nsecs >= HEVC_POST_FALLBACK_AUDIO_READY_NSECS,
+            fallback_target_nsecs: post_fallback_target_nsecs,
+        });
     let should_wait_for_demux = context
         .pipeline
         .output_scheduler
@@ -294,6 +386,7 @@ fn observe_output_gate_stall(
             audio_output: context.pipeline.audio_output.as_ref(),
             vo_queue: context.vo_queue,
             playback_telemetry: &mut *context.playback_telemetry,
+            playback_loop_deadline: context.pipeline.playback_loop_deadline(),
         },
         stall_reason,
     );
@@ -470,10 +563,15 @@ mod tests {
             queued_video_duration_nsecs: 800_000_000,
             queued_video_range_nsecs: Some((1_000_000_000, 1_800_000_000)),
             queued_video_forward_nsecs: Some(800_000_000),
+            queued_video_contiguous_forward_nsecs: Some(800_000_000),
+            queued_video_largest_gap_nsecs: None,
             video_output_low_water: false,
             pending_start_audio_frames: 0,
             pending_start_audio_nsecs: 0,
             video_output_rebuffer_anchor: None,
+            video_bootstrap_after_seek: false,
+            video_decode_underfill: false,
+            rebuffer_empty_audio_output_blocked: false,
         };
         let underrun_audio = AudioOutputSnapshot {
             played_timeline_nsecs: 1_000_000_000,
@@ -528,10 +626,17 @@ mod tests {
                 duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
             )),
             queued_video_forward_nsecs: Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+            queued_video_contiguous_forward_nsecs: Some(duration_nsecs(
+                VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+            )),
+            queued_video_largest_gap_nsecs: None,
             video_output_low_water: false,
             pending_start_audio_frames: 0,
             pending_start_audio_nsecs: 0,
             video_output_rebuffer_anchor: None,
+            video_bootstrap_after_seek: false,
+            video_decode_underfill: false,
+            rebuffer_empty_audio_output_blocked: false,
         };
         let recovered_audio = AudioOutputSnapshot {
             played_timeline_nsecs: 0,

@@ -19,6 +19,15 @@ use super::{
     SubtitlePipeline, TimestampMapper,
 };
 
+const MAX_SEEK_AUDIO_LEAD_NSECS: u64 = 2_000_000_000;
+
+fn decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before(
+    buffered_until_nsecs: u64,
+    drop_before_timeline_nsecs: u64,
+) -> bool {
+    buffered_until_nsecs <= drop_before_timeline_nsecs
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn service_decoded_audio_frame(
     decoded_frame: AudioDecodedFrame,
@@ -52,10 +61,72 @@ pub(super) fn service_decoded_audio_frame(
         audio.duration_nsecs,
         PENDING_AUDIO_CONTINUITY_TOLERANCE,
     );
+    let buffered_until_nsecs = timestamp
+        .timeline_nsecs
+        .saturating_add(audio.duration_nsecs);
+    let output_snapshot = output_scheduler.snapshot();
+    if let Some(drop_before_timeline_nsecs) =
+        output_scheduler.audio_sync_drop_before_timeline_nsecs()
+        && decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before(
+            buffered_until_nsecs,
+            drop_before_timeline_nsecs,
+        )
+    {
+        tracing::debug!(
+            session_id = ?session_id,
+            raw_timestamp,
+            timeline_nsecs = timestamp.timeline_nsecs,
+            buffered_until_nsecs,
+            drop_before_timeline_nsecs,
+            output_state = ?output_snapshot.state,
+            first_video_frame_pending = output_snapshot.first_video_frame_pending,
+            rebuffering = output_snapshot.rebuffering,
+            "dropping FFmpeg audio frame before rebuffer audio sync drop-before"
+        );
+        return Ok(());
+    }
+    let far_ahead_reference_nsecs =
+        output_scheduler.audio_far_ahead_reference_timeline_nsecs(current_start_position_nsecs);
+    if (output_snapshot.first_video_frame_pending || output_snapshot.rebuffering)
+        && timestamp.timeline_nsecs
+            > far_ahead_reference_nsecs.saturating_add(MAX_SEEK_AUDIO_LEAD_NSECS)
+    {
+        let audio_snapshot = output.snapshot()?;
+        let rebuffer_audio_realign_request = output_scheduler
+            .observe_rebuffer_far_ahead_audio_frame(
+                timestamp.timeline_nsecs,
+                current_start_position_nsecs,
+                Some(audio_snapshot.total_pending_nsecs),
+                session_id,
+                "decoded_audio_far_ahead",
+            );
+        tracing::debug!(
+            session_id = ?session_id,
+            raw_timestamp,
+            timeline_nsecs = timestamp.timeline_nsecs,
+            current_start_position_nsecs,
+            far_ahead_reference_nsecs,
+            audio_lead_ms = timestamp
+                .timeline_nsecs
+                .saturating_sub(far_ahead_reference_nsecs) as f64
+                / 1_000_000.0,
+            output_state = ?output_snapshot.state,
+            first_video_frame_pending = output_snapshot.first_video_frame_pending,
+            rebuffering = output_snapshot.rebuffering,
+            queued_video_frames = output_snapshot.queued_video_frames,
+            audio_output_pending_ms = audio_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
+            rebuffer_audio_realign_target_nsecs =
+                ?rebuffer_audio_realign_request.map(|request| request.target_timeline_nsecs),
+            rebuffer_audio_realign_drop_count =
+                ?rebuffer_audio_realign_request.map(|request| request.far_ahead_drop_count),
+            "dropping FFmpeg audio frame far ahead of seek/rebuffer resume"
+        );
+        return Ok(());
+    }
+    output_scheduler.clear_rebuffer_far_ahead_audio_observation();
     if timestamp.timeline_nsecs < current_start_position_nsecs {
         *dropped_audio_frames_before_start_count =
             (*dropped_audio_frames_before_start_count).saturating_add(1);
-        let output_snapshot = output_scheduler.snapshot();
         if *dropped_audio_frames_before_start_count == 1 {
             tracing::trace!(
                 dropped_audio_frames_before_start = *dropped_audio_frames_before_start_count,
@@ -78,9 +149,6 @@ pub(super) fn service_decoded_audio_frame(
         return Ok(());
     }
 
-    let buffered_until_nsecs = timestamp
-        .timeline_nsecs
-        .saturating_add(audio.duration_nsecs);
     output_scheduler.push_decoded_audio_or_buffer(
         output,
         control,
@@ -106,6 +174,12 @@ pub(super) fn service_decoded_audio_frame(
         subtitle_pipeline,
         buffered_reporter,
     )?;
+    let audio_snapshot = output.snapshot()?;
+    output_scheduler.clear_audio_sync_drop_before_if_covered(
+        Some(audio_snapshot),
+        session_id,
+        "decoded_audio_frame",
+    );
     Ok(())
 }
 
@@ -214,8 +288,30 @@ pub(super) fn drain_ready_audio_decode_output(
                 buffered_reporter,
             )?;
             if output_scheduler.pending_start_audio_backpressured() {
-                timing.pending_audio_backpressure += stage_started_at.elapsed();
-                break;
+                let worker_snapshot = worker.snapshot();
+                let audio_snapshot = audio_output.and_then(|output| output.snapshot().ok());
+                if output_scheduler.waiting_for_output_resume() {
+                    output_scheduler.discard_stale_pending_audio_before_output_resume(
+                        audio_snapshot,
+                        worker_snapshot.queued_duration_nsecs,
+                        worker_snapshot.in_flight_packets,
+                        current_start_position_nsecs,
+                        session_id,
+                    );
+                }
+                let keep_filling_resume_waterline = output_scheduler.waiting_for_output_resume()
+                    && output_scheduler.audio_resume_waterline_below_input_suppression(
+                        audio_snapshot,
+                        worker_snapshot.queued_duration_nsecs,
+                        worker_snapshot.in_flight_packets,
+                        current_start_position_nsecs,
+                    );
+                if !keep_filling_resume_waterline {
+                    timing.pending_audio_backpressure += stage_started_at.elapsed();
+                    break;
+                }
+                // Filling the waterline requires draining a decoded frame below;
+                // looping back here without consuming one cannot make progress.
             }
         }
         timing.pending_audio_backpressure += stage_started_at.elapsed();
@@ -357,4 +453,31 @@ pub(super) fn process_audio_decode_drain_result(
         );
     }
     process_result.and(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before as drops_before_sync_watermark;
+
+    #[test]
+    fn decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before() {
+        let drop_before_timeline_nsecs = 24_000_000_000;
+
+        assert!(drops_before_sync_watermark(
+            640_000_000,
+            drop_before_timeline_nsecs
+        ));
+        assert!(drops_before_sync_watermark(
+            2_000_000_000,
+            drop_before_timeline_nsecs
+        ));
+        assert!(drops_before_sync_watermark(
+            10_000_000_000,
+            drop_before_timeline_nsecs
+        ));
+        assert!(!drops_before_sync_watermark(
+            24_000_000_001,
+            drop_before_timeline_nsecs
+        ));
+    }
 }

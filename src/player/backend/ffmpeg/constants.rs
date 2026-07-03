@@ -7,11 +7,16 @@ pub(super) const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 pub(super) const RPU_MATCH_TOLERANCE: Duration = Duration::from_millis(60);
 pub(super) const RPU_QUEUE_CAPACITY: usize = 2048;
 pub(super) const AUDIO_BUFFER_SECONDS: usize = 4;
-pub(super) const AUDIO_DECODE_QUEUE_LIMIT_DURATION: Duration = Duration::from_secs(1);
-pub(super) const AUDIO_OUTPUT_QUEUE_LIMIT_DURATION: Duration = AUDIO_DECODE_QUEUE_LIMIT_DURATION;
+pub(super) const AUDIO_DECODE_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(1500);
+pub(super) const AUDIO_OUTPUT_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(1500);
 pub(super) const AUDIO_QUEUE_WAIT_LOG_AFTER: Duration = Duration::from_millis(50);
 pub(super) const AUDIO_CALLBACK_GAP_LOG_AFTER: Duration = Duration::from_millis(50);
 pub(super) const AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION: Duration = Duration::from_millis(250);
+pub(super) const AUDIO_REBUFFER_DELAYED_START_MAX: Duration = Duration::from_secs(2);
+pub(super) const AUDIO_REBUFFER_PREFILL_TARGET: Duration = Duration::from_millis(500);
+pub(super) const AUDIO_REBUFFER_PREFILL_LOOP_TARGET: Duration = Duration::from_millis(750);
+pub(super) const AUDIO_REBUFFER_LOOP_DETECTION_WINDOW: Duration = Duration::from_secs(2);
+pub(super) const AUDIO_OUTPUT_STEADY_TARGET_DURATION: Duration = Duration::from_millis(600);
 pub(super) const AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(1500);
 pub(super) const AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(600);
 pub(super) const DECODED_VIDEO_QUEUE_LIMIT_FRAMES: usize = 48;
@@ -24,6 +29,7 @@ pub(super) const AUDIO_OUTPUT_DELAY_LIMIT: Duration = Duration::from_millis(350)
 pub(super) const VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_millis(1500);
 pub(super) const VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_millis(600);
 pub(super) const PENDING_START_AUDIO_BACKPRESSURE_DURATION: Duration = Duration::from_millis(1500);
+pub(super) const AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN: Duration = Duration::from_millis(150);
 pub(super) const PLAYING_PENDING_AUDIO_FORCE_RECOVERY_DURATION: Duration = Duration::from_secs(2);
 pub(super) const PLAYING_PENDING_AUDIO_HARD_RESET_DURATION: Duration = Duration::from_secs(5);
 pub(super) const PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_secs(4);
@@ -39,6 +45,12 @@ pub(super) const VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER: Duration =
 pub(super) const VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER: Duration =
     Duration::from_millis(2000);
 pub(super) const VIDEO_OUTPUT_START_PREBUFFER_DURATION: Duration = Duration::from_millis(250);
+pub(super) const VIDEO_OUTPUT_START_FAST_READY_DURATION: Duration = Duration::from_millis(80);
+pub(super) const VIDEO_OUTPUT_START_FIRST_FRAME_FALLBACK_AFTER: Duration =
+    Duration::from_millis(300);
+pub(super) const VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER: Duration =
+    Duration::from_millis(500);
+pub(super) const VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE: Duration = Duration::from_millis(80);
 pub(super) const VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER: Duration = Duration::from_millis(800);
 pub(super) const VIDEO_DECODE_SKIP_NONREF_LOW_WATER_DURATION: Duration = Duration::from_millis(900);
 #[cfg(test)]

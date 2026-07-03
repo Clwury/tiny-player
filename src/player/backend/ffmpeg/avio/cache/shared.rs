@@ -16,11 +16,12 @@ use super::{
     CacheAppendPermit, CacheAppendResult, CacheReadResult, CacheRestartRequest, FfmpegControl,
     HTTP_CACHE_CONTENT_LEN_WAIT, HTTP_CACHE_PARTIAL_READ_MIN_BYTES,
     HTTP_CACHE_PREFETCH_PAUSE_LOG_AFTER, HTTP_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
-    HTTP_CACHE_SIDE_DOWNLOAD_WORKERS, HTTP_CACHE_STALL_LOG_AFTER, HTTP_CACHE_STALL_LOG_INTERVAL,
-    HTTP_CACHE_WAIT_INTERVAL, HttpCacheConfig, HttpCacheRangeKind, HttpRingCache,
-    HttpRingCacheShared, HttpRingCacheState, RetainedPlaybackSpliceSource,
-    http_ring_cache_download_loop, http_ring_cache_side_download_loop,
-    playback_cache_state_from_http_status, reqwest_header_pairs,
+    HTTP_CACHE_SIDE_DOWNLOAD_WORKERS, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
+    HTTP_CACHE_STALL_LOG_AFTER, HTTP_CACHE_STALL_LOG_INTERVAL, HTTP_CACHE_WAIT_INTERVAL,
+    HttpCacheConfig, HttpCacheRangeKind, HttpRingCache, HttpRingCacheShared, HttpRingCacheState,
+    RetainedPlaybackSpliceSource, http_ring_cache_download_loop,
+    http_ring_cache_side_download_loop, playback_cache_state_from_http_status,
+    reqwest_header_pairs,
 };
 
 impl HttpRingCache {
@@ -646,12 +647,20 @@ impl HttpRingCacheShared {
             .chunk_size
     }
 
-    pub(in crate::player::backend::ffmpeg::avio) fn range_request_bytes(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("HTTP stream cache poisoned")
-            .config
-            .range_request_bytes
+    pub(in crate::player::backend::ffmpeg::avio) fn playback_range_request_bytes(
+        &self,
+        offset: u64,
+    ) -> u64 {
+        let guard = self.state.lock().expect("HTTP stream cache poisoned");
+        let configured = guard.config.range_request_bytes.max(1);
+        if guard.active_range_kind == HttpCacheRangeKind::Playback
+            && offset == guard.base_offset
+            && guard.base_offset == guard.next_offset
+            && guard.active_request_start_offset == guard.base_offset
+        {
+            return configured.min(HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES.max(1));
+        }
+        configured
     }
 
     pub(in crate::player::backend::ffmpeg::avio) fn side_range_request_bytes(

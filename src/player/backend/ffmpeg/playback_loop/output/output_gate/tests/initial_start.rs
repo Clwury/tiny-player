@@ -1,6 +1,6 @@
 use super::super::{
-    AUDIO_OUTPUT_DELAY_LIMIT, DecodedAudio, InitialOutputSyncDecision, PlaybackOutputScheduler,
-    PlaybackOutputState, audio_output_contiguous_start_timeline_nsecs,
+    AUDIO_OUTPUT_STEADY_TARGET_DURATION, DecodedAudio, InitialOutputSyncDecision,
+    PlaybackOutputScheduler, PlaybackOutputState, audio_output_contiguous_start_timeline_nsecs,
     audio_output_flush_until_timeline_nsecs, duration_nsecs,
     initial_delayed_audio_start_timeline_nsecs,
 };
@@ -12,18 +12,28 @@ fn audio_output_flush_until_caps_total_pending_audio() {
     let video_lead_until = 12_000_000_000;
 
     assert_eq!(
-        audio_output_flush_until_timeline_nsecs(snapshot, video_lead_until),
-        10_000_000_000 + duration_nsecs(AUDIO_OUTPUT_DELAY_LIMIT)
+        audio_output_flush_until_timeline_nsecs(
+            snapshot,
+            video_lead_until,
+            AUDIO_OUTPUT_STEADY_TARGET_DURATION
+        ),
+        10_000_000_000 + duration_nsecs(AUDIO_OUTPUT_STEADY_TARGET_DURATION)
     );
 }
 #[test]
 fn audio_output_flush_until_stops_when_output_already_past_limit() {
-    let snapshot = audio_snapshot(10_000_000_000, duration_nsecs(AUDIO_OUTPUT_DELAY_LIMIT) + 1);
+    let snapshot = audio_snapshot(
+        10_000_000_000,
+        duration_nsecs(AUDIO_OUTPUT_STEADY_TARGET_DURATION) + 1,
+    );
     let video_lead_until = 12_000_000_000;
 
     assert!(
-        audio_output_flush_until_timeline_nsecs(snapshot, video_lead_until)
-            < audio_output_contiguous_start_timeline_nsecs(snapshot)
+        audio_output_flush_until_timeline_nsecs(
+            snapshot,
+            video_lead_until,
+            AUDIO_OUTPUT_STEADY_TARGET_DURATION
+        ) < audio_output_contiguous_start_timeline_nsecs(snapshot)
     );
 }
 #[test]

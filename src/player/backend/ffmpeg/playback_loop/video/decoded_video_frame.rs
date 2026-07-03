@@ -8,8 +8,15 @@ use crate::player::{
     render_host::{PlaybackSessionId, VideoOutputQueue},
 };
 
+use ffmpeg_sys_next as ffi;
+
 use super::audio_decode_pipeline::AudioDecodePipeline;
-use super::video_decode_pipeline::VideoDecodePipeline;
+use super::scheduled_video_queue::queued_video_continuity_gap_threshold_nsecs;
+use super::video_decode_pipeline::{
+    HevcAdmittedVideoProgressObservation, HevcDecodeChainRecoveryAction,
+    HevcDecodePacketObservation, HevcDecodedFrameGapObservation,
+    HevcSeekPrerollProgressObservation, VideoDecodePipeline,
+};
 use super::video_decode_recovery_service::{
     VideoDecodeRecoveryServiceContext, service_video_decode_recovery_result,
 };
@@ -22,7 +29,8 @@ use super::video_frame_prepare_admission_service::{
     enqueue_decoded_video_frame_prepare, service_decoded_video_frame_start,
 };
 use super::video_frame_prepare_worker::{
-    VideoFramePrepareEnqueueResult, VideoFramePrepareResult, VideoFramePrepareWorker,
+    VideoFramePrepareDiagnosticContext, VideoFramePrepareEnqueueResult, VideoFramePrepareResult,
+    VideoFramePrepareWorker,
 };
 use super::{
     AudioOutput, AvPacket, BufferedReporter, CORRUPT_VIDEO_FRAME_RECOVERY_ERROR,
@@ -38,6 +46,8 @@ pub(in crate::player::backend::ffmpeg) enum DecodedVideoFrameStartAction {
     Use { realign: bool },
 }
 
+const DECODED_VIDEO_FRAME_START_TOLERANCE_NSECS: u64 = 5_000_000;
+
 pub(in crate::player::backend::ffmpeg) fn decoded_video_frame_start_action(
     frame_timeline_nsecs: u64,
     current_start_position_nsecs: u64,
@@ -46,7 +56,9 @@ pub(in crate::player::backend::ffmpeg) fn decoded_video_frame_start_action(
     if recovery_realign {
         return DecodedVideoFrameStartAction::Use { realign: true };
     }
-    if frame_timeline_nsecs < current_start_position_nsecs {
+    let earliest_accepted_start_nsecs =
+        current_start_position_nsecs.saturating_sub(DECODED_VIDEO_FRAME_START_TOLERANCE_NSECS);
+    if frame_timeline_nsecs < earliest_accepted_start_nsecs {
         return DecodedVideoFrameStartAction::DropBeforeStart;
     }
     DecodedVideoFrameStartAction::Use { realign: false }
@@ -56,7 +68,8 @@ pub(in crate::player::backend::ffmpeg) fn decoded_video_frame_start_action(
 pub(super) fn service_decoded_video_frame<F>(
     decoded_frame: VideoDecodedFrame,
     generation: u64,
-    video_decode_pipeline: &VideoDecodePipeline,
+    video_decode_pipeline: &mut VideoDecodePipeline,
+    video_stream: StreamInfo,
     video_decode_recovery: &mut VideoDecodeRecovery,
     decoded_video_frame_count: &mut u64,
     dropped_video_frames_before_start_count: &mut u64,
@@ -110,24 +123,159 @@ where
         event_tx,
     ) {
         DecodedVideoFrameStartStatus::Ready(frame) => frame,
-        DecodedVideoFrameStartStatus::DroppedBeforeStart => return Ok(true),
+        DecodedVideoFrameStartStatus::DroppedBeforeStart => {
+            let output_snapshot = output_scheduler.snapshot();
+            if output_snapshot.rebuffering
+                || output_snapshot.first_video_frame_pending
+                || output_snapshot.queued_video_frames == 0
+            {
+                let video_decode_snapshot = video_decode_pipeline.snapshot();
+                let prepare_snapshot = video_frame_prepare_worker.snapshot();
+                tracing::debug!(
+                    session_id = ?session_id,
+                    generation,
+                    decoded_video_frame_count = *decoded_video_frame_count,
+                    current_start_position_nsecs = *current_start_position_nsecs,
+                    video_decode_state = ?video_decode_snapshot.state,
+                    video_decode_queued_frames = video_decode_snapshot.queued_frames,
+                    video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+                    video_decode_completed_packets = video_decode_snapshot.completed_packets,
+                    video_prepare_state = ?prepare_snapshot.state,
+                    video_prepare_pending_input_frames = prepare_snapshot.pending_input_frames,
+                    video_prepare_in_flight_frames = prepare_snapshot.in_flight_frames,
+                    video_prepare_completed_frames = prepare_snapshot.completed_frames,
+                    output_state = ?output_snapshot.state,
+                    output_first_video_frame_pending = output_snapshot.first_video_frame_pending,
+                    output_rebuffering = output_snapshot.rebuffering,
+                    queued_video_frames = output_snapshot.queued_video_frames,
+                    queued_video_range = ?output_snapshot.queued_video_range_nsecs,
+                    "decoded FFmpeg video frame dropped before prepare admission"
+                );
+            }
+            return Ok(true);
+        }
+        DecodedVideoFrameStartStatus::SeekPrerollBeforeStart(progress) => {
+            video_decode_pipeline.observe_hevc_seek_preroll_progress(
+                HevcSeekPrerollProgressObservation {
+                    session_id,
+                    codec_id: video_stream.codec_id,
+                    frame_timeline_nsecs: progress.timeline_nsecs,
+                    target_nsecs: progress.target_nsecs,
+                    preroll_frames: progress.preroll_frames,
+                },
+            );
+            let output_snapshot = output_scheduler.snapshot();
+            if output_snapshot.rebuffering
+                || output_snapshot.first_video_frame_pending
+                || output_snapshot.queued_video_frames == 0
+            {
+                let video_decode_snapshot = video_decode_pipeline.snapshot();
+                let prepare_snapshot = video_frame_prepare_worker.snapshot();
+                tracing::debug!(
+                    session_id = ?session_id,
+                    generation,
+                    decoded_video_frame_count = *decoded_video_frame_count,
+                    timeline_nsecs = progress.timeline_nsecs,
+                    target_nsecs = progress.target_nsecs,
+                    preroll_frames = progress.preroll_frames,
+                    current_start_position_nsecs = *current_start_position_nsecs,
+                    video_decode_state = ?video_decode_snapshot.state,
+                    video_decode_queued_frames = video_decode_snapshot.queued_frames,
+                    video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+                    video_decode_completed_packets = video_decode_snapshot.completed_packets,
+                    video_prepare_state = ?prepare_snapshot.state,
+                    video_prepare_pending_input_frames = prepare_snapshot.pending_input_frames,
+                    video_prepare_in_flight_frames = prepare_snapshot.in_flight_frames,
+                    video_prepare_completed_frames = prepare_snapshot.completed_frames,
+                    output_state = ?output_snapshot.state,
+                    output_first_video_frame_pending = output_snapshot.first_video_frame_pending,
+                    output_rebuffering = output_snapshot.rebuffering,
+                    queued_video_frames = output_snapshot.queued_video_frames,
+                    queued_video_range = ?output_snapshot.queued_video_range_nsecs,
+                    "decoded FFmpeg video frame consumed as seek preroll before prepare admission"
+                );
+            }
+            return Ok(true);
+        }
         DecodedVideoFrameStartStatus::DroppedCorrupt => {
             return Err(CORRUPT_VIDEO_FRAME_RECOVERY_ERROR.to_string());
         }
     };
     let frame_pts = start_frame.frame_pts;
     let timeline_nsecs = start_frame.timeline_nsecs;
+    let output_snapshot = output_scheduler.snapshot();
+    let force_completion_reason = if *decoded_video_frame_count == 1 {
+        "first_decoded_video_frame"
+    } else if output_snapshot.rebuffering {
+        "output_rebuffering"
+    } else if output_snapshot.first_video_frame_pending {
+        "first_video_frame_pending"
+    } else if output_snapshot.queued_video_frames == 0 {
+        "empty_video_output"
+    } else {
+        "normal"
+    };
+    let force_completion_log = force_completion_reason != "normal";
+    let diagnostic = VideoFramePrepareDiagnosticContext::from_output_snapshot(
+        session_id,
+        *decoded_video_frame_count,
+        force_completion_log,
+        force_completion_reason,
+        output_snapshot,
+    );
 
-    match enqueue_decoded_video_frame_prepare(
+    let prepare_status = enqueue_decoded_video_frame_prepare(
         decoded_frame,
         generation,
+        diagnostic,
         frame_pts,
         timeline_nsecs,
         video_frame_duration_nsecs,
         dovi_pipeline,
         video_frame_prepare_worker,
         &video_decode_pipeline.info().convert_context,
-    )? {
+    )?;
+    if force_completion_log || prepare_status != DecodedVideoFramePrepareStatus::Queued {
+        let prepare_snapshot = video_frame_prepare_worker.snapshot();
+        let video_decode_snapshot = video_decode_pipeline.snapshot();
+        let audio_output_snapshot = audio_output.and_then(|output| output.snapshot().ok());
+        tracing::debug!(
+            session_id = ?session_id,
+            generation,
+            decoded_video_frame_count = *decoded_video_frame_count,
+            prepare_status = ?prepare_status,
+            frame_pts_nsecs = frame_pts.nsecs,
+            timeline_nsecs,
+            duration_nsecs = video_frame_duration_nsecs,
+            current_start_position_nsecs = *current_start_position_nsecs,
+            force_completion_log,
+            force_completion_reason,
+            video_decode_state = ?video_decode_snapshot.state,
+            video_decode_queued_frames = video_decode_snapshot.queued_frames,
+            video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+            video_decode_completed_packets = video_decode_snapshot.completed_packets,
+            video_prepare_state = ?prepare_snapshot.state,
+            video_prepare_pending_input_frames = prepare_snapshot.pending_input_frames,
+            video_prepare_pending_input_capacity = prepare_snapshot.pending_input_capacity,
+            video_prepare_pending_input_full = prepare_snapshot.pending_input_full(),
+            video_prepare_in_flight_frames = prepare_snapshot.in_flight_frames,
+            video_prepare_completed_frames = prepare_snapshot.completed_frames,
+            video_prepare_command_queue_capacity = prepare_snapshot.command_queue_capacity,
+            output_state = ?output_snapshot.state,
+            output_first_video_frame_pending = output_snapshot.first_video_frame_pending,
+            output_rebuffering = output_snapshot.rebuffering,
+            queued_video_frames = output_snapshot.queued_video_frames,
+            queued_video_ms = output_snapshot.queued_video_duration_nsecs as f64 / 1_000_000.0,
+            queued_video_range = ?output_snapshot.queued_video_range_nsecs,
+            pending_start_audio_ms = output_snapshot.pending_start_audio_nsecs as f64 / 1_000_000.0,
+            audio_output_pending_ms = ?audio_output_snapshot
+                .map(|snapshot| snapshot.total_pending_nsecs as f64 / 1_000_000.0),
+            audio_output_queue_ms = ?audio_output_snapshot
+                .map(|snapshot| snapshot.queue_pending_nsecs as f64 / 1_000_000.0),
+            "FFmpeg decoded video frame prepare enqueue decision"
+        );
+    }
+    match prepare_status {
         DecodedVideoFramePrepareStatus::Queued => Ok(true),
         DecodedVideoFramePrepareStatus::Backpressured => Ok(false),
         DecodedVideoFramePrepareStatus::DroppedCorrupt => {
@@ -292,6 +440,7 @@ pub(super) fn drain_ready_video_decode_output<F>(
     position_reporter: &mut PositionReporter,
     subtitle_pipeline: &mut SubtitlePipeline,
     video_frame_prepare_worker: &mut VideoFramePrepareWorker,
+    video_decode_skip_nonref_active: &mut bool,
     current_start_position_nsecs: &mut u64,
     mut demux_reader_watermark: F,
 ) -> std::result::Result<bool, String>
@@ -331,6 +480,49 @@ where
             made_progress = true;
             match prepare_result.result {
                 Ok(prepared_frame) => {
+                    let admitted_frame_timeline_nsecs = prepared_frame.timeline_nsecs;
+                    let before_queue_end_nsecs = output_scheduler
+                        .scheduled_video_queue
+                        .range_nsecs()
+                        .map(|(_, end)| end);
+                    let previous_frame_timing =
+                        output_scheduler.scheduled_video_queue.back_timing_nsecs();
+                    let previous_expected_next_nsecs =
+                        previous_frame_timing.map(|(pts, duration)| pts.saturating_add(duration));
+                    let previous_gap_nsecs = previous_expected_next_nsecs.map(|expected| {
+                        i128::from(prepared_frame.timeline_nsecs)
+                            .saturating_sub(i128::from(expected))
+                    });
+                    let max_gap_nsecs = previous_frame_timing
+                        .map(|(_, duration)| queued_video_continuity_gap_threshold_nsecs(duration))
+                        .unwrap_or_else(|| {
+                            queued_video_continuity_gap_threshold_nsecs(
+                                prepared_frame.duration_nsecs,
+                            )
+                        });
+                    let audio_snapshot = audio_output.and_then(|output| output.snapshot().ok());
+                    let audio_played_timeline_nsecs =
+                        audio_snapshot.map(|snapshot| snapshot.played_timeline_nsecs);
+                    let output_snapshot =
+                        output_scheduler.snapshot_for_played_until(audio_played_timeline_nsecs);
+                    let fallback_target_nsecs = previous_expected_next_nsecs
+                        .or(audio_played_timeline_nsecs)
+                        .unwrap_or(*current_start_position_nsecs);
+                    video_decode_pipeline.observe_hevc_decoded_frame_gap(
+                        HevcDecodedFrameGapObservation {
+                            session_id,
+                            codec_id: video_stream.codec_id,
+                            timeline_nsecs: prepared_frame.timeline_nsecs,
+                            duration_nsecs: prepared_frame.duration_nsecs,
+                            previous_expected_next_nsecs,
+                            previous_gap_nsecs,
+                            max_gap_nsecs,
+                            fallback_target_nsecs,
+                            audio_played_timeline_nsecs,
+                            recovery_waiting: video_decode_recovery.waiting_for_keyframe(),
+                            output_snapshot,
+                        },
+                    );
                     let stage_started_at = Instant::now();
                     admit_prepared_video_frame(PreparedVideoFrameAdmissionContext {
                         prepared_frame,
@@ -347,8 +539,23 @@ where
                         position_reporter,
                         subtitle_pipeline,
                         current_start_position_nsecs,
+                        video_is_hevc: video_stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC,
                         demux_reader_watermark: &mut demux_reader_watermark,
                     })?;
+                    let after_queue_end_nsecs = output_scheduler
+                        .scheduled_video_queue
+                        .range_nsecs()
+                        .map(|(_, end)| end);
+                    video_decode_pipeline.observe_hevc_admitted_video_progress(
+                        HevcAdmittedVideoProgressObservation {
+                            session_id,
+                            codec_id: video_stream.codec_id,
+                            frame_timeline_nsecs: admitted_frame_timeline_nsecs,
+                            current_start_position_nsecs: *current_start_position_nsecs,
+                            before_queue_end_nsecs,
+                            after_queue_end_nsecs,
+                        },
+                    );
                     timing.admit_prepared_frame += stage_started_at.elapsed();
                 }
                 Err(error) => {
@@ -368,6 +575,7 @@ where
                         video_stream,
                         playback_generation,
                         video_decode_pipeline,
+                        video_decode_skip_nonref_active,
                         audio_decode_pipeline: audio_decode_pipeline.as_deref_mut(),
                         subtitle_pipeline,
                         video_decode_recovery,
@@ -383,6 +591,15 @@ where
             }
             continue;
         }
+        log_video_frame_prepare_result_pending(
+            session_id,
+            front_generation,
+            timing.iterations,
+            video_decode_pipeline,
+            video_frame_prepare_worker,
+            output_scheduler,
+            audio_output,
+        );
 
         let stage_started_at = Instant::now();
         let decoded_frame = video_decode_pipeline.poll_frame(front_generation)?;
@@ -395,6 +612,7 @@ where
                 decoded_frame,
                 front_generation,
                 video_decode_pipeline,
+                video_stream,
                 video_decode_recovery,
                 decoded_video_frame_count,
                 dropped_video_frames_before_start_count,
@@ -438,6 +656,7 @@ where
                         video_stream,
                         playback_generation,
                         video_decode_pipeline,
+                        video_decode_skip_nonref_active,
                         audio_decode_pipeline: audio_decode_pipeline.as_deref_mut(),
                         subtitle_pipeline,
                         video_decode_recovery,
@@ -501,6 +720,40 @@ where
                 "FFmpeg video decode packet completed slowly"
             );
         }
+        let output_snapshot = output_scheduler.snapshot();
+        let demux_watermark = demux_reader_watermark();
+        let fallback_target_nsecs = audio_output
+            .and_then(|output| output.snapshot().ok())
+            .map(|snapshot| snapshot.played_timeline_nsecs)
+            .or_else(|| {
+                output_snapshot
+                    .queued_video_range_nsecs
+                    .map(|(start, _)| start)
+            })
+            .unwrap_or(*current_start_position_nsecs);
+        let hevc_recovery_action =
+            video_decode_pipeline.observe_hevc_decode_packet_status(HevcDecodePacketObservation {
+                status: &status,
+                packet: &pending_packet.packet,
+                video_stream,
+                output_snapshot,
+                demux_watermark,
+                has_audio_output: audio_output.is_some(),
+                fallback_target_nsecs,
+                session_id,
+            });
+        if hevc_recovery_action == HevcDecodeChainRecoveryAction::SoftRecovery {
+            if *video_decode_skip_nonref_active {
+                video_decode_pipeline.set_skip_nonref_frames(false)?;
+                *video_decode_skip_nonref_active = false;
+            }
+            let generation = playback_generation.advance();
+            video_decode_pipeline.flush_buffers(generation)?;
+            video_decode_recovery.begin_with_realign(true);
+            video_decode_pipeline.clear_packets();
+            dovi_pipeline.reset();
+            break;
+        }
         let stage_started_at = Instant::now();
         service_video_decode_recovery_result(VideoDecodeRecoveryServiceContext {
             result: status.result,
@@ -509,6 +762,7 @@ where
             video_stream,
             playback_generation,
             video_decode_pipeline,
+            video_decode_skip_nonref_active,
             audio_decode_pipeline: audio_decode_pipeline.as_deref_mut(),
             subtitle_pipeline,
             video_decode_recovery,
@@ -528,4 +782,57 @@ where
         output_scheduler,
     );
     Ok(made_progress)
+}
+
+fn log_video_frame_prepare_result_pending(
+    session_id: PlaybackSessionId,
+    front_generation: u64,
+    iterations: u64,
+    video_decode_pipeline: &VideoDecodePipeline,
+    video_frame_prepare_worker: &VideoFramePrepareWorker,
+    output_scheduler: &PlaybackOutputScheduler,
+    audio_output: Option<&AudioOutput>,
+) {
+    let prepare_snapshot = video_frame_prepare_worker.snapshot();
+    let output_snapshot = output_scheduler.snapshot();
+    if !output_snapshot.rebuffering
+        && !output_snapshot.first_video_frame_pending
+        && output_snapshot.queued_video_frames > 0
+        && prepare_snapshot.completed_frames == 0
+    {
+        return;
+    }
+
+    let video_decode_snapshot = video_decode_pipeline.snapshot();
+    let audio_output_snapshot = audio_output.and_then(|output| output.snapshot().ok());
+    tracing::debug!(
+        session_id = ?session_id,
+        front_generation,
+        iterations,
+        video_prepare_state = ?prepare_snapshot.state,
+        video_prepare_pending_input_frames = prepare_snapshot.pending_input_frames,
+        video_prepare_pending_input_capacity = prepare_snapshot.pending_input_capacity,
+        video_prepare_pending_input_full = prepare_snapshot.pending_input_full(),
+        video_prepare_in_flight_frames = prepare_snapshot.in_flight_frames,
+        video_prepare_completed_frames = prepare_snapshot.completed_frames,
+        video_prepare_command_queue_capacity = prepare_snapshot.command_queue_capacity,
+        video_decode_state = ?video_decode_snapshot.state,
+        video_decode_queued_frames = video_decode_snapshot.queued_frames,
+        video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+        video_decode_completed_packets = video_decode_snapshot.completed_packets,
+        output_state = ?output_snapshot.state,
+        output_first_video_frame_pending = output_snapshot.first_video_frame_pending,
+        output_rebuffering = output_snapshot.rebuffering,
+        queued_video_frames = output_snapshot.queued_video_frames,
+        queued_video_range = ?output_snapshot.queued_video_range_nsecs,
+        queued_video_forward_ms = ?output_snapshot
+            .queued_video_forward_nsecs
+            .map(|duration| duration as f64 / 1_000_000.0),
+        pending_start_audio_ms = output_snapshot.pending_start_audio_nsecs as f64 / 1_000_000.0,
+        audio_output_pending_ms = ?audio_output_snapshot
+            .map(|snapshot| snapshot.total_pending_nsecs as f64 / 1_000_000.0),
+        audio_output_queue_ms = ?audio_output_snapshot
+            .map(|snapshot| snapshot.queue_pending_nsecs as f64 / 1_000_000.0),
+        "FFmpeg video frame prepare result not ready for front generation"
+    );
 }

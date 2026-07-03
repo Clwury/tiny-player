@@ -53,6 +53,54 @@ impl DemuxPacketCacheState {
         self.read_range().is_eof
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn current_generation_range_view(
+        &self,
+        range: &DemuxCachedRange,
+    ) -> (VecDeque<u64>, BTreeMap<c_int, VecDeque<u64>>) {
+        self.range_view_excluding_blocked_generation(range, self.generation)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn next_generation_range_view(
+        &self,
+        range: &DemuxCachedRange,
+    ) -> (VecDeque<u64>, BTreeMap<c_int, VecDeque<u64>>) {
+        self.range_view_excluding_blocked_generation(range, self.generation.saturating_add(1))
+    }
+
+    fn range_view_excluding_blocked_generation(
+        &self,
+        range: &DemuxCachedRange,
+        generation: u64,
+    ) -> (VecDeque<u64>, BTreeMap<c_int, VecDeque<u64>>) {
+        let global_order = range
+            .global_order
+            .iter()
+            .copied()
+            .filter(|packet_id| {
+                self.low_level_append_blocked_packet_generations
+                    .get(packet_id)
+                    .is_none_or(|blocked_generation| *blocked_generation != generation)
+            })
+            .collect::<VecDeque<_>>();
+        let stream_queues = range
+            .stream_queues
+            .iter()
+            .filter_map(|(stream_index, queue)| {
+                let queue = queue
+                    .iter()
+                    .copied()
+                    .filter(|packet_id| {
+                        self.low_level_append_blocked_packet_generations
+                            .get(packet_id)
+                            .is_none_or(|blocked_generation| *blocked_generation != generation)
+                    })
+                    .collect::<VecDeque<_>>();
+                (!queue.is_empty()).then_some((*stream_index, queue))
+            })
+            .collect::<BTreeMap<_, _>>();
+        (global_order, stream_queues)
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn detached_append_range_id(
         &self,
     ) -> Option<RangeId> {
@@ -73,16 +121,7 @@ impl DemuxPacketCacheState {
         let range_id = self.next_range_id();
         self.ranges.insert(
             range_id,
-            DemuxCachedRange {
-                id: range_id,
-                global_order: VecDeque::new(),
-                stream_queues: BTreeMap::new(),
-                sparse_stream_pruned_until_nsecs: BTreeMap::new(),
-                stream_boundaries: BTreeMap::new(),
-                is_bof,
-                is_eof: false,
-                last_used_generation: self.generation,
-            },
+            DemuxCachedRange::new(range_id, is_bof, self.generation),
         );
         self.read_range_id = range_id;
         self.append_range_id = range_id;
@@ -99,16 +138,7 @@ impl DemuxPacketCacheState {
         self.append_range_id = range_id;
         self.ranges.insert(
             range_id,
-            DemuxCachedRange {
-                id: range_id,
-                global_order: VecDeque::new(),
-                stream_queues: BTreeMap::new(),
-                sparse_stream_pruned_until_nsecs: BTreeMap::new(),
-                stream_boundaries: BTreeMap::new(),
-                is_bof: false,
-                is_eof: false,
-                last_used_generation: self.generation,
-            },
+            DemuxCachedRange::new(range_id, false, self.generation),
         );
     }
 
@@ -178,6 +208,8 @@ impl DemuxPacketCacheState {
     ) {
         for packet_id in range.global_order {
             self.consumed_packet_ids.remove(&packet_id);
+            self.low_level_append_blocked_packet_generations
+                .remove(&packet_id);
             if let Some(packet) = self.packets.remove(&packet_id) {
                 self.cached_bytes = self.cached_bytes.saturating_sub(packet.byte_len);
             }
@@ -194,6 +226,7 @@ impl DemuxPacketCacheState {
         if !is_bof {
             range.is_bof = false;
         }
+        range.mark_seekable_dirty();
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_range_eof(
@@ -213,6 +246,7 @@ impl DemuxPacketCacheState {
         for stream_index in stream_indices {
             range.ensure_stream_boundary(stream_index).is_eof = is_eof;
         }
+        range.mark_seekable_dirty();
     }
 
     #[cfg(test)]

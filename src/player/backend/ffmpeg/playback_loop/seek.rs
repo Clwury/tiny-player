@@ -45,12 +45,12 @@ mod seek_preroll_tests {
     };
 
     #[test]
-    fn hevc_low_level_seek_keeps_preroll_while_cached_seek_uses_recovery_point() {
+    fn hevc_cached_seek_uses_half_second_preroll_before_safe_point() {
         assert_eq!(
             seek_preroll_policy(ffi::AVCodecID::AV_CODEC_ID_HEVC),
             SeekPrerollPolicy {
                 low_level_nsecs: 1_000_000_000,
-                cached_nsecs: 0,
+                cached_nsecs: 500_000_000,
             }
         );
         assert_eq!(
@@ -59,7 +59,7 @@ mod seek_preroll_tests {
         );
         assert_eq!(
             video_cached_seek_preroll_nsecs(ffi::AVCodecID::AV_CODEC_ID_HEVC),
-            0
+            500_000_000
         );
         assert!(
             (preroll_seek_position_seconds(ffi::AVCodecID::AV_CODEC_ID_HEVC, 62.36) - 61.36).abs()

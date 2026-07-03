@@ -16,6 +16,10 @@ pub(super) fn service_video_decode_recovery_result(
         context.realign_after_decode_recovery,
     );
     if context.video_decode_recovery.waiting_for_keyframe() {
+        context
+            .video_decode_pipeline
+            .set_skip_nonref_frames(false)?;
+        *context.video_decode_skip_nonref_active = false;
         if context.realign_after_decode_recovery {
             context.output_scheduler.reset(context.control);
             let generation = context.playback_generation.advance();
@@ -37,6 +41,7 @@ pub(super) struct VideoDecodeRecoveryServiceContext<'a> {
     pub(super) video_stream: StreamInfo,
     pub(super) playback_generation: &'a mut PlaybackGeneration,
     pub(super) video_decode_pipeline: &'a mut VideoDecodePipeline,
+    pub(super) video_decode_skip_nonref_active: &'a mut bool,
     pub(super) audio_decode_pipeline: Option<&'a mut AudioDecodePipeline>,
     pub(super) subtitle_pipeline: &'a mut SubtitlePipeline,
     pub(super) video_decode_recovery: &'a mut VideoDecodeRecovery,

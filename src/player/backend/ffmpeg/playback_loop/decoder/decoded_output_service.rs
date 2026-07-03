@@ -49,6 +49,7 @@ impl VideoDecodeOutputService {
             &mut context.pipeline.position_reporter,
             &mut context.pipeline.subtitle_pipeline,
             &mut context.pipeline.video_frame_prepare_worker,
+            &mut context.pipeline.video_decode_skip_nonref_active,
             &mut context.pipeline.current_start_position_nsecs,
             context.demux_reader_watermark,
         )

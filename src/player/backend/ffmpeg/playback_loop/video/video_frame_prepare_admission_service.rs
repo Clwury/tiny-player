@@ -8,9 +8,11 @@ use crate::player::{
 };
 
 use super::decoded_video_frame::{DecodedVideoFrameStartAction, decoded_video_frame_start_action};
+use super::video_decode_pipeline::SeekPrerollFrameProgress;
 use super::video_decode_worker::VideoDecodedFrame;
 use super::video_frame_prepare_worker::{
-    VideoFramePrepareEnqueueResult, VideoFramePrepareInput, VideoFramePrepareWorker,
+    VideoFramePrepareDiagnosticContext, VideoFramePrepareEnqueueResult, VideoFramePrepareInput,
+    VideoFramePrepareWorker,
 };
 use super::{
     AudioOutput, BufferedReporter, DoviPipeline, FfmpegControl, PlaybackOutputScheduler,
@@ -27,9 +29,11 @@ pub(super) struct DecodedVideoFrameStartFrame {
 pub(super) enum DecodedVideoFrameStartStatus {
     Ready(DecodedVideoFrameStartFrame),
     DroppedBeforeStart,
+    SeekPrerollBeforeStart(SeekPrerollFrameProgress),
     DroppedCorrupt,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DecodedVideoFramePrepareStatus {
     Queued,
     Backpressured,
@@ -93,6 +97,28 @@ pub(super) fn service_decoded_video_frame_start(
     );
     match start_action {
         DecodedVideoFrameStartAction::DropBeforeStart => {
+            if let Some(progress) =
+                video_decode_recovery.observe_seek_preroll_frame(timestamp.timeline_nsecs)
+            {
+                if progress.preroll_frames == 1 || progress.preroll_frames.is_multiple_of(60) {
+                    let output_snapshot = output_scheduler.snapshot();
+                    tracing::debug!(
+                        frame_count,
+                        preroll_frames = progress.preroll_frames,
+                        raw_timestamp,
+                        timeline_nsecs = timestamp.timeline_nsecs,
+                        target_nsecs = progress.target_nsecs,
+                        first_preroll_frame_nsecs = ?progress.first_preroll_frame_nsecs,
+                        last_preroll_frame_nsecs = ?progress.last_preroll_frame_nsecs,
+                        current_start_position_nsecs = *current_start_position_nsecs,
+                        output_first_video_frame_pending = output_snapshot.first_video_frame_pending,
+                        recovery_realign_on_next_frame = realign_on_next_frame,
+                        "dropping decoded FFmpeg video frame as seek preroll before playback target"
+                    );
+                }
+                dovi_pipeline.discard_frame(frame_pts);
+                return DecodedVideoFrameStartStatus::SeekPrerollBeforeStart(progress);
+            }
             *dropped_video_frames_before_start_count =
                 dropped_video_frames_before_start_count.saturating_add(1);
             if *dropped_video_frames_before_start_count == 1 {
@@ -141,6 +167,19 @@ pub(super) fn service_decoded_video_frame_start(
                 subtitle_pipeline.reset_cues_for_position(frame_pts.nsecs);
                 buffered_reporter.reset_to(nsecs_to_seconds(frame_pts.nsecs), session_id, event_tx);
             }
+            if let Some(progress) =
+                video_decode_recovery.finish_seek_bootstrap_after_target_frame(frame_pts.nsecs)
+            {
+                tracing::debug!(
+                    frame_count,
+                    pts = frame_pts.nsecs,
+                    target_nsecs = progress.target_nsecs,
+                    preroll_frames = progress.preroll_frames,
+                    first_preroll_frame_nsecs = ?progress.first_preroll_frame_nsecs,
+                    last_preroll_frame_nsecs = ?progress.last_preroll_frame_nsecs,
+                    "completed FFmpeg seek preroll bootstrap at first admitted target video frame"
+                );
+            }
             DecodedVideoFrameStartStatus::Ready(DecodedVideoFrameStartFrame {
                 timeline_nsecs: timestamp.timeline_nsecs,
                 frame_pts,
@@ -179,6 +218,7 @@ pub(super) fn service_drained_video_frame_start(
 pub(super) fn enqueue_decoded_video_frame_prepare(
     decoded_frame: VideoDecodedFrame,
     generation: u64,
+    diagnostic: VideoFramePrepareDiagnosticContext,
     frame_pts: FramePts,
     timeline_nsecs: u64,
     duration_nsecs: u64,
@@ -194,6 +234,7 @@ pub(super) fn enqueue_decoded_video_frame_prepare(
     let dovi_metadata = dovi_pipeline.metadata_for_decoded_frame(frame, frame_pts);
     match video_frame_prepare_worker.try_enqueue(VideoFramePrepareInput {
         generation,
+        diagnostic,
         frame: decoded_frame,
         frame_pts,
         timeline_nsecs,

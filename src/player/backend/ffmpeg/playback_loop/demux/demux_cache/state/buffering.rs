@@ -141,12 +141,22 @@ impl DemuxPacketCacheState {
             .cached_timeline_range()
             .map(|(_, buffered_until_nsecs)| buffered_until_nsecs);
         let detached_end = self.detached_append_range().and_then(|range| {
-            Self::cached_timeline_range_in_packet_range(
-                &self.packets,
-                self.timeline_anchor_stream_index,
-                &range.stream_queues,
-            )
-            .map(|(_, buffered_until_nsecs)| buffered_until_nsecs)
+            if self.range_has_current_generation_blocked_packet(range) {
+                let (_, stream_queues) = self.current_generation_range_view(range);
+                Self::cached_timeline_range_in_packet_range(
+                    &self.packets,
+                    self.timeline_anchor_stream_index,
+                    &stream_queues,
+                )
+                .map(|(_, buffered_until_nsecs)| buffered_until_nsecs)
+            } else {
+                Self::cached_timeline_range_in_packet_range(
+                    &self.packets,
+                    self.timeline_anchor_stream_index,
+                    &range.stream_queues,
+                )
+                .map(|(_, buffered_until_nsecs)| buffered_until_nsecs)
+            }
         });
         active_end.into_iter().chain(detached_end).max()
     }

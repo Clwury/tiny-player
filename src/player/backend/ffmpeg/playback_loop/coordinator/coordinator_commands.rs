@@ -65,6 +65,7 @@ pub(super) fn service_playback_commands(
     if let Some(pending_track_selection) = drained_commands.pending_track_selection {
         let position_seconds =
             begin_track_switch(context.session, context.control, &pending_track_selection);
+        context.pipeline.clear_rebuffer_audio_realign_attempt();
         let switch_result = service_track_selection_command(
             &mut context,
             position_seconds,
@@ -80,10 +81,13 @@ pub(super) fn service_playback_commands(
     if let Some(pending_seek) = drained_commands.pending_seek {
         let position_seconds = begin_seek(context.session, context.control, &pending_seek);
         context.pipeline.current_start_position_nsecs = context.session.start_position_nsecs();
+        context.pipeline.clear_rebuffer_audio_realign_attempt();
         service_playback_seek_reset(PlaybackSeekResetContext {
             position_seconds,
             seek_mode: pending_seek.mode,
             seek_generation: pending_seek.generation,
+            force_low_level_seek: false,
+            low_level_seek_reason: None,
             session_id: context.session.id(),
             vo_queue: context.vo_queue,
             demux_cache: context.demux_cache,
@@ -138,6 +142,8 @@ fn service_track_selection_command(
         position_seconds,
         seek_mode: PlaybackSeekMode::Precise,
         seek_generation: pending_track_selection.generation,
+        force_low_level_seek: false,
+        low_level_seek_reason: None,
         session_id: context.session.id(),
         vo_queue: context.vo_queue,
         demux_cache: context.demux_cache,
@@ -145,6 +151,7 @@ fn service_track_selection_command(
         selected_tracks: Some(&selected_tracks),
         control: context.control,
     })?;
+    context.pipeline.clear_cached_seek_recovery_watchdog();
 
     context.pipeline.audio_decode_pipeline = None;
     let track_switch_pipeline_state = service_track_switch_pipelines(

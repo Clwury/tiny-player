@@ -1,8 +1,8 @@
 use super::playback_snapshot::PlaybackPipelineTelemetry;
 use super::playback_wait_service::{PlaybackPipelineWaitContext, PlaybackPipelineWaitService};
 use super::video_output_gate::{
-    service_audio_clocked_video_queue_if_playing, service_decode_backpressure_step,
-    service_video_clocked_video_queue_if_no_audio,
+    audio_clock_availability, service_audio_clocked_video_queue_if_playing,
+    service_decode_backpressure_step, service_video_clocked_video_queue_if_audio_clock_unavailable,
 };
 use std::{
     sync::{atomic::AtomicBool, mpsc::Sender},
@@ -145,11 +145,12 @@ fn service_output_queues_before_decoder_input(
         &mut context.pipeline.buffered_reporter,
     )?;
 
-    if service_video_clocked_video_queue_if_no_audio(
+    let audio_clock = audio_clock_availability(context.pipeline.audio_output.as_ref())?;
+    if service_video_clocked_video_queue_if_audio_clock_unavailable(
         &context.pipeline.scheduler,
         context.control,
         &mut context.pipeline.output_scheduler,
-        context.pipeline.audio_output.is_some(),
+        audio_clock,
         context.session_id,
         context.vo_queue,
         context.frame_presented,
@@ -198,9 +199,11 @@ fn service_output_queues_after_decoder_input_backpressure_or_wait(
     mut context: OutputQueueServiceContext<'_>,
 ) -> std::result::Result<OutputQueueServiceStatus, String> {
     observe_output_queue_stall(&mut context, "demux_decoder_backpressure");
+    let audio_clock = audio_clock_availability(context.pipeline.audio_output.as_ref())?;
     let made_progress = service_decode_backpressure_step(
         &context.pipeline.scheduler,
         context.pipeline.audio_output.as_ref(),
+        audio_clock,
         context.control,
         &mut context.pipeline.output_scheduler,
         context.session_id,
@@ -242,11 +245,12 @@ fn service_output_queues_after_demux_would_block(
         &mut context.pipeline.subtitle_pipeline,
         &mut context.pipeline.buffered_reporter,
     )?;
-    let video_progressed = service_video_clocked_video_queue_if_no_audio(
+    let audio_clock = audio_clock_availability(context.pipeline.audio_output.as_ref())?;
+    let video_progressed = service_video_clocked_video_queue_if_audio_clock_unavailable(
         &context.pipeline.scheduler,
         context.control,
         &mut context.pipeline.output_scheduler,
-        context.pipeline.audio_output.is_some(),
+        audio_clock,
         context.session_id,
         context.vo_queue,
         context.frame_presented,
@@ -274,6 +278,7 @@ fn observe_output_queue_stall(
         audio_output: context.pipeline.audio_output.as_ref(),
         vo_queue: context.vo_queue,
         playback_telemetry: &mut *context.playback_telemetry,
+        playback_loop_deadline: context.pipeline.playback_loop_deadline(),
     };
     context
         .playback_wait
@@ -297,6 +302,7 @@ fn wait_after_output_queue_stall(
             audio_output: context.pipeline.audio_output.as_ref(),
             vo_queue: context.vo_queue,
             playback_telemetry: &mut *context.playback_telemetry,
+            playback_loop_deadline: context.pipeline.playback_loop_deadline(),
         },
         stall_reason,
     );

@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use crate::player::backend::{DemuxCacheState, PlaybackCacheTimeRange};
+
 use super::{
     AvPacket, FormatContext, PlaybackCacheConfig, PlaybackCacheState, PlaybackSessionId, StreamInfo,
 };
@@ -53,6 +55,17 @@ pub(in crate::player::backend::ffmpeg::playback_loop) enum DemuxSeekResult {
     Requested,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxStreamReaderRealignResult {
+    pub(in crate::player::backend::ffmpeg::playback_loop) stream_index: i32,
+    pub(in crate::player::backend::ffmpeg::playback_loop) target_timeline_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop) old_packet_id: Option<PacketId>,
+    pub(in crate::player::backend::ffmpeg::playback_loop) old_start_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop) new_packet_id: PacketId,
+    pub(in crate::player::backend::ffmpeg::playback_loop) new_start_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop) new_end_nsecs: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxPacketAppendTiming {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) lock_wait: Duration,
@@ -72,6 +85,10 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxP
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) refresh_cache_pause:
         Duration,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) emit_state: Duration,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) emit_state_lock_wait:
+        Duration,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) emit_state_prepare: Duration,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) emit_state_send: Duration,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) notify: Duration,
 }
 
@@ -79,6 +96,8 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxP
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxPacketAppendOutcome {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) appended: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) force_cache_state_report:
+        bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) cache_state_emit_deferred_for_consumer:
         bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) timing:
         DemuxPacketAppendTiming,
@@ -97,6 +116,40 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct CacheS
         PlaybackCacheState,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) buffered_changed:
         Option<Option<f64>>,
+}
+
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxCacheReportSnapshot {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) session_id:
+        PlaybackSessionId,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) demux: DemuxCacheState,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) paused_for_cache: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) buffering_percent:
+        Option<u8>,
+}
+
+impl DemuxCacheReportSnapshot {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn into_cache_state(
+        self,
+    ) -> PlaybackCacheState {
+        PlaybackCacheState {
+            demux: self.demux,
+            byte: None,
+            paused_for_cache: self.paused_for_cache,
+            buffering_percent: self.buffering_percent,
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cache_end(
+        &self,
+    ) -> Option<f64> {
+        self.demux.cache_end
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_ranges(
+        &self,
+    ) -> &Vec<PlaybackCacheTimeRange> {
+        &self.demux.seekable_ranges
+    }
 }
 
 #[derive(Clone, Copy)]

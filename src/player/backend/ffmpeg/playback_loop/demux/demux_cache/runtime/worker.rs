@@ -123,6 +123,10 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
 
         let generation = shared.generation();
         let seek_generation = shared.control.seek_generation();
+        if shared.control.has_pending_seek() {
+            thread::yield_now();
+            continue;
+        }
         shared.mark_demux_read_started();
         let read_started_at = Instant::now();
         let read = unsafe { ffi::av_read_frame(input.as_mut_ptr(), packet.as_mut_ptr()) };
@@ -146,7 +150,19 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
         timeline.set_session_id(shared.session_id());
         if read >= 0 {
             match timeline.cache_packet(&packet, &shared.event_tx) {
-                Ok(Some(cached)) => shared.append_packet(cached),
+                Ok(Some(cached)) => {
+                    if shared.should_discard_demux_result(generation, seek_generation) {
+                        tracing::debug!(
+                            generation,
+                            current_generation = shared.generation(),
+                            seek_generation,
+                            current_seek_generation = shared.control.seek_generation(),
+                            "discarding FFmpeg demux packet before append after newer seek"
+                        );
+                    } else {
+                        shared.append_packet(cached);
+                    }
+                }
                 Ok(None) => {}
                 Err(error) => shared.set_error(error),
             }

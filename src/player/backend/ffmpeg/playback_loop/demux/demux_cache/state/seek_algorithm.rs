@@ -32,6 +32,7 @@ impl DemuxPacketCacheState {
         packets: &HashMap<u64, CachedDemuxPacket>,
         timeline_anchor_stream_index: c_int,
         cached_seek_preroll_nsecs: u64,
+        cached_seek_requires_safe_point: bool,
         range: DemuxPacketRangeView<'_>,
         target_nsecs: u64,
     ) -> Option<DemuxCachedSeekHit> {
@@ -51,9 +52,9 @@ impl DemuxPacketCacheState {
             target_nsecs,
         )?;
 
-        let mut covering_anchor_index = None;
-        let mut keyframe_anchor_index = None;
-        let mut preroll_keyframe_anchor_index = None;
+        let anchor_search_nsecs = seek_target_nsecs.saturating_sub(cached_seek_preroll_nsecs);
+        let mut covering_anchor_found = false;
+        let mut keyframe_anchor_packet_id = None;
         for packet_id in Self::timeline_anchor_packet_ids_in_packet_range(
             packets,
             timeline_anchor_stream_index,
@@ -62,43 +63,31 @@ impl DemuxPacketCacheState {
             let packet = packets.get(&packet_id)?;
             let start_nsecs = packet.start_nsecs?;
             let end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
-            let packet_index = range
-                .global_order
-                .iter()
-                .position(|candidate| *candidate == packet_id);
-            if packet.recovery_point && start_nsecs <= seek_target_nsecs {
-                if cached_seek_preroll_nsecs > 0 {
-                    preroll_keyframe_anchor_index = keyframe_anchor_index;
-                }
-                keyframe_anchor_index = packet_index;
+            if Self::packet_is_cached_seek_anchor(packet, cached_seek_requires_safe_point)
+                && start_nsecs <= anchor_search_nsecs
+            {
+                keyframe_anchor_packet_id = Some(packet_id);
             }
-            if covering_anchor_index.is_none()
+            if !covering_anchor_found
                 && start_nsecs <= seek_target_nsecs
                 && seek_target_nsecs <= end_nsecs
             {
-                covering_anchor_index = packet_index;
+                covering_anchor_found = true;
             }
         }
 
-        let _covering_anchor_index = covering_anchor_index?;
-        let read_index = if cached_seek_preroll_nsecs > 0 {
-            let read_index = preroll_keyframe_anchor_index?;
-            let required_preroll_start =
-                seek_target_nsecs.saturating_sub(cached_seek_preroll_nsecs);
-            let packet_id = *range.global_order.get(read_index)?;
-            let read_start_nsecs = packets.get(&packet_id)?.start_nsecs?;
-            if read_start_nsecs > required_preroll_start {
-                return None;
-            }
-            read_index
-        } else {
-            keyframe_anchor_index?
-        };
-        let anchor_packet_id = *range.global_order.get(read_index)?;
-        let anchor_seek_target_nsecs = packets
-            .get(&anchor_packet_id)?
-            .start_nsecs
-            .unwrap_or(seek_target_nsecs);
+        covering_anchor_found.then_some(())?;
+        let anchor_packet_id = keyframe_anchor_packet_id?;
+        let anchor_packet = packets.get(&anchor_packet_id)?;
+        let anchor_is_recovery_point = anchor_packet.recovery_point;
+        if !anchor_is_recovery_point {
+            return None;
+        }
+        let anchor_is_safe_seek_point = anchor_packet.safe_seek_point;
+        if cached_seek_requires_safe_point && !anchor_is_safe_seek_point {
+            return None;
+        }
+        let anchor_seek_target_nsecs = anchor_packet.start_nsecs.unwrap_or(seek_target_nsecs);
         let mut reader_heads = BTreeMap::new();
         for (stream_index, queue) in range.stream_queues {
             let packet_id = if *stream_index == timeline_anchor_stream_index {
@@ -116,10 +105,31 @@ impl DemuxPacketCacheState {
                 reader_heads.insert(*stream_index, packet_id);
             }
         }
+        let video_reader_head = reader_heads
+            .get(&timeline_anchor_stream_index)
+            .copied()
+            .filter(|packet_id| *packet_id == anchor_packet_id)?;
         Some(DemuxCachedSeekHit {
             reader_heads,
             buffered_until_nsecs,
+            target_nsecs: seek_target_nsecs,
+            anchor_nsecs: anchor_seek_target_nsecs,
+            anchor_packet_id,
+            video_reader_head,
+            anchor_is_recovery_point,
+            anchor_is_safe_seek_point,
+            requires_precise_trim: anchor_seek_target_nsecs < seek_target_nsecs,
         })
+    }
+
+    fn packet_is_cached_seek_anchor(
+        packet: &CachedDemuxPacket,
+        require_safe_seek_point: bool,
+    ) -> bool {
+        if require_safe_seek_point {
+            return packet.safe_seek_point;
+        }
+        packet.recovery_point
     }
 
     fn find_stream_seek_target_in_packet_queue(
@@ -138,6 +148,7 @@ impl DemuxPacketCacheState {
                 timeline_anchor_stream_index,
                 stream_index,
                 packet,
+                false,
             ) {
                 continue;
             }
@@ -193,6 +204,7 @@ impl DemuxPacketCacheState {
         packets: &HashMap<u64, CachedDemuxPacket>,
         timeline_anchor_stream_index: c_int,
         cached_seek_preroll_nsecs: u64,
+        cached_seek_requires_safe_point: bool,
         stream_queues: &BTreeMap<c_int, VecDeque<u64>>,
         close_open_segment: bool,
     ) -> Vec<(u64, u64)> {
@@ -200,6 +212,7 @@ impl DemuxPacketCacheState {
             packets,
             timeline_anchor_stream_index,
             cached_seek_preroll_nsecs,
+            cached_seek_requires_safe_point,
             stream_queues,
             close_open_segment,
         )
@@ -211,6 +224,7 @@ impl DemuxPacketCacheState {
         packets: &HashMap<u64, CachedDemuxPacket>,
         timeline_anchor_stream_index: c_int,
         cached_seek_preroll_nsecs: u64,
+        cached_seek_requires_safe_point: bool,
         stream_queues: &BTreeMap<c_int, VecDeque<u64>>,
         close_open_segment: bool,
     ) -> Option<(u64, u64)> {
@@ -232,7 +246,7 @@ impl DemuxPacketCacheState {
             };
             let end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
 
-            if packet.recovery_point {
+            if Self::packet_is_cached_seek_anchor(packet, cached_seek_requires_safe_point) {
                 if let Some(block) = current_block.take() {
                     Self::close_video_seek_block(
                         block,
@@ -290,14 +304,14 @@ impl DemuxPacketCacheState {
         if cached_seek_preroll_nsecs == 0 {
             return Some(block.min_nsecs);
         }
-        block.previous_recovery_start_nsecs.map(|previous_start| {
-            if previous_start == 0 {
-                block.min_nsecs
-            } else {
-                block
-                    .recovery_start_nsecs
-                    .max(previous_start.saturating_add(cached_seek_preroll_nsecs))
-            }
+        let first_seekable_from_this_recovery = block
+            .recovery_start_nsecs
+            .saturating_add(cached_seek_preroll_nsecs);
+        Some(match block.previous_recovery_start_nsecs {
+            Some(previous_start) => block
+                .recovery_start_nsecs
+                .max(previous_start.saturating_add(cached_seek_preroll_nsecs)),
+            None => first_seekable_from_this_recovery,
         })
     }
 

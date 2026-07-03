@@ -8,6 +8,7 @@ use crate::player::{
 
 use super::demux_cache::DemuxSeekResult;
 use super::{BufferedReporter, DemuxPacketCache, FfmpegControl, reset_playback_timeline_state};
+use ffmpeg_sys_next as ffi;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PlaybackPositionResetKind {
@@ -29,6 +30,8 @@ pub(super) struct PlaybackGenerationFlushContext<'a> {
     pub(super) position_seconds: f64,
     pub(super) seek_mode: PlaybackSeekMode,
     pub(super) seek_generation: u64,
+    pub(super) force_low_level_seek: bool,
+    pub(super) low_level_seek_reason: Option<&'static str>,
     pub(super) session_id: PlaybackSessionId,
     pub(super) vo_queue: &'a VideoOutputQueue,
     pub(super) demux_cache: &'a DemuxPacketCache,
@@ -50,6 +53,8 @@ pub(super) struct PlaybackSeekResetContext<'a> {
     pub(super) position_seconds: f64,
     pub(super) seek_mode: PlaybackSeekMode,
     pub(super) seek_generation: u64,
+    pub(super) force_low_level_seek: bool,
+    pub(super) low_level_seek_reason: Option<&'static str>,
     pub(super) session_id: PlaybackSessionId,
     pub(super) vo_queue: &'a VideoOutputQueue,
     pub(super) demux_cache: &'a DemuxPacketCache,
@@ -74,18 +79,31 @@ fn flush_playback_generation_for_position_reset(
         audio_output.reset_clock(context.pipeline.current_start_position_nsecs);
     }
     context.pipeline.output_scheduler.reset(context.control);
-    let demux_seek_result = context.demux_cache.seek(
-        context.position_seconds,
-        context.seek_mode,
-        context.session_id,
-        context.seek_generation,
-    );
+    let demux_seek_result = if context.force_low_level_seek {
+        context.demux_cache.seek_low_level(
+            context.position_seconds,
+            context.session_id,
+            context.seek_generation,
+            context
+                .low_level_seek_reason
+                .unwrap_or("forced_low_level_seek"),
+        )
+    } else {
+        context.demux_cache.seek(
+            context.position_seconds,
+            context.seek_mode,
+            context.session_id,
+            context.seek_generation,
+        )
+    };
     tracing::debug!(
         session_id = ?context.session_id,
         reset_kind = context.kind.as_str(),
         position_seconds = context.position_seconds,
         seek_mode = ?context.seek_mode,
         seek_generation = context.seek_generation,
+        force_low_level_seek = context.force_low_level_seek,
+        low_level_seek_reason = ?context.low_level_seek_reason,
         playback_generation = generation,
         current_start_position_nsecs = context.pipeline.current_start_position_nsecs,
         ?demux_seek_result,
@@ -99,9 +117,27 @@ fn flush_playback_generation_for_position_reset(
     })
 }
 
+fn hevc_seek_starts_video_bootstrap(
+    codec_id: ffi::AVCodecID,
+    force_low_level_seek: bool,
+    reason: Option<&'static str>,
+    demux_seek_result: DemuxSeekResult,
+) -> bool {
+    if codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
+        return false;
+    }
+    if !force_low_level_seek && !matches!(demux_seek_result, DemuxSeekResult::Requested) {
+        return false;
+    }
+    reason.is_some_and(|reason| {
+        matches!(reason, "first_video_frame_timeout" | "video_packet_limit")
+            || reason.starts_with("hevc_decode_chain_")
+    })
+}
+
 pub(super) fn service_playback_generation_seek(
     context: PlaybackGenerationFlushContext<'_>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<PlaybackGenerationFlushResult, String> {
     let kind = context.kind;
     let session_id = context.session_id;
     let flush_result = flush_playback_generation_for_position_reset(context)?;
@@ -112,7 +148,7 @@ pub(super) fn service_playback_generation_seek(
         demux_seek_result = ?flush_result.demux_seek_result,
         "completed FFmpeg playback generation seek reset"
     );
-    Ok(())
+    Ok(flush_result)
 }
 
 pub(super) fn service_playback_position_state_reset(
@@ -166,11 +202,13 @@ pub(super) fn service_playback_position_state_reset(
 
 pub(super) fn service_playback_seek_reset(
     context: PlaybackSeekResetContext<'_>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<DemuxSeekResult, String> {
     let PlaybackSeekResetContext {
         position_seconds,
         seek_mode,
         seek_generation,
+        force_low_level_seek,
+        low_level_seek_reason,
         session_id,
         vo_queue,
         demux_cache,
@@ -179,11 +217,13 @@ pub(super) fn service_playback_seek_reset(
         control,
         event_tx,
     } = context;
-    service_playback_generation_seek(PlaybackGenerationFlushContext {
+    let flush_result = service_playback_generation_seek(PlaybackGenerationFlushContext {
         kind: PlaybackPositionResetKind::Seek,
         position_seconds,
         seek_mode,
         seek_generation,
+        force_low_level_seek,
+        low_level_seek_reason,
         session_id,
         vo_queue,
         demux_cache,
@@ -199,9 +239,29 @@ pub(super) fn service_playback_seek_reset(
         control,
         event_tx,
     });
+    if hevc_seek_starts_video_bootstrap(
+        pipeline.video_stream.codec_id,
+        force_low_level_seek,
+        low_level_seek_reason,
+        flush_result.demux_seek_result,
+    ) {
+        pipeline.output_scheduler.begin_video_bootstrap_after_seek(
+            session_id,
+            low_level_seek_reason.unwrap_or("hevc_low_level_seek_recovery"),
+        );
+    }
+    if matches!(flush_result.demux_seek_result, DemuxSeekResult::Cached)
+        && !force_low_level_seek
+        && matches!(seek_mode, PlaybackSeekMode::Precise)
+    {
+        pipeline
+            .begin_cached_seek_recovery_watchdog(pipeline.current_start_position_nsecs, session_id);
+    } else {
+        pipeline.clear_cached_seek_recovery_watchdog();
+    }
     let _ = event_tx.send(BackendEvent::new(
         session_id,
         BackendEventKind::Buffering(true),
     ));
-    Ok(())
+    Ok(flush_result.demux_seek_result)
 }

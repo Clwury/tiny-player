@@ -1,5 +1,7 @@
 use super::playback_snapshot::PlaybackPipelineTelemetry;
-use super::playback_wait_service::{PlaybackPipelineWaitContext, PlaybackPipelineWaitService};
+use super::playback_wait_service::{
+    PlaybackLoopDeadline, PlaybackPipelineWaitContext, PlaybackPipelineWaitService,
+};
 use super::video_output_gate::{
     AudioClockedVideoDrainStatus, service_audio_clocked_video_drain_step,
     service_video_clocked_video_queue,
@@ -140,9 +142,17 @@ fn drain_video_clocked_output_until_idle(context: &mut OutputDrainContext<'_>) {
         > 0
     {
         if context.control.is_paused() {
+            let playback_loop_deadline = if context.control.is_user_paused() {
+                PlaybackLoopDeadline::default()
+            } else {
+                context.pipeline.playback_loop_deadline()
+            };
             context
                 .playback_wait
-                .wait_poll_interval_and_delay_scheduler(&mut context.pipeline.scheduler);
+                .wait_poll_interval_and_delay_scheduler_until(
+                    &mut context.pipeline.scheduler,
+                    playback_loop_deadline,
+                );
             continue;
         }
         let presented = service_video_clocked_video_queue(
@@ -180,6 +190,7 @@ fn wait_after_output_drain_stall(context: &mut OutputDrainContext<'_>, stall_rea
             audio_output: context.pipeline.audio_output.as_ref(),
             vo_queue: context.vo_queue,
             playback_telemetry: &mut *context.playback_telemetry,
+            playback_loop_deadline: context.pipeline.playback_loop_deadline(),
         },
         stall_reason,
     );

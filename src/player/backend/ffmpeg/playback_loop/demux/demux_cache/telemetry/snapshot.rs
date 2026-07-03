@@ -30,6 +30,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxPacketQueueSna
     pub(in crate::player::backend::ffmpeg::playback_loop) total_packets: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) total_bytes: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) memory_limit_bytes: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop) read_index: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) streams:
         Vec<DemuxStreamPacketQueueSnapshot>,
 }
@@ -41,8 +42,48 @@ pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxStreamPacketQu
     pub(in crate::player::backend::ffmpeg::playback_loop) queued_packets: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) packet_limit: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) packet_queue_full: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop) prefetch_packet_queue_full: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop) readable_packets_for_stream: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop) reader_head_available: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop) consumer_drainable: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop) queued_bytes: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) forward_nsecs: Option<u64>,
+}
+
+impl DemuxPacketQueueSnapshot {
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn prefetch_queue_full(&self) -> bool {
+        self.streams
+            .iter()
+            .any(|stream| stream.prefetch_packet_queue_full)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn consumer_drainable(&self) -> bool {
+        self.streams.iter().any(|stream| stream.consumer_drainable)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn consumer_drainable_for_streams(
+        &self,
+        stream_indices: &[c_int],
+    ) -> bool {
+        self.streams.iter().any(|stream| {
+            stream_indices.contains(&stream.stream_index) && stream.consumer_drainable
+        })
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn reader_head_lost_streams(
+        &self,
+        stream_indices: &[c_int],
+    ) -> Vec<c_int> {
+        self.streams
+            .iter()
+            .filter(|stream| stream_indices.contains(&stream.stream_index))
+            .filter(|stream| {
+                !stream.reader_head_available
+                    && stream.forward_nsecs.is_some_and(|forward| forward > 0)
+            })
+            .map(|stream| stream.stream_index)
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

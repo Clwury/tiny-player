@@ -1,5 +1,7 @@
 use std::{collections::VecDeque, time::Duration};
 
+use ffmpeg_sys_next as ffi;
+
 use crate::player::render_host::PlaybackSessionId;
 
 use super::super::{
@@ -10,8 +12,7 @@ use super::output_rebuffer::{
     AudioClockResumeDecision, InitialOutputSyncDecision, PlaybackOutputState,
     PlaybackResumeWaterline, initial_output_sync_decision, initial_playback_resume_waterline,
     log_playback_resume_waterline_wait, rebuffer_audio_clock_resume_decision,
-    rebuffer_playback_resume_waterline_with_resource_pressure,
-    video_decode_should_skip_nonref_for_pressure,
+    rebuffer_playback_resume_waterline_for_decision, video_decode_should_skip_nonref_for_pressure,
 };
 use super::pending_audio_queue::PendingStartAudio;
 use super::{
@@ -29,6 +30,28 @@ pub(in crate::player::backend::ffmpeg) struct ScheduledVideoQueue {
 pub(in crate::player::backend::ffmpeg) struct AudioClockedVideoPopResult {
     pub(in crate::player::backend::ffmpeg) frame: Option<QueuedVideoFrame>,
     pub(in crate::player::backend::ffmpeg) dropped_frames: usize,
+}
+
+const VIDEO_CONTIGUITY_MIN_GAP_NSECS: u64 = 200_000_000;
+const VIDEO_CONTIGUITY_MAX_GAP_NSECS: u64 = 500_000_000;
+const VIDEO_CONTIGUITY_GAP_FRAME_MULTIPLIER: u64 = 3;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) struct QueuedVideoContinuity {
+    pub(in crate::player::backend::ffmpeg) buffered_until_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) forward_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) largest_gap_nsecs: Option<u64>,
+}
+
+pub(in crate::player::backend::ffmpeg) fn queued_video_continuity_gap_threshold_nsecs(
+    frame_duration_nsecs: u64,
+) -> u64 {
+    frame_duration_nsecs
+        .saturating_mul(VIDEO_CONTIGUITY_GAP_FRAME_MULTIPLIER)
+        .clamp(
+            VIDEO_CONTIGUITY_MIN_GAP_NSECS,
+            VIDEO_CONTIGUITY_MAX_GAP_NSECS,
+        )
 }
 
 pub(in crate::player::backend::ffmpeg) fn discard_queued_video_before(
@@ -76,20 +99,101 @@ pub(in crate::player::backend::ffmpeg) fn queued_video_buffered_until_from_nsecs
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
     timeline_nsecs: u64,
 ) -> Option<u64> {
-    let buffered_until = queued_video_buffered_until_nsecs(queued_video_frames)?;
-    if queued_video_frames
-        .front()
-        .is_some_and(|frame| timeline_nsecs <= frame.timeline_nsecs)
-    {
-        return Some(buffered_until);
+    let start_index = queued_video_contiguous_start_index(queued_video_frames, timeline_nsecs)?;
+    let max_gap_nsecs = queued_video_continuity_gap_threshold_nsecs(
+        queued_video_frames.get(start_index)?.duration_nsecs,
+    );
+    queued_video_contiguous_buffered_until_from_nsecs(
+        queued_video_frames,
+        timeline_nsecs,
+        max_gap_nsecs,
+    )
+}
+
+pub(in crate::player::backend::ffmpeg) fn queued_video_contiguous_buffered_until_from_nsecs(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    timeline_nsecs: u64,
+    max_gap_nsecs: u64,
+) -> Option<u64> {
+    queued_video_contiguous_buffered_until_from_nsecs_with_gap(
+        queued_video_frames,
+        timeline_nsecs,
+        Some(max_gap_nsecs),
+    )
+}
+
+fn queued_video_contiguous_buffered_until_from_nsecs_with_gap(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    timeline_nsecs: u64,
+    fixed_max_gap_nsecs: Option<u64>,
+) -> Option<u64> {
+    let start_index = queued_video_contiguous_start_index(queued_video_frames, timeline_nsecs)?;
+    let first = queued_video_frames.get(start_index)?;
+    let mut buffered_until = first.timeline_nsecs.saturating_add(first.duration_nsecs);
+    let mut previous_duration_nsecs = first.duration_nsecs;
+
+    for frame in queued_video_frames.iter().skip(start_index + 1) {
+        let gap_nsecs = frame.timeline_nsecs.saturating_sub(buffered_until);
+        let max_gap_nsecs = fixed_max_gap_nsecs.unwrap_or_else(|| {
+            queued_video_continuity_gap_threshold_nsecs(previous_duration_nsecs)
+        });
+        if gap_nsecs > max_gap_nsecs {
+            break;
+        }
+        buffered_until =
+            buffered_until.max(frame.timeline_nsecs.saturating_add(frame.duration_nsecs));
+        previous_duration_nsecs = frame.duration_nsecs;
     }
-    queued_video_frames
-        .iter()
-        .any(|frame| {
-            let frame_end_nsecs = frame.timeline_nsecs.saturating_add(frame.duration_nsecs);
-            frame.timeline_nsecs <= timeline_nsecs && frame_end_nsecs > timeline_nsecs
-        })
-        .then_some(buffered_until)
+
+    Some(buffered_until)
+}
+
+fn queued_video_contiguous_start_index(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    timeline_nsecs: u64,
+) -> Option<usize> {
+    let first = queued_video_frames.front()?;
+    if timeline_nsecs <= first.timeline_nsecs {
+        return Some(0);
+    }
+
+    queued_video_frames.iter().position(|frame| {
+        let frame_end_nsecs = frame.timeline_nsecs.saturating_add(frame.duration_nsecs);
+        frame.timeline_nsecs <= timeline_nsecs && frame_end_nsecs > timeline_nsecs
+    })
+}
+
+pub(in crate::player::backend::ffmpeg) fn queued_video_largest_gap_nsecs(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+) -> Option<u64> {
+    let mut frames = queued_video_frames.iter();
+    let mut previous = frames.next()?;
+    let mut largest_gap_nsecs = None::<u64>;
+    for frame in frames {
+        let previous_end_nsecs = previous
+            .timeline_nsecs
+            .saturating_add(previous.duration_nsecs);
+        let gap_nsecs = frame.timeline_nsecs.saturating_sub(previous_end_nsecs);
+        if gap_nsecs > 0 {
+            largest_gap_nsecs = Some(largest_gap_nsecs.unwrap_or_default().max(gap_nsecs));
+        }
+        previous = frame;
+    }
+    largest_gap_nsecs
+}
+
+pub(in crate::player::backend::ffmpeg) fn queued_video_continuity_from_nsecs(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    timeline_nsecs: u64,
+) -> QueuedVideoContinuity {
+    let buffered_until_nsecs =
+        queued_video_buffered_until_from_nsecs(queued_video_frames, timeline_nsecs);
+    QueuedVideoContinuity {
+        buffered_until_nsecs,
+        forward_nsecs: buffered_until_nsecs
+            .map(|buffered_until| buffered_until.saturating_sub(timeline_nsecs)),
+        largest_gap_nsecs: queued_video_largest_gap_nsecs(queued_video_frames),
+    }
 }
 
 pub(in crate::player::backend::ffmpeg) fn queued_video_range_nsecs(
@@ -104,8 +208,7 @@ pub(in crate::player::backend::ffmpeg) fn queued_video_forward_nsecs_from(
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
     timeline_nsecs: u64,
 ) -> Option<u64> {
-    queued_video_buffered_until_from_nsecs(queued_video_frames, timeline_nsecs)
-        .map(|buffered_until| buffered_until.saturating_sub(timeline_nsecs))
+    queued_video_continuity_from_nsecs(queued_video_frames, timeline_nsecs).forward_nsecs
 }
 
 pub(in crate::player::backend::ffmpeg) fn video_output_rebuffer_low_water(
@@ -139,6 +242,10 @@ impl ScheduledVideoQueue {
 
     pub(in crate::player::backend::ffmpeg) fn is_empty(&self) -> bool {
         self.frames.is_empty()
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn frames(&self) -> &VecDeque<QueuedVideoFrame> {
+        &self.frames
     }
 
     pub(in crate::player::backend::ffmpeg) fn front_ready_for(
@@ -186,6 +293,17 @@ impl ScheduledVideoQueue {
         queued_video_forward_nsecs_from(&self.frames, timeline_nsecs)
     }
 
+    pub(in crate::player::backend::ffmpeg) fn continuity_from_nsecs(
+        &self,
+        timeline_nsecs: u64,
+    ) -> QueuedVideoContinuity {
+        queued_video_continuity_from_nsecs(&self.frames, timeline_nsecs)
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn largest_gap_nsecs(&self) -> Option<u64> {
+        queued_video_largest_gap_nsecs(&self.frames)
+    }
+
     pub(in crate::player::backend::ffmpeg) fn low_water(&self, played_until_nsecs: u64) -> bool {
         video_output_rebuffer_low_water(&self.frames, played_until_nsecs)
     }
@@ -227,6 +345,7 @@ impl ScheduledVideoQueue {
 
     pub(in crate::player::backend::ffmpeg) fn skip_nonref_for_pressure(
         &self,
+        codec_id: ffi::AVCodecID,
         output_state: PlaybackOutputState,
         played_until_nsecs: Option<u64>,
         has_audio_output: bool,
@@ -234,6 +353,7 @@ impl ScheduledVideoQueue {
         skip_nonref_active: bool,
     ) -> bool {
         video_decode_should_skip_nonref_for_pressure(
+            codec_id,
             output_state,
             &self.frames,
             played_until_nsecs,
@@ -281,6 +401,7 @@ impl ScheduledVideoQueue {
         pending_audio: &PendingStartAudio,
         played_until_nsecs: u64,
         audio_output_buffered_until_nsecs: Option<u64>,
+        audio_output_pending_nsecs: Option<u64>,
         reset_to_video_when_decoded_queue_misses_anchor: bool,
     ) -> Option<AudioClockResumeDecision> {
         rebuffer_audio_clock_resume_decision(
@@ -288,6 +409,7 @@ impl ScheduledVideoQueue {
             pending_audio,
             played_until_nsecs,
             audio_output_buffered_until_nsecs,
+            audio_output_pending_nsecs,
             reset_to_video_when_decoded_queue_misses_anchor,
         )
     }
@@ -316,20 +438,20 @@ impl ScheduledVideoQueue {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::player::backend::ffmpeg) fn rebuffer_playback_resume_waterline_with_resource_pressure(
+    pub(in crate::player::backend::ffmpeg) fn rebuffer_playback_resume_waterline_for_decision(
         &self,
         pending_audio: &PendingStartAudio,
-        resume_timeline_nsecs: u64,
+        resume_decision: AudioClockResumeDecision,
         demux_watermark: DemuxReaderWatermark,
         audio_output_buffered_until_nsecs: Option<u64>,
         needs_prefetch: bool,
         has_audio_output: bool,
         output_resource_pressure: bool,
     ) -> PlaybackResumeWaterline {
-        rebuffer_playback_resume_waterline_with_resource_pressure(
+        rebuffer_playback_resume_waterline_for_decision(
             &self.frames,
             pending_audio,
-            resume_timeline_nsecs,
+            resume_decision,
             demux_watermark,
             audio_output_buffered_until_nsecs,
             needs_prefetch,
@@ -355,6 +477,8 @@ impl ScheduledVideoQueue {
         pending_audio: &PendingStartAudio,
         waterline: PlaybackResumeWaterline,
         demux_watermark: DemuxReaderWatermark,
+        pending_audio_pressure_context: &'static str,
+        startup_pending_pressure_suppressed_hard_reset: bool,
     ) {
         log_playback_resume_waterline_wait(
             session_id,
@@ -365,6 +489,8 @@ impl ScheduledVideoQueue {
             pending_audio,
             waterline,
             demux_watermark,
+            pending_audio_pressure_context,
+            startup_pending_pressure_suppressed_hard_reset,
         );
     }
 }
@@ -453,4 +579,88 @@ pub(in crate::player::backend::ffmpeg) fn should_drop_late_video_frame(
         .saturating_add(frame_duration_nsecs)
         .saturating_add(duration_nsecs(LATE_VIDEO_DROP_TOLERANCE));
     late_cutoff <= played_until_nsecs
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use crate::player::render_host::{DecodedFrame, FramePixels, FramePts, RenderSize};
+
+    use super::*;
+
+    fn queued_video_frame(timeline_nsecs: u64, duration_nsecs: u64) -> QueuedVideoFrame {
+        QueuedVideoFrame {
+            frame: DecodedFrame {
+                size: RenderSize {
+                    width: 1,
+                    height: 1,
+                },
+                pts: Some(FramePts {
+                    nsecs: timeline_nsecs,
+                }),
+                key_frame: false,
+                pixels: FramePixels::Bgra8(vec![0, 0, 0, 255].into()),
+            },
+            timeline_nsecs,
+            duration_nsecs,
+        }
+    }
+
+    #[test]
+    fn contiguous_video_forward_stops_before_large_pts_gap() {
+        let mut queue = VecDeque::new();
+        queue.push_back(queued_video_frame(252_760_000_000, 40_000_000));
+        queue.push_back(queued_video_frame(252_800_000_000, 40_000_000));
+        queue.push_back(queued_video_frame(252_840_000_000, 40_000_000));
+        queue.push_back(queued_video_frame(252_880_000_000, 40_000_000));
+        queue.push_back(queued_video_frame(257_720_000_000, 40_000_000));
+
+        assert_eq!(
+            queued_video_buffered_until_nsecs(&queue),
+            Some(257_760_000_000)
+        );
+        assert_eq!(
+            queued_video_buffered_until_from_nsecs(&queue, 252_880_000_000),
+            Some(252_920_000_000)
+        );
+        assert_eq!(
+            queued_video_forward_nsecs_from(&queue, 252_880_000_000),
+            Some(40_000_000)
+        );
+        assert_eq!(queued_video_largest_gap_nsecs(&queue), Some(4_800_000_000));
+    }
+
+    #[test]
+    fn contiguous_video_forward_allows_small_timestamp_jitter() {
+        let mut queue = VecDeque::new();
+        queue.push_back(queued_video_frame(1_000_000_000, 40_000_000));
+        queue.push_back(queued_video_frame(1_080_000_000, 40_000_000));
+        queue.push_back(queued_video_frame(1_120_000_000, 40_000_000));
+
+        assert_eq!(
+            queued_video_buffered_until_from_nsecs(&queue, 1_000_000_000),
+            Some(1_160_000_000)
+        );
+        assert_eq!(
+            queued_video_forward_nsecs_from(&queue, 1_000_000_000),
+            Some(160_000_000)
+        );
+    }
+
+    #[test]
+    fn explicit_contiguous_video_gap_threshold_is_honored() {
+        let mut queue = VecDeque::new();
+        queue.push_back(queued_video_frame(1_000_000_000, 40_000_000));
+        queue.push_back(queued_video_frame(1_190_000_000, 40_000_000));
+
+        assert_eq!(
+            queued_video_contiguous_buffered_until_from_nsecs(&queue, 1_000_000_000, 100_000_000),
+            Some(1_040_000_000)
+        );
+        assert_eq!(
+            queued_video_contiguous_buffered_until_from_nsecs(&queue, 1_000_000_000, 200_000_000),
+            Some(1_230_000_000)
+        );
+    }
 }

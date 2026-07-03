@@ -50,6 +50,9 @@ impl DemuxPacketCacheShared {
             if let Some(request) = guard.take_seek_request() {
                 return Some(request);
             }
+            if self.control.has_pending_seek() {
+                return None;
+            }
             if guard.read_range_eof() || guard.error.is_some() {
                 let (next_guard, _) = self
                     .ready

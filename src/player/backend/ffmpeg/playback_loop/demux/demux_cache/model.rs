@@ -2,7 +2,8 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::{
     AvPacket, BackendEvent, BufferedReporter, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
     DemuxPacketCacheReadTiming, DemuxPacketDiskCache, FormatContext, PlaybackCacheConfig,
     PlaybackCacheState, PlaybackSessionId, StreamInfo, TimestampMapper, packet_duration_nsecs,
-    packet_is_video_seek_point, read_demux_packet_disk_payload, seconds_to_nsecs,
+    packet_is_video_recovery_point, packet_is_video_seek_point, read_demux_packet_disk_payload,
+    seconds_to_nsecs,
 };
 
 #[path = "model/packet.rs"]
@@ -33,10 +34,10 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use stream_wi
 };
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use timeline::DemuxPacketTimeline;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use types::{
-    CachePauseRefresh, CacheStateEmit, DemuxCacheLockWait, DemuxInputRateSample,
-    DemuxPacketAppendOutcome, DemuxPacketAppendTiming, DemuxPacketCacheThreadInput,
-    DemuxSeekRequest, DemuxSelectedStreams, PacketId, RangeId,
+    CachePauseRefresh, CacheStateEmit, DemuxCacheLockWait, DemuxCacheReportSnapshot,
+    DemuxInputRateSample, DemuxPacketAppendOutcome, DemuxPacketAppendTiming,
+    DemuxPacketCacheThreadInput, DemuxSeekRequest, DemuxSelectedStreams, PacketId, RangeId,
 };
 pub(in crate::player::backend::ffmpeg::playback_loop) use types::{
-    DemuxPacketCacheInput, DemuxReadResult, DemuxSeekResult,
+    DemuxPacketCacheInput, DemuxReadResult, DemuxSeekResult, DemuxStreamReaderRealignResult,
 };

@@ -1,5 +1,6 @@
 use std::{
     os::raw::c_int,
+    sync::MutexGuard,
     thread,
     time::{Duration, Instant},
 };
@@ -9,7 +10,7 @@ use super::{
     DEMUX_PACKET_CACHE_WAIT_INTERVAL, DemuxCacheLockWait, DemuxPacketCache,
     DemuxPacketCacheMonitorSnapshot, DemuxPacketCacheReadTiming, DemuxPacketCacheState,
     DemuxPacketQueueSnapshot, DemuxReadResult, DemuxReaderWatermark, DemuxSelectedStreams,
-    StreamInfo, demux_cache_blocked_on, nsecs_to_seconds,
+    DemuxStreamReaderRealignResult, StreamInfo, demux_cache_blocked_on, nsecs_to_seconds,
 };
 
 impl DemuxPacketCache {
@@ -104,6 +105,68 @@ impl DemuxPacketCache {
         guard.packet_queue_snapshot()
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn repair_reader_heads_for_read_index(
+        &self,
+        reason: &'static str,
+    ) -> bool {
+        let mut guard = self
+            .shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        let session_id = guard.session_id;
+        let before_read_index = guard.read_index;
+        let before_heads = guard.reader_heads.clone();
+        guard.reset_reader_heads_for_read_index();
+        let repaired = guard.reader_heads != before_heads || guard.read_index != before_read_index;
+        if repaired {
+            tracing::debug!(
+                session_id = ?session_id,
+                reason,
+                before_read_index,
+                after_read_index = guard.read_index,
+                before_reader_heads = ?before_heads,
+                after_reader_heads = ?guard.reader_heads,
+                "repaired FFmpeg demux packet cache reader heads"
+            );
+            self.shared.refresh_monitor_snapshot(&guard);
+            self.shared.ready.notify_all();
+        }
+        repaired
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn stream_reader_head_timeline(
+        &self,
+        stream_index: c_int,
+    ) -> Option<(u64, Option<u64>, Option<u64>)> {
+        let guard = self
+            .shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        guard.stream_reader_head_timeline(stream_index)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn realign_stream_reader_to_timeline(
+        &self,
+        stream_index: c_int,
+        target_timeline_nsecs: u64,
+        reason: &'static str,
+    ) -> Option<DemuxStreamReaderRealignResult> {
+        let mut guard = self
+            .shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        let result =
+            guard.realign_stream_reader_to_timeline(stream_index, target_timeline_nsecs, reason);
+        if result.is_some() {
+            self.shared.refresh_monitor_snapshot(&guard);
+            self.shared.ready.notify_all();
+        }
+        result
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop) fn cached_reader_watermark(
         &self,
     ) -> DemuxReaderWatermark {
@@ -184,7 +247,7 @@ impl DemuxPacketCache {
                 .refresh_cache_pause(&mut guard)
                 .force_cache_state_report
             {
-                self.shared.emit_cache_state(&mut guard);
+                self.shared.emit_cache_state_after_read(&mut guard, true);
             }
             let packet_source = match guard.take_packet_round_robin(stream_indices, &mut timing) {
                 Ok(packet) => packet,
@@ -241,15 +304,23 @@ impl DemuxPacketCache {
                     generation = guard.generation,
                     "FFmpeg demux packet cache exhausted selected stream queues; requested low-level continuation seek"
                 );
-                self.shared.emit_cache_state(&mut guard);
+                let emit = self.shared.prepare_cache_state_emit(&mut guard);
                 self.shared.ready.notify_all();
+                drop(guard);
+                self.shared.send_cache_state_emit(emit.into_emit());
+                let Some(next_guard) =
+                    self.reacquire_read_state(wait_for_data, lock_wait, &mut timing)
+                else {
+                    return (DemuxReadResult::WouldBlock, None, timing);
+                };
+                guard = next_guard;
                 continue;
             }
             self.shared
                 .enter_cache_pause_if_needed(&mut guard, cache_pause_signal);
             if !logged_wait && !self.shared.control.is_cache_paused() && guard.has_demux_underrun()
             {
-                self.shared.emit_cache_state(&mut guard);
+                self.shared.emit_cache_state_after_read(&mut guard, true);
             }
             if self.shared.should_log_would_block_diagnostic() {
                 guard.log_would_block_diagnostic(stream_indices);
@@ -329,7 +400,7 @@ impl DemuxPacketCache {
     fn lock_state_unbounded_with_timing(
         &self,
     ) -> (
-        std::sync::MutexGuard<'_, DemuxPacketCacheState>,
+        MutexGuard<'_, DemuxPacketCacheState>,
         DemuxPacketCacheReadTiming,
     ) {
         let started_at = Instant::now();
@@ -350,7 +421,7 @@ impl DemuxPacketCache {
     fn try_lock_state(
         &self,
         lock_wait: DemuxCacheLockWait,
-    ) -> Option<std::sync::MutexGuard<'_, DemuxPacketCacheState>> {
+    ) -> Option<MutexGuard<'_, DemuxPacketCacheState>> {
         self.try_lock_state_with_timing(lock_wait).0
     }
 
@@ -358,7 +429,7 @@ impl DemuxPacketCache {
         &self,
         lock_wait: DemuxCacheLockWait,
     ) -> (
-        Option<std::sync::MutexGuard<'_, DemuxPacketCacheState>>,
+        Option<MutexGuard<'_, DemuxPacketCacheState>>,
         DemuxPacketCacheReadTiming,
     ) {
         let started_at = Instant::now();
@@ -393,7 +464,7 @@ impl DemuxPacketCache {
     fn try_lock_state_once(
         &self,
         timing: &mut DemuxPacketCacheReadTiming,
-    ) -> Option<std::sync::MutexGuard<'_, DemuxPacketCacheState>> {
+    ) -> Option<MutexGuard<'_, DemuxPacketCacheState>> {
         match self.shared.state.try_lock() {
             Ok(guard) => Some(guard),
             Err(std::sync::TryLockError::WouldBlock) => {
@@ -404,5 +475,25 @@ impl DemuxPacketCache {
                 panic!("FFmpeg demux packet cache poisoned")
             }
         }
+    }
+
+    fn reacquire_read_state(
+        &self,
+        wait_for_data: bool,
+        lock_wait: DemuxCacheLockWait,
+        timing: &mut DemuxPacketCacheReadTiming,
+    ) -> Option<MutexGuard<'_, DemuxPacketCacheState>> {
+        let (guard, lock_timing) = if wait_for_data {
+            let (guard, lock_timing) = self.lock_state_unbounded_with_timing();
+            (Some(guard), lock_timing)
+        } else {
+            self.try_lock_state_with_timing(lock_wait)
+        };
+        timing.lock_wait += lock_timing.lock_wait;
+        timing.try_lock_failures = timing
+            .try_lock_failures
+            .saturating_add(lock_timing.try_lock_failures);
+        timing.lock_timed_out |= lock_timing.lock_timed_out;
+        guard
     }
 }

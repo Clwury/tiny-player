@@ -1,4 +1,10 @@
-use std::{ffi::CStr, mem, os::raw::c_int, ptr, slice, sync::Arc};
+use std::{
+    ffi::CStr,
+    mem,
+    os::raw::{c_int, c_uint},
+    ptr, slice,
+    sync::Arc,
+};
 
 use ffmpeg_sys_next as ffi;
 
@@ -10,6 +16,8 @@ use super::{
     FALLBACK_AUDIO_OUTPUT_CHANNELS, HardwareDecodeMode, StreamInfo, VideoHwDecodeContext,
     ffmpeg_error, frame_size, video_frame_len,
 };
+
+const VULKAN_THREAD_SAFE_LIBAVCODEC_VERSION: c_uint = av_version_int(62, 11, 100);
 
 pub(super) struct Decoder {
     ptr: *mut ffi::AVCodecContext,
@@ -116,7 +124,14 @@ impl Decoder {
         }
         unsafe {
             (*context).pkt_timebase = stream.time_base;
-            (*context).thread_count = 0;
+            (*context).thread_count = if vulkan_decode_needs_single_thread(
+                stream.codec_id,
+                decoder_context.video_hw.as_ref(),
+            ) {
+                1
+            } else {
+                0
+            };
             (*context).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
             if (*context).codec_type == ffi::AVMediaType::AVMEDIA_TYPE_VIDEO
                 && let Some(error_recognition) = video_error_recognition(stream.codec_id)
@@ -302,6 +317,26 @@ impl Decoder {
             frame_result?;
         }
     }
+}
+
+const fn av_version_int(major: c_uint, minor: c_uint, micro: c_uint) -> c_uint {
+    (major << 16) | (minor << 8) | micro
+}
+
+fn vulkan_decode_needs_single_thread(
+    codec_id: ffi::AVCodecID,
+    video_hw: Option<&VideoHwDecodeContext>,
+) -> bool {
+    video_hw.is_some()
+        && vulkan_decode_codec_needs_single_thread(codec_id, unsafe { ffi::avcodec_version() })
+}
+
+fn vulkan_decode_codec_needs_single_thread(
+    codec_id: ffi::AVCodecID,
+    avcodec_version: c_uint,
+) -> bool {
+    codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC
+        || avcodec_version < VULKAN_THREAD_SAFE_LIBAVCODEC_VERSION
 }
 
 fn video_error_recognition(codec_id: ffi::AVCodecID) -> Option<c_int> {
@@ -1050,7 +1085,7 @@ mod tests {
 
     use super::{
         AvPacket, packet_is_video_recovery_point, packet_is_video_seek_point,
-        video_error_recognition,
+        video_error_recognition, vulkan_decode_codec_needs_single_thread,
     };
 
     fn packet_from_data(data: &[u8]) -> AvPacket {
@@ -1115,6 +1150,20 @@ mod tests {
             video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_MPEG4),
             None
         );
+    }
+
+    #[test]
+    fn vulkan_hevc_decode_always_uses_single_thread() {
+        let newer_thread_safe_version = super::av_version_int(62, 28, 102);
+
+        assert!(vulkan_decode_codec_needs_single_thread(
+            ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            newer_thread_safe_version,
+        ));
+        assert!(!vulkan_decode_codec_needs_single_thread(
+            ffi::AVCodecID::AV_CODEC_ID_H264,
+            newer_thread_safe_version,
+        ));
     }
 
     #[test]

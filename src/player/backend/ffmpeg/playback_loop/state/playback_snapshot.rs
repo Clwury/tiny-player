@@ -109,10 +109,8 @@ impl PlaybackPipelineSnapshot {
             video_frame_prepare_blocked_on,
             audio_decode_blocked_on,
             subtitle_decode_blocked_on,
-            demux_packet_snapshot
-                .streams
-                .iter()
-                .any(|stream| stream.packet_queue_full),
+            demux_packet_snapshot.prefetch_queue_full()
+                && !demux_packet_snapshot.consumer_drainable(),
             demux_reader_watermark,
             audio_output_snapshot,
             output_snapshot.state,
@@ -236,7 +234,12 @@ impl PlaybackPipelineSnapshot {
         reasons
     }
 
-    fn log(self, session_id: PlaybackSessionId, stall_reason: &'static str) {
+    fn log(
+        self,
+        session_id: PlaybackSessionId,
+        stall_reason: &'static str,
+        planned_wait: Option<Duration>,
+    ) {
         let blocked_on_all = self
             .blocked_reasons
             .iter()
@@ -308,6 +311,7 @@ impl PlaybackPipelineSnapshot {
         tracing::debug!(
             session_id = ?session_id,
             stall_reason,
+            planned_wait_ms = ?planned_wait.map(|duration| duration.as_secs_f64() * 1000.0),
             blocked_on = self.blocked_on.as_str(),
             blocked_on_all = ?blocked_on_all,
             output_state = ?self.output_state,
@@ -372,6 +376,14 @@ impl PlaybackPipelineSnapshot {
                 .output_snapshot
                 .queued_video_forward_nsecs
                 .map(|duration| duration as f64 / 1_000_000.0),
+            queued_video_contiguous_forward_ms = ?self
+                .output_snapshot
+                .queued_video_contiguous_forward_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
+            queued_video_largest_gap_ms = ?self
+                .output_snapshot
+                .queued_video_largest_gap_nsecs
+                .map(|gap| gap as f64 / 1_000_000.0),
             output_rebuffering = self.output_snapshot.rebuffering,
             output_video_low_water = self.output_snapshot.video_output_low_water,
             output_rebuffer_anchor = ?self.output_snapshot.video_output_rebuffer_anchor,
@@ -411,6 +423,16 @@ impl PlaybackPipelineTelemetry {
         stall_reason: &'static str,
         snapshot: PlaybackPipelineSnapshot,
     ) {
+        self.observe_stall_with_wait(session_id, stall_reason, snapshot, None);
+    }
+
+    pub(super) fn observe_stall_with_wait(
+        &mut self,
+        session_id: PlaybackSessionId,
+        stall_reason: &'static str,
+        snapshot: PlaybackPipelineSnapshot,
+        planned_wait: Option<Duration>,
+    ) {
         let now = Instant::now();
         let blocked_on = snapshot.blocked_on();
         let blocked_reasons_changed =
@@ -432,7 +454,7 @@ impl PlaybackPipelineTelemetry {
         self.last_block_reasons
             .extend_from_slice(snapshot.block_reasons());
         self.last_stall_reason = Some(stall_reason);
-        snapshot.log(session_id, stall_reason);
+        snapshot.log(session_id, stall_reason, planned_wait);
     }
 }
 
@@ -457,6 +479,8 @@ fn decoder_backpressure_reasons(
         matches!(
             reason,
             PlaybackBlockReason::PacketQueueFull
+                | PlaybackBlockReason::DecoderInFlight
+                | PlaybackBlockReason::DecoderOutputPending
                 | PlaybackBlockReason::DecodedVideoQueue
                 | PlaybackBlockReason::DecodedQueueFull
                 | PlaybackBlockReason::HwSurfacePool
@@ -657,6 +681,40 @@ mod tests {
         );
 
         assert_eq!(blocked_on, PlaybackBlockReason::DecodedVideoQueue);
+    }
+
+    #[test]
+    fn playback_snapshot_reports_decoder_in_flight_pressure() {
+        let blocked_on = PlaybackPipelineSnapshot::resolve_blocked_on(
+            vo_snapshot(0, 3, RenderBackpressure::default()),
+            Some(PlaybackBlockReason::DecoderInFlight),
+            None,
+            None,
+            None,
+            false,
+            idle_demux_watermark(),
+            None,
+            PlaybackOutputState::Playing,
+        );
+
+        assert_eq!(blocked_on, PlaybackBlockReason::DecoderInFlight);
+    }
+
+    #[test]
+    fn playback_snapshot_reports_decoder_output_pending_pressure() {
+        let blocked_on = PlaybackPipelineSnapshot::resolve_blocked_on(
+            vo_snapshot(0, 3, RenderBackpressure::default()),
+            Some(PlaybackBlockReason::DecoderOutputPending),
+            None,
+            None,
+            None,
+            false,
+            idle_demux_watermark(),
+            None,
+            PlaybackOutputState::Playing,
+        );
+
+        assert_eq!(blocked_on, PlaybackBlockReason::DecoderOutputPending);
     }
 
     #[test]

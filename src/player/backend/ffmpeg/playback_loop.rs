@@ -1,10 +1,13 @@
 use super::{
     AUDIO_CLOCK_VIDEO_PRESENT_LEAD, AUDIO_DECODE_QUEUE_LIMIT_DURATION, AUDIO_OUTPUT_DELAY_LIMIT,
+    AUDIO_OUTPUT_QUEUE_LIMIT_DURATION, AUDIO_OUTPUT_STEADY_TARGET_DURATION,
     AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AUDIO_OUTPUT_VIDEO_LEAD_DURATION,
-    AUDIO_VIDEO_QUEUE_LIMIT_DURATION, AUDIO_VIDEO_QUEUE_TARGET_DURATION,
-    AUDIO_VIDEO_REBUFFER_DRIFT_RESET_THRESHOLD, AudioClockMode, AudioOutput,
-    AudioOutputDrainStatus, AudioOutputPushResult, AudioOutputSnapshot, AudioResampler, AvFrame,
-    AvPacket, BufferedReporter, DECODE_PACKET_SLOW_LOG_AFTER,
+    AUDIO_REBUFFER_DELAYED_START_MAX, AUDIO_REBUFFER_LOOP_DETECTION_WINDOW,
+    AUDIO_REBUFFER_PREFILL_LOOP_TARGET, AUDIO_REBUFFER_PREFILL_TARGET,
+    AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN, AUDIO_VIDEO_QUEUE_LIMIT_DURATION,
+    AUDIO_VIDEO_QUEUE_TARGET_DURATION, AUDIO_VIDEO_REBUFFER_DRIFT_RESET_THRESHOLD, AudioClockMode,
+    AudioOutput, AudioOutputDrainStatus, AudioOutputPushResult, AudioOutputSnapshot,
+    AudioResampler, AvFrame, AvPacket, BufferedReporter, DECODE_PACKET_SLOW_LOG_AFTER,
     DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
     DEMUX_CACHE_LOCK_TIMING_LOG_AFTER, DEMUX_PACKET_CACHE_LOCK_WAIT,
     DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_AFTER, DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
@@ -21,7 +24,9 @@ use super::{
     VIDEO_DECODE_SKIP_NONREF_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER,
     VIDEO_OUTPUT_REBUFFER_ENTER_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
     VIDEO_OUTPUT_REBUFFER_MIN_STABLE_RESUME_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-    VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER, VIDEO_OUTPUT_START_PREBUFFER_DURATION,
+    VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE,
+    VIDEO_OUTPUT_START_FAST_READY_DURATION, VIDEO_OUTPUT_START_FIRST_FRAME_FALLBACK_AFTER,
+    VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER, VIDEO_OUTPUT_START_PREBUFFER_DURATION,
     VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER,
     VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VULKAN_VIDEO_OUTPUT_RESOURCE_PRESSURE_FRAMES,
     VideoFrameConvertContext, VideoFrameConverter, WORKER_CHANNEL_RECV_WAIT_LOG_AFTER,
@@ -157,7 +162,10 @@ use coordinator_drain::{
     PlaybackEofDrainContext, PlaybackEofDrainStatus, service_playback_eof_drain,
 };
 use coordinator_gate::PlaybackCoordinatorGateContext;
-use coordinator_tick::{PlaybackTickContext, PlaybackTickStatus, service_playback_tick};
+use coordinator_tick::{
+    PlaybackTickContext, PlaybackTickStatus, service_hevc_startup_stall_watchdog_if_due,
+    service_playback_tick,
+};
 use decode::PlaybackGeneration;
 #[cfg(test)]
 pub(super) use decoded_video_frame::{
@@ -174,10 +182,9 @@ use input::{
     select_subtitle_stream_for_selection_from_catalog,
 };
 pub(super) use output_gate::{PlaybackOutputScheduler, PlaybackOutputSnapshot};
-pub(super) use output_rebuffer::PlaybackOutputState;
 #[cfg(test)]
 pub(super) use output_rebuffer::{
-    AudioClockResumeDecision, InitialOutputSyncDecision, RebufferResumeAnchor,
+    AudioClockResumeDecision, InitialOutputSyncDecision, RebufferResumeAnchor, ResumeAnchorSource,
     audio_clock_resume_decision, audio_clock_resume_timeline_nsecs,
     audio_output_buffered_until_for_resume, decoded_audio_forward_nsecs_from,
     decoded_video_start_prebuffer_reached, demux_reader_ready_for_output,
@@ -185,11 +192,13 @@ pub(super) use output_rebuffer::{
     initial_playback_resume_waterline, playback_resume_waterline,
     playback_resume_waterline_blocked_on, rebuffer_audio_clock_resume_decision,
     rebuffer_playback_resume_waterline, rebuffer_playback_resume_waterline_after_prolonged_wait,
+    rebuffer_playback_resume_waterline_for_decision,
     rebuffer_playback_resume_waterline_with_resource_pressure, should_block_for_demux_read,
     video_decode_should_skip_nonref_for_pressure, video_output_rebuffer_resume_duration,
     video_output_rebuffer_resume_duration_with_resource_pressure,
     video_output_rebuffer_resume_reached, video_output_rebuffer_should_enter,
 };
+pub(super) use output_rebuffer::{AudioResumeWaterline, PlaybackOutputState};
 #[cfg(test)]
 pub(super) use pending_audio_queue::PendingStartAudio;
 pub(super) use playback_block::PlaybackBlockReason;
@@ -238,6 +247,6 @@ pub(super) const VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS: u64 = 240;
 // Low-level seeks already snap backward to a keyframe; keep this small so seek-forward
 // shortcuts do not spend several seconds decoding and dropping HEVC preroll frames.
 pub(super) const HEVC_SEEK_PREROLL_NSECS: u64 = 1_000_000_000;
-// Cached seeks follow mpv's HR cache behavior: start at the nearest cached
-// recovery point and let precise decode discard frames up to the target.
-pub(super) const HEVC_CACHED_SEEK_PREROLL_NSECS: u64 = 0;
+// Cached HEVC seeks follow mpv's HR cache behavior: seek the demux/cache reader
+// before the display target, then let precise decode discard frames up to it.
+pub(super) const HEVC_CACHED_SEEK_PREROLL_NSECS: u64 = 500_000_000;

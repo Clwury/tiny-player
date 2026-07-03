@@ -41,6 +41,8 @@ pub(super) struct VideoDecodeWorker {
     draining: bool,
     recovering: bool,
     eof: bool,
+    shutdown_on_drop: bool,
+    join_on_drop: bool,
 }
 
 #[derive(Clone)]
@@ -203,11 +205,19 @@ impl VideoDecodeWorker {
             draining: false,
             recovering: false,
             eof: false,
+            shutdown_on_drop: true,
+            join_on_drop: true,
         })
     }
 
     pub(super) fn info(&self) -> &VideoDecodeWorkerInfo {
         &self.info
+    }
+
+    pub(super) fn detach_without_join(&mut self) {
+        self.shutdown_on_drop = false;
+        self.join_on_drop = false;
+        self.handle.take();
     }
 
     pub(super) fn set_skip_nonref_frames(
@@ -534,8 +544,18 @@ impl VideoDecodeWorker {
 
 impl Drop for VideoDecodeWorker {
     fn drop(&mut self) {
-        let _ = self.command_tx.send(VideoDecodeCommand::Shutdown);
-        if let Some(handle) = self.handle.take() {
+        let shutdown_joinable = if self.shutdown_on_drop {
+            !matches!(
+                self.command_tx.try_send(VideoDecodeCommand::Shutdown),
+                Err(mpsc::TrySendError::Full(_))
+            )
+        } else {
+            false
+        };
+        if self.join_on_drop
+            && shutdown_joinable
+            && let Some(handle) = self.handle.take()
+        {
             let _ = handle.join();
         }
     }
@@ -889,6 +909,8 @@ mod tests {
                 draining: false,
                 recovering: false,
                 eof: false,
+                shutdown_on_drop: true,
+                join_on_drop: true,
             },
             result_tx,
             command_rx,
@@ -965,5 +987,18 @@ mod tests {
         let snapshot = worker.snapshot();
         assert_eq!(snapshot.state, VideoDecodeWorkerState::NeedPacket);
         assert_eq!(snapshot.in_flight_packets, 0);
+    }
+
+    #[test]
+    fn set_skip_nonref_false_sends_decoder_control_command() {
+        let (mut worker, _result_tx, command_rx) = test_worker_with_command_rx();
+
+        worker.set_skip_nonref_frames(false).unwrap();
+
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            VideoDecodeCommand::SetSkipNonref(false)
+        ));
+        assert_eq!(worker.pending_skip_nonref, None);
     }
 }

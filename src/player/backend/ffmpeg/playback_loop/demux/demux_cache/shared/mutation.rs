@@ -32,20 +32,34 @@ impl DemuxPacketCacheShared {
         }
         let force_cache_state_report = append_outcome.force_cache_state_report
             || (!append_outcome.appended && cache_pause_refresh.force_cache_state_report);
+        if append_outcome.appended || force_cache_state_report {
+            guard.mark_cache_state_emit_dirty();
+        }
         let should_emit_cache_state =
-            force_cache_state_report || first_cache_state_report || cache_state_report_due;
+            guard.cache_state_emit_dirty() && (first_cache_state_report || cache_state_report_due);
         let notify_started_at = Instant::now();
         self.ready.notify_all();
         append_outcome.timing.notify += notify_started_at.elapsed();
         append_outcome.timing.lock_hold = append_lock_hold_started_at.elapsed();
         drop(guard);
         let emit_state_started_at = Instant::now();
-        let cache_state_emit = should_emit_cache_state
-            .then(|| self.prepare_cache_state_emit_after_append(force_cache_state_report))
-            .flatten();
+        let (cache_state_emit, cache_state_emit_deferred_for_consumer) = if should_emit_cache_state
+        {
+            self.prepare_cache_state_emit_after_append_with_timing(
+                force_cache_state_report,
+                true,
+                &mut append_outcome.timing,
+            )
+        } else {
+            (None, false)
+        };
+        append_outcome.cache_state_emit_deferred_for_consumer =
+            cache_state_emit_deferred_for_consumer;
         append_outcome.timing.emit_state += emit_state_started_at.elapsed();
         if let Some(emit) = cache_state_emit {
+            let send_started_at = Instant::now();
             self.send_cache_state_emit(emit);
+            append_outcome.timing.emit_state_send += send_started_at.elapsed();
         }
         log_demux_packet_append_timing(
             session_id,
@@ -57,73 +71,87 @@ impl DemuxPacketCacheShared {
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn mark_eof(&self) {
-        let mut guard = self
-            .state
-            .lock()
-            .expect("FFmpeg demux packet cache poisoned");
-        guard.mark_eof();
-        self.refresh_cache_pause(&mut guard);
-        self.emit_cache_state(&mut guard);
-        self.ready.notify_all();
+        let emit = {
+            let mut guard = self
+                .state
+                .lock()
+                .expect("FFmpeg demux packet cache poisoned");
+            guard.mark_eof();
+            self.refresh_cache_pause(&mut guard);
+            let emit = self.prepare_cache_state_emit(&mut guard);
+            self.ready.notify_all();
+            emit
+        };
+        self.send_cache_state_emit(emit.into_emit());
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_error(
         &self,
         error: String,
     ) {
-        let mut guard = self
-            .state
-            .lock()
-            .expect("FFmpeg demux packet cache poisoned");
-        guard.error = Some(error);
-        guard.seeking = false;
-        guard.cache_buffering_percent = None;
-        if self.control.set_cache_paused(false) {
-            let _ = self.event_tx.send(BackendEvent::new(
-                guard.session_id,
-                BackendEventKind::CacheBufferingChanged(None),
-            ));
-            let _ = self.event_tx.send(BackendEvent::new(
-                guard.session_id,
-                BackendEventKind::PausedForCacheChanged(false),
-            ));
-            let _ = self.event_tx.send(BackendEvent::new(
-                guard.session_id,
-                BackendEventKind::Pause(self.control.is_paused()),
-            ));
-        }
-        self.emit_cache_state(&mut guard);
-        self.ready.notify_all();
+        let emit = {
+            let mut guard = self
+                .state
+                .lock()
+                .expect("FFmpeg demux packet cache poisoned");
+            guard.error = Some(error);
+            guard.seeking = false;
+            guard.cache_buffering_percent = None;
+            if self.control.set_cache_paused(false) {
+                let _ = self.event_tx.send(BackendEvent::new(
+                    guard.session_id,
+                    BackendEventKind::CacheBufferingChanged(None),
+                ));
+                let _ = self.event_tx.send(BackendEvent::new(
+                    guard.session_id,
+                    BackendEventKind::PausedForCacheChanged(false),
+                ));
+                let _ = self.event_tx.send(BackendEvent::new(
+                    guard.session_id,
+                    BackendEventKind::Pause(self.control.is_paused()),
+                ));
+            }
+            let emit = self.prepare_cache_state_emit(&mut guard);
+            self.ready.notify_all();
+            emit
+        };
+        self.send_cache_state_emit(emit.into_emit());
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn clear_cache_pause_for_decoded_resume(
         &self,
     ) {
-        let mut guard = self
-            .state
-            .lock()
-            .expect("FFmpeg demux packet cache poisoned");
-        let had_percent = guard.cache_buffering_percent.take().is_some();
-        let changed = self.control.set_cache_paused(false);
-        if had_percent {
-            let _ = self.event_tx.send(BackendEvent::new(
-                guard.session_id,
-                BackendEventKind::CacheBufferingChanged(None),
-            ));
-        }
-        if changed {
-            let _ = self.event_tx.send(BackendEvent::new(
-                guard.session_id,
-                BackendEventKind::PausedForCacheChanged(false),
-            ));
-            let _ = self.event_tx.send(BackendEvent::new(
-                guard.session_id,
-                BackendEventKind::Pause(self.control.is_paused()),
-            ));
-        }
-        if changed || had_percent {
-            self.emit_cache_state(&mut guard);
-            self.ready.notify_all();
+        let emit = {
+            let mut guard = self
+                .state
+                .lock()
+                .expect("FFmpeg demux packet cache poisoned");
+            let had_percent = guard.cache_buffering_percent.take().is_some();
+            let changed = self.control.set_cache_paused(false);
+            if had_percent {
+                let _ = self.event_tx.send(BackendEvent::new(
+                    guard.session_id,
+                    BackendEventKind::CacheBufferingChanged(None),
+                ));
+            }
+            if changed {
+                let _ = self.event_tx.send(BackendEvent::new(
+                    guard.session_id,
+                    BackendEventKind::PausedForCacheChanged(false),
+                ));
+                let _ = self.event_tx.send(BackendEvent::new(
+                    guard.session_id,
+                    BackendEventKind::Pause(self.control.is_paused()),
+                ));
+            }
+            (changed || had_percent).then(|| {
+                let emit = self.prepare_cache_state_emit(&mut guard);
+                self.ready.notify_all();
+                emit
+            })
+        };
+        if let Some(emit) = emit {
+            self.send_cache_state_emit(emit.into_emit());
         }
     }
 }

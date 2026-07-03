@@ -1,15 +1,17 @@
 use std::{
     os::raw::c_int,
     sync::{atomic::AtomicBool, mpsc::Sender},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+use ffmpeg_sys_next as ffi;
 
 use crate::player::{
     backend::BackendEvent,
     render_host::{PlaybackSessionId, VideoOutputQueue, VideoOutputQueueSnapshot},
 };
 
-use super::audio_decode_worker::AudioDecodePacketResult;
+use super::audio_decode_worker::{AudioDecodePacketResult, AudioDecodeWorkerSnapshot};
 use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
 use super::decoded_audio_frame::process_audio_decode_drain_result;
 use super::drain_phase::{PlaybackDrainPhase, PlaybackDrainResults};
@@ -17,18 +19,131 @@ use super::playback_block::{
     VideoOutputResourcePressure, video_decode_block_reason_with_output_queue,
     video_output_resource_pressure,
 };
+use super::playback_wait_service::PlaybackLoopDeadline;
 use super::video_decode_drain_frame_processor::{
     VideoDecodeDrainFrameProcessor, VideoDecodeDrainProcessStatus,
 };
 use super::video_decode_pipeline::{VideoPacketAdmissionContext, VideoPacketAdmissionPressure};
 use super::video_decode_worker::{VideoDecodeDrainResult, VideoDecodeWorkerSnapshot};
 use super::{
-    AudioDecodePipeline, AudioOutput, AvPacket, BufferedReporter, DoviPipeline, FfmpegControl,
-    PENDING_START_AUDIO_BACKPRESSURE_DURATION, PlaybackBlockReason, PlaybackGeneration,
-    PlaybackOutputScheduler, PlaybackOutputSnapshot, PlaybackScheduler, PositionReporter,
-    StreamInfo, SubtitleDecodeContext, SubtitlePipeline, TimestampMapper, VideoDecodePipeline,
-    VideoDecodeRecovery, VideoFramePrepareWorker,
+    AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN, AudioDecodePipeline, AudioOutput, AudioResumeWaterline,
+    AvPacket, BufferedReporter, DoviPipeline, FfmpegControl, PlaybackBlockReason,
+    PlaybackGeneration, PlaybackOutputScheduler, PlaybackOutputSnapshot, PlaybackScheduler,
+    PositionReporter, StreamInfo, SubtitleDecodeContext, SubtitlePipeline, TimestampMapper,
+    VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    VideoDecodePipeline, VideoDecodeRecovery, VideoFramePrepareWorker, duration_nsecs,
 };
+
+const CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_millis(2_500);
+const CACHED_SEEK_STARTUP_MAX_VIDEO_PACKETS: u64 = VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CachedSeekRecoveryFallbackReason {
+    FirstVideoFrameTimeout,
+    VideoPacketLimit,
+}
+
+impl CachedSeekRecoveryFallbackReason {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstVideoFrameTimeout => "first_video_frame_timeout",
+            Self::VideoPacketLimit => "video_packet_limit",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CachedSeekRecoveryFallbackAction {
+    SoftRecover,
+    ReopenSoftware,
+    LowLevelSeek,
+}
+
+impl CachedSeekRecoveryFallbackAction {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::SoftRecover => "soft_recover",
+            Self::ReopenSoftware => "reopen_software",
+            Self::LowLevelSeek => "low_level_seek",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CachedSeekRecoveryFallback {
+    pub(super) target_nsecs: u64,
+    pub(super) reason: CachedSeekRecoveryFallbackReason,
+    pub(super) action: CachedSeekRecoveryFallbackAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CachedSeekRecoveryWatchdogDecision {
+    Wait,
+    Clear,
+    Fallback(CachedSeekRecoveryFallbackReason),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CachedSeekRecoveryWatchdog {
+    target_nsecs: u64,
+    started_at: Instant,
+    start_video_packet_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CachedSeekRecoveryWatchdogSnapshot {
+    pub(super) target_nsecs: u64,
+    pub(super) elapsed: Duration,
+    pub(super) remaining: Duration,
+    pub(super) video_packets_since_seek: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CachedSeekRecoveryAttempt {
+    target_nsecs: u64,
+    soft_recoveries: u8,
+    software_reopens: u8,
+    low_level_seeks: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CachedSeekRecoveryProgress {
+    video_packets_since_seek: u64,
+    video_decode_pending_input_packets: usize,
+    video_decode_in_flight_packets: usize,
+    video_decode_completed_packets: usize,
+    video_decode_queued_frames: usize,
+    seek_preroll_frames: u64,
+}
+
+impl CachedSeekRecoveryProgress {
+    fn from_decode_snapshot(
+        video_packets_since_seek: u64,
+        snapshot: VideoDecodeWorkerSnapshot,
+        seek_preroll_frames: u64,
+    ) -> Self {
+        Self {
+            video_packets_since_seek,
+            video_decode_pending_input_packets: snapshot.pending_input_packets,
+            video_decode_in_flight_packets: snapshot.in_flight_packets,
+            video_decode_completed_packets: snapshot.completed_packets,
+            video_decode_queued_frames: snapshot.queued_frames,
+            seek_preroll_frames,
+        }
+    }
+
+    fn decoder_work_pending(self) -> bool {
+        self.video_decode_pending_input_packets > 0
+            || self.video_decode_in_flight_packets > 0
+            || self.video_decode_completed_packets > 0
+            || self.video_decode_queued_frames > 0
+    }
+
+    fn has_actual_progress(self) -> bool {
+        self.seek_preroll_frames > 0
+            || (self.video_packets_since_seek > 0 && self.decoder_work_pending())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DecoderInputStreamState {
@@ -42,6 +157,7 @@ pub(super) struct DecoderInputSnapshot {
     pub(super) video_stream_index: c_int,
     pub(super) audio_stream_index: Option<c_int>,
     pub(super) subtitle_stream_index: Option<c_int>,
+    pub(super) audio_resume_waterline: Option<AudioResumeWaterline>,
     pub(super) video_decode_snapshot: VideoDecodeWorkerSnapshot,
     pub(super) video_decode_blocked_on: Option<PlaybackBlockReason>,
 }
@@ -71,6 +187,21 @@ pub(super) struct PlaybackPipelineState {
     pub(super) current_start_position_nsecs: u64,
     pub(super) video_packet_count: u64,
     pub(super) video_decode_skip_nonref_active: bool,
+    pub(super) cached_seek_recovery_watchdog: Option<CachedSeekRecoveryWatchdog>,
+    pub(super) cached_seek_recovery_attempt: Option<CachedSeekRecoveryAttempt>,
+    pub(super) rebuffer_audio_realign_attempt: Option<RebufferAudioRealignAttempt>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RebufferAudioRealignAttempt {
+    pub(super) target_timeline_nsecs: u64,
+    pub(super) attempts: u8,
+}
+
+fn mark_video_decode_skip_nonref_inactive(skip_nonref_active: &mut bool) -> bool {
+    let was_active = *skip_nonref_active;
+    *skip_nonref_active = false;
+    was_active
 }
 
 impl PlaybackPipelineState {
@@ -84,11 +215,261 @@ impl PlaybackPipelineState {
     ) -> std::result::Result<(), String> {
         self.video_frame_prepare_worker.flush_generation(generation);
         self.video_decode_pipeline.flush_buffers(generation)?;
+        self.restore_video_decode_skip_nonref_default(None, "playback_generation_flush")?;
+        self.video_decode_pipeline
+            .reset_hevc_decode_chain_watchdog();
         if let Some(worker) = self.audio_decode_pipeline.as_mut() {
             worker.flush_buffers(generation)?;
         }
         self.subtitle_pipeline.flush_decode_state(generation)?;
         Ok(())
+    }
+
+    pub(super) fn observe_rebuffer_audio_realign_attempt(
+        &mut self,
+        target_timeline_nsecs: u64,
+    ) -> u8 {
+        let attempts = match self.rebuffer_audio_realign_attempt {
+            Some(previous)
+                if previous
+                    .target_timeline_nsecs
+                    .abs_diff(target_timeline_nsecs)
+                    <= 500_000_000 =>
+            {
+                previous.attempts.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.rebuffer_audio_realign_attempt = Some(RebufferAudioRealignAttempt {
+            target_timeline_nsecs,
+            attempts,
+        });
+        attempts
+    }
+
+    pub(super) fn clear_rebuffer_audio_realign_attempt(&mut self) {
+        self.rebuffer_audio_realign_attempt = None;
+    }
+
+    pub(super) fn restore_video_decode_skip_nonref_default(
+        &mut self,
+        session_id: Option<PlaybackSessionId>,
+        reason: &'static str,
+    ) -> std::result::Result<(), String> {
+        self.video_decode_pipeline.set_skip_nonref_frames(false)?;
+        let was_active =
+            mark_video_decode_skip_nonref_inactive(&mut self.video_decode_skip_nonref_active);
+        tracing::debug!(
+            session_id = ?session_id,
+            reason,
+            was_active,
+            "resetting FFmpeg video decode nonref skip to default"
+        );
+        Ok(())
+    }
+
+    pub(super) fn soft_recover_hevc_decode_chain(
+        &mut self,
+        session_id: PlaybackSessionId,
+    ) -> std::result::Result<(), String> {
+        if self.video_decode_skip_nonref_active {
+            self.video_decode_pipeline.set_skip_nonref_frames(false)?;
+            self.video_decode_skip_nonref_active = false;
+        }
+        let generation = self.playback_generation.advance();
+        self.video_decode_pipeline.flush_buffers(generation)?;
+        self.video_decode_recovery.begin_with_realign(true);
+        self.video_decode_pipeline.clear_packets();
+        self.dovi_pipeline.reset();
+        tracing::debug!(
+            session_id = ?session_id,
+            generation,
+            "soft recovered HEVC decode chain while waiting for first decoded video frame"
+        );
+        Ok(())
+    }
+
+    pub(super) fn soft_recover_cached_seek_hevc_decode_chain(
+        &mut self,
+        session_id: PlaybackSessionId,
+    ) -> std::result::Result<usize, String> {
+        if self.video_decode_skip_nonref_active {
+            self.video_decode_pipeline.set_skip_nonref_frames(false)?;
+            self.video_decode_skip_nonref_active = false;
+        }
+        let generation = self.playback_generation.advance();
+        self.video_decode_pipeline.flush_buffers(generation)?;
+        self.video_decode_recovery.begin_with_realign(true);
+        self.dovi_pipeline.reset();
+        let requeued_probe_packets = self
+            .video_decode_pipeline
+            .requeue_hevc_startup_probe_packets(&mut self.playback_generation, session_id)?;
+        self.video_decode_pipeline
+            .reset_hevc_decode_chain_watchdog();
+        tracing::debug!(
+            session_id = ?session_id,
+            generation,
+            requeued_probe_packets,
+            "soft recovered HEVC cached seek decode chain without low-level seek"
+        );
+        Ok(requeued_probe_packets)
+    }
+
+    pub(super) fn begin_cached_seek_recovery_watchdog(
+        &mut self,
+        target_nsecs: u64,
+        session_id: PlaybackSessionId,
+    ) {
+        if self.video_stream.codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
+            self.cached_seek_recovery_watchdog = None;
+            return;
+        }
+        self.cached_seek_recovery_watchdog = Some(CachedSeekRecoveryWatchdog {
+            target_nsecs,
+            started_at: Instant::now(),
+            start_video_packet_count: self.video_packet_count,
+        });
+        tracing::debug!(
+            ?session_id,
+            target_nsecs,
+            video_packet_count = self.video_packet_count,
+            "started HEVC cached seek recovery watchdog"
+        );
+    }
+
+    pub(super) fn clear_cached_seek_recovery_watchdog(&mut self) {
+        self.cached_seek_recovery_watchdog = None;
+        self.cached_seek_recovery_attempt = None;
+    }
+
+    pub(super) fn cached_seek_recovery_watchdog_deadline(&self) -> Option<Instant> {
+        self.cached_seek_recovery_watchdog
+            .map(|watchdog| watchdog.started_at + CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT)
+    }
+
+    pub(super) fn playback_loop_deadline(&self) -> PlaybackLoopDeadline {
+        PlaybackLoopDeadline::from_cached_seek_recovery_watchdog(
+            self.cached_seek_recovery_watchdog_deadline(),
+        )
+        .with_hevc_startup_stall_watchdog_deadline(
+            self.video_decode_pipeline
+                .hevc_startup_stall_watchdog_deadline(),
+        )
+    }
+
+    pub(super) fn cached_seek_recovery_watchdog_expired(&self) -> bool {
+        self.cached_seek_recovery_watchdog_deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    pub(super) fn cached_seek_recovery_watchdog_snapshot(
+        &self,
+    ) -> Option<CachedSeekRecoveryWatchdogSnapshot> {
+        let watchdog = self.cached_seek_recovery_watchdog?;
+        let elapsed = watchdog.started_at.elapsed();
+        Some(CachedSeekRecoveryWatchdogSnapshot {
+            target_nsecs: watchdog.target_nsecs,
+            elapsed,
+            remaining: CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT.saturating_sub(elapsed),
+            video_packets_since_seek: self
+                .video_packet_count
+                .saturating_sub(watchdog.start_video_packet_count),
+        })
+    }
+
+    pub(super) fn take_cached_seek_recovery_fallback(
+        &mut self,
+        session_id: PlaybackSessionId,
+    ) -> Option<CachedSeekRecoveryFallback> {
+        let watchdog = self.cached_seek_recovery_watchdog?;
+        let output_snapshot = self.output_scheduler.snapshot();
+        let video_decode_snapshot = self.video_decode_pipeline.snapshot();
+        let elapsed = watchdog.started_at.elapsed();
+        let video_packets_since_seek = self
+            .video_packet_count
+            .saturating_sub(watchdog.start_video_packet_count);
+        let progress = CachedSeekRecoveryProgress::from_decode_snapshot(
+            video_packets_since_seek,
+            video_decode_snapshot,
+            self.video_decode_recovery.seek_bootstrap_preroll_frames(),
+        );
+        tracing::trace!(
+            ?session_id,
+            target_nsecs = watchdog.target_nsecs,
+            elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+            remaining_ms = CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT
+                .saturating_sub(elapsed)
+                .as_secs_f64()
+                * 1000.0,
+            video_packets_since_seek,
+            video_decode_pending_input_packets = progress.video_decode_pending_input_packets,
+            video_decode_in_flight_packets = progress.video_decode_in_flight_packets,
+            video_decode_completed_packets = progress.video_decode_completed_packets,
+            video_decode_queued_frames = progress.video_decode_queued_frames,
+            seek_preroll_frames = progress.seek_preroll_frames,
+            decoder_work_pending = progress.decoder_work_pending(),
+            queued_video_frames = output_snapshot.queued_video_frames,
+            first_video_frame_pending = output_snapshot.first_video_frame_pending,
+            "checked HEVC cached seek recovery watchdog"
+        );
+        match cached_seek_recovery_watchdog_decision(output_snapshot, elapsed, progress) {
+            CachedSeekRecoveryWatchdogDecision::Wait => None,
+            CachedSeekRecoveryWatchdogDecision::Clear => {
+                tracing::debug!(
+                    ?session_id,
+                    target_nsecs = watchdog.target_nsecs,
+                    elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                    video_packets_since_seek,
+                    queued_video_frames = output_snapshot.queued_video_frames,
+                    "cleared HEVC cached seek recovery watchdog after first video frame"
+                );
+                self.cached_seek_recovery_watchdog = None;
+                self.cached_seek_recovery_attempt = None;
+                None
+            }
+            CachedSeekRecoveryWatchdogDecision::Fallback(reason) => {
+                let action = self.cached_seek_recovery_next_action(watchdog.target_nsecs);
+                tracing::debug!(
+                    ?session_id,
+                    target_nsecs = watchdog.target_nsecs,
+                    reason = reason.as_str(),
+                    action = action.as_str(),
+                    elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                    timeout_ms = CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT.as_secs_f64() * 1000.0,
+                    video_packets_since_seek,
+                    video_decode_pending_input_packets =
+                        progress.video_decode_pending_input_packets,
+                    video_decode_in_flight_packets = progress.video_decode_in_flight_packets,
+                    video_decode_completed_packets = progress.video_decode_completed_packets,
+                    video_decode_queued_frames = progress.video_decode_queued_frames,
+                    seek_preroll_frames = progress.seek_preroll_frames,
+                    decoder_work_pending = progress.decoder_work_pending(),
+                    max_video_packets = CACHED_SEEK_STARTUP_MAX_VIDEO_PACKETS,
+                    queued_video_frames = output_snapshot.queued_video_frames,
+                    first_video_frame_pending = output_snapshot.first_video_frame_pending,
+                    recovery_waiting = self.video_decode_recovery.waiting_for_keyframe(),
+                    recovery_skipped_packets = self.video_decode_recovery.skipped_packets(),
+                    "HEVC cached seek recovery watchdog requesting fallback"
+                );
+                self.cached_seek_recovery_watchdog = None;
+                Some(CachedSeekRecoveryFallback {
+                    target_nsecs: watchdog.target_nsecs,
+                    reason,
+                    action,
+                })
+            }
+        }
+    }
+
+    fn cached_seek_recovery_next_action(
+        &mut self,
+        target_nsecs: u64,
+    ) -> CachedSeekRecoveryFallbackAction {
+        cached_seek_recovery_next_action_for_attempt(
+            &mut self.cached_seek_recovery_attempt,
+            target_nsecs,
+            self.video_decode_pipeline.info().hardware_accelerated,
+        )
     }
 
     pub(super) fn decoder_outputs_pending_or_in_flight(&self) -> bool {
@@ -242,9 +623,20 @@ impl PlaybackPipelineState {
             output_resource_pressure,
         );
         let video_stream_index = self.video_decode_stream_index();
-        let audio_input_suppressed = self.audio_input_suppressed_until_output_resume();
+        let audio_decode_snapshot = self
+            .audio_decode_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.snapshot());
+        let audio_resume_waterline =
+            self.audio_resume_waterline_for_output_wait(audio_decode_snapshot);
+        let audio_input_suppressed = audio_input_suppressed_until_output_resume_state(
+            self.audio_decode_pipeline.is_some(),
+            self.output_scheduler.waiting_for_output_resume(),
+            audio_resume_waterline,
+        );
         let audio_stream = self.audio_decode_pipeline.as_ref().map(|pipeline| {
-            let audio_decode_snapshot = pipeline.snapshot();
+            let audio_decode_snapshot =
+                audio_decode_snapshot.expect("audio snapshot exists when pipeline exists");
             DecoderInputStreamState {
                 stream_index: pipeline.info().stream_index,
                 packet_input_blocked: audio_input_suppressed
@@ -280,20 +672,48 @@ impl PlaybackPipelineState {
             video_stream_index,
             audio_stream_index: audio_stream.map(|stream| stream.stream_index),
             subtitle_stream_index: subtitle_stream.map(|stream| stream.stream_index),
+            audio_resume_waterline,
             video_decode_snapshot,
             video_decode_blocked_on,
         }
     }
 
     fn audio_input_suppressed_until_output_resume(&self) -> bool {
+        let audio_decode_snapshot = self
+            .audio_decode_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.snapshot());
+        let audio_resume_waterline =
+            self.audio_resume_waterline_for_output_wait(audio_decode_snapshot);
         audio_input_suppressed_until_output_resume_state(
             self.audio_decode_pipeline.is_some(),
-            self.output_scheduler.rebuffering(),
-            self.output_scheduler.first_video_frame_pending,
-            self.output_scheduler
-                .pending_start_audio
-                .buffered_duration(),
+            self.output_scheduler.waiting_for_output_resume(),
+            audio_resume_waterline,
         )
+    }
+
+    fn audio_resume_waterline_for_output_wait(
+        &self,
+        audio_decode_snapshot: Option<AudioDecodeWorkerSnapshot>,
+    ) -> Option<AudioResumeWaterline> {
+        let audio_snapshot = self
+            .audio_output
+            .as_ref()
+            .and_then(|output| output.snapshot().ok());
+        self.output_scheduler
+            .audio_resume_waterline_for_output_wait(
+                audio_snapshot,
+                audio_decode_snapshot
+                    .map(|snapshot| snapshot.queued_duration_nsecs)
+                    .unwrap_or_default(),
+                audio_decode_snapshot
+                    .map(|snapshot| snapshot.in_flight_packets)
+                    .unwrap_or_default(),
+                self.current_start_position_nsecs,
+                duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+                None,
+                None,
+            )
     }
 
     pub(super) fn video_packet_admission_pressure(
@@ -318,6 +738,7 @@ impl PlaybackPipelineState {
         VideoPacketAdmissionPressure {
             output_snapshot,
             skip_nonref_for_pressure: self.output_scheduler.video_decode_skip_nonref_for_pressure(
+                self.video_stream.codec_id,
                 played_until_nsecs,
                 has_audio_output,
                 audio_output_pending_nsecs,
@@ -406,6 +827,59 @@ impl PlaybackPipelineState {
     }
 }
 
+fn cached_seek_recovery_fallback_reason(
+    elapsed: Duration,
+    progress: CachedSeekRecoveryProgress,
+) -> Option<CachedSeekRecoveryFallbackReason> {
+    if elapsed >= CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT && !progress.has_actual_progress() {
+        return Some(CachedSeekRecoveryFallbackReason::FirstVideoFrameTimeout);
+    }
+    if progress.video_packets_since_seek >= CACHED_SEEK_STARTUP_MAX_VIDEO_PACKETS {
+        return Some(CachedSeekRecoveryFallbackReason::VideoPacketLimit);
+    }
+    None
+}
+
+fn cached_seek_recovery_next_action_for_attempt(
+    attempt: &mut Option<CachedSeekRecoveryAttempt>,
+    target_nsecs: u64,
+    hardware_accelerated: bool,
+) -> CachedSeekRecoveryFallbackAction {
+    let reset_attempt = attempt.is_none_or(|attempt| attempt.target_nsecs != target_nsecs);
+    if reset_attempt {
+        *attempt = Some(CachedSeekRecoveryAttempt {
+            target_nsecs,
+            ..Default::default()
+        });
+    }
+    let attempt = attempt
+        .as_mut()
+        .expect("cached seek recovery attempt exists");
+    if attempt.soft_recoveries == 0 {
+        attempt.soft_recoveries = attempt.soft_recoveries.saturating_add(1);
+        return CachedSeekRecoveryFallbackAction::SoftRecover;
+    }
+    if hardware_accelerated && attempt.software_reopens == 0 {
+        attempt.software_reopens = attempt.software_reopens.saturating_add(1);
+        return CachedSeekRecoveryFallbackAction::ReopenSoftware;
+    }
+    attempt.low_level_seeks = attempt.low_level_seeks.saturating_add(1);
+    CachedSeekRecoveryFallbackAction::LowLevelSeek
+}
+
+fn cached_seek_recovery_watchdog_decision(
+    output_snapshot: PlaybackOutputSnapshot,
+    elapsed: Duration,
+    progress: CachedSeekRecoveryProgress,
+) -> CachedSeekRecoveryWatchdogDecision {
+    if !output_snapshot.first_video_frame_pending || output_snapshot.queued_video_frames > 0 {
+        return CachedSeekRecoveryWatchdogDecision::Clear;
+    }
+    cached_seek_recovery_fallback_reason(elapsed, progress)
+        .map(CachedSeekRecoveryWatchdogDecision::Fallback)
+        .unwrap_or(CachedSeekRecoveryWatchdogDecision::Wait)
+}
+
 fn decoder_input_retry_status_from_streams(
     statuses: impl IntoIterator<Item = Option<DecodeInputRetryStatus>>,
 ) -> DecodeInputRetryStatus {
@@ -429,6 +903,8 @@ fn decoder_block_reason_blocks_packet_input(blocked_on: Option<PlaybackBlockReas
         blocked_on,
         Some(
             PlaybackBlockReason::PacketQueueFull
+                | PlaybackBlockReason::DecoderInFlight
+                | PlaybackBlockReason::DecoderOutputPending
                 | PlaybackBlockReason::DecodedVideoQueue
                 | PlaybackBlockReason::DecodedQueueFull
                 | PlaybackBlockReason::HwSurfacePool
@@ -438,17 +914,19 @@ fn decoder_block_reason_blocks_packet_input(blocked_on: Option<PlaybackBlockReas
 
 fn audio_input_suppressed_until_output_resume_state(
     has_audio_decode_pipeline: bool,
-    output_rebuffering: bool,
-    first_video_frame_pending: bool,
-    pending_start_audio_duration: Duration,
+    output_waiting_for_resume: bool,
+    audio_resume_waterline: Option<AudioResumeWaterline>,
 ) -> bool {
-    // Total pending-start audio duration is not the same as audio coverage from
-    // the eventual resume timeline. During seeks/track switches, preroll can
-    // leave a gap before the first queued video frame; keep feeding audio until
-    // the pending-start queue reaches its real backpressure limit.
+    // Total pending-start audio duration is not the same as continuous coverage
+    // from the eventual resume timeline. Keep feeding audio until the same
+    // resume waterline used by the output gate has headroom beyond the resume
+    // target; stale preroll or disconnected pending audio must not close the
+    // audio demux/decode path.
     has_audio_decode_pipeline
-        && (output_rebuffering || first_video_frame_pending)
-        && pending_start_audio_duration >= PENDING_START_AUDIO_BACKPRESSURE_DURATION
+        && output_waiting_for_resume
+        && audio_resume_waterline.is_some_and(|waterline| {
+            waterline.reaches_target_with_margin(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)
+        })
 }
 
 fn decoder_input_streams_for_state(
@@ -478,11 +956,20 @@ mod tests {
     use std::{os::raw::c_int, time::Duration};
 
     use super::super::decode::DecodeInputRetryStatus;
-    use super::super::{PlaybackBlockReason, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION};
+    use super::super::{
+        AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN, AudioResumeWaterline, PlaybackBlockReason,
+        PlaybackOutputSnapshot, PlaybackOutputState, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+        duration_nsecs,
+    };
     use super::{
-        DecoderInputStreamState, PENDING_START_AUDIO_BACKPRESSURE_DURATION,
-        audio_input_suppressed_until_output_resume_state, decoder_block_reason_blocks_packet_input,
-        decoder_input_retry_status_from_streams, decoder_input_streams_for_state,
+        CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT, CACHED_SEEK_STARTUP_MAX_VIDEO_PACKETS,
+        CachedSeekRecoveryAttempt, CachedSeekRecoveryFallbackAction,
+        CachedSeekRecoveryFallbackReason, CachedSeekRecoveryProgress,
+        CachedSeekRecoveryWatchdogDecision, DecoderInputStreamState,
+        audio_input_suppressed_until_output_resume_state, cached_seek_recovery_fallback_reason,
+        cached_seek_recovery_next_action_for_attempt, cached_seek_recovery_watchdog_decision,
+        decoder_block_reason_blocks_packet_input, decoder_input_retry_status_from_streams,
+        decoder_input_streams_for_state, mark_video_decode_skip_nonref_inactive,
     };
 
     fn stream(stream_index: c_int, packet_input_blocked: bool) -> DecoderInputStreamState {
@@ -490,6 +977,227 @@ mod tests {
             stream_index,
             packet_input_blocked,
         }
+    }
+
+    fn audio_waterline(decoded_audio_forward_nsecs: Option<u64>) -> AudioResumeWaterline {
+        AudioResumeWaterline {
+            resume_timeline_nsecs: 1_000_000_000,
+            target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            audio_output_buffered_until_nsecs: None,
+            audio_output_pending_nsecs: None,
+            pending_audio_start_nsecs: Some(1_000_000_000),
+            pending_audio_forward_nsecs: decoded_audio_forward_nsecs,
+            decoded_audio_forward_nsecs,
+            audio_decode_queued_nsecs: 0,
+            audio_decode_in_flight_packets: 0,
+            demux_audio_forward_nsecs: None,
+            demux_audio_cached_packets: None,
+            ready: decoded_audio_forward_nsecs.is_some_and(|duration| {
+                duration >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+            }),
+        }
+    }
+
+    fn output_snapshot(
+        first_video_frame_pending: bool,
+        queued_video_frames: usize,
+    ) -> PlaybackOutputSnapshot {
+        PlaybackOutputSnapshot {
+            state: PlaybackOutputState::Syncing,
+            first_video_frame_pending,
+            rebuffering: false,
+            queued_video_frames,
+            queued_video_duration_nsecs: 0,
+            queued_video_range_nsecs: None,
+            queued_video_forward_nsecs: None,
+            queued_video_contiguous_forward_nsecs: None,
+            queued_video_largest_gap_nsecs: None,
+            video_output_low_water: false,
+            pending_start_audio_frames: 0,
+            pending_start_audio_nsecs: 0,
+            video_output_rebuffer_anchor: None,
+            video_bootstrap_after_seek: false,
+            video_decode_underfill: false,
+            rebuffer_empty_audio_output_blocked: false,
+        }
+    }
+
+    fn cached_seek_progress(video_packets_since_seek: u64) -> CachedSeekRecoveryProgress {
+        CachedSeekRecoveryProgress {
+            video_packets_since_seek,
+            ..Default::default()
+        }
+    }
+
+    fn cached_seek_progress_with_decoder_work(
+        video_packets_since_seek: u64,
+    ) -> CachedSeekRecoveryProgress {
+        CachedSeekRecoveryProgress {
+            video_packets_since_seek,
+            video_decode_in_flight_packets: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn video_decode_skip_nonref_reset_marks_active_state_inactive() {
+        let mut active = true;
+
+        assert!(mark_video_decode_skip_nonref_inactive(&mut active));
+        assert!(!active);
+        assert!(!mark_video_decode_skip_nonref_inactive(&mut active));
+    }
+
+    #[test]
+    fn cached_seek_recovery_fallback_waits_before_limits() {
+        assert_eq!(
+            cached_seek_recovery_fallback_reason(
+                CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT - Duration::from_millis(1),
+                cached_seek_progress(CACHED_SEEK_STARTUP_MAX_VIDEO_PACKETS - 1),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cached_seek_recovery_fallback_triggers_on_first_frame_timeout() {
+        assert_eq!(
+            cached_seek_recovery_fallback_reason(
+                CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT,
+                cached_seek_progress(0),
+            ),
+            Some(CachedSeekRecoveryFallbackReason::FirstVideoFrameTimeout)
+        );
+    }
+
+    #[test]
+    fn cached_seek_recovery_fallback_waits_after_deadline_with_decoder_progress() {
+        assert_eq!(
+            cached_seek_recovery_fallback_reason(
+                CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT,
+                cached_seek_progress_with_decoder_work(1),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cached_seek_recovery_fallback_triggers_on_video_packet_limit() {
+        assert_eq!(
+            cached_seek_recovery_fallback_reason(
+                Duration::from_millis(1),
+                cached_seek_progress(CACHED_SEEK_STARTUP_MAX_VIDEO_PACKETS),
+            ),
+            Some(CachedSeekRecoveryFallbackReason::VideoPacketLimit)
+        );
+    }
+
+    #[test]
+    fn cached_seek_recovery_actions_escalate_for_same_hardware_target() {
+        let mut attempt = None::<CachedSeekRecoveryAttempt>;
+
+        assert_eq!(
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true),
+            CachedSeekRecoveryFallbackAction::SoftRecover
+        );
+        assert_eq!(
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true),
+            CachedSeekRecoveryFallbackAction::ReopenSoftware
+        );
+        assert_eq!(
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true),
+            CachedSeekRecoveryFallbackAction::LowLevelSeek
+        );
+    }
+
+    #[test]
+    fn cached_seek_recovery_actions_reset_for_new_target() {
+        let mut attempt = Some(CachedSeekRecoveryAttempt {
+            target_nsecs: 35_000_000_000,
+            soft_recoveries: 1,
+            software_reopens: 1,
+            low_level_seeks: 1,
+        });
+
+        assert_eq!(
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 83_000_000_000, true),
+            CachedSeekRecoveryFallbackAction::SoftRecover
+        );
+    }
+
+    #[test]
+    fn cached_seek_recovery_actions_skip_software_reopen_when_decoder_is_software() {
+        let mut attempt = None::<CachedSeekRecoveryAttempt>;
+
+        assert_eq!(
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, false),
+            CachedSeekRecoveryFallbackAction::SoftRecover
+        );
+        assert_eq!(
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, false),
+            CachedSeekRecoveryFallbackAction::LowLevelSeek
+        );
+    }
+
+    #[test]
+    fn cached_seek_recovery_watchdog_waits_before_deadline_without_first_video() {
+        assert_eq!(
+            cached_seek_recovery_watchdog_decision(
+                output_snapshot(true, 0),
+                CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT - Duration::from_millis(1),
+                cached_seek_progress(CACHED_SEEK_STARTUP_MAX_VIDEO_PACKETS - 1),
+            ),
+            CachedSeekRecoveryWatchdogDecision::Wait
+        );
+    }
+
+    #[test]
+    fn cached_seek_recovery_watchdog_falls_back_after_deadline_without_first_video() {
+        assert_eq!(
+            cached_seek_recovery_watchdog_decision(
+                output_snapshot(true, 0),
+                CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT,
+                cached_seek_progress(0),
+            ),
+            CachedSeekRecoveryWatchdogDecision::Fallback(
+                CachedSeekRecoveryFallbackReason::FirstVideoFrameTimeout
+            )
+        );
+    }
+
+    #[test]
+    fn cached_seek_recovery_watchdog_waits_after_deadline_with_seek_preroll_progress() {
+        assert_eq!(
+            cached_seek_recovery_watchdog_decision(
+                output_snapshot(true, 0),
+                CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT,
+                CachedSeekRecoveryProgress {
+                    seek_preroll_frames: 1,
+                    ..Default::default()
+                },
+            ),
+            CachedSeekRecoveryWatchdogDecision::Wait
+        );
+    }
+
+    #[test]
+    fn cached_seek_recovery_watchdog_clears_after_first_video() {
+        assert_eq!(
+            cached_seek_recovery_watchdog_decision(
+                output_snapshot(false, 0),
+                CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT,
+                cached_seek_progress(0),
+            ),
+            CachedSeekRecoveryWatchdogDecision::Clear
+        );
+        assert_eq!(
+            cached_seek_recovery_watchdog_decision(
+                output_snapshot(true, 1),
+                CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT,
+                cached_seek_progress(0),
+            ),
+            CachedSeekRecoveryWatchdogDecision::Clear
+        );
     }
 
     #[test]
@@ -537,37 +1245,57 @@ mod tests {
     }
 
     #[test]
-    fn audio_input_suppression_waits_until_pending_start_audio_backpressure() {
+    fn audio_input_suppression_waits_until_resume_waterline_has_margin() {
         assert!(!audio_input_suppressed_until_output_resume_state(
             true,
             true,
-            false,
-            VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
+            Some(audio_waterline(Some(duration_nsecs(
+                VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
+            ))))
         ));
         assert!(!audio_input_suppressed_until_output_resume_state(
             true,
-            false,
             true,
-            VIDEO_OUTPUT_REBUFFER_RESUME_DURATION + Duration::from_millis(1)
+            Some(audio_waterline(Some(
+                duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+                    + duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)
+                    - 1
+            )))
         ));
         assert!(audio_input_suppressed_until_output_resume_state(
             true,
             true,
-            false,
-            PENDING_START_AUDIO_BACKPRESSURE_DURATION
-        ));
-        assert!(audio_input_suppressed_until_output_resume_state(
-            true,
-            false,
-            true,
-            PENDING_START_AUDIO_BACKPRESSURE_DURATION + Duration::from_millis(1)
+            Some(audio_waterline(Some(
+                duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+                    + duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)
+            )))
         ));
         assert!(!audio_input_suppressed_until_output_resume_state(
             true,
             true,
-            false,
-            PENDING_START_AUDIO_BACKPRESSURE_DURATION - Duration::from_millis(1)
+            Some(audio_waterline(None))
         ));
+    }
+
+    #[test]
+    fn decoder_input_keeps_audio_stream_open_when_resume_audio_is_below_target() {
+        let audio_input_suppressed = audio_input_suppressed_until_output_resume_state(
+            true,
+            true,
+            Some(audio_waterline(Some(
+                duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) - 1,
+            ))),
+        );
+
+        assert!(!audio_input_suppressed);
+        assert_eq!(
+            decoder_input_streams_for_state(
+                stream(10, false),
+                Some(stream(11, audio_input_suppressed)),
+                Some(stream(12, false))
+            ),
+            vec![10, 11, 12]
+        );
     }
 
     #[test]
@@ -575,14 +1303,18 @@ mod tests {
         assert!(!audio_input_suppressed_until_output_resume_state(
             false,
             true,
-            false,
-            VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
+            Some(audio_waterline(Some(
+                duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+                    + duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)
+            )))
         ));
         assert!(!audio_input_suppressed_until_output_resume_state(
             true,
             false,
-            false,
-            VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
+            Some(audio_waterline(Some(
+                duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+                    + duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)
+            )))
         ));
     }
 
@@ -590,6 +1322,12 @@ mod tests {
     fn decoder_block_reason_blocks_only_packet_input_pressure() {
         assert!(decoder_block_reason_blocks_packet_input(Some(
             PlaybackBlockReason::PacketQueueFull
+        )));
+        assert!(decoder_block_reason_blocks_packet_input(Some(
+            PlaybackBlockReason::DecoderInFlight
+        )));
+        assert!(decoder_block_reason_blocks_packet_input(Some(
+            PlaybackBlockReason::DecoderOutputPending
         )));
         assert!(decoder_block_reason_blocks_packet_input(Some(
             PlaybackBlockReason::DecodedVideoQueue

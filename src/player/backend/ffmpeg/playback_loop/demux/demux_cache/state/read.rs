@@ -6,9 +6,11 @@ use std::{
 
 use super::{
     DEMUX_CACHE_LOCK_TIMING_LOG_AFTER, DemuxPacketCacheReadTiming, DemuxPacketCacheState,
-    DemuxPacketQueueSnapshot, DemuxPacketReadSource, DemuxStreamPacketQueueSnapshot, PacketId,
-    StreamCacheKind,
+    DemuxPacketQueueSnapshot, DemuxPacketReadSource, DemuxStreamPacketQueueSnapshot,
+    DemuxStreamReaderRealignResult, PacketId, StreamCacheKind,
 };
+
+const CACHE_STATE_EMIT_CONSUMER_YIELD_PACKET_THRESHOLD: usize = 1024;
 
 impl DemuxPacketCacheState {
     fn packet_read_source(
@@ -55,7 +57,83 @@ impl DemuxPacketCacheState {
         stream_index: c_int,
     ) -> Option<PacketId> {
         let packet_id = self.reader_heads.get(&stream_index).copied()?;
-        self.packets.contains_key(&packet_id).then_some(packet_id)
+        self.reader_head_current_for_stream(stream_index, packet_id)
+            .then_some(packet_id)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn stream_reader_head_timeline(
+        &self,
+        stream_index: c_int,
+    ) -> Option<(PacketId, Option<u64>, Option<u64>)> {
+        let packet_id = self.next_packet_id_for_stream(stream_index)?;
+        let packet = self.packets.get(&packet_id)?;
+        Some((packet_id, packet.start_nsecs, packet.end_nsecs))
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn realign_stream_reader_to_timeline(
+        &mut self,
+        stream_index: c_int,
+        target_timeline_nsecs: u64,
+        reason: &'static str,
+    ) -> Option<DemuxStreamReaderRealignResult> {
+        let old_head = self.stream_reader_head_timeline(stream_index);
+        let queue = self.read_range().stream_queues.get(&stream_index)?;
+        let mut selected = None;
+        for packet_id in queue {
+            if !self.packet_readable_in_current_generation(*packet_id) {
+                continue;
+            }
+            let Some(packet) = self.packets.get(packet_id) else {
+                continue;
+            };
+            let Some(start_nsecs) = packet.start_nsecs else {
+                continue;
+            };
+            if start_nsecs > target_timeline_nsecs && selected.is_some() {
+                break;
+            }
+            if start_nsecs <= target_timeline_nsecs {
+                selected = Some((*packet_id, start_nsecs, packet.end_nsecs));
+            }
+        }
+        let (new_packet_id, new_start_nsecs, new_end_nsecs) = selected?;
+        self.set_reader_head_for_current_generation(stream_index, new_packet_id);
+        self.refresh_reader_tracking();
+        tracing::debug!(
+            session_id = ?self.session_id,
+            reason,
+            stream_index,
+            target_timeline_nsecs,
+            old_packet_id = ?old_head.map(|(packet_id, _, _)| packet_id),
+            old_start_nsecs = ?old_head.and_then(|(_, start, _)| start),
+            old_end_nsecs = ?old_head.and_then(|(_, _, end)| end),
+            new_packet_id,
+            new_start_nsecs,
+            new_end_nsecs,
+            read_index = self.read_index,
+            generation = self.generation,
+            "realigned FFmpeg demux stream reader head to timeline"
+        );
+        Some(DemuxStreamReaderRealignResult {
+            stream_index,
+            target_timeline_nsecs,
+            old_packet_id: old_head.map(|(packet_id, _, _)| packet_id),
+            old_start_nsecs: old_head.and_then(|(_, start, _)| start),
+            new_packet_id,
+            new_start_nsecs: Some(new_start_nsecs),
+            new_end_nsecs,
+        })
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn consumer_readable_packet_available(
+        &self,
+    ) -> bool {
+        if self.packets.len() < CACHE_STATE_EMIT_CONSUMER_YIELD_PACKET_THRESHOLD {
+            return false;
+        }
+        self.reader_heads.iter().any(|(stream_index, packet_id)| {
+            self.reader_head_current_for_stream(*stream_index, *packet_id)
+        })
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn consume_packet_id(
@@ -88,7 +166,7 @@ impl DemuxPacketCacheState {
             return;
         };
         let stream_index = packet.stream_index;
-        if self.reader_heads.get(&stream_index).copied() != Some(packet_id) {
+        if self.next_packet_id_for_stream(stream_index) != Some(packet_id) {
             return;
         }
         let old_position = self
@@ -107,11 +185,11 @@ impl DemuxPacketCacheState {
                     .iter()
                     .skip(position.saturating_add(1))
                     .copied()
-                    .find(|candidate| self.packets.contains_key(candidate))
+                    .find(|candidate| self.packet_readable_in_current_generation(*candidate))
             });
         match next_packet_id {
             Some(next_packet_id) => {
-                self.reader_heads.insert(stream_index, next_packet_id);
+                self.set_reader_head_for_current_generation(stream_index, next_packet_id);
                 if let Some(next_position) = old_position
                     .and_then(|position| {
                         self.packet_position_in_read_range_after(next_packet_id, position)
@@ -125,8 +203,7 @@ impl DemuxPacketCacheState {
                 }
             }
             None => {
-                self.reader_heads.remove(&stream_index);
-                self.reader_head_positions.remove(&stream_index);
+                self.remove_reader_head(stream_index);
             }
         }
         self.refresh_read_index_from_reader_head_positions();
@@ -148,7 +225,7 @@ impl DemuxPacketCacheState {
         let mut reader_heads = BTreeMap::new();
         for (stream_index, queue) in &self.read_range().stream_queues {
             let Some(packet_id) = queue.iter().copied().find(|packet_id| {
-                self.packets.contains_key(packet_id)
+                self.packet_readable_in_current_generation(*packet_id)
                     && packet_positions
                         .get(packet_id)
                         .is_some_and(|position| *position >= read_index)
@@ -157,7 +234,7 @@ impl DemuxPacketCacheState {
             };
             reader_heads.insert(*stream_index, packet_id);
         }
-        self.reader_heads = reader_heads;
+        self.set_reader_heads_for_current_generation(reader_heads);
         self.refresh_reader_tracking();
     }
 
@@ -189,13 +266,26 @@ impl DemuxPacketCacheState {
             .map(|(index, packet_id)| (packet_id, index))
             .collect::<HashMap<_, _>>();
         let stream_queues = self.read_range().stream_queues.clone();
+        let stream_kinds = &self.stream_kinds;
+        let packets = &self.packets;
+        let blocked_packet_generations = &self.low_level_append_blocked_packet_generations;
+        let reader_head_generations = &self.reader_head_generations;
+        let generation = self.generation;
         self.reader_heads.retain(|stream_index, packet_id| {
-            self.stream_kinds.contains_key(stream_index)
-                && self.packets.contains_key(packet_id)
+            stream_kinds.contains_key(stream_index)
+                && reader_head_generations
+                    .get(stream_index)
+                    .is_some_and(|head_generation| *head_generation == generation)
+                && packets.contains_key(packet_id)
+                && blocked_packet_generations
+                    .get(packet_id)
+                    .is_none_or(|blocked_generation| *blocked_generation != generation)
                 && stream_queues
                     .get(stream_index)
                     .is_some_and(|queue| queue.iter().any(|candidate| *candidate == *packet_id))
         });
+        self.reader_head_generations
+            .retain(|stream_index, _| self.reader_heads.contains_key(stream_index));
         self.reader_head_positions = self
             .reader_heads
             .iter()
@@ -294,6 +384,10 @@ impl DemuxPacketCacheState {
                 continue;
             }
             let packet_limit = self.stream_packet_queue_limit(stream_index);
+            let prefetch_packet_queue_full = queued_packets >= packet_limit;
+            let readable_packets_for_stream = self.readable_packet_count_for_stream(stream_index);
+            let reader_head_available = self.next_packet_id_for_stream(stream_index).is_some();
+            let consumer_drainable = readable_packets_for_stream > 0;
             let queued_bytes = self.queued_bytes_for_stream(stream_index);
             let forward_nsecs = forward_by_kind
                 .iter()
@@ -303,7 +397,11 @@ impl DemuxPacketCacheState {
                 kind,
                 queued_packets,
                 packet_limit,
-                packet_queue_full: queued_packets >= packet_limit,
+                packet_queue_full: prefetch_packet_queue_full,
+                prefetch_packet_queue_full,
+                readable_packets_for_stream,
+                reader_head_available,
+                consumer_drainable,
                 queued_bytes,
                 forward_nsecs,
             });
@@ -312,8 +410,26 @@ impl DemuxPacketCacheState {
             total_packets: streams.iter().map(|stream| stream.queued_packets).sum(),
             total_bytes: streams.iter().map(|stream| stream.queued_bytes).sum(),
             memory_limit_bytes: self.memory_limit_bytes,
+            read_index: self.read_index,
             streams,
         }
+    }
+
+    fn readable_packet_count_for_stream(&self, stream_index: c_int) -> usize {
+        let Some(packet_id) = self.next_packet_id_for_stream(stream_index) else {
+            return 0;
+        };
+        let Some(queue) = self.read_range().stream_queues.get(&stream_index) else {
+            return 0;
+        };
+        let Some(position) = queue.iter().position(|candidate| *candidate == packet_id) else {
+            return 0;
+        };
+        queue
+            .iter()
+            .skip(position)
+            .filter(|packet_id| self.packet_readable_in_current_generation(**packet_id))
+            .count()
     }
 
     fn queued_packet_count_for_stream(&self, stream_index: c_int) -> usize {
@@ -333,6 +449,62 @@ impl DemuxPacketCacheState {
             })
             .unwrap_or_default();
         active_count + detached_count
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn packet_readable_in_current_generation(
+        &self,
+        packet_id: PacketId,
+    ) -> bool {
+        self.packets.contains_key(&packet_id)
+            && !self.packet_blocked_for_current_generation(packet_id)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn packet_blocked_for_current_generation(
+        &self,
+        packet_id: PacketId,
+    ) -> bool {
+        self.low_level_append_blocked_packet_generations
+            .get(&packet_id)
+            .is_some_and(|generation| *generation == self.generation)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_reader_head_for_current_generation(
+        &mut self,
+        stream_index: c_int,
+        packet_id: PacketId,
+    ) {
+        self.reader_heads.insert(stream_index, packet_id);
+        self.reader_head_generations
+            .insert(stream_index, self.generation);
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_reader_heads_for_current_generation(
+        &mut self,
+        reader_heads: BTreeMap<c_int, PacketId>,
+    ) {
+        self.reader_heads = reader_heads;
+        self.reader_head_generations = self
+            .reader_heads
+            .keys()
+            .copied()
+            .map(|stream_index| (stream_index, self.generation))
+            .collect();
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn remove_reader_head(
+        &mut self,
+        stream_index: c_int,
+    ) {
+        self.reader_heads.remove(&stream_index);
+        self.reader_head_positions.remove(&stream_index);
+        self.reader_head_generations.remove(&stream_index);
+    }
+
+    fn reader_head_current_for_stream(&self, stream_index: c_int, packet_id: PacketId) -> bool {
+        self.reader_head_generations
+            .get(&stream_index)
+            .is_some_and(|generation| *generation == self.generation)
+            && self.packet_readable_in_current_generation(packet_id)
     }
 
     fn queued_bytes_for_stream(&self, stream_index: c_int) -> usize {

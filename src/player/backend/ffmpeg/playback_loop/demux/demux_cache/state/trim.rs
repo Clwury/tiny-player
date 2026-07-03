@@ -56,8 +56,7 @@ impl DemuxPacketCacheState {
             return false;
         }
         let slack = (self.memory_limit_bytes / 16)
-            .max(64 * 1024)
-            .min(DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_BYTES);
+            .clamp(64 * 1024, DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_BYTES);
         self.cached_bytes > self.memory_limit_bytes.saturating_add(slack)
     }
 
@@ -168,7 +167,7 @@ impl DemuxPacketCacheState {
             .iter()
             .filter(|(stream_index, queue)| {
                 queue.front().is_some_and(|packet_id| {
-                    Some(*packet_id) != self.reader_heads.get(stream_index).copied()
+                    Some(*packet_id) != self.next_packet_id_for_stream(**stream_index)
                 })
             })
             .map(|(stream_index, queue)| {
@@ -202,7 +201,7 @@ impl DemuxPacketCacheState {
 
     fn active_stream_prefix_prune_count(&self, stream_index: c_int) -> Option<usize> {
         let queue = self.read_range().stream_queues.get(&stream_index)?;
-        let reader_head = self.reader_heads.get(&stream_index).copied();
+        let reader_head = self.next_packet_id_for_stream(stream_index);
         let boundaries = queue
             .iter()
             .take_while(|packet_id| Some(**packet_id) != reader_head)
@@ -312,7 +311,8 @@ impl DemuxPacketCacheState {
             return Self::seekable_timeline_ranges_in_packet_range(
                 &self.packets,
                 self.timeline_anchor_stream_index,
-                0,
+                self.cached_seek_preroll_nsecs,
+                self.cached_seek_requires_safe_point,
                 &stream_queues,
                 false,
             )
@@ -351,6 +351,7 @@ impl DemuxPacketCacheState {
             self.timeline_anchor_stream_index,
             stream_index,
             packet,
+            self.cached_seek_requires_safe_point,
         )
     }
 
@@ -358,9 +359,15 @@ impl DemuxPacketCacheState {
         timeline_anchor_stream_index: c_int,
         stream_index: c_int,
         packet: &CachedDemuxPacket,
+        require_safe_seek_point: bool,
     ) -> bool {
         if stream_index == timeline_anchor_stream_index {
-            return packet.timeline_anchor && packet.recovery_point && packet.start_nsecs.is_some();
+            let seek_boundary = if require_safe_seek_point {
+                packet.safe_seek_point
+            } else {
+                packet.recovery_point
+            };
+            return packet.timeline_anchor && seek_boundary && packet.start_nsecs.is_some();
         }
         packet.start_nsecs.is_some()
     }
@@ -385,6 +392,7 @@ impl DemuxPacketCacheState {
         if removed.is_empty() {
             return;
         }
+        range.mark_seekable_dirty();
         let sparse_pruned_until_nsecs = matches!(
             self.stream_kinds.get(&stream_index),
             Some(StreamCacheKind::Subtitle)
@@ -421,8 +429,11 @@ impl DemuxPacketCacheState {
         }
         for packet_id in removed {
             self.consumed_packet_ids.remove(&packet_id);
+            self.low_level_append_blocked_packet_generations
+                .remove(&packet_id);
             if let Some(packet) = self.packets.remove(&packet_id) {
                 self.cached_bytes = self.cached_bytes.saturating_sub(packet.byte_len);
+                range.subtract_report_bytes(packet.byte_len);
             }
         }
     }

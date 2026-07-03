@@ -38,19 +38,7 @@ impl DemuxPacketCacheState {
         let mut stream_kinds = BTreeMap::new();
         stream_kinds.insert(timeline_anchor_stream_index, StreamCacheKind::Video);
         let mut ranges = BTreeMap::new();
-        ranges.insert(
-            0,
-            DemuxCachedRange {
-                id: 0,
-                global_order: VecDeque::new(),
-                stream_queues: BTreeMap::new(),
-                sparse_stream_pruned_until_nsecs: BTreeMap::new(),
-                stream_boundaries: BTreeMap::new(),
-                is_bof: reader_nsecs == 0,
-                is_eof: false,
-                last_used_generation: 0,
-            },
-        );
+        ranges.insert(0, DemuxCachedRange::new(0, reader_nsecs == 0, 0));
         Self {
             packets: HashMap::new(),
             ranges,
@@ -60,6 +48,7 @@ impl DemuxPacketCacheState {
             consumed_packet_ids: HashSet::new(),
             reader_heads: BTreeMap::new(),
             reader_head_positions: BTreeMap::new(),
+            reader_head_generations: BTreeMap::new(),
             forward_streams: BTreeMap::new(),
             reader_forward_bytes: 0,
             read_range_id: 0,
@@ -70,6 +59,8 @@ impl DemuxPacketCacheState {
             stream_kinds,
             selected_streams: DemuxSelectedStreams::default(),
             cached_seek_preroll_nsecs: video_cached_seek_preroll_nsecs(timeline_anchor_codec_id),
+            cached_seek_requires_safe_point: timeline_anchor_codec_id
+                == ffi::AVCodecID::AV_CODEC_ID_HEVC,
             memory_limit_bytes,
             backbuffer_limit_bytes,
             donate_backbuffer: cache_config.demuxer_donate_buffer,
@@ -89,6 +80,8 @@ impl DemuxPacketCacheState {
             seek_request: None,
             demux_position_detached: false,
             resume_append_skip_until_nsecs: None,
+            low_level_append_guard_target_nsecs: None,
+            low_level_append_blocked_packet_generations: HashMap::new(),
             seeking: false,
             demux_ts_nsecs: None,
             cached_seeks: 0,
@@ -96,7 +89,8 @@ impl DemuxPacketCacheState {
             input_rate_samples: VecDeque::new(),
             last_reported_buffered_until: None,
             last_cache_state_emit_at: None,
-            last_emitted_cache_state: None,
+            last_emitted_seekable_ranges: None,
+            cache_state_emit_dirty: false,
             generation: 0,
             error: None,
             shutdown: false,
@@ -109,6 +103,7 @@ impl DemuxPacketCacheState {
         kind: StreamCacheKind,
     ) {
         self.stream_kinds.insert(stream_index, kind);
+        self.mark_all_seekable_summaries_dirty();
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_selected_streams(
@@ -128,6 +123,9 @@ impl DemuxPacketCacheState {
             .retain(|stream_index, _| self.stream_kinds.contains_key(stream_index));
         self.reader_head_positions
             .retain(|stream_index, _| self.stream_kinds.contains_key(stream_index));
+        self.reader_head_generations
+            .retain(|stream_index, _| self.stream_kinds.contains_key(stream_index));
+        self.mark_all_seekable_summaries_dirty();
         self.refresh_reader_tracking();
         self.refresh_readahead_hysteresis();
     }
@@ -173,5 +171,11 @@ impl DemuxPacketCacheState {
 
         self.trim_to_limit();
         self.refresh_readahead_hysteresis();
+    }
+
+    fn mark_all_seekable_summaries_dirty(&self) {
+        for range in self.ranges.values() {
+            range.mark_seekable_dirty();
+        }
     }
 }

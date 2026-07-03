@@ -1,12 +1,14 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     os::raw::c_int,
     time::Instant,
 };
 
+#[cfg(test)]
+use super::PlaybackCacheState;
 use super::{
-    DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL, DemuxCacheState, DemuxCachedRange,
-    DemuxPacketCacheState, PacketId, PlaybackCacheState, PlaybackCacheTimeRange,
+    DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL, DemuxCacheReportSnapshot, DemuxCacheState,
+    DemuxCachedRange, DemuxPacketCacheState, PacketId, PlaybackCacheTimeRange,
     SeekableTimelineSummary, StreamCacheKind, StreamCacheRangeState, StreamCacheState,
     StreamForwardWindow, nsecs_to_seconds, optional_buffered_value_changed,
     ordered_duration_seconds,
@@ -19,6 +21,7 @@ impl DemuxPacketCacheState {
             .get(&self.timeline_anchor_stream_index)
             .into_iter()
             .flat_map(|queue| queue.iter().copied())
+            .filter(|packet_id| !self.packet_blocked_for_current_generation(*packet_id))
             .filter(|packet_id| {
                 self.packets
                     .get(packet_id)
@@ -41,14 +44,29 @@ impl DemuxPacketCacheState {
         first_cached_nsecs.zip(buffered_until_nsecs)
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn playback_cache_state(
         &self,
         paused_for_cache: bool,
     ) -> PlaybackCacheState {
+        self.cache_report_snapshot(paused_for_cache)
+            .into_cache_state()
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cache_report_snapshot(
+        &self,
+        paused_for_cache: bool,
+    ) -> DemuxCacheReportSnapshot {
         let forward_window = self.selected_forward_timeline_window();
+        let cached_until_nsecs = if forward_window.is_none() {
+            self.cached_until_nsecs()
+        } else {
+            None
+        };
+        let forward_bytes = self.forward_bytes();
         let cache_end = forward_window
             .map(|window| window.end_nsecs)
-            .or_else(|| self.cached_until_nsecs())
+            .or(cached_until_nsecs)
             .map(nsecs_to_seconds);
         let reader_pts = Some(nsecs_to_seconds(
             forward_window
@@ -57,44 +75,11 @@ impl DemuxPacketCacheState {
         ));
         let cache_duration = forward_window
             .map(|window| nsecs_to_seconds(window.duration_nsecs()))
-            .or_else(|| {
-                ordered_duration_seconds(Some(self.reader_nsecs), self.cached_until_nsecs())
-            });
-        let seekable_ranges = self.seekable_time_ranges();
-        let active_seekable_summary = self.range_seekable_timeline_summary(self.read_range());
-        let active_has_seekable_range = !active_seekable_summary.ranges.is_empty();
-        let detached_append_range_id = self.detached_append_range_id();
-        let detached_seekable_summary = self
-            .detached_append_range()
-            .map(|range| self.range_seekable_timeline_summary(range));
-        let bof_cached = (active_has_seekable_range && active_seekable_summary.is_bof)
-            || detached_seekable_summary
-                .as_ref()
-                .is_some_and(|summary| !summary.ranges.is_empty() && summary.is_bof)
-            || self
-                .ranges
-                .iter()
-                .filter(|(range_id, _)| **range_id != self.read_range_id)
-                .filter(|(range_id, _)| Some(**range_id) != detached_append_range_id)
-                .any(|(_, range)| {
-                    let summary = self.range_seekable_timeline_summary(range);
-                    !summary.ranges.is_empty() && summary.is_bof
-                });
-        let eof_cached = (active_has_seekable_range && active_seekable_summary.is_eof)
-            || detached_seekable_summary
-                .as_ref()
-                .is_some_and(|summary| !summary.ranges.is_empty() && summary.is_eof)
-            || self
-                .ranges
-                .iter()
-                .filter(|(range_id, _)| **range_id != self.read_range_id)
-                .filter(|(range_id, _)| Some(**range_id) != detached_append_range_id)
-                .any(|(_, range)| {
-                    let summary = self.range_seekable_timeline_summary(range);
-                    !summary.ranges.is_empty() && summary.is_eof
-                });
+            .or_else(|| ordered_duration_seconds(Some(self.reader_nsecs), cached_until_nsecs));
+        let seekable_report = self.seekable_time_ranges_report();
 
-        PlaybackCacheState {
+        DemuxCacheReportSnapshot {
+            session_id: self.session_id,
             demux: DemuxCacheState {
                 cache_end,
                 reader_pts,
@@ -103,30 +88,28 @@ impl DemuxPacketCacheState {
                 underrun: self.has_demux_underrun(),
                 idle: self.effective_eof() || self.should_pause_demux(),
                 seeking: self.seeking || self.seek_request.is_some(),
-                bof_cached,
-                eof_cached,
+                bof_cached: seekable_report.bof_cached,
+                eof_cached: seekable_report.eof_cached,
                 total_bytes: u64::try_from(self.cached_bytes).unwrap_or(u64::MAX),
-                forward_bytes: u64::try_from(self.forward_bytes()).unwrap_or(u64::MAX),
+                forward_bytes: u64::try_from(forward_bytes).unwrap_or(u64::MAX),
                 file_cache_bytes: self.disk_cache.as_ref().map(|cache| cache.next_offset),
                 raw_input_rate: self.raw_input_rate(),
                 ts_last: self.demux_ts_nsecs.map(nsecs_to_seconds),
                 cached_seeks: self.cached_seeks,
                 low_level_seeks: self.low_level_seeks,
                 byte_level_seeks: 0,
-                seekable_ranges,
-                streams: self.stream_cache_states(),
+                seekable_ranges: seekable_report.ranges,
+                streams: self.stream_cache_states_with_forward_bytes(forward_bytes),
             },
-            byte: None,
             paused_for_cache,
             buffering_percent: self.cache_buffering_percent,
         }
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn take_buffered_changed_for_cache_state(
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn take_buffered_changed_for_cache_end(
         &mut self,
-        cache_state: &PlaybackCacheState,
+        buffered_until: Option<f64>,
     ) -> Option<Option<f64>> {
-        let buffered_until = cache_state.demux.cache_end;
         let changed = self
             .last_reported_buffered_until
             .map(|previous| optional_buffered_value_changed(previous, buffered_until))
@@ -147,6 +130,32 @@ impl DemuxPacketCacheState {
             .is_none_or(|elapsed| elapsed >= DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL)
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn mark_cache_state_emit_dirty(
+        &mut self,
+    ) {
+        self.cache_state_emit_dirty = true;
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cache_state_emit_dirty(
+        &self,
+    ) -> bool {
+        self.cache_state_emit_dirty
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cache_state_emit_ready(
+        &self,
+        now: Instant,
+    ) -> bool {
+        self.cache_state_emit_dirty
+            && (self.last_cache_state_emit_at.is_none() || self.cache_state_report_due(now))
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn clear_cache_state_emit_dirty(
+        &mut self,
+    ) {
+        self.cache_state_emit_dirty = false;
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn record_cache_state_emit(
         &mut self,
         now: Instant,
@@ -154,19 +163,27 @@ impl DemuxPacketCacheState {
         self.last_cache_state_emit_at = Some(now);
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn record_emitted_cache_state(
         &mut self,
         cache_state: &PlaybackCacheState,
     ) {
-        self.last_emitted_cache_state = Some(cache_state.clone());
+        self.record_emitted_seekable_ranges(cache_state.demux.seekable_ranges.clone());
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn record_emitted_seekable_ranges(
+        &mut self,
+        seekable_ranges: Vec<PlaybackCacheTimeRange>,
+    ) {
+        self.last_emitted_seekable_ranges = Some(seekable_ranges);
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_ranges_changed_since_last_emit(
         &self,
     ) -> bool {
-        self.last_emitted_cache_state
+        self.last_emitted_seekable_ranges
             .as_ref()
-            .is_some_and(|state| state.demux.seekable_ranges != self.seekable_time_ranges())
+            .is_some_and(|ranges| ranges != &self.seekable_time_ranges())
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn forward_bytes(
@@ -174,7 +191,13 @@ impl DemuxPacketCacheState {
     ) -> usize {
         self.reader_forward_bytes.saturating_add(
             self.detached_append_range()
-                .map(|range| self.range_bytes(range))
+                .map(|range| {
+                    if self.range_has_current_generation_blocked_packet(range) {
+                        self.range_bytes(range)
+                    } else {
+                        range.report_bytes()
+                    }
+                })
                 .unwrap_or_default(),
         )
     }
@@ -189,9 +212,24 @@ impl DemuxPacketCacheState {
         range
             .global_order
             .iter()
+            .filter(|packet_id| !self.packet_blocked_for_current_generation(**packet_id))
             .filter_map(|packet_id| self.packets.get(packet_id))
             .map(|packet| packet.byte_len)
             .sum()
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn range_has_current_generation_blocked_packet(
+        &self,
+        range: &DemuxCachedRange,
+    ) -> bool {
+        if self.low_level_append_blocked_packet_generations.is_empty() {
+            return false;
+        }
+        range.global_order.iter().any(|packet_id| {
+            self.low_level_append_blocked_packet_generations
+                .get(packet_id)
+                .is_some_and(|generation| *generation == self.generation)
+        })
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn has_demux_underrun(
@@ -235,13 +273,21 @@ impl DemuxPacketCacheState {
         &self,
         window: StreamForwardWindow,
     ) -> bool {
+        self.stream_window_idle_with_forward_bytes(window, self.forward_bytes())
+    }
+
+    fn stream_window_idle_with_forward_bytes(
+        &self,
+        window: StreamForwardWindow,
+        forward_bytes: usize,
+    ) -> bool {
         if self.effective_eof() || self.demux_position_detached {
             return true;
         }
         if self.stream_window_needs_reader_packet(window) {
             return false;
         }
-        if self.memory_limit_bytes > 0 && self.forward_bytes() >= self.memory_limit_bytes {
+        if self.memory_limit_bytes > 0 && forward_bytes >= self.memory_limit_bytes {
             return true;
         }
         let forward_duration = window.duration_nsecs();
@@ -256,7 +302,16 @@ impl DemuxPacketCacheState {
         &self,
         window: StreamForwardWindow,
     ) -> bool {
-        self.stream_window_needs_reader_packet(window) && !self.stream_window_idle(window)
+        self.stream_window_underrun_with_forward_bytes(window, self.forward_bytes())
+    }
+
+    fn stream_window_underrun_with_forward_bytes(
+        &self,
+        window: StreamForwardWindow,
+        forward_bytes: usize,
+    ) -> bool {
+        self.stream_window_needs_reader_packet(window)
+            && !self.stream_window_idle_with_forward_bytes(window, forward_bytes)
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn stream_window_needs_reader_packet(
@@ -297,6 +352,9 @@ impl DemuxPacketCacheState {
                 detached_append_range.and_then(|range| range.stream_queues.get(stream_index))
             {
                 for packet_id in queue {
+                    if self.packet_blocked_for_current_generation(*packet_id) {
+                        continue;
+                    }
                     let Some(packet) = self.packets.get(packet_id) else {
                         continue;
                     };
@@ -326,10 +384,26 @@ impl DemuxPacketCacheState {
     }
 
     fn seekable_time_ranges(&self) -> Vec<PlaybackCacheTimeRange> {
+        self.seekable_time_ranges_report().ranges
+    }
+
+    fn seekable_time_ranges_report(&self) -> SeekableTimeRangesReport {
         let mut ranges = Vec::new();
-        self.collect_seekable_time_ranges(self.read_range(), &mut ranges);
+        let mut bof_cached = false;
+        let mut eof_cached = false;
+        self.collect_seekable_time_ranges_report(
+            self.read_range(),
+            &mut ranges,
+            &mut bof_cached,
+            &mut eof_cached,
+        );
         if let Some(range) = self.detached_append_range() {
-            self.collect_seekable_time_ranges(range, &mut ranges);
+            self.collect_seekable_time_ranges_report(
+                range,
+                &mut ranges,
+                &mut bof_cached,
+                &mut eof_cached,
+            );
         }
         let detached_append_range_id = self.detached_append_range_id();
         for (range_id, range) in &self.ranges {
@@ -339,25 +413,43 @@ impl DemuxPacketCacheState {
             if Some(*range_id) == detached_append_range_id {
                 continue;
             }
-            self.collect_seekable_time_ranges(range, &mut ranges);
+            self.collect_seekable_time_ranges_report(
+                range,
+                &mut ranges,
+                &mut bof_cached,
+                &mut eof_cached,
+            );
         }
         ranges.sort_by(|left, right| {
             left.start
                 .partial_cmp(&right.start)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        ranges
+        let ranges = ranges
             .into_iter()
             .filter(|range| range.end >= range.start)
-            .collect()
+            .collect::<Vec<_>>();
+        SeekableTimeRangesReport {
+            ranges,
+            bof_cached,
+            eof_cached,
+        }
     }
 
-    fn collect_seekable_time_ranges(
+    fn collect_seekable_time_ranges_report(
         &self,
         range: &DemuxCachedRange,
         ranges: &mut Vec<PlaybackCacheTimeRange>,
+        bof_cached: &mut bool,
+        eof_cached: &mut bool,
     ) {
-        for (start, end) in self.range_seekable_timeline_ranges(range) {
+        let summary = self.range_seekable_timeline_summary(range);
+        if summary.ranges.is_empty() {
+            return;
+        }
+        *bof_cached |= summary.is_bof;
+        *eof_cached |= summary.is_eof;
+        for (start, end) in summary.ranges {
             ranges.push(PlaybackCacheTimeRange {
                 start: nsecs_to_seconds(start),
                 end: nsecs_to_seconds(end),
@@ -365,23 +457,35 @@ impl DemuxPacketCacheState {
         }
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn range_seekable_timeline_ranges(
-        &self,
-        range: &DemuxCachedRange,
-    ) -> Vec<(u64, u64)> {
-        self.range_seekable_timeline_summary(range).ranges
-    }
-
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn range_seekable_timeline_summary(
         &self,
         range: &DemuxCachedRange,
+    ) -> SeekableTimelineSummary {
+        if let Some(summary) = range.cached_seekable_summary(self.generation) {
+            return summary;
+        }
+        let summary = if self.range_has_current_generation_blocked_packet(range) {
+            let (_, stream_queues) = self.current_generation_range_view(range);
+            self.compute_range_seekable_timeline_summary(range, &stream_queues)
+        } else {
+            self.compute_range_seekable_timeline_summary(range, &range.stream_queues)
+        };
+        range.store_seekable_summary(self.generation, summary.clone());
+        summary
+    }
+
+    fn compute_range_seekable_timeline_summary(
+        &self,
+        range: &DemuxCachedRange,
+        stream_queues: &BTreeMap<c_int, VecDeque<u64>>,
     ) -> SeekableTimelineSummary {
         let timeline_boundary = range.stream_boundary(self.timeline_anchor_stream_index);
         let Some((mut start, mut end)) = Self::seekable_timeline_range_in_packet_range(
             &self.packets,
             self.timeline_anchor_stream_index,
-            0,
-            &range.stream_queues,
+            self.cached_seek_preroll_nsecs,
+            self.cached_seek_requires_safe_point,
+            stream_queues,
             timeline_boundary.is_eof,
         ) else {
             return SeekableTimelineSummary::default();
@@ -400,8 +504,7 @@ impl DemuxPacketCacheState {
             let boundary = range.stream_boundary(*stream_index);
             is_bof &= boundary.is_bof;
             is_eof &= boundary.is_eof;
-            match range
-                .stream_queues
+            match stream_queues
                 .get(stream_index)
                 .and_then(|queue| Self::stream_seek_range_in_packet_queue(&self.packets, queue))
             {
@@ -452,24 +555,21 @@ impl DemuxPacketCacheState {
         }
     }
 
-    fn stream_cache_states(&self) -> Vec<StreamCacheState> {
+    fn stream_cache_states_with_forward_bytes(
+        &self,
+        forward_bytes: usize,
+    ) -> Vec<StreamCacheState> {
         let mut streams: BTreeMap<c_int, StreamCacheRangeState> = BTreeMap::new();
-        let read_packet_positions = self
-            .read_range()
-            .global_order
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, packet_id)| (packet_id, index))
-            .collect::<HashMap<_, _>>();
-        self.collect_stream_cache_ranges(
-            &self.read_range().stream_queues,
-            &mut streams,
-            |packet_id| {
-                read_packet_positions.contains_key(&packet_id)
-                    && self.active_packet_is_forward(packet_id)
-            },
-        );
+        for (stream_index, state) in &self.forward_streams {
+            streams.insert(
+                *stream_index,
+                StreamCacheRangeState {
+                    reader_nsecs: state.reader_nsecs,
+                    cache_end_nsecs: state.end_nsecs,
+                    has_forward_packet: state.packet_count > 0,
+                },
+            );
+        }
         if let Some(range) = self.detached_append_range() {
             self.collect_stream_cache_ranges(&range.stream_queues, &mut streams, |_| true);
         }
@@ -510,8 +610,8 @@ impl DemuxPacketCacheState {
                         state.reader_nsecs,
                         state.cache_end_nsecs,
                     ),
-                    underrun: self.stream_window_underrun(window),
-                    idle: self.stream_window_idle(window),
+                    underrun: self.stream_window_underrun_with_forward_bytes(window, forward_bytes),
+                    idle: self.stream_window_idle_with_forward_bytes(window, forward_bytes),
                 }
             })
             .collect()
@@ -544,4 +644,10 @@ impl DemuxPacketCacheState {
             }
         }
     }
+}
+
+struct SeekableTimeRangesReport {
+    ranges: Vec<PlaybackCacheTimeRange>,
+    bof_cached: bool,
+    eof_cached: bool,
 }

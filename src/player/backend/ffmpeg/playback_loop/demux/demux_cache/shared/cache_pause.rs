@@ -7,14 +7,17 @@ impl DemuxPacketCacheShared {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn enter_initial_cache_pause_if_needed(
         &self,
     ) {
-        let mut guard = self
-            .state
-            .lock()
-            .expect("FFmpeg demux packet cache poisoned");
-        if guard.cache_pause_initial && guard.cache_pause_can_enter(false) {
-            self.enter_cache_pause(&mut guard);
-        }
-        self.emit_cache_state(&mut guard);
+        let emit = {
+            let mut guard = self
+                .state
+                .lock()
+                .expect("FFmpeg demux packet cache poisoned");
+            if guard.cache_pause_initial && guard.cache_pause_can_enter(false) {
+                self.enter_cache_pause(&mut guard);
+            }
+            self.prepare_cache_state_emit(&mut guard)
+        };
+        self.send_cache_state_emit(emit.into_emit());
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn enter_cache_pause_if_needed(
@@ -26,7 +29,7 @@ impl DemuxPacketCacheShared {
             return;
         }
         if self.enter_cache_pause(guard).force_cache_state_report {
-            self.emit_cache_state(guard);
+            guard.mark_cache_state_emit_dirty();
         }
     }
 

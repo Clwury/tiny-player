@@ -18,7 +18,9 @@ use super::video_frame_prepare_admission_service::{
     DecodedVideoFramePrepareStatus, DecodedVideoFrameStartStatus,
     enqueue_decoded_video_frame_prepare, service_drained_video_frame_start,
 };
-use super::video_frame_prepare_worker::{VideoFramePrepareEnqueueResult, VideoFramePrepareWorker};
+use super::video_frame_prepare_worker::{
+    VideoFramePrepareDiagnosticContext, VideoFramePrepareEnqueueResult, VideoFramePrepareWorker,
+};
 use super::{
     AudioOutput, BufferedReporter, CORRUPT_VIDEO_FRAME_RECOVERY_ERROR, DoviPipeline, FfmpegControl,
     PlaybackOutputScheduler, PlaybackScheduler, PositionReporter, SubtitlePipeline,
@@ -104,7 +106,9 @@ impl VideoDecodeDrainFrameProcessor {
             subtitle_pipeline,
             current_start_position_nsecs,
             dovi_pipeline,
+            output_scheduler,
             video_frame_prepare_worker,
+            session_id,
         )?;
         made_progress |= self.drain_ready_prepared_frames(
             video_frame_prepare_worker,
@@ -151,7 +155,9 @@ impl VideoDecodeDrainFrameProcessor {
         subtitle_pipeline: &mut SubtitlePipeline,
         current_start_position_nsecs: &mut u64,
         dovi_pipeline: &mut DoviPipeline,
+        output_scheduler: &PlaybackOutputScheduler,
         video_frame_prepare_worker: &mut VideoFramePrepareWorker,
+        session_id: PlaybackSessionId,
     ) -> std::result::Result<bool, String> {
         let mut made_progress = false;
         while let Some(decoded_frame) = self.frames.pop_front() {
@@ -164,7 +170,9 @@ impl VideoDecodeDrainFrameProcessor {
                 subtitle_pipeline,
                 current_start_position_nsecs,
                 dovi_pipeline,
+                output_scheduler,
                 video_frame_prepare_worker,
+                session_id,
             )? {
                 DrainedFramePrepareAdmission::Queued => {
                     made_progress = true;
@@ -192,7 +200,9 @@ impl VideoDecodeDrainFrameProcessor {
         subtitle_pipeline: &mut SubtitlePipeline,
         current_start_position_nsecs: &mut u64,
         dovi_pipeline: &mut DoviPipeline,
+        output_scheduler: &PlaybackOutputScheduler,
         video_frame_prepare_worker: &mut VideoFramePrepareWorker,
+        session_id: PlaybackSessionId,
     ) -> std::result::Result<DrainedFramePrepareAdmission, String> {
         let frame = decoded_frame.as_mut_ptr();
         let start_frame = match service_drained_video_frame_start(
@@ -206,15 +216,24 @@ impl VideoDecodeDrainFrameProcessor {
         ) {
             DecodedVideoFrameStartStatus::Ready(frame) => frame,
             DecodedVideoFrameStartStatus::DroppedBeforeStart
+            | DecodedVideoFrameStartStatus::SeekPrerollBeforeStart(_)
             | DecodedVideoFrameStartStatus::DroppedCorrupt => {
                 return Ok(DrainedFramePrepareAdmission::Dropped);
             }
         };
         let frame_pts = start_frame.frame_pts;
         let timeline_nsecs = start_frame.timeline_nsecs;
+        let diagnostic = VideoFramePrepareDiagnosticContext::from_output_snapshot(
+            session_id,
+            self.decoded_video_frame_count,
+            false,
+            "eof_drain",
+            output_scheduler.snapshot(),
+        );
         match enqueue_decoded_video_frame_prepare(
             decoded_frame,
             self.generation,
+            diagnostic,
             frame_pts,
             timeline_nsecs,
             video_frame_duration_nsecs,

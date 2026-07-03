@@ -6,8 +6,9 @@ use crate::player::{
 };
 
 use super::super::{
-    CacheAppendPermit, FfmpegControl, HTTP_CACHE_RANGE_REQUEST_BYTES, HttpCacheRangeKind,
-    HttpRingCache, HttpRingCacheShared, HttpRingCacheState,
+    CacheAppendPermit, FfmpegControl, HTTP_CACHE_RANGE_REQUEST_BYTES,
+    HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES, HttpCacheConfig, HttpCacheRangeKind, HttpRingCache,
+    HttpRingCacheShared, HttpRingCacheState,
 };
 
 #[test]
@@ -90,6 +91,40 @@ fn http_cache_playback_status_skips_busy_state_lock() {
     let _guard = cache.shared.state.lock().expect("state locks");
 
     assert!(cache.try_playback_byte_cache_status().is_none());
+}
+
+#[test]
+fn http_cache_shared_uses_small_range_for_initial_empty_playback_request() {
+    let (event_tx, _) = mpsc::channel();
+    let config = HttpCacheConfig {
+        range_request_bytes: HTTP_CACHE_RANGE_REQUEST_BYTES,
+        ..HttpCacheConfig::for_test(500 * 1024 * 1024)
+    };
+    let shared = HttpRingCacheShared {
+        state: Mutex::new(HttpRingCacheState::new_with_config(0, config)),
+        ready: Condvar::new(),
+        control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
+        event_tx,
+    };
+
+    assert_eq!(
+        shared.playback_range_request_bytes(0),
+        HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES
+    );
+
+    {
+        let mut guard = shared.state.lock().expect("state locks");
+        assert!(guard.append_at(0, b"abcdef"));
+    }
+
+    assert_eq!(
+        shared.playback_range_request_bytes(6),
+        HTTP_CACHE_RANGE_REQUEST_BYTES
+    );
+    assert_eq!(
+        shared.playback_range_request_bytes(0),
+        HTTP_CACHE_RANGE_REQUEST_BYTES
+    );
 }
 
 #[test]

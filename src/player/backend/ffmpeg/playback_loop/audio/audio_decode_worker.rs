@@ -620,7 +620,7 @@ fn run_audio_decode_worker(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::mpsc, time::Duration};
+    use std::{collections::VecDeque, sync::mpsc};
 
     use ffmpeg_sys_next as ffi;
 
@@ -660,12 +660,12 @@ mod tests {
     }
 
     #[test]
-    fn decoded_audio_queue_limit_is_one_second() {
+    fn decoded_audio_queue_limit_has_rebuffer_headroom() {
         let worker = worker_for_test();
 
         assert_eq!(
             worker.snapshot().duration_limit_nsecs,
-            duration_nsecs(Duration::from_secs(1))
+            duration_nsecs(AUDIO_DECODE_QUEUE_LIMIT_DURATION)
         );
     }
 

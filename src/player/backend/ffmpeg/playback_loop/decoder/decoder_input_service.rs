@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 
 use crate::player::render_host::PlaybackSessionId;
 
-use super::{DemuxPacketCache, FfmpegControl, PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER};
+use super::{
+    DemuxPacketCache, FfmpegControl, PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER,
+    PlaybackBlockReason,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 enum DecoderInputServiceStatus {
@@ -123,6 +126,15 @@ fn service_decoder_input_once(
         pump_result,
         &status,
     );
+    log_decoder_input_empty_output_diagnostic(
+        context,
+        service_started_at.elapsed(),
+        retry_elapsed,
+        pump_elapsed,
+        retry_status,
+        pump_result,
+        &status,
+    );
     status
 }
 
@@ -210,6 +222,82 @@ fn log_decoder_input_timing(
         pump_result,
         status = ?status,
         "FFmpeg decoder input service completed slowly"
+    );
+}
+
+fn log_decoder_input_empty_output_diagnostic(
+    context: &DecoderInputServiceContext<'_>,
+    total: Duration,
+    retry_elapsed: Duration,
+    pump_elapsed: Duration,
+    retry_status: DecodeInputRetryStatus,
+    pump_result: &'static str,
+    status: &DecoderInputServiceStatus,
+) {
+    let output_snapshot = context.pipeline.output_scheduler.snapshot();
+    if output_snapshot.queued_video_frames > 0
+        || !(output_snapshot.first_video_frame_pending || output_snapshot.rebuffering)
+    {
+        return;
+    }
+    if !matches!(
+        status,
+        DecoderInputServiceStatus::Progress
+            | DecoderInputServiceStatus::WouldBlock
+            | DecoderInputServiceStatus::Backpressured
+    ) {
+        return;
+    }
+
+    let demux_watermark = context.demux_cache.cached_reader_watermark();
+    let demux_packet_snapshot = context.demux_cache.packet_queue_snapshot();
+    let decoder_input = context
+        .pipeline
+        .decoder_input_snapshot(context.video_admission_pressure.output_resource_pressure);
+    let video_decode_snapshot = decoder_input.video_decode_snapshot;
+    tracing::debug!(
+        session_id = ?context.session_id,
+        total_ms = total.as_secs_f64() * 1000.0,
+        retry_pending_input_ms = retry_elapsed.as_secs_f64() * 1000.0,
+        demux_packet_pump_ms = pump_elapsed.as_secs_f64() * 1000.0,
+        retry_status = ?retry_status,
+        pump_result,
+        status = ?status,
+        should_wait_for_demux = context.should_wait_for_demux,
+        video_output_waiting_for_demux = context.video_output_waiting_for_demux,
+        output_state = ?output_snapshot.state,
+        first_video_frame_pending = output_snapshot.first_video_frame_pending,
+        output_rebuffering = output_snapshot.rebuffering,
+        queued_video_frames = output_snapshot.queued_video_frames,
+        queued_video_forward_ms = ?output_snapshot
+            .queued_video_forward_nsecs
+            .map(|duration| duration as f64 / 1_000_000.0),
+        demux_packet_queued = demux_packet_snapshot.total_packets,
+        demux_packet_bytes = demux_packet_snapshot.total_bytes,
+        demux_packet_streams = ?demux_packet_snapshot.streams,
+        demux_min_forward_ms = ?demux_watermark
+            .selected_min_forward_nsecs
+            .map(|duration| duration as f64 / 1_000_000.0),
+        demux_video_forward_ms = ?demux_watermark
+            .video_forward_nsecs
+            .map(|duration| duration as f64 / 1_000_000.0),
+        demux_audio_forward_ms = ?demux_watermark
+            .audio_forward_nsecs
+            .map(|duration| duration as f64 / 1_000_000.0),
+        demux_underrun = demux_watermark.underrun,
+        demux_video_underrun = demux_watermark.video_underrun,
+        demux_audio_underrun = demux_watermark.audio_underrun,
+        video_decode_blocked_on = ?decoder_input
+            .video_decode_blocked_on
+            .map(PlaybackBlockReason::as_str),
+        video_decode_state = ?video_decode_snapshot.state,
+        video_decode_queued_frames = video_decode_snapshot.queued_frames,
+        video_decode_pending_input_packets = video_decode_snapshot.pending_input_packets,
+        video_decode_pending_input_capacity = video_decode_snapshot.pending_input_capacity,
+        video_decode_pending_input_full = video_decode_snapshot.pending_input_full(),
+        video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+        video_decode_completed_packets = video_decode_snapshot.completed_packets,
+        "FFmpeg decoder input completed while output still has no video frame"
     );
 }
 

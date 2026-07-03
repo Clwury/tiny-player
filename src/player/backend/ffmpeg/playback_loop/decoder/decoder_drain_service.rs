@@ -185,6 +185,7 @@ fn wait_after_decoder_drain_stall(
             audio_output: context.pipeline.audio_output.as_ref(),
             vo_queue: context.vo_queue,
             playback_telemetry: &mut *context.playback_telemetry,
+            playback_loop_deadline: context.pipeline.playback_loop_deadline(),
         },
         stall_reason,
     );

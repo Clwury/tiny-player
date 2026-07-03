@@ -22,11 +22,22 @@ where
     F: FnMut() -> DemuxReaderWatermark,
 {
     let PreparedVideoFrame {
+        generation,
         frame,
         timeline_nsecs,
         duration_nsecs,
         ..
     } = context.prepared_frame;
+    log_prepared_video_frame_admission_entry(
+        context.session_id,
+        generation,
+        context.decoded_video_frame_count,
+        timeline_nsecs,
+        duration_nsecs,
+        *context.current_start_position_nsecs,
+        context.audio_output.is_some(),
+        context.output_scheduler,
+    );
     if let Some(output) = context.audio_output {
         if service_audio_clocked_decoded_video_frame(
             context.output_scheduler,
@@ -44,6 +55,7 @@ where
             timeline_nsecs,
             duration_nsecs,
             context.current_start_position_nsecs,
+            context.video_is_hevc,
             context.demux_reader_watermark,
         )? == DecodedVideoAdmissionStatus::Stop
         {
@@ -72,6 +84,55 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn log_prepared_video_frame_admission_entry(
+    session_id: PlaybackSessionId,
+    generation: u64,
+    decoded_video_frame_count: u64,
+    timeline_nsecs: u64,
+    duration_nsecs: u64,
+    current_start_position_nsecs: u64,
+    has_audio_output: bool,
+    output_scheduler: &PlaybackOutputScheduler,
+) {
+    let output_snapshot = output_scheduler.snapshot();
+    if decoded_video_frame_count != 1
+        && !output_snapshot.first_video_frame_pending
+        && !output_snapshot.rebuffering
+        && output_snapshot.queued_video_frames > 0
+    {
+        return;
+    }
+
+    tracing::debug!(
+        session_id = ?session_id,
+        generation,
+        decoded_video_frame_count,
+        timeline_nsecs,
+        duration_nsecs,
+        duration_ms = duration_nsecs as f64 / 1_000_000.0,
+        current_start_position_nsecs,
+        has_audio_output,
+        output_state = ?output_snapshot.state,
+        output_first_video_frame_pending = output_snapshot.first_video_frame_pending,
+        output_rebuffering = output_snapshot.rebuffering,
+        queued_video_frames = output_snapshot.queued_video_frames,
+        queued_video_ms = output_snapshot.queued_video_duration_nsecs as f64 / 1_000_000.0,
+        queued_video_range = ?output_snapshot.queued_video_range_nsecs,
+        queued_video_forward_ms = ?output_snapshot
+            .queued_video_forward_nsecs
+            .map(|duration| duration as f64 / 1_000_000.0),
+        queued_video_largest_gap_ms = ?output_snapshot
+            .queued_video_largest_gap_nsecs
+            .map(|gap| gap as f64 / 1_000_000.0),
+        pending_start_audio_frames = output_snapshot.pending_start_audio_frames,
+        pending_start_audio_ms = output_snapshot.pending_start_audio_nsecs as f64 / 1_000_000.0,
+        output_rebuffer_anchor = ?output_snapshot.video_output_rebuffer_anchor,
+        video_bootstrap_after_seek = output_snapshot.video_bootstrap_after_seek,
+        "admitting prepared FFmpeg video frame into output gate"
+    );
+}
+
 pub(super) struct PreparedVideoFrameAdmissionContext<'a, F>
 where
     F: FnMut() -> DemuxReaderWatermark,
@@ -90,14 +151,26 @@ where
     pub(super) position_reporter: &'a mut PositionReporter,
     pub(super) subtitle_pipeline: &'a mut SubtitlePipeline,
     pub(super) current_start_position_nsecs: &'a mut u64,
+    pub(super) video_is_hevc: bool,
     pub(super) demux_reader_watermark: F,
 }
 
 pub(super) fn admit_drained_prepared_video_frame(
     context: DrainedPreparedVideoFrameAdmissionContext<'_>,
 ) -> std::result::Result<(), String> {
+    let generation = context.prepared_frame.generation;
     let timeline_nsecs = context.prepared_frame.timeline_nsecs;
     let duration_nsecs = context.prepared_frame.duration_nsecs;
+    log_prepared_video_frame_admission_entry(
+        context.session_id,
+        generation,
+        context.decoded_video_frame_count,
+        timeline_nsecs,
+        duration_nsecs,
+        *context.current_start_position_nsecs,
+        context.audio_output.is_some(),
+        context.output_scheduler,
+    );
     if let Some(output) = context.audio_output {
         let _ = service_audio_clocked_drain_decoded_video_frame(
             context.output_scheduler,

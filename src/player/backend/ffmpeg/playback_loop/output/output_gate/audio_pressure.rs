@@ -1,14 +1,38 @@
 use super::{
-    AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AtomicBool, AudioClockMode,
-    AudioOutput, AudioOutputSnapshot, BackendEvent, BufferedReporter, DecodedAudio,
+    AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_QUEUE_LIMIT_DURATION,
+    AUDIO_OUTPUT_STEADY_TARGET_DURATION, AUDIO_OUTPUT_VIDEO_LEAD_DURATION,
+    AUDIO_REBUFFER_PREFILL_LOOP_TARGET, AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN, AtomicBool,
+    AudioClockMode, AudioOutput, AudioOutputSnapshot, AudioResumeWaterline,
+    AudioResumeWaterlineInput, BackendEvent, BufferedReporter, DecodedAudio,
     DelayedAudioStartSilencePolicy, Duration, FfmpegControl,
     PLAYING_PENDING_AUDIO_FORCE_RECOVERY_DURATION, PLAYING_PENDING_AUDIO_HARD_RESET_DURATION,
     PendingStartAudioPressureLevel, PlaybackOutputScheduler, PlaybackOutputState,
-    PlaybackSessionId, PositionReporter, SubtitlePipeline, VideoOutputQueue, duration_nsecs,
+    PlaybackSessionId, PositionReporter, SubtitlePipeline, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    VideoOutputQueue, audio_output_buffered_until_for_resume, duration_nsecs,
     enter_video_output_rebuffer, flush_pending_start_audio, pending_audio_underrun_recovery_plan,
     push_decoded_audio_to_output, recover_pending_start_audio_after_underrun,
 };
 use super::{PENDING_START_AUDIO_BACKPRESSURE_DURATION, Sender};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) enum PendingAudioPressureContext
+{
+    StartupSync,
+    RebufferResume,
+    PlayingSteady,
+}
+
+impl PendingAudioPressureContext {
+    pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn as_str(
+        self,
+    ) -> &'static str {
+        match self {
+            Self::StartupSync => "startup_sync",
+            Self::RebufferResume => "rebuffer_resume",
+            Self::PlayingSteady => "playing_steady",
+        }
+    }
+}
 
 impl PendingStartAudioPressureLevel {
     pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn from_duration(
@@ -64,19 +88,46 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn playing_pe
     playing_pending_audio_limit_duration().saturating_sub(Duration::from_millis(100))
 }
 
+fn startup_pending_audio_backpressure_duration() -> Duration {
+    AUDIO_OUTPUT_QUEUE_LIMIT_DURATION
+        .min(PENDING_START_AUDIO_BACKPRESSURE_DURATION)
+        .min(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION + AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)
+}
+
 pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn audio_output_flush_until_timeline_nsecs(
     snapshot: AudioOutputSnapshot,
     video_lead_until_timeline_nsecs: u64,
+    target_duration: Duration,
 ) -> u64 {
     let max_audio_until_nsecs = snapshot
         .played_timeline_nsecs
-        .saturating_add(duration_nsecs(AUDIO_OUTPUT_DELAY_LIMIT));
+        .saturating_add(duration_nsecs(target_duration));
     video_lead_until_timeline_nsecs.min(max_audio_until_nsecs)
 }
 
 impl PlaybackOutputScheduler {
+    pub(in crate::player::backend::ffmpeg) fn waiting_for_output_resume(&self) -> bool {
+        self.playback_output_state.first_video_frame_pending()
+            || self.playback_output_state.rebuffering()
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn audio_output_steady_target_duration(
+        &self,
+        _audio_snapshot: AudioOutputSnapshot,
+    ) -> Duration {
+        if self.audio_rebuffer_loop_active() {
+            return AUDIO_REBUFFER_PREFILL_LOOP_TARGET.min(AUDIO_OUTPUT_QUEUE_LIMIT_DURATION);
+        }
+        AUDIO_OUTPUT_STEADY_TARGET_DURATION.min(AUDIO_OUTPUT_QUEUE_LIMIT_DURATION)
+    }
+
     pub(in crate::player::backend::ffmpeg) fn pending_start_audio_backpressured(&self) -> bool {
         let buffered_duration = self.pending_start_audio.buffered_duration();
+        if self.playback_output_state.first_video_frame_pending()
+            || self.startup_pending_audio_pressure_context_active
+        {
+            return buffered_duration >= startup_pending_audio_backpressure_duration();
+        }
         if self.playback_output_state == PlaybackOutputState::Playing {
             return buffered_duration >= playing_pending_audio_limit_duration();
         }
@@ -85,6 +136,187 @@ impl PlaybackOutputScheduler {
         }
         !self.playback_output_state.first_video_frame_pending()
             || !self.scheduled_video_queue.is_empty()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::player::backend::ffmpeg) fn audio_resume_waterline_for_output_wait(
+        &self,
+        audio_snapshot: Option<AudioOutputSnapshot>,
+        audio_decode_queued_nsecs: u64,
+        audio_decode_in_flight_packets: usize,
+        current_start_position_nsecs: u64,
+        target_nsecs: u64,
+        demux_audio_forward_nsecs: Option<u64>,
+        demux_audio_cached_packets: Option<usize>,
+    ) -> Option<AudioResumeWaterline> {
+        if !self.waiting_for_output_resume() {
+            return None;
+        }
+
+        let previous_audio_played_until = audio_snapshot
+            .map(|snapshot| snapshot.played_timeline_nsecs)
+            .unwrap_or(current_start_position_nsecs);
+        if self.scheduled_video_queue.is_empty() {
+            return self.startup_audio_resume_waterline_without_video_queue(
+                audio_snapshot,
+                audio_decode_queued_nsecs,
+                audio_decode_in_flight_packets,
+                previous_audio_played_until,
+                target_nsecs,
+                demux_audio_forward_nsecs,
+                demux_audio_cached_packets,
+            );
+        }
+
+        let rebuffer_anchor = self
+            .playback_output_state
+            .rebuffering()
+            .then_some(self.video_output_rebuffer_anchor)
+            .flatten();
+        let resume_audio_played_until = rebuffer_anchor
+            .map(|anchor| anchor.timeline_nsecs)
+            .unwrap_or(previous_audio_played_until);
+        let audio_output_buffered_until_nsecs = if self.playback_output_state.rebuffering() {
+            audio_snapshot
+                .filter(|snapshot| snapshot.total_pending_nsecs > 0)
+                .map(|snapshot| snapshot.buffered_until_timeline_nsecs)
+        } else {
+            None
+        };
+        let resume_decision = if self.playback_output_state.first_video_frame_pending() {
+            self.scheduled_video_queue
+                .initial_output_sync_decision(
+                    &self.pending_start_audio,
+                    previous_audio_played_until,
+                )
+                .map(|decision| decision.audio_clock_resume_decision())
+        } else {
+            self.scheduled_video_queue
+                .rebuffer_audio_clock_resume_decision(
+                    &self.pending_start_audio,
+                    resume_audio_played_until,
+                    audio_output_buffered_until_nsecs,
+                    audio_snapshot.map(|snapshot| snapshot.total_pending_nsecs),
+                    rebuffer_anchor.is_some_and(|anchor| {
+                        anchor.reset_to_video_when_decoded_queue_misses_anchor
+                    }),
+                )
+        }?;
+        let resume_audio_output_buffered_until_nsecs = audio_output_buffered_until_for_resume(
+            resume_decision,
+            audio_output_buffered_until_nsecs,
+        );
+
+        Some(AudioResumeWaterline::from_input(
+            AudioResumeWaterlineInput {
+                pending_audio: &self.pending_start_audio,
+                resume_timeline_nsecs: resume_decision.timeline_nsecs,
+                target_nsecs,
+                audio_output_buffered_until_nsecs: resume_audio_output_buffered_until_nsecs,
+                audio_output_pending_nsecs: audio_snapshot
+                    .map(|snapshot| snapshot.total_pending_nsecs),
+                audio_decode_queued_nsecs,
+                audio_decode_in_flight_packets,
+                demux_audio_forward_nsecs,
+                demux_audio_cached_packets,
+            },
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn startup_audio_resume_waterline_without_video_queue(
+        &self,
+        audio_snapshot: Option<AudioOutputSnapshot>,
+        audio_decode_queued_nsecs: u64,
+        audio_decode_in_flight_packets: usize,
+        resume_timeline_nsecs: u64,
+        target_nsecs: u64,
+        demux_audio_forward_nsecs: Option<u64>,
+        demux_audio_cached_packets: Option<usize>,
+    ) -> Option<AudioResumeWaterline> {
+        if !self.playback_output_state.first_video_frame_pending() {
+            return None;
+        }
+
+        Some(AudioResumeWaterline::from_input(
+            AudioResumeWaterlineInput {
+                pending_audio: &self.pending_start_audio,
+                resume_timeline_nsecs,
+                target_nsecs,
+                audio_output_buffered_until_nsecs: None,
+                audio_output_pending_nsecs: audio_snapshot
+                    .map(|snapshot| snapshot.total_pending_nsecs),
+                audio_decode_queued_nsecs,
+                audio_decode_in_flight_packets,
+                demux_audio_forward_nsecs,
+                demux_audio_cached_packets,
+            },
+        ))
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn audio_resume_waterline_below_input_suppression(
+        &self,
+        audio_snapshot: Option<AudioOutputSnapshot>,
+        audio_decode_queued_nsecs: u64,
+        audio_decode_in_flight_packets: usize,
+        current_start_position_nsecs: u64,
+    ) -> bool {
+        self.audio_resume_waterline_for_output_wait(
+            audio_snapshot,
+            audio_decode_queued_nsecs,
+            audio_decode_in_flight_packets,
+            current_start_position_nsecs,
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            None,
+            None,
+        )
+        .is_some_and(|waterline| {
+            !waterline.reaches_target_with_margin(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)
+        })
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn discard_stale_pending_audio_before_output_resume(
+        &mut self,
+        audio_snapshot: Option<AudioOutputSnapshot>,
+        audio_decode_queued_nsecs: u64,
+        audio_decode_in_flight_packets: usize,
+        current_start_position_nsecs: u64,
+        session_id: PlaybackSessionId,
+    ) -> Option<AudioResumeWaterline> {
+        let waterline = self.audio_resume_waterline_for_output_wait(
+            audio_snapshot,
+            audio_decode_queued_nsecs,
+            audio_decode_in_flight_packets,
+            current_start_position_nsecs,
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            None,
+            None,
+        )?;
+        let dropped_audio_frames = self
+            .pending_start_audio
+            .discard_before(waterline.resume_timeline_nsecs);
+        if dropped_audio_frames == 0 {
+            return Some(waterline);
+        }
+
+        tracing::debug!(
+            session_id = ?session_id,
+            dropped_audio_frames,
+            resume_timeline_nsecs = waterline.resume_timeline_nsecs,
+            pending_audio_frames = self.pending_start_audio.len(),
+            pending_audio_ms = self.pending_start_audio.buffered_duration().as_secs_f64()
+                * 1000.0,
+            "discarded stale pending FFmpeg audio before output resume anchor"
+        );
+        self.audio_resume_waterline_for_output_wait(
+            audio_snapshot,
+            audio_decode_queued_nsecs,
+            audio_decode_in_flight_packets,
+            current_start_position_nsecs,
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            None,
+            None,
+        )
     }
 
     pub(in crate::player::backend::ffmpeg) fn pending_start_audio_can_recover_output(
@@ -122,6 +354,7 @@ impl PlaybackOutputScheduler {
         let audio_flush_until_timeline_nsecs = audio_output_flush_until_timeline_nsecs(
             audio_snapshot,
             video_lead_until_timeline_nsecs,
+            self.audio_output_steady_target_duration(audio_snapshot),
         );
         audio_flush_until_timeline_nsecs > audio_start_timeline_nsecs
             && self
@@ -293,6 +526,7 @@ impl PlaybackOutputScheduler {
         let audio_flush_until_timeline_nsecs = audio_output_flush_until_timeline_nsecs(
             audio_snapshot,
             video_lead_until_timeline_nsecs,
+            self.audio_output_steady_target_duration(audio_snapshot),
         );
         let made_progress = flush_pending_start_audio(
             &mut self.pending_start_audio,
@@ -345,11 +579,43 @@ impl PlaybackOutputScheduler {
         self.defer_pending_start_audio_flush_once = true;
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn defer_next_pending_start_audio_flush_after_initial_start(
+        &mut self,
+    ) {
+        self.defer_pending_start_audio_flush_once = true;
+        self.startup_pending_audio_pressure_context_active = true;
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn pending_audio_pressure_context(
+        &self,
+    ) -> PendingAudioPressureContext {
+        if self.playback_output_state.first_video_frame_pending()
+            || self.startup_pending_audio_pressure_context_active
+        {
+            PendingAudioPressureContext::StartupSync
+        } else if self.playback_output_state.rebuffering() {
+            PendingAudioPressureContext::RebufferResume
+        } else {
+            PendingAudioPressureContext::PlayingSteady
+        }
+    }
+
+    fn clear_startup_pending_audio_pressure_context_if_ready(&mut self) {
+        if self.startup_pending_audio_pressure_context_active
+            && self.pending_start_audio.buffered_duration()
+                < playing_pending_audio_pressure_clear_duration()
+        {
+            self.startup_pending_audio_pressure_context_active = false;
+        }
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn report_playing_pending_start_audio_pressure(
         &mut self,
         session_id: PlaybackSessionId,
         reason: &'static str,
     ) {
+        self.clear_startup_pending_audio_pressure_context_if_ready();
+        let pressure_context = self.pending_audio_pressure_context();
         if self.playback_output_state != PlaybackOutputState::Playing {
             self.pending_start_audio_pressure_level = PendingStartAudioPressureLevel::Normal;
             return;
@@ -377,6 +643,10 @@ impl PlaybackOutputScheduler {
                     session_id = ?session_id,
                     reason,
                     pressure_level = crossed.label(),
+                    pending_audio_pressure_context = pressure_context.as_str(),
+                    startup_pending_pressure_suppressed_hard_reset =
+                        pressure_context == PendingAudioPressureContext::StartupSync
+                            && crossed == PendingStartAudioPressureLevel::HardReset,
                     pending_audio_frames = self.pending_start_audio.len(),
                     pending_audio_ms = pending_duration.as_secs_f64() * 1000.0,
                     threshold_ms = crossed.threshold().as_secs_f64() * 1000.0,
@@ -400,6 +670,24 @@ impl PlaybackOutputScheduler {
             || self.pending_start_audio.buffered_duration()
                 < PLAYING_PENDING_AUDIO_HARD_RESET_DURATION
         {
+            return Ok(false);
+        }
+        self.clear_startup_pending_audio_pressure_context_if_ready();
+        let pressure_context = self.pending_audio_pressure_context();
+        if pressure_context != PendingAudioPressureContext::PlayingSteady {
+            tracing::debug!(
+                session_id = ?session_id,
+                reason,
+                pending_audio_pressure_context = pressure_context.as_str(),
+                startup_pending_pressure_suppressed_hard_reset =
+                    pressure_context == PendingAudioPressureContext::StartupSync,
+                pending_audio_frames = self.pending_start_audio.len(),
+                pending_audio_ms = self.pending_start_audio.buffered_duration().as_secs_f64()
+                    * 1000.0,
+                hard_reset_threshold_ms =
+                    PLAYING_PENDING_AUDIO_HARD_RESET_DURATION.as_secs_f64() * 1000.0,
+                "suppressed FFmpeg pending audio hard reset outside steady-state playback"
+            );
             return Ok(false);
         }
 
@@ -452,6 +740,9 @@ impl PlaybackOutputScheduler {
             session_id,
             Duration::ZERO,
             decoded_video_forward_nsecs,
+            None,
+            super::VideoOutputUnderflowClassification::DemuxRebuffer,
+            false,
         );
         self.sync_first_video_frame_pending();
         tracing::warn!(

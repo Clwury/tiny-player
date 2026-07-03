@@ -146,7 +146,8 @@ fn download_http_cache_range(
         return Ok(HttpDownloadOutcome::Eof);
     }
 
-    let range_request_bytes = http_cache_playback_range_request_bytes(shared.range_request_bytes());
+    let range_request_bytes =
+        http_cache_playback_range_request_bytes(shared.playback_range_request_bytes(offset));
     let range = http_cache_range_header(offset, known_content_len, range_request_bytes);
     let range_len = http_cache_range_request_len(offset, known_content_len, range_request_bytes);
     let request_timeout = http_cache_range_request_timeout(range_len);

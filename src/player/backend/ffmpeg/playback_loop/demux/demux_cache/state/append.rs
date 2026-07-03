@@ -9,6 +9,8 @@ use super::{
     PacketId, StreamCacheKind,
 };
 
+const LOW_LEVEL_SEEK_APPEND_MAX_INITIAL_LEAD_NSECS: u64 = 2_000_000_000;
+
 impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn append_packet(
         &mut self,
@@ -27,6 +29,7 @@ impl DemuxPacketCacheState {
             return DemuxPacketAppendOutcome {
                 appended: false,
                 force_cache_state_report: false,
+                cache_state_emit_deferred_for_consumer: false,
                 timing,
             };
         }
@@ -36,6 +39,8 @@ impl DemuxPacketCacheState {
         self.next_packet_id = self.next_packet_id.saturating_add(1);
         let stream_index = packet.stream_index;
         let packet_forward_end_nsecs = packet.end_nsecs.or(packet.start_nsecs);
+        let blocked_for_current_read =
+            self.mark_low_level_seek_noncurrent_packet_if_needed(packet_id, &packet);
         timing.packet_index += packet_index_started_at.elapsed();
         if self.disk_cache_writable
             && let Some(disk_cache) = self.disk_cache.as_mut()
@@ -50,13 +55,20 @@ impl DemuxPacketCacheState {
         let cleared_seek = self.seeking;
         let queue_insert_started_at = Instant::now();
         self.cached_bytes = self.cached_bytes.saturating_add(packet.byte_len);
-        self.append_packet_id_to_append_range(packet_id, stream_index);
+        let packet_position =
+            self.append_packet_id_to_append_range(packet_id, stream_index, packet.byte_len);
         self.packets.insert(packet_id, packet);
         timing.queue_insert += queue_insert_started_at.elapsed();
         let maybe_start_reader_head_started_at = Instant::now();
-        self.maybe_start_reader_head_for_appended_packet(packet_id, stream_index);
+        if !blocked_for_current_read {
+            self.maybe_start_reader_head_for_appended_packet(
+                packet_id,
+                stream_index,
+                packet_position,
+            );
+        }
         timing.maybe_start_reader_head += maybe_start_reader_head_started_at.elapsed();
-        self.update_forward_cache_after_appended_packet(packet_id);
+        self.update_forward_cache_after_appended_packet(packet_id, packet_position);
         self.seeking = false;
         let readahead_reached =
             self.appended_packet_may_reach_readahead(stream_index, packet_forward_end_nsecs);
@@ -88,7 +100,8 @@ impl DemuxPacketCacheState {
             };
         DemuxPacketAppendOutcome {
             appended: true,
-            force_cache_state_report: cleared_seek || pruned || should_pause_demux,
+            force_cache_state_report: cleared_seek || should_pause_demux,
+            cache_state_emit_deferred_for_consumer: false,
             timing,
         }
     }
@@ -110,10 +123,8 @@ impl DemuxPacketCacheState {
             return false;
         }
         self.append_trim_pressure_packets = self.append_trim_pressure_packets.saturating_add(1);
-        if self.append_trim_pressure_packets == 1
-            || self.append_trim_pressure_packets >= DEMUX_PACKET_APPEND_TRIM_INTERVAL
-        {
-            self.append_trim_pressure_packets = 1;
+        if self.append_trim_pressure_packets >= DEMUX_PACKET_APPEND_TRIM_INTERVAL {
+            self.append_trim_pressure_packets = 0;
             return true;
         }
         false
@@ -148,37 +159,46 @@ impl DemuxPacketCacheState {
             .all(|(stream_index, _)| {
                 self.reader_heads
                     .get(stream_index)
-                    .is_some_and(|packet_id| self.packets.contains_key(packet_id))
+                    .is_some_and(|_| self.next_packet_id_for_stream(*stream_index).is_some())
             })
     }
 
-    fn append_packet_id_to_append_range(&mut self, packet_id: PacketId, stream_index: c_int) {
+    fn append_packet_id_to_append_range(
+        &mut self,
+        packet_id: PacketId,
+        stream_index: c_int,
+        byte_len: usize,
+    ) -> usize {
         let range = self.append_range_mut();
         range.ensure_stream_boundary(stream_index);
+        let packet_position = range.global_order.len();
         range.global_order.push_back(packet_id);
         range
             .stream_queues
             .entry(stream_index)
             .or_default()
             .push_back(packet_id);
+        range.add_report_bytes(byte_len);
+        range.mark_seekable_dirty();
+        packet_position
     }
 
     fn maybe_start_reader_head_for_appended_packet(
         &mut self,
         packet_id: PacketId,
         stream_index: c_int,
+        packet_position: usize,
     ) {
         if self.append_range_id != self.read_range_id {
             return;
         }
-        if self.reader_heads.contains_key(&stream_index) {
+        if self.next_packet_id_for_stream(stream_index).is_some() {
             return;
         }
-        let packet_position = self.read_range().global_order.len().saturating_sub(1);
-        self.reader_heads.insert(stream_index, packet_id);
+        self.set_reader_head_for_current_generation(stream_index, packet_id);
         self.reader_head_positions
             .insert(stream_index, packet_position);
-        self.read_index = self.read_index.min(packet_position);
+        self.refresh_read_index_from_reader_head_positions();
         self.consumed_packet_ids.remove(&packet_id);
     }
 
@@ -223,7 +243,7 @@ impl DemuxPacketCacheState {
         };
         let packet_end_nsecs = packet.end_nsecs.or(packet.start_nsecs);
         if packet_end_nsecs.is_some_and(|end_nsecs| end_nsecs <= skip_until_nsecs) {
-            return true;
+            return false;
         }
         if packet
             .start_nsecs
@@ -232,6 +252,67 @@ impl DemuxPacketCacheState {
         {
             self.resume_append_skip_until_nsecs = None;
         }
+        false
+    }
+
+    fn mark_low_level_seek_noncurrent_packet_if_needed(
+        &mut self,
+        packet_id: PacketId,
+        packet: &CachedDemuxPacket,
+    ) -> bool {
+        if let Some(skip_until_nsecs) = self.resume_append_skip_until_nsecs {
+            let packet_end_nsecs = packet.end_nsecs.or(packet.start_nsecs);
+            if packet_end_nsecs.is_some_and(|end_nsecs| end_nsecs <= skip_until_nsecs) {
+                self.low_level_append_blocked_packet_generations
+                    .insert(packet_id, self.generation);
+                self.consumed_packet_ids.insert(packet_id);
+                tracing::debug!(
+                    session_id = ?self.session_id,
+                    skip_until_nsecs,
+                    packet_start_nsecs = ?packet.start_nsecs,
+                    packet_end_nsecs = ?packet.end_nsecs,
+                    stream_index = packet.stream_index,
+                    "appending repeated FFmpeg demux packet outside current reader head after cached-range low-level resume"
+                );
+                return true;
+            }
+            if packet
+                .start_nsecs
+                .is_some_and(|start_nsecs| start_nsecs >= skip_until_nsecs)
+                || packet_end_nsecs.is_none()
+            {
+                self.resume_append_skip_until_nsecs = None;
+            }
+        }
+
+        let Some(target_nsecs) = self.low_level_append_guard_target_nsecs else {
+            return false;
+        };
+        let Some(packet_start_nsecs) = packet.start_nsecs.or(packet.end_nsecs) else {
+            self.low_level_append_guard_target_nsecs = None;
+            return false;
+        };
+        let max_initial_nsecs =
+            target_nsecs.saturating_add(LOW_LEVEL_SEEK_APPEND_MAX_INITIAL_LEAD_NSECS);
+        if packet_start_nsecs > max_initial_nsecs {
+            self.low_level_append_blocked_packet_generations
+                .insert(packet_id, self.generation);
+            self.consumed_packet_ids.insert(packet_id);
+            tracing::debug!(
+                session_id = ?self.session_id,
+                target_nsecs,
+                packet_start_nsecs,
+                packet_end_nsecs = ?packet.end_nsecs,
+                stream_index = packet.stream_index,
+                packet_lead_ms =
+                    packet_start_nsecs.saturating_sub(target_nsecs) as f64 / 1_000_000.0,
+                max_initial_lead_ms =
+                    LOW_LEVEL_SEEK_APPEND_MAX_INITIAL_LEAD_NSECS as f64 / 1_000_000.0,
+                "appending stale FFmpeg demux packet ahead of low-level seek target outside current reader head"
+            );
+            return true;
+        }
+        self.low_level_append_guard_target_nsecs = None;
         false
     }
 }

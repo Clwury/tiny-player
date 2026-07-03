@@ -24,6 +24,7 @@ impl DemuxPacketCacheState {
         self.seek_cached_with_generation(target_nsecs, PlaybackSeekMode::Fast, session_id, 0)
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seek_cached_with_generation(
         &mut self,
         target_nsecs: u64,
@@ -31,20 +32,33 @@ impl DemuxPacketCacheState {
         session_id: PlaybackSessionId,
         seek_generation: u64,
     ) -> Option<f64> {
+        self.seek_cached_with_generation_hit(target_nsecs, mode, session_id, seek_generation)
+            .map(|hit| nsecs_to_seconds(hit.buffered_until_nsecs))
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seek_cached_with_generation_hit(
+        &mut self,
+        target_nsecs: u64,
+        mode: PlaybackSeekMode,
+        session_id: PlaybackSessionId,
+        seek_generation: u64,
+    ) -> Option<DemuxCachedSeekHit> {
         let current_hit = self.seek_cached_in_range(self.read_range(), target_nsecs, mode);
         if let Some(hit) = current_hit {
-            let buffered_until_nsecs = hit.buffered_until_nsecs;
-            self.reader_heads = hit.reader_heads;
+            let result = hit.clone();
+            self.generation = self.generation.saturating_add(1);
+            self.set_reader_heads_for_current_generation(hit.reader_heads);
             self.refresh_reader_tracking();
-            self.reader_nsecs = target_nsecs;
+            self.reader_nsecs = hit.anchor_nsecs;
             self.session_id = session_id;
             self.seek_request = None;
             self.seeking = false;
+            self.resume_append_skip_until_nsecs = None;
+            self.low_level_append_guard_target_nsecs = None;
             self.trim_to_limit();
-            self.generation = self.generation.saturating_add(1);
             self.cached_seeks = self.cached_seeks.saturating_add(1);
             self.refresh_readahead_hysteresis();
-            return Some(nsecs_to_seconds(buffered_until_nsecs));
+            return Some(result);
         }
 
         let detached_append_range_id = self.detached_append_range_id();
@@ -55,18 +69,20 @@ impl DemuxPacketCacheState {
             })
         });
         if let Some((range_id, hit)) = detached_hit {
-            let buffered_until_nsecs = hit.buffered_until_nsecs;
+            let result = hit.clone();
             self.preserve_current_range();
+            self.generation = self.generation.saturating_add(1);
             self.activate_range_for_read_with_heads(range_id, hit.reader_heads);
-            self.reader_nsecs = target_nsecs;
+            self.reader_nsecs = hit.anchor_nsecs;
             self.session_id = session_id;
             self.seek_request = None;
             self.seeking = false;
+            self.resume_append_skip_until_nsecs = None;
+            self.low_level_append_guard_target_nsecs = None;
             self.trim_to_limit();
-            self.generation = self.generation.saturating_add(1);
             self.cached_seeks = self.cached_seeks.saturating_add(1);
             self.refresh_readahead_hysteresis();
-            return Some(nsecs_to_seconds(buffered_until_nsecs));
+            return Some(result);
         }
 
         let hit = self
@@ -79,21 +95,24 @@ impl DemuxPacketCacheState {
                     .map(|hit| (*range_id, hit))
             });
         let (range_id, hit) = hit?;
+        let result = hit.clone();
         let buffered_until_nsecs = hit.buffered_until_nsecs;
         self.preserve_current_range();
+        self.generation = self.generation.saturating_add(1);
         self.activate_range_for_read_with_heads(range_id, hit.reader_heads);
-        self.reader_nsecs = target_nsecs;
+        self.reader_nsecs = hit.anchor_nsecs;
         self.session_id = session_id;
         self.seek_request = None;
         self.seeking = false;
+        self.resume_append_skip_until_nsecs = None;
+        self.low_level_append_guard_target_nsecs = None;
         if !self.read_range_eof() {
             self.queue_resume_seek_after_cached_range(buffered_until_nsecs, seek_generation);
         }
         self.trim_to_limit();
-        self.generation = self.generation.saturating_add(1);
         self.cached_seeks = self.cached_seeks.saturating_add(1);
         self.refresh_readahead_hysteresis();
-        Some(nsecs_to_seconds(buffered_until_nsecs))
+        Some(result)
     }
 
     fn seek_cached_in_range(
@@ -103,6 +122,7 @@ impl DemuxPacketCacheState {
         mode: PlaybackSeekMode,
     ) -> Option<DemuxCachedSeekHit> {
         let seek_target = self.range_cached_seek_target(range, target_nsecs)?;
+        let (_, stream_queues) = self.next_generation_range_view(range);
         let cached_seek_preroll_nsecs = match mode {
             PlaybackSeekMode::Precise => self.cached_seek_preroll_nsecs,
             PlaybackSeekMode::Fast => 0,
@@ -111,9 +131,9 @@ impl DemuxPacketCacheState {
             &self.packets,
             self.timeline_anchor_stream_index,
             cached_seek_preroll_nsecs,
+            self.cached_seek_requires_safe_point,
             DemuxPacketRangeView {
-                global_order: &range.global_order,
-                stream_queues: &range.stream_queues,
+                stream_queues: &stream_queues,
                 is_bof: seek_target.is_bof,
                 is_eof: seek_target.is_eof,
             },
@@ -184,6 +204,12 @@ impl DemuxPacketCacheState {
         self.append_range_id = range_id;
         self.read_range_mut().last_used_generation = self.generation;
         self.reader_heads = reader_heads;
+        self.reader_head_generations = self
+            .reader_heads
+            .keys()
+            .copied()
+            .map(|stream_index| (stream_index, self.generation))
+            .collect();
         self.refresh_reader_tracking();
     }
 
@@ -199,6 +225,7 @@ impl DemuxPacketCacheState {
         });
         self.demux_position_detached = false;
         self.resume_append_skip_until_nsecs = Some(buffered_until_nsecs);
+        self.low_level_append_guard_target_nsecs = Some(buffered_until_nsecs);
         self.start_detached_append_range();
         self.seeking = true;
         self.low_level_seeks = self.low_level_seeks.saturating_add(1);
@@ -239,11 +266,12 @@ impl DemuxPacketCacheState {
         });
         self.demux_position_detached = false;
         self.resume_append_skip_until_nsecs = None;
+        self.low_level_append_guard_target_nsecs = Some(target_nsecs);
+        self.generation = self.generation.saturating_add(1);
         self.start_new_current_range(target_nsecs == 0);
         self.seeking = true;
         self.low_level_seeks = self.low_level_seeks.saturating_add(1);
         self.demux_ts_nsecs = None;
-        self.generation = self.generation.saturating_add(1);
         self.hysteresis_active = false;
         self.trim_to_limit();
     }
@@ -265,11 +293,12 @@ impl DemuxPacketCacheState {
         });
         self.demux_position_detached = false;
         self.resume_append_skip_until_nsecs = None;
+        self.low_level_append_guard_target_nsecs = Some(self.reader_nsecs);
+        self.generation = self.generation.saturating_add(1);
         self.start_new_current_range(false);
         self.seeking = true;
         self.low_level_seeks = self.low_level_seeks.saturating_add(1);
         self.demux_ts_nsecs = None;
-        self.generation = self.generation.saturating_add(1);
         self.hysteresis_active = false;
         self.trim_to_limit();
     }
