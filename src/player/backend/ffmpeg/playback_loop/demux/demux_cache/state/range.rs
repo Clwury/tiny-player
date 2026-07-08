@@ -247,6 +247,7 @@ impl DemuxPacketCacheState {
             range.ensure_stream_boundary(stream_index).is_eof = is_eof;
         }
         range.mark_seekable_dirty();
+        self.refresh_range_seek_boundaries(range_id);
     }
 
     #[cfg(test)]

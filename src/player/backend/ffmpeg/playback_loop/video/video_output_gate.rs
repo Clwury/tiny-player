@@ -362,6 +362,11 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_video_queue_if_a
     {
         return false;
     }
+    // Draining on the video clock while rebuffering advances the resume point
+    // past the anchor, so refilling audio can never catch up and rejoin.
+    if output_scheduler.playback_output_state.rebuffering() {
+        return false;
+    }
     if audio_clock.available {
         return false;
     }

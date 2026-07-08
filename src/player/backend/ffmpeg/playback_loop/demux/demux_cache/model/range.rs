@@ -12,8 +12,6 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxC
         VecDeque<PacketId>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_queues:
         BTreeMap<c_int, VecDeque<PacketId>>,
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) sparse_stream_pruned_until_nsecs:
-        BTreeMap<c_int, u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_boundaries:
         BTreeMap<c_int, StreamRangeBoundary>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) report_stats:
@@ -33,7 +31,6 @@ impl DemuxCachedRange {
             id,
             global_order: VecDeque::new(),
             stream_queues: BTreeMap::new(),
-            sparse_stream_pruned_until_nsecs: BTreeMap::new(),
             stream_boundaries: BTreeMap::new(),
             report_stats: RefCell::new(RangeReportStats::default()),
             is_bof,
@@ -49,20 +46,14 @@ impl DemuxCachedRange {
         self.stream_boundaries
             .get(&stream_index)
             .copied()
-            .unwrap_or(StreamRangeBoundary {
-                is_bof: self.is_bof,
-                is_eof: self.is_eof,
-            })
+            .unwrap_or_else(|| StreamRangeBoundary::new(self.is_bof, self.is_eof))
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn ensure_stream_boundary(
         &mut self,
         stream_index: c_int,
     ) -> &mut StreamRangeBoundary {
-        let default_boundary = StreamRangeBoundary {
-            is_bof: self.is_bof,
-            is_eof: self.is_eof,
-        };
+        let default_boundary = StreamRangeBoundary::new(self.is_bof, self.is_eof);
         self.stream_boundaries
             .entry(stream_index)
             .or_insert(default_boundary)
@@ -129,6 +120,28 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct RangeR
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct StreamRangeBoundary {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) is_bof: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) is_eof: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) seek_start_nsecs:
+        Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) seek_end_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) last_pruned_nsecs:
+        Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) pruned_packet_count: u64,
+}
+
+impl StreamRangeBoundary {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn new(
+        is_bof: bool,
+        is_eof: bool,
+    ) -> Self {
+        Self {
+            is_bof,
+            is_eof,
+            seek_start_nsecs: None,
+            seek_end_nsecs: None,
+            last_pruned_nsecs: None,
+            pruned_packet_count: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -145,6 +158,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxP
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) is_eof: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct ArchivedStreamPruneCandidate
 {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_index: c_int,

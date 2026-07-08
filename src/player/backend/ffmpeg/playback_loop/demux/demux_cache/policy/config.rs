@@ -12,9 +12,13 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_P
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_WOULD_BLOCK_DIAG_INTERVAL: Duration = Duration::from_millis(500);
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_APPEND_TIMING_LOG_AFTER: Duration = Duration::from_millis(1);
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_APPEND_MAINTENANCE_INTERVAL: usize = 16;
-pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_APPEND_TRIM_INTERVAL: usize = 64;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT: usize = 1;
+// The monitor snapshot is refreshed while holding the cache mutex on every
+// consumer read; callers only need "any readable packet" plus a diagnostic
+// magnitude, so the readable count saturates instead of scanning the queue.
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT: usize = 256;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_READ_TRIM_INTERVAL: usize = 128;
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL: usize = 16;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_BYTES: usize = 8 * 1024 * 1024;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_READ_TRIM_STEP_LIMIT: usize = 1;
 

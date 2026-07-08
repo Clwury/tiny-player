@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     os::raw::c_int,
     time::Instant,
 };
@@ -184,6 +184,23 @@ impl DemuxPacketCacheState {
         self.last_emitted_seekable_ranges
             .as_ref()
             .is_some_and(|ranges| ranges != &self.seekable_time_ranges())
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_range_window_changed_since_last_emit(
+        &self,
+    ) -> bool {
+        let Some(last_ranges) = self.last_emitted_seekable_ranges.as_ref() else {
+            return false;
+        };
+        if last_ranges.is_empty() {
+            return false;
+        }
+        let current_ranges = self.seekable_time_ranges();
+        current_ranges.len() < last_ranges.len()
+            || last_ranges
+                .iter()
+                .zip(&current_ranges)
+                .any(|(last, current)| last.start != current.start || current.end < last.end)
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn forward_bytes(
@@ -464,12 +481,7 @@ impl DemuxPacketCacheState {
         if let Some(summary) = range.cached_seekable_summary(self.generation) {
             return summary;
         }
-        let summary = if self.range_has_current_generation_blocked_packet(range) {
-            let (_, stream_queues) = self.current_generation_range_view(range);
-            self.compute_range_seekable_timeline_summary(range, &stream_queues)
-        } else {
-            self.compute_range_seekable_timeline_summary(range, &range.stream_queues)
-        };
+        let summary = self.compute_range_seekable_timeline_summary(range);
         range.store_seekable_summary(self.generation, summary.clone());
         summary
     }
@@ -477,71 +489,73 @@ impl DemuxPacketCacheState {
     fn compute_range_seekable_timeline_summary(
         &self,
         range: &DemuxCachedRange,
-        stream_queues: &BTreeMap<c_int, VecDeque<u64>>,
     ) -> SeekableTimelineSummary {
-        let timeline_boundary = range.stream_boundary(self.timeline_anchor_stream_index);
-        let Some((mut start, mut end)) = Self::seekable_timeline_range_in_packet_range(
-            &self.packets,
-            self.timeline_anchor_stream_index,
-            self.cached_seek_preroll_nsecs,
-            self.cached_seek_requires_safe_point,
-            stream_queues,
-            timeline_boundary.is_eof,
-        ) else {
-            return SeekableTimelineSummary::default();
-        };
+        let mut seek_start = None;
+        let mut seek_end = None;
+        let mut min_bof_start = None;
+        let mut max_eof_end = None;
+        let mut is_bof = true;
+        let mut is_eof = true;
+        let mut saw_eager_stream = false;
 
-        let mut audio_ranges = Vec::new();
-        let mut is_bof = timeline_boundary.is_bof;
-        let mut is_eof = timeline_boundary.is_eof;
         for (stream_index, kind) in &self.stream_kinds {
-            if *stream_index == self.timeline_anchor_stream_index {
-                continue;
-            }
-            if !matches!(kind, StreamCacheKind::Audio) {
+            if !matches!(kind, StreamCacheKind::Video | StreamCacheKind::Audio) {
                 continue;
             }
             let boundary = range.stream_boundary(*stream_index);
             is_bof &= boundary.is_bof;
             is_eof &= boundary.is_eof;
-            match stream_queues
-                .get(stream_index)
-                .and_then(|queue| Self::stream_seek_range_in_packet_queue(&self.packets, queue))
-            {
-                Some(stream_range) => audio_ranges.push((boundary, stream_range)),
-                None if boundary.is_eof => {}
-                None => return SeekableTimelineSummary::default(),
-            }
-        }
-        if !audio_ranges.is_empty() {
-            for (boundary, (audio_start, audio_end)) in &audio_ranges {
-                start = if is_bof && boundary.is_bof {
-                    start.min(*audio_start)
-                } else if !boundary.is_bof {
-                    start.max(*audio_start)
-                } else {
-                    start
-                };
-                end = if is_eof && boundary.is_eof {
-                    end.max(*audio_end)
-                } else if !boundary.is_eof {
-                    end.min(*audio_end)
-                } else {
-                    end
-                };
-            }
-            if end <= start {
+
+            let Some(stream_start) = boundary.seek_start_nsecs else {
+                if boundary.is_eof {
+                    continue;
+                }
                 return SeekableTimelineSummary::default();
+            };
+            let Some(stream_end) = boundary.seek_end_nsecs else {
+                if boundary.is_eof {
+                    continue;
+                }
+                return SeekableTimelineSummary::default();
+            };
+            if stream_end <= stream_start {
+                return SeekableTimelineSummary::default();
+            }
+            saw_eager_stream = true;
+
+            if boundary.is_bof {
+                min_bof_start = Some(min_bof_start.unwrap_or(stream_start).min(stream_start));
+            } else {
+                seek_start = Some(seek_start.unwrap_or(stream_start).max(stream_start));
+            }
+            if boundary.is_eof {
+                max_eof_end = Some(max_eof_end.unwrap_or(stream_end).max(stream_end));
+            } else {
+                seek_end = Some(seek_end.unwrap_or(stream_end).min(stream_end));
             }
         }
 
-        if let Some(pruned_until_nsecs) = range
-            .sparse_stream_pruned_until_nsecs
-            .values()
-            .copied()
-            .max()
-        {
-            start = start.max(pruned_until_nsecs);
+        if !saw_eager_stream {
+            return SeekableTimelineSummary::default();
+        }
+        if is_bof {
+            seek_start = min_bof_start;
+        }
+        if is_eof {
+            seek_end = max_eof_end;
+        }
+        let (Some(mut start), Some(end)) = (seek_start, seek_end) else {
+            return SeekableTimelineSummary::default();
+        };
+
+        for (stream_index, kind) in &self.stream_kinds {
+            if !matches!(kind, StreamCacheKind::Subtitle) {
+                continue;
+            }
+            let boundary = range.stream_boundary(*stream_index);
+            if let Some(last_pruned_nsecs) = boundary.last_pruned_nsecs {
+                start = start.max(last_pruned_nsecs.saturating_add(100_000_000));
+            }
         }
 
         if end <= start {
@@ -553,6 +567,135 @@ impl DemuxPacketCacheState {
             is_bof,
             is_eof,
         }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn refresh_range_stream_seek_boundary(
+        &mut self,
+        range_id: super::RangeId,
+        stream_index: c_int,
+    ) {
+        let Some(mut range) = self.ranges.remove(&range_id) else {
+            return;
+        };
+        self.refresh_range_stream_seek_boundary_in_range(&mut range, stream_index);
+        self.ranges.insert(range_id, range);
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn refresh_range_stream_seek_boundary_in_range(
+        &self,
+        range: &mut DemuxCachedRange,
+        stream_index: c_int,
+    ) {
+        let queue = range
+            .stream_queues
+            .get(&stream_index)
+            .map(|queue| {
+                queue
+                    .iter()
+                    .copied()
+                    .filter(|packet_id| self.packet_readable_in_current_generation(*packet_id))
+                    .collect::<VecDeque<_>>()
+            })
+            .unwrap_or_default();
+
+        let seek_range = if stream_index == self.timeline_anchor_stream_index {
+            let mut stream_queues = BTreeMap::new();
+            stream_queues.insert(stream_index, queue);
+            Self::seekable_timeline_range_in_packet_range(
+                &self.packets,
+                self.timeline_anchor_stream_index,
+                self.cached_seek_preroll_nsecs,
+                self.cached_seek_requires_safe_point,
+                &stream_queues,
+                range.stream_boundary(stream_index).is_eof,
+            )
+        } else {
+            Self::stream_seek_range_in_packet_queue(&self.packets, &queue)
+        };
+
+        let boundary = range.ensure_stream_boundary(stream_index);
+        boundary.seek_start_nsecs = seek_range.map(|(start, _)| start);
+        boundary.seek_end_nsecs = seek_range.map(|(_, end)| end);
+        range.mark_seekable_dirty();
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn refresh_range_seek_boundaries(
+        &mut self,
+        range_id: super::RangeId,
+    ) {
+        let Some(range) = self.ranges.get(&range_id) else {
+            return;
+        };
+        let mut stream_indices = self.stream_kinds.keys().copied().collect::<BTreeSet<_>>();
+        stream_indices.extend(range.stream_queues.keys().copied());
+        for stream_index in stream_indices {
+            self.refresh_range_stream_seek_boundary(range_id, stream_index);
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn log_seekable_range_diagnostics(
+        &self,
+        seekable_ranges: &[PlaybackCacheTimeRange],
+        forward_bytes: usize,
+    ) {
+        let mut per_stream = Vec::new();
+        for (range_id, range) in &self.ranges {
+            let mut stream_indices = self.stream_kinds.keys().copied().collect::<BTreeSet<_>>();
+            stream_indices.extend(range.stream_queues.keys().copied());
+            stream_indices.extend(range.stream_boundaries.keys().copied());
+            for stream_index in stream_indices {
+                let queue = range.stream_queues.get(&stream_index);
+                let queue_len = queue.map(VecDeque::len).unwrap_or_default();
+                let (queue_start_nsecs, queue_end_nsecs) = queue
+                    .map(|queue| {
+                        queue.iter().fold((None, None), |(start, end), packet_id| {
+                            let Some(packet) = self.packets.get(packet_id) else {
+                                return (start, end);
+                            };
+                            let packet_start = packet.start_nsecs;
+                            let packet_end = packet.end_nsecs.or(packet.start_nsecs);
+                            (
+                                packet_start
+                                    .map(|value| start.unwrap_or(value).min(value))
+                                    .or(start),
+                                packet_end
+                                    .map(|value| end.unwrap_or(value).max(value))
+                                    .or(end),
+                            )
+                        })
+                    })
+                    .unwrap_or((None, None));
+                let boundary = range.stream_boundary(stream_index);
+                per_stream.push((
+                    *range_id,
+                    stream_index,
+                    self.stream_kinds.get(&stream_index).copied(),
+                    queue_len,
+                    queue_start_nsecs,
+                    queue_end_nsecs,
+                    boundary.seek_start_nsecs,
+                    boundary.seek_end_nsecs,
+                    boundary.last_pruned_nsecs,
+                    boundary.pruned_packet_count,
+                    boundary.is_bof,
+                    boundary.is_eof,
+                ));
+            }
+        }
+
+        tracing::debug!(
+            session_id = ?self.session_id,
+            reader_nsecs = self.reader_nsecs,
+            seekable_ranges = ?seekable_ranges,
+            cached_bytes = self.cached_bytes,
+            forward_bytes,
+            backward_bytes = self.backward_bytes(),
+            effective_backbuffer_limit = self.effective_backbuffer_limit(),
+            memory_limit_bytes = self.memory_limit_bytes,
+            backbuffer_limit_bytes = self.backbuffer_limit_bytes,
+            per_stream = ?per_stream,
+            "FFmpeg demux seekable range report diagnostics"
+        );
     }
 
     fn stream_cache_states_with_forward_bytes(

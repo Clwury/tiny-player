@@ -119,7 +119,6 @@ struct DemuxPacketCacheState {
     cache_buffering_percent: Option<u8>,
     cached_bytes: usize,
     append_maintenance_packets: usize,
-    append_trim_pressure_packets: usize,
     read_trim_pressure_packets: usize,
     reader_nsecs: u64,
     session_id: PlaybackSessionId,

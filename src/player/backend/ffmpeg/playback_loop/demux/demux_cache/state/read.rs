@@ -5,9 +5,10 @@ use std::{
 };
 
 use super::{
-    DEMUX_CACHE_LOCK_TIMING_LOG_AFTER, DemuxPacketCacheReadTiming, DemuxPacketCacheState,
-    DemuxPacketQueueSnapshot, DemuxPacketReadSource, DemuxStreamPacketQueueSnapshot,
-    DemuxStreamReaderRealignResult, PacketId, StreamCacheKind,
+    DEMUX_CACHE_LOCK_TIMING_LOG_AFTER, DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT,
+    DemuxPacketCacheReadTiming, DemuxPacketCacheState, DemuxPacketQueueSnapshot,
+    DemuxPacketReadSource, DemuxStreamPacketQueueSnapshot, DemuxStreamReaderRealignResult,
+    PacketId, StreamCacheKind,
 };
 
 const CACHE_STATE_EMIT_CONSUMER_YIELD_PACKET_THRESHOLD: usize = 1024;
@@ -41,7 +42,9 @@ impl DemuxPacketCacheState {
                 continue;
             };
             let packet = self.packet_read_source(packet_id, stream_offset)?;
-            if let Some(end_nsecs) = self.packet_end_nsecs(packet_id) {
+            if let Some(end_nsecs) = self.packet_end_nsecs(packet_id)
+                && self.stream_advances_global_reader(stream_index)
+            {
                 self.reader_nsecs = self.reader_nsecs.max(end_nsecs);
             }
             self.consume_packet_id(packet_id, timing);
@@ -50,6 +53,13 @@ impl DemuxPacketCacheState {
         }
         timing.take_packet += started_at.elapsed();
         Ok(None)
+    }
+
+    fn stream_advances_global_reader(&self, stream_index: c_int) -> bool {
+        !matches!(
+            self.stream_kinds.get(&stream_index),
+            Some(StreamCacheKind::Subtitle)
+        )
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn next_packet_id_for_stream(
@@ -428,6 +438,7 @@ impl DemuxPacketCacheState {
         queue
             .iter()
             .skip(position)
+            .take(DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT)
             .filter(|packet_id| self.packet_readable_in_current_generation(**packet_id))
             .count()
     }

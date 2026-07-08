@@ -25,6 +25,7 @@ const DEMUX_PACKET_CACHE_LOW_WATER_LOCK_WAIT: Duration = Duration::from_millis(2
 const DEMUX_PACKET_CACHE_READY_LOCK_WAIT: Duration = Duration::from_millis(1);
 const DEMUX_PACKET_CACHE_READY_FORWARD_NSECS: u64 = 2_000_000_000;
 const DEMUX_PACKET_FORCE_CONSUMER_DRAIN_RETRY_WAIT: Duration = Duration::from_millis(2);
+const DEMUX_PACKET_READER_OUTPUT_LEAD_LIMIT: Duration = Duration::from_millis(2500);
 
 #[derive(Default)]
 pub(super) struct DemuxPacketPump {
@@ -41,6 +42,7 @@ struct DemuxPacketPumpContext<'a> {
     should_wait_for_demux: bool,
     video_output_waiting_for_demux: bool,
     cached_reader_watermark: DemuxReaderWatermark,
+    current_start_position_nsecs: u64,
     hard_deadline: Option<Instant>,
 }
 
@@ -72,10 +74,16 @@ pub(super) enum DemuxPacketPumpResult {
 
 impl DemuxPacketPump {
     fn poll_packet(&mut self, context: DemuxPacketPumpContext<'_>) -> DemuxReadResult {
-        let (demux_streams, demux_stream_rotation) = self.ordered_demux_streams_for_context(
+        let (mut demux_streams, demux_stream_rotation) = self.ordered_demux_streams_for_context(
             context.decoder_input,
             context.video_admission_pressure.output_snapshot,
         );
+        if self.filter_demux_streams_by_output_lead(&context, &mut demux_streams) {
+            return DemuxReadResult::WouldBlock;
+        }
+        if demux_streams.is_empty() {
+            return DemuxReadResult::WouldBlock;
+        }
 
         let (mut demux_packet_snapshot, _, _) = context.demux_cache.monitor_snapshot();
         let reader_head_lost_streams =
@@ -105,7 +113,7 @@ impl DemuxPacketPump {
         let read_path;
         let mut requested_lock_wait = None;
         let mut applied_lock_wait = None;
-        let mut force_consumer_drain_retry_count = 0;
+        let mut force_consumer_drain_retry_count = 0_u64;
         let (demux_read_result, demux_consumed_stream_offset, demux_cache_timing) =
             if force_consumer_drain {
                 read_path = "force_consumer_drain";
@@ -140,6 +148,22 @@ impl DemuxPacketPump {
                     result = retry_result;
                     stream_offset = retry_stream_offset;
                     timing = combine_demux_read_timing(timing, retry_timing);
+                }
+                if matches!(result, DemuxReadResult::WouldBlock) && timing.lock_timed_out {
+                    // The decoder is starving with readable packets available;
+                    // bounded try-lock spins lose to long append/trim holds, so
+                    // park on the mutex and drain as soon as it is released.
+                    force_consumer_drain_retry_count =
+                        force_consumer_drain_retry_count.saturating_add(1);
+                    let (drain_result, drain_stream_offset, drain_timing) = context
+                        .demux_cache
+                        .drain_available_packet_round_robin_with_unbounded_lock_and_timing(
+                            &demux_streams,
+                            demux_cache_pause_signal(&context),
+                        );
+                    result = drain_result;
+                    stream_offset = drain_stream_offset;
+                    timing = combine_demux_read_timing(timing, drain_timing);
                 }
                 (result, stream_offset, timing)
             } else if let Some(lock_wait) = demux_pump_cache_lock_wait(
@@ -221,12 +245,85 @@ impl DemuxPacketPump {
         if matches!(demux_read_result, DemuxReadResult::Packet(_))
             && !demux_streams.is_empty()
             && let Some(consumed_offset) = demux_consumed_stream_offset
+            && let Some(consumed_stream_index) = demux_streams.get(consumed_offset)
         {
-            self.stream_cursor =
-                (demux_stream_rotation + consumed_offset + 1) % demux_streams.len();
+            self.stream_cursor = context
+                .decoder_input
+                .demux_streams
+                .iter()
+                .position(|stream_index| stream_index == consumed_stream_index)
+                .map(|position| (position + 1) % context.decoder_input.demux_streams.len().max(1))
+                .unwrap_or_else(|| {
+                    (demux_stream_rotation + consumed_offset + 1) % demux_streams.len()
+                });
         }
 
         demux_read_result
+    }
+
+    fn filter_demux_streams_by_output_lead(
+        &self,
+        context: &DemuxPacketPumpContext<'_>,
+        demux_streams: &mut Vec<c_int>,
+    ) -> bool {
+        let throttle_audio_video = demux_reader_output_lead_throttle_enabled(
+            context.video_admission_pressure.output_snapshot,
+            context.should_wait_for_demux,
+            context.video_output_waiting_for_demux,
+        );
+        let output_reference_nsecs = context
+            .video_admission_pressure
+            .played_until_nsecs
+            .unwrap_or(context.current_start_position_nsecs);
+        let mut throttled_streams = Vec::new();
+        demux_streams.retain(|stream_index| {
+            if !decoder_input_output_lead_throttled_stream(
+                context.decoder_input,
+                *stream_index,
+                throttle_audio_video,
+            ) {
+                return true;
+            }
+            let Some((_, Some(reader_head_start_nsecs), _)) = context
+                .demux_cache
+                .stream_reader_head_timeline(*stream_index)
+            else {
+                return true;
+            };
+            if demux_reader_head_exceeds_output_lead(
+                reader_head_start_nsecs,
+                output_reference_nsecs,
+            ) {
+                throttled_streams.push((*stream_index, reader_head_start_nsecs));
+                false
+            } else {
+                true
+            }
+        });
+        if throttled_streams.is_empty() {
+            return false;
+        }
+        let has_unthrottled_timed_stream = demux_streams
+            .iter()
+            .any(|stream_index| decoder_input_timed_stream(context.decoder_input, *stream_index));
+        tracing::debug!(
+            session_id = ?context.session_id,
+            throttled_streams = ?throttled_streams,
+            remaining_streams = ?demux_streams,
+            output_reference_nsecs,
+            max_reader_output_lead_ms =
+                demux_reader_output_lead_limit_nsecs() as f64 / 1_000_000.0,
+            output_state = ?context.video_admission_pressure.output_snapshot.state,
+            queued_video_frames =
+                context.video_admission_pressure.output_snapshot.queued_video_frames,
+            queued_video_forward_ms = ?context
+                .video_admission_pressure
+                .output_snapshot
+                .queued_video_forward_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
+            "throttling FFmpeg demux reader ahead of output clock"
+        );
+        !has_unthrottled_timed_stream
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -626,6 +723,7 @@ impl DemuxPacketPump {
             should_wait_for_demux: context.should_wait_for_demux,
             video_output_waiting_for_demux: context.video_output_waiting_for_demux,
             cached_reader_watermark: context.demux_cache.cached_reader_watermark(),
+            current_start_position_nsecs: context.pipeline.current_start_position_nsecs,
             hard_deadline,
         });
         let mut packet = match demux_read_result {
@@ -1240,6 +1338,46 @@ fn demux_pump_audio_cache_lock_wait(
     None
 }
 
+fn demux_reader_output_lead_throttle_enabled(
+    output_snapshot: PlaybackOutputSnapshot,
+    should_wait_for_demux: bool,
+    video_output_waiting_for_demux: bool,
+) -> bool {
+    !should_wait_for_demux
+        && !video_output_waiting_for_demux
+        && !output_queue_low_water_needs_decoder_input(output_snapshot)
+        && !output_queue_needs_decoder_input(output_snapshot)
+}
+
+fn demux_reader_head_exceeds_output_lead(
+    reader_head_start_nsecs: u64,
+    output_reference_nsecs: u64,
+) -> bool {
+    reader_head_start_nsecs
+        > output_reference_nsecs.saturating_add(demux_reader_output_lead_limit_nsecs())
+}
+
+fn demux_reader_output_lead_limit_nsecs() -> u64 {
+    duration_nsecs(DEMUX_PACKET_READER_OUTPUT_LEAD_LIMIT)
+}
+
+fn decoder_input_timed_stream(decoder_input: &DecoderInputSnapshot, stream_index: c_int) -> bool {
+    stream_index == decoder_input.video_stream_index
+        || decoder_input.audio_stream_index == Some(stream_index)
+        || decoder_input.subtitle_stream_index == Some(stream_index)
+}
+
+fn decoder_input_output_lead_throttled_stream(
+    decoder_input: &DecoderInputSnapshot,
+    stream_index: c_int,
+    throttle_audio_video: bool,
+) -> bool {
+    decoder_input.subtitle_stream_index == Some(stream_index)
+        || (throttle_audio_video
+            && (stream_index == decoder_input.video_stream_index
+                || decoder_input.audio_stream_index == Some(stream_index)))
+}
+
 fn demux_cache_lock_wait_for_watermark(
     requested_wait: Duration,
     cached_reader_watermark: DemuxReaderWatermark,
@@ -1459,8 +1597,11 @@ mod tests {
         DEMUX_PACKET_CACHE_LOW_WATER_LOCK_WAIT, DEMUX_PACKET_CACHE_READY_LOCK_WAIT,
         DemuxPacketPump, DemuxPacketRoute, PlaybackBlockReason, PlaybackOutputSnapshot,
         VideoPacketAdmissionPressure, audio_priority_demux_streams,
-        demux_pump_cache_lock_wait_for_test, demux_pump_cache_lock_wait_with_watermark_for_test,
-        demux_pump_should_wait_for_cache_lock, duration_nsecs, eof_cached_backpressured_streams,
+        decoder_input_output_lead_throttled_stream, demux_pump_cache_lock_wait_for_test,
+        demux_pump_cache_lock_wait_with_watermark_for_test, demux_pump_should_wait_for_cache_lock,
+        demux_reader_head_exceeds_output_lead, demux_reader_output_lead_limit_nsecs,
+        demux_reader_output_lead_throttle_enabled, duration_nsecs,
+        eof_cached_backpressured_streams,
     };
     use std::os::raw::c_int;
     use std::time::Duration;
@@ -1882,6 +2023,81 @@ mod tests {
             ),
             Some(DEMUX_PACKET_CACHE_READY_LOCK_WAIT)
         );
+    }
+
+    #[test]
+    fn demux_packet_pump_throttles_reader_when_output_has_headroom() {
+        let output_reference_nsecs = 10_000_000_000_u64;
+        let allowed_reader_head =
+            output_reference_nsecs.saturating_add(demux_reader_output_lead_limit_nsecs());
+        let output_snapshot = playback_output_snapshot_for_test(
+            10,
+            duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION) + 1,
+        );
+
+        assert!(demux_reader_output_lead_throttle_enabled(
+            output_snapshot,
+            false,
+            false
+        ));
+        assert!(!demux_reader_head_exceeds_output_lead(
+            allowed_reader_head,
+            output_reference_nsecs
+        ));
+        assert!(demux_reader_head_exceeds_output_lead(
+            allowed_reader_head + 1,
+            output_reference_nsecs
+        ));
+    }
+
+    #[test]
+    fn demux_packet_pump_throttles_subtitle_reader_even_when_output_needs_packets() {
+        let decoder_input = decoder_input_snapshot(vec![0, 1, 3], 0, Some(1), Some(3));
+
+        assert!(decoder_input_output_lead_throttled_stream(
+            &decoder_input,
+            3,
+            false
+        ));
+        assert!(!decoder_input_output_lead_throttled_stream(
+            &decoder_input,
+            0,
+            false
+        ));
+        assert!(decoder_input_output_lead_throttled_stream(
+            &decoder_input,
+            0,
+            true
+        ));
+    }
+
+    #[test]
+    fn demux_packet_pump_does_not_throttle_reader_when_output_needs_packets() {
+        let low_water_output = playback_output_snapshot_for_test(
+            1,
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
+        );
+        let draining_output =
+            playback_output_snapshot_for_test(9, duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION));
+
+        assert!(!demux_reader_output_lead_throttle_enabled(
+            low_water_output,
+            false,
+            false
+        ));
+        assert!(!demux_reader_output_lead_throttle_enabled(
+            draining_output,
+            false,
+            false
+        ));
+        assert!(!demux_reader_output_lead_throttle_enabled(
+            playback_output_snapshot_for_test(
+                10,
+                duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION) + 1,
+            ),
+            true,
+            false
+        ));
     }
 
     #[test]

@@ -50,37 +50,19 @@ pub(super) fn cache_range_fractions(
     let Some(cache_state) = cache_state else {
         return Vec::new();
     };
-    let mut ranges: Vec<_> = cache_state
+    cache_state
         .demux
         .seekable_ranges
         .iter()
         .filter_map(|range| normalized_cache_range(range.start, range.end, duration))
-        .collect();
-    ranges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(ranges.len());
-    for (start, end) in ranges {
-        if let Some(last) = merged.last_mut()
-            && start <= last.1
-        {
-            last.1 = last.1.max(end);
-            continue;
-        }
-        merged.push((start, end));
-    }
-
-    merged
-        .into_iter()
         .map(|(start, end)| ((start / duration) as f32, (end / duration) as f32))
         .collect()
 }
 
 fn normalized_cache_range(start: f64, end: f64, duration: f64) -> Option<(f64, f64)> {
-    if !start.is_finite() || !end.is_finite() {
+    if !start.is_finite() || !end.is_finite() || !duration.is_finite() || duration <= 0.0 {
         return None;
     }
-    let start = clamp_playback_position(start, duration);
-    let end = clamp_playback_position(end, duration);
     (end > start).then_some((start, end))
 }
 
@@ -190,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_range_fractions_clamp_and_merge_ranges() {
+    fn cache_range_fractions_map_seekable_ranges_like_mpv_osc() {
         let state = PlaybackCacheState {
             demux: DemuxCacheState {
                 seekable_ranges: vec![
@@ -214,7 +196,7 @@ mod tests {
 
         assert_eq!(
             cache_range_fractions(Some(&state), 100.0),
-            vec![(0.0, 0.4), (0.8, 1.0)]
+            vec![(-0.1, 0.2), (0.15, 0.4), (0.8, 1.2)]
         );
     }
 

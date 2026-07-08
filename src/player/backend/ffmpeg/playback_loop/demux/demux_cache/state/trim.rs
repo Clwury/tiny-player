@@ -6,9 +6,9 @@ use std::{
 use super::{
     ArchivedStreamPruneCandidate, CachedDemuxPacket, DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT,
     DEMUX_PACKET_READ_TRIM_INTERVAL, DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_BYTES,
-    DEMUX_PACKET_READ_TRIM_STEP_LIMIT, DEMUX_STREAM_PACKET_QUEUE_LIMIT,
-    DEMUX_SUBTITLE_PACKET_QUEUE_LIMIT, DemuxCachedRange, DemuxPacketCacheState, PacketId, RangeId,
-    StreamCacheKind,
+    DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL, DEMUX_PACKET_READ_TRIM_STEP_LIMIT,
+    DEMUX_STREAM_PACKET_QUEUE_LIMIT, DEMUX_SUBTITLE_PACKET_QUEUE_LIMIT, DemuxCachedRange,
+    DemuxPacketCacheState, PacketId, RangeId, StreamCacheKind,
 };
 
 impl DemuxPacketCacheState {
@@ -40,10 +40,16 @@ impl DemuxPacketCacheState {
             return false;
         }
 
+        // Memory overrun is the steady state whenever the forward window sits
+        // at its byte cap with any backbuffer retained, so it must pace trims
+        // rather than run one on every consumer read.
+        let read_trim_interval = if self.read_trim_memory_overrun() {
+            DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL
+        } else {
+            DEMUX_PACKET_READ_TRIM_INTERVAL
+        };
         self.read_trim_pressure_packets = self.read_trim_pressure_packets.saturating_add(1);
-        if self.read_trim_memory_overrun()
-            || self.read_trim_pressure_packets >= DEMUX_PACKET_READ_TRIM_INTERVAL
-        {
+        if self.read_trim_pressure_packets >= read_trim_interval {
             self.read_trim_pressure_packets = 0;
             true
         } else {
@@ -162,7 +168,8 @@ impl DemuxPacketCacheState {
     }
 
     fn active_stream_prune_candidate(&self) -> Option<ArchivedStreamPruneCandidate> {
-        self.read_range()
+        let range = self.read_range();
+        let candidates = range
             .stream_queues
             .iter()
             .filter(|(stream_index, queue)| {
@@ -186,17 +193,15 @@ impl DemuxPacketCacheState {
                     seek_start_nsecs,
                 }
             })
-            .min_by(
-                |left, right| match (left.prune_always, right.prune_always) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    (true, true) => left.stream_index.cmp(&right.stream_index),
-                    (false, false) => left
-                        .seek_start_nsecs
-                        .cmp(&right.seek_start_nsecs)
-                        .then_with(|| left.stream_index.cmp(&right.stream_index)),
-                },
-            )
+            .collect::<Vec<_>>();
+        let candidates = candidates
+            .into_iter()
+            .filter(|candidate| {
+                self.active_stream_prefix_prune_count(candidate.stream_index)
+                    .is_some_and(|count| count > 0)
+            })
+            .collect::<Vec<_>>();
+        self.preferred_stream_prune_candidate(range, &candidates)
     }
 
     fn active_stream_prefix_prune_count(&self, stream_index: c_int) -> Option<usize> {
@@ -209,8 +214,25 @@ impl DemuxPacketCacheState {
                 self.packets
                     .get(packet_id)
                     .is_some_and(|packet| self.packet_is_stream_seek_boundary(stream_index, packet))
-            });
-        stream_prefix_prune_count_from_boundaries(boundaries, self.backbuffer_limit_bytes > 0)
+            })
+            .collect::<Vec<_>>();
+        let prune_count = stream_prefix_prune_count_from_boundaries(
+            boundaries.iter().copied(),
+            self.backbuffer_limit_bytes > 0,
+        )?;
+        let prune_count =
+            self.limit_eager_side_stream_prune_count(self.read_range(), stream_index, prune_count)?;
+
+        if self.backbuffer_limit_bytes > 0
+            && reader_head.is_some()
+            && let Some(last_boundary_index) =
+                boundaries.iter().rposition(|is_boundary| *is_boundary)
+            && prune_count > last_boundary_index
+        {
+            return (last_boundary_index > 0).then_some(last_boundary_index);
+        }
+
+        Some(prune_count)
     }
 
     fn prune_oldest_backbuffer_range(&mut self) -> bool {
@@ -265,7 +287,7 @@ impl DemuxPacketCacheState {
         &self,
         range: &DemuxCachedRange,
     ) -> Option<ArchivedStreamPruneCandidate> {
-        range
+        let candidates = range
             .stream_queues
             .iter()
             .filter_map(|(stream_index, queue)| {
@@ -287,17 +309,15 @@ impl DemuxPacketCacheState {
                     seek_start_nsecs,
                 })
             })
-            .min_by(
-                |left, right| match (left.prune_always, right.prune_always) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    (true, true) => left.stream_index.cmp(&right.stream_index),
-                    (false, false) => left
-                        .seek_start_nsecs
-                        .cmp(&right.seek_start_nsecs)
-                        .then_with(|| left.stream_index.cmp(&right.stream_index)),
-                },
-            )
+            .collect::<Vec<_>>();
+        let candidates = candidates
+            .into_iter()
+            .filter(|candidate| {
+                self.archived_stream_prefix_prune_count(range, candidate.stream_index)
+                    .is_some_and(|count| count > 0)
+            })
+            .collect::<Vec<_>>();
+        self.preferred_stream_prune_candidate(range, &candidates)
     }
 
     fn stream_queue_seek_start_nsecs(
@@ -306,18 +326,12 @@ impl DemuxPacketCacheState {
         queue: &VecDeque<PacketId>,
     ) -> Option<u64> {
         if stream_index == self.timeline_anchor_stream_index {
-            let mut stream_queues = BTreeMap::new();
-            stream_queues.insert(stream_index, queue.clone());
-            return Self::seekable_timeline_ranges_in_packet_range(
-                &self.packets,
-                self.timeline_anchor_stream_index,
-                self.cached_seek_preroll_nsecs,
-                self.cached_seek_requires_safe_point,
-                &stream_queues,
-                false,
-            )
-            .first()
-            .map(|(start_nsecs, _)| *start_nsecs);
+            return queue.iter().find_map(|packet_id| {
+                let packet = self.packets.get(packet_id)?;
+                let start_nsecs = packet.start_nsecs?;
+                self.packet_is_stream_seek_boundary(stream_index, packet)
+                    .then(|| start_nsecs.saturating_add(self.cached_seek_preroll_nsecs))
+            });
         }
 
         queue.iter().find_map(|packet_id| {
@@ -339,7 +353,125 @@ impl DemuxPacketCacheState {
                 .get(packet_id)
                 .is_some_and(|packet| self.packet_is_stream_seek_boundary(stream_index, packet))
         });
-        stream_prefix_prune_count_from_boundaries(boundaries, self.backbuffer_limit_bytes > 0)
+        let prune_count =
+            stream_prefix_prune_count_from_boundaries(boundaries, self.backbuffer_limit_bytes > 0)?;
+        self.limit_eager_side_stream_prune_count(range, stream_index, prune_count)
+    }
+
+    fn preferred_stream_prune_candidate(
+        &self,
+        range: &DemuxCachedRange,
+        candidates: &[ArchivedStreamPruneCandidate],
+    ) -> Option<ArchivedStreamPruneCandidate> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|candidate| self.stream_prune_candidate_keeps_anchor_order(range, *candidate))
+            .min_by(|left, right| self.compare_stream_prune_candidates(left, right))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .copied()
+                    .min_by(|left, right| self.compare_stream_prune_candidates(left, right))
+            })
+    }
+
+    fn compare_stream_prune_candidates(
+        &self,
+        left: &ArchivedStreamPruneCandidate,
+        right: &ArchivedStreamPruneCandidate,
+    ) -> std::cmp::Ordering {
+        match (left.prune_always, right.prune_always) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, true) => left.stream_index.cmp(&right.stream_index),
+            (false, false) => left
+                .seek_start_nsecs
+                .cmp(&right.seek_start_nsecs)
+                .then_with(|| left.stream_index.cmp(&right.stream_index)),
+        }
+    }
+
+    fn stream_prune_candidate_keeps_anchor_order(
+        &self,
+        range: &DemuxCachedRange,
+        candidate: ArchivedStreamPruneCandidate,
+    ) -> bool {
+        if candidate.stream_index == self.timeline_anchor_stream_index {
+            return true;
+        }
+        if !matches!(
+            self.stream_kinds.get(&candidate.stream_index),
+            Some(StreamCacheKind::Audio)
+        ) {
+            return true;
+        }
+        let Some(anchor_seek_start) = range
+            .stream_boundary(self.timeline_anchor_stream_index)
+            .seek_start_nsecs
+        else {
+            return true;
+        };
+        let Some(candidate_seek_start) = candidate.seek_start_nsecs else {
+            return true;
+        };
+        if candidate_seek_start < anchor_seek_start {
+            return true;
+        }
+        self.stream_has_prunable_prefix(range, self.timeline_anchor_stream_index)
+            .is_none()
+    }
+
+    fn stream_has_prunable_prefix(
+        &self,
+        range: &DemuxCachedRange,
+        stream_index: c_int,
+    ) -> Option<()> {
+        let queue = range.stream_queues.get(&stream_index)?;
+        let front = queue.front()?;
+        if range.id == self.read_range_id
+            && Some(*front) == self.next_packet_id_for_stream(stream_index)
+        {
+            return None;
+        }
+        Some(())
+    }
+
+    fn limit_eager_side_stream_prune_count(
+        &self,
+        range: &DemuxCachedRange,
+        stream_index: c_int,
+        prune_count: usize,
+    ) -> Option<usize> {
+        if stream_index == self.timeline_anchor_stream_index
+            || !matches!(
+                self.stream_kinds.get(&stream_index),
+                Some(StreamCacheKind::Audio)
+            )
+            || self.backbuffer_limit_bytes == 0
+        {
+            return Some(prune_count);
+        }
+        let anchor_seek_start = range
+            .stream_boundary(self.timeline_anchor_stream_index)
+            .seek_start_nsecs?;
+        let queue = range.stream_queues.get(&stream_index)?;
+        for count in (1..=prune_count).rev() {
+            let Some(next_packet_id) = queue.get(count) else {
+                continue;
+            };
+            let Some(next_start) = self
+                .packets
+                .get(next_packet_id)
+                .and_then(|packet| packet.start_nsecs)
+            else {
+                continue;
+            };
+            if next_start <= anchor_seek_start {
+                return Some(count);
+            }
+        }
+        None
     }
 
     fn packet_is_stream_seek_boundary(
@@ -378,6 +510,7 @@ impl DemuxPacketCacheState {
         stream_index: c_int,
         count: usize,
     ) {
+        let old_seek_start_nsecs = range.stream_boundary(stream_index).seek_start_nsecs;
         let removed = {
             let Some(queue) = range.stream_queues.get_mut(&stream_index) else {
                 return;
@@ -393,29 +526,30 @@ impl DemuxPacketCacheState {
             return;
         }
         range.mark_seekable_dirty();
-        let sparse_pruned_until_nsecs = matches!(
-            self.stream_kinds.get(&stream_index),
-            Some(StreamCacheKind::Subtitle)
-        )
-        .then(|| {
-            removed
-                .iter()
-                .filter_map(|packet_id| {
-                    self.packets
-                        .get(packet_id)
-                        .and_then(|packet| packet.end_nsecs.or(packet.start_nsecs))
-                })
-                .max()
-        })
-        .flatten();
+        let pruned_until_nsecs = removed
+            .iter()
+            .filter_map(|packet_id| {
+                self.packets
+                    .get(packet_id)
+                    .and_then(|packet| packet.end_nsecs.or(packet.start_nsecs))
+            })
+            .max();
         range.is_bof = false;
-        range.ensure_stream_boundary(stream_index).is_bof = false;
-        if let Some(pruned_until_nsecs) = sparse_pruned_until_nsecs {
-            range
-                .sparse_stream_pruned_until_nsecs
-                .entry(stream_index)
-                .and_modify(|existing| *existing = (*existing).max(pruned_until_nsecs))
-                .or_insert(pruned_until_nsecs);
+        {
+            let boundary = range.ensure_stream_boundary(stream_index);
+            boundary.is_bof = false;
+            boundary.pruned_packet_count = boundary
+                .pruned_packet_count
+                .saturating_add(u64::try_from(removed.len()).unwrap_or(u64::MAX));
+            let last_pruned_nsecs = old_seek_start_nsecs.or(pruned_until_nsecs);
+            if let Some(last_pruned_nsecs) = last_pruned_nsecs {
+                boundary.last_pruned_nsecs = Some(
+                    boundary
+                        .last_pruned_nsecs
+                        .unwrap_or(last_pruned_nsecs)
+                        .max(last_pruned_nsecs),
+                );
+            }
         }
         let removed_packet_ids = removed.iter().copied().collect::<HashSet<_>>();
         if range.id == self.read_range_id {
@@ -436,6 +570,7 @@ impl DemuxPacketCacheState {
                 range.subtract_report_bytes(packet.byte_len);
             }
         }
+        self.refresh_range_stream_seek_boundary_in_range(range, stream_index);
     }
 
     fn adjust_reader_head_positions_after_prune(

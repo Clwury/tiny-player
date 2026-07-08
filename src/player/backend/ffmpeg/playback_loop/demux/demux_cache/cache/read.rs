@@ -94,6 +94,19 @@ impl DemuxPacketCache {
         )
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn drain_available_packet_round_robin_with_unbounded_lock_and_timing(
+        &self,
+        stream_indices: &[c_int],
+        cache_pause_signal: bool,
+    ) -> (DemuxReadResult, Option<usize>, DemuxPacketCacheReadTiming) {
+        self.read_packet_round_robin_inner(
+            stream_indices,
+            false,
+            DemuxCacheLockWait::Unbounded,
+            cache_pause_signal,
+        )
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop) fn packet_queue_snapshot(
         &self,
     ) -> DemuxPacketQueueSnapshot {
@@ -259,7 +272,7 @@ impl DemuxPacketCache {
                     .refresh_monitor_snapshot_with_timing(&guard, &mut timing);
                 let seekable_changed = guard.seekable_ranges_changed_since_last_emit();
                 self.shared
-                    .emit_cache_state_after_read(&mut guard, wait_for_data || seekable_changed);
+                    .emit_cache_state_after_read(&mut guard, seekable_changed);
                 self.shared.ready.notify_all();
                 drop(guard);
                 let (packet, stream_offset) = match packet_source.packet_ref(&mut timing) {
@@ -457,6 +470,11 @@ impl DemuxPacketCache {
                     }
                     thread::yield_now();
                 }
+            }
+            DemuxCacheLockWait::Unbounded => {
+                let (guard, lock_timing) = self.lock_state_unbounded_with_timing();
+                timing.lock_wait = lock_timing.lock_wait;
+                (Some(guard), timing)
             }
         }
     }

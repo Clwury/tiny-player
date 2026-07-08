@@ -25,14 +25,14 @@ use crate::player::{
 use super::super::DEMUX_PACKET_CACHE_MEMORY_BYTES;
 use super::{
     AvPacket, CachedDemuxPacket, CachedDemuxPacketPayload, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
-    DEMUX_PACKET_APPEND_TRIM_INTERVAL, DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS,
-    DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL, DEMUX_PACKET_READ_TRIM_INTERVAL,
-    DEMUX_STREAM_PACKET_QUEUE_LIMIT, DemuxPacketCache, DemuxPacketCacheMonitorSnapshot,
-    DemuxPacketCacheReadTiming, DemuxPacketCacheShared, DemuxPacketCacheState,
-    DemuxPacketDiskCache, DemuxPacketTimeline, DemuxReadResult, DemuxSeekRequest, DemuxSeekResult,
-    DemuxSelectedStreams, FfmpegControl, StreamInfo, demux_cache_blocked_on,
-    demux_packet_cache_hysteresis_nsecs, demux_packet_cache_readahead_nsecs, duration_nsecs,
-    seconds_to_nsecs,
+    DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS, DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL,
+    DEMUX_PACKET_READ_TRIM_INTERVAL, DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL,
+    DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT, DEMUX_STREAM_PACKET_QUEUE_LIMIT, DemuxPacketCache,
+    DemuxPacketCacheMonitorSnapshot, DemuxPacketCacheReadTiming, DemuxPacketCacheShared,
+    DemuxPacketCacheState, DemuxPacketDiskCache, DemuxPacketTimeline, DemuxReadResult,
+    DemuxSeekRequest, DemuxSeekResult, DemuxSelectedStreams, FfmpegControl, PacketId, StreamInfo,
+    demux_cache_blocked_on, demux_packet_cache_hysteresis_nsecs,
+    demux_packet_cache_readahead_nsecs, duration_nsecs, seconds_to_nsecs,
 };
 
 fn cached_anchor(start_nsecs: u64, end_nsecs: u64) -> CachedDemuxPacket {
@@ -47,6 +47,30 @@ fn cached_seek_closer(at_nsecs: u64) -> CachedDemuxPacket {
 
 fn close_seek_range(state: &mut DemuxPacketCacheState, at_nsecs: u64) {
     state.append_packet(cached_seek_closer(at_nsecs));
+}
+
+fn set_reader_head_for_stream_time(
+    state: &mut DemuxPacketCacheState,
+    stream_index: c_int,
+    at_or_after_nsecs: u64,
+) -> PacketId {
+    let packet_id = state
+        .read_range()
+        .stream_queues
+        .get(&stream_index)
+        .and_then(|queue| {
+            queue.iter().copied().find(|packet_id| {
+                state
+                    .packets
+                    .get(packet_id)
+                    .and_then(|packet| packet.start_nsecs)
+                    .is_some_and(|start_nsecs| start_nsecs >= at_or_after_nsecs)
+            })
+        })
+        .expect("reader head packet exists for stream time");
+    state.set_reader_head_for_current_generation(stream_index, packet_id);
+    state.refresh_reader_tracking();
+    packet_id
 }
 
 fn cached_packet(
@@ -396,7 +420,7 @@ fn demux_packet_cache_state_trims_consumed_packet_at_memory_limit() {
 }
 
 #[test]
-fn demux_packet_cache_append_trims_backbuffer_incrementally() {
+fn demux_packet_cache_append_trims_backbuffer_incrementally_under_pressure() {
     let mut config = cache_config_for_test();
     config.cache_secs = 1000.0;
     config.demuxer_readahead_secs = 1000.0;
@@ -421,24 +445,502 @@ fn demux_packet_cache_append_trims_backbuffer_incrementally() {
 
     let outcome = state.append_packet(cached_anchor(8_000_000_000, 9_000_000_000));
 
-    assert!(!outcome.force_cache_state_report);
-    assert_eq!(state.backward_bytes(), 6 * 1024);
+    assert!(outcome.timing.trim > Duration::ZERO);
+    assert_eq!(state.backward_bytes(), 5 * 1024);
     assert!(state.backward_bytes() > state.effective_backbuffer_limit());
+    assert_eq!(
+        state
+            .playback_cache_state(false)
+            .demux
+            .seekable_ranges
+            .first(),
+        Some(&PlaybackCacheTimeRange {
+            start: 1.0,
+            end: 8.0,
+        })
+    );
+}
 
-    let mut trimmed = false;
-    for index in 9..(9 + DEMUX_PACKET_APPEND_TRIM_INTERVAL as u64) {
-        let start_nsecs = index * 1_000_000_000;
-        let outcome = state.append_packet(cached_anchor(start_nsecs, start_nsecs + 1_000_000_000));
-        trimmed |= outcome.timing.trim > Duration::ZERO;
-        if trimmed {
-            break;
+#[test]
+fn demux_packet_cache_append_trim_emits_seekable_window_change_immediately() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let mut config = cache_config_for_test();
+    config.cache_secs = 1000.0;
+    config.demuxer_readahead_secs = 1000.0;
+    config.demuxer_max_bytes = 64 * 1024;
+    config.demuxer_max_back_bytes = 1024;
+    config.demuxer_donate_buffer = false;
+    let (shared, event_rx) = shared_with_config_for_test(control, config);
+
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        for index in 0..8 {
+            let start_nsecs = u64::try_from(index).unwrap() * 1_000_000_000;
+            guard.append_packet(cached_anchor(start_nsecs, start_nsecs + 1_000_000_000));
         }
+        guard.set_read_index_for_test(6);
+        guard.reader_nsecs = 6_000_000_000;
+        let emitted_state = guard.playback_cache_state(false);
+        assert_eq!(
+            emitted_state.demux.seekable_ranges.first(),
+            Some(&PlaybackCacheTimeRange {
+                start: 0.0,
+                end: 7.0,
+            })
+        );
+        guard.record_cache_state_emit(Instant::now());
+        guard.record_emitted_cache_state(&emitted_state);
     }
-    assert!(trimmed);
-    assert!(state.backward_bytes() < 6 * 1024);
+    let _ = event_rx.try_iter().collect::<Vec<_>>();
 
+    shared.append_packet(cached_anchor(8_000_000_000, 9_000_000_000));
+    let emitted_state = event_rx.try_iter().find_map(|event| match event.kind {
+        BackendEventKind::CacheStateChanged(state)
+            if state
+                .demux
+                .seekable_ranges
+                .first()
+                .is_some_and(|range| range.start > 0.0) =>
+        {
+            Some(state)
+        }
+        _ => None,
+    });
+
+    let emitted_state =
+        emitted_state.expect("append trim emits changed seekable window immediately");
+    assert_eq!(
+        emitted_state.demux.seekable_ranges.first(),
+        Some(&PlaybackCacheTimeRange {
+            start: 1.0,
+            end: 8.0,
+        })
+    );
+}
+
+#[test]
+fn demux_packet_cache_append_trim_keeps_distant_next_seek_boundary() {
+    let mut config = cache_config_for_test();
+    config.cache_secs = 1000.0;
+    config.demuxer_readahead_secs = 1000.0;
+    config.demuxer_max_bytes = 1024 * 1024;
+    config.demuxer_max_back_bytes = 1024;
+    config.demuxer_donate_buffer = false;
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        config,
+    );
+
+    for index in 0..700_u64 {
+        let start_nsecs = index * 40_000_000;
+        state.append_packet(cached_packet_with_keyframe(
+            0,
+            true,
+            index == 0 || index == 600,
+            Some(start_nsecs),
+            Some(start_nsecs + 40_000_000),
+        ));
+    }
+    close_seek_range(&mut state, 28_000_000_000);
+    state.set_read_index_for_test(650);
+    state.reader_nsecs = 26_000_000_000;
+
+    assert!(state.backward_bytes() > state.effective_backbuffer_limit());
+    assert!(state.trim_to_limit_for_append());
+
+    assert_eq!(
+        state.read_range().stream_queues.get(&0).unwrap().front(),
+        Some(&600)
+    );
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 24.0,
+            end: 28.0,
+        }]
+    );
+}
+
+#[test]
+fn demux_packet_cache_trim_preserves_reader_covering_seek_boundary() {
+    let mut config = cache_config_for_test();
+    config.cache_secs = 1000.0;
+    config.demuxer_readahead_secs = 1000.0;
+    config.demuxer_max_bytes = 1024 * 1024;
+    config.demuxer_max_back_bytes = 1024;
+    config.demuxer_donate_buffer = false;
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        config,
+    );
+
+    for index in 0..=30_u64 {
+        let start_nsecs = index * 1_000_000_000;
+        state.append_packet(cached_packet_with_keyframe(
+            0,
+            true,
+            index % 10 == 0,
+            Some(start_nsecs),
+            Some(start_nsecs + 1_000_000_000),
+        ));
+    }
+    state.set_read_index_for_test(15);
+    state.reader_nsecs = 15_000_000_000;
+
+    assert!(state.backward_bytes() > state.effective_backbuffer_limit());
+    assert!(state.trim_to_limit_for_append());
+    assert_eq!(
+        state.read_range().stream_queues.get(&0).unwrap().front(),
+        Some(&10)
+    );
+    assert!(!state.trim_to_limit_for_append());
+
+    assert_eq!(
+        state.read_range().stream_queues.get(&0).unwrap().front(),
+        Some(&10)
+    );
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 10.0,
+            end: 30.0,
+        }]
+    );
+}
+
+#[test]
+fn demux_packet_cache_trim_keeps_reader_covering_seekable_start() {
+    let mut config = cache_config_for_test();
+    config.cache_secs = 1000.0;
+    config.demuxer_readahead_secs = 1000.0;
+    config.demuxer_max_bytes = 1024 * 1024;
+    config.demuxer_max_back_bytes = 1024;
+    config.demuxer_donate_buffer = false;
+    let mut state = DemuxPacketCacheState::new(
+        130_000_000_000,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        config,
+    );
+    state.set_stream_kind(1, StreamCacheKind::Audio);
+
+    for second in 130..=170_u64 {
+        let start_nsecs = second * 1_000_000_000;
+        state.append_packet(cached_packet_with_keyframe(
+            0,
+            true,
+            second == 130 || second == 150,
+            Some(start_nsecs),
+            Some(start_nsecs + 1_000_000_000),
+        ));
+    }
+    for second in 120..=170_u64 {
+        let start_nsecs = second * 1_000_000_000;
+        state.append_packet(cached_packet(
+            1,
+            false,
+            Some(start_nsecs),
+            Some(start_nsecs + 1_000_000_000),
+        ));
+    }
+    let reader_nsecs = 139_000_000_000;
+    set_reader_head_for_stream_time(&mut state, 0, reader_nsecs);
+    set_reader_head_for_stream_time(&mut state, 1, reader_nsecs);
+    state.reader_nsecs = reader_nsecs;
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 130.0,
+            end: 150.0,
+        }]
+    );
+    assert!(state.backward_bytes() > state.effective_backbuffer_limit());
     assert!(state.trim_to_limit());
-    assert!(state.backward_bytes() <= state.effective_backbuffer_limit());
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 130.0,
+            end: 150.0,
+        }]
+    );
+}
+
+#[test]
+fn demux_packet_cache_trim_slides_to_shared_seek_boundary() {
+    let mut config = cache_config_for_test();
+    config.cache_secs = 1000.0;
+    config.demuxer_readahead_secs = 1000.0;
+    config.demuxer_max_bytes = 1024 * 1024;
+    config.demuxer_max_back_bytes = 1024;
+    config.demuxer_donate_buffer = false;
+    let mut state = DemuxPacketCacheState::new(
+        130_000_000_000,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        config,
+    );
+    state.set_stream_kind(1, StreamCacheKind::Audio);
+
+    for second in 130..=170_u64 {
+        let start_nsecs = second * 1_000_000_000;
+        state.append_packet(cached_packet_with_keyframe(
+            0,
+            true,
+            second == 130 || second == 140 || second == 150,
+            Some(start_nsecs),
+            Some(start_nsecs + 1_000_000_000),
+        ));
+    }
+    for second in 120..=170_u64 {
+        let start_nsecs = second * 1_000_000_000;
+        state.append_packet(cached_packet(
+            1,
+            false,
+            Some(start_nsecs),
+            Some(start_nsecs + 1_000_000_000),
+        ));
+    }
+    let reader_nsecs = 145_000_000_000;
+    set_reader_head_for_stream_time(&mut state, 0, reader_nsecs);
+    set_reader_head_for_stream_time(&mut state, 1, reader_nsecs);
+    state.reader_nsecs = reader_nsecs;
+
+    assert!(state.backward_bytes() > state.effective_backbuffer_limit());
+    assert!(state.trim_to_limit());
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 140.0,
+            end: 150.0,
+        }]
+    );
+}
+
+#[test]
+fn demux_packet_cache_trim_falls_back_to_anchor_when_audio_is_at_anchor_limit() {
+    let mut config = cache_config_for_test();
+    config.cache_secs = 1000.0;
+    config.demuxer_readahead_secs = 1000.0;
+    config.demuxer_max_back_bytes = 3500;
+    config.demuxer_donate_buffer = false;
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        config,
+    );
+    state.set_stream_kind(1, StreamCacheKind::Audio);
+    state.mark_read_stream_bof(0, false);
+    state.mark_read_stream_bof(1, false);
+
+    for second in [0_u64, 10, 20, 30] {
+        let start_nsecs = second * 1_000_000_000;
+        state.append_packet(cached_packet_with_keyframe(
+            0,
+            true,
+            true,
+            Some(start_nsecs),
+            Some(start_nsecs + 1_000_000_000),
+        ));
+    }
+    for start_nsecs in [487_000_000_u64, 510_000_000, 20_000_000_000] {
+        state.append_packet(cached_packet(
+            1,
+            false,
+            Some(start_nsecs),
+            Some(start_nsecs + 20_000_000),
+        ));
+    }
+
+    set_reader_head_for_stream_time(&mut state, 0, 20_000_000_000);
+    set_reader_head_for_stream_time(&mut state, 1, 20_000_000_000);
+    state.reader_nsecs = 20_000_000_000;
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 0.5,
+            end: 20.02,
+        }]
+    );
+    assert!(state.backward_bytes() > state.effective_backbuffer_limit());
+    assert!(state.trim_to_limit());
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 10.5,
+            end: 20.02,
+        }]
+    );
+}
+
+#[test]
+fn demux_packet_cache_append_trim_emit_keeps_seekable_start_before_reader_with_dense_audio() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let mut config = cache_config_for_test();
+    config.cache_secs = 1000.0;
+    config.demuxer_readahead_secs = 1000.0;
+    config.demuxer_max_bytes = 1024 * 1024;
+    config.demuxer_max_back_bytes = 1024;
+    config.demuxer_donate_buffer = false;
+    let (shared, event_rx) = shared_with_config_for_test(control, config);
+    let reader_nsecs = 139_000_000_000;
+    let initial_cached_bytes;
+
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        guard.set_stream_kind(1, StreamCacheKind::Audio);
+        guard.mark_read_stream_bof(0, false);
+        guard.mark_read_stream_bof(1, false);
+
+        for second in 130..=170_u64 {
+            let start_nsecs = second * 1_000_000_000;
+            guard.append_packet(cached_packet_with_keyframe(
+                0,
+                true,
+                second == 130 || second == 150,
+                Some(start_nsecs),
+                Some(start_nsecs + 1_000_000_000),
+            ));
+        }
+        for packet_index in 0..=DEMUX_STREAM_PACKET_QUEUE_LIMIT {
+            let start_nsecs = 120_000_000_000 + u64::try_from(packet_index).unwrap() * 20_000_000;
+            let mut packet =
+                cached_packet(1, false, Some(start_nsecs), Some(start_nsecs + 20_000_000));
+            packet.byte_len = 1;
+            guard.append_packet(packet);
+        }
+
+        assert!(
+            guard.read_range().stream_queues.get(&1).unwrap().len()
+                > DEMUX_STREAM_PACKET_QUEUE_LIMIT
+        );
+        set_reader_head_for_stream_time(&mut guard, 0, reader_nsecs);
+        set_reader_head_for_stream_time(&mut guard, 1, reader_nsecs);
+        guard.reader_nsecs = reader_nsecs;
+        assert_eq!(
+            guard.playback_cache_state(false).demux.seekable_ranges,
+            vec![PlaybackCacheTimeRange {
+                start: 130.0,
+                end: 150.0,
+            }]
+        );
+        assert!(guard.backward_bytes() > guard.effective_backbuffer_limit());
+        initial_cached_bytes = guard.cached_bytes;
+    }
+    let _ = event_rx.try_iter().collect::<Vec<_>>();
+
+    shared.append_packet(cached_packet_with_keyframe(
+        0,
+        true,
+        false,
+        Some(171_000_000_000),
+        Some(172_000_000_000),
+    ));
+
+    let events = event_rx.try_iter().collect::<Vec<_>>();
+    let emitted_state = events.iter().find_map(|event| match &event.kind {
+        BackendEventKind::CacheStateChanged(state) => Some(state),
+        _ => None,
+    });
+    let emitted_state = emitted_state.expect("append trim emits cache state for dense audio case");
+    assert_eq!(
+        emitted_state.demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 130.0,
+            end: 150.0,
+        }]
+    );
+    assert!(
+        emitted_state.demux.seekable_ranges[0].start < 139.0,
+        "seekable range start jumped to reader/current"
+    );
+
+    let guard = shared
+        .state
+        .lock()
+        .expect("FFmpeg demux packet cache poisoned");
+    assert!(guard.cached_bytes < initial_cached_bytes + 1024);
+    assert!(guard.read_range().stream_boundary(1).pruned_packet_count > 0);
+    let video_front = guard
+        .read_range()
+        .stream_queues
+        .get(&0)
+        .and_then(|queue| queue.front())
+        .and_then(|packet_id| guard.packets.get(packet_id))
+        .expect("video backbuffer front remains cached");
+    assert_eq!(video_front.start_nsecs, Some(130_000_000_000));
+    assert!(video_front.timeline_anchor);
+}
+
+#[test]
+fn demux_packet_cache_donated_append_budget_slides_seekable_window_immediately() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let mut config = cache_config_for_test();
+    config.cache_secs = 1000.0;
+    config.demuxer_readahead_secs = 1000.0;
+    config.demuxer_max_bytes = 8 * 1024;
+    config.demuxer_max_back_bytes = 1024;
+    config.demuxer_donate_buffer = true;
+    let (shared, event_rx) = shared_with_config_for_test(control, config);
+
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        for index in 0..8 {
+            let start_nsecs = u64::try_from(index).unwrap() * 1_000_000_000;
+            guard.append_packet(cached_anchor(start_nsecs, start_nsecs + 1_000_000_000));
+        }
+        guard.set_read_index_for_test(6);
+        guard.reader_nsecs = 6_000_000_000;
+        let emitted_state = guard.playback_cache_state(false);
+        assert_eq!(
+            emitted_state.demux.seekable_ranges.first(),
+            Some(&PlaybackCacheTimeRange {
+                start: 0.0,
+                end: 7.0,
+            })
+        );
+        guard.record_cache_state_emit(Instant::now());
+        guard.record_emitted_cache_state(&emitted_state);
+    }
+    let _ = event_rx.try_iter().collect::<Vec<_>>();
+
+    shared.append_packet(cached_anchor(8_000_000_000, 9_000_000_000));
+    let emitted_state = event_rx.try_iter().find_map(|event| match event.kind {
+        BackendEventKind::CacheStateChanged(state) => Some(state),
+        _ => None,
+    });
+    let emitted_state =
+        emitted_state.expect("donated append budget emits changed seekable window immediately");
+    assert_eq!(
+        emitted_state.demux.seekable_ranges.first(),
+        Some(&PlaybackCacheTimeRange {
+            start: 1.0,
+            end: 8.0,
+        })
+    );
 }
 
 #[test]
@@ -1065,33 +1567,23 @@ fn demux_packet_cache_reports_reader_state_after_packet_read() {
         DemuxReadResult::Packet(_)
     ));
     let events = event_rx.try_iter().collect::<Vec<_>>();
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(&event.kind, BackendEventKind::CacheStateChanged(_)))
-    );
-    {
-        let mut guard = shared
-            .state
-            .lock()
-            .expect("FFmpeg demux packet cache poisoned");
-        assert!(guard.cache_state_emit_dirty());
-        guard.last_cache_state_emit_at =
-            Some(Instant::now() - DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL);
-    }
-
-    shared.append_packet(cached_anchor(2_000_000_000, 3_000_000_000));
-    let events = event_rx.try_iter().collect::<Vec<_>>();
     let cache_state = events.iter().find_map(|event| match &event.kind {
         BackendEventKind::CacheStateChanged(state) => Some(state),
         _ => None,
     });
 
-    let cache_state = cache_state.expect("append emits dirty reader state when report is due");
+    let cache_state = cache_state.expect("read emits changed seekable range state immediately");
     assert_eq!(cache_state.demux.reader_pts, Some(1.0));
-    assert_eq!(cache_state.demux.cache_end, Some(3.0));
-    assert_eq!(cache_state.demux.cache_duration, Some(2.0));
-    assert_eq!(cache_state.demux.forward_bytes, 2048);
+    assert_eq!(cache_state.demux.cache_end, Some(2.0));
+    assert_eq!(cache_state.demux.cache_duration, Some(1.0));
+    assert_eq!(cache_state.demux.forward_bytes, 1024);
+    assert_eq!(
+        cache_state.demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 0.0,
+            end: 1.0,
+        }]
+    );
 }
 
 #[test]
@@ -1159,30 +1651,12 @@ fn demux_packet_cache_read_trim_emits_seekable_range_change_after_coalesced_main
             DemuxReadResult::Packet(_)
         ));
     }
-    {
-        let mut guard = shared
-            .state
-            .lock()
-            .expect("FFmpeg demux packet cache poisoned");
-        assert!(guard.cache_state_emit_dirty());
-        guard.last_cache_state_emit_at =
-            Some(Instant::now() - DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL);
-    }
-    assert!(matches!(
-        cache.poll_packet_round_robin(&[0]).0,
-        DemuxReadResult::Packet(_)
-    ));
     let events = event_rx.try_iter().collect::<Vec<_>>();
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(&event.kind, BackendEventKind::CacheStateChanged(_)))
-    );
-
-    let emit = shared
-        .prepare_cache_state_emit_after_append(false)
-        .expect("coalesced maintenance emits changed seekable ranges when report is due");
-    let cache_state = emit.cache_state;
+    let cache_state = events.iter().find_map(|event| match &event.kind {
+        BackendEventKind::CacheStateChanged(state) => Some(state),
+        _ => None,
+    });
+    let cache_state = cache_state.expect("read trim emits changed seekable ranges immediately");
     assert_eq!(
         cache_state.demux.seekable_ranges,
         vec![PlaybackCacheTimeRange {
@@ -1220,38 +1694,21 @@ fn demux_packet_cache_reports_reader_state_after_nonblocking_packet_read() {
         DemuxReadResult::Packet(_)
     ));
     let events = event_rx.try_iter().collect::<Vec<_>>();
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(&event.kind, BackendEventKind::CacheStateChanged(_)))
-    );
-    {
-        let mut guard = shared
-            .state
-            .lock()
-            .expect("FFmpeg demux packet cache poisoned");
-        assert!(guard.cache_state_emit_dirty());
-        guard.last_cache_state_emit_at =
-            Some(Instant::now() - DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL);
-    }
-
-    shared.append_packet(cached_anchor(2_000_000_000, 3_000_000_000));
-    let events = event_rx.try_iter().collect::<Vec<_>>();
     let cache_state = events.iter().find_map(|event| match &event.kind {
         BackendEventKind::CacheStateChanged(state) => Some(state),
         _ => None,
     });
 
     let cache_state =
-        cache_state.expect("append emits dirty nonblocking reader state when report is due");
+        cache_state.expect("nonblocking read emits changed seekable range state immediately");
     assert_eq!(cache_state.demux.reader_pts, Some(1.0));
-    assert_eq!(cache_state.demux.cache_end, Some(3.0));
-    assert_eq!(cache_state.demux.cache_duration, Some(2.0));
+    assert_eq!(cache_state.demux.cache_end, Some(2.0));
+    assert_eq!(cache_state.demux.cache_duration, Some(1.0));
     assert_eq!(
         cache_state.demux.seekable_ranges,
         vec![PlaybackCacheTimeRange {
             start: 0.0,
-            end: 2.0,
+            end: 1.0,
         }]
     );
 }
@@ -1401,14 +1858,44 @@ fn demux_packet_cache_reports_per_stream_packet_queue_limit_without_pausing() {
     assert!(video_queue.packet_queue_full);
     assert!(video_queue.prefetch_packet_queue_full);
     assert!(video_queue.reader_head_available);
+    // The readable count saturates at the snapshot scan limit to keep the
+    // per-read monitor refresh cheap.
     assert_eq!(
         video_queue.readable_packets_for_stream,
-        DEMUX_STREAM_PACKET_QUEUE_LIMIT
+        DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT
     );
     assert!(video_queue.consumer_drainable);
     assert!(state.stream_packet_queue_full());
     assert!(!state.should_pause_demux());
     assert_eq!(demux_cache_blocked_on(&state, false), "demux_cache");
+}
+
+#[test]
+fn read_trim_memory_overrun_paces_by_interval() {
+    let mut config = cache_config_for_test();
+    config.cache_secs = 1000.0;
+    config.demuxer_readahead_secs = 1000.0;
+    config.demuxer_max_bytes = 128 * 1024;
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        config,
+    );
+    for index in 0..300_u64 {
+        let start_nsecs = index * 1_000_000_000;
+        state.append_packet(cached_anchor(start_nsecs, start_nsecs + 1_000_000_000));
+    }
+    assert!(state.memory_pressure());
+
+    // Memory overrun is the steady state at the forward byte cap, so read
+    // trims must stay paced instead of running on every consumer read.
+    for _ in 0..DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL - 1 {
+        assert!(!state.read_trim_due());
+    }
+    assert!(state.read_trim_due());
+    assert!(!state.read_trim_due());
 }
 
 #[test]
@@ -1440,7 +1927,7 @@ fn cache_full_decoder_empty_drains_existing_packets() {
     assert!(video_queue.reader_head_available);
     assert_eq!(
         video_queue.readable_packets_for_stream,
-        DEMUX_STREAM_PACKET_QUEUE_LIMIT
+        DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT
     );
 
     let mut timing = DemuxPacketCacheReadTiming::default();
@@ -1460,7 +1947,7 @@ fn cache_full_decoder_empty_drains_existing_packets() {
     assert!(video_queue.consumer_drainable);
     assert_eq!(
         video_queue.readable_packets_for_stream,
-        DEMUX_STREAM_PACKET_QUEUE_LIMIT - 1
+        DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT
     );
 }
 
@@ -2195,34 +2682,22 @@ fn demux_packet_cache_coalesces_underrun_state_after_read_without_cache_pause() 
     });
 
     let deadline = Instant::now() + Duration::from_secs(1);
-    let mut underrun_dirty = false;
+    let mut underrun_state = None;
     while Instant::now() < deadline {
-        {
-            let mut guard = shared
-                .state
-                .lock()
-                .expect("FFmpeg demux packet cache poisoned");
-            if guard.cache_state_emit_dirty() && guard.has_demux_underrun() {
-                guard.last_cache_state_emit_at =
-                    Some(Instant::now() - DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL);
-                underrun_dirty = true;
+        for event in event_rx.try_iter() {
+            if let BackendEventKind::CacheStateChanged(state) = event.kind
+                && state.demux.underrun
+            {
+                underrun_state = Some(state);
                 break;
             }
         }
+        if underrun_state.is_some() {
+            break;
+        }
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(underrun_dirty, "read underrun marks cache state dirty");
-    assert!(event_rx.try_iter().all(|event| {
-        !matches!(
-            event.kind,
-            BackendEventKind::CacheStateChanged(state) if state.demux.underrun
-        )
-    }));
-
-    let emit = shared
-        .prepare_cache_state_emit_after_append(false)
-        .expect("coalesced maintenance emits dirty underrun state when report is due");
-    let underrun_state = emit.cache_state;
+    let underrun_state = underrun_state.expect("read underrun emits cache state immediately");
 
     {
         let mut guard = shared
@@ -3002,6 +3477,35 @@ fn demux_packet_cache_state_keeps_consumed_packet_in_seekable_backbuffer_range()
 }
 
 #[test]
+fn demux_packet_cache_state_does_not_advance_reader_from_sparse_subtitle_packet() {
+    let mut state = DemuxPacketCacheState::new(
+        55_000_000_000,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.set_stream_kind(3, StreamCacheKind::Subtitle);
+    state.append_packet(cached_anchor(55_000_000_000, 56_000_000_000));
+    state.append_packet(cached_packet(
+        3,
+        false,
+        Some(153_800_000_000),
+        Some(154_120_000_000),
+    ));
+
+    let mut timing = DemuxPacketCacheReadTiming::default();
+    assert!(
+        state
+            .take_packet_round_robin(&[3], &mut timing)
+            .expect("subtitle packet reads")
+            .is_some()
+    );
+
+    assert_eq!(state.reader_nsecs, 55_000_000_000);
+}
+
+#[test]
 fn demux_packet_cache_state_materializes_disk_packet_after_reader_advance() {
     let temp_dir = tempfile::tempdir().expect("temp dir creates");
     let mut config = cache_config_for_test();
@@ -3336,11 +3840,11 @@ fn demux_packet_cache_state_forward_growth_reclaims_donated_backbuffer() {
     close_seek_range(&mut state, 6_000_000_000);
 
     assert_eq!(state.forward_bytes(), 2 * 1024);
-    assert_eq!(state.backward_bytes(), 3 * 1024);
+    assert_eq!(state.backward_bytes(), 2 * 1024);
     assert_eq!(
         state.playback_cache_state(false).demux.seekable_ranges,
         vec![PlaybackCacheTimeRange {
-            start: 1.0,
+            start: 2.0,
             end: 6.0,
         }]
     );
@@ -4859,7 +5363,7 @@ fn demux_packet_cache_state_excludes_pruned_sparse_stream_from_seekable_range() 
     assert_eq!(
         state.playback_cache_state(false).demux.seekable_ranges[0],
         PlaybackCacheTimeRange {
-            start: 1.5,
+            start: 1.0,
             end: 3.0,
         }
     );
@@ -4870,6 +5374,120 @@ fn demux_packet_cache_state_excludes_pruned_sparse_stream_from_seekable_range() 
     assert_eq!(
         state.seek_cached(1_750_000_000, PlaybackSessionId(4)),
         Some(3.0)
+    );
+}
+
+#[test]
+fn demux_packet_cache_state_applies_sparse_last_pruned_without_reader_gate() {
+    let mut state = DemuxPacketCacheState::new(
+        60_000_000_000,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.set_stream_kind(3, StreamCacheKind::Subtitle);
+    state.append_packet(cached_anchor(50_000_000_000, 60_000_000_000));
+    state.append_packet(cached_anchor(60_000_000_000, 160_000_000_000));
+    close_seek_range(&mut state, 160_000_000_000);
+    {
+        let range = state.read_range_mut();
+        range.ensure_stream_boundary(3).last_pruned_nsecs = Some(153_800_000_000);
+        range.mark_seekable_dirty();
+    }
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges[0],
+        PlaybackCacheTimeRange {
+            start: 153.9,
+            end: 160.0,
+        }
+    );
+}
+
+#[test]
+fn demux_packet_cache_trim_records_sparse_last_pruned_from_old_seek_start_like_mpv() {
+    let mut config = cache_config_for_test();
+    config.cache_secs = 1000.0;
+    config.demuxer_readahead_secs = 1000.0;
+    config.demuxer_max_back_bytes = 1;
+    config.demuxer_donate_buffer = false;
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        config,
+    );
+    state.set_stream_kind(1, StreamCacheKind::Audio);
+    state.set_stream_kind(2, StreamCacheKind::Subtitle);
+    state.append_packet(cached_anchor(500_000_000, 240_000_000_000));
+    state.append_packet(cached_packet(
+        1,
+        false,
+        Some(500_000_000),
+        Some(240_000_000_000),
+    ));
+    state.append_packet(cached_packet(2, false, Some(0), Some(141_520_000_000)));
+    state.append_packet(cached_packet(
+        2,
+        false,
+        Some(141_520_000_000),
+        Some(200_000_000_000),
+    ));
+    state.append_packet(cached_packet(
+        2,
+        false,
+        Some(200_000_000_000),
+        Some(240_000_000_000),
+    ));
+    state.append_packet(cached_packet(
+        2,
+        false,
+        Some(240_000_000_000),
+        Some(260_000_000_000),
+    ));
+    close_seek_range(&mut state, 240_000_000_000);
+
+    set_reader_head_for_stream_time(&mut state, 0, 500_000_000);
+    set_reader_head_for_stream_time(&mut state, 1, 500_000_000);
+    set_reader_head_for_stream_time(&mut state, 2, 200_000_000_000);
+    state.reader_nsecs = 141_990_022_676;
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges[0],
+        PlaybackCacheTimeRange {
+            start: 0.5,
+            end: 240.0,
+        }
+    );
+    assert!(state.trim_to_limit());
+    assert_eq!(
+        state.read_range().stream_boundary(2).last_pruned_nsecs,
+        Some(0)
+    );
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges[0],
+        PlaybackCacheTimeRange {
+            start: 0.5,
+            end: 240.0,
+        }
+    );
+
+    set_reader_head_for_stream_time(&mut state, 2, 240_000_000_000);
+    state.reader_nsecs = 200_000_000_000;
+
+    assert!(state.trim_to_limit());
+    assert_eq!(
+        state.read_range().stream_boundary(2).last_pruned_nsecs,
+        Some(141_520_000_000)
+    );
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges[0],
+        PlaybackCacheTimeRange {
+            start: 141.62,
+            end: 240.0,
+        }
     );
 }
 

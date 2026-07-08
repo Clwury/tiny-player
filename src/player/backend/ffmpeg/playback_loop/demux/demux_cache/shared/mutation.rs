@@ -27,32 +27,45 @@ impl DemuxPacketCacheShared {
         append_outcome.timing.refresh_cache_pause += refresh_cache_pause_started_at.elapsed();
         let first_cache_state_report = guard.last_cache_state_emit_at.is_none();
         let cache_state_report_due = guard.cache_state_report_due(Instant::now());
+        let seekable_window_changed =
+            append_outcome.appended && guard.seekable_range_window_changed_since_last_emit();
         if append_outcome.appended {
-            append_outcome.force_cache_state_report |= cache_pause_refresh.force_cache_state_report;
+            append_outcome.force_cache_state_report |=
+                cache_pause_refresh.force_cache_state_report || seekable_window_changed;
         }
         let force_cache_state_report = append_outcome.force_cache_state_report
             || (!append_outcome.appended && cache_pause_refresh.force_cache_state_report);
         if append_outcome.appended || force_cache_state_report {
             guard.mark_cache_state_emit_dirty();
         }
-        let should_emit_cache_state =
-            guard.cache_state_emit_dirty() && (first_cache_state_report || cache_state_report_due);
+        let should_emit_cache_state = guard.cache_state_emit_dirty()
+            && (seekable_window_changed || first_cache_state_report || cache_state_report_due);
+        let forced_cache_state_emit = if should_emit_cache_state && seekable_window_changed {
+            let prepare_started_at = Instant::now();
+            let emit = self.prepare_cache_state_emit(&mut guard).into_emit();
+            append_outcome.timing.emit_state_prepare += prepare_started_at.elapsed();
+            Some(emit)
+        } else {
+            None
+        };
         let notify_started_at = Instant::now();
         self.ready.notify_all();
         append_outcome.timing.notify += notify_started_at.elapsed();
         append_outcome.timing.lock_hold = append_lock_hold_started_at.elapsed();
         drop(guard);
         let emit_state_started_at = Instant::now();
-        let (cache_state_emit, cache_state_emit_deferred_for_consumer) = if should_emit_cache_state
-        {
-            self.prepare_cache_state_emit_after_append_with_timing(
-                force_cache_state_report,
-                true,
-                &mut append_outcome.timing,
-            )
-        } else {
-            (None, false)
-        };
+        let (cache_state_emit, cache_state_emit_deferred_for_consumer) =
+            if forced_cache_state_emit.is_some() {
+                (forced_cache_state_emit, false)
+            } else if should_emit_cache_state {
+                self.prepare_cache_state_emit_after_append_with_timing(
+                    force_cache_state_report,
+                    true,
+                    &mut append_outcome.timing,
+                )
+            } else {
+                (None, false)
+            };
         append_outcome.cache_state_emit_deferred_for_consumer =
             cache_state_emit_deferred_for_consumer;
         append_outcome.timing.emit_state += emit_state_started_at.elapsed();

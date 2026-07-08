@@ -73,7 +73,6 @@ impl DemuxPacketCacheState {
             cache_buffering_percent: None,
             cached_bytes: 0,
             append_maintenance_packets: 0,
-            append_trim_pressure_packets: 0,
             read_trim_pressure_packets: 0,
             reader_nsecs,
             session_id,
@@ -103,7 +102,10 @@ impl DemuxPacketCacheState {
         kind: StreamCacheKind,
     ) {
         self.stream_kinds.insert(stream_index, kind);
-        self.mark_all_seekable_summaries_dirty();
+        let range_ids = self.ranges.keys().copied().collect::<Vec<_>>();
+        for range_id in range_ids {
+            self.refresh_range_stream_seek_boundary(range_id, stream_index);
+        }
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_selected_streams(

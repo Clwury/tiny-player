@@ -200,26 +200,6 @@ impl DemuxPacketCacheState {
         first_cached_nsecs.zip(buffered_until_nsecs)
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_timeline_ranges_in_packet_range(
-        packets: &HashMap<u64, CachedDemuxPacket>,
-        timeline_anchor_stream_index: c_int,
-        cached_seek_preroll_nsecs: u64,
-        cached_seek_requires_safe_point: bool,
-        stream_queues: &BTreeMap<c_int, VecDeque<u64>>,
-        close_open_segment: bool,
-    ) -> Vec<(u64, u64)> {
-        Self::seekable_timeline_range_in_packet_range(
-            packets,
-            timeline_anchor_stream_index,
-            cached_seek_preroll_nsecs,
-            cached_seek_requires_safe_point,
-            stream_queues,
-            close_open_segment,
-        )
-        .into_iter()
-        .collect()
-    }
-
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_timeline_range_in_packet_range(
         packets: &HashMap<u64, CachedDemuxPacket>,
         timeline_anchor_stream_index: c_int,

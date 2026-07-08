@@ -56,6 +56,10 @@ impl DemuxPacketCacheShared {
     ) -> PreparedCacheStateEmit {
         let snapshot = guard.cache_report_snapshot(self.control.is_cache_paused());
         let buffered_changed = guard.take_buffered_changed_for_cache_end(snapshot.cache_end());
+        guard.log_seekable_range_diagnostics(
+            snapshot.seekable_ranges(),
+            usize::try_from(snapshot.demux.forward_bytes).unwrap_or(usize::MAX),
+        );
         guard.record_cache_state_emit(Instant::now());
         guard.record_emitted_seekable_ranges(snapshot.seekable_ranges().clone());
         guard.clear_cache_state_emit_dirty();
@@ -64,16 +68,6 @@ impl DemuxPacketCacheShared {
             snapshot,
             buffered_changed,
         }
-    }
-
-    #[cfg(test)]
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn prepare_cache_state_emit_after_append(
-        &self,
-        force: bool,
-    ) -> Option<CacheStateEmit> {
-        let mut timing = DemuxPacketAppendTiming::default();
-        self.prepare_cache_state_emit_after_append_with_timing(force, false, &mut timing)
-            .0
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn prepare_cache_state_emit_after_append_with_timing(
@@ -123,8 +117,12 @@ impl DemuxPacketCacheShared {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn emit_cache_state_after_read(
         &self,
         guard: &mut DemuxPacketCacheState,
-        _force: bool,
+        force: bool,
     ) {
         guard.mark_cache_state_emit_dirty();
+        if force {
+            let emit = self.prepare_cache_state_emit(guard);
+            self.send_cache_state_emit(emit.into_emit());
+        }
     }
 }
