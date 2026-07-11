@@ -1,7 +1,10 @@
 use std::{io::Read, sync::Arc, time::Duration};
 
 use super::{
-    cache::{CacheAppendPermit, CacheAppendResult, CacheRestartRequest, HttpRingCacheShared},
+    cache::{
+        CacheAppendPermit, CacheAppendResult, CacheRestartRequest, CacheRetryPermit,
+        HttpRingCacheShared,
+    },
     http::{
         content_len_from_content_range, content_len_from_response, content_range_from_headers,
         http_cache_playback_range_request_bytes, http_cache_range_header,
@@ -9,10 +12,60 @@ use super::{
     },
 };
 
+const HTTP_CACHE_MAX_RETRIES: u32 = 5;
+const HTTP_CACHE_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+const HTTP_CACHE_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+
 enum HttpDownloadOutcome {
     Eof,
     Restart(u64),
     Stopped,
+}
+
+#[derive(Debug)]
+struct HttpDownloadError {
+    offset: u64,
+    message: String,
+    retryable: bool,
+}
+
+impl HttpDownloadError {
+    fn new(offset: u64, message: String, retryable: bool) -> Self {
+        Self {
+            offset,
+            message,
+            retryable,
+        }
+    }
+}
+
+#[derive(Default)]
+struct HttpRetryState {
+    offset: Option<u64>,
+    retries: u32,
+}
+
+impl HttpRetryState {
+    fn next_delay(&mut self, offset: u64) -> Option<(u32, Duration)> {
+        if self.offset != Some(offset) {
+            self.offset = Some(offset);
+            self.retries = 0;
+        }
+        if self.retries >= HTTP_CACHE_MAX_RETRIES {
+            return None;
+        }
+        let multiplier = 1_u32.checked_shl(self.retries).unwrap_or(u32::MAX);
+        let delay = HTTP_CACHE_RETRY_BASE_DELAY
+            .saturating_mul(multiplier)
+            .min(HTTP_CACHE_RETRY_MAX_DELAY);
+        self.retries = self.retries.saturating_add(1);
+        Some((self.retries, delay))
+    }
+
+    fn reset(&mut self) {
+        self.offset = None;
+        self.retries = 0;
+    }
 }
 
 pub(super) fn http_ring_cache_download_loop(
@@ -26,24 +79,27 @@ pub(super) fn http_ring_cache_download_loop(
     {
         Ok(client) => client,
         Err(error) => {
-            shared.set_error(format!("创建 HTTP 视频缓存客户端失败：{error}"));
+            shared.set_error_at(0, format!("创建 HTTP 视频缓存客户端失败：{error}"));
             return;
         }
     };
 
     let mut offset = 0;
+    let mut retry_state = HttpRetryState::default();
     loop {
         if shared.should_stop() {
             return;
         }
         if let Some(next_offset) = shared.take_restart_offset() {
             offset = next_offset;
+            retry_state.reset();
         }
         match shared.wait_for_append_capacity(offset) {
             CacheAppendPermit::Ready(_) => {}
             CacheAppendPermit::Full => continue,
             CacheAppendPermit::Restart(next_offset) => {
                 offset = next_offset;
+                retry_state.reset();
                 continue;
             }
             CacheAppendPermit::Stopped => return,
@@ -51,6 +107,7 @@ pub(super) fn http_ring_cache_download_loop(
 
         match download_http_cache_range(&client, &url, &headers, Arc::clone(&shared), offset) {
             Ok(HttpDownloadOutcome::Eof) => {
+                retry_state.reset();
                 shared.mark_eof();
                 match shared.wait_for_restart_after_eof() {
                     Some(next_offset) => offset = next_offset,
@@ -59,6 +116,7 @@ pub(super) fn http_ring_cache_download_loop(
             }
             Ok(HttpDownloadOutcome::Restart(next_offset)) => {
                 offset = next_offset;
+                retry_state.reset();
             }
             Ok(HttpDownloadOutcome::Stopped) => return,
             Err(error) => {
@@ -67,10 +125,62 @@ pub(super) fn http_ring_cache_download_loop(
                 }
                 if let Some(next_offset) = shared.take_restart_offset() {
                     offset = next_offset;
+                    retry_state.reset();
                     continue;
                 }
-                shared.set_error(error);
-                return;
+                offset = error.offset;
+                if error.retryable
+                    && let Some((retry, delay)) = retry_state.next_delay(error.offset)
+                {
+                    tracing::warn!(
+                        offset = error.offset,
+                        retry,
+                        max_retries = HTTP_CACHE_MAX_RETRIES,
+                        retry_delay_ms = delay.as_millis(),
+                        error = %error.message,
+                        "retrying HTTP stream cache range after transient failure"
+                    );
+                    if !shared.wait_for_retry_delay(delay) {
+                        return;
+                    }
+                    continue;
+                }
+
+                let reader_offset = shared.reader_offset_now();
+                if reader_offset < error.offset {
+                    tracing::warn!(
+                        offset = error.offset,
+                        reader_offset,
+                        retryable = error.retryable,
+                        error = %error.message,
+                        "HTTP prefetch failed; deferring playback error until the reader reaches the gap"
+                    );
+                    match shared.wait_for_reader_at_or_restart(error.offset) {
+                        CacheRetryPermit::Ready if error.retryable => {
+                            retry_state.reset();
+                            continue;
+                        }
+                        CacheRetryPermit::Ready => {}
+                        CacheRetryPermit::Restart(next_offset) => {
+                            offset = next_offset;
+                            retry_state.reset();
+                            continue;
+                        }
+                        CacheRetryPermit::Stopped => return,
+                    }
+                }
+
+                shared.set_error_at(error.offset, error.message);
+                match shared.wait_for_restart_after_error(error.offset) {
+                    CacheRetryPermit::Ready => {
+                        retry_state.reset();
+                    }
+                    CacheRetryPermit::Restart(next_offset) => {
+                        offset = next_offset;
+                        retry_state.reset();
+                    }
+                    CacheRetryPermit::Stopped => return,
+                }
             }
         }
     }
@@ -87,7 +197,7 @@ pub(super) fn http_ring_cache_side_download_loop(
     {
         Ok(client) => client,
         Err(error) => {
-            shared.set_error(format!("创建 HTTP 视频缓存辅助客户端失败：{error}"));
+            tracing::warn!(%error, "creating HTTP side-cache client failed");
             return;
         }
     };
@@ -100,6 +210,7 @@ pub(super) fn http_ring_cache_side_download_loop(
             return;
         };
         let mut offset = request.offset;
+        let mut retry_state = HttpRetryState::default();
         loop {
             match download_http_side_cache_range(
                 &client,
@@ -111,6 +222,7 @@ pub(super) fn http_ring_cache_side_download_loop(
             ) {
                 Ok(HttpDownloadOutcome::Restart(next_offset)) => {
                     offset = next_offset;
+                    retry_state.reset();
                 }
                 Ok(HttpDownloadOutcome::Eof) => {
                     shared.finish_side_download(request, true);
@@ -125,9 +237,28 @@ pub(super) fn http_ring_cache_side_download_loop(
                         shared.finish_side_download(request, false);
                         return;
                     }
-                    shared.finish_side_download(request, false);
-                    shared.set_error(error);
-                    return;
+                    offset = error.offset;
+                    if error.retryable
+                        && let Some((retry, delay)) = retry_state.next_delay(error.offset)
+                    {
+                        tracing::warn!(
+                            offset = error.offset,
+                            request_offset = request.offset,
+                            range_kind = ?request.range_kind,
+                            retry,
+                            max_retries = HTTP_CACHE_MAX_RETRIES,
+                            retry_delay_ms = delay.as_millis(),
+                            error = %error.message,
+                            "retrying HTTP side-cache range after transient failure"
+                        );
+                        if !shared.wait_for_retry_delay(delay) {
+                            shared.finish_side_download(request, false);
+                            return;
+                        }
+                        continue;
+                    }
+                    shared.finish_side_download_with_error(request, error.offset, error.message);
+                    break;
                 }
             }
         }
@@ -140,7 +271,7 @@ fn download_http_cache_range(
     headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
     shared: Arc<HttpRingCacheShared>,
     mut offset: u64,
-) -> std::result::Result<HttpDownloadOutcome, String> {
+) -> std::result::Result<HttpDownloadOutcome, HttpDownloadError> {
     let known_content_len = shared.content_len_now();
     if known_content_len.is_some_and(|content_len| offset >= content_len) {
         return Ok(HttpDownloadOutcome::Eof);
@@ -169,40 +300,48 @@ fn download_http_cache_range(
         request = request.header(name, value);
     }
 
-    let mut response = match request.send() {
-        Ok(response) => response,
-        Err(error) if http_cache_request_should_retry(&error) => {
-            tracing::debug!(
-                offset,
-                range = %range,
-                %error,
-                "HTTP stream cache range request failed transiently; restarting"
-            );
-            return Ok(HttpDownloadOutcome::Restart(offset));
-        }
-        Err(error) => return Err(format!("HTTP 视频缓存请求失败：{error}")),
-    };
+    let mut response = request.send().map_err(|error| {
+        let retryable = http_cache_request_should_retry(&error);
+        HttpDownloadError::new(offset, format!("HTTP 视频缓存请求失败：{error}"), retryable)
+    })?;
     let status = response.status();
     if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
         shared.set_content_len(content_len_from_content_range(response.headers()));
         return Ok(HttpDownloadOutcome::Eof);
     }
     if offset > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(format!("HTTP 视频缓存 Range 请求失败：服务器返回 {status}"));
+        return Err(HttpDownloadError::new(
+            offset,
+            format!("HTTP 视频缓存 Range 请求失败：服务器返回 {status}"),
+            http_cache_status_should_retry(status),
+        ));
     }
     if offset == 0
         && status != reqwest::StatusCode::OK
         && status != reqwest::StatusCode::PARTIAL_CONTENT
     {
-        return Err(format!("HTTP 视频缓存请求失败：服务器返回 {status}"));
+        return Err(HttpDownloadError::new(
+            offset,
+            format!("HTTP 视频缓存请求失败：服务器返回 {status}"),
+            http_cache_status_should_retry(status),
+        ));
     }
     if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        let content_range = content_range_from_headers(response.headers())
-            .ok_or_else(|| "HTTP 视频缓存 Range 响应缺少 Content-Range".to_string())?;
+        let content_range = content_range_from_headers(response.headers()).ok_or_else(|| {
+            HttpDownloadError::new(
+                offset,
+                "HTTP 视频缓存 Range 响应缺少 Content-Range".to_string(),
+                false,
+            )
+        })?;
         if content_range.start != offset {
-            return Err(format!(
-                "HTTP 视频缓存 Range 响应偏移不匹配：请求 {offset}，返回 {}",
-                content_range.start
+            return Err(HttpDownloadError::new(
+                offset,
+                format!(
+                    "HTTP 视频缓存 Range 响应偏移不匹配：请求 {offset}，返回 {}",
+                    content_range.start
+                ),
+                false,
             ));
         }
     }
@@ -225,32 +364,32 @@ fn download_http_cache_range(
         let read_capacity = chunk.len().min(capacity);
         let read = match response.read(&mut chunk[..read_capacity]) {
             Ok(read) => read,
-            Err(error) if http_cache_read_should_restart(&error) => {
+            Err(error) => {
                 if let Some(next_offset) = shared.take_restart_offset() {
                     tracing::debug!(
                         offset,
                         next_offset,
                         range = %range,
                         %error,
-                        "HTTP stream cache read failed transiently with pending restart"
+                        "HTTP stream cache read stopped for a pending restart"
                     );
                     return Ok(HttpDownloadOutcome::Restart(next_offset));
                 }
-                tracing::debug!(
+                let retryable = http_cache_read_should_restart(&error);
+                return Err(HttpDownloadError::new(
                     offset,
-                    range = %range,
-                    %error,
-                    "HTTP stream cache read failed transiently; restarting current range"
-                );
-                return Ok(HttpDownloadOutcome::Restart(offset));
-            }
-            Err(error) => {
-                return Err(format!("读取 HTTP 视频缓存失败：{error}"));
+                    format!("读取 HTTP 视频缓存失败：{error}"),
+                    retryable,
+                ));
             }
         };
         if read == 0 {
             if content_len.is_some_and(|content_len| offset < content_len) {
-                return Ok(HttpDownloadOutcome::Restart(offset));
+                return Err(HttpDownloadError::new(
+                    offset,
+                    "HTTP 视频缓存响应在预期内容结束前提前关闭".to_string(),
+                    true,
+                ));
             }
             return Ok(HttpDownloadOutcome::Eof);
         }
@@ -273,7 +412,7 @@ fn download_http_side_cache_range(
     shared: Arc<HttpRingCacheShared>,
     request: CacheRestartRequest,
     mut offset: u64,
-) -> std::result::Result<HttpDownloadOutcome, String> {
+) -> std::result::Result<HttpDownloadOutcome, HttpDownloadError> {
     let known_content_len = shared.content_len_now();
     if known_content_len.is_some_and(|content_len| offset >= content_len) {
         return Ok(HttpDownloadOutcome::Eof);
@@ -308,42 +447,52 @@ fn download_http_side_cache_range(
         http_request = http_request.header(name, value);
     }
 
-    let mut response = match http_request.send() {
-        Ok(response) => response,
-        Err(error) if http_cache_request_should_retry(&error) => {
-            tracing::debug!(
-                offset,
-                range = %range,
-                %error,
-                "HTTP side cache range request failed transiently; restarting"
-            );
-            return Ok(HttpDownloadOutcome::Restart(offset));
-        }
-        Err(error) => return Err(format!("HTTP 视频缓存辅助请求失败：{error}")),
-    };
+    let mut response = http_request.send().map_err(|error| {
+        let retryable = http_cache_request_should_retry(&error);
+        HttpDownloadError::new(
+            offset,
+            format!("HTTP 视频缓存辅助请求失败：{error}"),
+            retryable,
+        )
+    })?;
     let status = response.status();
     if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
         shared.set_content_len(content_len_from_content_range(response.headers()));
         return Ok(HttpDownloadOutcome::Eof);
     }
     if offset > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(format!(
-            "HTTP 视频缓存辅助 Range 请求失败：服务器返回 {status}"
+        return Err(HttpDownloadError::new(
+            offset,
+            format!("HTTP 视频缓存辅助 Range 请求失败：服务器返回 {status}"),
+            http_cache_status_should_retry(status),
         ));
     }
     if offset == 0
         && status != reqwest::StatusCode::OK
         && status != reqwest::StatusCode::PARTIAL_CONTENT
     {
-        return Err(format!("HTTP 视频缓存辅助请求失败：服务器返回 {status}"));
+        return Err(HttpDownloadError::new(
+            offset,
+            format!("HTTP 视频缓存辅助请求失败：服务器返回 {status}"),
+            http_cache_status_should_retry(status),
+        ));
     }
     if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        let content_range = content_range_from_headers(response.headers())
-            .ok_or_else(|| "HTTP 视频缓存辅助 Range 响应缺少 Content-Range".to_string())?;
+        let content_range = content_range_from_headers(response.headers()).ok_or_else(|| {
+            HttpDownloadError::new(
+                offset,
+                "HTTP 视频缓存辅助 Range 响应缺少 Content-Range".to_string(),
+                false,
+            )
+        })?;
         if content_range.start != offset {
-            return Err(format!(
-                "HTTP 视频缓存辅助 Range 响应偏移不匹配：请求 {offset}，返回 {}",
-                content_range.start
+            return Err(HttpDownloadError::new(
+                offset,
+                format!(
+                    "HTTP 视频缓存辅助 Range 响应偏移不匹配：请求 {offset}，返回 {}",
+                    content_range.start
+                ),
+                false,
             ));
         }
     }
@@ -363,27 +512,26 @@ fn download_http_side_cache_range(
         let read_capacity = chunk
             .len()
             .min(usize::try_from(request_remaining).unwrap_or(usize::MAX));
-        let read = match response.read(&mut chunk[..read_capacity]) {
-            Ok(read) => read,
-            Err(error) if http_cache_read_should_restart(&error) => {
-                tracing::debug!(
+        let read = response
+            .read(&mut chunk[..read_capacity])
+            .map_err(|error| {
+                let retryable = http_cache_read_should_restart(&error);
+                HttpDownloadError::new(
                     offset,
-                    range = %range,
-                    %error,
-                    "HTTP side cache read failed transiently; restarting current side range"
-                );
-                return Ok(HttpDownloadOutcome::Restart(offset));
-            }
-            Err(error) => {
-                return Err(format!("读取 HTTP 视频缓存辅助 range 失败：{error}"));
-            }
-        };
+                    format!("读取 HTTP 视频缓存辅助 range 失败：{error}"),
+                    retryable,
+                )
+            })?;
         if read == 0 {
             if content_len.is_some_and(|content_len| offset < content_len)
                 && side_request_remaining_bytes(request, offset, content_len, range_request_bytes)
                     .is_some()
             {
-                return Ok(HttpDownloadOutcome::Restart(offset));
+                return Err(HttpDownloadError::new(
+                    offset,
+                    "HTTP 视频缓存辅助响应在预期 range 结束前提前关闭".to_string(),
+                    true,
+                ));
             }
             return Ok(HttpDownloadOutcome::Eof);
         }
@@ -422,6 +570,16 @@ fn http_cache_request_should_retry(error: &reqwest::Error) -> bool {
         || transient_http_error_message(&error.to_string())
 }
 
+fn http_cache_status_should_retry(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
 fn http_cache_read_should_restart(error: &std::io::Error) -> bool {
     http_cache_read_timed_out(error)
         || matches!(
@@ -449,7 +607,48 @@ fn transient_http_error_message(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::cache::{CacheRestartRequest, HttpCacheRangeKind};
-    use super::{side_request_remaining_bytes, transient_http_error_message};
+    use super::{
+        HTTP_CACHE_MAX_RETRIES, HttpRetryState, http_cache_status_should_retry,
+        side_request_remaining_bytes, transient_http_error_message,
+    };
+
+    #[test]
+    fn http_cache_retries_transient_gateway_statuses() {
+        for status in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(http_cache_status_should_retry(status), "status={status}");
+        }
+    }
+
+    #[test]
+    fn http_cache_does_not_retry_permanent_client_statuses() {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+        ] {
+            assert!(!http_cache_status_should_retry(status), "status={status}");
+        }
+    }
+
+    #[test]
+    fn http_cache_retry_backoff_is_bounded_and_resets_for_new_offset() {
+        let mut state = HttpRetryState::default();
+        let delays = (0..HTTP_CACHE_MAX_RETRIES)
+            .map(|_| state.next_delay(100).expect("retry remains").1.as_millis())
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays, vec![200, 400, 800, 1_600, 2_000]);
+        assert!(state.next_delay(100).is_none());
+        assert_eq!(
+            state.next_delay(200).expect("new offset resets retries").1,
+            std::time::Duration::from_millis(200)
+        );
+    }
 
     #[test]
     fn side_request_remaining_bytes_stops_at_side_range_boundary() {

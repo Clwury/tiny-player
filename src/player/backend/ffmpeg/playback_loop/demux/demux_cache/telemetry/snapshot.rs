@@ -5,7 +5,7 @@ use std::{
 
 use crate::player::backend::StreamCacheKind;
 
-use super::DemuxPacketCacheState;
+use super::{DemuxPacketCacheState, DemuxPacketTrimOutcome};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxPacketCacheReadTiming {
@@ -18,6 +18,8 @@ pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxPacketCacheRea
     pub(in crate::player::backend::ffmpeg::playback_loop) advance_reader_head: Duration,
     pub(in crate::player::backend::ffmpeg::playback_loop) refresh_reader_tracking: Duration,
     pub(in crate::player::backend::ffmpeg::playback_loop) trim: Duration,
+    pub(in crate::player::backend::ffmpeg::playback_loop) trim_outcome: DemuxPacketTrimOutcome,
+    pub(in crate::player::backend::ffmpeg::playback_loop) trim_suppressed_for_recovery: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop) forward_bytes: Duration,
     pub(in crate::player::backend::ffmpeg::playback_loop) forward_window: Duration,
     pub(in crate::player::backend::ffmpeg::playback_loop) packet_ref: Duration,

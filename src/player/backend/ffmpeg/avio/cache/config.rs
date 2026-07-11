@@ -4,12 +4,11 @@ use std::env;
 use crate::player::backend::CacheUnlinkPolicy;
 use crate::player::backend::{PlaybackCacheConfig, PlaybackCacheMode};
 
-use super::HttpCacheConfig;
 #[cfg(test)]
 use super::{
-    HTTP_CACHE_CHUNK_SIZE, HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS,
-    HTTP_CACHE_DEFAULT_READAHEAD_SECONDS, HTTP_CACHE_RANGE_REQUEST_BYTES,
+    HTTP_CACHE_CHUNK_SIZE, HTTP_CACHE_DEFAULT_READAHEAD_SECONDS, HTTP_CACHE_RANGE_REQUEST_BYTES,
 };
+use super::{HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS, HttpCacheConfig};
 
 impl HttpCacheConfig {
     pub(in crate::player::backend::ffmpeg::avio::cache) fn from_playback_config(
@@ -31,6 +30,8 @@ impl HttpCacheConfig {
             .unwrap_or(config.http_cache_range_request_bytes)
             .clamp(64 * 1024, 128 * 1024 * 1024)
             .max(u64::try_from(chunk_size).unwrap_or(u64::MAX));
+        let configured_hysteresis_seconds =
+            http_cache_hysteresis_seconds(config.demuxer_hysteresis_secs);
         Self {
             memory_capacity,
             chunk_size,
@@ -42,7 +43,7 @@ impl HttpCacheConfig {
             .max(1.0),
             hysteresis_seconds: env_f64(
                 "TINY_HTTP_CACHE_HYSTERESIS_SECS",
-                config.demuxer_hysteresis_secs,
+                configured_hysteresis_seconds,
             )
             .max(0.0),
             max_readahead_bytes: Some(
@@ -74,6 +75,14 @@ impl HttpCacheConfig {
     }
 }
 
+fn http_cache_hysteresis_seconds(configured: f64) -> f64 {
+    if configured.is_finite() && configured > 0.0 {
+        configured
+    } else {
+        HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS
+    }
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     env::var(name)
         .ok()
@@ -95,4 +104,22 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS, http_cache_hysteresis_seconds};
+
+    #[test]
+    fn http_cache_uses_default_hysteresis_when_demux_hysteresis_is_zero() {
+        assert_eq!(
+            http_cache_hysteresis_seconds(0.0),
+            HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS
+        );
+    }
+
+    #[test]
+    fn http_cache_preserves_explicit_hysteresis() {
+        assert_eq!(http_cache_hysteresis_seconds(2.5), 2.5);
+    }
 }

@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{sync::TryLockError, time::Instant};
 
 use super::{
     BackendEvent, BackendEventKind, CachedDemuxPacket, DemuxPacketCacheShared,
@@ -20,52 +20,84 @@ impl DemuxPacketCacheShared {
         let append_lock_wait = lock_wait_started_at.elapsed();
         let append_lock_hold_started_at = Instant::now();
         let session_id = guard.session_id;
-        let mut append_outcome = guard.append_packet(packet);
+        let mut append_outcome = guard.append_packet_fast(packet);
         append_outcome.timing.lock_wait = append_lock_wait;
         let refresh_cache_pause_started_at = Instant::now();
         let cache_pause_refresh = self.refresh_cache_pause_after_append(&mut guard);
+        let mut cache_pause_changed = cache_pause_refresh.force_cache_state_report;
         append_outcome.timing.refresh_cache_pause += refresh_cache_pause_started_at.elapsed();
-        let first_cache_state_report = guard.last_cache_state_emit_at.is_none();
-        let cache_state_report_due = guard.cache_state_report_due(Instant::now());
-        let seekable_window_changed =
-            append_outcome.appended && guard.seekable_range_window_changed_since_last_emit();
         if append_outcome.appended {
-            append_outcome.force_cache_state_report |=
-                cache_pause_refresh.force_cache_state_report || seekable_window_changed;
+            append_outcome.force_cache_state_report |= cache_pause_changed;
         }
-        let force_cache_state_report = append_outcome.force_cache_state_report
-            || (!append_outcome.appended && cache_pause_refresh.force_cache_state_report);
+        let mut force_cache_state_report = append_outcome.force_cache_state_report
+            || (!append_outcome.appended && cache_pause_changed);
         if append_outcome.appended || force_cache_state_report {
             guard.mark_cache_state_emit_dirty();
         }
-        let should_emit_cache_state = guard.cache_state_emit_dirty()
-            && (seekable_window_changed || first_cache_state_report || cache_state_report_due);
-        let forced_cache_state_emit = if should_emit_cache_state && seekable_window_changed {
-            let prepare_started_at = Instant::now();
-            let emit = self.prepare_cache_state_emit(&mut guard).into_emit();
-            append_outcome.timing.emit_state_prepare += prepare_started_at.elapsed();
-            Some(emit)
-        } else {
-            None
-        };
         let notify_started_at = Instant::now();
         self.ready.notify_all();
         append_outcome.timing.notify += notify_started_at.elapsed();
-        append_outcome.timing.lock_hold = append_lock_hold_started_at.elapsed();
+        append_outcome.timing.lock_hold += append_lock_hold_started_at.elapsed();
         drop(guard);
-        let emit_state_started_at = Instant::now();
-        let (cache_state_emit, cache_state_emit_deferred_for_consumer) =
-            if forced_cache_state_emit.is_some() {
-                (forced_cache_state_emit, false)
-            } else if should_emit_cache_state {
-                self.prepare_cache_state_emit_after_append_with_timing(
-                    force_cache_state_report,
-                    true,
-                    &mut append_outcome.timing,
-                )
+
+        if append_outcome.trim_requested {
+            if self.playback_recovery_critical() {
+                append_outcome.trim_deferred_for_recovery = true;
+                append_outcome.trim_deferred_for_consumer = true;
+            } else if self.consumer_priority_active() {
+                append_outcome.trim_deferred_for_consumer = true;
             } else {
-                (None, false)
-            };
+                let maintenance_lock_started_at = Instant::now();
+                match self.state.try_lock() {
+                    Ok(mut guard) => {
+                        append_outcome.timing.lock_wait += maintenance_lock_started_at.elapsed();
+                        if self.playback_recovery_critical() {
+                            append_outcome.trim_deferred_for_recovery = true;
+                            append_outcome.trim_deferred_for_consumer = true;
+                        } else if self.consumer_priority_active() {
+                            append_outcome.trim_deferred_for_consumer = true;
+                        } else {
+                            let maintenance_hold_started_at = Instant::now();
+                            let pruned = guard.complete_append_packet_trim(&mut append_outcome);
+                            if pruned {
+                                let refresh_cache_pause_started_at = Instant::now();
+                                let refresh = self.refresh_cache_pause_after_append(&mut guard);
+                                append_outcome.timing.refresh_cache_pause +=
+                                    refresh_cache_pause_started_at.elapsed();
+                                cache_pause_changed |= refresh.force_cache_state_report;
+                                append_outcome.force_cache_state_report |=
+                                    refresh.force_cache_state_report;
+                                force_cache_state_report |= refresh.force_cache_state_report;
+                                guard.mark_cache_state_emit_dirty();
+                                self.refresh_monitor_snapshot(&guard);
+                            }
+                            let notify_started_at = Instant::now();
+                            self.ready.notify_all();
+                            append_outcome.timing.notify += notify_started_at.elapsed();
+                            append_outcome.timing.lock_hold +=
+                                maintenance_hold_started_at.elapsed();
+                        }
+                    }
+                    Err(TryLockError::WouldBlock) => {
+                        append_outcome.timing.lock_wait += maintenance_lock_started_at.elapsed();
+                        append_outcome.trim_deferred_for_consumer = true;
+                    }
+                    Err(TryLockError::Poisoned(_)) => {
+                        panic!("FFmpeg demux packet cache poisoned")
+                    }
+                }
+            }
+        }
+
+        let emit_state_started_at = Instant::now();
+        let (cache_state_emit, cache_state_emit_deferred_for_consumer, force_cache_state_report) =
+            self.prepare_cache_state_emit_after_append_with_timing(
+                force_cache_state_report,
+                append_outcome.appended,
+                true,
+                &mut append_outcome.timing,
+            );
+        append_outcome.force_cache_state_report = force_cache_state_report;
         append_outcome.cache_state_emit_deferred_for_consumer =
             cache_state_emit_deferred_for_consumer;
         append_outcome.timing.emit_state += emit_state_started_at.elapsed();
@@ -79,7 +111,7 @@ impl DemuxPacketCacheShared {
             packet_stream_index,
             packet_bytes,
             append_outcome,
-            cache_pause_refresh.force_cache_state_report,
+            cache_pause_changed,
         );
     }
 

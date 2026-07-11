@@ -12,6 +12,7 @@ pub(super) const AUDIO_OUTPUT_QUEUE_LIMIT_DURATION: Duration = Duration::from_mi
 pub(super) const AUDIO_QUEUE_WAIT_LOG_AFTER: Duration = Duration::from_millis(50);
 pub(super) const AUDIO_CALLBACK_GAP_LOG_AFTER: Duration = Duration::from_millis(50);
 pub(super) const AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION: Duration = Duration::from_millis(250);
+pub(super) const AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION: Duration = Duration::from_millis(120);
 pub(super) const AUDIO_REBUFFER_DELAYED_START_MAX: Duration = Duration::from_secs(2);
 pub(super) const AUDIO_REBUFFER_PREFILL_TARGET: Duration = Duration::from_millis(500);
 pub(super) const AUDIO_REBUFFER_PREFILL_LOOP_TARGET: Duration = Duration::from_millis(750);
@@ -107,7 +108,6 @@ pub(super) const HTTP_CACHE_PROGRESS_REPORT_THRESHOLD: f64 = 0.001;
 pub(super) const HTTP_CACHE_PROBE_READ_WAIT: Duration = Duration::from_millis(250);
 #[cfg(test)]
 pub(super) const HTTP_CACHE_DEFAULT_READAHEAD_SECONDS: f64 = 120.0;
-#[cfg(test)]
 pub(super) const HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS: f64 = 10.0;
 pub(super) const FFMPEG_AVIO_BUFFER_SIZE: c_int = 1024 * 1024;
 pub(super) const FFMPEG_FAST_PROBE_SIZE: usize = 1024 * 1024;

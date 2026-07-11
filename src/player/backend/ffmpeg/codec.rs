@@ -381,6 +381,23 @@ pub(super) fn packet_is_video_seek_point(packet: &AvPacket, codec_id: ffi::AVCod
     }
 }
 
+pub(super) fn audio_codec_requires_recovery_point(codec_id: ffi::AVCodecID) -> bool {
+    matches!(
+        codec_id,
+        ffi::AVCodecID::AV_CODEC_ID_TRUEHD | ffi::AVCodecID::AV_CODEC_ID_MLP
+    )
+}
+
+pub(super) fn packet_is_audio_recovery_point(packet: &AvPacket, codec_id: ffi::AVCodecID) -> bool {
+    if !audio_codec_requires_recovery_point(codec_id) {
+        return false;
+    }
+    packet.data().is_some_and(|data| {
+        data.windows(4)
+            .any(|window| matches!(window, [0xf8, 0x72, 0x6f, 0xba] | [0xf8, 0x72, 0x6f, 0xbb]))
+    })
+}
+
 fn h264_access_unit_recovery_state(data: &[u8]) -> Option<bool> {
     access_unit_nal_recovery_state(data, |nal| {
         nal.first()
@@ -1084,8 +1101,9 @@ mod tests {
     use ffmpeg_sys_next as ffi;
 
     use super::{
-        AvPacket, packet_is_video_recovery_point, packet_is_video_seek_point,
-        video_error_recognition, vulkan_decode_codec_needs_single_thread,
+        AvPacket, audio_codec_requires_recovery_point, packet_is_audio_recovery_point,
+        packet_is_video_recovery_point, packet_is_video_seek_point, video_error_recognition,
+        vulkan_decode_codec_needs_single_thread,
     };
 
     fn packet_from_data(data: &[u8]) -> AvPacket {
@@ -1100,6 +1118,45 @@ mod tests {
         assert!(packet_is_video_recovery_point(
             &packet,
             ffi::AVCodecID::AV_CODEC_ID_H264
+        ));
+    }
+
+    #[test]
+    fn truehd_audio_recovery_point_detects_major_sync() {
+        let packet = packet_from_data(&[0x01, 0x02, 0xf8, 0x72, 0x6f, 0xba, 0x03]);
+
+        assert!(audio_codec_requires_recovery_point(
+            ffi::AVCodecID::AV_CODEC_ID_TRUEHD
+        ));
+        assert!(packet_is_audio_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_TRUEHD
+        ));
+    }
+
+    #[test]
+    fn mlp_audio_recovery_point_detects_major_sync() {
+        let packet = packet_from_data(&[0xf8, 0x72, 0x6f, 0xbb]);
+
+        assert!(audio_codec_requires_recovery_point(
+            ffi::AVCodecID::AV_CODEC_ID_MLP
+        ));
+        assert!(packet_is_audio_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_MLP
+        ));
+    }
+
+    #[test]
+    fn truehd_audio_recovery_point_rejects_non_sync_packet() {
+        let packet = packet_from_data(&[0xf8, 0x72, 0x6f, 0xb9]);
+
+        assert!(!packet_is_audio_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_TRUEHD
+        ));
+        assert!(!audio_codec_requires_recovery_point(
+            ffi::AVCodecID::AV_CODEC_ID_AAC
         ));
     }
 

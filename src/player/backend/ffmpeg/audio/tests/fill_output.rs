@@ -7,7 +7,7 @@ use crate::player::render_host::PlaybackSessionId;
 
 use super::super::super::FALLBACK_AUDIO_OUTPUT_CHANNELS;
 use super::super::{
-    AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AudioShared, FfmpegControl, duration_nsecs,
+    AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION, AudioShared, FfmpegControl, duration_nsecs,
     fill_audio_output,
 };
 
@@ -111,8 +111,12 @@ fn audio_clock_freezes_during_output_underrun_until_pending_recovers() {
     shared.set_queued_end_timeline_nsecs(2_000_000_000);
     assert_eq!(shared.played_timeline_nsecs(), frozen_timeline_nsecs);
 
+    shared.clear_underrun_if_recovered_for_test(
+        duration_nsecs(AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION) - 1,
+    );
+    assert!(shared.underrun_active_for_test());
     shared.clear_underrun_if_recovered_for_test(duration_nsecs(
-        AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
+        AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION,
     ));
     assert!(!shared.underrun_active_for_test());
     assert_ne!(shared.played_timeline_nsecs(), frozen_timeline_nsecs);

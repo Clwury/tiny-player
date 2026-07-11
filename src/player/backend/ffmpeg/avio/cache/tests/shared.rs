@@ -6,10 +6,169 @@ use crate::player::{
 };
 
 use super::super::{
-    CacheAppendPermit, FfmpegControl, HTTP_CACHE_RANGE_REQUEST_BYTES,
-    HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES, HttpCacheConfig, HttpCacheRangeKind, HttpRingCache,
-    HttpRingCacheShared, HttpRingCacheState,
+    CacheAppendPermit, CacheReadResult, CacheRestartRequest, FfmpegControl,
+    HTTP_CACHE_RANGE_REQUEST_BYTES, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES, HttpCacheConfig,
+    HttpCacheRangeKind, HttpRingCache, HttpRingCacheShared, HttpRingCacheState,
 };
+
+#[test]
+fn http_cache_read_error_does_not_poison_cached_prefix() {
+    let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(1_000));
+    assert!(state.append_at(0, b"abcdef"));
+    let cache = HttpRingCache::from_state_for_test(state);
+    cache.shared.set_error_at(6, "range failed".to_string());
+
+    let mut cached = [0; 6];
+    assert!(matches!(
+        cache.read_at_for_test(0, &mut cached),
+        CacheReadResult::Data(6)
+    ));
+    assert_eq!(&cached, b"abcdef");
+
+    let mut missing = [0; 1];
+    assert!(matches!(
+        cache.read_at_for_test(6, &mut missing),
+        CacheReadResult::Error(error) if error == "range failed"
+    ));
+}
+
+#[test]
+fn http_cache_read_error_waits_while_side_range_can_recover_gap() {
+    let cache = HttpRingCache::from_state_for_test(
+        HttpRingCacheState::new(0).with_content_len_hint(Some(1_000)),
+    );
+    cache.shared.set_error_at(500, "temporary gap".to_string());
+    let request = CacheRestartRequest {
+        offset: 500,
+        range_kind: HttpCacheRangeKind::Playback,
+    };
+    cache
+        .shared
+        .state
+        .lock()
+        .expect("state locks")
+        .side_download_active
+        .push(request);
+
+    let mut output = [0; 1];
+    assert!(matches!(
+        cache.read_cached_at(500, &mut output),
+        CacheReadResult::WouldBlock
+    ));
+}
+
+#[test]
+fn http_cache_successful_side_append_clears_matching_read_error() {
+    let cache = HttpRingCache::from_state_for_test(
+        HttpRingCacheState::new(0).with_content_len_hint(Some(1_000)),
+    );
+    cache.shared.set_error_at(500, "temporary gap".to_string());
+    let request = CacheRestartRequest {
+        offset: 500,
+        range_kind: HttpCacheRangeKind::Playback,
+    };
+    cache
+        .shared
+        .state
+        .lock()
+        .expect("state locks")
+        .side_download_active
+        .push(request);
+
+    assert!(matches!(
+        cache
+            .shared
+            .append_side_download_or_stop(request, 500, b"x"),
+        super::super::CacheAppendResult::Appended
+    ));
+    assert!(
+        cache
+            .shared
+            .state
+            .lock()
+            .expect("state locks")
+            .error
+            .is_none()
+    );
+}
+
+#[test]
+fn http_cache_tail_side_failure_does_not_set_playback_error() {
+    let (event_tx, _) = mpsc::channel();
+    let shared = HttpRingCacheShared {
+        state: Mutex::new(HttpRingCacheState::new(0).with_content_len_hint(Some(1_000))),
+        ready: Condvar::new(),
+        control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
+        event_tx,
+    };
+    let request = CacheRestartRequest {
+        offset: 900,
+        range_kind: HttpCacheRangeKind::TailMetadataProbe,
+    };
+    shared
+        .state
+        .lock()
+        .expect("state locks")
+        .side_download_active
+        .push(request);
+
+    shared.finish_side_download_with_error(request, 900, "tail failed".to_string());
+
+    assert!(shared.state.lock().expect("state locks").error.is_none());
+}
+
+#[test]
+fn http_cache_playback_side_failure_only_sets_error_for_active_reader_range() {
+    let (event_tx, _) = mpsc::channel();
+    let shared = HttpRingCacheShared {
+        state: Mutex::new(HttpRingCacheState::new(0).with_content_len_hint(Some(1_000))),
+        ready: Condvar::new(),
+        control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
+        event_tx,
+    };
+    let request = CacheRestartRequest {
+        offset: 500,
+        range_kind: HttpCacheRangeKind::Playback,
+    };
+    {
+        let mut guard = shared.state.lock().expect("state locks");
+        guard.reader_offset = 500;
+        guard.side_download_active.push(request);
+        assert!(guard.append_retained_at_protected(500, &[0; 20], request));
+    }
+
+    shared.finish_side_download_with_error(request, 520, "playback failed".to_string());
+
+    let guard = shared.state.lock().expect("state locks");
+    let error = guard.error.as_ref().expect("active reader receives error");
+    assert_eq!(error.offset, 520);
+    assert_eq!(error.message, "playback failed");
+}
+
+#[test]
+fn http_cache_playback_side_failure_ahead_of_reader_stays_background_only() {
+    let (event_tx, _) = mpsc::channel();
+    let shared = HttpRingCacheShared {
+        state: Mutex::new(HttpRingCacheState::new(0).with_content_len_hint(Some(1_000))),
+        ready: Condvar::new(),
+        control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
+        event_tx,
+    };
+    let request = CacheRestartRequest {
+        offset: 500,
+        range_kind: HttpCacheRangeKind::Playback,
+    };
+    shared
+        .state
+        .lock()
+        .expect("state locks")
+        .side_download_active
+        .push(request);
+
+    shared.finish_side_download_with_error(request, 500, "prefetch failed".to_string());
+
+    assert!(shared.state.lock().expect("state locks").error.is_none());
+}
 
 #[test]
 fn http_cache_shared_reports_idle_when_eof_reached() {

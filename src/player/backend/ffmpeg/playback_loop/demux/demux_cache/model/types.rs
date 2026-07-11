@@ -100,8 +100,62 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxP
         bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) cache_state_emit_deferred_for_consumer:
         bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) trim_requested: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) trim_deferred_for_consumer:
+        bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) trim_deferred_for_recovery:
+        bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) trim_outcome:
+        DemuxPacketTrimOutcome,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) timing:
         DemuxPacketAppendTiming,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxPacketTrimOutcome {
+    pub(in crate::player::backend::ffmpeg::playback_loop) performed: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop) steps: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop) removed_packets: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop) removed_bytes: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop) compacted_global_entries: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop) global_order_len_before: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop) global_order_len_after: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop) budget_exhausted: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop) remaining_overrun_bytes: usize,
+}
+
+impl DemuxPacketTrimOutcome {
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn merged(self, other: Self) -> Self {
+        let other_recorded = other.performed
+            || other.global_order_len_before > 0
+            || other.budget_exhausted
+            || other.remaining_overrun_bytes > 0;
+        Self {
+            performed: self.performed || other.performed,
+            steps: self.steps.saturating_add(other.steps),
+            removed_packets: self.removed_packets.saturating_add(other.removed_packets),
+            removed_bytes: self.removed_bytes.saturating_add(other.removed_bytes),
+            compacted_global_entries: self
+                .compacted_global_entries
+                .saturating_add(other.compacted_global_entries),
+            global_order_len_before: if self.global_order_len_before == 0 {
+                other.global_order_len_before
+            } else {
+                self.global_order_len_before
+            },
+            global_order_len_after: if other_recorded {
+                other.global_order_len_after
+            } else {
+                self.global_order_len_after
+            },
+            budget_exhausted: self.budget_exhausted || other.budget_exhausted,
+            remaining_overrun_bytes: if other_recorded {
+                other.remaining_overrun_bytes
+            } else {
+                self.remaining_overrun_bytes
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

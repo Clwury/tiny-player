@@ -1,5 +1,9 @@
 use std::{
-    sync::{Arc, Condvar, Mutex, atomic::AtomicU64, mpsc::Sender},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize},
+        mpsc::Sender,
+    },
     thread,
     time::Instant,
 };
@@ -49,6 +53,11 @@ impl DemuxPacketCache {
             clock_start: Instant::now(),
             demux_read_started_nanos: AtomicU64::new(0),
             last_would_block_diag_nanos: AtomicU64::new(0),
+            last_recovery_demand_diag_nanos: AtomicU64::new(0),
+            consumer_waiting_readers: AtomicUsize::new(0),
+            consumer_lock_pressure_until_nanos: AtomicU64::new(0),
+            playback_recovery_critical: AtomicBool::new(false),
+            playback_recovery_demand: AtomicU8::new(0),
         });
         shared.enter_initial_cache_pause_if_needed();
         let thread_shared = Arc::clone(&shared);

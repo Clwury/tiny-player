@@ -132,6 +132,7 @@ impl DemuxPacketCacheState {
             self.timeline_anchor_stream_index,
             cached_seek_preroll_nsecs,
             self.cached_seek_requires_safe_point,
+            self.recovery_point_stream_index(),
             DemuxPacketRangeView {
                 stream_queues: &stream_queues,
                 is_bof: seek_target.is_bof,

@@ -122,12 +122,13 @@ impl PlaybackOutputScheduler {
     }
 
     pub(in crate::player::backend::ffmpeg) fn pending_start_audio_backpressured(&self) -> bool {
-        let buffered_duration = self.pending_start_audio.buffered_duration();
         if self.playback_output_state.first_video_frame_pending()
             || self.startup_pending_audio_pressure_context_active
         {
-            return buffered_duration >= startup_pending_audio_backpressure_duration();
+            return self.pending_start_audio.contiguous_duration()
+                >= startup_pending_audio_backpressure_duration();
         }
+        let buffered_duration = self.pending_start_audio.buffered_duration();
         if self.playback_output_state == PlaybackOutputState::Playing {
             return buffered_duration >= playing_pending_audio_limit_duration();
         }
@@ -136,6 +137,45 @@ impl PlaybackOutputScheduler {
         }
         !self.playback_output_state.first_video_frame_pending()
             || !self.scheduled_video_queue.is_empty()
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn output_wait_audio_input_backpressured(&self) -> bool {
+        if !self.waiting_for_output_resume() {
+            return false;
+        }
+        let Some((start_nsecs, end_nsecs)) = self.pending_start_audio.contiguous_range_nsecs()
+        else {
+            return false;
+        };
+        if end_nsecs.saturating_sub(start_nsecs)
+            < duration_nsecs(startup_pending_audio_backpressure_duration())
+        {
+            return false;
+        }
+        let resume_reference_nsecs = if self.playback_output_state.rebuffering() {
+            self.video_output_rebuffer_anchor
+                .map(|anchor| anchor.timeline_nsecs)
+                .or_else(|| {
+                    self.scheduled_video_queue
+                        .range_nsecs()
+                        .map(|(first_video_nsecs, _)| first_video_nsecs)
+                })
+        } else {
+            self.scheduled_video_queue
+                .range_nsecs()
+                .map(|(first_video_nsecs, _)| first_video_nsecs)
+        };
+        resume_reference_nsecs.is_none_or(|resume_reference_nsecs| {
+            start_nsecs
+                <= resume_reference_nsecs
+                    .saturating_add(duration_nsecs(AUDIO_OUTPUT_VIDEO_LEAD_DURATION))
+        })
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn pending_audio_contiguous_range_nsecs(
+        &self,
+    ) -> Option<(u64, u64)> {
+        self.pending_start_audio.contiguous_range_nsecs()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -493,12 +533,17 @@ impl PlaybackOutputScheduler {
     ) -> std::result::Result<(), String> {
         if self.playback_output_state.first_video_frame_pending()
             || self.playback_output_state.rebuffering()
-            || self.pending_start_audio.is_empty()
         {
+            return Ok(());
+        }
+        if self.pending_start_audio.is_empty() {
+            self.defer_pending_start_audio_flush_once = false;
+            self.startup_pending_audio_pressure_context_active = false;
             return Ok(());
         }
         if self.defer_pending_start_audio_flush_once {
             self.defer_pending_start_audio_flush_once = false;
+            self.startup_pending_audio_pressure_context_active = false;
             return Ok(());
         }
         if recover_pending_start_audio_after_underrun(
@@ -602,8 +647,7 @@ impl PlaybackOutputScheduler {
 
     fn clear_startup_pending_audio_pressure_context_if_ready(&mut self) {
         if self.startup_pending_audio_pressure_context_active
-            && self.pending_start_audio.buffered_duration()
-                < playing_pending_audio_pressure_clear_duration()
+            && (!self.defer_pending_start_audio_flush_once || self.pending_start_audio.is_empty())
         {
             self.startup_pending_audio_pressure_context_active = false;
         }

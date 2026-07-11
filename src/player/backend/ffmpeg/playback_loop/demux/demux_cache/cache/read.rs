@@ -1,9 +1,29 @@
 use std::{
     os::raw::c_int,
-    sync::MutexGuard,
+    sync::{
+        MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
+
+struct ConsumerLockWaitRegistration<'a> {
+    waiting_readers: &'a AtomicUsize,
+}
+
+impl<'a> ConsumerLockWaitRegistration<'a> {
+    fn new(waiting_readers: &'a AtomicUsize) -> Self {
+        waiting_readers.fetch_add(1, Ordering::AcqRel);
+        Self { waiting_readers }
+    }
+}
+
+impl Drop for ConsumerLockWaitRegistration<'_> {
+    fn drop(&mut self) {
+        self.waiting_readers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 use super::{
     DEMUX_PACKET_CACHE_STALL_LOG_AFTER, DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL,
@@ -262,7 +282,13 @@ impl DemuxPacketCache {
             {
                 self.shared.emit_cache_state_after_read(&mut guard, true);
             }
-            let packet_source = match guard.take_packet_round_robin(stream_indices, &mut timing) {
+            let trim_allowed = !self.shared.playback_recovery_critical();
+            timing.trim_suppressed_for_recovery |= !trim_allowed;
+            let packet_source = match guard.take_packet_round_robin_with_trim(
+                stream_indices,
+                &mut timing,
+                trim_allowed,
+            ) {
                 Ok(packet) => packet,
                 Err(error) => return (DemuxReadResult::Error(error), None, timing),
             };
@@ -270,9 +296,11 @@ impl DemuxPacketCache {
                 guard.refresh_readahead_hysteresis();
                 self.shared
                     .refresh_monitor_snapshot_with_timing(&guard, &mut timing);
-                let seekable_changed = guard.seekable_ranges_changed_since_last_emit();
+                // mpv publishes ordinary cache growth on its 250 ms cache tick;
+                // only a contracted seekable window bypasses that cadence.
+                let (_, seekable_contracted) = guard.seekable_range_change_since_last_emit();
                 self.shared
-                    .emit_cache_state_after_read(&mut guard, seekable_changed);
+                    .emit_cache_state_after_read(&mut guard, seekable_contracted);
                 self.shared.ready.notify_all();
                 drop(guard);
                 let (packet, stream_offset) = match packet_source.packet_ref(&mut timing) {
@@ -417,15 +445,19 @@ impl DemuxPacketCache {
         DemuxPacketCacheReadTiming,
     ) {
         let started_at = Instant::now();
+        let waiting = ConsumerLockWaitRegistration::new(&self.shared.consumer_waiting_readers);
         let guard = self
             .shared
             .state
             .lock()
             .expect("FFmpeg demux packet cache poisoned");
+        let lock_wait = started_at.elapsed();
+        drop(waiting);
+        self.shared.note_consumer_lock_wait(lock_wait);
         (
             guard,
             DemuxPacketCacheReadTiming {
-                lock_wait: started_at.elapsed(),
+                lock_wait,
                 ..DemuxPacketCacheReadTiming::default()
             },
         )
@@ -457,15 +489,21 @@ impl DemuxPacketCache {
                 (guard, timing)
             }
             DemuxCacheLockWait::Bounded(lock_wait) => {
+                let waiting =
+                    ConsumerLockWaitRegistration::new(&self.shared.consumer_waiting_readers);
                 let deadline = Instant::now().checked_add(lock_wait);
                 loop {
                     if let Some(guard) = self.try_lock_state_once(&mut timing) {
                         timing.lock_wait = started_at.elapsed();
+                        drop(waiting);
+                        self.shared.note_consumer_lock_wait(timing.lock_wait);
                         return (Some(guard), timing);
                     }
                     if deadline.is_none_or(|deadline| Instant::now() >= deadline) {
                         timing.lock_wait = started_at.elapsed();
                         timing.lock_timed_out = true;
+                        drop(waiting);
+                        self.shared.note_consumer_lock_wait(timing.lock_wait);
                         return (None, timing);
                     }
                     thread::yield_now();

@@ -73,9 +73,10 @@ impl DemuxPacketCacheShared {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn prepare_cache_state_emit_after_append_with_timing(
         &self,
         force: bool,
+        appended: bool,
         defer_for_consumer: bool,
         timing: &mut DemuxPacketAppendTiming,
-    ) -> (Option<CacheStateEmit>, bool) {
+    ) -> (Option<CacheStateEmit>, bool, bool) {
         let now = Instant::now();
         let lock_started_at = Instant::now();
         let mut guard = match self.state.try_lock() {
@@ -85,33 +86,42 @@ impl DemuxPacketCacheShared {
             }
             Err(TryLockError::WouldBlock) => {
                 timing.emit_state_lock_wait += lock_started_at.elapsed();
-                return (None, false);
+                return (None, false, force);
             }
             Err(TryLockError::Poisoned(_)) => panic!("FFmpeg demux packet cache poisoned"),
         };
-        if force {
+        let (seekable_ranges_changed, seekable_window_contracted) = if appended {
+            guard.seekable_range_change_since_last_emit()
+        } else {
+            (false, false)
+        };
+        let force = force || seekable_window_contracted;
+        if appended || force {
             guard.mark_cache_state_emit_dirty();
         }
-        if !guard.cache_state_emit_ready(now) {
-            return (None, false);
-        }
         let first_report = guard.last_cache_state_emit_at.is_none();
+        let should_emit = guard.cache_state_emit_dirty()
+            && (seekable_window_contracted || first_report || guard.cache_state_report_due(now));
+        if !should_emit {
+            return (None, false, force);
+        }
         if defer_for_consumer
             && !force
             && !first_report
+            && !seekable_ranges_changed
             && guard.consumer_readable_packet_available()
         {
             tracing::trace!(
                 session_id = ?guard.session_id,
                 "deferred FFmpeg demux cache state emit while consumer-readable packets are available"
             );
-            return (None, true);
+            return (None, true, force);
         }
         let prepare_started_at = Instant::now();
         let emit = self.prepare_cache_state_emit(&mut guard);
         timing.emit_state_prepare += prepare_started_at.elapsed();
         drop(guard);
-        (Some(emit.into_emit()), false)
+        (Some(emit.into_emit()), false, force)
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn emit_cache_state_after_read(
@@ -120,7 +130,7 @@ impl DemuxPacketCacheShared {
         force: bool,
     ) {
         guard.mark_cache_state_emit_dirty();
-        if force {
+        if force || guard.cache_state_report_due(Instant::now()) {
             let emit = self.prepare_cache_state_emit(guard);
             self.send_cache_state_emit(emit.into_emit());
         }

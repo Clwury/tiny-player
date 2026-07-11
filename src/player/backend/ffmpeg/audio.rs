@@ -16,10 +16,12 @@ pub(in crate::player::backend::ffmpeg::audio) use cpal::{
 };
 pub(in crate::player::backend::ffmpeg::audio) use ffmpeg_sys_next as ffi;
 
+#[cfg(test)]
+pub(in crate::player::backend::ffmpeg::audio) use super::AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION;
 pub(in crate::player::backend::ffmpeg::audio) use super::{
     AUDIO_BUFFER_SECONDS, AUDIO_CALLBACK_GAP_LOG_AFTER, AUDIO_OUTPUT_DELAY_LIMIT,
     AUDIO_OUTPUT_QUEUE_LIMIT_DURATION, AUDIO_OUTPUT_STAGE_TIMING_LOG_AFTER,
-    AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AUDIO_QUEUE_WAIT_LOG_AFTER, FfmpegControl,
+    AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION, AUDIO_QUEUE_WAIT_LOG_AFTER, FfmpegControl,
     SCHEDULER_POLL_INTERVAL, duration_nsecs,
 };
 

@@ -8,8 +8,9 @@ use ffmpeg_sys_next as ffi;
 use super::{
     DemuxCachedRange, DemuxPacketCacheState, DemuxPacketDiskCache, DemuxSelectedStreams,
     PlaybackCacheConfig, PlaybackCacheMode, PlaybackSessionId, StreamCacheKind,
-    demux_packet_cache_hysteresis_nsecs, demux_packet_cache_readahead_nsecs,
-    demux_packet_disk_cache_enabled, seconds_to_nsecs, video_cached_seek_preroll_nsecs,
+    audio_codec_requires_recovery_point, demux_packet_cache_hysteresis_nsecs,
+    demux_packet_cache_readahead_nsecs, demux_packet_disk_cache_enabled, seconds_to_nsecs,
+    video_cached_seek_preroll_nsecs,
 };
 
 impl DemuxPacketCacheState {
@@ -49,6 +50,8 @@ impl DemuxPacketCacheState {
             reader_heads: BTreeMap::new(),
             reader_head_positions: BTreeMap::new(),
             reader_head_generations: BTreeMap::new(),
+            #[cfg(test)]
+            reader_tracking_full_refresh_count: 0,
             forward_streams: BTreeMap::new(),
             reader_forward_bytes: 0,
             read_range_id: 0,
@@ -73,6 +76,9 @@ impl DemuxPacketCacheState {
             cache_buffering_percent: None,
             cached_bytes: 0,
             append_maintenance_packets: 0,
+            append_trim_pressure_packets: 0,
+            append_trim_active: false,
+            append_trim_pending: false,
             read_trim_pressure_packets: 0,
             reader_nsecs,
             session_id,
@@ -104,8 +110,26 @@ impl DemuxPacketCacheState {
         self.stream_kinds.insert(stream_index, kind);
         let range_ids = self.ranges.keys().copied().collect::<Vec<_>>();
         for range_id in range_ids {
-            self.refresh_range_stream_seek_boundary(range_id, stream_index);
+            self.rebuild_range_stream_seek_boundaries(range_id, stream_index);
         }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn stream_requires_recovery_point(
+        &self,
+        stream_index: c_int,
+    ) -> bool {
+        self.selected_streams.audio_stream.is_some_and(|stream| {
+            stream.index == stream_index && audio_codec_requires_recovery_point(stream.codec_id)
+        })
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn recovery_point_stream_index(
+        &self,
+    ) -> Option<c_int> {
+        self.selected_streams
+            .audio_stream
+            .filter(|stream| audio_codec_requires_recovery_point(stream.codec_id))
+            .map(|stream| stream.index)
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_selected_streams(
@@ -148,6 +172,10 @@ impl DemuxPacketCacheState {
             0
         };
         self.donate_backbuffer = cache_config.demuxer_donate_buffer;
+        self.append_trim_pressure_packets = 0;
+        self.append_trim_active = false;
+        self.append_trim_pending = false;
+        self.read_trim_pressure_packets = 0;
         self.readahead_nsecs = demux_packet_cache_readahead_nsecs(&cache_config, cache_active);
         self.hysteresis_nsecs =
             demux_packet_cache_hysteresis_nsecs(&cache_config, self.readahead_nsecs);

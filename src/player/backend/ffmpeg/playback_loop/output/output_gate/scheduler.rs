@@ -7,8 +7,9 @@ use super::RebufferResumeAnchor;
 use super::{
     AUDIO_OUTPUT_QUEUE_LIMIT_DURATION, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
     AUDIO_REBUFFER_LOOP_DETECTION_WINDOW, AUDIO_REBUFFER_PREFILL_LOOP_TARGET,
-    AUDIO_REBUFFER_PREFILL_TARGET, AudioOutput, AudioOutputSnapshot, AudioResumeWaterline,
-    Duration, FfmpegControl, Instant, PendingStartAudio, PendingStartAudioPressureLevel,
+    AUDIO_REBUFFER_PREFILL_TARGET, AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN, AudioOutput,
+    AudioOutputSnapshot, AudioResumeWaterline, Duration, FfmpegControl, Instant,
+    PENDING_AUDIO_CONTINUITY_TOLERANCE, PendingStartAudio, PendingStartAudioPressureLevel,
     PlaybackOutputScheduler, PlaybackOutputState, PlaybackResumeWaterline, PlaybackSessionId,
     RebufferAudioRealignRequest, ScheduledVideoQueue,
     VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
@@ -163,6 +164,7 @@ impl PlaybackOutputScheduler {
         far_ahead_audio_timeline_nsecs: u64,
         current_start_position_nsecs: u64,
         audio_output_pending_nsecs: Option<u64>,
+        force_immediate_realign: bool,
         session_id: PlaybackSessionId,
         reason: &'static str,
     ) -> Option<RebufferAudioRealignRequest> {
@@ -192,10 +194,23 @@ impl PlaybackOutputScheduler {
             .pending_start_audio
             .buffered_until_from(target_timeline_nsecs)
             .is_some();
+        let pending_audio_near_resume_target = self
+            .pending_start_audio
+            .buffered_until_from(target_timeline_nsecs)
+            .map(|buffered_until_nsecs| {
+                let pending_forward_nsecs =
+                    buffered_until_nsecs.saturating_sub(target_timeline_nsecs);
+                let protected_target_nsecs = duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+                    .saturating_sub(duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN));
+                pending_forward_nsecs >= protected_target_nsecs
+            })
+            .unwrap_or(false);
         let audio_output_empty = audio_output_pending_nsecs == Some(0);
-        let realign_needed = audio_output_empty || !pending_audio_covers_target;
-        let bypass_drop_threshold =
-            self.rebuffer_empty_audio_output_blocked && self.playback_output_state.rebuffering();
+        let realign_needed = !pending_audio_near_resume_target
+            && (force_immediate_realign || audio_output_empty || !pending_audio_covers_target);
+        let bypass_drop_threshold = force_immediate_realign
+            || (self.rebuffer_empty_audio_output_blocked
+                && self.playback_output_state.rebuffering());
         if (!bypass_drop_threshold
             && self.rebuffer_far_ahead_audio_drop_count
                 < REBUFFER_AUDIO_REALIGN_AFTER_FAR_AHEAD_DROPS)
@@ -219,8 +234,10 @@ impl PlaybackOutputScheduler {
                     ?audio_output_pending_nsecs.map(|duration| duration as f64 / 1_000_000.0),
                 audio_output_empty,
                 pending_audio_covers_target,
+                pending_audio_near_resume_target,
                 realign_needed,
                 bypass_drop_threshold,
+                force_immediate_realign,
                 "observed FFmpeg rebuffer audio far ahead of video target"
             );
             return None;
@@ -254,79 +271,113 @@ impl PlaybackOutputScheduler {
                     ?audio_output_pending_nsecs.map(|duration| duration as f64 / 1_000_000.0),
                 audio_output_empty,
                 pending_audio_covers_target,
+                pending_audio_near_resume_target,
                 bypass_drop_threshold,
+                force_immediate_realign,
                 "requested FFmpeg rebuffer audio realign to video target"
             );
         }
         Some(request)
     }
 
-    pub(in crate::player::backend::ffmpeg) fn request_rebuffer_audio_reader_head_realign_if_needed(
+    pub(in crate::player::backend::ffmpeg) fn request_output_wait_audio_reader_head_realign_if_needed(
         &mut self,
         reader_head_start_nsecs: u64,
         audio_waterline: AudioResumeWaterline,
         current_start_position_nsecs: u64,
         session_id: PlaybackSessionId,
     ) -> Option<RebufferAudioRealignRequest> {
-        if !self.rebuffer_empty_audio_output_blocked || !self.playback_output_state.rebuffering() {
+        if !self.waiting_for_output_resume() || self.rebuffer_audio_realign_request.is_some() {
             return None;
         }
-        if self.rebuffer_audio_realign_request.is_some() || !audio_waterline.below_target() {
-            return None;
-        }
-        let far_ahead_threshold_nsecs = audio_waterline
-            .resume_timeline_nsecs
-            .saturating_add(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION));
-        if reader_head_start_nsecs <= far_ahead_threshold_nsecs {
-            return None;
-        }
-
-        let (first_video_timeline_nsecs, _) = self.scheduled_video_queue.range_nsecs()?;
-        let pending_audio_covers_resume = self
+        let (target_timeline_nsecs, anchor_timeline_nsecs, first_video_timeline_nsecs) =
+            self.rebuffer_audio_realign_target(current_start_position_nsecs)?;
+        let pending_audio_buffered_until_nsecs = self
             .pending_start_audio
-            .buffered_until_from(audio_waterline.resume_timeline_nsecs)
-            .is_some();
+            .buffered_until_from(audio_waterline.resume_timeline_nsecs);
+        let pending_audio_covers_resume = pending_audio_buffered_until_nsecs.is_some();
+        let protected_audio_target_nsecs = audio_waterline
+            .target_nsecs
+            .saturating_sub(duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN));
+        let pending_audio_near_target = pending_audio_buffered_until_nsecs
+            .map(|buffered_until_nsecs| {
+                buffered_until_nsecs.saturating_sub(audio_waterline.resume_timeline_nsecs)
+                    >= protected_audio_target_nsecs
+            })
+            .unwrap_or(false);
+        if pending_audio_near_target {
+            return None;
+        }
         let audio_output_empty = audio_waterline.audio_output_pending_nsecs == Some(0);
-        let realign_needed = audio_output_empty || !pending_audio_covers_resume;
-        if !realign_needed {
-            tracing::debug!(
-                session_id = ?session_id,
-                reason = "rebuffer_audio_reader_far_ahead",
-                reader_head_start_nsecs,
-                resume_timeline_nsecs = audio_waterline.resume_timeline_nsecs,
-                far_ahead_threshold_nsecs,
-                current_start_position_nsecs,
-                first_video_timeline_nsecs,
-                pending_audio_covers_resume,
-                audio_output_pending_ms = ?audio_waterline
-                    .audio_output_pending_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                "observed FFmpeg rebuffer audio reader far ahead but pending audio covers resume"
+        let blocked_rebuffer_recovery = self.rebuffer_empty_audio_output_blocked
+            && self.playback_output_state.rebuffering()
+            && audio_waterline.below_target()
+            && !pending_audio_near_target
+            && (audio_output_empty || !pending_audio_covers_resume);
+        let pending_contiguous_until_nsecs = self
+            .pending_start_audio
+            .contiguous_range_nsecs()
+            .filter(|(start_nsecs, _)| {
+                *start_nsecs
+                    <= audio_waterline
+                        .resume_timeline_nsecs
+                        .saturating_add(duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN))
+            })
+            .map(|(_, end_nsecs)| end_nsecs);
+        let decoded_contiguous_until_nsecs = audio_waterline
+            .decoded_audio_forward_nsecs
+            .map(|forward_nsecs| {
+                audio_waterline
+                    .resume_timeline_nsecs
+                    .saturating_add(forward_nsecs)
+            })
+            .or(pending_contiguous_until_nsecs)
+            .or(audio_waterline.audio_output_buffered_until_nsecs);
+        let in_flight_allowance_nsecs = duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)
+            .saturating_mul(
+                u64::try_from(audio_waterline.audio_decode_in_flight_packets).unwrap_or(u64::MAX),
             );
+        let proactive_reader_limit_nsecs = decoded_contiguous_until_nsecs.map(|until_nsecs| {
+            until_nsecs
+                .saturating_add(audio_waterline.audio_decode_queued_nsecs)
+                .saturating_add(in_flight_allowance_nsecs)
+                .saturating_add(duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE))
+        });
+        let blocked_rebuffer_reader_limit_nsecs = audio_waterline
+            .resume_timeline_nsecs
+            .saturating_add(
+                audio_waterline
+                    .target_nsecs
+                    .max(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)),
+            )
+            .saturating_add(duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN));
+        let (reason, reader_limit_nsecs) = if blocked_rebuffer_recovery {
+            (
+                "rebuffer_audio_reader_far_ahead",
+                blocked_rebuffer_reader_limit_nsecs,
+            )
+        } else {
+            (
+                "output_wait_audio_reader_continuity_gap",
+                proactive_reader_limit_nsecs?,
+            )
+        };
+        if reader_head_start_nsecs <= reader_limit_nsecs {
             return None;
         }
 
         let queued_video_range_nsecs = self.scheduled_video_queue.range_nsecs();
-        let queued_video_covers_resume = self
+        let queued_video_covers_target = self
             .scheduled_video_queue
-            .buffered_until_from_nsecs(audio_waterline.resume_timeline_nsecs)
+            .buffered_until_from_nsecs(target_timeline_nsecs)
             .is_some();
-        let target_timeline_nsecs = if queued_video_covers_resume {
-            audio_waterline.resume_timeline_nsecs
-        } else {
-            first_video_timeline_nsecs
-        };
-        let anchor_timeline_nsecs = self
-            .video_output_rebuffer_anchor
-            .map(|anchor| anchor.timeline_nsecs)
-            .unwrap_or(audio_waterline.resume_timeline_nsecs);
         let request = RebufferAudioRealignRequest {
             target_timeline_nsecs,
             anchor_timeline_nsecs,
             first_video_timeline_nsecs,
             far_ahead_audio_timeline_nsecs: reader_head_start_nsecs,
             far_ahead_drop_count: 0,
-            reason: "rebuffer_audio_reader_far_ahead",
+            reason,
         };
         self.rebuffer_audio_realign_request = Some(request);
         tracing::debug!(
@@ -334,7 +385,10 @@ impl PlaybackOutputScheduler {
             reason = request.reason,
             reader_head_start_nsecs,
             resume_timeline_nsecs = audio_waterline.resume_timeline_nsecs,
-            far_ahead_threshold_nsecs,
+            reader_limit_nsecs,
+            proactive_reader_limit_nsecs,
+            blocked_rebuffer_reader_limit_nsecs,
+            blocked_rebuffer_recovery,
             current_start_position_nsecs,
             target_timeline_nsecs,
             anchor_timeline_nsecs,
@@ -342,19 +396,27 @@ impl PlaybackOutputScheduler {
             queued_video_frames = self.scheduled_video_queue.len(),
             queued_video_ms = self.scheduled_video_queue.duration().as_secs_f64() * 1000.0,
             queued_video_range_nsecs = ?queued_video_range_nsecs,
-            queued_video_covers_resume,
+            queued_video_covers_target,
             pending_audio_start_nsecs = ?audio_waterline.pending_audio_start_nsecs,
             pending_audio_covers_resume,
+            pending_audio_near_target,
+            protected_audio_target_ms = protected_audio_target_nsecs as f64 / 1_000_000.0,
+            pending_contiguous_until_nsecs,
+            decoded_contiguous_until_nsecs,
             pending_audio_forward_ms = ?audio_waterline
                 .pending_audio_forward_nsecs
                 .map(|duration| duration as f64 / 1_000_000.0),
+            audio_decode_queued_ms = audio_waterline.audio_decode_queued_nsecs as f64
+                / 1_000_000.0,
+            audio_decode_in_flight_packets = audio_waterline.audio_decode_in_flight_packets,
+            in_flight_allowance_ms = in_flight_allowance_nsecs as f64 / 1_000_000.0,
             audio_output_pending_ms = ?audio_waterline
                 .audio_output_pending_nsecs
                 .map(|duration| duration as f64 / 1_000_000.0),
             demux_audio_forward_ms = ?audio_waterline
                 .demux_audio_forward_nsecs
                 .map(|duration| duration as f64 / 1_000_000.0),
-            "requested FFmpeg immediate rebuffer audio reader realign"
+            "requested FFmpeg output-wait audio reader realign before resume"
         );
         Some(request)
     }

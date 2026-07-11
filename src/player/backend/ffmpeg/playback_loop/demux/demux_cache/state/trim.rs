@@ -1,35 +1,99 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::VecDeque,
     os::raw::c_int,
+    time::{Duration, Instant},
 };
 
 use super::{
-    ArchivedStreamPruneCandidate, CachedDemuxPacket, DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT,
+    ArchivedStreamPruneCandidate, CachedDemuxPacket, DEMUX_PACKET_APPEND_MAINTENANCE_INTERVAL,
+    DEMUX_PACKET_APPEND_TRIM_INTERVAL, DEMUX_PACKET_APPEND_TRIM_MAX_OVERRUN_BYTES,
+    DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT, DEMUX_PACKET_APPEND_TRIM_TIME_BUDGET,
     DEMUX_PACKET_READ_TRIM_INTERVAL, DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_BYTES,
     DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL, DEMUX_PACKET_READ_TRIM_STEP_LIMIT,
-    DEMUX_STREAM_PACKET_QUEUE_LIMIT, DEMUX_SUBTITLE_PACKET_QUEUE_LIMIT, DemuxCachedRange,
-    DemuxPacketCacheState, PacketId, RangeId, StreamCacheKind,
+    DEMUX_PACKET_READ_TRIM_TIME_BUDGET, DEMUX_PACKET_TRIM_INLINE_GLOBAL_SCAN_LIMIT,
+    DEMUX_PACKET_TRIM_MAX_PACKETS_PER_STEP, DEMUX_STREAM_PACKET_QUEUE_LIMIT,
+    DEMUX_SUBTITLE_PACKET_QUEUE_LIMIT, DemuxCachedRange, DemuxPacketCacheState,
+    DemuxPacketTrimOutcome, PacketId, RangeId, StreamCacheKind,
 };
 
 impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn trim_after_read_needed(
         &self,
     ) -> bool {
-        self.backbuffer_limit_bytes == 0
-            || self.backward_bytes() > self.effective_backbuffer_limit()
-            || (self.memory_limit_bytes > 0 && self.cached_bytes > self.memory_limit_bytes)
+        self.backbuffer_pressure()
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn memory_pressure(
         &self,
     ) -> bool {
-        self.memory_limit_bytes > 0 && self.cached_bytes > self.memory_limit_bytes
+        // Match mpv's demuxer-max-bytes semantics: this limit applies to the
+        // forward packet window. Retained/donated backbuffer bytes are governed
+        // separately by effective_backbuffer_limit().
+        self.memory_limit_bytes > 0 && self.forward_bytes() >= self.memory_limit_bytes
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn backbuffer_pressure(
         &self,
     ) -> bool {
         self.backward_bytes() > self.effective_backbuffer_limit()
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn append_trim_due(
+        &mut self,
+        force: bool,
+    ) -> bool {
+        let overrun = self.backbuffer_overrun_bytes();
+        if overrun == 0 {
+            self.append_trim_pressure_packets = 0;
+            self.append_trim_active = false;
+            self.append_trim_pending = false;
+            return false;
+        }
+        if self.append_trim_pending {
+            return true;
+        }
+
+        self.append_trim_pressure_packets = self.append_trim_pressure_packets.saturating_add(1);
+        let interval = if self.append_trim_active {
+            DEMUX_PACKET_APPEND_MAINTENANCE_INTERVAL
+        } else {
+            DEMUX_PACKET_APPEND_TRIM_INTERVAL
+        };
+        let enter_hysteresis =
+            !self.append_trim_active && overrun >= self.append_trim_overrun_trigger_bytes();
+        if force || enter_hysteresis || self.append_trim_pressure_packets >= interval {
+            self.append_trim_pressure_packets = 0;
+            self.append_trim_active = true;
+            self.append_trim_pending = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn complete_append_trim(
+        &mut self,
+    ) {
+        self.append_trim_pending = false;
+        self.append_trim_pressure_packets = 0;
+        self.append_trim_active =
+            self.backbuffer_overrun_bytes() > self.append_trim_overrun_low_water_bytes();
+    }
+
+    fn backbuffer_overrun_bytes(&self) -> usize {
+        self.backward_bytes()
+            .saturating_sub(self.effective_backbuffer_limit())
+    }
+
+    fn append_trim_overrun_trigger_bytes(&self) -> usize {
+        let total_budget = self
+            .memory_limit_bytes
+            .saturating_add(self.backbuffer_limit_bytes);
+        (total_budget / 32).clamp(1, DEMUX_PACKET_APPEND_TRIM_MAX_OVERRUN_BYTES)
+    }
+
+    fn append_trim_overrun_low_water_bytes(&self) -> usize {
+        self.append_trim_overrun_trigger_bytes() / 4
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn read_trim_due(
@@ -40,10 +104,7 @@ impl DemuxPacketCacheState {
             return false;
         }
 
-        // Memory overrun is the steady state whenever the forward window sits
-        // at its byte cap with any backbuffer retained, so it must pace trims
-        // rather than run one on every consumer read.
-        let read_trim_interval = if self.read_trim_memory_overrun() {
+        let read_trim_interval = if self.read_trim_backbuffer_overrun() {
             DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL
         } else {
             DEMUX_PACKET_READ_TRIM_INTERVAL
@@ -57,13 +118,16 @@ impl DemuxPacketCacheState {
         }
     }
 
-    fn read_trim_memory_overrun(&self) -> bool {
-        if self.memory_limit_bytes == 0 || self.cached_bytes <= self.memory_limit_bytes {
+    fn read_trim_backbuffer_overrun(&self) -> bool {
+        let overrun = self
+            .backward_bytes()
+            .saturating_sub(self.effective_backbuffer_limit());
+        if overrun == 0 {
             return false;
         }
         let slack = (self.memory_limit_bytes / 16)
             .clamp(64 * 1024, DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_BYTES);
-        self.cached_bytes > self.memory_limit_bytes.saturating_add(slack)
+        overrun > slack
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn stream_packet_queue_limit(
@@ -110,41 +174,86 @@ impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn trim_to_limit(
         &mut self,
     ) -> bool {
-        self.trim_to_limit_with_step_limit(None)
+        self.trim_to_limit_with_budget(None, None).performed
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn trim_to_limit_for_append(
         &mut self,
     ) -> bool {
-        self.trim_to_limit_with_step_limit(Some(DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT))
+        self.trim_to_limit_for_append_with_outcome().performed
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn trim_to_limit_for_read(
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn trim_to_limit_for_append_with_outcome(
         &mut self,
-    ) -> bool {
-        self.trim_to_limit_with_step_limit(Some(DEMUX_PACKET_READ_TRIM_STEP_LIMIT))
+    ) -> DemuxPacketTrimOutcome {
+        self.trim_to_limit_with_budget(
+            Some(DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT),
+            Some(DEMUX_PACKET_APPEND_TRIM_TIME_BUDGET),
+        )
     }
 
-    fn trim_to_limit_with_step_limit(&mut self, max_steps: Option<usize>) -> bool {
-        let mut pruned = false;
-        let mut steps = 0usize;
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn trim_to_limit_for_read_with_outcome(
+        &mut self,
+    ) -> DemuxPacketTrimOutcome {
+        self.trim_to_limit_with_budget(
+            Some(DEMUX_PACKET_READ_TRIM_STEP_LIMIT),
+            Some(DEMUX_PACKET_READ_TRIM_TIME_BUDGET),
+        )
+    }
+
+    fn trim_to_limit_with_budget(
+        &mut self,
+        max_steps: Option<usize>,
+        time_budget: Option<Duration>,
+    ) -> DemuxPacketTrimOutcome {
+        let started_at = Instant::now();
+        let mut outcome = DemuxPacketTrimOutcome {
+            global_order_len_before: self.global_order_entry_count(),
+            ..DemuxPacketTrimOutcome::default()
+        };
         while self.backward_bytes() > self.effective_backbuffer_limit() {
-            if max_steps.is_some_and(|limit| steps >= limit) {
+            if max_steps.is_some_and(|limit| outcome.steps >= limit) {
                 break;
             }
-            if self.prune_oldest_backbuffer_range() {
-                pruned = true;
-                steps = steps.saturating_add(1);
-                continue;
+            if time_budget.is_some_and(|budget| started_at.elapsed() >= budget) {
+                outcome.budget_exhausted = true;
+                break;
             }
-            if self.prune_active_stream_prefix() {
-                pruned = true;
-                steps = steps.saturating_add(1);
-                continue;
+            let packets_before = self.packets.len();
+            let bytes_before = self.cached_bytes;
+            let order_entries_before = self.global_order_entry_count();
+            let pruned = self.prune_oldest_backbuffer_range() || self.prune_active_stream_prefix();
+            if !pruned {
+                break;
             }
-            break;
+            outcome.performed = true;
+            outcome.steps = outcome.steps.saturating_add(1);
+            outcome.removed_packets = outcome
+                .removed_packets
+                .saturating_add(packets_before.saturating_sub(self.packets.len()));
+            outcome.removed_bytes = outcome
+                .removed_bytes
+                .saturating_add(bytes_before.saturating_sub(self.cached_bytes));
+            outcome.compacted_global_entries = outcome.compacted_global_entries.saturating_add(
+                order_entries_before.saturating_sub(self.global_order_entry_count()),
+            );
         }
-        pruned
+        outcome.global_order_len_after = self.global_order_entry_count();
+        outcome.remaining_overrun_bytes = self.backbuffer_overrun_bytes();
+        if outcome.remaining_overrun_bytes > 0
+            && time_budget.is_some_and(|budget| started_at.elapsed() >= budget)
+        {
+            outcome.budget_exhausted = true;
+        }
+        outcome
+    }
+
+    fn global_order_entry_count(&self) -> usize {
+        self.ranges
+            .values()
+            .map(|range| range.global_order.len())
+            .fold(0usize, usize::saturating_add)
     }
 
     fn prune_active_stream_prefix(&mut self) -> bool {
@@ -152,17 +261,11 @@ impl DemuxPacketCacheState {
             return false;
         };
         let stream_index = candidate.stream_index;
-        let Some(prune_count) = self.active_stream_prefix_prune_count(stream_index) else {
-            return false;
-        };
-        if prune_count == 0 {
-            return false;
-        }
         let range_id = self.read_range_id;
         let Some(mut range) = self.ranges.remove(&range_id) else {
             return false;
         };
-        self.remove_range_stream_prefix_packets(&mut range, stream_index, prune_count);
+        self.remove_range_stream_prefix_packets(&mut range, stream_index, candidate.prune_count);
         self.ranges.insert(range_id, range);
         true
     }
@@ -177,62 +280,55 @@ impl DemuxPacketCacheState {
                     Some(*packet_id) != self.next_packet_id_for_stream(**stream_index)
                 })
             })
-            .map(|(stream_index, queue)| {
+            .filter_map(|(stream_index, queue)| {
+                let prune_count = self.active_stream_prefix_prune_count(*stream_index)?;
                 let head_packet = queue
                     .front()
                     .and_then(|packet_id| self.packets.get(packet_id));
-                let seek_start_nsecs = self.stream_queue_seek_start_nsecs(*stream_index, queue);
+                let seek_start_nsecs = self.stream_queue_seek_start_nsecs(range, *stream_index);
                 let prune_always = self.backbuffer_limit_bytes == 0
                     || seek_start_nsecs.is_none()
                     || head_packet.is_none_or(|packet| {
                         !self.packet_is_stream_seek_boundary(*stream_index, packet)
                     });
-                ArchivedStreamPruneCandidate {
+                Some(ArchivedStreamPruneCandidate {
                     stream_index: *stream_index,
                     prune_always,
                     seek_start_nsecs,
-                }
-            })
-            .collect::<Vec<_>>();
-        let candidates = candidates
-            .into_iter()
-            .filter(|candidate| {
-                self.active_stream_prefix_prune_count(candidate.stream_index)
-                    .is_some_and(|count| count > 0)
+                    prune_count,
+                })
             })
             .collect::<Vec<_>>();
         self.preferred_stream_prune_candidate(range, &candidates)
     }
 
     fn active_stream_prefix_prune_count(&self, stream_index: c_int) -> Option<usize> {
-        let queue = self.read_range().stream_queues.get(&stream_index)?;
+        let range = self.read_range();
+        let queue = range.stream_queues.get(&stream_index)?;
         let reader_head = self.next_packet_id_for_stream(stream_index);
-        let boundaries = queue
-            .iter()
-            .take_while(|packet_id| Some(**packet_id) != reader_head)
-            .map(|packet_id| {
-                self.packets
-                    .get(packet_id)
-                    .is_some_and(|packet| self.packet_is_stream_seek_boundary(stream_index, packet))
-            })
+        let prefix_len = reader_head
+            .map(|packet_id| packet_id_lower_bound(queue, packet_id))
+            .unwrap_or(queue.len());
+        let boundary_ids = self
+            .stream_seek_boundary_ids(range, stream_index)
+            .take_while(|packet_id| reader_head.is_none_or(|head| *packet_id < head))
+            .take(2)
             .collect::<Vec<_>>();
-        let prune_count = stream_prefix_prune_count_from_boundaries(
-            boundaries.iter().copied(),
+        let prune_count = indexed_stream_prefix_prune_count(
+            queue,
+            prefix_len,
+            &boundary_ids,
             self.backbuffer_limit_bytes > 0,
+            true,
         )?;
-        let prune_count =
-            self.limit_eager_side_stream_prune_count(self.read_range(), stream_index, prune_count)?;
-
-        if self.backbuffer_limit_bytes > 0
-            && reader_head.is_some()
-            && let Some(last_boundary_index) =
-                boundaries.iter().rposition(|is_boundary| *is_boundary)
-            && prune_count > last_boundary_index
-        {
-            return (last_boundary_index > 0).then_some(last_boundary_index);
-        }
-
-        Some(prune_count)
+        let prune_count = self.bounded_stream_prefix_prune_count(
+            range,
+            stream_index,
+            prune_count,
+            prefix_len,
+            true,
+        );
+        self.limit_eager_side_stream_prune_count(range, stream_index, prune_count)
     }
 
     fn prune_oldest_backbuffer_range(&mut self) -> bool {
@@ -266,16 +362,7 @@ impl DemuxPacketCacheState {
             return false;
         };
         let stream_index = candidate.stream_index;
-        let Some(prune_count) = self.archived_stream_prefix_prune_count(&range, stream_index)
-        else {
-            self.ranges.insert(range_id, range);
-            return false;
-        };
-        if prune_count == 0 {
-            self.ranges.insert(range_id, range);
-            return false;
-        }
-        self.remove_range_stream_prefix_packets(&mut range, stream_index, prune_count);
+        self.remove_range_stream_prefix_packets(&mut range, stream_index, candidate.prune_count);
         if range.global_order.is_empty() {
             return true;
         }
@@ -291,10 +378,11 @@ impl DemuxPacketCacheState {
             .stream_queues
             .iter()
             .filter_map(|(stream_index, queue)| {
+                let prune_count = self.archived_stream_prefix_prune_count(range, *stream_index)?;
                 let head_packet = queue
                     .front()
                     .and_then(|packet_id| self.packets.get(packet_id));
-                let seek_start_nsecs = self.stream_queue_seek_start_nsecs(*stream_index, queue);
+                let seek_start_nsecs = self.stream_queue_seek_start_nsecs(range, *stream_index);
                 let prune_always = self.backbuffer_limit_bytes == 0
                     || seek_start_nsecs.is_none()
                     || head_packet.is_none_or(|packet| {
@@ -307,14 +395,8 @@ impl DemuxPacketCacheState {
                     stream_index: *stream_index,
                     prune_always,
                     seek_start_nsecs,
+                    prune_count,
                 })
-            })
-            .collect::<Vec<_>>();
-        let candidates = candidates
-            .into_iter()
-            .filter(|candidate| {
-                self.archived_stream_prefix_prune_count(range, candidate.stream_index)
-                    .is_some_and(|count| count > 0)
             })
             .collect::<Vec<_>>();
         self.preferred_stream_prune_candidate(range, &candidates)
@@ -322,24 +404,22 @@ impl DemuxPacketCacheState {
 
     fn stream_queue_seek_start_nsecs(
         &self,
+        range: &DemuxCachedRange,
         stream_index: c_int,
-        queue: &VecDeque<PacketId>,
     ) -> Option<u64> {
-        if stream_index == self.timeline_anchor_stream_index {
-            return queue.iter().find_map(|packet_id| {
-                let packet = self.packets.get(packet_id)?;
+        self.stream_seek_boundary_ids(range, stream_index)
+            .find_map(|packet_id| {
+                let packet = self.packets.get(&packet_id)?;
                 let start_nsecs = packet.start_nsecs?;
-                self.packet_is_stream_seek_boundary(stream_index, packet)
-                    .then(|| start_nsecs.saturating_add(self.cached_seek_preroll_nsecs))
-            });
-        }
-
-        queue.iter().find_map(|packet_id| {
-            let packet = self.packets.get(packet_id)?;
-            let start_nsecs = packet.start_nsecs?;
-            let end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
-            (end_nsecs >= start_nsecs).then_some(start_nsecs)
-        })
+                let end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
+                (end_nsecs >= start_nsecs).then(|| {
+                    if stream_index == self.timeline_anchor_stream_index {
+                        start_nsecs.saturating_add(self.cached_seek_preroll_nsecs)
+                    } else {
+                        start_nsecs
+                    }
+                })
+            })
     }
 
     fn archived_stream_prefix_prune_count(
@@ -348,14 +428,52 @@ impl DemuxPacketCacheState {
         stream_index: c_int,
     ) -> Option<usize> {
         let queue = range.stream_queues.get(&stream_index)?;
-        let boundaries = queue.iter().map(|packet_id| {
-            self.packets
-                .get(packet_id)
-                .is_some_and(|packet| self.packet_is_stream_seek_boundary(stream_index, packet))
-        });
-        let prune_count =
-            stream_prefix_prune_count_from_boundaries(boundaries, self.backbuffer_limit_bytes > 0)?;
+        let boundary_ids = self
+            .stream_seek_boundary_ids(range, stream_index)
+            .take(2)
+            .collect::<Vec<_>>();
+        let prune_count = indexed_stream_prefix_prune_count(
+            queue,
+            queue.len(),
+            &boundary_ids,
+            self.backbuffer_limit_bytes > 0,
+            false,
+        )?;
+        let prune_count = self.bounded_stream_prefix_prune_count(
+            range,
+            stream_index,
+            prune_count,
+            queue.len(),
+            false,
+        );
         self.limit_eager_side_stream_prune_count(range, stream_index, prune_count)
+    }
+
+    fn stream_seek_boundary_ids<'a>(
+        &'a self,
+        range: &'a DemuxCachedRange,
+        stream_index: c_int,
+    ) -> impl Iterator<Item = PacketId> + 'a {
+        let queue_start = range
+            .stream_queues
+            .get(&stream_index)
+            .and_then(|queue| queue.front())
+            .copied();
+        let queue_end = range
+            .stream_queues
+            .get(&stream_index)
+            .and_then(|queue| queue.back())
+            .copied();
+        range
+            .stream_seek_boundaries
+            .get(&stream_index)
+            .into_iter()
+            .flat_map(|boundaries| boundaries.iter().copied())
+            .filter(move |packet_id| {
+                queue_start.is_some_and(|start| *packet_id >= start)
+                    && queue_end.is_some_and(|end| *packet_id <= end)
+                    && self.packet_readable_in_current_generation(*packet_id)
+            })
     }
 
     fn preferred_stream_prune_candidate(
@@ -456,6 +574,22 @@ impl DemuxPacketCacheState {
             .stream_boundary(self.timeline_anchor_stream_index)
             .seek_start_nsecs?;
         let queue = range.stream_queues.get(&stream_index)?;
+        if self.stream_requires_recovery_point(stream_index) {
+            // Never let side-stream alignment move a TrueHD/MLP trim point off
+            // the major-sync index chosen by the mpv-style boundary scan.
+            return self
+                .stream_seek_boundary_ids(range, stream_index)
+                .map(|packet_id| packet_id_lower_bound(queue, packet_id))
+                .filter(|position| *position > 0 && *position <= prune_count)
+                .filter(|position| {
+                    queue
+                        .get(*position)
+                        .and_then(|packet_id| self.packets.get(packet_id))
+                        .and_then(|packet| packet.start_nsecs)
+                        .is_some_and(|next_start| next_start <= anchor_seek_start)
+                })
+                .last();
+        }
         for count in (1..=prune_count).rev() {
             let Some(next_packet_id) = queue.get(count) else {
                 continue;
@@ -474,7 +608,40 @@ impl DemuxPacketCacheState {
         None
     }
 
-    fn packet_is_stream_seek_boundary(
+    fn bounded_stream_prefix_prune_count(
+        &self,
+        range: &DemuxCachedRange,
+        stream_index: c_int,
+        prune_count: usize,
+        maximum_prune_count: usize,
+        preserve_last_boundary: bool,
+    ) -> usize {
+        if self.stream_requires_recovery_point(stream_index) {
+            // A recovery block is atomic for seekability, like mpv's keyframe run.
+            return prune_count;
+        }
+        if range.global_order.len() <= DEMUX_PACKET_TRIM_INLINE_GLOBAL_SCAN_LIMIT {
+            return prune_count;
+        }
+        let Some(queue) = range.stream_queues.get(&stream_index) else {
+            return prune_count;
+        };
+        let maximum_prune_count = maximum_prune_count.min(queue.len());
+        let bounded_limit = maximum_prune_count.min(DEMUX_PACKET_TRIM_MAX_PACKETS_PER_STEP);
+        let bounded_boundary = self
+            .stream_seek_boundary_ids(range, stream_index)
+            .map(|packet_id| packet_id_lower_bound(queue, packet_id))
+            .take_while(|position| *position <= bounded_limit)
+            .filter(|position| *position > 0 && *position <= maximum_prune_count)
+            .last();
+        match bounded_boundary {
+            Some(position) => position.max(prune_count.min(bounded_limit)),
+            None if preserve_last_boundary => prune_count,
+            None => prune_count.min(DEMUX_PACKET_TRIM_MAX_PACKETS_PER_STEP),
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn packet_is_stream_seek_boundary(
         &self,
         stream_index: c_int,
         packet: &CachedDemuxPacket,
@@ -484,6 +651,7 @@ impl DemuxPacketCacheState {
             stream_index,
             packet,
             self.cached_seek_requires_safe_point,
+            self.stream_requires_recovery_point(stream_index),
         )
     }
 
@@ -492,6 +660,7 @@ impl DemuxPacketCacheState {
         stream_index: c_int,
         packet: &CachedDemuxPacket,
         require_safe_seek_point: bool,
+        require_recovery_point: bool,
     ) -> bool {
         if stream_index == timeline_anchor_stream_index {
             let seek_boundary = if require_safe_seek_point {
@@ -501,7 +670,40 @@ impl DemuxPacketCacheState {
             };
             return packet.timeline_anchor && seek_boundary && packet.start_nsecs.is_some();
         }
+        if require_recovery_point {
+            return packet.recovery_point && packet.start_nsecs.is_some();
+        }
         packet.start_nsecs.is_some()
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn rebuild_range_stream_seek_boundaries(
+        &mut self,
+        range_id: super::RangeId,
+        stream_index: c_int,
+    ) {
+        let Some(mut range) = self.ranges.remove(&range_id) else {
+            return;
+        };
+        let boundaries = range
+            .stream_queues
+            .get(&stream_index)
+            .into_iter()
+            .flat_map(|queue| queue.iter().copied())
+            .filter(|packet_id| {
+                self.packets
+                    .get(packet_id)
+                    .is_some_and(|packet| self.packet_is_stream_seek_boundary(stream_index, packet))
+            })
+            .collect::<VecDeque<_>>();
+        if boundaries.is_empty() {
+            range.stream_seek_boundaries.remove(&stream_index);
+        } else {
+            range
+                .stream_seek_boundaries
+                .insert(stream_index, boundaries);
+        }
+        self.refresh_range_stream_seek_boundary_in_range(&mut range, stream_index);
+        self.ranges.insert(range_id, range);
     }
 
     fn remove_range_stream_prefix_packets(
@@ -524,6 +726,19 @@ impl DemuxPacketCacheState {
         };
         if removed.is_empty() {
             return;
+        }
+        if let Some(last_removed_packet_id) = removed.last().copied()
+            && let Some(boundaries) = range.stream_seek_boundaries.get_mut(&stream_index)
+        {
+            while boundaries
+                .front()
+                .is_some_and(|packet_id| *packet_id <= last_removed_packet_id)
+            {
+                boundaries.pop_front();
+            }
+            if boundaries.is_empty() {
+                range.stream_seek_boundaries.remove(&stream_index);
+            }
         }
         range.mark_seekable_dirty();
         let pruned_until_nsecs = removed
@@ -551,16 +766,6 @@ impl DemuxPacketCacheState {
                 );
             }
         }
-        let removed_packet_ids = removed.iter().copied().collect::<HashSet<_>>();
-        if range.id == self.read_range_id {
-            self.adjust_reader_head_positions_after_prune(range, &removed_packet_ids);
-        }
-        range
-            .global_order
-            .retain(|packet_id| !removed_packet_ids.contains(packet_id));
-        if range.id == self.read_range_id && range.global_order.is_empty() {
-            self.clear_reader_tracking();
-        }
         for packet_id in removed {
             self.consumed_packet_ids.remove(&packet_id);
             self.low_level_append_blocked_packet_generations
@@ -570,35 +775,55 @@ impl DemuxPacketCacheState {
                 range.subtract_report_bytes(packet.byte_len);
             }
         }
-        self.refresh_range_stream_seek_boundary_in_range(range, stream_index);
+        if range.global_order.len() <= DEMUX_PACKET_TRIM_INLINE_GLOBAL_SCAN_LIMIT {
+            if range.id == self.read_range_id {
+                self.adjust_reader_head_positions_before_inline_compaction(range);
+            }
+            range
+                .global_order
+                .retain(|packet_id| self.packets.contains_key(packet_id));
+        }
+        self.compact_range_global_order_front(range);
+        if range.id == self.read_range_id && range.global_order.is_empty() {
+            self.clear_reader_tracking();
+        }
+        self.refresh_range_stream_seek_boundary_after_prefix_prune(range, stream_index);
     }
 
-    fn adjust_reader_head_positions_after_prune(
-        &mut self,
-        range: &DemuxCachedRange,
-        removed_packet_ids: &HashSet<PacketId>,
-    ) {
-        if removed_packet_ids.is_empty() || self.reader_head_positions.is_empty() {
+    fn adjust_reader_head_positions_before_inline_compaction(&mut self, range: &DemuxCachedRange) {
+        if self.reader_head_positions.is_empty() {
             return;
         }
-
         let reader_head_positions = self.reader_head_positions.clone();
-        let mut removed_before_head = BTreeMap::new();
-        for (position, packet_id) in range.global_order.iter().copied().enumerate() {
-            if !removed_packet_ids.contains(&packet_id) {
-                continue;
-            }
-            for (stream_index, head_position) in &reader_head_positions {
-                if position < *head_position {
-                    *removed_before_head.entry(*stream_index).or_insert(0usize) += 1;
-                }
-            }
-        }
-
-        for (stream_index, removed_before) in removed_before_head {
+        for (stream_index, head_position) in reader_head_positions {
+            let removed_before = range
+                .global_order
+                .iter()
+                .take(head_position)
+                .filter(|packet_id| !self.packets.contains_key(packet_id))
+                .count();
             if let Some(position) = self.reader_head_positions.get_mut(&stream_index) {
                 *position = position.saturating_sub(removed_before);
             }
+        }
+        self.refresh_read_index_from_reader_head_positions();
+    }
+
+    fn compact_range_global_order_front(&mut self, range: &mut DemuxCachedRange) {
+        let mut compacted = 0usize;
+        while range
+            .global_order
+            .front()
+            .is_some_and(|packet_id| !self.packets.contains_key(packet_id))
+        {
+            range.global_order.pop_front();
+            compacted = compacted.saturating_add(1);
+        }
+        if compacted == 0 || range.id != self.read_range_id {
+            return;
+        }
+        for position in self.reader_head_positions.values_mut() {
+            *position = position.saturating_sub(compacted);
         }
         self.refresh_read_index_from_reader_head_positions();
     }
@@ -630,27 +855,57 @@ impl DemuxPacketCacheState {
     }
 }
 
-fn stream_prefix_prune_count_from_boundaries<I>(
-    boundaries: I,
-    seekable_cache: bool,
-) -> Option<usize>
-where
-    I: IntoIterator<Item = bool>,
-{
-    let mut boundaries = boundaries.into_iter();
-    let first_is_boundary = boundaries.next()?;
-    let starts_with_non_boundary = !first_is_boundary;
-    let mut boundary_was_pruned = false;
-    let mut prune_count = 0;
-
-    for is_boundary in std::iter::once(first_is_boundary).chain(boundaries) {
-        if is_boundary {
-            if seekable_cache && (boundary_was_pruned || starts_with_non_boundary) {
-                break;
-            }
-            boundary_was_pruned = true;
+fn packet_id_lower_bound(queue: &VecDeque<PacketId>, packet_id: PacketId) -> usize {
+    let mut left = 0usize;
+    let mut right = queue.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        if queue
+            .get(middle)
+            .is_some_and(|candidate| *candidate < packet_id)
+        {
+            left = middle.saturating_add(1);
+        } else {
+            right = middle;
         }
-        prune_count += 1;
+    }
+    left
+}
+
+fn indexed_stream_prefix_prune_count(
+    queue: &VecDeque<PacketId>,
+    prefix_len: usize,
+    boundary_ids: &[PacketId],
+    seekable_cache: bool,
+    preserve_last_boundary: bool,
+) -> Option<usize> {
+    let prefix_len = prefix_len.min(queue.len());
+    if prefix_len == 0 {
+        return None;
+    }
+    if !seekable_cache {
+        return Some(prefix_len);
+    }
+
+    let boundary_positions = boundary_ids
+        .iter()
+        .copied()
+        .map(|packet_id| packet_id_lower_bound(queue, packet_id))
+        .filter(|position| *position < prefix_len)
+        .collect::<Vec<_>>();
+    let starts_with_boundary = boundary_positions.first().copied() == Some(0);
+    let retained_boundary_position = if starts_with_boundary {
+        boundary_positions.get(1).copied()
+    } else {
+        boundary_positions.first().copied()
+    };
+    let mut prune_count = retained_boundary_position.unwrap_or(prefix_len);
+
+    if preserve_last_boundary
+        && let Some(last_boundary_position) = boundary_positions.last().copied()
+        && prune_count > last_boundary_position
+    {
+        prune_count = last_boundary_position;
     }
 
     (prune_count > 0).then_some(prune_count)
@@ -658,12 +913,20 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::stream_prefix_prune_count_from_boundaries;
+    use std::collections::VecDeque;
+
+    use super::indexed_stream_prefix_prune_count;
 
     #[test]
     fn seekable_prefix_prune_count_keeps_next_seek_boundary() {
         assert_eq!(
-            stream_prefix_prune_count_from_boundaries([true, false, true, false], true),
+            indexed_stream_prefix_prune_count(
+                &VecDeque::from([10, 20, 30, 40]),
+                4,
+                &[10, 30],
+                true,
+                false,
+            ),
             Some(2)
         );
     }
@@ -671,19 +934,45 @@ mod tests {
     #[test]
     fn seekable_prefix_prune_count_stops_before_first_boundary_after_delta_head() {
         assert_eq!(
-            stream_prefix_prune_count_from_boundaries([false, false, true, false], true),
+            indexed_stream_prefix_prune_count(
+                &VecDeque::from([10, 20, 30, 40]),
+                4,
+                &[30],
+                true,
+                false,
+            ),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn active_prefix_prune_count_preserves_only_covering_boundary() {
+        assert_eq!(
+            indexed_stream_prefix_prune_count(
+                &VecDeque::from([10, 20, 30, 40]),
+                4,
+                &[10],
+                true,
+                true,
+            ),
+            None
         );
     }
 
     #[test]
     fn non_seekable_prefix_prune_count_prunes_all_available_packets() {
         assert_eq!(
-            stream_prefix_prune_count_from_boundaries([false, true, false, true], false),
+            indexed_stream_prefix_prune_count(
+                &VecDeque::from([10, 20, 30, 40]),
+                4,
+                &[20, 40],
+                false,
+                false,
+            ),
             Some(4)
         );
         assert_eq!(
-            stream_prefix_prune_count_from_boundaries(std::iter::empty(), false),
+            indexed_stream_prefix_prune_count(&VecDeque::new(), 0, &[], false, false,),
             None
         );
     }

@@ -12,6 +12,8 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxC
         VecDeque<PacketId>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_queues:
         BTreeMap<c_int, VecDeque<PacketId>>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_seek_boundaries:
+        BTreeMap<c_int, VecDeque<PacketId>>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_boundaries:
         BTreeMap<c_int, StreamRangeBoundary>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) report_stats:
@@ -31,6 +33,7 @@ impl DemuxCachedRange {
             id,
             global_order: VecDeque::new(),
             stream_queues: BTreeMap::new(),
+            stream_seek_boundaries: BTreeMap::new(),
             stream_boundaries: BTreeMap::new(),
             report_stats: RefCell::new(RangeReportStats::default()),
             is_bof,
@@ -165,6 +168,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct Archiv
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) prune_always: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) seek_start_nsecs:
         Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) prune_count: usize,
 }
 
 #[derive(Clone, Debug)]

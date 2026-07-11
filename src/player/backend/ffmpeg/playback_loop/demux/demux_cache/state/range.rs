@@ -76,6 +76,7 @@ impl DemuxPacketCacheState {
             .global_order
             .iter()
             .copied()
+            .filter(|packet_id| self.packets.contains_key(packet_id))
             .filter(|packet_id| {
                 self.low_level_append_blocked_packet_generations
                     .get(packet_id)

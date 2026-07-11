@@ -117,6 +117,18 @@ impl PendingStartAudio {
         self.frames.front().map(|frame| frame.start_timeline_nsecs)
     }
 
+    pub(in crate::player::backend::ffmpeg) fn contiguous_range_nsecs(&self) -> Option<(u64, u64)> {
+        let start_timeline_nsecs = self.first_start_timeline_nsecs()?;
+        let end_timeline_nsecs = self.buffered_until_from(start_timeline_nsecs)?;
+        Some((start_timeline_nsecs, end_timeline_nsecs))
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn contiguous_duration(&self) -> Duration {
+        self.contiguous_range_nsecs()
+            .map(|(start, end)| Duration::from_nanos(end.saturating_sub(start)))
+            .unwrap_or_default()
+    }
+
     pub(in crate::player::backend::ffmpeg) fn first_start_at_or_after(
         &self,
         timeline_nsecs: u64,
@@ -207,5 +219,41 @@ impl PendingStartAudio {
     #[cfg(test)]
     pub(in crate::player::backend::ffmpeg) fn queued_samples(&self) -> usize {
         self.buffered_samples
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecodedAudio, PendingStartAudio};
+
+    fn decoded_audio(duration_nsecs: u64) -> DecodedAudio {
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs,
+        }
+    }
+
+    #[test]
+    fn contiguous_duration_stops_at_first_real_gap() {
+        let mut pending = PendingStartAudio::default();
+        pending.push(decoded_audio(20_000_000), 1_000_000_000, 1_020_000_000);
+        pending.push(decoded_audio(20_000_000), 1_020_000_000, 1_040_000_000);
+        pending.push(decoded_audio(20_000_000), 1_100_000_000, 1_120_000_000);
+
+        assert_eq!(
+            pending.contiguous_range_nsecs(),
+            Some((1_000_000_000, 1_040_000_000))
+        );
+        assert_eq!(pending.contiguous_duration().as_nanos(), 40_000_000);
+        assert_eq!(pending.buffered_duration().as_nanos(), 60_000_000);
+    }
+
+    #[test]
+    fn contiguous_duration_allows_small_timestamp_jitter() {
+        let mut pending = PendingStartAudio::default();
+        pending.push(decoded_audio(20_000_000), 1_000_000_000, 1_020_000_000);
+        pending.push(decoded_audio(20_000_000), 1_024_000_000, 1_044_000_000);
+
+        assert_eq!(pending.contiguous_duration().as_nanos(), 44_000_000);
     }
 }

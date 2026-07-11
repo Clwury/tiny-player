@@ -2,7 +2,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::{
     DEMUX_PACKET_APPEND_TIMING_LOG_AFTER, DemuxPacketCacheState, nsecs_to_seconds,
 };
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::{
-    DemuxPacketAppendOutcome, DemuxPacketAppendTiming,
+    DemuxPacketAppendOutcome, DemuxPacketAppendTiming, DemuxPacketTrimOutcome,
 };
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) mod types {

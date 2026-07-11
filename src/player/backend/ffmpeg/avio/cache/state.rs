@@ -7,9 +7,9 @@ use super::HTTP_RING_CACHE_CAPACITY;
 pub(in crate::player::backend::ffmpeg::avio::cache) use super::{
     ByteRingBuffer, CacheRestartRequest, HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR,
     HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
-    HttpCacheConfig, HttpCacheRangeKind, HttpDiskCache, HttpPlaybackBufferRange,
-    HttpRingCacheState, InputRateSample, RetainedCacheRange, RetainedPlaybackSpliceSource,
-    http_stream_cache_status_changed,
+    HttpCacheConfig, HttpCacheRangeKind, HttpCacheReadError, HttpDiskCache,
+    HttpPlaybackBufferRange, HttpRingCacheState, InputRateSample, RetainedCacheRange,
+    RetainedPlaybackSpliceSource, http_stream_cache_status_changed,
 };
 
 pub(in crate::player::backend::ffmpeg::avio::cache) use progress::{

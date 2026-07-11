@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     os::raw::c_int,
     time::Instant,
 };
@@ -8,7 +8,7 @@ use super::{
     DEMUX_CACHE_LOCK_TIMING_LOG_AFTER, DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT,
     DemuxPacketCacheReadTiming, DemuxPacketCacheState, DemuxPacketQueueSnapshot,
     DemuxPacketReadSource, DemuxStreamPacketQueueSnapshot, DemuxStreamReaderRealignResult,
-    PacketId, StreamCacheKind,
+    PacketId, StreamCacheKind, audio_codec_requires_recovery_point,
 };
 
 const CACHE_STATE_EMIT_CONSUMER_YIELD_PACKET_THRESHOLD: usize = 1024;
@@ -31,10 +31,20 @@ impl DemuxPacketCacheState {
             .and_then(|packet| packet.end_nsecs)
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn take_packet_round_robin(
         &mut self,
         stream_indices: &[c_int],
         timing: &mut DemuxPacketCacheReadTiming,
+    ) -> std::result::Result<Option<DemuxPacketReadSource>, String> {
+        self.take_packet_round_robin_with_trim(stream_indices, timing, true)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn take_packet_round_robin_with_trim(
+        &mut self,
+        stream_indices: &[c_int],
+        timing: &mut DemuxPacketCacheReadTiming,
+        trim_allowed: bool,
     ) -> std::result::Result<Option<DemuxPacketReadSource>, String> {
         let started_at = Instant::now();
         for (stream_offset, stream_index) in stream_indices.iter().copied().enumerate() {
@@ -47,7 +57,7 @@ impl DemuxPacketCacheState {
             {
                 self.reader_nsecs = self.reader_nsecs.max(end_nsecs);
             }
-            self.consume_packet_id(packet_id, timing);
+            self.consume_packet_id_with_trim(packet_id, timing, trim_allowed);
             timing.take_packet += started_at.elapsed();
             return Ok(Some(packet));
         }
@@ -87,28 +97,52 @@ impl DemuxPacketCacheState {
         reason: &'static str,
     ) -> Option<DemuxStreamReaderRealignResult> {
         let old_head = self.stream_reader_head_timeline(stream_index);
-        let queue = self.read_range().stream_queues.get(&stream_index)?;
-        let mut selected = None;
-        for packet_id in queue {
-            if !self.packet_readable_in_current_generation(*packet_id) {
-                continue;
-            }
-            let Some(packet) = self.packets.get(packet_id) else {
-                continue;
-            };
-            let Some(start_nsecs) = packet.start_nsecs else {
-                continue;
-            };
-            if start_nsecs > target_timeline_nsecs && selected.is_some() {
-                break;
-            }
-            if start_nsecs <= target_timeline_nsecs {
-                selected = Some((*packet_id, start_nsecs, packet.end_nsecs));
-            }
+        let requires_recovery_point = self
+            .selected_streams
+            .audio_stream
+            .filter(|stream| stream.index == stream_index)
+            .is_some_and(|stream| audio_codec_requires_recovery_point(stream.codec_id));
+        let selected = if requires_recovery_point {
+            self.latest_stream_packet_at_or_before(
+                self.read_range()
+                    .stream_seek_boundaries
+                    .get(&stream_index)
+                    .into_iter()
+                    .flat_map(|boundaries| boundaries.iter().copied()),
+                target_timeline_nsecs,
+                true,
+            )
+        } else {
+            self.latest_stream_packet_at_or_before(
+                self.read_range()
+                    .stream_queues
+                    .get(&stream_index)?
+                    .iter()
+                    .copied(),
+                target_timeline_nsecs,
+                false,
+            )
+        };
+        let Some((new_packet_id, new_start_nsecs, new_end_nsecs)) = selected else {
+            tracing::debug!(
+                session_id = ?self.session_id,
+                reason,
+                stream_index,
+                target_timeline_nsecs,
+                requires_recovery_point,
+                old_packet_id = ?old_head.map(|(packet_id, _, _)| packet_id),
+                old_start_nsecs = ?old_head.and_then(|(_, start, _)| start),
+                "FFmpeg demux stream reader realign has no safe recovery packet"
+            );
+            return None;
+        };
+        let old_packet_id = old_head.map(|(packet_id, _, _)| packet_id);
+        let incremental_tracking =
+            self.realign_stream_reader_tracking(stream_index, old_packet_id, new_packet_id);
+        if !incremental_tracking {
+            self.set_reader_head_for_current_generation(stream_index, new_packet_id);
+            self.refresh_reader_tracking();
         }
-        let (new_packet_id, new_start_nsecs, new_end_nsecs) = selected?;
-        self.set_reader_head_for_current_generation(stream_index, new_packet_id);
-        self.refresh_reader_tracking();
         tracing::debug!(
             session_id = ?self.session_id,
             reason,
@@ -120,6 +154,14 @@ impl DemuxPacketCacheState {
             new_packet_id,
             new_start_nsecs,
             new_end_nsecs,
+            requires_recovery_point,
+            incremental_tracking,
+            selected_recovery_point = self
+                .packets
+                .get(&new_packet_id)
+                .is_some_and(|packet| packet.recovery_point),
+            recovery_preroll_ms = target_timeline_nsecs.saturating_sub(new_start_nsecs) as f64
+                / 1_000_000.0,
             read_index = self.read_index,
             generation = self.generation,
             "realigned FFmpeg demux stream reader head to timeline"
@@ -135,6 +177,115 @@ impl DemuxPacketCacheState {
         })
     }
 
+    fn latest_stream_packet_at_or_before(
+        &self,
+        packet_ids: impl Iterator<Item = PacketId>,
+        target_timeline_nsecs: u64,
+        requires_recovery_point: bool,
+    ) -> Option<(PacketId, u64, Option<u64>)> {
+        let mut selected = None;
+        for packet_id in packet_ids {
+            if !self.packet_readable_in_current_generation(packet_id) {
+                continue;
+            }
+            let Some(packet) = self.packets.get(&packet_id) else {
+                continue;
+            };
+            let Some(start_nsecs) = packet.start_nsecs else {
+                continue;
+            };
+            if start_nsecs > target_timeline_nsecs && selected.is_some() {
+                break;
+            }
+            if start_nsecs <= target_timeline_nsecs
+                && (!requires_recovery_point || packet.recovery_point)
+            {
+                selected = Some((packet_id, start_nsecs, packet.end_nsecs));
+            }
+        }
+        selected
+    }
+
+    fn realign_stream_reader_tracking(
+        &mut self,
+        stream_index: c_int,
+        old_packet_id: Option<PacketId>,
+        new_packet_id: PacketId,
+    ) -> bool {
+        let Some((old_queue_position, new_queue_position, new_global_position, changed_ids)) = self
+            .read_range()
+            .stream_queues
+            .get(&stream_index)
+            .and_then(|queue| {
+                let new_queue_position = ordered_packet_position(queue, new_packet_id)?;
+                let old_queue_position = match old_packet_id {
+                    Some(packet_id) => Some(ordered_packet_position(queue, packet_id)?),
+                    None => None,
+                };
+                let new_global_position =
+                    ordered_packet_position(&self.read_range().global_order, new_packet_id)?;
+                let changed_ids = match old_queue_position {
+                    Some(old_position) if new_queue_position < old_position => queue
+                        .iter()
+                        .skip(new_queue_position)
+                        .take(old_position.saturating_sub(new_queue_position))
+                        .copied()
+                        .collect::<Vec<_>>(),
+                    Some(old_position) if old_position < new_queue_position => queue
+                        .iter()
+                        .skip(old_position)
+                        .take(new_queue_position.saturating_sub(old_position))
+                        .copied()
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                Some((
+                    old_queue_position,
+                    new_queue_position,
+                    new_global_position,
+                    changed_ids,
+                ))
+            })
+        else {
+            return false;
+        };
+
+        self.set_reader_head_for_current_generation(stream_index, new_packet_id);
+        self.reader_head_positions
+            .insert(stream_index, new_global_position);
+        match old_queue_position {
+            Some(old_position) if new_queue_position < old_position => {
+                for packet_id in changed_ids {
+                    self.consumed_packet_ids.remove(&packet_id);
+                }
+            }
+            Some(old_position) if old_position < new_queue_position => {
+                self.consumed_packet_ids.extend(changed_ids);
+            }
+            None => {
+                let stream_packet_ids = self
+                    .read_range()
+                    .stream_queues
+                    .get(&stream_index)
+                    .map(|queue| queue.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                for packet_id in &stream_packet_ids {
+                    self.consumed_packet_ids.remove(packet_id);
+                }
+                self.consumed_packet_ids
+                    .extend(stream_packet_ids.into_iter().take(new_queue_position));
+            }
+            _ => {}
+        }
+        self.refresh_read_index_from_reader_head_positions();
+        self.update_forward_cache_after_reader_realign(
+            stream_index,
+            old_queue_position,
+            new_queue_position,
+        );
+        true
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn consumer_readable_packet_available(
         &self,
     ) -> bool {
@@ -146,10 +297,82 @@ impl DemuxPacketCacheState {
         })
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn consumer_drainable_packet_available(
+        &self,
+    ) -> bool {
+        self.reader_heads.iter().any(|(stream_index, packet_id)| {
+            self.reader_head_current_for_stream(*stream_index, *packet_id)
+        })
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn consumer_drainable_for_recovery_demand(
+        &self,
+        video_required: bool,
+        audio_required: bool,
+    ) -> bool {
+        let mut has_required_stream = false;
+        if video_required {
+            has_required_stream = true;
+            if self
+                .next_packet_id_for_stream(self.timeline_anchor_stream_index)
+                .is_none()
+            {
+                return false;
+            }
+        }
+        if audio_required {
+            has_required_stream = true;
+            let Some(audio_stream) = self.selected_streams.audio_stream else {
+                return false;
+            };
+            if self.next_packet_id_for_stream(audio_stream.index).is_none() {
+                return false;
+            }
+        }
+        has_required_stream
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn recovery_demand_streams(
+        &self,
+        video_required: bool,
+        audio_required: bool,
+    ) -> Vec<c_int> {
+        let mut streams = Vec::with_capacity(2);
+        if video_required {
+            streams.push(self.timeline_anchor_stream_index);
+        }
+        if audio_required && let Some(audio_stream) = self.selected_streams.audio_stream {
+            streams.push(audio_stream.index);
+        }
+        streams
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn drainable_streams(
+        &self,
+    ) -> Vec<c_int> {
+        self.reader_heads
+            .iter()
+            .filter_map(|(stream_index, packet_id)| {
+                self.reader_head_current_for_stream(*stream_index, *packet_id)
+                    .then_some(*stream_index)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn consume_packet_id(
         &mut self,
         packet_id: PacketId,
         timing: &mut DemuxPacketCacheReadTiming,
+    ) {
+        self.consume_packet_id_with_trim(packet_id, timing, true);
+    }
+
+    fn consume_packet_id_with_trim(
+        &mut self,
+        packet_id: PacketId,
+        timing: &mut DemuxPacketCacheReadTiming,
+        trim_allowed: bool,
     ) {
         let advance_started_at = Instant::now();
         self.advance_reader_head_over_packet(packet_id);
@@ -164,10 +387,11 @@ impl DemuxPacketCacheState {
             self.read_range_mut().is_bof = false;
         }
         self.update_forward_cache_after_consumed_packet(packet_id);
-        if self.read_trim_due() {
+        if trim_allowed && self.read_trim_due() {
             let trim_started_at = Instant::now();
-            self.trim_to_limit_for_read();
+            let trim_outcome = self.trim_to_limit_for_read_with_outcome();
             timing.trim += trim_started_at.elapsed();
+            timing.trim_outcome = timing.trim_outcome.merged(trim_outcome);
         }
     }
 
@@ -251,6 +475,11 @@ impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn refresh_reader_tracking(
         &mut self,
     ) {
+        #[cfg(test)]
+        {
+            self.reader_tracking_full_refresh_count =
+                self.reader_tracking_full_refresh_count.saturating_add(1);
+        }
         let started_at = Instant::now();
         self.refresh_reader_tracking_inner();
         let elapsed = started_at.elapsed();
@@ -340,10 +569,7 @@ impl DemuxPacketCacheState {
     }
 
     fn packet_position_in_read_range(&self, packet_id: PacketId) -> Option<usize> {
-        self.read_range()
-            .global_order
-            .iter()
-            .position(|candidate| *candidate == packet_id)
+        ordered_packet_position(&self.read_range().global_order, packet_id)
     }
 
     fn packet_position_in_read_range_after(
@@ -534,4 +760,24 @@ impl DemuxPacketCacheState {
             .sum();
         active_bytes + detached_bytes
     }
+}
+
+fn ordered_packet_position(queue: &VecDeque<PacketId>, packet_id: PacketId) -> Option<usize> {
+    let mut left = 0usize;
+    let mut right = queue.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        if queue
+            .get(middle)
+            .is_some_and(|candidate| *candidate < packet_id)
+        {
+            left = middle.saturating_add(1);
+        } else {
+            right = middle;
+        }
+    }
+    queue
+        .get(left)
+        .is_some_and(|candidate| *candidate == packet_id)
+        .then_some(left)
 }

@@ -78,7 +78,18 @@ impl DemuxPacketPump {
             context.decoder_input,
             context.video_admission_pressure.output_snapshot,
         );
-        if self.filter_demux_streams_by_output_lead(&context, &mut demux_streams) {
+        let all_timed_streams_throttled =
+            self.filter_demux_streams_by_output_lead(&context, &mut demux_streams);
+        let output_snapshot = context.video_admission_pressure.output_snapshot;
+        context.demux_cache.set_playback_recovery_demand(
+            demux_playback_recovery_critical(output_snapshot, context.decoder_input),
+            demux_streams.contains(&context.decoder_input.video_stream_index),
+            context
+                .decoder_input
+                .audio_stream_index
+                .is_some_and(|stream_index| demux_streams.contains(&stream_index)),
+        );
+        if all_timed_streams_throttled {
             return DemuxReadResult::WouldBlock;
         }
         if demux_streams.is_empty() {
@@ -710,7 +721,7 @@ impl DemuxPacketPump {
         let decoder_input = context
             .pipeline
             .decoder_input_snapshot(context.video_admission_pressure.output_resource_pressure);
-        self.request_rebuffer_audio_reader_head_realign_if_needed(context, &decoder_input);
+        self.request_output_wait_audio_reader_head_realign_if_needed(context, &decoder_input);
         let rebuffer_audio_priority_active = rebuffer_audio_resume_low_water_priority_active(
             context.video_admission_pressure.output_snapshot,
             &decoder_input,
@@ -802,7 +813,7 @@ impl DemuxPacketPump {
         }
     }
 
-    fn request_rebuffer_audio_reader_head_realign_if_needed(
+    fn request_output_wait_audio_reader_head_realign_if_needed(
         &self,
         context: &mut DemuxPacketPumpAdmissionContext<'_>,
         decoder_input: &DecoderInputSnapshot,
@@ -824,7 +835,7 @@ impl DemuxPacketPump {
         context
             .pipeline
             .output_scheduler
-            .request_rebuffer_audio_reader_head_realign_if_needed(
+            .request_output_wait_audio_reader_head_realign_if_needed(
                 reader_head_start_nsecs,
                 audio_waterline,
                 current_start_position_nsecs,
@@ -922,6 +933,17 @@ impl DemuxPacketPump {
             cache_refresh_reader_tracking_ms =
                 demux_cache_timing.refresh_reader_tracking.as_secs_f64() * 1000.0,
             cache_trim_ms = demux_cache_timing.trim.as_secs_f64() * 1000.0,
+            cache_trim_suppressed_for_recovery =
+                demux_cache_timing.trim_suppressed_for_recovery,
+            cache_trim_performed = demux_cache_timing.trim_outcome.performed,
+            cache_trim_steps = demux_cache_timing.trim_outcome.steps,
+            cache_trim_removed_packets = demux_cache_timing.trim_outcome.removed_packets,
+            cache_trim_removed_bytes = demux_cache_timing.trim_outcome.removed_bytes,
+            cache_trim_compacted_global_entries =
+                demux_cache_timing.trim_outcome.compacted_global_entries,
+            cache_trim_budget_exhausted = demux_cache_timing.trim_outcome.budget_exhausted,
+            cache_trim_remaining_overrun_bytes =
+                demux_cache_timing.trim_outcome.remaining_overrun_bytes,
             cache_forward_bytes_ms = demux_cache_timing.forward_bytes.as_secs_f64() * 1000.0,
             cache_forward_window_ms = demux_cache_timing.forward_window.as_secs_f64() * 1000.0,
             packet_ref_ms = demux_cache_timing.packet_ref.as_secs_f64() * 1000.0,
@@ -970,6 +992,17 @@ impl DemuxPacketPump {
             cache_refresh_reader_tracking_ms =
                 demux_cache_timing.refresh_reader_tracking.as_secs_f64() * 1000.0,
             cache_trim_ms = demux_cache_timing.trim.as_secs_f64() * 1000.0,
+            cache_trim_suppressed_for_recovery =
+                demux_cache_timing.trim_suppressed_for_recovery,
+            cache_trim_performed = demux_cache_timing.trim_outcome.performed,
+            cache_trim_steps = demux_cache_timing.trim_outcome.steps,
+            cache_trim_removed_packets = demux_cache_timing.trim_outcome.removed_packets,
+            cache_trim_removed_bytes = demux_cache_timing.trim_outcome.removed_bytes,
+            cache_trim_compacted_global_entries =
+                demux_cache_timing.trim_outcome.compacted_global_entries,
+            cache_trim_budget_exhausted = demux_cache_timing.trim_outcome.budget_exhausted,
+            cache_trim_remaining_overrun_bytes =
+                demux_cache_timing.trim_outcome.remaining_overrun_bytes,
             cache_forward_bytes_ms = demux_cache_timing.forward_bytes.as_secs_f64() * 1000.0,
             cache_forward_window_ms = demux_cache_timing.forward_window.as_secs_f64() * 1000.0,
             packet_ref_ms = demux_cache_timing.packet_ref.as_secs_f64() * 1000.0,
@@ -1119,6 +1152,16 @@ impl DemuxPacketPump {
     }
 }
 
+fn demux_playback_recovery_critical(
+    output_snapshot: PlaybackOutputSnapshot,
+    decoder_input: &DecoderInputSnapshot,
+) -> bool {
+    output_snapshot.rebuffering
+        || output_snapshot.video_output_low_water
+        || decoder_input.audio_output_low_water
+        || (!output_snapshot.first_video_frame_pending && output_snapshot.queued_video_frames == 0)
+}
+
 fn demux_read_result_name(result: &DemuxReadResult) -> &'static str {
     match result {
         DemuxReadResult::Packet(_) => "packet",
@@ -1167,6 +1210,9 @@ fn combine_demux_read_timing(
         advance_reader_head: first.advance_reader_head + second.advance_reader_head,
         refresh_reader_tracking: first.refresh_reader_tracking + second.refresh_reader_tracking,
         trim: first.trim + second.trim,
+        trim_outcome: first.trim_outcome.merged(second.trim_outcome),
+        trim_suppressed_for_recovery: first.trim_suppressed_for_recovery
+            || second.trim_suppressed_for_recovery,
         forward_bytes: first.forward_bytes + second.forward_bytes,
         forward_window: first.forward_window + second.forward_window,
         packet_ref: first.packet_ref + second.packet_ref,
@@ -1433,7 +1479,16 @@ fn decoder_input_waiting_for_packets(decoder_input: &DecoderInputSnapshot) -> bo
     matches!(
         decoder_input.video_decode_blocked_on,
         Some(PlaybackBlockReason::DecoderInputEmpty)
-    ) || audio_low_water_priority_active(decoder_input)
+    ) || (decoder_input_accepts_video_packet(decoder_input)
+        && matches!(
+            decoder_input.video_decode_snapshot.state,
+            VideoDecodeWorkerState::NeedPacket
+        )
+        && decoder_input.video_decode_snapshot.queued_frames == 0
+        && decoder_input.video_decode_snapshot.pending_input_packets == 0
+        && decoder_input.video_decode_snapshot.in_flight_packets == 0
+        && decoder_input.video_decode_snapshot.completed_packets == 0)
+        || audio_low_water_priority_active(decoder_input)
 }
 
 fn audio_low_water_priority_active(decoder_input: &DecoderInputSnapshot) -> bool {
@@ -1597,7 +1652,8 @@ mod tests {
         DEMUX_PACKET_CACHE_LOW_WATER_LOCK_WAIT, DEMUX_PACKET_CACHE_READY_LOCK_WAIT,
         DemuxPacketPump, DemuxPacketRoute, PlaybackBlockReason, PlaybackOutputSnapshot,
         VideoPacketAdmissionPressure, audio_priority_demux_streams,
-        decoder_input_output_lead_throttled_stream, demux_pump_cache_lock_wait_for_test,
+        decoder_input_output_lead_throttled_stream, decoder_input_waiting_for_packets,
+        demux_playback_recovery_critical, demux_pump_cache_lock_wait_for_test,
         demux_pump_cache_lock_wait_with_watermark_for_test, demux_pump_should_wait_for_cache_lock,
         demux_reader_head_exceeds_output_lead, demux_reader_output_lead_limit_nsecs,
         demux_reader_output_lead_throttle_enabled, duration_nsecs,
@@ -1612,6 +1668,18 @@ mod tests {
             (*packet.as_mut_ptr()).stream_index = stream_index;
         }
         packet
+    }
+
+    #[test]
+    fn demux_packet_pump_treats_idle_need_packet_decoder_as_waiting() {
+        let mut decoder_input = decoder_input_snapshot(vec![0], 0, None, None);
+        decoder_input.video_decode_blocked_on = Some(PlaybackBlockReason::DecodedVideoQueue);
+
+        assert!(decoder_input_waiting_for_packets(&decoder_input));
+
+        decoder_input.video_decode_snapshot.state = VideoDecodeWorkerState::Decoding;
+        decoder_input.video_decode_snapshot.in_flight_packets = 1;
+        assert!(!decoder_input_waiting_for_packets(&decoder_input));
     }
 
     #[test]
@@ -1854,6 +1922,23 @@ mod tests {
 
         assert_eq!(rotation, 0);
         assert_eq!(streams, vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn demux_packet_pump_marks_playing_audio_low_water_recovery_critical() {
+        let mut decoder_input = decoder_input_snapshot(vec![0, 1], 0, Some(1), None);
+        let output_snapshot =
+            playback_output_snapshot_for_test(12, duration_nsecs(Duration::from_millis(1_200)));
+
+        assert!(!demux_playback_recovery_critical(
+            output_snapshot,
+            &decoder_input
+        ));
+        decoder_input.audio_output_low_water = true;
+        assert!(demux_playback_recovery_critical(
+            output_snapshot,
+            &decoder_input
+        ));
     }
 
     #[test]
@@ -2127,6 +2212,7 @@ mod tests {
             audio_stream_index,
             subtitle_stream_index,
             audio_resume_waterline: None,
+            audio_output_low_water: false,
             video_decode_snapshot: VideoDecodeWorkerSnapshot {
                 state: VideoDecodeWorkerState::NeedPacket,
                 queued_frames: 0,

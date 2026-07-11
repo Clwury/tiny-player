@@ -26,12 +26,13 @@ use super::video_decode_drain_frame_processor::{
 use super::video_decode_pipeline::{VideoPacketAdmissionContext, VideoPacketAdmissionPressure};
 use super::video_decode_worker::{VideoDecodeDrainResult, VideoDecodeWorkerSnapshot};
 use super::{
-    AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN, AudioDecodePipeline, AudioOutput, AudioResumeWaterline,
-    AvPacket, BufferedReporter, DoviPipeline, FfmpegControl, PlaybackBlockReason,
-    PlaybackGeneration, PlaybackOutputScheduler, PlaybackOutputSnapshot, PlaybackScheduler,
-    PositionReporter, StreamInfo, SubtitleDecodeContext, SubtitlePipeline, TimestampMapper,
-    VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-    VideoDecodePipeline, VideoDecodeRecovery, VideoFramePrepareWorker, duration_nsecs,
+    AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN,
+    AudioDecodePipeline, AudioOutput, AudioResumeWaterline, AvPacket, BufferedReporter,
+    DoviPipeline, FfmpegControl, PlaybackBlockReason, PlaybackGeneration, PlaybackOutputScheduler,
+    PlaybackOutputSnapshot, PlaybackScheduler, PositionReporter, StreamInfo, SubtitleDecodeContext,
+    SubtitlePipeline, TimestampMapper, VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VideoDecodePipeline, VideoDecodeRecovery,
+    VideoFramePrepareWorker, duration_nsecs,
 };
 
 const CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_millis(2_500);
@@ -158,6 +159,7 @@ pub(super) struct DecoderInputSnapshot {
     pub(super) audio_stream_index: Option<c_int>,
     pub(super) subtitle_stream_index: Option<c_int>,
     pub(super) audio_resume_waterline: Option<AudioResumeWaterline>,
+    pub(super) audio_output_low_water: bool,
     pub(super) video_decode_snapshot: VideoDecodeWorkerSnapshot,
     pub(super) video_decode_blocked_on: Option<PlaybackBlockReason>,
 }
@@ -627,13 +629,23 @@ impl PlaybackPipelineState {
             .audio_decode_pipeline
             .as_ref()
             .map(|pipeline| pipeline.snapshot());
+        let audio_snapshot = self
+            .audio_output
+            .as_ref()
+            .and_then(|output| output.snapshot().ok());
         let audio_resume_waterline =
-            self.audio_resume_waterline_for_output_wait(audio_decode_snapshot);
-        let audio_input_suppressed = audio_input_suppressed_until_output_resume_state(
-            self.audio_decode_pipeline.is_some(),
-            self.output_scheduler.waiting_for_output_resume(),
-            audio_resume_waterline,
-        );
+            self.audio_resume_waterline_for_output_wait(audio_snapshot, audio_decode_snapshot);
+        let audio_output_low_water = audio_snapshot.is_some_and(|snapshot| {
+            snapshot.total_pending_nsecs < duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION)
+        });
+        let audio_input_suppressed = self
+            .output_scheduler
+            .output_wait_audio_input_backpressured()
+            || audio_input_suppressed_until_output_resume_state(
+                self.audio_decode_pipeline.is_some(),
+                self.output_scheduler.waiting_for_output_resume(),
+                audio_resume_waterline,
+            );
         let audio_stream = self.audio_decode_pipeline.as_ref().map(|pipeline| {
             let audio_decode_snapshot =
                 audio_decode_snapshot.expect("audio snapshot exists when pipeline exists");
@@ -673,6 +685,7 @@ impl PlaybackPipelineState {
             audio_stream_index: audio_stream.map(|stream| stream.stream_index),
             subtitle_stream_index: subtitle_stream.map(|stream| stream.stream_index),
             audio_resume_waterline,
+            audio_output_low_water,
             video_decode_snapshot,
             video_decode_blocked_on,
         }
@@ -683,8 +696,12 @@ impl PlaybackPipelineState {
             .audio_decode_pipeline
             .as_ref()
             .map(|pipeline| pipeline.snapshot());
+        let audio_snapshot = self
+            .audio_output
+            .as_ref()
+            .and_then(|output| output.snapshot().ok());
         let audio_resume_waterline =
-            self.audio_resume_waterline_for_output_wait(audio_decode_snapshot);
+            self.audio_resume_waterline_for_output_wait(audio_snapshot, audio_decode_snapshot);
         audio_input_suppressed_until_output_resume_state(
             self.audio_decode_pipeline.is_some(),
             self.output_scheduler.waiting_for_output_resume(),
@@ -694,12 +711,9 @@ impl PlaybackPipelineState {
 
     fn audio_resume_waterline_for_output_wait(
         &self,
+        audio_snapshot: Option<super::AudioOutputSnapshot>,
         audio_decode_snapshot: Option<AudioDecodeWorkerSnapshot>,
     ) -> Option<AudioResumeWaterline> {
-        let audio_snapshot = self
-            .audio_output
-            .as_ref()
-            .and_then(|output| output.snapshot().ok());
         self.output_scheduler
             .audio_resume_waterline_for_output_wait(
                 audio_snapshot,

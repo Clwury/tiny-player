@@ -30,10 +30,11 @@ use super::{
     PlaybackScheduler, PlaybackSession, PlaybackTickContext, PlaybackTickStatus, PositionReporter,
     StreamInfo, SubtitlePipeline, TimestampMapper, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
     VideoDecodePipeline, VideoDecodeRecovery, VideoDecodeWorkerInfo, VideoFramePrepareWorker,
-    duration_nsecs, nsecs_to_seconds, open_playback_input_with_fallback,
-    preroll_seek_position_seconds, service_hevc_startup_stall_watchdog_if_due,
-    service_playback_commands, service_playback_eof_drain, service_playback_tick,
-    should_cache_http_url, video_seek_preroll_nsecs,
+    audio_codec_requires_recovery_point, duration_nsecs, nsecs_to_seconds,
+    open_playback_input_with_fallback, preroll_seek_position_seconds,
+    service_hevc_startup_stall_watchdog_if_due, service_playback_commands,
+    service_playback_eof_drain, service_playback_tick, should_cache_http_url,
+    video_seek_preroll_nsecs,
 };
 
 fn frame_rate_from_duration(frame_duration_nsecs: Option<u64>) -> Option<f64> {
@@ -460,7 +461,7 @@ fn service_rebuffer_audio_realign_seek_if_needed(
             .is_some_and(|(start, end)| {
                 start <= request.target_timeline_nsecs && request.target_timeline_nsecs < end
             });
-    let force_low_level_seek =
+    let mut force_low_level_seek =
         rebuffer_audio_realign_requires_low_level_seek(attempts, queued_video_covers_target);
     let can_preserve_video_queue = rebuffer_audio_realign_can_preserve_video_queue(
         attempts,
@@ -515,18 +516,26 @@ fn service_rebuffer_audio_realign_seek_if_needed(
     );
 
     if can_preserve_video_queue && let Some(audio_stream_index) = audio_stream_index {
+        let audio_realign_requires_recovery_point = pipeline
+            .audio_stream
+            .is_some_and(|stream| audio_codec_requires_recovery_point(stream.codec_id));
         let reader_realign = demux_cache.realign_stream_reader_to_timeline(
             audio_stream_index,
             request.target_timeline_nsecs,
             request.reason,
         );
-        if reader_realign.is_none() && !queued_video_covers_target {
+        if reader_realign.is_none()
+            && (!queued_video_covers_target || audio_realign_requires_recovery_point)
+        {
+            force_low_level_seek |= audio_realign_requires_recovery_point;
             tracing::debug!(
                 session_id = ?session.id(),
                 target_timeline_nsecs = request.target_timeline_nsecs,
                 attempts,
                 queued_video_covers_target,
                 audio_stream_index,
+                audio_realign_requires_recovery_point,
+                force_low_level_seek,
                 "FFmpeg rebuffer audio realign reader reposition unavailable"
             );
         } else {

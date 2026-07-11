@@ -6,6 +6,7 @@ use std::{
 
 #[cfg(test)]
 use super::PlaybackCacheState;
+use super::seek_algorithm::{StreamSeekBlock, VideoSeekBlock};
 use super::{
     DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL, DemuxCacheReportSnapshot, DemuxCacheState,
     DemuxCachedRange, DemuxPacketCacheState, PacketId, PlaybackCacheTimeRange,
@@ -142,14 +143,6 @@ impl DemuxPacketCacheState {
         self.cache_state_emit_dirty
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cache_state_emit_ready(
-        &self,
-        now: Instant,
-    ) -> bool {
-        self.cache_state_emit_dirty
-            && (self.last_cache_state_emit_at.is_none() || self.cache_state_report_due(now))
-    }
-
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn clear_cache_state_emit_dirty(
         &mut self,
     ) {
@@ -178,29 +171,20 @@ impl DemuxPacketCacheState {
         self.last_emitted_seekable_ranges = Some(seekable_ranges);
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_ranges_changed_since_last_emit(
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_range_change_since_last_emit(
         &self,
-    ) -> bool {
-        self.last_emitted_seekable_ranges
-            .as_ref()
-            .is_some_and(|ranges| ranges != &self.seekable_time_ranges())
-    }
-
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_range_window_changed_since_last_emit(
-        &self,
-    ) -> bool {
+    ) -> (bool, bool) {
         let Some(last_ranges) = self.last_emitted_seekable_ranges.as_ref() else {
-            return false;
+            return (false, false);
         };
-        if last_ranges.is_empty() {
-            return false;
-        }
         let current_ranges = self.seekable_time_ranges();
-        current_ranges.len() < last_ranges.len()
-            || last_ranges
+        let changed = last_ranges != &current_ranges;
+        let contracted = last_ranges.iter().any(|last| {
+            !current_ranges
                 .iter()
-                .zip(&current_ranges)
-                .any(|(last, current)| last.start != current.start || current.end < last.end)
+                .any(|current| current.start <= last.start && current.end >= last.end)
+        });
+        (changed, contracted)
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn forward_bytes(
@@ -581,6 +565,198 @@ impl DemuxPacketCacheState {
         self.ranges.insert(range_id, range);
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn refresh_range_stream_seek_boundary_after_append(
+        &mut self,
+        range_id: super::RangeId,
+        stream_index: c_int,
+        packet_id: PacketId,
+    ) {
+        if !self.packet_readable_in_current_generation(packet_id) {
+            return;
+        }
+
+        if stream_index != self.timeline_anchor_stream_index {
+            if self.stream_requires_recovery_point(stream_index) {
+                let appended_closes_seek_block = self
+                    .packets
+                    .get(&packet_id)
+                    .is_some_and(|packet| packet.recovery_point && packet.start_nsecs.is_some());
+                if !appended_closes_seek_block {
+                    return;
+                }
+                let Some(block) = self.stream_seek_block_closed_by_appended_boundary(
+                    range_id,
+                    stream_index,
+                    packet_id,
+                ) else {
+                    return;
+                };
+                let Some(range) = self.ranges.get_mut(&range_id) else {
+                    return;
+                };
+                let boundary = range.ensure_stream_boundary(stream_index);
+                Self::close_stream_seek_block(
+                    block,
+                    &mut boundary.seek_start_nsecs,
+                    &mut boundary.seek_end_nsecs,
+                );
+                range.mark_seekable_dirty();
+                return;
+            }
+
+            let Some((start_nsecs, end_nsecs)) = self.packets.get(&packet_id).and_then(|packet| {
+                let start_nsecs = packet.start_nsecs?;
+                let end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
+                Some((start_nsecs, end_nsecs))
+            }) else {
+                return;
+            };
+            let Some(range) = self.ranges.get_mut(&range_id) else {
+                return;
+            };
+            let boundary = range.ensure_stream_boundary(stream_index);
+            boundary.seek_start_nsecs = Some(
+                boundary
+                    .seek_start_nsecs
+                    .unwrap_or(start_nsecs)
+                    .min(start_nsecs),
+            );
+            boundary.seek_end_nsecs =
+                Some(boundary.seek_end_nsecs.unwrap_or(end_nsecs).max(end_nsecs));
+            range.mark_seekable_dirty();
+            return;
+        }
+
+        let appended_closes_seek_block = self.packets.get(&packet_id).is_some_and(|packet| {
+            packet.timeline_anchor
+                && packet.start_nsecs.is_some()
+                && Self::packet_is_cached_seek_anchor(packet, self.cached_seek_requires_safe_point)
+        });
+        if !appended_closes_seek_block {
+            return;
+        }
+        let Some(block) =
+            self.video_seek_block_closed_by_appended_anchor(range_id, stream_index, packet_id)
+        else {
+            return;
+        };
+        let cached_seek_preroll_nsecs = self.cached_seek_preroll_nsecs;
+        let Some(range) = self.ranges.get_mut(&range_id) else {
+            return;
+        };
+        let boundary = range.ensure_stream_boundary(stream_index);
+        Self::close_video_seek_block(
+            block,
+            cached_seek_preroll_nsecs,
+            &mut boundary.seek_start_nsecs,
+            &mut boundary.seek_end_nsecs,
+        );
+        range.mark_seekable_dirty();
+    }
+
+    fn stream_seek_block_closed_by_appended_boundary(
+        &self,
+        range_id: super::RangeId,
+        stream_index: c_int,
+        packet_id: PacketId,
+    ) -> Option<StreamSeekBlock> {
+        let queue = self
+            .ranges
+            .get(&range_id)?
+            .stream_queues
+            .get(&stream_index)?;
+        let mut found_appended_packet = false;
+        let mut block_min_nsecs = None;
+        let mut block_max_nsecs = None;
+
+        for candidate_id in queue.iter().rev().copied() {
+            if !found_appended_packet {
+                if candidate_id == packet_id {
+                    found_appended_packet = true;
+                }
+                continue;
+            }
+            if !self.packet_readable_in_current_generation(candidate_id) {
+                continue;
+            }
+            let Some(packet) = self.packets.get(&candidate_id) else {
+                continue;
+            };
+            let Some(start_nsecs) = packet.start_nsecs else {
+                continue;
+            };
+            block_min_nsecs = Some(block_min_nsecs.unwrap_or(start_nsecs).min(start_nsecs));
+            block_max_nsecs = Some(block_max_nsecs.unwrap_or(start_nsecs).max(start_nsecs));
+            if packet.recovery_point {
+                return Some(StreamSeekBlock {
+                    min_nsecs: block_min_nsecs?,
+                    max_nsecs: block_max_nsecs?,
+                });
+            }
+        }
+        None
+    }
+
+    fn video_seek_block_closed_by_appended_anchor(
+        &self,
+        range_id: super::RangeId,
+        stream_index: c_int,
+        packet_id: PacketId,
+    ) -> Option<VideoSeekBlock> {
+        let queue = self
+            .ranges
+            .get(&range_id)?
+            .stream_queues
+            .get(&stream_index)?;
+        let mut found_appended_packet = false;
+        let mut block_min_nsecs = None;
+        let mut block_max_nsecs = None;
+        let mut recovery_start_nsecs = None;
+        let mut previous_recovery_start_nsecs = None;
+
+        for candidate_id in queue.iter().rev().copied() {
+            if !found_appended_packet {
+                if candidate_id == packet_id {
+                    found_appended_packet = true;
+                }
+                continue;
+            }
+            if !self.packet_readable_in_current_generation(candidate_id) {
+                continue;
+            }
+            let Some(packet) = self.packets.get(&candidate_id) else {
+                continue;
+            };
+            if !packet.timeline_anchor {
+                continue;
+            }
+            let Some(start_nsecs) = packet.start_nsecs else {
+                continue;
+            };
+            let is_recovery =
+                Self::packet_is_cached_seek_anchor(packet, self.cached_seek_requires_safe_point);
+
+            if recovery_start_nsecs.is_none() {
+                let end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
+                block_min_nsecs = Some(block_min_nsecs.unwrap_or(start_nsecs).min(start_nsecs));
+                block_max_nsecs = Some(block_max_nsecs.unwrap_or(end_nsecs).max(end_nsecs));
+                if is_recovery {
+                    recovery_start_nsecs = Some(start_nsecs);
+                }
+            } else if is_recovery {
+                previous_recovery_start_nsecs = Some(start_nsecs);
+                break;
+            }
+        }
+
+        Some(VideoSeekBlock {
+            min_nsecs: block_min_nsecs?,
+            max_nsecs: block_max_nsecs?,
+            recovery_start_nsecs: recovery_start_nsecs?,
+            previous_recovery_start_nsecs,
+        })
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn refresh_range_stream_seek_boundary_in_range(
         &self,
         range: &mut DemuxCachedRange,
@@ -610,7 +786,136 @@ impl DemuxPacketCacheState {
                 range.stream_boundary(stream_index).is_eof,
             )
         } else {
-            Self::stream_seek_range_in_packet_queue(&self.packets, &queue)
+            Self::stream_seek_range_in_packet_queue(
+                &self.packets,
+                &queue,
+                self.stream_requires_recovery_point(stream_index),
+                range.stream_boundary(stream_index).is_eof,
+            )
+        };
+
+        let boundary = range.ensure_stream_boundary(stream_index);
+        boundary.seek_start_nsecs = seek_range.map(|(start, _)| start);
+        boundary.seek_end_nsecs = seek_range.map(|(_, end)| end);
+        range.mark_seekable_dirty();
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn refresh_range_stream_seek_boundary_after_prefix_prune(
+        &self,
+        range: &mut DemuxCachedRange,
+        stream_index: c_int,
+    ) {
+        let old_seek_end_nsecs = range.stream_boundary(stream_index).seek_end_nsecs;
+        let Some(queue) = range.stream_queues.get(&stream_index) else {
+            let boundary = range.ensure_stream_boundary(stream_index);
+            boundary.seek_start_nsecs = None;
+            boundary.seek_end_nsecs = None;
+            range.mark_seekable_dirty();
+            return;
+        };
+        let queue_start = queue.front().copied();
+        let queue_end = queue.back().copied();
+        let boundary_ids = range
+            .stream_seek_boundaries
+            .get(&stream_index)
+            .into_iter()
+            .flat_map(|boundaries| boundaries.iter().copied())
+            .filter(|packet_id| {
+                queue_start.is_some_and(|start| *packet_id >= start)
+                    && queue_end.is_some_and(|end| *packet_id <= end)
+                    && self.packet_readable_in_current_generation(*packet_id)
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+
+        let seek_range = if stream_index == self.timeline_anchor_stream_index {
+            let close_open_segment = range.stream_boundary(stream_index).is_eof;
+            let required_boundaries = if close_open_segment { 1 } else { 2 };
+            if boundary_ids.len() < required_boundaries {
+                None
+            } else {
+                let first_boundary = boundary_ids[0];
+                let first_position = packet_queue_lower_bound(queue, first_boundary);
+                let end_position = boundary_ids
+                    .get(1)
+                    .map(|packet_id| packet_queue_lower_bound(queue, *packet_id).saturating_add(1))
+                    .unwrap_or(queue.len())
+                    .min(queue.len());
+                let local_queue = queue
+                    .iter()
+                    .skip(first_position)
+                    .take(end_position.saturating_sub(first_position))
+                    .copied()
+                    .filter(|packet_id| self.packet_readable_in_current_generation(*packet_id))
+                    .collect::<VecDeque<_>>();
+                let mut stream_queues = BTreeMap::new();
+                stream_queues.insert(stream_index, local_queue);
+                Self::seekable_timeline_range_in_packet_range(
+                    &self.packets,
+                    self.timeline_anchor_stream_index,
+                    self.cached_seek_preroll_nsecs,
+                    self.cached_seek_requires_safe_point,
+                    &stream_queues,
+                    close_open_segment && boundary_ids.len() == 1,
+                )
+                .map(|(start_nsecs, local_end_nsecs)| {
+                    (
+                        start_nsecs,
+                        old_seek_end_nsecs
+                            .unwrap_or(local_end_nsecs)
+                            .max(local_end_nsecs),
+                    )
+                })
+            }
+        } else if self.stream_requires_recovery_point(stream_index) {
+            let close_open_segment = range.stream_boundary(stream_index).is_eof;
+            let required_boundaries = if close_open_segment { 1 } else { 2 };
+            if boundary_ids.len() < required_boundaries {
+                None
+            } else {
+                // A TrueHD/MLP seek range starts at a major-sync block and the
+                // next major-sync closes it. Prefix pruning cannot change the
+                // already-computed tail, so only rescan this first recovery
+                // block instead of copying and walking the entire audio queue.
+                let first_boundary = boundary_ids[0];
+                let first_position = packet_queue_lower_bound(queue, first_boundary);
+                let end_position = boundary_ids
+                    .get(1)
+                    .map(|packet_id| packet_queue_lower_bound(queue, *packet_id).saturating_add(1))
+                    .unwrap_or(queue.len())
+                    .min(queue.len());
+                let local_queue = queue
+                    .iter()
+                    .skip(first_position)
+                    .take(end_position.saturating_sub(first_position))
+                    .copied()
+                    .filter(|packet_id| self.packet_readable_in_current_generation(*packet_id))
+                    .collect::<VecDeque<_>>();
+                Self::stream_seek_range_in_packet_queue(
+                    &self.packets,
+                    &local_queue,
+                    true,
+                    close_open_segment && boundary_ids.len() == 1,
+                )
+                .map(|(start_nsecs, local_end_nsecs)| {
+                    (
+                        start_nsecs,
+                        old_seek_end_nsecs
+                            .unwrap_or(local_end_nsecs)
+                            .max(local_end_nsecs),
+                    )
+                })
+            }
+        } else {
+            boundary_ids.first().and_then(|packet_id| {
+                let packet = self.packets.get(packet_id)?;
+                let start_nsecs = packet.start_nsecs?;
+                let packet_end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
+                let end_nsecs = old_seek_end_nsecs
+                    .unwrap_or(packet_end_nsecs)
+                    .max(packet_end_nsecs);
+                (end_nsecs > start_nsecs).then_some((start_nsecs, end_nsecs))
+            })
         };
 
         let boundary = range.ensure_stream_boundary(stream_index);
@@ -646,25 +951,14 @@ impl DemuxPacketCacheState {
             for stream_index in stream_indices {
                 let queue = range.stream_queues.get(&stream_index);
                 let queue_len = queue.map(VecDeque::len).unwrap_or_default();
-                let (queue_start_nsecs, queue_end_nsecs) = queue
-                    .map(|queue| {
-                        queue.iter().fold((None, None), |(start, end), packet_id| {
-                            let Some(packet) = self.packets.get(packet_id) else {
-                                return (start, end);
-                            };
-                            let packet_start = packet.start_nsecs;
-                            let packet_end = packet.end_nsecs.or(packet.start_nsecs);
-                            (
-                                packet_start
-                                    .map(|value| start.unwrap_or(value).min(value))
-                                    .or(start),
-                                packet_end
-                                    .map(|value| end.unwrap_or(value).max(value))
-                                    .or(end),
-                            )
-                        })
-                    })
-                    .unwrap_or((None, None));
+                let queue_start_nsecs = queue
+                    .and_then(|queue| queue.front())
+                    .and_then(|packet_id| self.packets.get(packet_id))
+                    .and_then(|packet| packet.start_nsecs);
+                let queue_end_nsecs = queue
+                    .and_then(|queue| queue.back())
+                    .and_then(|packet_id| self.packets.get(packet_id))
+                    .and_then(|packet| packet.end_nsecs.or(packet.start_nsecs));
                 let boundary = range.stream_boundary(stream_index);
                 per_stream.push((
                     *range_id,
@@ -787,6 +1081,23 @@ impl DemuxPacketCacheState {
             }
         }
     }
+}
+
+fn packet_queue_lower_bound(queue: &VecDeque<PacketId>, packet_id: PacketId) -> usize {
+    let mut left = 0usize;
+    let mut right = queue.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        if queue
+            .get(middle)
+            .is_some_and(|candidate| *candidate < packet_id)
+        {
+            left = middle.saturating_add(1);
+        } else {
+            right = middle;
+        }
+    }
+    left
 }
 
 struct SeekableTimeRangesReport {

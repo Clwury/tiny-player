@@ -55,6 +55,7 @@ use clock::{
 };
 use codec::{
     AudioResampler, AvFrame, AvPacket, DecodedAudio, Decoder, VideoScaler,
+    audio_codec_requires_recovery_point, packet_is_audio_recovery_point,
     packet_is_video_recovery_point, packet_is_video_seek_point,
 };
 use constants::*;

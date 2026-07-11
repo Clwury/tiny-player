@@ -12,7 +12,17 @@ use super::{
 const LOW_LEVEL_SEEK_APPEND_MAX_INITIAL_LEAD_NSECS: u64 = 2_000_000_000;
 
 impl DemuxPacketCacheState {
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn append_packet(
+        &mut self,
+        packet: CachedDemuxPacket,
+    ) -> DemuxPacketAppendOutcome {
+        let mut outcome = self.append_packet_fast(packet);
+        self.complete_append_packet_trim(&mut outcome);
+        outcome
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn append_packet_fast(
         &mut self,
         mut packet: CachedDemuxPacket,
     ) -> DemuxPacketAppendOutcome {
@@ -30,6 +40,10 @@ impl DemuxPacketCacheState {
                 appended: false,
                 force_cache_state_report: false,
                 cache_state_emit_deferred_for_consumer: false,
+                trim_requested: false,
+                trim_deferred_for_consumer: false,
+                trim_deferred_for_recovery: false,
+                trim_outcome: Default::default(),
                 timing,
             };
         }
@@ -57,10 +71,27 @@ impl DemuxPacketCacheState {
         let packet_byte_len = packet.byte_len;
         self.cached_bytes = self.cached_bytes.saturating_add(packet_byte_len);
         self.packets.insert(packet_id, packet);
-        let packet_position =
-            self.append_packet_id_to_append_range(packet_id, stream_index, packet_byte_len);
+        let packet_is_seek_boundary = self.packets.get(&packet_id).is_some_and(|packet| {
+            Self::packet_is_stream_seek_boundary_for(
+                self.timeline_anchor_stream_index,
+                stream_index,
+                packet,
+                self.cached_seek_requires_safe_point,
+                self.stream_requires_recovery_point(stream_index),
+            )
+        });
+        let packet_position = self.append_packet_id_to_append_range(
+            packet_id,
+            stream_index,
+            packet_byte_len,
+            packet_is_seek_boundary,
+        );
         if !blocked_for_current_read {
-            self.refresh_range_stream_seek_boundary(self.append_range_id, stream_index);
+            self.refresh_range_stream_seek_boundary_after_append(
+                self.append_range_id,
+                stream_index,
+                packet_id,
+            );
         }
         timing.queue_insert += queue_insert_started_at.elapsed();
         let maybe_start_reader_head_started_at = Instant::now();
@@ -78,36 +109,59 @@ impl DemuxPacketCacheState {
             self.appended_packet_may_reach_readahead(stream_index, packet_forward_end_nsecs);
         let memory_pressure = self.memory_pressure();
         let backbuffer_pressure = self.backbuffer_pressure();
-        let run_pause_maintenance = self.append_maintenance_due(
-            cleared_seek || readahead_reached || memory_pressure || backbuffer_pressure,
-        );
-        let trim_due = cleared_seek || memory_pressure || backbuffer_pressure;
-        let pruned = if trim_due {
-            let trim_started_at = Instant::now();
-            let pruned = self.trim_to_limit_for_append();
-            timing.trim += trim_started_at.elapsed();
-            pruned
+        let run_pause_maintenance =
+            self.append_maintenance_due(cleared_seek || readahead_reached || memory_pressure);
+        // mpv stops prefetching on forward-byte pressure, but only prunes the
+        // backward cache when it exceeds the effective (possibly donated)
+        // backbuffer budget.
+        let trim_requested = backbuffer_pressure && self.append_trim_due(cleared_seek);
+        let should_pause_demux = if cleared_seek || readahead_reached || run_pause_maintenance {
+            let hysteresis_started_at = Instant::now();
+            self.refresh_readahead_hysteresis();
+            timing.refresh_readahead_hysteresis += hysteresis_started_at.elapsed();
+            let should_pause_started_at = Instant::now();
+            let should_pause_demux = self.should_pause_demux();
+            timing.should_pause_demux += should_pause_started_at.elapsed();
+            should_pause_demux
         } else {
             false
         };
-        let should_pause_demux =
-            if cleared_seek || readahead_reached || run_pause_maintenance || pruned {
-                let hysteresis_started_at = Instant::now();
-                self.refresh_readahead_hysteresis();
-                timing.refresh_readahead_hysteresis += hysteresis_started_at.elapsed();
-                let should_pause_started_at = Instant::now();
-                let should_pause_demux = self.should_pause_demux();
-                timing.should_pause_demux += should_pause_started_at.elapsed();
-                should_pause_demux
-            } else {
-                false
-            };
         DemuxPacketAppendOutcome {
             appended: true,
             force_cache_state_report: cleared_seek || should_pause_demux,
             cache_state_emit_deferred_for_consumer: false,
+            trim_requested,
+            trim_deferred_for_consumer: false,
+            trim_deferred_for_recovery: false,
+            trim_outcome: Default::default(),
             timing,
         }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn complete_append_packet_trim(
+        &mut self,
+        outcome: &mut DemuxPacketAppendOutcome,
+    ) -> bool {
+        if !outcome.trim_requested {
+            return false;
+        }
+        let trim_started_at = Instant::now();
+        let trim_outcome = self.trim_to_limit_for_append_with_outcome();
+        outcome.timing.trim += trim_started_at.elapsed();
+        outcome.trim_outcome = outcome.trim_outcome.merged(trim_outcome);
+        self.complete_append_trim();
+        outcome.trim_requested = false;
+        if !trim_outcome.performed {
+            return false;
+        }
+
+        let hysteresis_started_at = Instant::now();
+        self.refresh_readahead_hysteresis();
+        outcome.timing.refresh_readahead_hysteresis += hysteresis_started_at.elapsed();
+        let should_pause_started_at = Instant::now();
+        outcome.force_cache_state_report |= self.should_pause_demux();
+        outcome.timing.should_pause_demux += should_pause_started_at.elapsed();
+        true
     }
 
     fn append_maintenance_due(&mut self, force: bool) -> bool {
@@ -159,6 +213,7 @@ impl DemuxPacketCacheState {
         packet_id: PacketId,
         stream_index: c_int,
         byte_len: usize,
+        packet_is_seek_boundary: bool,
     ) -> usize {
         let range = self.append_range_mut();
         range.ensure_stream_boundary(stream_index);
@@ -169,6 +224,13 @@ impl DemuxPacketCacheState {
             .entry(stream_index)
             .or_default()
             .push_back(packet_id);
+        if packet_is_seek_boundary {
+            range
+                .stream_seek_boundaries
+                .entry(stream_index)
+                .or_default()
+                .push_back(packet_id);
+        }
         range.add_report_bytes(byte_len);
         range.mark_seekable_dirty();
         packet_position

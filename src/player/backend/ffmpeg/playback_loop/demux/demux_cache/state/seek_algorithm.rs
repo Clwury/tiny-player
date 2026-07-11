@@ -33,6 +33,7 @@ impl DemuxPacketCacheState {
         timeline_anchor_stream_index: c_int,
         cached_seek_preroll_nsecs: u64,
         cached_seek_requires_safe_point: bool,
+        recovery_point_stream_index: Option<c_int>,
         range: DemuxPacketRangeView<'_>,
         target_nsecs: u64,
     ) -> Option<DemuxCachedSeekHit> {
@@ -99,6 +100,7 @@ impl DemuxPacketCacheState {
                     *stream_index,
                     queue,
                     anchor_seek_target_nsecs,
+                    recovery_point_stream_index == Some(*stream_index),
                 )
             };
             if let Some(packet_id) = packet_id {
@@ -122,7 +124,7 @@ impl DemuxPacketCacheState {
         })
     }
 
-    fn packet_is_cached_seek_anchor(
+    pub(super) fn packet_is_cached_seek_anchor(
         packet: &CachedDemuxPacket,
         require_safe_seek_point: bool,
     ) -> bool {
@@ -138,6 +140,7 @@ impl DemuxPacketCacheState {
         stream_index: c_int,
         queue: &VecDeque<u64>,
         target_nsecs: u64,
+        require_recovery_point: bool,
     ) -> Option<PacketId> {
         let mut target = None;
         for packet_id in queue {
@@ -149,6 +152,7 @@ impl DemuxPacketCacheState {
                 stream_index,
                 packet,
                 false,
+                require_recovery_point,
             ) {
                 continue;
             }
@@ -262,7 +266,7 @@ impl DemuxPacketCacheState {
             .filter(|(start_nsecs, end_nsecs)| end_nsecs > start_nsecs)
     }
 
-    fn close_video_seek_block(
+    pub(super) fn close_video_seek_block(
         block: VideoSeekBlock,
         cached_seek_preroll_nsecs: u64,
         seek_start_out: &mut Option<u64>,
@@ -298,7 +302,48 @@ impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn stream_seek_range_in_packet_queue(
         packets: &HashMap<u64, CachedDemuxPacket>,
         queue: &VecDeque<u64>,
+        require_recovery_point: bool,
+        close_open_segment: bool,
     ) -> Option<(u64, u64)> {
+        if require_recovery_point {
+            // Match mpv's keyframe_latest handling: a TrueHD/MLP major-sync opens
+            // a block, and only the next major-sync (or EOF) makes that block seekable.
+            // compute_keyframe_times() uses packet PTS/DTS only, not packet duration.
+            let mut seek_start_nsecs = None;
+            let mut seek_end_nsecs = None;
+            let mut current_block = None;
+            for packet_id in queue {
+                let Some(packet) = packets.get(packet_id) else {
+                    continue;
+                };
+                let Some(start_nsecs) = packet.start_nsecs else {
+                    continue;
+                };
+                if packet.recovery_point {
+                    if let Some(block) = current_block.take() {
+                        Self::close_stream_seek_block(
+                            block,
+                            &mut seek_start_nsecs,
+                            &mut seek_end_nsecs,
+                        );
+                    }
+                    current_block = Some(StreamSeekBlock {
+                        min_nsecs: start_nsecs,
+                        max_nsecs: start_nsecs,
+                    });
+                } else if let Some(block) = current_block.as_mut() {
+                    block.min_nsecs = block.min_nsecs.min(start_nsecs);
+                    block.max_nsecs = block.max_nsecs.max(start_nsecs);
+                }
+            }
+            if close_open_segment && let Some(block) = current_block {
+                Self::close_stream_seek_block(block, &mut seek_start_nsecs, &mut seek_end_nsecs);
+            }
+            return seek_start_nsecs
+                .zip(seek_end_nsecs)
+                .filter(|(start_nsecs, end_nsecs)| end_nsecs > start_nsecs);
+        }
+
         let mut seek_start_nsecs = None;
         let mut seek_end_nsecs = None;
         for packet_id in queue {
@@ -309,22 +354,36 @@ impl DemuxPacketCacheState {
                 continue;
             };
             let end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
-            if end_nsecs <= start_nsecs {
-                continue;
-            }
             seek_start_nsecs = Some(seek_start_nsecs.unwrap_or(start_nsecs).min(start_nsecs));
             seek_end_nsecs = Some(seek_end_nsecs.unwrap_or(end_nsecs).max(end_nsecs));
         }
-        seek_start_nsecs.zip(seek_end_nsecs)
+        seek_start_nsecs
+            .zip(seek_end_nsecs)
+            .filter(|(start_nsecs, end_nsecs)| end_nsecs > start_nsecs)
+    }
+
+    pub(super) fn close_stream_seek_block(
+        block: StreamSeekBlock,
+        seek_start_out: &mut Option<u64>,
+        seek_end_out: &mut Option<u64>,
+    ) {
+        *seek_start_out = Some(seek_start_out.unwrap_or(block.min_nsecs));
+        *seek_end_out = Some(seek_end_out.unwrap_or(block.max_nsecs).max(block.max_nsecs));
     }
 }
 
 #[derive(Clone, Copy)]
-struct VideoSeekBlock {
-    min_nsecs: u64,
-    max_nsecs: u64,
-    recovery_start_nsecs: u64,
-    previous_recovery_start_nsecs: Option<u64>,
+pub(super) struct VideoSeekBlock {
+    pub(super) min_nsecs: u64,
+    pub(super) max_nsecs: u64,
+    pub(super) recovery_start_nsecs: u64,
+    pub(super) previous_recovery_start_nsecs: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StreamSeekBlock {
+    pub(super) min_nsecs: u64,
+    pub(super) max_nsecs: u64,
 }
 
 #[cfg(test)]

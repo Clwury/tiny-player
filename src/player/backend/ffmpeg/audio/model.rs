@@ -1,4 +1,4 @@
-use super::{AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION};
+use super::{AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION};
 use super::{
     Arc, AtomicBool, AtomicU64, Condvar, Duration, FfmpegControl, Instant, JoinHandle, Mutex,
     Ordering, VecDeque, audio_elements_duration, audio_elements_for_duration_floor, c_int,
@@ -303,7 +303,10 @@ impl AudioShared {
         &self,
         pending_nsecs: u64,
     ) {
-        if pending_nsecs >= duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION) {
+        // Keep the 250 ms watermark for low-water admission and rebuffer
+        // planning, but release the frozen audio/video clock sooner once a
+        // contiguous 120 ms AO window has been rebuilt.
+        if pending_nsecs >= duration_nsecs(AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION) {
             self.clear_underrun();
         }
     }

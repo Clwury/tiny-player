@@ -1,15 +1,17 @@
 use super::{
-    AtomicBool, AudioClockMode, AudioClockResumeDecision, AudioOutput, AudioOutputSnapshot,
-    BackendEvent, BufferedReporter, DelayedAudioStartSilencePolicy, DemuxPacketCache,
-    DemuxReaderWatermark, Duration, FfmpegControl, HevcDecodeChainStats, InitialOutputSyncDecision,
-    Instant, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PENDING_AUDIO_CONTINUITY_TOLERANCE,
+    AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION, AtomicBool, AudioClockMode,
+    AudioClockResumeDecision, AudioOutput, AudioOutputSnapshot, BackendEvent, BufferedReporter,
+    DelayedAudioStartSilencePolicy, DemuxPacketCache, DemuxReaderWatermark, Duration,
+    FfmpegControl, HevcDecodeChainStats, InitialOutputSyncDecision, Instant,
+    OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PENDING_AUDIO_CONTINUITY_TOLERANCE,
     PLAYING_PENDING_AUDIO_HARD_RESET_DURATION, PendingAudioPressureContext,
     PlaybackOutputScheduler, PlaybackOutputState, PlaybackResumeWaterline, PlaybackScheduler,
     PlaybackSessionId, PositionReporter, Sender, SubtitlePipeline,
     VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
-    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER,
-    VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, VideoDecodeWorkerSnapshot, VideoOutputQueue,
-    audio_output_buffered_until_for_resume, audio_output_contiguous_start_timeline_nsecs,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE,
+    VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER, VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER,
+    VideoDecodeWorkerSnapshot, VideoOutputQueue, audio_output_buffered_until_for_resume,
+    audio_output_contiguous_start_timeline_nsecs,
     discard_decoded_video_before_output_gate_resume_if_ready, duration_nsecs,
     flush_pending_start_audio, initial_delayed_audio_start_timeline_nsecs,
     initial_first_frame_resume_waterline_after_cached_seek_wait,
@@ -269,8 +271,15 @@ fn rebuffer_audio_prefill_status(
     let queued_video_contiguous_forward_nsecs = output_scheduler
         .scheduled_video_queue
         .forward_nsecs_from(audio_start_timeline_nsecs);
-    let target_nsecs =
+    let mut target_nsecs =
         output_scheduler.audio_rebuffer_prefill_target_nsecs(queued_video_contiguous_forward_nsecs);
+    if delayed_audio_start_timeline_nsecs.is_some_and(|delayed_start_nsecs| {
+        delayed_start_nsecs.saturating_sub(resume_decision.timeline_nsecs)
+            <= duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE)
+    }) {
+        target_nsecs =
+            target_nsecs.min(duration_nsecs(AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION));
+    }
     let pending_audio_forward_nsecs = output_scheduler
         .pending_start_audio
         .buffered_until_from(audio_start_timeline_nsecs)
@@ -284,6 +293,37 @@ fn rebuffer_audio_prefill_status(
         loop_recovery,
         delayed_audio_start: delayed_audio_start_timeline_nsecs.is_some(),
     })
+}
+
+fn rebuffer_audio_flush_start(
+    resume_decision: AudioClockResumeDecision,
+    audio_snapshot: AudioOutputSnapshot,
+) -> (u64, DelayedAudioStartSilencePolicy) {
+    let delayed_audio_start_timeline_nsecs = resume_decision
+        .allow_audio_gap_at_video_resume
+        .then_some(resume_decision.delayed_audio_start_timeline_nsecs)
+        .flatten();
+    if let Some(delayed_start_nsecs) = delayed_audio_start_timeline_nsecs {
+        let gap_nsecs = delayed_start_nsecs.saturating_sub(resume_decision.timeline_nsecs);
+        if gap_nsecs <= duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE) {
+            return (
+                resume_decision.timeline_nsecs,
+                DelayedAudioStartSilencePolicy::Allow,
+            );
+        }
+        return (delayed_start_nsecs, DelayedAudioStartSilencePolicy::Skip);
+    }
+    if resume_decision.reset_audio_to_video {
+        return (
+            resume_decision.timeline_nsecs,
+            DelayedAudioStartSilencePolicy::Skip,
+        );
+    }
+    (
+        audio_output_contiguous_start_timeline_nsecs(audio_snapshot)
+            .max(resume_decision.timeline_nsecs),
+        DelayedAudioStartSilencePolicy::Skip,
+    )
 }
 
 fn enforce_rebuffer_audio_prefill_waterline(
@@ -1256,17 +1296,11 @@ where
             .allow_audio_gap_at_video_resume
             .then_some(resume_decision.delayed_audio_start_timeline_nsecs)
             .flatten();
-        let audio_start_timeline_nsecs =
-            if let Some(delayed_audio_start_timeline_nsecs) = delayed_audio_start_timeline_nsecs {
-                output.reset_clock(resume_decision.timeline_nsecs);
-                delayed_audio_start_timeline_nsecs
-            } else if resume_decision.reset_audio_to_video {
-                output.reset_clock(resume_decision.timeline_nsecs);
-                resume_decision.timeline_nsecs
-            } else {
-                audio_output_contiguous_start_timeline_nsecs(audio_snapshot)
-                    .max(resume_decision.timeline_nsecs)
-            };
+        let (audio_start_timeline_nsecs, delayed_audio_start_silence_policy) =
+            rebuffer_audio_flush_start(resume_decision, audio_snapshot);
+        if delayed_audio_start_timeline_nsecs.is_some() || resume_decision.reset_audio_to_video {
+            output.reset_clock(resume_decision.timeline_nsecs);
+        }
         let mut audio_flush_until_timeline_nsecs = output_scheduler
             .scheduled_video_queue
             .buffered_until_from_nsecs(audio_start_timeline_nsecs)
@@ -1297,9 +1331,13 @@ where
                 audio_flush_until_timeline_nsecs,
                 pending_audio_buffered_until_timeline_nsecs,
                 prefill_ms = prefill_target_nsecs as f64 / 1_000_000.0,
-                delayed_audio_start_gap_ms = audio_start_timeline_nsecs
-                    .saturating_sub(resume_decision.timeline_nsecs) as f64
-                    / 1_000_000.0,
+                delayed_audio_start_gap_ms = delayed_audio_start_timeline_nsecs
+                    .map(|delayed_start_nsecs| {
+                        delayed_start_nsecs.saturating_sub(resume_decision.timeline_nsecs) as f64
+                            / 1_000_000.0
+                    }),
+                fill_short_gap_with_silence = delayed_audio_start_silence_policy
+                    == DelayedAudioStartSilencePolicy::Allow,
                 "prefilling delayed FFmpeg audio after rebuffer video-clock reset"
             );
         }
@@ -1309,7 +1347,7 @@ where
             audio_start_timeline_nsecs,
             audio_flush_until_timeline_nsecs,
             AudioClockMode::UnderrunRecovery,
-            DelayedAudioStartSilencePolicy::Skip,
+            delayed_audio_start_silence_policy,
             control,
             &mut output_scheduler.scheduled_video_queue,
             session_id,
@@ -1567,6 +1605,63 @@ mod tests {
             decoded_audio_ready: true,
             demux_ready: true,
         }
+    }
+
+    #[test]
+    fn short_rebuffer_audio_gap_uses_silence_from_video_resume_timeline() {
+        let resume_timeline_nsecs = 35_040_000_000;
+        let audio_snapshot = test_audio_snapshot(resume_timeline_nsecs);
+        let short_gap_decision = AudioClockResumeDecision {
+            timeline_nsecs: resume_timeline_nsecs,
+            reset_audio_to_video: true,
+            delayed_audio_start_timeline_nsecs: Some(resume_timeline_nsecs + 42_000_000),
+            allow_audio_gap_at_video_resume: true,
+            resume_anchor_source: Default::default(),
+        };
+        assert_eq!(
+            rebuffer_audio_flush_start(short_gap_decision, audio_snapshot),
+            (resume_timeline_nsecs, DelayedAudioStartSilencePolicy::Allow,)
+        );
+        let mut scheduler = PlaybackOutputScheduler::new();
+        scheduler.set_state(PlaybackOutputState::Rebuffering);
+        for index in 0..10_u64 {
+            scheduler.push_decoded_video_for_test(test_video_frame(
+                resume_timeline_nsecs + index * 40_000_000,
+                40_000_000,
+            ));
+        }
+        let audio_start_nsecs = short_gap_decision
+            .delayed_audio_start_timeline_nsecs
+            .expect("short delayed start");
+        let short_prefill_nsecs = duration_nsecs(AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION);
+        scheduler.push_pending_start_audio_for_test(
+            DecodedAudio {
+                samples: vec![0.0; 4],
+                duration_nsecs: short_prefill_nsecs,
+            },
+            audio_start_nsecs,
+            audio_start_nsecs + short_prefill_nsecs,
+        );
+        let prefill = rebuffer_audio_prefill_status(&scheduler, audio_snapshot, short_gap_decision)
+            .expect("short delayed start requests bounded prefill");
+        assert_eq!(prefill.target_nsecs, short_prefill_nsecs);
+        assert!(prefill.ready());
+
+        let long_gap_decision = AudioClockResumeDecision {
+            delayed_audio_start_timeline_nsecs: Some(
+                resume_timeline_nsecs + duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE) + 1,
+            ),
+            ..short_gap_decision
+        };
+        assert_eq!(
+            rebuffer_audio_flush_start(long_gap_decision, audio_snapshot),
+            (
+                long_gap_decision
+                    .delayed_audio_start_timeline_nsecs
+                    .expect("long delayed start"),
+                DelayedAudioStartSilencePolicy::Skip,
+            )
+        );
     }
 
     #[test]

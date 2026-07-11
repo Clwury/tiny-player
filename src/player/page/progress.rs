@@ -50,6 +50,9 @@ pub(super) fn cache_range_fractions(
     let Some(cache_state) = cache_state else {
         return Vec::new();
     };
+    // Mirror mpv OSC's seekRangesF: map each authoritative demux range directly
+    // onto the duration, preserving reported order and overlap. Clamping happens
+    // only when the range is translated to track coordinates for drawing.
     cache_state
         .demux
         .seekable_ranges

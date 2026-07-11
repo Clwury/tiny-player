@@ -370,6 +370,20 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_video_queue_if_a
     if audio_clock.available {
         return false;
     }
+    if !video_clock_drain_allowed_while_audio_unavailable(audio_clock) {
+        tracing::debug!(
+            session_id = ?session_id,
+            audio_output_pending_ms =
+                ?audio_clock.pending_nsecs.map(|pending| pending as f64 / 1_000_000.0),
+            audio_output_buffered_until_timeline_nsecs =
+                ?audio_clock.buffered_until_timeline_nsecs,
+            queued_video_frames = output_scheduler.scheduled_video_queue.len(),
+            queued_video_ms =
+                output_scheduler.scheduled_video_queue.duration_nsecs() as f64 / 1_000_000.0,
+            "holding FFmpeg video clock while audio output is underrun"
+        );
+        return false;
+    }
     if audio_clock.has_audio_output {
         tracing::debug!(
             session_id = ?session_id,
@@ -398,6 +412,10 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_video_queue_if_a
         subtitle_pipeline,
         buffered_reporter,
     )
+}
+
+fn video_clock_drain_allowed_while_audio_unavailable(audio_clock: AudioClockAvailability) -> bool {
+    !audio_clock.has_audio_output || !audio_clock.underrun_active
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -893,7 +911,10 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
 
 #[cfg(test)]
 mod tests {
-    use super::AudioClockedVideoDrainStatus;
+    use super::{
+        AudioClockAvailability, AudioClockedVideoDrainStatus,
+        video_clock_drain_allowed_while_audio_unavailable,
+    };
 
     #[test]
     fn audio_clocked_video_drain_status_tracks_progress() {
@@ -911,5 +932,27 @@ mod tests {
         );
         assert!(!AudioClockedVideoDrainStatus::Drained.made_progress());
         assert!(!AudioClockedVideoDrainStatus::Interrupted.made_progress());
+    }
+
+    #[test]
+    fn audio_underrun_holds_video_clocked_queue() {
+        assert!(!video_clock_drain_allowed_while_audio_unavailable(
+            AudioClockAvailability {
+                has_audio_output: true,
+                available: false,
+                pending_nsecs: Some(0),
+                buffered_until_timeline_nsecs: Some(24_716_997_309),
+                underrun_active: true,
+            }
+        ));
+        assert!(video_clock_drain_allowed_while_audio_unavailable(
+            AudioClockAvailability {
+                has_audio_output: false,
+                available: false,
+                pending_nsecs: None,
+                buffered_until_timeline_nsecs: None,
+                underrun_active: false,
+            }
+        ));
     }
 }

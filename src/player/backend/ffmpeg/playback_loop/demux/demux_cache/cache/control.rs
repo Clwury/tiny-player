@@ -8,6 +8,16 @@ use super::{
 };
 
 impl DemuxPacketCache {
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn set_playback_recovery_demand(
+        &self,
+        critical: bool,
+        video_required: bool,
+        audio_required: bool,
+    ) {
+        self.shared
+            .set_playback_recovery_demand(critical, video_required, audio_required);
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop) fn seek(
         &self,
         position_seconds: f64,

@@ -1,6 +1,38 @@
-use super::{ByteRingBuffer, HttpCacheRangeKind, HttpRingCacheState, RetainedCacheRange};
+use super::{
+    ByteRingBuffer, HttpCacheRangeKind, HttpCacheReadError, HttpRingCacheState, RetainedCacheRange,
+};
 
 impl HttpRingCacheState {
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn set_read_error(
+        &mut self,
+        offset: u64,
+        message: String,
+    ) {
+        self.error = Some(HttpCacheReadError { offset, message });
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn read_error_at(
+        &self,
+        offset: u64,
+    ) -> Option<&HttpCacheReadError> {
+        self.error.as_ref().filter(|error| error.offset == offset)
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn clear_read_error_covered_by(
+        &mut self,
+        offset: u64,
+        len: usize,
+    ) {
+        let end = offset.saturating_add(len as u64);
+        if self
+            .error
+            .as_ref()
+            .is_some_and(|error| error.offset >= offset && error.offset < end)
+        {
+            self.error = None;
+        }
+    }
+
     pub(in crate::player::backend::ffmpeg) fn copy_available(
         &mut self,
         offset: u64,

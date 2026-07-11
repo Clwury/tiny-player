@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use std::{
     sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, mpsc::Sender},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::player::backend::{BackendEvent, BackendEventKind, ByteCacheState, PlaybackCacheConfig};
@@ -13,8 +13,8 @@ use crate::player::render_host::PlaybackSessionId;
 #[cfg(test)]
 use super::HTTP_CACHE_PROBE_READ_WAIT;
 use super::{
-    CacheAppendPermit, CacheAppendResult, CacheReadResult, CacheRestartRequest, FfmpegControl,
-    HTTP_CACHE_CONTENT_LEN_WAIT, HTTP_CACHE_PARTIAL_READ_MIN_BYTES,
+    CacheAppendPermit, CacheAppendResult, CacheReadResult, CacheRestartRequest, CacheRetryPermit,
+    FfmpegControl, HTTP_CACHE_CONTENT_LEN_WAIT, HTTP_CACHE_PARTIAL_READ_MIN_BYTES,
     HTTP_CACHE_PREFETCH_PAUSE_LOG_AFTER, HTTP_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
     HTTP_CACHE_SIDE_DOWNLOAD_WORKERS, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
     HTTP_CACHE_STALL_LOG_AFTER, HTTP_CACHE_STALL_LOG_INTERVAL, HTTP_CACHE_WAIT_INTERVAL,
@@ -116,17 +116,6 @@ impl HttpRingCache {
                 );
                 return CacheReadResult::Interrupted;
             }
-            if let Some(error) = guard.error.clone() {
-                tracing::debug!(
-                    offset,
-                    current_offset,
-                    total,
-                    requested = output.len(),
-                    %error,
-                    "HTTP stream cache read failed"
-                );
-                return CacheReadResult::Error(error);
-            }
             if guard
                 .content_len
                 .is_some_and(|content_len| current_offset >= content_len)
@@ -180,6 +169,20 @@ impl HttpRingCache {
                 drop(guard);
                 self.shared.send_stream_cache_status(status);
                 return CacheReadResult::Data(total);
+            }
+            if let Some(error) = guard.read_error_at(current_offset).cloned()
+                && !guard.side_download_may_produce(current_offset)
+            {
+                tracing::debug!(
+                    offset,
+                    current_offset,
+                    total,
+                    requested = output.len(),
+                    error_offset = error.offset,
+                    error = %error.message,
+                    "HTTP stream cache read reached failed byte range"
+                );
+                return CacheReadResult::Error(error.message);
             }
             if current_offset < guard.base_offset || current_offset > guard.next_offset {
                 tracing::debug!(
@@ -321,9 +324,6 @@ impl HttpRingCache {
             if guard.shutdown || self.shared.control.should_stop() {
                 return CacheReadResult::Interrupted;
             }
-            if let Some(error) = guard.error.clone() {
-                return CacheReadResult::Error(error);
-            }
             if guard
                 .content_len
                 .is_some_and(|content_len| offset >= content_len)
@@ -332,6 +332,11 @@ impl HttpRingCache {
             }
             if let Some(read) = guard.copy_available(offset, output) {
                 return CacheReadResult::Data(read);
+            }
+            if let Some(error) = guard.read_error_at(offset).cloned()
+                && !guard.side_download_may_produce(offset)
+            {
+                return CacheReadResult::Error(error.message);
             }
             if offset < guard.base_offset || offset > guard.next_offset {
                 let status = guard
@@ -549,11 +554,96 @@ impl HttpRingCacheShared {
             .map(|request| request.offset)
     }
 
-    pub(in crate::player::backend::ffmpeg::avio) fn set_error(&self, error: String) {
-        tracing::warn!(%error, "HTTP video stream cache failed");
+    pub(in crate::player::backend::ffmpeg::avio) fn set_error_at(
+        &self,
+        offset: u64,
+        error: String,
+    ) {
+        tracing::warn!(offset, %error, "HTTP video stream cache range failed");
         let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
-        guard.error = Some(error);
+        guard.set_read_error(offset, error);
         self.ready.notify_all();
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn reader_offset_now(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("HTTP stream cache poisoned")
+            .reader_offset
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn wait_for_retry_delay(
+        &self,
+        delay: Duration,
+    ) -> bool {
+        let deadline = Instant::now()
+            .checked_add(delay)
+            .unwrap_or_else(Instant::now);
+        let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+        loop {
+            if guard.shutdown || self.control.should_stop() {
+                return false;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return true;
+            }
+            let (next_guard, _) = self
+                .ready
+                .wait_timeout(guard, deadline - now)
+                .expect("HTTP stream cache poisoned");
+            guard = next_guard;
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn wait_for_reader_at_or_restart(
+        &self,
+        offset: u64,
+    ) -> CacheRetryPermit {
+        let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+        loop {
+            if guard.shutdown || self.control.should_stop() {
+                return CacheRetryPermit::Stopped;
+            }
+            if let Some(request) = guard.restart_request.take() {
+                guard.restart_at_with_kind(request.offset, request.range_kind);
+                self.ready.notify_all();
+                return CacheRetryPermit::Restart(request.offset);
+            }
+            if guard.reader_offset >= offset {
+                return CacheRetryPermit::Ready;
+            }
+            let (next_guard, _) = self
+                .ready
+                .wait_timeout(guard, HTTP_CACHE_WAIT_INTERVAL)
+                .expect("HTTP stream cache poisoned");
+            guard = next_guard;
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn wait_for_restart_after_error(
+        &self,
+        offset: u64,
+    ) -> CacheRetryPermit {
+        let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+        loop {
+            if guard.shutdown || self.control.should_stop() {
+                return CacheRetryPermit::Stopped;
+            }
+            if let Some(request) = guard.restart_request.take() {
+                guard.restart_at_with_kind(request.offset, request.range_kind);
+                self.ready.notify_all();
+                return CacheRetryPermit::Restart(request.offset);
+            }
+            if guard.read_error_at(offset).is_none() {
+                return CacheRetryPermit::Ready;
+            }
+            let (next_guard, _) = self
+                .ready
+                .wait_timeout(guard, HTTP_CACHE_WAIT_INTERVAL)
+                .expect("HTTP stream cache poisoned");
+            guard = next_guard;
+        }
     }
 
     pub(in crate::player::backend::ffmpeg::avio) fn mark_eof(&self) {
@@ -617,6 +707,46 @@ impl HttpRingCacheShared {
             guard.finish_side_download_request(request, completed && !self.control.should_stop());
             guard.take_stream_cache_status_report()
         };
+        self.send_stream_cache_status(status);
+        self.ready.notify_all();
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn finish_side_download_with_error(
+        &self,
+        request: CacheRestartRequest,
+        error_offset: u64,
+        error: String,
+    ) {
+        let (status, affects_reader) = {
+            let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+            let request_end = request
+                .offset
+                .saturating_add(guard.side_range_request_bytes(request.range_kind).max(1));
+            let affects_reader = request.range_kind == HttpCacheRangeKind::Playback
+                && guard.reader_offset >= request.offset
+                && guard.reader_offset < request_end;
+            guard.finish_side_download_request(request, false);
+            if affects_reader {
+                guard.set_read_error(error_offset, error.clone());
+            }
+            (guard.take_stream_cache_status_report(), affects_reader)
+        };
+        if affects_reader {
+            tracing::warn!(
+                request_offset = request.offset,
+                error_offset,
+                %error,
+                "HTTP playback side range failed at the active reader"
+            );
+        } else {
+            tracing::warn!(
+                request_offset = request.offset,
+                error_offset,
+                range_kind = ?request.range_kind,
+                %error,
+                "HTTP background side range failed without poisoning playback"
+            );
+        }
         self.send_stream_cache_status(status);
         self.ready.notify_all();
     }
@@ -844,6 +974,7 @@ impl HttpRingCacheShared {
             if !guard.append_at(offset, data) {
                 return CacheAppendResult::Restart(offset);
             }
+            guard.clear_read_error_covered_by(offset, data.len());
             (
                 CacheAppendResult::Appended,
                 guard.take_stream_cache_status_report(),
@@ -871,6 +1002,7 @@ impl HttpRingCacheShared {
             if !guard.append_retained_at_protected(offset, data, request) {
                 return CacheAppendResult::Restart(offset);
             }
+            guard.clear_read_error_covered_by(offset, data.len());
             guard.take_stream_cache_status_report()
         };
         self.ready.notify_all();

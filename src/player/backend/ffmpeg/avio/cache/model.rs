@@ -51,7 +51,7 @@ pub(in crate::player::backend::ffmpeg) struct HttpRingCacheState {
         VecDeque<CacheRestartRequest>,
     pub(in crate::player::backend::ffmpeg::avio::cache) side_download_active:
         Vec<CacheRestartRequest>,
-    pub(in crate::player::backend::ffmpeg::avio::cache) error: Option<String>,
+    pub(in crate::player::backend::ffmpeg::avio::cache) error: Option<HttpCacheReadError>,
     pub(in crate::player::backend::ffmpeg::avio::cache) last_reported_status:
         Option<ByteCacheState>,
 }
@@ -63,6 +63,12 @@ pub(in crate::player::backend::ffmpeg) enum CacheReadResult {
     WouldBlock,
     Interrupted,
     Error(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg::avio::cache) struct HttpCacheReadError {
+    pub(in crate::player::backend::ffmpeg::avio::cache) offset: u64,
+    pub(in crate::player::backend::ffmpeg::avio::cache) message: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -81,6 +87,12 @@ pub(in crate::player::backend::ffmpeg::avio) enum CacheAppendPermit {
 
 pub(in crate::player::backend::ffmpeg::avio) enum CacheAppendResult {
     Appended,
+    Restart(u64),
+    Stopped,
+}
+
+pub(in crate::player::backend::ffmpeg::avio) enum CacheRetryPermit {
+    Ready,
     Restart(u64),
     Stopped,
 }

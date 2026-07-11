@@ -1,7 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     os::raw::c_int,
-    sync::{Arc, Condvar, Mutex, atomic::AtomicU64, mpsc::Sender},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize},
+        mpsc::Sender,
+    },
     thread::JoinHandle,
     time::Instant,
 };
@@ -22,8 +26,9 @@ use super::{
     DEMUX_CACHE_LOCK_TIMING_LOG_AFTER, DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_AFTER,
     DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL, DEMUX_PACKET_CACHE_STALL_LOG_AFTER,
     DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL, DEMUX_PACKET_CACHE_WAIT_INTERVAL, FfmpegControl,
-    FormatContext, StreamInfo, TimestampMapper, duration_nsecs, ffmpeg_error, nsecs_to_seconds,
-    optional_buffered_value_changed, packet_duration_nsecs, packet_is_video_recovery_point,
+    FormatContext, StreamInfo, TimestampMapper, audio_codec_requires_recovery_point,
+    duration_nsecs, ffmpeg_error, nsecs_to_seconds, optional_buffered_value_changed,
+    packet_duration_nsecs, packet_is_audio_recovery_point, packet_is_video_recovery_point,
     packet_is_video_seek_point, playback_buffered_near_duration, preroll_seek_position_seconds,
     seconds_to_nsecs, video_cached_seek_preroll_nsecs, video_seek_preroll_nsecs,
 };
@@ -52,9 +57,9 @@ use model::{
     DemuxCacheLockWait, DemuxCacheReportSnapshot, DemuxCachedRange, DemuxCachedSeekHit,
     DemuxInputRateSample, DemuxPacketAppendOutcome, DemuxPacketAppendTiming,
     DemuxPacketCacheThreadInput, DemuxPacketRangeView, DemuxPacketReadSource, DemuxPacketTimeline,
-    DemuxSeekRequest, DemuxSelectedStreams, DemuxStreamReaderRealignResult, PacketId, RangeId,
-    SeekableTimelineSummary, StreamCacheRangeState, StreamForwardState, StreamForwardWindow,
-    ordered_duration_seconds,
+    DemuxPacketTrimOutcome, DemuxSeekRequest, DemuxSelectedStreams, DemuxStreamReaderRealignResult,
+    PacketId, RangeId, SeekableTimelineSummary, StreamCacheRangeState, StreamForwardState,
+    StreamForwardWindow, ordered_duration_seconds,
 };
 pub(super) use model::{DemuxPacketCacheInput, DemuxReadResult, DemuxSeekResult};
 use policy::*;
@@ -84,6 +89,11 @@ struct DemuxPacketCacheShared {
     clock_start: Instant,
     demux_read_started_nanos: AtomicU64,
     last_would_block_diag_nanos: AtomicU64,
+    last_recovery_demand_diag_nanos: AtomicU64,
+    consumer_waiting_readers: AtomicUsize,
+    consumer_lock_pressure_until_nanos: AtomicU64,
+    playback_recovery_critical: AtomicBool,
+    playback_recovery_demand: AtomicU8,
 }
 
 struct DemuxPacketCacheState {
@@ -96,6 +106,8 @@ struct DemuxPacketCacheState {
     reader_heads: BTreeMap<c_int, PacketId>,
     reader_head_positions: BTreeMap<c_int, usize>,
     reader_head_generations: BTreeMap<c_int, u64>,
+    #[cfg(test)]
+    reader_tracking_full_refresh_count: u64,
     forward_streams: BTreeMap<c_int, StreamForwardState>,
     reader_forward_bytes: usize,
     read_range_id: RangeId,
@@ -119,6 +131,9 @@ struct DemuxPacketCacheState {
     cache_buffering_percent: Option<u8>,
     cached_bytes: usize,
     append_maintenance_packets: usize,
+    append_trim_pressure_packets: usize,
+    append_trim_active: bool,
+    append_trim_pending: bool,
     read_trim_pressure_packets: usize,
     reader_nsecs: u64,
     session_id: PlaybackSessionId,

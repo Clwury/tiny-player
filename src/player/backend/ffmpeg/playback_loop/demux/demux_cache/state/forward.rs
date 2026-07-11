@@ -184,6 +184,85 @@ impl DemuxPacketCacheState {
         }
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn update_forward_cache_after_reader_realign(
+        &mut self,
+        stream_index: c_int,
+        old_queue_position: Option<usize>,
+        new_queue_position: usize,
+    ) {
+        let extend_existing_backwards = old_queue_position
+            .is_some_and(|old_position| new_queue_position < old_position)
+            && self.forward_streams.contains_key(&stream_index);
+        if extend_existing_backwards {
+            let old_queue_position = old_queue_position.expect("checked above");
+            let packet_parts = self
+                .read_range()
+                .stream_queues
+                .get(&stream_index)
+                .into_iter()
+                .flat_map(|queue| {
+                    queue
+                        .iter()
+                        .skip(new_queue_position)
+                        .take(old_queue_position.saturating_sub(new_queue_position))
+                })
+                .filter_map(|packet_id| {
+                    self.packet_readable_in_current_generation(*packet_id)
+                        .then(|| self.packets.get(packet_id))
+                        .flatten()
+                        .map(|packet| (packet.byte_len, packet.start_nsecs, packet.end_nsecs))
+                })
+                .collect::<Vec<_>>();
+            if let Some(state) = self.forward_streams.get_mut(&stream_index) {
+                for (byte_len, start_nsecs, end_nsecs) in packet_parts {
+                    state.push_packet_parts(byte_len, start_nsecs, end_nsecs);
+                }
+            }
+        } else if old_queue_position != Some(new_queue_position)
+            || !self.forward_streams.contains_key(&stream_index)
+        {
+            self.rebuild_forward_cache_for_stream_from_queue_position(
+                stream_index,
+                new_queue_position,
+            );
+        }
+        self.reader_forward_bytes = self
+            .forward_streams
+            .values()
+            .map(|state| state.bytes)
+            .fold(0usize, usize::saturating_add);
+    }
+
+    fn rebuild_forward_cache_for_stream_from_queue_position(
+        &mut self,
+        stream_index: c_int,
+        queue_position: usize,
+    ) {
+        let packet_parts = self
+            .read_range()
+            .stream_queues
+            .get(&stream_index)
+            .into_iter()
+            .flat_map(|queue| queue.iter().skip(queue_position))
+            .filter_map(|packet_id| {
+                (self.packet_readable_in_current_generation(*packet_id)
+                    && !self.consumed_packet_ids.contains(packet_id))
+                .then(|| self.packets.get(packet_id))
+                .flatten()
+                .map(|packet| (packet.byte_len, packet.start_nsecs, packet.end_nsecs))
+            })
+            .collect::<Vec<_>>();
+        if packet_parts.is_empty() {
+            self.forward_streams.remove(&stream_index);
+            return;
+        }
+        let state = self.forward_streams.entry(stream_index).or_default();
+        *state = StreamForwardState::default();
+        for (byte_len, start_nsecs, end_nsecs) in packet_parts {
+            state.push_packet_parts(byte_len, start_nsecs, end_nsecs);
+        }
+    }
+
     fn rebuild_forward_cache_for_stream(&mut self, stream_index: c_int) {
         let mut state = StreamForwardState::default();
         let mut found = false;

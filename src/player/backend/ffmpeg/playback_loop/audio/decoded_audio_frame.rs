@@ -16,10 +16,43 @@ use super::{
     AudioOutput, BufferedReporter, DECODE_PACKET_SLOW_LOG_AFTER,
     DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER, FfmpegControl,
     PENDING_AUDIO_CONTINUITY_TOLERANCE, PlaybackOutputScheduler, PositionReporter,
-    SubtitlePipeline, TimestampMapper,
+    SubtitlePipeline, TimestampMapper, duration_nsecs,
 };
 
 const MAX_SEEK_AUDIO_LEAD_NSECS: u64 = 2_000_000_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodedAudioFrameServiceStatus {
+    ContinueDrain,
+    StopDrain,
+}
+
+fn far_ahead_audio_frame_is_contiguous(
+    frame_start_nsecs: u64,
+    far_ahead_reference_nsecs: u64,
+    pending_audio_range_nsecs: Option<(u64, u64)>,
+    audio_output_buffered_until_nsecs: u64,
+) -> bool {
+    let pending_audio_until_nsecs = pending_audio_range_nsecs
+        .filter(|(start_nsecs, _)| {
+            *start_nsecs <= far_ahead_reference_nsecs.saturating_add(MAX_SEEK_AUDIO_LEAD_NSECS)
+        })
+        .map(|(_, end_nsecs)| end_nsecs);
+    let contiguous_until_nsecs = pending_audio_until_nsecs
+        .unwrap_or(audio_output_buffered_until_nsecs.max(far_ahead_reference_nsecs));
+    frame_start_nsecs
+        <= contiguous_until_nsecs.saturating_add(duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE))
+}
+
+fn keep_filling_audio_resume_waterline(
+    waiting_for_output_resume: bool,
+    contiguous_audio_backpressured: bool,
+    audio_resume_waterline_below_input_suppression: bool,
+) -> bool {
+    waiting_for_output_resume
+        && !contiguous_audio_backpressured
+        && audio_resume_waterline_below_input_suppression
+}
 
 fn decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before(
     buffered_until_nsecs: u64,
@@ -29,7 +62,7 @@ fn decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn service_decoded_audio_frame(
+fn service_decoded_audio_frame(
     decoded_frame: AudioDecodedFrame,
     audio_time_base: ffi::AVRational,
     control: &FfmpegControl,
@@ -45,12 +78,12 @@ pub(super) fn service_decoded_audio_frame(
     event_tx: &Sender<BackendEvent>,
     subtitle_pipeline: &mut SubtitlePipeline,
     buffered_reporter: &mut BufferedReporter,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<DecodedAudioFrameServiceStatus, String> {
     if control.has_pending_seek() {
-        return Ok(());
+        return Ok(DecodedAudioFrameServiceStatus::StopDrain);
     }
     let Some(output) = audio_output else {
-        return Ok(());
+        return Ok(DecodedAudioFrameServiceStatus::ContinueDrain);
     };
 
     let raw_timestamp = decoded_frame.raw_timestamp;
@@ -83,7 +116,7 @@ pub(super) fn service_decoded_audio_frame(
             rebuffering = output_snapshot.rebuffering,
             "dropping FFmpeg audio frame before rebuffer audio sync drop-before"
         );
-        return Ok(());
+        return Ok(DecodedAudioFrameServiceStatus::ContinueDrain);
     }
     let far_ahead_reference_nsecs =
         output_scheduler.audio_far_ahead_reference_timeline_nsecs(current_start_position_nsecs);
@@ -92,36 +125,64 @@ pub(super) fn service_decoded_audio_frame(
             > far_ahead_reference_nsecs.saturating_add(MAX_SEEK_AUDIO_LEAD_NSECS)
     {
         let audio_snapshot = output.snapshot()?;
-        let rebuffer_audio_realign_request = output_scheduler
-            .observe_rebuffer_far_ahead_audio_frame(
-                timestamp.timeline_nsecs,
-                current_start_position_nsecs,
-                Some(audio_snapshot.total_pending_nsecs),
-                session_id,
-                "decoded_audio_far_ahead",
-            );
-        tracing::debug!(
-            session_id = ?session_id,
-            raw_timestamp,
-            timeline_nsecs = timestamp.timeline_nsecs,
-            current_start_position_nsecs,
+        let frame_is_contiguous = far_ahead_audio_frame_is_contiguous(
+            timestamp.timeline_nsecs,
             far_ahead_reference_nsecs,
-            audio_lead_ms = timestamp
-                .timeline_nsecs
-                .saturating_sub(far_ahead_reference_nsecs) as f64
-                / 1_000_000.0,
-            output_state = ?output_snapshot.state,
-            first_video_frame_pending = output_snapshot.first_video_frame_pending,
-            rebuffering = output_snapshot.rebuffering,
-            queued_video_frames = output_snapshot.queued_video_frames,
-            audio_output_pending_ms = audio_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
-            rebuffer_audio_realign_target_nsecs =
-                ?rebuffer_audio_realign_request.map(|request| request.target_timeline_nsecs),
-            rebuffer_audio_realign_drop_count =
-                ?rebuffer_audio_realign_request.map(|request| request.far_ahead_drop_count),
-            "dropping FFmpeg audio frame far ahead of seek/rebuffer resume"
+            output_scheduler.pending_audio_contiguous_range_nsecs(),
+            audio_snapshot.buffered_until_timeline_nsecs,
         );
-        return Ok(());
+        if frame_is_contiguous {
+            tracing::debug!(
+                session_id = ?session_id,
+                raw_timestamp,
+                timeline_nsecs = timestamp.timeline_nsecs,
+                buffered_until_nsecs,
+                current_start_position_nsecs,
+                far_ahead_reference_nsecs,
+                audio_lead_ms = timestamp
+                    .timeline_nsecs
+                    .saturating_sub(far_ahead_reference_nsecs) as f64
+                    / 1_000_000.0,
+                output_state = ?output_snapshot.state,
+                first_video_frame_pending = output_snapshot.first_video_frame_pending,
+                rebuffering = output_snapshot.rebuffering,
+                queued_video_frames = output_snapshot.queued_video_frames,
+                audio_output_pending_ms = audio_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
+                "buffering contiguous FFmpeg audio frame at seek/rebuffer lead limit and stopping drain"
+            );
+        } else {
+            let rebuffer_audio_realign_request = output_scheduler
+                .observe_rebuffer_far_ahead_audio_frame(
+                    timestamp.timeline_nsecs,
+                    current_start_position_nsecs,
+                    Some(audio_snapshot.total_pending_nsecs),
+                    true,
+                    session_id,
+                    "decoded_audio_continuity_gap",
+                );
+            tracing::debug!(
+                session_id = ?session_id,
+                raw_timestamp,
+                timeline_nsecs = timestamp.timeline_nsecs,
+                current_start_position_nsecs,
+                far_ahead_reference_nsecs,
+                audio_lead_ms = timestamp
+                    .timeline_nsecs
+                    .saturating_sub(far_ahead_reference_nsecs) as f64
+                    / 1_000_000.0,
+                output_state = ?output_snapshot.state,
+                first_video_frame_pending = output_snapshot.first_video_frame_pending,
+                rebuffering = output_snapshot.rebuffering,
+                queued_video_frames = output_snapshot.queued_video_frames,
+                audio_output_pending_ms = audio_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
+                rebuffer_audio_realign_target_nsecs =
+                    ?rebuffer_audio_realign_request.map(|request| request.target_timeline_nsecs),
+                rebuffer_audio_realign_drop_count =
+                    ?rebuffer_audio_realign_request.map(|request| request.far_ahead_drop_count),
+                "dropping discontinuous FFmpeg audio frame and stopping drain for reader realign"
+            );
+            return Ok(DecodedAudioFrameServiceStatus::StopDrain);
+        }
     }
     output_scheduler.clear_rebuffer_far_ahead_audio_observation();
     if timestamp.timeline_nsecs < current_start_position_nsecs {
@@ -146,7 +207,7 @@ pub(super) fn service_decoded_audio_frame(
                 "dropping FFmpeg audio frame before playback start"
             );
         }
-        return Ok(());
+        return Ok(DecodedAudioFrameServiceStatus::ContinueDrain);
     }
 
     output_scheduler.push_decoded_audio_or_buffer(
@@ -180,7 +241,14 @@ pub(super) fn service_decoded_audio_frame(
         session_id,
         "decoded_audio_frame",
     );
-    Ok(())
+    if (output_snapshot.first_video_frame_pending || output_snapshot.rebuffering)
+        && timestamp.timeline_nsecs
+            > far_ahead_reference_nsecs.saturating_add(MAX_SEEK_AUDIO_LEAD_NSECS)
+    {
+        Ok(DecodedAudioFrameServiceStatus::StopDrain)
+    } else {
+        Ok(DecodedAudioFrameServiceStatus::ContinueDrain)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -299,13 +367,16 @@ pub(super) fn drain_ready_audio_decode_output(
                         session_id,
                     );
                 }
-                let keep_filling_resume_waterline = output_scheduler.waiting_for_output_resume()
-                    && output_scheduler.audio_resume_waterline_below_input_suppression(
+                let keep_filling_resume_waterline = keep_filling_audio_resume_waterline(
+                    output_scheduler.waiting_for_output_resume(),
+                    output_scheduler.output_wait_audio_input_backpressured(),
+                    output_scheduler.audio_resume_waterline_below_input_suppression(
                         audio_snapshot,
                         worker_snapshot.queued_duration_nsecs,
                         worker_snapshot.in_flight_packets,
                         current_start_position_nsecs,
-                    );
+                    ),
+                );
                 if !keep_filling_resume_waterline {
                     timing.pending_audio_backpressure += stage_started_at.elapsed();
                     break;
@@ -324,7 +395,7 @@ pub(super) fn drain_ready_audio_decode_output(
             made_progress = true;
             timing.decoded_frames = timing.decoded_frames.saturating_add(1);
             let stage_started_at = Instant::now();
-            service_decoded_audio_frame(
+            let service_status = service_decoded_audio_frame(
                 decoded_frame,
                 audio_time_base,
                 control,
@@ -342,7 +413,9 @@ pub(super) fn drain_ready_audio_decode_output(
                 buffered_reporter,
             )?;
             timing.service_frame += stage_started_at.elapsed();
-            if control.has_pending_seek() {
+            if control.has_pending_seek()
+                || service_status == DecodedAudioFrameServiceStatus::StopDrain
+            {
                 break;
             }
             continue;
@@ -457,7 +530,10 @@ pub(super) fn process_audio_decode_drain_result(
 
 #[cfg(test)]
 mod tests {
-    use super::decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before as drops_before_sync_watermark;
+    use super::{
+        decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before as drops_before_sync_watermark,
+        far_ahead_audio_frame_is_contiguous, keep_filling_audio_resume_waterline,
+    };
 
     #[test]
     fn decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before() {
@@ -479,5 +555,31 @@ mod tests {
             24_000_000_001,
             drop_before_timeline_nsecs
         ));
+    }
+
+    #[test]
+    fn far_ahead_boundary_frame_remains_contiguous_with_pending_audio_tail() {
+        assert!(far_ahead_audio_frame_is_contiguous(
+            204_567_800_334,
+            202_549_751_669,
+            Some((202_570_884_290, 204_567_800_334)),
+            202_549_751_669,
+        ));
+    }
+
+    #[test]
+    fn far_ahead_frame_after_reader_gap_requires_realign() {
+        assert!(!far_ahead_audio_frame_is_contiguous(
+            210_535_328_512,
+            204_583_333_333,
+            None,
+            204_567_800_334,
+        ));
+    }
+
+    #[test]
+    fn contiguous_startup_audio_backpressure_stops_waterline_drain() {
+        assert!(!keep_filling_audio_resume_waterline(true, true, true));
+        assert!(keep_filling_audio_resume_waterline(true, false, true));
     }
 }

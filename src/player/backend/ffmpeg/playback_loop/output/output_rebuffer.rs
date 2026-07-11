@@ -14,10 +14,11 @@ use super::scheduled_video_queue::{
     queued_video_largest_gap_nsecs, queued_video_range_nsecs,
 };
 use super::{
-    AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AUDIO_OUTPUT_VIDEO_LEAD_DURATION,
-    AUDIO_REBUFFER_DELAYED_START_MAX, AUDIO_REBUFFER_PREFILL_TARGET,
-    AUDIO_VIDEO_REBUFFER_DRIFT_RESET_THRESHOLD, AudioOutput, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
-    DemuxReaderWatermark, FfmpegControl, PENDING_AUDIO_CONTINUITY_TOLERANCE, QueuedVideoFrame,
+    AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
+    AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AUDIO_REBUFFER_DELAYED_START_MAX,
+    AUDIO_REBUFFER_PREFILL_TARGET, AUDIO_VIDEO_REBUFFER_DRIFT_RESET_THRESHOLD, AudioOutput,
+    DEFAULT_VIDEO_FRAME_DURATION_NSECS, DemuxReaderWatermark, FfmpegControl,
+    PENDING_AUDIO_CONTINUITY_TOLERANCE, QueuedVideoFrame,
     VIDEO_DECODE_SKIP_NONREF_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER,
     VIDEO_OUTPUT_REBUFFER_ENTER_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
     VIDEO_OUTPUT_REBUFFER_MIN_STABLE_RESUME_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
@@ -824,9 +825,16 @@ fn rebuffer_delayed_audio_start_timeline_nsecs(
             {
                 return false;
             }
+            let required_prefill_nsecs =
+                if gap_nsecs <= duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE) {
+                    prefill_target_nsecs
+                        .min(duration_nsecs(AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION))
+                } else {
+                    prefill_target_nsecs
+                };
             pending_audio
                 .forward_duration_from(*audio_start)
-                .is_some_and(|duration| duration >= prefill_target_nsecs)
+                .is_some_and(|duration| duration >= required_prefill_nsecs)
         })
 }
 
@@ -1709,13 +1717,13 @@ mod tests {
 
     use super::super::DecodedAudio;
     use super::{
-        AUDIO_REBUFFER_DELAYED_START_MAX, AUDIO_REBUFFER_PREFILL_TARGET, AudioResumeWaterline,
-        AudioResumeWaterlineInput, DEFAULT_VIDEO_FRAME_DURATION_NSECS, DemuxReaderWatermark,
-        InitialOutputSyncDecision, PendingStartAudio, PlaybackResumeWaterline,
-        PlaybackResumeWaterlineOptions, QueuedVideoFrame, RebufferAudioAnchorResetContext,
-        ResumeAnchorSource, VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER,
-        VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-        VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER,
+        AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION, AUDIO_REBUFFER_DELAYED_START_MAX,
+        AUDIO_REBUFFER_PREFILL_TARGET, AudioResumeWaterline, AudioResumeWaterlineInput,
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS, DemuxReaderWatermark, InitialOutputSyncDecision,
+        PendingStartAudio, PlaybackResumeWaterline, PlaybackResumeWaterlineOptions,
+        QueuedVideoFrame, RebufferAudioAnchorResetContext, ResumeAnchorSource,
+        VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
+        VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER,
         VIDEO_OUTPUT_START_FIRST_FRAME_FALLBACK_AFTER, VIDEO_OUTPUT_START_PREBUFFER_DURATION,
         VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, audio_output_buffered_until_for_resume,
         duration_nsecs, initial_first_frame_resume_waterline_after_cached_seek_wait,
@@ -2141,6 +2149,54 @@ mod tests {
             waterline.delayed_audio_start_gap_nsecs,
             Some(first_audio_nsecs - first_video_nsecs)
         );
+    }
+
+    #[test]
+    fn rebuffer_short_audio_gap_uses_clock_resume_prefill_without_two_second_fallback() {
+        let anchor_nsecs = 35_000_000_000;
+        let first_video_nsecs = 35_040_000_000;
+        let first_audio_nsecs = first_video_nsecs + 42_000_000;
+        let audio_prefill_nsecs = duration_nsecs(AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION);
+        let target_nsecs = duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
+        let queued_video_frames = queued_video_window(first_video_nsecs, target_nsecs);
+        let mut pending_audio = PendingStartAudio::default();
+        pending_audio.push(
+            DecodedAudio {
+                samples: vec![0.0; 4],
+                duration_nsecs: audio_prefill_nsecs,
+            },
+            first_audio_nsecs,
+            first_audio_nsecs + audio_prefill_nsecs,
+        );
+
+        let decision = rebuffer_audio_clock_resume_decision(
+            &queued_video_frames,
+            &pending_audio,
+            anchor_nsecs,
+            None,
+            Some(0),
+            false,
+        )
+        .expect("short audio gap produces a rebuffer resume decision");
+
+        assert_eq!(decision.timeline_nsecs, first_video_nsecs);
+        assert_eq!(
+            decision.delayed_audio_start_timeline_nsecs,
+            Some(first_audio_nsecs)
+        );
+        assert!(decision.allow_audio_gap_at_video_resume);
+        let waterline = rebuffer_playback_resume_waterline_for_decision(
+            &queued_video_frames,
+            &pending_audio,
+            decision,
+            ready_demux_watermark(target_nsecs),
+            None,
+            false,
+            true,
+            false,
+        );
+        assert!(waterline.ready());
+        assert_eq!(waterline.delayed_audio_start_gap_nsecs, Some(42_000_000));
     }
 
     #[test]

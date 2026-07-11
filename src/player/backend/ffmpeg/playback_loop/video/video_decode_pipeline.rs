@@ -21,7 +21,8 @@ use super::video_decode_worker::{
 use super::{
     AvPacket, CORRUPT_VIDEO_FRAME_RECOVERY_ERROR, Decoder, DemuxReaderWatermark, DoviPipeline,
     HardwareDecodeMode, PlaybackBlockReason, PlaybackGeneration, PlaybackOutputSnapshot,
-    StreamInfo, VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    StreamInfo, VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS,
+    VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
     duration_nsecs, packet_is_video_recovery_point, packet_is_video_seek_point, timestamp_to_nsecs,
 };
 
@@ -944,9 +945,17 @@ impl HevcDecodeChainWatchdog {
         let demux_underrun = input.demux_watermark.underrun
             || input.demux_watermark.video_underrun
             || (input.has_audio_output && input.demux_watermark.audio_underrun);
-        let output_unstable = (input.output_snapshot.rebuffering
-            && !input.output_snapshot.video_decode_underfill)
-            || input.output_snapshot.video_output_low_water;
+        let queued_video_contiguous_forward_nsecs = input
+            .output_snapshot
+            .queued_video_contiguous_forward_nsecs
+            .or(input.output_snapshot.queued_video_forward_nsecs)
+            .unwrap_or(input.output_snapshot.queued_video_duration_nsecs);
+        let rebuffer_video_starving = input.output_snapshot.rebuffering
+            && queued_video_contiguous_forward_nsecs
+                <= duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION);
+        let output_unstable = input.output_snapshot.video_output_low_water
+            || input.output_snapshot.video_decode_underfill
+            || rebuffer_video_starving;
         let startup_zero_output_context = hevc_startup_first_frame_zero_output_context(
             input.output_snapshot,
             input.demux_watermark,
@@ -2563,6 +2572,28 @@ mod tests {
         ));
 
         assert_eq!(action, HevcDecodeChainRecoveryAction::SoftRecovery);
+        assert_eq!(watchdog.take_fallback(), None);
+    }
+
+    #[test]
+    fn hevc_zero_output_watchdog_keeps_hardware_decode_when_rebuffer_has_video_headroom() {
+        let mut watchdog = HevcDecodeChainWatchdog::default();
+        let queued_video_end_nsecs = 583_322_222;
+        let action = watchdog.observe_packet(hevc_watchdog_input(
+            1_375_322_222,
+            output_snapshot(
+                PlaybackOutputState::Rebuffering,
+                true,
+                false,
+                Some((0, queued_video_end_nsecs)),
+                Some(queued_video_end_nsecs),
+            ),
+            demux_watermark(false),
+            0,
+        ));
+
+        assert_eq!(action, HevcDecodeChainRecoveryAction::None);
+        assert!(!watchdog.soft_recovery_attempted);
         assert_eq!(watchdog.take_fallback(), None);
     }
 
