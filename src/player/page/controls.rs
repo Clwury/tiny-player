@@ -835,11 +835,6 @@ impl PlaybackPage {
         } else {
             theme.input_border_focused
         };
-        let thumb_border_color = match state.cached_seek_preview {
-            Some(true) => theme.input_border_focused.opacity(0.86),
-            Some(false) => theme.warning.opacity(0.92),
-            None => theme.input_border_focused.opacity(0.7),
-        };
 
         let track = div()
             .id("playback-progress-track")
@@ -869,20 +864,10 @@ impl PlaybackPage {
                     }),
             );
         let track = track
-            .child(progress_track_fill(played_color, state.played_fraction))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(9.0))
-                    .left(relative(state.played_fraction))
-                    .ml(-px(2.0))
-                    .w(px(4.0))
-                    .h(px(10.0))
-                    .rounded(px(2.0))
-                    .bg(theme.foreground)
-                    .border_1()
-                    .border_color(thumb_border_color),
-            )
+            .child(progress_track_played_fill(
+                played_color,
+                state.played_fraction,
+            ))
             .child(progress_track_observer(cx));
 
         div()
@@ -990,15 +975,21 @@ impl PlaybackPage {
     }
 }
 
-fn progress_track_fill(color: gpui::Hsla, width_fraction: f32) -> impl IntoElement {
+fn progress_track_fill(color: gpui::Hsla, width_fraction: f32) -> gpui::Div {
     div()
         .absolute()
         .left_0()
         .top(px(11.0))
         .h(px(6.0))
         .w(relative(width_fraction))
-        .rounded_full()
+        .rounded(px(3.0))
         .bg(color)
+}
+
+fn progress_track_played_fill(color: gpui::Hsla, width_fraction: f32) -> impl IntoElement {
+    let width_fraction = width_fraction.clamp(0.0, 1.0);
+    progress_track_fill(color, width_fraction)
+        .when(width_fraction > 0.0, |fill| fill.min_w(px(6.0)))
 }
 
 fn progress_track_seekable_range_fill(

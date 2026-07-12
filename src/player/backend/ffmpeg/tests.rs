@@ -1,5 +1,8 @@
 use super::avio::{CacheRestartRequest, CachedInputSource, HttpCacheRangeKind};
-use super::worker::{FfmpegCommand, PendingSeek, PendingTrackSelection, drain_playback_commands};
+use super::worker::{
+    FfmpegCommand, PendingSeek, PendingTrackSelection, coalesce_playback_seek_commands,
+    drain_playback_commands,
+};
 use super::{
     AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
     AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN,
@@ -203,6 +206,85 @@ fn drain_playback_commands_keeps_latest_live_cache_config() {
     assert_eq!(drained.cache_config, Some(second.normalized()));
     assert!(drained.pending_seek.is_none());
     assert!(drained.pending_track_selection.is_none());
+}
+
+#[test]
+fn drain_playback_commands_coalesces_continuous_seeks_to_latest_generation() {
+    let control = FfmpegControl::new(PlaybackSessionId(1));
+    let (command_tx, command_rx) = mpsc::channel();
+
+    for position_seconds in [75.0, 77.0, 79.0] {
+        let generation = control.request_seek();
+        command_tx
+            .send(FfmpegCommand::Seek {
+                session_id: PlaybackSessionId(1),
+                position_seconds,
+                mode: PlaybackSeekMode::Fast,
+                generation,
+            })
+            .unwrap();
+    }
+
+    let drained = drain_playback_commands(&command_rx, &control);
+    let pending_seek = drained.pending_seek.expect("latest seek is retained");
+
+    assert_eq!(pending_seek.generation, control.seek_generation());
+    assert_eq!(pending_seek.position_seconds, 79.0);
+}
+
+#[test]
+fn trailing_edge_seek_coalescing_keeps_commands_arriving_after_initial_drain() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
+    let (command_tx, command_rx) = mpsc::channel();
+    let first_generation = control.request_seek();
+    command_tx
+        .send(FfmpegCommand::Seek {
+            session_id: PlaybackSessionId(1),
+            position_seconds: 75.0,
+            mode: PlaybackSeekMode::Fast,
+            generation: first_generation,
+        })
+        .unwrap();
+    let initial = drain_playback_commands(&command_rx, &control);
+    assert_eq!(
+        initial.pending_seek.map(|pending| pending.generation),
+        Some(first_generation)
+    );
+
+    let sender_control = Arc::clone(&control);
+    let sender = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        let second_generation = sender_control.request_seek();
+        command_tx
+            .send(FfmpegCommand::Seek {
+                session_id: PlaybackSessionId(1),
+                position_seconds: 77.0,
+                mode: PlaybackSeekMode::Fast,
+                generation: second_generation,
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(5));
+        let latest_generation = sender_control.request_seek();
+        command_tx
+            .send(FfmpegCommand::Seek {
+                session_id: PlaybackSessionId(1),
+                position_seconds: 79.0,
+                mode: PlaybackSeekMode::Fast,
+                generation: latest_generation,
+            })
+            .unwrap();
+        latest_generation
+    });
+
+    let drained =
+        coalesce_playback_seek_commands(&command_rx, &control, initial, Duration::from_millis(20));
+    let latest_generation = sender.join().unwrap();
+    let pending_seek = drained
+        .pending_seek
+        .expect("latest trailing seek is retained");
+
+    assert_eq!(pending_seek.generation, latest_generation);
+    assert_eq!(pending_seek.position_seconds, 79.0);
 }
 
 #[test]

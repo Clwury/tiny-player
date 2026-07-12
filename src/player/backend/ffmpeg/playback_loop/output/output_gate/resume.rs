@@ -9,9 +9,9 @@ use super::{
     PlaybackSessionId, PositionReporter, Sender, SubtitlePipeline,
     VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
     VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE,
-    VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER, VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER,
-    VideoDecodeWorkerSnapshot, VideoOutputQueue, audio_output_buffered_until_for_resume,
-    audio_output_contiguous_start_timeline_nsecs,
+    VIDEO_OUTPUT_START_FAST_READY_DURATION, VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER,
+    VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, VideoDecodeWorkerSnapshot, VideoOutputQueue,
+    audio_output_buffered_until_for_resume, audio_output_contiguous_start_timeline_nsecs,
     discard_decoded_video_before_output_gate_resume_if_ready, duration_nsecs,
     flush_pending_start_audio, initial_delayed_audio_start_timeline_nsecs,
     initial_first_frame_resume_waterline_after_cached_seek_wait,
@@ -93,6 +93,7 @@ fn hevc_startup_gate_defer_reason(
     after: PlaybackResumeWaterline,
     queued_video_frames: usize,
     hevc_decode_chain_stats: HevcDecodeChainStats,
+    startup_sync_elapsed: Option<Duration>,
 ) -> Option<&'static str> {
     if !video_is_hevc || before.decoded_video_ready || !after.decoded_video_ready {
         return None;
@@ -104,7 +105,13 @@ fn hevc_startup_gate_defer_reason(
         return Some("insufficient_lookahead_frames");
     }
     let decoded_video_forward_nsecs = after.decoded_video_forward_nsecs.unwrap_or_default();
-    if decoded_video_forward_nsecs < duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION) {
+    let bounded_startup_fallback_ready = decoded_video_forward_nsecs
+        >= duration_nsecs(VIDEO_OUTPUT_START_FAST_READY_DURATION)
+        && startup_sync_elapsed
+            .is_some_and(|elapsed| elapsed >= VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER);
+    if decoded_video_forward_nsecs < duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
+        && !bounded_startup_fallback_ready
+    {
         return Some("decoded_video_below_hevc_startup_waterline");
     }
     None
@@ -994,6 +1001,7 @@ where
             first_frame_waterline,
             output_scheduler.scheduled_video_queue.len(),
             hevc_decode_chain_stats,
+            output_scheduler.startup_sync_elapsed(),
         ) {
             first_frame_waterline.decoded_video_ready = false;
             tracing::debug!(
@@ -1535,6 +1543,7 @@ where
 mod tests {
     use crate::player::render_host::{DecodedFrame, FramePixels, FramePts, RenderSize};
 
+    use super::super::super::video_decode_pipeline::HevcDecodeChainFallbackReason;
     use super::super::{DecodedAudio, QueuedVideoFrame, RebufferResumeAnchor};
     use super::*;
 
@@ -1679,6 +1688,7 @@ mod tests {
                     recent_zero_output_packets: 1,
                     ..Default::default()
                 },
+                None,
             ),
             Some("recent_zero_output_or_recovery")
         );
@@ -1690,8 +1700,67 @@ mod tests {
         let after = startup_gate_waterline(80_000_000, true);
 
         assert_eq!(
-            hevc_startup_gate_defer_reason(true, before, after, 2, HevcDecodeChainStats::default(),),
+            hevc_startup_gate_defer_reason(
+                true,
+                before,
+                after,
+                2,
+                HevcDecodeChainStats::default(),
+                None,
+            ),
             Some("decoded_video_below_hevc_startup_waterline")
+        );
+    }
+
+    #[test]
+    fn hevc_startup_gate_allows_bounded_start_with_short_contiguous_head() {
+        let before = startup_gate_waterline(120_000_000, false);
+        let after = startup_gate_waterline(120_000_000, true);
+
+        assert_eq!(
+            hevc_startup_gate_defer_reason(
+                true,
+                before,
+                after,
+                56,
+                HevcDecodeChainStats::default(),
+                Some(VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER - Duration::from_millis(1)),
+            ),
+            Some("decoded_video_below_hevc_startup_waterline")
+        );
+        assert_eq!(
+            hevc_startup_gate_defer_reason(
+                true,
+                before,
+                after,
+                56,
+                HevcDecodeChainStats::default(),
+                Some(VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hevc_startup_gate_keeps_pts_gap_fallback_ahead_of_bounded_start() {
+        let before = startup_gate_waterline(120_000_000, false);
+        let after = startup_gate_waterline(120_000_000, true);
+
+        assert_eq!(
+            hevc_startup_gate_defer_reason(
+                true,
+                before,
+                after,
+                56,
+                HevcDecodeChainStats {
+                    pending_fallback_reason: Some(
+                        HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
+                    ),
+                    ..Default::default()
+                },
+                Some(VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER),
+            ),
+            Some("recent_zero_output_or_recovery")
         );
     }
 

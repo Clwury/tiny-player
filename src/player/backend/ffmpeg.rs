@@ -75,8 +75,8 @@ use util::ffmpeg_error;
 use video::ffmpeg_raw_video_format;
 use video::{VideoFrameConvertContext, VideoFrameConverter, frame_size, video_frame_len};
 use worker::{
-    FfmpegCommand, FfmpegControl, FfmpegPlaybackInput, FfmpegWorker, drain_playback_commands,
-    ffmpeg_interrupt_callback,
+    FfmpegCommand, FfmpegControl, FfmpegPlaybackInput, FfmpegWorker,
+    coalesce_playback_seek_commands, drain_playback_commands, ffmpeg_interrupt_callback,
 };
 
 fn normalize_playback_volume(volume: f32) -> f32 {

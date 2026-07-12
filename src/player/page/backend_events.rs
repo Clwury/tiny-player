@@ -29,21 +29,7 @@ impl PlaybackPage {
     ) {
         match event.kind {
             BackendEventKind::PlaybackRestart => {
-                let paused_for_cache = self.timeline.paused_for_cache;
-                let cache_buffering_percent = self.timeline.cache_buffering_percent;
-                self.timeline.loaded = true;
-                self.timeline.ended = false;
-                self.timeline.user_paused = false;
-                self.timeline.paused =
-                    effective_playback_paused(self.timeline.user_paused, paused_for_cache);
-                self.timeline.buffering = false;
-                self.timeline.cache_state = None;
-                self.timeline.cache_status_open = false;
-                self.timeline.paused_for_cache = paused_for_cache;
-                self.timeline.cache_buffering_percent =
-                    cache_buffering_percent.filter(|_| paused_for_cache);
-                self.timeline.pending_seek_position = None;
-                self.timeline.pending_seek_keeps_frame = false;
+                apply_playback_restart_to_timeline(&mut self.timeline);
                 self.status_message = "".into();
                 self.error_message = None;
             }
@@ -312,6 +298,23 @@ fn cache_state_needs_poll(state: &PlaybackCacheState) -> bool {
     !state.demux.idle && !state.demux.eof
 }
 
+fn apply_playback_restart_to_timeline(timeline: &mut PlaybackTimelineState) {
+    let paused_for_cache = timeline.paused_for_cache;
+    let cache_buffering_percent = timeline.cache_buffering_percent;
+    timeline.loaded = true;
+    timeline.ended = false;
+    timeline.user_paused = false;
+    timeline.paused = effective_playback_paused(timeline.user_paused, paused_for_cache);
+    timeline.buffering = false;
+    // A restart also marks the first frame after a seek. The cache state emitted
+    // earlier in the same poll remains authoritative until the next cache tick.
+    timeline.cache_status_open = false;
+    timeline.paused_for_cache = paused_for_cache;
+    timeline.cache_buffering_percent = cache_buffering_percent.filter(|_| paused_for_cache);
+    timeline.pending_seek_position = None;
+    timeline.pending_seek_keeps_frame = false;
+}
+
 fn apply_paused_for_cache_to_timeline(
     timeline: &mut PlaybackTimelineState,
     paused_for_cache: bool,
@@ -338,11 +341,13 @@ fn apply_cache_buffering_to_timeline(timeline: &mut PlaybackTimelineState, perce
 
 #[cfg(test)]
 mod tests {
-    use crate::player::backend::{ByteCacheState, DemuxCacheState, PlaybackCacheState};
+    use crate::player::backend::{
+        ByteCacheState, DemuxCacheState, PlaybackCacheState, PlaybackCacheTimeRange,
+    };
 
     use super::{
         apply_cache_buffering_to_timeline, apply_paused_for_cache_to_timeline,
-        cache_state_needs_poll,
+        apply_playback_restart_to_timeline, cache_state_needs_poll,
     };
     use crate::player::page::state::PlaybackTimelineState;
 
@@ -422,6 +427,40 @@ mod tests {
         };
 
         assert!(cache_state_needs_poll(&state));
+    }
+
+    #[test]
+    fn playback_restart_preserves_seekable_cache_ranges() {
+        let cache_state = PlaybackCacheState {
+            demux: DemuxCacheState {
+                cache_end: Some(90.0),
+                reader_pts: Some(60.0),
+                seekable_ranges: vec![PlaybackCacheTimeRange {
+                    start: 12.0,
+                    end: 90.0,
+                }],
+                ..DemuxCacheState::default()
+            },
+            ..PlaybackCacheState::default()
+        };
+        let mut timeline = PlaybackTimelineState {
+            loaded: true,
+            buffering: true,
+            cache_state: Some(cache_state.clone()),
+            cache_status_open: true,
+            pending_seek_position: Some(60.0),
+            pending_seek_keeps_frame: true,
+            ..PlaybackTimelineState::default()
+        };
+
+        apply_playback_restart_to_timeline(&mut timeline);
+
+        assert_eq!(timeline.cache_state.as_ref(), Some(&cache_state));
+        assert!(timeline.loaded);
+        assert!(!timeline.buffering);
+        assert!(!timeline.cache_status_open);
+        assert_eq!(timeline.pending_seek_position, None);
+        assert!(!timeline.pending_seek_keeps_frame);
     }
 
     #[test]

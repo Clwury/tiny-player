@@ -84,7 +84,7 @@ enum CachedSeekRecoveryWatchdogDecision {
     Fallback(CachedSeekRecoveryFallbackReason),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CachedSeekRecoveryWatchdog {
     target_nsecs: u64,
     started_at: Instant,
@@ -219,7 +219,7 @@ impl PlaybackPipelineState {
         self.video_decode_pipeline.flush_buffers(generation)?;
         self.restore_video_decode_skip_nonref_default(None, "playback_generation_flush")?;
         self.video_decode_pipeline
-            .reset_hevc_decode_chain_watchdog();
+            .reset_hevc_decode_chain_transient_state();
         if let Some(worker) = self.audio_decode_pipeline.as_mut() {
             worker.flush_buffers(generation)?;
         }
@@ -307,7 +307,7 @@ impl PlaybackPipelineState {
             .video_decode_pipeline
             .requeue_hevc_startup_probe_packets(&mut self.playback_generation, session_id)?;
         self.video_decode_pipeline
-            .reset_hevc_decode_chain_watchdog();
+            .reset_hevc_decode_chain_transient_state();
         tracing::debug!(
             session_id = ?session_id,
             generation,
@@ -326,17 +326,35 @@ impl PlaybackPipelineState {
             self.cached_seek_recovery_watchdog = None;
             return;
         }
-        self.cached_seek_recovery_watchdog = Some(CachedSeekRecoveryWatchdog {
+        let previous_target_nsecs = self
+            .cached_seek_recovery_watchdog
+            .map(|watchdog| watchdog.target_nsecs);
+        let (watchdog, started) = cached_seek_recovery_watchdog_after_begin(
+            self.cached_seek_recovery_watchdog,
             target_nsecs,
-            started_at: Instant::now(),
-            start_video_packet_count: self.video_packet_count,
-        });
-        tracing::debug!(
-            ?session_id,
-            target_nsecs,
-            video_packet_count = self.video_packet_count,
-            "started HEVC cached seek recovery watchdog"
+            Instant::now(),
+            self.video_packet_count,
         );
+        self.cached_seek_recovery_watchdog = Some(watchdog);
+        if started {
+            tracing::debug!(
+                ?session_id,
+                target_nsecs,
+                video_packet_count = self.video_packet_count,
+                "started HEVC cached seek recovery watchdog"
+            );
+        } else {
+            tracing::debug!(
+                ?session_id,
+                previous_target_nsecs,
+                target_nsecs,
+                elapsed_ms = watchdog.started_at.elapsed().as_secs_f64() * 1000.0,
+                video_packets_since_start = self
+                    .video_packet_count
+                    .saturating_sub(watchdog.start_video_packet_count),
+                "retained HEVC cached seek recovery watchdog across internal reset"
+            );
+        }
     }
 
     pub(super) fn clear_cached_seek_recovery_watchdog(&mut self) {
@@ -854,6 +872,26 @@ fn cached_seek_recovery_fallback_reason(
     None
 }
 
+fn cached_seek_recovery_watchdog_after_begin(
+    existing: Option<CachedSeekRecoveryWatchdog>,
+    target_nsecs: u64,
+    now: Instant,
+    video_packet_count: u64,
+) -> (CachedSeekRecoveryWatchdog, bool) {
+    if let Some(mut watchdog) = existing {
+        watchdog.target_nsecs = target_nsecs;
+        return (watchdog, false);
+    }
+    (
+        CachedSeekRecoveryWatchdog {
+            target_nsecs,
+            started_at: now,
+            start_video_packet_count: video_packet_count,
+        },
+        true,
+    )
+}
+
 fn cached_seek_recovery_next_action_for_attempt(
     attempt: &mut Option<CachedSeekRecoveryAttempt>,
     target_nsecs: u64,
@@ -886,8 +924,13 @@ fn cached_seek_recovery_watchdog_decision(
     elapsed: Duration,
     progress: CachedSeekRecoveryProgress,
 ) -> CachedSeekRecoveryWatchdogDecision {
-    if !output_snapshot.first_video_frame_pending || output_snapshot.queued_video_frames > 0 {
+    if !output_snapshot.first_video_frame_pending {
         return CachedSeekRecoveryWatchdogDecision::Clear;
+    }
+    if output_snapshot.queued_video_frames > 0 && elapsed >= CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT {
+        return CachedSeekRecoveryWatchdogDecision::Fallback(
+            CachedSeekRecoveryFallbackReason::FirstVideoFrameTimeout,
+        );
     }
     cached_seek_recovery_fallback_reason(elapsed, progress)
         .map(CachedSeekRecoveryWatchdogDecision::Fallback)
@@ -978,12 +1021,13 @@ mod tests {
     use super::{
         CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT, CACHED_SEEK_STARTUP_MAX_VIDEO_PACKETS,
         CachedSeekRecoveryAttempt, CachedSeekRecoveryFallbackAction,
-        CachedSeekRecoveryFallbackReason, CachedSeekRecoveryProgress,
+        CachedSeekRecoveryFallbackReason, CachedSeekRecoveryProgress, CachedSeekRecoveryWatchdog,
         CachedSeekRecoveryWatchdogDecision, DecoderInputStreamState,
         audio_input_suppressed_until_output_resume_state, cached_seek_recovery_fallback_reason,
-        cached_seek_recovery_next_action_for_attempt, cached_seek_recovery_watchdog_decision,
-        decoder_block_reason_blocks_packet_input, decoder_input_retry_status_from_streams,
-        decoder_input_streams_for_state, mark_video_decode_skip_nonref_inactive,
+        cached_seek_recovery_next_action_for_attempt, cached_seek_recovery_watchdog_after_begin,
+        cached_seek_recovery_watchdog_decision, decoder_block_reason_blocks_packet_input,
+        decoder_input_retry_status_from_streams, decoder_input_streams_for_state,
+        mark_video_decode_skip_nonref_inactive,
     };
 
     fn stream(stream_index: c_int, packet_input_blocked: bool) -> DecoderInputStreamState {
@@ -1071,6 +1115,28 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn cached_seek_recovery_watchdog_keeps_original_deadline_across_internal_reset() {
+        let started_at = std::time::Instant::now();
+        let existing = CachedSeekRecoveryWatchdog {
+            target_nsecs: 123_000_000_000,
+            started_at,
+            start_video_packet_count: 100,
+        };
+
+        let (watchdog, started) = cached_seek_recovery_watchdog_after_begin(
+            Some(existing),
+            123_360_000_000,
+            started_at + Duration::from_secs(1),
+            180,
+        );
+
+        assert!(!started);
+        assert_eq!(watchdog.target_nsecs, 123_360_000_000);
+        assert_eq!(watchdog.started_at, started_at);
+        assert_eq!(watchdog.start_video_packet_count, 100);
     }
 
     #[test]
@@ -1195,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_seek_recovery_watchdog_clears_after_first_video() {
+    fn cached_seek_recovery_watchdog_clears_after_first_video_is_presented() {
         assert_eq!(
             cached_seek_recovery_watchdog_decision(
                 output_snapshot(false, 0),
@@ -1204,13 +1270,35 @@ mod tests {
             ),
             CachedSeekRecoveryWatchdogDecision::Clear
         );
+    }
+
+    #[test]
+    fn cached_seek_recovery_watchdog_waits_for_queued_first_video_before_deadline() {
+        assert_eq!(
+            cached_seek_recovery_watchdog_decision(
+                output_snapshot(true, 1),
+                CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT - Duration::from_millis(1),
+                cached_seek_progress(0),
+            ),
+            CachedSeekRecoveryWatchdogDecision::Wait
+        );
+    }
+
+    #[test]
+    fn cached_seek_recovery_watchdog_falls_back_when_queued_first_video_is_not_presented() {
         assert_eq!(
             cached_seek_recovery_watchdog_decision(
                 output_snapshot(true, 1),
                 CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT,
-                cached_seek_progress(0),
+                CachedSeekRecoveryProgress {
+                    video_packets_since_seek: 1,
+                    video_decode_queued_frames: 1,
+                    ..Default::default()
+                },
             ),
-            CachedSeekRecoveryWatchdogDecision::Clear
+            CachedSeekRecoveryWatchdogDecision::Fallback(
+                CachedSeekRecoveryFallbackReason::FirstVideoFrameTimeout
+            )
         );
     }
 

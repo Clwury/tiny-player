@@ -1295,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn hevc_zero_output_rebuffer_fallback_preempts_demux_wait() {
+    fn hevc_pending_fallback_forces_low_level_seek_in_current_tick() {
         assert_eq!(
             hevc_decode_chain_fallback_tick_status(true),
             Some(PlaybackTickStatus::ForceLowLevelSeek)

@@ -296,11 +296,10 @@ impl DemuxPacketCache {
                 guard.refresh_readahead_hysteresis();
                 self.shared
                     .refresh_monitor_snapshot_with_timing(&guard, &mut timing);
-                // mpv publishes ordinary cache growth on its 250 ms cache tick;
-                // only a contracted seekable window bypasses that cadence.
-                let (_, seekable_contracted) = guard.seekable_range_change_since_last_emit();
-                self.shared
-                    .emit_cache_state_after_read(&mut guard, seekable_contracted);
+                // Match mpv's handle_update_cache(): packet consumption and
+                // pruning update the internal range immediately, while OSC
+                // observes the coalesced result on the 250 ms cache tick.
+                self.shared.emit_cache_state_after_read(&mut guard, false);
                 self.shared.ready.notify_all();
                 drop(guard);
                 let (packet, stream_offset) = match packet_source.packet_ref(&mut timing) {

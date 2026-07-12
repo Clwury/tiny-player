@@ -14,7 +14,7 @@ use super::audio_decode_pipeline::AudioDecodePipeline;
 use super::scheduled_video_queue::queued_video_continuity_gap_threshold_nsecs;
 use super::video_decode_pipeline::{
     HevcAdmittedVideoProgressObservation, HevcDecodeChainRecoveryAction,
-    HevcDecodePacketObservation, HevcDecodedFrameGapObservation,
+    HevcDecodePacketObservation, HevcDecodedFrameGapAction, HevcDecodedFrameGapObservation,
     HevcSeekPrerollProgressObservation, VideoDecodePipeline,
 };
 use super::video_decode_recovery_service::{
@@ -39,6 +39,12 @@ use super::{
     PlaybackScheduler, PositionReporter, StreamInfo, SubtitlePipeline, TimestampMapper,
     VideoDecodeRecovery,
 };
+
+fn hevc_decoded_frame_gap_allows_scheduled_queue_admission(
+    action: HevcDecodedFrameGapAction,
+) -> bool {
+    action == HevcDecodedFrameGapAction::Admit
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) enum DecodedVideoFrameStartAction {
@@ -508,7 +514,7 @@ where
                     let fallback_target_nsecs = previous_expected_next_nsecs
                         .or(audio_played_timeline_nsecs)
                         .unwrap_or(*current_start_position_nsecs);
-                    video_decode_pipeline.observe_hevc_decoded_frame_gap(
+                    let gap_action = video_decode_pipeline.observe_hevc_decoded_frame_gap(
                         HevcDecodedFrameGapObservation {
                             session_id,
                             codec_id: video_stream.codec_id,
@@ -523,6 +529,21 @@ where
                             output_snapshot,
                         },
                     );
+                    if !hevc_decoded_frame_gap_allows_scheduled_queue_admission(gap_action) {
+                        tracing::debug!(
+                            session_id = ?session_id,
+                            timeline_nsecs = prepared_frame.timeline_nsecs,
+                            duration_nsecs = prepared_frame.duration_nsecs,
+                            previous_expected_next_nsecs,
+                            previous_gap_nsecs,
+                            fallback_reason = ?video_decode_pipeline
+                                .hevc_decode_chain_stats()
+                                .pending_fallback_reason
+                                .map(|reason| reason.as_str()),
+                            "dropped prepared HEVC video frame after decode-chain gap fallback"
+                        );
+                        break;
+                    }
                     let stage_started_at = Instant::now();
                     admit_prepared_video_frame(PreparedVideoFrameAdmissionContext {
                         prepared_frame,
@@ -835,4 +856,26 @@ fn log_video_frame_prepare_result_pending(
             .map(|snapshot| snapshot.queue_pending_nsecs as f64 / 1_000_000.0),
         "FFmpeg video frame prepare result not ready for front generation"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HevcDecodedFrameGapAction, hevc_decoded_frame_gap_allows_scheduled_queue_admission,
+    };
+
+    #[test]
+    fn hevc_pts_gap_fallback_drops_current_frame_before_scheduled_queue_admission() {
+        let mut scheduled_queue_admissions = 0;
+        if hevc_decoded_frame_gap_allows_scheduled_queue_admission(
+            HevcDecodedFrameGapAction::DropForFallback,
+        ) {
+            scheduled_queue_admissions += 1;
+        }
+
+        assert_eq!(scheduled_queue_admissions, 0);
+        assert!(hevc_decoded_frame_gap_allows_scheduled_queue_admission(
+            HevcDecodedFrameGapAction::Admit
+        ));
+    }
 }

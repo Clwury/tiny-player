@@ -50,7 +50,8 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) use super::{
     VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER,
     VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
     VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER,
-    VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, duration_nsecs, nsecs_to_seconds,
+    VIDEO_OUTPUT_START_FAST_READY_DURATION, VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER,
+    duration_nsecs, nsecs_to_seconds,
 };
 
 #[path = "output_gate/audio_pressure.rs"]

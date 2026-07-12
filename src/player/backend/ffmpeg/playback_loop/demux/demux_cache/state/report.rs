@@ -171,20 +171,12 @@ impl DemuxPacketCacheState {
         self.last_emitted_seekable_ranges = Some(seekable_ranges);
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_range_change_since_last_emit(
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_ranges_changed_since_last_emit(
         &self,
-    ) -> (bool, bool) {
-        let Some(last_ranges) = self.last_emitted_seekable_ranges.as_ref() else {
-            return (false, false);
-        };
-        let current_ranges = self.seekable_time_ranges();
-        let changed = last_ranges != &current_ranges;
-        let contracted = last_ranges.iter().any(|last| {
-            !current_ranges
-                .iter()
-                .any(|current| current.start <= last.start && current.end >= last.end)
-        });
-        (changed, contracted)
+    ) -> bool {
+        self.last_emitted_seekable_ranges
+            .as_ref()
+            .is_some_and(|ranges| ranges != &self.seekable_time_ranges())
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn forward_bytes(

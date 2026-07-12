@@ -500,7 +500,7 @@ fn demux_packet_cache_append_trims_backbuffer_incrementally_under_pressure() {
 }
 
 #[test]
-fn demux_packet_cache_append_trim_emits_seekable_window_change_immediately() {
+fn demux_packet_cache_append_trim_coalesces_seekable_window_until_report_due() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let mut config = cache_config_for_test();
     config.cache_secs = 1000.0;
@@ -535,26 +535,51 @@ fn demux_packet_cache_append_trim_emits_seekable_window_change_immediately() {
     let _ = event_rx.try_iter().collect::<Vec<_>>();
 
     shared.append_packet(cached_anchor(8_000_000_000, 9_000_000_000));
-    let emitted_state = event_rx.try_iter().find_map(|event| match event.kind {
-        BackendEventKind::CacheStateChanged(state)
-            if state
+    assert!(
+        event_rx
+            .try_iter()
+            .all(|event| !matches!(event.kind, BackendEventKind::CacheStateChanged(_))),
+        "mpv keeps internal trim contractions off OSC until the 250 ms cache tick"
+    );
+    {
+        let guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        assert_eq!(
+            guard
+                .playback_cache_state(false)
                 .demux
                 .seekable_ranges
-                .first()
-                .is_some_and(|range| range.start > 0.0) =>
-        {
-            Some(state)
-        }
-        _ => None,
-    });
+                .first(),
+            Some(&PlaybackCacheTimeRange {
+                start: 4.0,
+                end: 8.0,
+            })
+        );
+    }
 
-    let emitted_state =
-        emitted_state.expect("append trim emits changed seekable window immediately");
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        guard.last_cache_state_emit_at =
+            Some(Instant::now() - DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL);
+    }
+    shared.append_packet(cached_anchor(9_000_000_000, 10_000_000_000));
+    let emitted_state = event_rx
+        .try_iter()
+        .find_map(|event| match event.kind {
+            BackendEventKind::CacheStateChanged(state) => Some(state),
+            _ => None,
+        })
+        .expect("250 ms cache tick publishes the coalesced seekable contraction");
     assert_eq!(
         emitted_state.demux.seekable_ranges.first(),
         Some(&PlaybackCacheTimeRange {
             start: 4.0,
-            end: 8.0,
+            end: 9.0,
         })
     );
 }
@@ -999,12 +1024,21 @@ fn demux_packet_cache_donated_append_budget_uses_trim_hysteresis() {
         );
     }
 
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        guard.last_cache_state_emit_at =
+            Some(Instant::now() - DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL);
+    }
     shared.append_packet(cached_anchor(9_000_000_000, 10_000_000_000));
     let emitted_state = event_rx.try_iter().find_map(|event| match event.kind {
         BackendEventKind::CacheStateChanged(state) => Some(state),
         _ => None,
     });
-    let emitted_state = emitted_state.expect("trim emits contraction immediately after hysteresis");
+    let emitted_state =
+        emitted_state.expect("250 ms cache tick publishes contraction after trim hysteresis");
     assert!(
         emitted_state
             .demux
@@ -2102,19 +2136,38 @@ fn demux_packet_cache_read_trim_emits_seekable_range_change_after_coalesced_main
             DemuxReadResult::Packet(_)
         ));
     }
+    assert!(
+        event_rx
+            .try_iter()
+            .all(|event| !matches!(event.kind, BackendEventKind::CacheStateChanged(_))),
+        "read-side trim contractions wait for mpv's cache update cadence"
+    );
+    let expected_ranges = {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        let ranges = guard.playback_cache_state(false).demux.seekable_ranges;
+        assert!(
+            ranges.first().is_some_and(|range| range.start > 1.0),
+            "multiple internal trim steps should be coalesced before OSC observes them"
+        );
+        guard.last_cache_state_emit_at =
+            Some(Instant::now() - DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL);
+        ranges
+    };
+    assert!(matches!(
+        cache.poll_packet_round_robin(&[0]).0,
+        DemuxReadResult::Packet(_)
+    ));
     let events = event_rx.try_iter().collect::<Vec<_>>();
     let cache_state = events.iter().find_map(|event| match &event.kind {
         BackendEventKind::CacheStateChanged(state) => Some(state),
         _ => None,
     });
-    let cache_state = cache_state.expect("read trim emits changed seekable ranges immediately");
-    assert_eq!(
-        cache_state.demux.seekable_ranges,
-        vec![PlaybackCacheTimeRange {
-            start: 1.0,
-            end: u64::try_from(DEMUX_PACKET_READ_TRIM_INTERVAL + 7).unwrap() as f64,
-        }]
-    );
+    let cache_state =
+        cache_state.expect("250 ms cache tick publishes the coalesced read-side contraction");
+    assert_eq!(cache_state.demux.seekable_ranges, expected_ranges);
 }
 
 #[test]
@@ -2195,10 +2248,8 @@ fn demux_packet_cache_read_coalesces_truehd_seekable_growth_until_report_due() {
 
         guard.append_packet(cached_packet(1, false, Some(3_000_000_000), None));
         guard.append_packet(cached_key_packet(1, false, Some(4_000_000_000), None));
-        let (changed, contracted) = guard.seekable_range_change_since_last_emit();
-        assert!(changed);
-        assert!(!contracted);
-        shared.emit_cache_state_after_read(&mut guard, contracted);
+        assert!(guard.seekable_ranges_changed_since_last_emit());
+        shared.emit_cache_state_after_read(&mut guard, false);
     }
     assert!(
         event_rx
@@ -3653,6 +3704,8 @@ fn demux_packet_cache_state_precise_hevc_cached_seek_uses_safe_point_before_prer
     assert!(hit.requires_precise_trim);
     assert_eq!(state.read_index, 2);
     assert_eq!(state.reader_nsecs, 2_000_000_000);
+    assert_eq!(state.cached_seeks, 1);
+    assert_eq!(state.low_level_seeks, 0);
 }
 
 #[test]

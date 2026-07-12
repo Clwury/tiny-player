@@ -831,6 +831,9 @@ fn service_cached_seek_recovery_fallback_if_needed(
             control,
             event_tx,
         })?;
+        pipeline
+            .video_decode_pipeline
+            .remember_hevc_recovery_low_level_seek_target(fallback.target_nsecs);
         tracing::debug!(
             session_id = ?session.id(),
             position_seconds,
@@ -857,14 +860,22 @@ fn service_cached_seek_recovery_fallback_if_needed(
     let loop_action = pipeline
         .video_decode_pipeline
         .hevc_decode_chain_fallback_loop_action(fallback);
+    if loop_action == HevcDecodeChainFallbackLoopAction::RecoveryExhausted {
+        return Err(format!(
+            "HEVC 解码链恢复失败：目标 {:.3}s 在 cached、软件解码和低层 seek 后仍无视频输出（{}）",
+            position_seconds,
+            fallback.reason.as_str(),
+        ));
+    }
     if loop_action == HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek {
         pipeline.video_decode_recovery.reset();
         pipeline
             .video_decode_pipeline
-            .reset_hevc_decode_chain_watchdog();
+            .reset_hevc_decode_chain_transient_state();
         pipeline
             .video_decode_pipeline
-            .remember_hevc_decode_chain_fallback(fallback);
+            .remember_hevc_decode_chain_software_suppression(fallback);
+        pipeline.begin_cached_seek_recovery_watchdog(fallback.target_nsecs, session.id());
         tracing::warn!(
             session_id = ?session.id(),
             target_nsecs = fallback.target_nsecs,
@@ -957,7 +968,7 @@ fn service_cached_seek_recovery_fallback_if_needed(
         pipeline.video_decode_recovery.reset();
         pipeline
             .video_decode_pipeline
-            .reset_hevc_decode_chain_watchdog();
+            .reset_hevc_decode_chain_transient_state();
         pipeline
             .video_decode_pipeline
             .remember_hevc_decode_chain_fallback(fallback);
@@ -978,7 +989,12 @@ fn service_cached_seek_recovery_fallback_if_needed(
     }
     let boundary_reset_required =
         hevc_decode_chain_fallback_requires_boundary_reset(fallback.reason);
-    if !boundary_reset_required && !demux_reader_unusable_for_hevc_low_level_seek(demux_watermark) {
+    let force_low_level_from_loop =
+        loop_action == HevcDecodeChainFallbackLoopAction::ForceLowLevelSeek;
+    if !force_low_level_from_loop
+        && !boundary_reset_required
+        && !demux_reader_unusable_for_hevc_low_level_seek(demux_watermark)
+    {
         pipeline
             .video_decode_pipeline
             .remember_hevc_decode_chain_fallback(fallback);
@@ -1000,11 +1016,10 @@ fn service_cached_seek_recovery_fallback_if_needed(
     let seek_generation = control.request_seek();
     session.reset_to(session.id(), position_seconds);
     pipeline.current_start_position_nsecs = session.start_position_nsecs();
-    pipeline
-        .video_decode_pipeline
-        .remember_hevc_decode_chain_fallback(fallback);
-    let force_low_level_seek = !boundary_reset_required;
-    let reset_path = if boundary_reset_required {
+    let force_low_level_seek = force_low_level_from_loop || !boundary_reset_required;
+    let reset_path = if force_low_level_seek {
+        "forced_low_level"
+    } else if boundary_reset_required {
         "cached_then_low_level"
     } else {
         "forced_low_level"
@@ -1037,6 +1052,15 @@ fn service_cached_seek_recovery_fallback_if_needed(
         control,
         event_tx,
     })?;
+    if force_low_level_seek {
+        pipeline
+            .video_decode_pipeline
+            .remember_hevc_decode_chain_low_level_seek(fallback);
+    } else {
+        pipeline
+            .video_decode_pipeline
+            .remember_hevc_decode_chain_fallback(fallback);
+    }
     tracing::debug!(
         session_id = ?session.id(),
         position_seconds,

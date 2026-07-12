@@ -6,6 +6,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use crate::player::render_host::{PlaybackSessionId, VideoOutputQueue};
@@ -414,75 +415,113 @@ pub(super) fn drain_playback_commands(
     command_rx: &Receiver<FfmpegCommand>,
     control: &FfmpegControl,
 ) -> DrainedFfmpegCommands {
-    let mut pending_seek = None;
-    let mut pending_track_selection: Option<PendingTrackSelection> = None;
-    let mut cache_config = None;
+    let mut drained = DrainedFfmpegCommands::default();
     while let Ok(command) = command_rx.try_recv() {
-        match command {
-            FfmpegCommand::Seek {
-                session_id,
-                position_seconds,
-                mode,
-                generation,
-            } => {
-                pending_track_selection = None;
-                pending_seek = Some(PendingSeek {
-                    session_id,
-                    position_seconds: position_seconds.max(0.0),
-                    mode,
-                    generation,
-                });
-            }
-            FfmpegCommand::Pause { session_id } => {
-                control.set_session_id(session_id);
-                control.set_user_paused(true);
-                if let Some(pending) = pending_track_selection.as_mut() {
-                    pending.pause_after_switch = true;
+        apply_playback_command(&mut drained, command, control);
+    }
+    drained
+}
+
+pub(super) fn coalesce_playback_seek_commands(
+    command_rx: &Receiver<FfmpegCommand>,
+    control: &FfmpegControl,
+    mut drained: DrainedFfmpegCommands,
+    quiet_period: Duration,
+) -> DrainedFfmpegCommands {
+    if drained.pending_seek.is_none() || quiet_period.is_zero() {
+        return drained;
+    }
+
+    let mut deadline = Instant::now() + quiet_period;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match command_rx.recv_timeout(remaining) {
+            Ok(command) => {
+                let is_seek = matches!(&command, FfmpegCommand::Seek { .. });
+                apply_playback_command(&mut drained, command, control);
+                if control.should_stop() || drained.pending_track_selection.is_some() {
+                    break;
+                }
+                if is_seek {
+                    deadline = Instant::now() + quiet_period;
                 }
             }
-            FfmpegCommand::Resume { session_id } => {
-                control.set_session_id(session_id);
-                control.set_user_paused(false);
-                if let Some(pending) = pending_track_selection.as_mut() {
-                    pending.pause_after_switch = false;
-                }
-            }
-            FfmpegCommand::Stop => {
-                control.shutdown();
-            }
-            FfmpegCommand::SetTrackSelection {
-                session_id,
-                selected_tracks,
-                position_seconds,
-                generation,
-                pause_after_switch,
-            } => {
-                pending_seek = None;
-                pending_track_selection = Some(PendingTrackSelection {
-                    session_id,
-                    selected_tracks,
-                    position_seconds: position_seconds.max(0.0),
-                    generation,
-                    pause_after_switch,
-                });
-            }
-            FfmpegCommand::SetCacheConfig { session_id, config } => {
-                control.set_session_id(session_id);
-                cache_config = Some(config.normalized());
-            }
-            FfmpegCommand::SetPlaybackRate { session_id, rate } => {
-                control.set_session_id(session_id);
-                tracing::debug!(
-                    rate,
-                    "FFmpeg playback-rate command queued but not implemented yet"
-                );
-            }
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    DrainedFfmpegCommands {
-        pending_seek,
-        pending_track_selection,
-        cache_config,
+    while let Ok(command) = command_rx.try_recv() {
+        apply_playback_command(&mut drained, command, control);
+    }
+    drained
+}
+
+fn apply_playback_command(
+    drained: &mut DrainedFfmpegCommands,
+    command: FfmpegCommand,
+    control: &FfmpegControl,
+) {
+    match command {
+        FfmpegCommand::Seek {
+            session_id,
+            position_seconds,
+            mode,
+            generation,
+        } => {
+            drained.pending_track_selection = None;
+            drained.pending_seek = Some(PendingSeek {
+                session_id,
+                position_seconds: position_seconds.max(0.0),
+                mode,
+                generation,
+            });
+        }
+        FfmpegCommand::Pause { session_id } => {
+            control.set_session_id(session_id);
+            control.set_user_paused(true);
+            if let Some(pending) = drained.pending_track_selection.as_mut() {
+                pending.pause_after_switch = true;
+            }
+        }
+        FfmpegCommand::Resume { session_id } => {
+            control.set_session_id(session_id);
+            control.set_user_paused(false);
+            if let Some(pending) = drained.pending_track_selection.as_mut() {
+                pending.pause_after_switch = false;
+            }
+        }
+        FfmpegCommand::Stop => {
+            control.shutdown();
+        }
+        FfmpegCommand::SetTrackSelection {
+            session_id,
+            selected_tracks,
+            position_seconds,
+            generation,
+            pause_after_switch,
+        } => {
+            drained.pending_seek = None;
+            drained.pending_track_selection = Some(PendingTrackSelection {
+                session_id,
+                selected_tracks,
+                position_seconds: position_seconds.max(0.0),
+                generation,
+                pause_after_switch,
+            });
+        }
+        FfmpegCommand::SetCacheConfig { session_id, config } => {
+            control.set_session_id(session_id);
+            drained.cache_config = Some(config.normalized());
+        }
+        FfmpegCommand::SetPlaybackRate { session_id, rate } => {
+            control.set_session_id(session_id);
+            tracing::debug!(
+                rate,
+                "FFmpeg playback-rate command queued but not implemented yet"
+            );
+        }
     }
 }
 

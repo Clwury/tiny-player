@@ -90,21 +90,16 @@ impl DemuxPacketCacheShared {
             }
             Err(TryLockError::Poisoned(_)) => panic!("FFmpeg demux packet cache poisoned"),
         };
-        let (seekable_ranges_changed, seekable_window_contracted) = if appended {
-            guard.seekable_range_change_since_last_emit()
-        } else {
-            (false, false)
-        };
-        let force = force || seekable_window_contracted;
         if appended || force {
             guard.mark_cache_state_emit_dirty();
         }
         let first_report = guard.last_cache_state_emit_at.is_none();
-        let should_emit = guard.cache_state_emit_dirty()
-            && (seekable_window_contracted || first_report || guard.cache_state_report_due(now));
+        let should_emit =
+            guard.cache_state_emit_dirty() && (first_report || guard.cache_state_report_due(now));
         if !should_emit {
             return (None, false, force);
         }
+        let seekable_ranges_changed = appended && guard.seekable_ranges_changed_since_last_emit();
         if defer_for_consumer
             && !force
             && !first_report

@@ -33,13 +33,13 @@ use super::{
     VideoFrameConvertContext, VideoFrameConverter, WORKER_CHANNEL_RECV_WAIT_LOG_AFTER,
     WORKER_CHANNEL_SEND_WAIT_LOG_AFTER, align_audio_elements_to_frame_boundary,
     audio_codec_requires_recovery_point, audio_elements_for_duration_floor,
-    audio_elements_for_frames, audio_frames_for_duration_round, decoded_subrip_packet_cue,
-    drain_playback_commands, duration_nsecs, ffmpeg_error, frame_best_effort_timestamp,
-    frame_decode_error_flags, frame_is_corrupt, load_external_subtitle_cues, nsecs_to_seconds,
-    optional_buffered_value_changed, packet_is_audio_recovery_point,
-    packet_is_video_recovery_point, packet_is_video_seek_point, queued_video_duration,
-    queued_video_frames_have_vulkan, queued_video_limit_duration, queued_video_target_duration,
-    seconds_to_nsecs, timestamp_to_nsecs,
+    audio_elements_for_frames, audio_frames_for_duration_round, coalesce_playback_seek_commands,
+    decoded_subrip_packet_cue, drain_playback_commands, duration_nsecs, ffmpeg_error,
+    frame_best_effort_timestamp, frame_decode_error_flags, frame_is_corrupt,
+    load_external_subtitle_cues, nsecs_to_seconds, optional_buffered_value_changed,
+    packet_is_audio_recovery_point, packet_is_video_recovery_point, packet_is_video_seek_point,
+    queued_video_duration, queued_video_frames_have_vulkan, queued_video_limit_duration,
+    queued_video_target_duration, seconds_to_nsecs, timestamp_to_nsecs,
 };
 #[cfg(test)]
 use super::{

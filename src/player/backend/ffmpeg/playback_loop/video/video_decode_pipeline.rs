@@ -54,6 +54,12 @@ pub(super) enum HevcDecodeChainRecoveryAction {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HevcDecodedFrameGapAction {
+    Admit,
+    DropForFallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HevcDecodeChainFallbackReason {
     ZeroOutputRebuffer,
     StartupInFlightStall,
@@ -98,14 +104,26 @@ pub(super) enum HevcDecodeChainFallbackLoopAction {
     Proceed,
     ForceSoftware,
     SuppressLowLevelSeek,
+    ForceLowLevelSeek,
+    RecoveryExhausted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct HevcDecodeChainFallbackRecord {
-    target_nsecs: u64,
-    reason: HevcDecodeChainFallbackReason,
+    root_target_nsecs: u64,
+    last_target_nsecs: u64,
+    last_reason: HevcDecodeChainFallbackReason,
     hardware_accelerated: bool,
     recorded_at: Instant,
+    software_suppressions: u8,
+    post_low_level_suppressions: u8,
+    low_level_seeks: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HevcDecodeChainResetScope {
+    Transient,
+    RecoveryTransaction,
 }
 
 pub(super) struct HevcDecodePacketObservation<'a> {
@@ -501,6 +519,12 @@ impl HevcDecodeChainWatchdog {
         *self = Self::default();
     }
 
+    fn reset_transient_after_progress(&mut self) {
+        let pending_fallback = self.pending_fallback;
+        self.reset();
+        self.pending_fallback = pending_fallback;
+    }
+
     fn take_fallback(&mut self) -> Option<HevcDecodeChainFallback> {
         self.pending_fallback.take()
     }
@@ -665,9 +689,12 @@ impl HevcDecodeChainWatchdog {
         );
     }
 
-    fn observe_admitted_video_progress(&mut self, input: HevcAdmittedVideoProgressObservation) {
+    fn observe_admitted_video_progress(
+        &mut self,
+        input: HevcAdmittedVideoProgressObservation,
+    ) -> bool {
         if input.codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
-            return;
+            return false;
         }
         let queue_end_advanced = input.after_queue_end_nsecs.is_some_and(|after| {
             input
@@ -686,7 +713,7 @@ impl HevcDecodeChainWatchdog {
                 after_start,
                 "ignored HEVC decoded frame for watchdog reset because it was not admitted progress"
             );
-            return;
+            return false;
         }
         if self.zero_output_packets > 0
             || self.soft_recovery_attempted
@@ -711,7 +738,8 @@ impl HevcDecodeChainWatchdog {
                 "resetting HEVC decode chain watchdog after admitted video progress"
             );
         }
-        self.reset();
+        self.reset_transient_after_progress();
+        true
     }
 
     fn observe_seek_preroll_progress(&mut self, input: HevcSeekPrerollProgressObservation) {
@@ -740,7 +768,7 @@ impl HevcDecodeChainWatchdog {
                 "resetting HEVC decode chain watchdog after seek preroll decoded progress"
             );
         }
-        self.reset();
+        self.reset_transient_after_progress();
     }
 
     fn observe_post_fallback_rebuffer_underfill(
@@ -815,21 +843,27 @@ impl HevcDecodeChainWatchdog {
         );
     }
 
-    fn observe_decoded_frame_gap(&mut self, input: HevcDecodedFrameGapObservation) {
+    fn observe_decoded_frame_gap(
+        &mut self,
+        input: HevcDecodedFrameGapObservation,
+    ) -> HevcDecodedFrameGapAction {
         if input.codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
             self.clear_recent_gap_evidence();
-            return;
+            return HevcDecodedFrameGapAction::Admit;
+        }
+        if self.pending_fallback.is_some() {
+            return HevcDecodedFrameGapAction::DropForFallback;
         }
 
         let positive_gap_nsecs = input
             .previous_gap_nsecs
             .and_then(|gap| u64::try_from(gap).ok());
         let Some(gap_nsecs) = positive_gap_nsecs else {
-            return;
+            return HevcDecodedFrameGapAction::Admit;
         };
         if gap_nsecs <= input.max_gap_nsecs {
             self.clear_recent_gap_evidence();
-            return;
+            return HevcDecodedFrameGapAction::Admit;
         }
 
         let has_evidence = self.has_decoded_frame_gap_evidence(input.recovery_waiting);
@@ -853,7 +887,7 @@ impl HevcDecodeChainWatchdog {
                     .map(|gap| gap as f64 / 1_000_000.0),
                 "observed HEVC decoded frame PTS gap without decode-chain evidence"
             );
-            return;
+            return HevcDecodedFrameGapAction::Admit;
         }
 
         let target_nsecs = input
@@ -892,6 +926,7 @@ impl HevcDecodeChainWatchdog {
                 .map(|gap| gap as f64 / 1_000_000.0),
             "hevc_decode_chain_pts_gap"
         );
+        HevcDecodedFrameGapAction::DropForFallback
     }
 
     fn observe_packet(
@@ -1678,10 +1713,21 @@ impl VideoDecodePipeline {
         self.packets.clear();
     }
 
-    pub(super) fn reset_hevc_decode_chain_watchdog(&mut self) {
+    pub(super) fn reset_hevc_decode_chain_transient_state(&mut self) {
         self.hevc_decode_chain_watchdog.reset();
         self.hevc_startup_probe_packets.clear();
-        self.last_hevc_decode_chain_fallback = None;
+        self.last_hevc_decode_chain_fallback = hevc_decode_chain_recovery_record_after_reset(
+            self.last_hevc_decode_chain_fallback,
+            HevcDecodeChainResetScope::Transient,
+        );
+    }
+
+    pub(super) fn reset_hevc_decode_chain_recovery_transaction(&mut self) {
+        self.reset_hevc_decode_chain_transient_state();
+        self.last_hevc_decode_chain_fallback = hevc_decode_chain_recovery_record_after_reset(
+            self.last_hevc_decode_chain_fallback,
+            HevcDecodeChainResetScope::RecoveryTransaction,
+        );
     }
 
     pub(super) fn observe_hevc_decode_packet_status(
@@ -1713,9 +1759,9 @@ impl VideoDecodePipeline {
     pub(super) fn observe_hevc_decoded_frame_gap(
         &mut self,
         observation: HevcDecodedFrameGapObservation,
-    ) {
+    ) -> HevcDecodedFrameGapAction {
         self.hevc_decode_chain_watchdog
-            .observe_decoded_frame_gap(observation);
+            .observe_decoded_frame_gap(observation)
     }
 
     pub(super) fn observe_hevc_seek_preroll_progress(
@@ -1730,10 +1776,12 @@ impl VideoDecodePipeline {
         &mut self,
         observation: HevcAdmittedVideoProgressObservation,
     ) {
-        self.hevc_decode_chain_watchdog
+        let admitted_progress = self
+            .hevc_decode_chain_watchdog
             .observe_admitted_video_progress(observation);
-        if observation.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC {
+        if admitted_progress && !self.hevc_decode_chain_watchdog.has_pending_fallback() {
             self.hevc_startup_probe_packets.clear();
+            self.last_hevc_decode_chain_fallback = None;
         }
     }
 
@@ -1784,12 +1832,56 @@ impl VideoDecodePipeline {
         &mut self,
         fallback: HevcDecodeChainFallback,
     ) {
-        self.last_hevc_decode_chain_fallback = Some(HevcDecodeChainFallbackRecord {
-            target_nsecs: fallback.target_nsecs,
-            reason: fallback.reason,
-            hardware_accelerated: self.info().hardware_accelerated,
-            recorded_at: Instant::now(),
-        });
+        self.last_hevc_decode_chain_fallback = Some(hevc_decode_chain_fallback_record_after(
+            self.last_hevc_decode_chain_fallback,
+            fallback,
+            self.info().hardware_accelerated,
+            Instant::now(),
+        ));
+    }
+
+    pub(super) fn remember_hevc_decode_chain_software_suppression(
+        &mut self,
+        fallback: HevcDecodeChainFallback,
+    ) {
+        let mut record = hevc_decode_chain_fallback_record_after(
+            self.last_hevc_decode_chain_fallback,
+            fallback,
+            self.info().hardware_accelerated,
+            Instant::now(),
+        );
+        if record.low_level_seeks > 0 {
+            record.post_low_level_suppressions =
+                record.post_low_level_suppressions.saturating_add(1);
+        } else {
+            record.software_suppressions = record.software_suppressions.saturating_add(1);
+        }
+        self.last_hevc_decode_chain_fallback = Some(record);
+    }
+
+    pub(super) fn remember_hevc_decode_chain_low_level_seek(
+        &mut self,
+        fallback: HevcDecodeChainFallback,
+    ) {
+        let mut record = hevc_decode_chain_fallback_record_after(
+            self.last_hevc_decode_chain_fallback,
+            fallback,
+            self.info().hardware_accelerated,
+            Instant::now(),
+        );
+        record.low_level_seeks = record.low_level_seeks.saturating_add(1);
+        self.last_hevc_decode_chain_fallback = Some(record);
+    }
+
+    pub(super) fn remember_hevc_recovery_low_level_seek_target(&mut self, target_nsecs: u64) {
+        let Some(mut record) = self.last_hevc_decode_chain_fallback else {
+            return;
+        };
+        record.last_target_nsecs = target_nsecs;
+        record.hardware_accelerated = self.info().hardware_accelerated;
+        record.recorded_at = Instant::now();
+        record.low_level_seeks = record.low_level_seeks.saturating_add(1);
+        self.last_hevc_decode_chain_fallback = Some(record);
     }
 
     pub(super) fn has_pending_or_in_flight(&self) -> bool {
@@ -1907,16 +1999,55 @@ fn hevc_decode_chain_fallback_loop_action(
     let Some(last) = last else {
         return HevcDecodeChainFallbackLoopAction::Proceed;
     };
-    if last.target_nsecs != fallback.target_nsecs
-        || last.reason != fallback.reason
-        || last.hardware_accelerated != hardware_accelerated
-    {
-        return HevcDecodeChainFallbackLoopAction::Proceed;
-    }
     if hardware_accelerated {
-        HevcDecodeChainFallbackLoopAction::ForceSoftware
-    } else {
-        HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek
+        return HevcDecodeChainFallbackLoopAction::ForceSoftware;
+    }
+    if fallback.target_nsecs == 0 {
+        return HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek;
+    }
+    if last.low_level_seeks > 0 {
+        return if last.post_low_level_suppressions == 0 {
+            HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek
+        } else {
+            HevcDecodeChainFallbackLoopAction::RecoveryExhausted
+        };
+    }
+    if last.software_suppressions == 0 {
+        return HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek;
+    }
+    HevcDecodeChainFallbackLoopAction::ForceLowLevelSeek
+}
+
+fn hevc_decode_chain_fallback_record_after(
+    last: Option<HevcDecodeChainFallbackRecord>,
+    fallback: HevcDecodeChainFallback,
+    hardware_accelerated: bool,
+    recorded_at: Instant,
+) -> HevcDecodeChainFallbackRecord {
+    let mut record = last.unwrap_or(HevcDecodeChainFallbackRecord {
+        root_target_nsecs: fallback.target_nsecs,
+        last_target_nsecs: fallback.target_nsecs,
+        last_reason: fallback.reason,
+        hardware_accelerated,
+        recorded_at,
+        software_suppressions: 0,
+        post_low_level_suppressions: 0,
+        low_level_seeks: 0,
+    });
+    record.last_target_nsecs = fallback.target_nsecs;
+    record.last_reason = fallback.reason;
+    record.hardware_accelerated = hardware_accelerated;
+    record.recorded_at = recorded_at;
+    record
+}
+
+fn hevc_decode_chain_recovery_record_after_reset(
+    record: Option<HevcDecodeChainFallbackRecord>,
+    scope: HevcDecodeChainResetScope,
+) -> Option<HevcDecodeChainFallbackRecord> {
+    match scope {
+        HevcDecodeChainResetScope::Transient => record,
+        HevcDecodeChainResetScope::RecoveryTransaction => None,
     }
 }
 
@@ -2358,14 +2489,15 @@ mod tests {
         HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER, HEVC_STARTUP_ZERO_OUTPUT_HARD_PACKET_LIMIT,
         HevcAdmittedVideoProgressObservation, HevcDecodeChainFallback,
         HevcDecodeChainFallbackLoopAction, HevcDecodeChainFallbackReason,
-        HevcDecodeChainFallbackRecord, HevcDecodeChainRecoveryAction, HevcDecodeChainWatchdog,
-        HevcDecodeChainWatchdogInput, HevcDecodedFrameGapObservation,
-        HevcPostFallbackRebufferObservation, HevcSeekPrerollProgressObservation,
-        HevcStartupProbePackets, HevcStartupStallObservation, HevcStreamFormat,
-        PlaybackBlockReason, StrippedHevcDoviDecodeAction,
+        HevcDecodeChainFallbackRecord, HevcDecodeChainRecoveryAction, HevcDecodeChainResetScope,
+        HevcDecodeChainWatchdog, HevcDecodeChainWatchdogInput, HevcDecodedFrameGapAction,
+        HevcDecodedFrameGapObservation, HevcPostFallbackRebufferObservation,
+        HevcSeekPrerollProgressObservation, HevcStartupProbePackets, HevcStartupStallObservation,
+        HevcStreamFormat, PlaybackBlockReason, StrippedHevcDoviDecodeAction,
         VIDEO_DECODE_PENDING_INPUT_QUEUE_CAPACITY, VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS,
         VideoDecodePipeline, VideoDecodeRecovery, VideoDecodeWorkerInfo, VideoDecodeWorkerSnapshot,
         VideoDecodeWorkerState, hevc_decode_chain_fallback_loop_action,
+        hevc_decode_chain_fallback_record_after, hevc_decode_chain_recovery_record_after_reset,
         hevc_dovi_decode_action_for_inspection, hevc_startup_in_flight_packet_should_arm,
         hevc_startup_probe_packet_should_record,
     };
@@ -3154,7 +3286,7 @@ mod tests {
     }
 
     #[test]
-    fn hevc_same_target_software_hard_fallback_is_suppressed() {
+    fn hevc_recovery_transaction_escalates_across_target_and_reason_drift() {
         let target_nsecs = 83_177_300_977;
         let fallback = HevcDecodeChainFallback {
             target_nsecs,
@@ -3162,48 +3294,182 @@ mod tests {
         };
         let now = Instant::now();
         let hardware_record = HevcDecodeChainFallbackRecord {
-            target_nsecs,
-            reason: HevcDecodeChainFallbackReason::RecoveryWaitRebuffer,
+            root_target_nsecs: target_nsecs,
+            last_target_nsecs: target_nsecs,
+            last_reason: HevcDecodeChainFallbackReason::RecoveryWaitRebuffer,
             hardware_accelerated: true,
             recorded_at: now,
+            software_suppressions: 0,
+            post_low_level_suppressions: 0,
+            low_level_seeks: 0,
         };
-        let recent_software_record = Some(HevcDecodeChainFallbackRecord {
+        let software_record = HevcDecodeChainFallbackRecord {
             hardware_accelerated: false,
             ..hardware_record
-        });
-        let cooled_down_software_record = Some(HevcDecodeChainFallbackRecord {
-            recorded_at: now - Duration::from_secs(2),
-            hardware_accelerated: false,
-            ..hardware_record
-        });
+        };
 
         assert_eq!(
             hevc_decode_chain_fallback_loop_action(Some(hardware_record), fallback, true),
             HevcDecodeChainFallbackLoopAction::ForceSoftware
         );
         assert_eq!(
-            hevc_decode_chain_fallback_loop_action(recent_software_record, fallback, false),
+            hevc_decode_chain_fallback_loop_action(Some(software_record), fallback, false),
             HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek
         );
-        assert_eq!(
-            hevc_decode_chain_fallback_loop_action(cooled_down_software_record, fallback, false),
-            HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek
-        );
-        assert_eq!(
-            hevc_decode_chain_fallback_loop_action(recent_software_record, fallback, true),
-            HevcDecodeChainFallbackLoopAction::Proceed
-        );
+
+        let mut suppressed_record = software_record;
+        suppressed_record.software_suppressions = 1;
         assert_eq!(
             hevc_decode_chain_fallback_loop_action(
-                recent_software_record,
+                Some(suppressed_record),
                 HevcDecodeChainFallback {
-                    target_nsecs: target_nsecs + 40_000_000,
-                    reason: HevcDecodeChainFallbackReason::RecoveryWaitRebuffer,
+                    target_nsecs: target_nsecs + 360_000_000,
+                    reason: HevcDecodeChainFallbackReason::ZeroOutputRebuffer,
                 },
                 false,
             ),
+            HevcDecodeChainFallbackLoopAction::ForceLowLevelSeek
+        );
+
+        suppressed_record.low_level_seeks = 1;
+        assert_eq!(
+            hevc_decode_chain_fallback_loop_action(Some(suppressed_record), fallback, false,),
+            HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek
+        );
+        suppressed_record.post_low_level_suppressions = 1;
+        assert_eq!(
+            hevc_decode_chain_fallback_loop_action(Some(suppressed_record), fallback, false,),
+            HevcDecodeChainFallbackLoopAction::RecoveryExhausted
+        );
+    }
+
+    #[test]
+    fn hevc_recovery_record_keeps_root_target_across_fallback_drift() {
+        let now = Instant::now();
+        let first = HevcDecodeChainFallback {
+            target_nsecs: 123_000_000_000,
+            reason: HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
+        };
+        let second = HevcDecodeChainFallback {
+            target_nsecs: 123_360_000_000,
+            reason: HevcDecodeChainFallbackReason::ZeroOutputRebuffer,
+        };
+        let first_record = hevc_decode_chain_fallback_record_after(None, first, false, now);
+        let second_record = hevc_decode_chain_fallback_record_after(
+            Some(first_record),
+            second,
+            false,
+            now + Duration::from_millis(100),
+        );
+
+        assert_eq!(second_record.root_target_nsecs, first.target_nsecs);
+        assert_eq!(second_record.last_target_nsecs, second.target_nsecs);
+        assert_eq!(second_record.last_reason, second.reason);
+        assert_eq!(
+            hevc_decode_chain_fallback_loop_action(Some(second_record), second, false,),
+            HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek
+        );
+    }
+
+    #[test]
+    fn hevc_recovery_generation_transient_reset_preserves_fallback_record() {
+        let fallback = HevcDecodeChainFallback {
+            target_nsecs: 123_360_000_000,
+            reason: HevcDecodeChainFallbackReason::ZeroOutputRebuffer,
+        };
+        let record = hevc_decode_chain_fallback_record_after(None, fallback, false, Instant::now());
+
+        assert_eq!(
+            hevc_decode_chain_recovery_record_after_reset(
+                Some(record),
+                HevcDecodeChainResetScope::Transient,
+            ),
+            Some(record)
+        );
+        assert_eq!(
+            hevc_decode_chain_recovery_record_after_reset(
+                Some(record),
+                HevcDecodeChainResetScope::RecoveryTransaction,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hevc_recovery_transaction_bounds_internal_seek_resets() {
+        let cached_fallback = HevcDecodeChainFallback {
+            target_nsecs: 123_000_000_000,
+            reason: HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
+        };
+        let zero_output_fallback = HevcDecodeChainFallback {
+            target_nsecs: 123_360_000_000,
+            reason: HevcDecodeChainFallbackReason::ZeroOutputRebuffer,
+        };
+        let now = Instant::now();
+        let mut internal_seek_resets = 0;
+
+        assert_eq!(
+            hevc_decode_chain_fallback_loop_action(None, cached_fallback, true),
             HevcDecodeChainFallbackLoopAction::Proceed
         );
+        internal_seek_resets += 1;
+        let hardware_record =
+            hevc_decode_chain_fallback_record_after(None, cached_fallback, true, now);
+        assert_eq!(
+            hevc_decode_chain_fallback_loop_action(
+                Some(hardware_record),
+                zero_output_fallback,
+                true,
+            ),
+            HevcDecodeChainFallbackLoopAction::ForceSoftware
+        );
+
+        let software_record = hevc_decode_chain_fallback_record_after(
+            Some(hardware_record),
+            zero_output_fallback,
+            false,
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(
+            hevc_decode_chain_fallback_loop_action(
+                Some(software_record),
+                zero_output_fallback,
+                false,
+            ),
+            HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek
+        );
+
+        let mut suppressed_record = software_record;
+        suppressed_record.software_suppressions = 1;
+        assert_eq!(
+            hevc_decode_chain_fallback_loop_action(
+                Some(suppressed_record),
+                zero_output_fallback,
+                false,
+            ),
+            HevcDecodeChainFallbackLoopAction::ForceLowLevelSeek
+        );
+        internal_seek_resets += 1;
+
+        suppressed_record.low_level_seeks = 1;
+        assert_eq!(
+            hevc_decode_chain_fallback_loop_action(
+                Some(suppressed_record),
+                zero_output_fallback,
+                false,
+            ),
+            HevcDecodeChainFallbackLoopAction::SuppressLowLevelSeek
+        );
+        suppressed_record.post_low_level_suppressions = 1;
+        assert_eq!(
+            hevc_decode_chain_fallback_loop_action(
+                Some(suppressed_record),
+                zero_output_fallback,
+                false,
+            ),
+            HevcDecodeChainFallbackLoopAction::RecoveryExhausted
+        );
+        assert_eq!(internal_seek_resets, 2);
     }
 
     #[test]
@@ -3441,7 +3707,7 @@ mod tests {
     }
 
     #[test]
-    fn hevc_zero_output_watchdog_fallbacks_on_large_pts_gap_after_zero_output() {
+    fn hevc_zero_output_pts_gap_fallback_survives_admitted_video_progress() {
         let mut watchdog = HevcDecodeChainWatchdog::default();
         let snapshot = output_snapshot(
             PlaybackOutputState::Playing,
@@ -3460,10 +3726,64 @@ mod tests {
             HevcDecodeChainRecoveryAction::SoftRecovery
         );
 
-        watchdog.observe_decoded_frame_gap(decoded_frame_gap_observation(
-            ffi::AVCodecID::AV_CODEC_ID_HEVC,
-            snapshot,
-        ));
+        assert_eq!(
+            watchdog.observe_decoded_frame_gap(decoded_frame_gap_observation(
+                ffi::AVCodecID::AV_CODEC_ID_HEVC,
+                snapshot,
+            )),
+            HevcDecodedFrameGapAction::DropForFallback
+        );
+        watchdog.observe_admitted_video_progress(HevcAdmittedVideoProgressObservation {
+            session_id: PlaybackSessionId(1),
+            codec_id: ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            frame_timeline_nsecs: 257_720_000_000,
+            current_start_position_nsecs: 252_900_000_000,
+            before_queue_end_nsecs: Some(252_920_000_000),
+            after_queue_end_nsecs: Some(257_760_000_000),
+        });
+
+        assert_eq!(
+            watchdog.take_fallback(),
+            Some(HevcDecodeChainFallback {
+                target_nsecs: 252_920_000_000,
+                reason: HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
+            })
+        );
+    }
+
+    #[test]
+    fn hevc_zero_output_pts_gap_fallback_survives_seek_preroll_progress() {
+        let mut watchdog = HevcDecodeChainWatchdog::default();
+        let snapshot = output_snapshot(
+            PlaybackOutputState::Playing,
+            false,
+            true,
+            Some((252_760_000_000, 252_920_000_000)),
+            Some(40_000_000),
+        );
+        assert_eq!(
+            watchdog.observe_packet(hevc_watchdog_input(
+                253_500_000_000,
+                snapshot,
+                demux_watermark(false),
+                252_900_000_000,
+            )),
+            HevcDecodeChainRecoveryAction::SoftRecovery
+        );
+        assert_eq!(
+            watchdog.observe_decoded_frame_gap(decoded_frame_gap_observation(
+                ffi::AVCodecID::AV_CODEC_ID_HEVC,
+                snapshot,
+            )),
+            HevcDecodedFrameGapAction::DropForFallback
+        );
+        watchdog.observe_seek_preroll_progress(HevcSeekPrerollProgressObservation {
+            session_id: PlaybackSessionId(1),
+            codec_id: ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            frame_timeline_nsecs: 252_880_000_000,
+            target_nsecs: 252_920_000_000,
+            preroll_frames: 1,
+        });
 
         assert_eq!(
             watchdog.take_fallback(),
@@ -3485,10 +3805,13 @@ mod tests {
             Some(40_000_000),
         );
 
-        watchdog.observe_decoded_frame_gap(decoded_frame_gap_observation(
-            ffi::AVCodecID::AV_CODEC_ID_HEVC,
-            snapshot,
-        ));
+        assert_eq!(
+            watchdog.observe_decoded_frame_gap(decoded_frame_gap_observation(
+                ffi::AVCodecID::AV_CODEC_ID_HEVC,
+                snapshot,
+            )),
+            HevcDecodedFrameGapAction::Admit
+        );
 
         assert_eq!(watchdog.take_fallback(), None);
     }
@@ -3513,10 +3836,13 @@ mod tests {
             HevcDecodeChainRecoveryAction::SoftRecovery
         );
 
-        watchdog.observe_decoded_frame_gap(decoded_frame_gap_observation(
-            ffi::AVCodecID::AV_CODEC_ID_H264,
-            snapshot,
-        ));
+        assert_eq!(
+            watchdog.observe_decoded_frame_gap(decoded_frame_gap_observation(
+                ffi::AVCodecID::AV_CODEC_ID_H264,
+                snapshot,
+            )),
+            HevcDecodedFrameGapAction::Admit
+        );
 
         assert_eq!(watchdog.take_fallback(), None);
     }
