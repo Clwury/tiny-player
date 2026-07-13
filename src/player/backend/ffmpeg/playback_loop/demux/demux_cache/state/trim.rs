@@ -270,6 +270,21 @@ impl DemuxPacketCacheState {
         true
     }
 
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn remove_read_range_stream_prefix_packets_for_test(
+        &mut self,
+        stream_index: c_int,
+        count: usize,
+    ) {
+        let range_id = self.read_range_id;
+        let mut range = self
+            .ranges
+            .remove(&range_id)
+            .expect("read range exists for prefix prune test");
+        self.remove_range_stream_prefix_packets(&mut range, stream_index, count);
+        self.ranges.insert(range_id, range);
+    }
+
     fn active_stream_prune_candidate(&self) -> Option<ArchivedStreamPruneCandidate> {
         let range = self.read_range();
         let candidates = range
@@ -727,6 +742,7 @@ impl DemuxPacketCacheState {
         if removed.is_empty() {
             return;
         }
+        let removed_packet_count = removed.len();
         if let Some(last_removed_packet_id) = removed.last().copied()
             && let Some(boundaries) = range.stream_seek_boundaries.get_mut(&stream_index)
         {
@@ -787,7 +803,11 @@ impl DemuxPacketCacheState {
         if range.id == self.read_range_id && range.global_order.is_empty() {
             self.clear_reader_tracking();
         }
-        self.refresh_range_stream_seek_boundary_after_prefix_prune(range, stream_index);
+        self.refresh_range_stream_seek_boundary_after_prefix_prune(
+            range,
+            stream_index,
+            removed_packet_count,
+        );
     }
 
     fn adjust_reader_head_positions_before_inline_compaction(&mut self, range: &DemuxCachedRange) {

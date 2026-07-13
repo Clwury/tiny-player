@@ -4,11 +4,15 @@ use super::audio_decode_worker::{
 };
 use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
 use super::decoder_packet_queue::DecoderPacketQueues;
+use super::pending_audio_queue::matching_audio_timeline_gap;
 use std::os::raw::c_int;
 
 use crate::player::render_host::PlaybackSessionId;
 
-use super::{AvPacket, Decoder, PlaybackBlockReason, PlaybackGeneration};
+use super::{
+    AvPacket, Decoder, PENDING_AUDIO_CONTINUITY_TOLERANCE, PlaybackBlockReason, PlaybackGeneration,
+    TimestampMapper,
+};
 
 const AUDIO_DECODE_PENDING_INPUT_QUEUE_CAPACITY: usize = 16;
 
@@ -186,6 +190,42 @@ impl AudioDecodePipeline {
         generation: u64,
     ) -> std::result::Result<Option<AudioDecodedFrame>, String> {
         self.worker.poll_frame(generation)
+    }
+
+    pub(super) fn decoded_timeline_gap_near(
+        &mut self,
+        audio_clock: &TimestampMapper,
+        expected_previous_end_nsecs: u64,
+        expected_next_start_nsecs: u64,
+        min_gap_nsecs: u64,
+        endpoint_tolerance_nsecs: u64,
+    ) -> std::result::Result<Option<(u64, u64)>, String> {
+        let mut preview_clock = audio_clock.clone();
+        let initial_previous_end_nsecs = preview_clock.last_contiguous_end_nsecs();
+        let audio_time_base = self.info().time_base;
+        let timings = self.worker.decoded_frame_timings()?;
+        let mapped_frames = timings.into_iter().map(|timing| {
+            let timestamp = preview_clock.map_contiguous(
+                timing.raw_timestamp,
+                audio_time_base,
+                timing.duration_nsecs,
+                PENDING_AUDIO_CONTINUITY_TOLERANCE,
+            );
+            (
+                timestamp.timeline_nsecs,
+                timestamp
+                    .timeline_nsecs
+                    .saturating_add(timing.duration_nsecs),
+            )
+        });
+        Ok(matching_audio_timeline_gap(
+            initial_previous_end_nsecs,
+            mapped_frames,
+            expected_previous_end_nsecs,
+            expected_next_start_nsecs,
+            min_gap_nsecs,
+            endpoint_tolerance_nsecs,
+        ))
     }
 
     pub(super) fn poll_packet_status(

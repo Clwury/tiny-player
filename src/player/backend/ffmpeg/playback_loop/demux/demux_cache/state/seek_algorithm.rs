@@ -101,6 +101,7 @@ impl DemuxPacketCacheState {
                     queue,
                     anchor_seek_target_nsecs,
                     recovery_point_stream_index == Some(*stream_index),
+                    range.subtitle_stream_index == Some(*stream_index),
                 )
             };
             if let Some(packet_id) = packet_id {
@@ -141,8 +142,10 @@ impl DemuxPacketCacheState {
         queue: &VecDeque<u64>,
         target_nsecs: u64,
         require_recovery_point: bool,
+        prefer_first_packet_at_timestamp: bool,
     ) -> Option<PacketId> {
         let mut target = None;
+        let mut target_start_nsecs = None;
         for packet_id in queue {
             let Some(packet) = packets.get(packet_id) else {
                 continue;
@@ -162,7 +165,11 @@ impl DemuxPacketCacheState {
             if target.is_some() && start_nsecs > target_nsecs {
                 break;
             }
+            if prefer_first_packet_at_timestamp && target_start_nsecs == Some(start_nsecs) {
+                continue;
+            }
             target = Some(*packet_id);
+            target_start_nsecs = Some(start_nsecs);
         }
         target
     }

@@ -56,7 +56,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
         output_scheduler.set_state(PlaybackOutputState::Ready);
         if first_video_timeline_nsecs > *current_start_position_nsecs {
             *current_start_position_nsecs = first_video_timeline_nsecs;
-            subtitle_pipeline.reset_cues_for_position(first_video_timeline_nsecs);
+            subtitle_pipeline.realign_cues_for_position(first_video_timeline_nsecs);
             buffered_reporter.reset_to(
                 nsecs_to_seconds(first_video_timeline_nsecs),
                 session_id,

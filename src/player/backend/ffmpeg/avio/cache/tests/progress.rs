@@ -28,8 +28,8 @@ fn http_cache_status_reports_byte_level_seek_count_changes() {
 fn http_cache_status_is_not_idle_while_side_download_is_pending() {
     let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
     assert!(state.append_at(100, b"abcdef"));
-    state.note_seek_offset(500, HttpCacheRangeKind::Playback);
-    state.queue_read_miss_at(500);
+    state.set_reader_offset(500);
+    assert!(state.request_side_download_at(500, HttpCacheRangeKind::Playback));
 
     assert_eq!(state.append_capacity_from(106), 0);
 

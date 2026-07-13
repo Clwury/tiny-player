@@ -135,6 +135,10 @@ impl DemuxPacketCacheState {
             self.recovery_point_stream_index(),
             DemuxPacketRangeView {
                 stream_queues: &stream_queues,
+                subtitle_stream_index: self
+                    .selected_streams
+                    .subtitle_stream
+                    .map(|stream| stream.index),
                 is_bof: seek_target.is_bof,
                 is_eof: seek_target.is_eof,
             },

@@ -157,6 +157,8 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct Seekab
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxPacketRangeView<'a> {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_queues:
         &'a BTreeMap<c_int, VecDeque<PacketId>>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) subtitle_stream_index:
+        Option<c_int>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) is_bof: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) is_eof: bool,
 }

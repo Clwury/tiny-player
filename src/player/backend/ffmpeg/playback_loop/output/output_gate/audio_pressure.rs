@@ -178,6 +178,23 @@ impl PlaybackOutputScheduler {
         self.pending_start_audio.contiguous_range_nsecs()
     }
 
+    pub(in crate::player::backend::ffmpeg) fn pending_audio_timeline_gap_near(
+        &self,
+        initial_previous_end_nsecs: Option<u64>,
+        expected_previous_end_nsecs: u64,
+        expected_next_start_nsecs: u64,
+        min_gap_nsecs: u64,
+        endpoint_tolerance_nsecs: u64,
+    ) -> Option<(u64, u64)> {
+        self.pending_start_audio.timeline_gap_near(
+            initial_previous_end_nsecs,
+            expected_previous_end_nsecs,
+            expected_next_start_nsecs,
+            min_gap_nsecs,
+            endpoint_tolerance_nsecs,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(in crate::player::backend::ffmpeg) fn audio_resume_waterline_for_output_wait(
         &self,

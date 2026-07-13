@@ -106,6 +106,13 @@ fn http_cache_state_demotes_active_range_when_playback_seek_leaves_it() {
     assert_eq!(state.base_offset, 106);
     assert_eq!(state.next_offset, 106);
     assert_eq!(state.reader_offset, 500);
+    assert_eq!(
+        state.restart_request,
+        Some(CacheRestartRequest {
+            offset: 500,
+            range_kind: HttpCacheRangeKind::Playback,
+        })
+    );
     assert_eq!(state.stream_cache_status().byte_level_seeks, 1);
     let mut output = [0; 3];
     assert_eq!(state.copy_available(102, &mut output), Some(3));
@@ -115,8 +122,8 @@ fn http_cache_state_demotes_active_range_when_playback_seek_leaves_it() {
 fn http_cache_state_pauses_inactive_active_prefetch_while_side_range_can_serve_reader() {
     let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
     assert!(state.append_at(100, b"abcdef"));
-    state.note_seek_offset(500, HttpCacheRangeKind::Playback);
-    state.queue_read_miss_at(500);
+    state.set_reader_offset(500);
+    assert!(state.request_side_download_at(500, HttpCacheRangeKind::Playback));
 
     assert_eq!(state.append_capacity_from(106), 0);
     assert!(state.prefetch_paused);
@@ -125,8 +132,8 @@ fn http_cache_state_pauses_inactive_active_prefetch_while_side_range_can_serve_r
 fn http_cache_state_schedules_active_continuation_after_playback_side_range() {
     let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
     assert!(state.append_at(100, b"abcdef"));
-    state.note_seek_offset(500, HttpCacheRangeKind::Playback);
-    state.queue_read_miss_at(500);
+    state.set_reader_offset(500);
+    assert!(state.request_side_download_at(500, HttpCacheRangeKind::Playback));
     let request = state
         .side_download_requests
         .pop_front()
@@ -149,8 +156,8 @@ fn http_cache_state_schedules_active_continuation_after_playback_side_range() {
 fn http_cache_state_marks_eof_instead_of_continuing_after_terminal_side_range() {
     let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(504));
     assert!(state.append_at(100, b"abcdef"));
-    state.note_seek_offset(500, HttpCacheRangeKind::Playback);
-    state.queue_read_miss_at(500);
+    state.set_reader_offset(500);
+    assert!(state.request_side_download_at(500, HttpCacheRangeKind::Playback));
     let request = state
         .side_download_requests
         .pop_front()
@@ -169,8 +176,8 @@ fn http_cache_state_marks_eof_instead_of_continuing_after_terminal_side_range() 
 fn http_cache_state_does_not_schedule_active_continuation_for_incomplete_side_range() {
     let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
     assert!(state.append_at(100, b"abcdef"));
-    state.note_seek_offset(500, HttpCacheRangeKind::Playback);
-    state.queue_read_miss_at(500);
+    state.set_reader_offset(500);
+    assert!(state.request_side_download_at(500, HttpCacheRangeKind::Playback));
     let request = state
         .side_download_requests
         .pop_front()
@@ -199,6 +206,79 @@ fn http_cache_state_does_not_schedule_stale_active_continuation_after_side_range
 
     assert!(state.side_download_active.is_empty());
     assert!(state.restart_request.is_none());
+}
+
+#[test]
+fn http_cache_state_schedules_backward_continuation_outside_live_active_range() {
+    let mut state = HttpRingCacheState::new(600).with_content_len_hint(Some(1_000));
+    assert!(state.append_at(600, &[0; 100]));
+    state.set_reader_offset(100);
+    let request = CacheRestartRequest {
+        offset: 100,
+        range_kind: HttpCacheRangeKind::Playback,
+    };
+    state.side_download_active.push(request);
+    assert!(state.append_retained_at(100, b"side", HttpCacheRangeKind::Playback));
+
+    state.finish_side_download_request(request, true);
+
+    assert_eq!(
+        state.restart_request,
+        Some(CacheRestartRequest {
+            offset: 104,
+            range_kind: HttpCacheRangeKind::Playback,
+        })
+    );
+}
+
+#[test]
+fn http_cache_state_backward_uncached_seek_requests_active_restart_without_side_range() {
+    let mut state = HttpRingCacheState::new(600).with_content_len_hint(Some(1_000));
+    assert!(state.append_at(600, &[0; 100]));
+
+    state.note_seek_offset(100, HttpCacheRangeKind::Playback);
+    assert!(!state.queue_read_miss_at(100));
+
+    assert_eq!(state.base_offset, 700);
+    assert_eq!(state.next_offset, 700);
+    assert_eq!(state.reader_offset, 100);
+    assert_eq!(
+        state.restart_request,
+        Some(CacheRestartRequest {
+            offset: 100,
+            range_kind: HttpCacheRangeKind::Playback,
+        })
+    );
+    assert!(state.side_download_requests.is_empty());
+}
+
+#[test]
+fn http_cache_state_latest_playback_seek_replaces_or_cancels_active_restart() {
+    let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
+    assert!(state.append_at(100, &[0; 100]));
+
+    state.note_seek_offset(500, HttpCacheRangeKind::Playback);
+    assert_eq!(
+        state.restart_request,
+        Some(CacheRestartRequest {
+            offset: 500,
+            range_kind: HttpCacheRangeKind::Playback,
+        })
+    );
+
+    state.note_seek_offset(600, HttpCacheRangeKind::Playback);
+    assert_eq!(
+        state.restart_request,
+        Some(CacheRestartRequest {
+            offset: 600,
+            range_kind: HttpCacheRangeKind::Playback,
+        })
+    );
+
+    state.note_seek_offset(150, HttpCacheRangeKind::Playback);
+    assert!(state.restart_request.is_none());
+    let mut output = [0; 4];
+    assert_eq!(state.copy_available(150, &mut output), Some(4));
 }
 #[test]
 fn http_cache_state_splices_proactive_playback_range_at_active_end() {

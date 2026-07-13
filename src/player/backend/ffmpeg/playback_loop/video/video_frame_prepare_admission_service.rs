@@ -164,7 +164,7 @@ pub(super) fn service_decoded_video_frame_start(
                 *audio_clock =
                     TimestampMapper::new(audio_stream_start_nsecs, frame_pts.nsecs, None);
                 output_scheduler.reset(control);
-                subtitle_pipeline.reset_cues_for_position(frame_pts.nsecs);
+                subtitle_pipeline.realign_cues_for_position(frame_pts.nsecs);
                 buffered_reporter.reset_to(nsecs_to_seconds(frame_pts.nsecs), session_id, event_tx);
             }
             if let Some(progress) =

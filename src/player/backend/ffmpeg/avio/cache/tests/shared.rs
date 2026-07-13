@@ -209,8 +209,8 @@ fn http_cache_shared_reports_idle_after_last_side_download_finishes() {
     let request = {
         let mut guard = shared.state.lock().expect("state locks");
         assert!(guard.append_at(100, b"abcdef"));
-        guard.note_seek_offset(500, HttpCacheRangeKind::Playback);
-        guard.queue_read_miss_at(500);
+        guard.set_reader_offset(500);
+        assert!(guard.request_side_download_at(500, HttpCacheRangeKind::Playback));
         assert_eq!(guard.append_capacity_from(106), 0);
         assert!(!guard.stream_cache_status().idle);
         assert!(guard.take_stream_cache_status_report().is_some());

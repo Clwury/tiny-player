@@ -139,6 +139,26 @@ impl PendingStartAudio {
             .map(|frame| frame.start_timeline_nsecs)
     }
 
+    pub(in crate::player::backend::ffmpeg) fn timeline_gap_near(
+        &self,
+        initial_previous_end_nsecs: Option<u64>,
+        expected_previous_end_nsecs: u64,
+        expected_next_start_nsecs: u64,
+        min_gap_nsecs: u64,
+        endpoint_tolerance_nsecs: u64,
+    ) -> Option<(u64, u64)> {
+        matching_audio_timeline_gap(
+            initial_previous_end_nsecs,
+            self.frames
+                .iter()
+                .map(|frame| (frame.start_timeline_nsecs, frame.end_timeline_nsecs)),
+            expected_previous_end_nsecs,
+            expected_next_start_nsecs,
+            min_gap_nsecs,
+            endpoint_tolerance_nsecs,
+        )
+    }
+
     fn first_end_timeline_nsecs(&self) -> Option<u64> {
         self.frames.front().map(|frame| frame.end_timeline_nsecs)
     }
@@ -222,9 +242,39 @@ impl PendingStartAudio {
     }
 }
 
+pub(in crate::player::backend::ffmpeg::playback_loop) fn matching_audio_timeline_gap<I>(
+    initial_previous_end_nsecs: Option<u64>,
+    frames: I,
+    expected_previous_end_nsecs: u64,
+    expected_next_start_nsecs: u64,
+    min_gap_nsecs: u64,
+    endpoint_tolerance_nsecs: u64,
+) -> Option<(u64, u64)>
+where
+    I: IntoIterator<Item = (u64, u64)>,
+{
+    let mut previous_end_nsecs = initial_previous_end_nsecs;
+    for (start_nsecs, end_nsecs) in frames {
+        if let Some(previous_end) = previous_end_nsecs
+            && let Some(gap_nsecs) = start_nsecs.checked_sub(previous_end)
+            && gap_nsecs > min_gap_nsecs
+            && previous_end.abs_diff(expected_previous_end_nsecs) <= endpoint_tolerance_nsecs
+            && start_nsecs.abs_diff(expected_next_start_nsecs) <= endpoint_tolerance_nsecs
+        {
+            return Some((previous_end, start_nsecs));
+        }
+        previous_end_nsecs = Some(
+            previous_end_nsecs
+                .unwrap_or_default()
+                .max(end_nsecs.max(start_nsecs)),
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DecodedAudio, PendingStartAudio};
+    use super::{DecodedAudio, PendingStartAudio, matching_audio_timeline_gap};
 
     fn decoded_audio(duration_nsecs: u64) -> DecodedAudio {
         DecodedAudio {
@@ -255,5 +305,37 @@ mod tests {
         pending.push(decoded_audio(20_000_000), 1_024_000_000, 1_044_000_000);
 
         assert_eq!(pending.contiguous_duration().as_nanos(), 44_000_000);
+    }
+
+    #[test]
+    fn matching_timeline_gap_requires_both_audio_boundaries_to_align() {
+        let frames = [
+            (1_000_000_000, 1_032_000_000),
+            (1_032_000_000, 1_064_000_000),
+            (1_896_000_000, 1_928_000_000),
+        ];
+
+        assert_eq!(
+            matching_audio_timeline_gap(
+                None,
+                frames,
+                1_064_000_000,
+                1_914_000_000,
+                200_000_000,
+                80_000_000,
+            ),
+            Some((1_064_000_000, 1_896_000_000))
+        );
+        assert_eq!(
+            matching_audio_timeline_gap(
+                None,
+                frames,
+                1_300_000_000,
+                1_914_000_000,
+                200_000_000,
+                80_000_000,
+            ),
+            None
+        );
     }
 }

@@ -51,8 +51,9 @@ pub(super) fn cache_range_fractions(
         return Vec::new();
     };
     // Mirror mpv OSC's seekRangesF: map each authoritative demux range directly
-    // onto the duration, preserving reported order and overlap. Clamping happens
-    // only when the range is translated to track coordinates for drawing.
+    // onto the duration. The FFmpeg demux report already coalesces positively
+    // overlapping physical ranges like mpv's cache range joining. Clamping
+    // happens only when the range is translated to track coordinates for drawing.
     cache_state
         .demux
         .seekable_ranges

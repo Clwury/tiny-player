@@ -137,6 +137,20 @@ impl SubtitlePipeline {
         self.active = None;
     }
 
+    pub(super) fn realign_cues_for_position(&mut self, start_position_nsecs: u64) {
+        if self.external_cues.is_empty() {
+            // Internal subtitle packets may already have been decoded while the
+            // output gate waited for the first video frame. Keep those cues when
+            // the video clock moves forward by a few milliseconds.
+            self.cues
+                .retain(|cue| cue.end_nsecs >= start_position_nsecs);
+        } else {
+            // External cues are immutable, so rebuilding also supports a rare
+            // backward clock realignment without losing an earlier cue.
+            self.cues = subtitle_cue_queue_from_external(&self.external_cues, start_position_nsecs);
+        }
+    }
+
     pub(super) fn refresh_timeline_origin(
         &mut self,
         playback_timeline_origin_nsecs: &mut Option<u64>,
@@ -313,7 +327,7 @@ impl SubtitlePipeline {
             return Ok(None);
         };
         for update in std::mem::take(&mut status.updates) {
-            self.apply_decode_update(update);
+            self.apply_decode_update(update, session_id);
         }
         if let Some(output) = audio_output {
             self.update_overlay_from_audio_clock(output, session_id, event_tx)?;
@@ -393,18 +407,40 @@ impl SubtitlePipeline {
         Ok(made_progress)
     }
 
-    fn apply_decode_update(&mut self, update: SubtitleCueUpdate) {
+    fn apply_decode_update(&mut self, update: SubtitleCueUpdate, session_id: PlaybackSessionId) {
+        let is_pgs = self
+            .stream
+            .is_some_and(|stream| stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE);
         match update {
             SubtitleCueUpdate::Push(cue) => {
-                if self.stream.is_some_and(|stream| {
-                    stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE
-                }) {
+                if is_pgs {
                     trim_overlapping_subtitle_cues_at(&mut self.cues, cue.start_nsecs);
                 }
+                let cue_start_nsecs = cue.start_nsecs;
+                let cue_end_nsecs = cue.end_nsecs;
+                let cue_bitmap_count = cue.bitmaps.len();
                 push_subtitle_cue(&mut self.cues, cue);
+                if is_pgs {
+                    tracing::debug!(
+                        session_id = ?session_id,
+                        cue_start_nsecs,
+                        cue_end_nsecs,
+                        cue_bitmap_count,
+                        queued_cues = self.cues.len(),
+                        "queued decoded FFmpeg PGS subtitle cue"
+                    );
+                }
             }
             SubtitleCueUpdate::TrimOverlapsAt(timeline_nsecs) => {
                 trim_overlapping_subtitle_cues_at(&mut self.cues, timeline_nsecs);
+                if is_pgs {
+                    tracing::debug!(
+                        session_id = ?session_id,
+                        timeline_nsecs,
+                        queued_cues = self.cues.len(),
+                        "applied decoded FFmpeg PGS subtitle clear"
+                    );
+                }
             }
         }
     }
@@ -454,10 +490,53 @@ fn subtitle_needs_prefetch(stream: Option<StreamInfo>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, ptr};
+
+    use ffmpeg_sys_next as ffi;
+
+    use crate::player::backend::BackendSubtitleCue;
+
     use super::{
-        PlaybackBlockReason, SUBTITLE_DECODE_PENDING_INPUT_QUEUE_CAPACITY,
+        PlaybackBlockReason, SUBTITLE_DECODE_PENDING_INPUT_QUEUE_CAPACITY, StreamInfo,
         SubtitleDecodeWorkerSnapshot, SubtitleDecodeWorkerState, SubtitlePipeline,
     };
+
+    fn cue(text: &str, start_nsecs: u64, end_nsecs: u64) -> BackendSubtitleCue {
+        BackendSubtitleCue {
+            text: text.to_string(),
+            bitmaps: Vec::new(),
+            start_nsecs,
+            end_nsecs,
+        }
+    }
+
+    fn subtitle_pipeline(
+        stream: Option<StreamInfo>,
+        external_cues: Vec<BackendSubtitleCue>,
+        cues: VecDeque<BackendSubtitleCue>,
+    ) -> SubtitlePipeline {
+        SubtitlePipeline {
+            stream,
+            worker: None,
+            packets: Default::default(),
+            external_cues,
+            cues,
+            active: None,
+            needs_prefetch: stream.is_some(),
+        }
+    }
+
+    fn pgs_stream() -> StreamInfo {
+        StreamInfo {
+            index: 2,
+            stream: ptr::null_mut(),
+            decoder: ptr::null(),
+            codec_id: ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE,
+            time_base: ffi::AVRational { num: 1, den: 1_000 },
+            start_nsecs: None,
+            frame_duration_nsecs: None,
+        }
+    }
 
     fn snapshot(
         state: SubtitleDecodeWorkerState,
@@ -489,5 +568,38 @@ mod tests {
             SubtitlePipeline::block_reason_for(snapshot(SubtitleDecodeWorkerState::NeedPacket, 1));
 
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn clock_realign_preserves_predecoded_internal_subtitle_cues() {
+        let expired = cue("expired", 1_000_000_000, 2_000_000_000);
+        let spanning = cue("spanning", 2_000_000_000, 5_000_000_000);
+        let future = cue("future", 6_000_000_000, 8_000_000_000);
+        let mut pipeline = subtitle_pipeline(
+            Some(pgs_stream()),
+            Vec::new(),
+            VecDeque::from([expired, spanning.clone(), future.clone()]),
+        );
+        pipeline.active = Some(spanning.clone());
+
+        pipeline.realign_cues_for_position(3_000_000_000);
+
+        assert_eq!(pipeline.cues, VecDeque::from([spanning.clone(), future]));
+        assert_eq!(pipeline.active, Some(spanning));
+    }
+
+    #[test]
+    fn clock_realign_rebuilds_external_cues_when_moving_backward() {
+        let earlier = cue("earlier", 1_000_000_000, 3_000_000_000);
+        let later = cue("later", 5_000_000_000, 7_000_000_000);
+        let mut pipeline = subtitle_pipeline(
+            None,
+            vec![earlier.clone(), later.clone()],
+            VecDeque::from([later.clone()]),
+        );
+
+        pipeline.realign_cues_for_position(2_000_000_000);
+
+        assert_eq!(pipeline.cues, VecDeque::from([earlier, later]));
     }
 }

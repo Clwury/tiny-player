@@ -28,6 +28,7 @@ const EXTERNAL_SUBTITLE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const EXTERNAL_SUBTITLE_TIMEOUT: Duration = Duration::from_secs(12);
 const SUBTITLE_BITMAP_MAX_PIXELS: usize = 16 * 1024 * 1024;
 const FALLBACK_SUBTITLE_DURATION_NSECS: u64 = 4_000_000_000;
+const UNBOUNDED_BITMAP_SUBTITLE_DURATION_NSECS: u64 = 60_000_000_000;
 
 pub(super) fn load_external_subtitle_cues(
     url: &str,
@@ -86,12 +87,19 @@ pub(super) fn decoded_subtitle_cues(
     emit_empty_cues: bool,
 ) -> std::result::Result<Vec<DecodedSubtitleCue>, String> {
     let start_offset_nsecs = u64::from(subtitle.start_display_time).saturating_mul(1_000_000);
+    let fallback_duration_nsecs = if emit_empty_cues {
+        // PGS display sets remain active until a later display/clear packet. Match
+        // mpv's bounded open-ended handling instead of hiding them after 4 seconds.
+        UNBOUNDED_BITMAP_SUBTITLE_DURATION_NSECS
+    } else {
+        FALLBACK_SUBTITLE_DURATION_NSECS
+    };
     let end_offset_nsecs = if subtitle.end_display_time > subtitle.start_display_time
         && subtitle.end_display_time != u32::MAX
     {
         u64::from(subtitle.end_display_time).saturating_mul(1_000_000)
     } else {
-        start_offset_nsecs.saturating_add(FALLBACK_SUBTITLE_DURATION_NSECS)
+        start_offset_nsecs.saturating_add(fallback_duration_nsecs)
     };
     let pts_nsecs = (subtitle.pts != ffi::AV_NOPTS_VALUE).then(|| {
         u64::try_from(subtitle.pts)
@@ -807,6 +815,39 @@ mod tests {
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].start_offset_nsecs, 250_000_000);
         assert_eq!(cues[0].end_offset_nsecs, 4_250_000_000);
+    }
+
+    #[test]
+    fn decoded_pgs_subtitle_keeps_unbounded_cue_until_clear_or_safety_limit() {
+        let text = CString::new("PGS open ended").unwrap();
+        let mut rect = ffi::AVSubtitleRect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+            nb_colors: 0,
+            data: [ptr::null_mut(); 4],
+            linesize: [0; 4],
+            flags: 0,
+            type_: ffi::AVSubtitleType::SUBTITLE_TEXT,
+            text: text.as_ptr() as *mut _,
+            ass: ptr::null_mut(),
+        };
+        let mut rect_ptr = &mut rect as *mut ffi::AVSubtitleRect;
+        let subtitle = ffi::AVSubtitle {
+            format: 0,
+            start_display_time: 250,
+            end_display_time: u32::MAX,
+            num_rects: 1,
+            rects: &mut rect_ptr,
+            pts: ffi::AV_NOPTS_VALUE,
+        };
+
+        let cues = decoded_subtitle_cues(&subtitle, None, true).unwrap();
+
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].start_offset_nsecs, 250_000_000);
+        assert_eq!(cues[0].end_offset_nsecs, 60_250_000_000);
     }
 
     #[test]

@@ -153,14 +153,16 @@ fn shared_with_config_for_test(
     control: Arc<FfmpegControl>,
     cache_config: PlaybackCacheConfig,
 ) -> (DemuxPacketCacheShared, Receiver<BackendEvent>) {
+    shared_with_codec_and_config_for_test(control, ffi::AVCodecID::AV_CODEC_ID_MPEG4, cache_config)
+}
+
+fn shared_with_codec_and_config_for_test(
+    control: Arc<FfmpegControl>,
+    codec_id: ffi::AVCodecID,
+    cache_config: PlaybackCacheConfig,
+) -> (DemuxPacketCacheShared, Receiver<BackendEvent>) {
     let (event_tx, event_rx) = mpsc::channel();
-    let state = DemuxPacketCacheState::new(
-        0,
-        0,
-        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
-        PlaybackSessionId(1),
-        cache_config,
-    );
+    let state = DemuxPacketCacheState::new(0, 0, codec_id, PlaybackSessionId(1), cache_config);
     let monitor_snapshot = DemuxPacketCacheMonitorSnapshot::from_state(&state);
     let shared = DemuxPacketCacheShared {
         state: Mutex::new(state),
@@ -182,6 +184,40 @@ fn shared_with_config_for_test(
 
 fn cache_config_for_test() -> PlaybackCacheConfig {
     PlaybackCacheConfig::default()
+}
+
+fn append_hevc_prefix_trim_regression_packets(state: &mut DemuxPacketCacheState) {
+    state.append_packet(cached_key_packet(0, true, Some(0), Some(40_000_000)));
+    state.append_packet(cached_key_packet(
+        0,
+        true,
+        Some(100_000_000),
+        Some(140_000_000),
+    ));
+    state.append_packet(cached_key_packet(
+        0,
+        true,
+        Some(300_000_000),
+        Some(340_000_000),
+    ));
+    state.append_packet(cached_packet(
+        0,
+        true,
+        Some(800_000_000),
+        Some(1_200_000_000),
+    ));
+    state.append_packet(cached_packet(
+        0,
+        true,
+        Some(1_500_000_000),
+        Some(1_540_000_000),
+    ));
+    state.append_packet(cached_key_packet(
+        0,
+        true,
+        Some(2_000_000_000),
+        Some(2_040_000_000),
+    ));
 }
 
 #[test]
@@ -3998,6 +4034,200 @@ fn demux_packet_cache_state_reports_hevc_seekable_range_after_cached_seek_prerol
 }
 
 #[test]
+fn demux_packet_cache_hevc_prefix_trim_preserves_confirmed_tail_after_short_block() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    append_hevc_prefix_trim_regression_packets(&mut state);
+    set_reader_head_for_stream_time(&mut state, 0, 1_500_000_000);
+    state.reader_nsecs = 1_500_000_000;
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 0.5,
+            end: 1.54,
+        }]
+    );
+
+    state.remove_read_range_stream_prefix_packets_for_test(0, 1);
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 0.6,
+            end: 1.54,
+        }],
+        "prefix trim updates the first retained HEVC seek point without discarding the confirmed tail"
+    );
+    assert!(
+        state
+            .seek_cached(1_000_000_000, PlaybackSessionId(2))
+            .is_some(),
+        "the reported post-trim range remains usable for cached seek"
+    );
+}
+
+#[test]
+fn demux_packet_cache_hevc_prefix_trim_repairs_missing_boundary_index() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    append_hevc_prefix_trim_regression_packets(&mut state);
+    set_reader_head_for_stream_time(&mut state, 0, 1_500_000_000);
+    state.reader_nsecs = 1_500_000_000;
+    state.read_range_mut().stream_seek_boundaries.remove(&0);
+
+    state.remove_read_range_stream_prefix_packets_for_test(0, 1);
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 0.6,
+            end: 1.54,
+        }]
+    );
+    assert_eq!(
+        state
+            .read_range()
+            .stream_seek_boundaries
+            .get(&0)
+            .and_then(|boundaries| boundaries.front())
+            .and_then(|packet_id| state.packets.get(packet_id))
+            .and_then(|packet| packet.start_nsecs),
+        Some(100_000_000),
+        "prefix trim rebuilds a stale HEVC safe-point index from retained packets"
+    );
+}
+
+#[test]
+fn demux_packet_cache_hevc_append_keeps_prefix_trim_start_stable() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    append_hevc_prefix_trim_regression_packets(&mut state);
+    set_reader_head_for_stream_time(&mut state, 0, 1_500_000_000);
+    state.reader_nsecs = 1_500_000_000;
+    state.remove_read_range_stream_prefix_packets_for_test(0, 1);
+
+    state.append_packet(cached_packet(
+        0,
+        true,
+        Some(2_500_000_000),
+        Some(2_540_000_000),
+    ));
+    state.append_packet(cached_key_packet(
+        0,
+        true,
+        Some(3_000_000_000),
+        Some(3_040_000_000),
+    ));
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 0.6,
+            end: 2.54,
+        }],
+        "tail append may extend the confirmed end but must not replace the retained head start"
+    );
+}
+
+#[test]
+fn demux_packet_cache_hevc_prefix_trim_clears_range_without_usable_safe_point() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    append_hevc_prefix_trim_regression_packets(&mut state);
+    set_reader_head_for_stream_time(&mut state, 0, 2_000_000_000);
+    state.reader_nsecs = 2_000_000_000;
+
+    state.remove_read_range_stream_prefix_packets_for_test(0, 5);
+
+    assert!(
+        state
+            .playback_cache_state(false)
+            .demux
+            .seekable_ranges
+            .is_empty(),
+        "a retained HEVC safe point after the previously confirmed end is not reported as seekable"
+    );
+}
+
+#[test]
+fn demux_packet_cache_emits_stable_hevc_range_across_prefix_trim() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let (shared, event_rx) = shared_with_codec_and_config_for_test(
+        control,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        cache_config_for_test(),
+    );
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        append_hevc_prefix_trim_regression_packets(&mut guard);
+        set_reader_head_for_stream_time(&mut guard, 0, 1_500_000_000);
+        guard.reader_nsecs = 1_500_000_000;
+        guard.remove_read_range_stream_prefix_packets_for_test(0, 1);
+        shared.emit_cache_state_after_read(&mut guard, true);
+
+        guard.append_packet(cached_packet(
+            0,
+            true,
+            Some(2_500_000_000),
+            Some(2_540_000_000),
+        ));
+        guard.append_packet(cached_key_packet(
+            0,
+            true,
+            Some(3_000_000_000),
+            Some(3_040_000_000),
+        ));
+        shared.emit_cache_state_after_read(&mut guard, true);
+    }
+
+    let emitted_ranges = event_rx
+        .try_iter()
+        .filter_map(|event| match event.kind {
+            BackendEventKind::CacheStateChanged(state) => Some(state.demux.seekable_ranges),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        emitted_ranges,
+        vec![
+            vec![PlaybackCacheTimeRange {
+                start: 0.6,
+                end: 1.54,
+            }],
+            vec![PlaybackCacheTimeRange {
+                start: 0.6,
+                end: 2.54,
+            }],
+        ],
+        "OSC cache events must not expose an empty or future-only range between prefix trim and tail growth"
+    );
+}
+
+#[test]
 fn demux_packet_cache_state_reports_full_active_seekable_range() {
     let mut state = DemuxPacketCacheState::new(
         0,
@@ -4239,6 +4469,74 @@ fn demux_packet_cache_state_cached_seek_sets_per_stream_reader_heads() {
     assert!(!state.active_packet_is_forward(3));
     assert!(!state.active_packet_is_forward(4));
     assert!(state.active_packet_is_forward(5));
+}
+
+#[test]
+fn demux_packet_cache_state_cached_seek_rewinds_to_first_pgs_packet_at_same_pts() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.set_selected_streams(DemuxSelectedStreams {
+        audio_stream: None,
+        subtitle_stream: Some(stream_info_for_test(
+            2,
+            ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE,
+        )),
+    });
+    state.append_packet(cached_key_packet(0, true, Some(0), Some(10_000_000_000)));
+    state.append_packet(cached_key_packet(
+        0,
+        true,
+        Some(10_000_000_000),
+        Some(20_000_000_000),
+    ));
+    state.append_packet(cached_key_packet(
+        0,
+        true,
+        Some(20_000_000_000),
+        Some(30_000_000_000),
+    ));
+    state.append_packet(cached_packet(
+        2,
+        false,
+        Some(5_000_000_000),
+        Some(15_000_000_000),
+    ));
+    state.append_packet(cached_packet(
+        2,
+        false,
+        Some(15_000_000_000),
+        Some(25_000_000_000),
+    ));
+    state.append_packet(cached_packet(
+        2,
+        false,
+        Some(15_000_000_000),
+        Some(25_000_000_000),
+    ));
+    state.append_packet(cached_packet(
+        2,
+        false,
+        Some(25_000_000_000),
+        Some(30_000_000_000),
+    ));
+    close_seek_range(&mut state, 30_000_000_000);
+
+    assert_eq!(
+        state.seek_cached(22_000_000_000, PlaybackSessionId(2)),
+        Some(30.0)
+    );
+
+    assert_eq!(state.reader_heads.get(&0), Some(&2));
+    assert_eq!(
+        state.reader_heads.get(&2),
+        Some(&4),
+        "PGS frame merge must replay every packet from the selected display-set PTS"
+    );
 }
 
 #[test]
@@ -5726,6 +6024,31 @@ fn demux_packet_cache_state_reports_multiple_seekable_ranges() {
     assert_eq!(cache_state.demux.cached_seeks, 0);
     assert_eq!(cache_state.demux.low_level_seeks, 1);
     assert_eq!(cache_state.demux.total_bytes, 4096);
+}
+
+#[test]
+fn demux_packet_cache_state_merges_overlapping_ranges_after_backward_seek() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.append_packet(cached_anchor(10_000_000_000, 20_000_000_000));
+    state.append_packet(cached_anchor(20_000_000_000, 30_000_000_000));
+    state.request_seek(0.0, PlaybackSessionId(2), 1, 0);
+    state.append_packet(cached_anchor(0, 15_000_000_000));
+    state.append_packet(cached_anchor(15_000_000_000, 25_000_000_000));
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 0.0,
+            end: 20.0
+        }],
+        "overlapping physical ranges must be exposed as one mpv-style seekable range"
+    );
 }
 
 #[test]

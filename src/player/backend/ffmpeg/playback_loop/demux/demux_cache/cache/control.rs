@@ -45,6 +45,15 @@ impl DemuxPacketCache {
                     .selected_streams
                     .audio_stream
                     .and_then(|stream| hit.reader_heads.get(&stream.index).copied());
+                let subtitle_reader_head = guard
+                    .selected_streams
+                    .subtitle_stream
+                    .and_then(|stream| hit.reader_heads.get(&stream.index).copied());
+                let subtitle_reader_head_start_nsecs = guard
+                    .selected_streams
+                    .subtitle_stream
+                    .and_then(|stream| guard.stream_reader_head_timeline(stream.index))
+                    .and_then(|(_, start_nsecs, _)| start_nsecs);
                 tracing::debug!(
                     ?session_id,
                     position_seconds,
@@ -55,6 +64,8 @@ impl DemuxPacketCache {
                     anchor_packet_id = hit.anchor_packet_id,
                     video_reader_head = hit.video_reader_head,
                     ?audio_reader_head,
+                    ?subtitle_reader_head,
+                    ?subtitle_reader_head_start_nsecs,
                     anchor_is_recovery_point = hit.anchor_is_recovery_point,
                     anchor_is_safe_seek_point = hit.anchor_is_safe_seek_point,
                     cached_seek_preroll_nsecs = guard.cached_seek_preroll_nsecs,

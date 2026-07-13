@@ -1208,7 +1208,7 @@ where
                 if first_video.timeline_nsecs > *current_start_position_nsecs {
                     *current_start_position_nsecs = first_video.timeline_nsecs;
                     scheduler.reset(first_video.timeline_nsecs);
-                    subtitle_pipeline.reset_cues_for_position(first_video.timeline_nsecs);
+                    subtitle_pipeline.realign_cues_for_position(first_video.timeline_nsecs);
                     buffered_reporter.reset_to(
                         nsecs_to_seconds(first_video.timeline_nsecs),
                         session_id,

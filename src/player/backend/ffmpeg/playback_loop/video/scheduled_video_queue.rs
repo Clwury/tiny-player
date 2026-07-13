@@ -279,6 +279,20 @@ impl ScheduledVideoQueue {
             .map(|frame| (frame.timeline_nsecs, frame.duration_nsecs))
     }
 
+    pub(in crate::player::backend::ffmpeg) fn extend_back_duration_to(
+        &mut self,
+        timeline_nsecs: u64,
+    ) -> Option<(u64, u64)> {
+        let frame = self.frames.back_mut()?;
+        let extended_duration_nsecs = timeline_nsecs.checked_sub(frame.timeline_nsecs)?;
+        if extended_duration_nsecs <= frame.duration_nsecs {
+            return None;
+        }
+        let previous_duration_nsecs = frame.duration_nsecs;
+        frame.duration_nsecs = extended_duration_nsecs;
+        Some((previous_duration_nsecs, extended_duration_nsecs))
+    }
+
     pub(in crate::player::backend::ffmpeg) fn buffered_until_from_nsecs(
         &self,
         timeline_nsecs: u64,
@@ -662,5 +676,23 @@ mod tests {
             queued_video_contiguous_buffered_until_from_nsecs(&queue, 1_000_000_000, 200_000_000),
             Some(1_230_000_000)
         );
+    }
+
+    #[test]
+    fn extending_tail_duration_bridges_confirmed_media_timeline_gap() {
+        let mut queue = ScheduledVideoQueue::default();
+        queue.push_queued(queued_video_frame(1_000_000_000, 40_000_000));
+
+        assert_eq!(
+            queue.extend_back_duration_to(1_834_000_000),
+            Some((40_000_000, 834_000_000))
+        );
+        queue.push_queued(queued_video_frame(1_834_000_000, 40_000_000));
+
+        assert_eq!(
+            queue.buffered_until_from_nsecs(1_000_000_000),
+            Some(1_874_000_000)
+        );
+        assert_eq!(queue.largest_gap_nsecs(), None);
     }
 }

@@ -859,7 +859,7 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
             );
             *current_start_position_nsecs = timeline_nsecs;
             scheduler.reset(timeline_nsecs);
-            subtitle_pipeline.reset_cues_for_position(timeline_nsecs);
+            subtitle_pipeline.realign_cues_for_position(timeline_nsecs);
             buffered_reporter.reset_to(nsecs_to_seconds(timeline_nsecs), session_id, event_tx);
         }
         tracing::debug!(

@@ -13,7 +13,7 @@ use ffmpeg_sys_next as ffi;
 use super::audio_decode_pipeline::AudioDecodePipeline;
 use super::scheduled_video_queue::queued_video_continuity_gap_threshold_nsecs;
 use super::video_decode_pipeline::{
-    HevcAdmittedVideoProgressObservation, HevcDecodeChainRecoveryAction,
+    AudioTimelineGapEvidence, HevcAdmittedVideoProgressObservation, HevcDecodeChainRecoveryAction,
     HevcDecodePacketObservation, HevcDecodedFrameGapAction, HevcDecodedFrameGapObservation,
     HevcSeekPrerollProgressObservation, VideoDecodePipeline,
 };
@@ -37,13 +37,74 @@ use super::{
     DECODE_PACKET_SLOW_LOG_AFTER, DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER,
     DemuxReaderWatermark, DoviPipeline, FfmpegControl, PlaybackGeneration, PlaybackOutputScheduler,
     PlaybackScheduler, PositionReporter, StreamInfo, SubtitlePipeline, TimestampMapper,
-    VideoDecodeRecovery,
+    VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, VideoDecodeRecovery, duration_nsecs,
 };
 
 fn hevc_decoded_frame_gap_allows_scheduled_queue_admission(
     action: HevcDecodedFrameGapAction,
 ) -> bool {
-    action == HevcDecodedFrameGapAction::Admit
+    action != HevcDecodedFrameGapAction::DropForFallback
+}
+
+fn hevc_decoded_frame_gap_bridges_scheduled_queue(action: HevcDecodedFrameGapAction) -> bool {
+    action == HevcDecodedFrameGapAction::AdmitSynchronizedTimelineGap
+}
+
+#[allow(clippy::too_many_arguments)]
+fn synchronized_audio_timeline_gap_evidence(
+    codec_id: ffi::AVCodecID,
+    audio_decode_pipeline: Option<&mut AudioDecodePipeline>,
+    audio_clock: &TimestampMapper,
+    output_scheduler: &PlaybackOutputScheduler,
+    audio_output_buffered_until_nsecs: Option<u64>,
+    previous_expected_next_nsecs: Option<u64>,
+    previous_gap_nsecs: Option<i128>,
+    next_video_timeline_nsecs: u64,
+    max_gap_nsecs: u64,
+) -> std::result::Result<Option<AudioTimelineGapEvidence>, String> {
+    if codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
+        return Ok(None);
+    }
+    let Some(previous_gap_nsecs) = previous_gap_nsecs.and_then(|gap| u64::try_from(gap).ok())
+    else {
+        return Ok(None);
+    };
+    if previous_gap_nsecs <= max_gap_nsecs {
+        return Ok(None);
+    }
+    let Some(previous_video_end_nsecs) = previous_expected_next_nsecs else {
+        return Ok(None);
+    };
+    let endpoint_tolerance_nsecs = duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE);
+    let pending_gap = output_scheduler.pending_audio_timeline_gap_near(
+        audio_output_buffered_until_nsecs,
+        previous_video_end_nsecs,
+        next_video_timeline_nsecs,
+        max_gap_nsecs,
+        endpoint_tolerance_nsecs,
+    );
+    let decoded_gap = if pending_gap.is_none() {
+        match audio_decode_pipeline {
+            Some(pipeline) => pipeline.decoded_timeline_gap_near(
+                audio_clock,
+                previous_video_end_nsecs,
+                next_video_timeline_nsecs,
+                max_gap_nsecs,
+                endpoint_tolerance_nsecs,
+            )?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    Ok(pending_gap
+        .or(decoded_gap)
+        .map(
+            |(previous_end_nsecs, next_start_nsecs)| AudioTimelineGapEvidence {
+                previous_end_nsecs,
+                next_start_nsecs,
+            },
+        ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -487,7 +548,7 @@ where
             match prepare_result.result {
                 Ok(prepared_frame) => {
                     let admitted_frame_timeline_nsecs = prepared_frame.timeline_nsecs;
-                    let before_queue_end_nsecs = output_scheduler
+                    let mut before_queue_end_nsecs = output_scheduler
                         .scheduled_video_queue
                         .range_nsecs()
                         .map(|(_, end)| end);
@@ -507,8 +568,22 @@ where
                             )
                         });
                     let audio_snapshot = audio_output.and_then(|output| output.snapshot().ok());
-                    let audio_played_timeline_nsecs =
-                        audio_snapshot.map(|snapshot| snapshot.played_timeline_nsecs);
+                    let audio_played_timeline_nsecs = audio_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.played_timeline_nsecs);
+                    let audio_timeline_gap = synchronized_audio_timeline_gap_evidence(
+                        video_stream.codec_id,
+                        audio_decode_pipeline.as_deref_mut(),
+                        audio_clock,
+                        output_scheduler,
+                        audio_snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.buffered_until_timeline_nsecs),
+                        previous_expected_next_nsecs,
+                        previous_gap_nsecs,
+                        prepared_frame.timeline_nsecs,
+                        max_gap_nsecs,
+                    )?;
                     let output_snapshot =
                         output_scheduler.snapshot_for_played_until(audio_played_timeline_nsecs);
                     let fallback_target_nsecs = previous_expected_next_nsecs
@@ -525,6 +600,7 @@ where
                             max_gap_nsecs,
                             fallback_target_nsecs,
                             audio_played_timeline_nsecs,
+                            audio_timeline_gap,
                             recovery_waiting: video_decode_recovery.waiting_for_keyframe(),
                             output_snapshot,
                         },
@@ -543,6 +619,29 @@ where
                             "dropped prepared HEVC video frame after decode-chain gap fallback"
                         );
                         break;
+                    }
+                    if hevc_decoded_frame_gap_bridges_scheduled_queue(gap_action)
+                        && let Some((previous_duration_nsecs, extended_duration_nsecs)) =
+                            output_scheduler
+                                .scheduled_video_queue
+                                .extend_back_duration_to(prepared_frame.timeline_nsecs)
+                    {
+                        before_queue_end_nsecs = output_scheduler
+                            .scheduled_video_queue
+                            .range_nsecs()
+                            .map(|(_, end)| end);
+                        tracing::debug!(
+                            session_id = ?session_id,
+                            next_video_timeline_nsecs = prepared_frame.timeline_nsecs,
+                            previous_duration_ms =
+                                previous_duration_nsecs as f64 / 1_000_000.0,
+                            extended_duration_ms =
+                                extended_duration_nsecs as f64 / 1_000_000.0,
+                            bridged_gap_ms = extended_duration_nsecs
+                                .saturating_sub(previous_duration_nsecs) as f64
+                                / 1_000_000.0,
+                            "extended previous video frame across synchronized media timeline gap"
+                        );
                     }
                     let stage_started_at = Instant::now();
                     admit_prepared_video_frame(PreparedVideoFrameAdmissionContext {
@@ -862,6 +961,7 @@ fn log_video_frame_prepare_result_pending(
 mod tests {
     use super::{
         HevcDecodedFrameGapAction, hevc_decoded_frame_gap_allows_scheduled_queue_admission,
+        hevc_decoded_frame_gap_bridges_scheduled_queue,
     };
 
     #[test]
@@ -876,6 +976,12 @@ mod tests {
         assert_eq!(scheduled_queue_admissions, 0);
         assert!(hevc_decoded_frame_gap_allows_scheduled_queue_admission(
             HevcDecodedFrameGapAction::Admit
+        ));
+        assert!(hevc_decoded_frame_gap_allows_scheduled_queue_admission(
+            HevcDecodedFrameGapAction::AdmitSynchronizedTimelineGap
+        ));
+        assert!(hevc_decoded_frame_gap_bridges_scheduled_queue(
+            HevcDecodedFrameGapAction::AdmitSynchronizedTimelineGap
         ));
     }
 }

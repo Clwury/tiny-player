@@ -103,6 +103,12 @@ pub(super) struct AudioDecodedFrame {
     pub(super) raw_timestamp: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AudioDecodedFrameTiming {
+    pub(super) raw_timestamp: i64,
+    pub(super) duration_nsecs: u64,
+}
+
 struct QueuedAudioDecodedFrame {
     generation: u64,
     frame: AudioDecodedFrame,
@@ -258,6 +264,20 @@ impl AudioDecodeWorker {
             .decoded_duration_nsecs
             .saturating_sub(queued.frame.audio.duration_nsecs);
         Ok(Some(queued.frame))
+    }
+
+    pub(super) fn decoded_frame_timings(
+        &mut self,
+    ) -> std::result::Result<Vec<AudioDecodedFrameTiming>, String> {
+        self.pump_available_results()?;
+        Ok(self
+            .decoded_frames
+            .iter()
+            .map(|queued| AudioDecodedFrameTiming {
+                raw_timestamp: queued.frame.raw_timestamp,
+                duration_nsecs: queued.frame.audio.duration_nsecs,
+            })
+            .collect())
     }
 
     pub(super) fn poll_packet_status(

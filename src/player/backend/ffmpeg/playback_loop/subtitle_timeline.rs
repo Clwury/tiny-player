@@ -156,6 +156,15 @@ pub(super) fn update_subtitle_overlay(
     if *active == next {
         return;
     }
+    tracing::debug!(
+        session_id = ?session_id,
+        position_nsecs,
+        subtitle_visible = next.is_some(),
+        cue_start_nsecs = next.as_ref().map(|cue| cue.start_nsecs),
+        cue_end_nsecs = next.as_ref().map(|cue| cue.end_nsecs),
+        cue_bitmap_count = next.as_ref().map(|cue| cue.bitmaps.len()),
+        "updated FFmpeg subtitle overlay"
+    );
     *active = next.clone();
     let _ = event_tx.send(BackendEvent::new(
         session_id,

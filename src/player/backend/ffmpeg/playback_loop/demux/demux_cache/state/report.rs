@@ -413,15 +413,7 @@ impl DemuxPacketCacheState {
                 &mut eof_cached,
             );
         }
-        ranges.sort_by(|left, right| {
-            left.start
-                .partial_cmp(&right.start)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let ranges = ranges
-            .into_iter()
-            .filter(|range| range.end >= range.start)
-            .collect::<Vec<_>>();
+        let ranges = merge_overlapping_seekable_time_ranges(ranges);
         SeekableTimeRangesReport {
             ranges,
             bof_cached,
@@ -796,15 +788,44 @@ impl DemuxPacketCacheState {
         &self,
         range: &mut DemuxCachedRange,
         stream_index: c_int,
+        pruned_packet_count: usize,
     ) {
-        let old_seek_end_nsecs = range.stream_boundary(stream_index).seek_end_nsecs;
-        let Some(queue) = range.stream_queues.get(&stream_index) else {
+        let old_boundary = range.stream_boundary(stream_index);
+        let old_seek_start_nsecs = old_boundary.seek_start_nsecs;
+        let old_seek_end_nsecs = old_boundary.seek_end_nsecs;
+        if !range.stream_queues.contains_key(&stream_index) {
             let boundary = range.ensure_stream_boundary(stream_index);
             boundary.seek_start_nsecs = None;
             boundary.seek_end_nsecs = None;
             range.mark_seekable_dirty();
+            tracing::debug!(
+                session_id = ?self.session_id,
+                range_id = range.id,
+                stream_index,
+                stream_kind = ?self.stream_kinds.get(&stream_index),
+                pruned_packet_count,
+                old_seek_start_nsecs = ?old_seek_start_nsecs,
+                old_seek_end_nsecs = ?old_seek_end_nsecs,
+                new_seek_start_nsecs = ?Option::<u64>::None,
+                new_seek_end_nsecs = ?Option::<u64>::None,
+                boundary_index_rebuilt = false,
+                retained_boundary_samples = ?Vec::<u64>::new(),
+                outcome = "queue_empty",
+                "updated FFmpeg demux seek boundary after prefix trim"
+            );
             return;
-        };
+        }
+
+        // mpv keeps the already-confirmed seek tail when pruning a queue head:
+        // only the first retained seek point changes. Requiring the first local
+        // block to close again can transiently erase a valid HEVC range when its
+        // first two IRAP points are closer than cached seek preroll.
+        let boundary_index_rebuilt =
+            self.repair_range_stream_seek_boundary_index(range, stream_index);
+        let queue = range
+            .stream_queues
+            .get(&stream_index)
+            .expect("stream queue checked before prefix boundary repair");
         let queue_start = queue.front().copied();
         let queue_end = queue.back().copied();
         let boundary_ids = range
@@ -817,103 +838,112 @@ impl DemuxPacketCacheState {
                     && queue_end.is_some_and(|end| *packet_id <= end)
                     && self.packet_readable_in_current_generation(*packet_id)
             })
-            .take(2)
+            .take(3)
+            .collect::<Vec<_>>();
+        let retained_boundary_samples = boundary_ids
+            .iter()
+            .filter_map(|packet_id| {
+                self.packets
+                    .get(packet_id)
+                    .and_then(|packet| packet.start_nsecs)
+            })
             .collect::<Vec<_>>();
 
-        let seek_range = if stream_index == self.timeline_anchor_stream_index {
-            let close_open_segment = range.stream_boundary(stream_index).is_eof;
-            let required_boundaries = if close_open_segment { 1 } else { 2 };
-            if boundary_ids.len() < required_boundaries {
-                None
-            } else {
-                let first_boundary = boundary_ids[0];
-                let first_position = packet_queue_lower_bound(queue, first_boundary);
-                let end_position = boundary_ids
-                    .get(1)
-                    .map(|packet_id| packet_queue_lower_bound(queue, *packet_id).saturating_add(1))
-                    .unwrap_or(queue.len())
-                    .min(queue.len());
-                let local_queue = queue
-                    .iter()
-                    .skip(first_position)
-                    .take(end_position.saturating_sub(first_position))
-                    .copied()
-                    .filter(|packet_id| self.packet_readable_in_current_generation(*packet_id))
-                    .collect::<VecDeque<_>>();
-                let mut stream_queues = BTreeMap::new();
-                stream_queues.insert(stream_index, local_queue);
-                Self::seekable_timeline_range_in_packet_range(
-                    &self.packets,
-                    self.timeline_anchor_stream_index,
-                    self.cached_seek_preroll_nsecs,
-                    self.cached_seek_requires_safe_point,
-                    &stream_queues,
-                    close_open_segment && boundary_ids.len() == 1,
-                )
-                .map(|(start_nsecs, local_end_nsecs)| {
-                    (
-                        start_nsecs,
-                        old_seek_end_nsecs
-                            .unwrap_or(local_end_nsecs)
-                            .max(local_end_nsecs),
-                    )
+        let (seek_range, outcome) = if let Some(old_seek_end_nsecs) = old_seek_end_nsecs {
+            let new_seek_start_nsecs = boundary_ids.first().and_then(|packet_id| {
+                let start_nsecs = self.packets.get(packet_id)?.start_nsecs?;
+                Some(if stream_index == self.timeline_anchor_stream_index {
+                    start_nsecs.saturating_add(self.cached_seek_preroll_nsecs)
+                } else {
+                    start_nsecs
                 })
-            }
-        } else if self.stream_requires_recovery_point(stream_index) {
-            let close_open_segment = range.stream_boundary(stream_index).is_eof;
-            let required_boundaries = if close_open_segment { 1 } else { 2 };
-            if boundary_ids.len() < required_boundaries {
-                None
-            } else {
-                // A TrueHD/MLP seek range starts at a major-sync block and the
-                // next major-sync closes it. Prefix pruning cannot change the
-                // already-computed tail, so only rescan this first recovery
-                // block instead of copying and walking the entire audio queue.
-                let first_boundary = boundary_ids[0];
-                let first_position = packet_queue_lower_bound(queue, first_boundary);
-                let end_position = boundary_ids
-                    .get(1)
-                    .map(|packet_id| packet_queue_lower_bound(queue, *packet_id).saturating_add(1))
-                    .unwrap_or(queue.len())
-                    .min(queue.len());
-                let local_queue = queue
-                    .iter()
-                    .skip(first_position)
-                    .take(end_position.saturating_sub(first_position))
-                    .copied()
-                    .filter(|packet_id| self.packet_readable_in_current_generation(*packet_id))
-                    .collect::<VecDeque<_>>();
-                Self::stream_seek_range_in_packet_queue(
-                    &self.packets,
-                    &local_queue,
-                    true,
-                    close_open_segment && boundary_ids.len() == 1,
-                )
-                .map(|(start_nsecs, local_end_nsecs)| {
-                    (
-                        start_nsecs,
-                        old_seek_end_nsecs
-                            .unwrap_or(local_end_nsecs)
-                            .max(local_end_nsecs),
-                    )
-                })
+            });
+            match new_seek_start_nsecs {
+                Some(start_nsecs) if start_nsecs < old_seek_end_nsecs => (
+                    Some((start_nsecs, old_seek_end_nsecs)),
+                    "preserved_confirmed_end",
+                ),
+                Some(_) => (None, "retained_boundary_after_confirmed_end"),
+                None => (None, "no_retained_boundary"),
             }
         } else {
-            boundary_ids.first().and_then(|packet_id| {
-                let packet = self.packets.get(packet_id)?;
-                let start_nsecs = packet.start_nsecs?;
-                let packet_end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
-                let end_nsecs = old_seek_end_nsecs
-                    .unwrap_or(packet_end_nsecs)
-                    .max(packet_end_nsecs);
-                (end_nsecs > start_nsecs).then_some((start_nsecs, end_nsecs))
-            })
+            self.refresh_range_stream_seek_boundary_in_range(range, stream_index);
+            let boundary = range.stream_boundary(stream_index);
+            let seek_range = boundary.seek_start_nsecs.zip(boundary.seek_end_nsecs);
+            (seek_range, "recomputed_without_confirmed_end")
         };
 
-        let boundary = range.ensure_stream_boundary(stream_index);
-        boundary.seek_start_nsecs = seek_range.map(|(start, _)| start);
-        boundary.seek_end_nsecs = seek_range.map(|(_, end)| end);
+        let range_id = range.id;
+        let (new_seek_start_nsecs, new_seek_end_nsecs) = {
+            let boundary = range.ensure_stream_boundary(stream_index);
+            boundary.seek_start_nsecs = seek_range.map(|(start, _)| start);
+            boundary.seek_end_nsecs = seek_range.map(|(_, end)| end);
+            (boundary.seek_start_nsecs, boundary.seek_end_nsecs)
+        };
         range.mark_seekable_dirty();
+        tracing::debug!(
+            session_id = ?self.session_id,
+            range_id,
+            stream_index,
+            stream_kind = ?self.stream_kinds.get(&stream_index),
+            pruned_packet_count,
+            old_seek_start_nsecs = ?old_seek_start_nsecs,
+            old_seek_end_nsecs = ?old_seek_end_nsecs,
+            new_seek_start_nsecs = ?new_seek_start_nsecs,
+            new_seek_end_nsecs = ?new_seek_end_nsecs,
+            boundary_index_rebuilt,
+            retained_boundary_samples = ?retained_boundary_samples,
+            outcome,
+            "updated FFmpeg demux seek boundary after prefix trim"
+        );
+    }
+
+    fn repair_range_stream_seek_boundary_index(
+        &self,
+        range: &mut DemuxCachedRange,
+        stream_index: c_int,
+    ) -> bool {
+        let Some(queue) = range.stream_queues.get(&stream_index) else {
+            return false;
+        };
+        let queue_start = queue.front().copied();
+        let queue_end = queue.back().copied();
+        let indexed_first = range
+            .stream_seek_boundaries
+            .get(&stream_index)
+            .into_iter()
+            .flat_map(|boundaries| boundaries.iter().copied())
+            .find(|packet_id| {
+                queue_start.is_some_and(|start| *packet_id >= start)
+                    && queue_end.is_some_and(|end| *packet_id <= end)
+                    && self.packet_readable_in_current_generation(*packet_id)
+            });
+        let actual_first = queue.iter().copied().find(|packet_id| {
+            self.packets
+                .get(packet_id)
+                .is_some_and(|packet| self.packet_is_stream_seek_boundary(stream_index, packet))
+                && self.packet_readable_in_current_generation(*packet_id)
+        });
+        if indexed_first == actual_first {
+            return false;
+        }
+
+        let rebuilt = queue
+            .iter()
+            .copied()
+            .filter(|packet_id| {
+                self.packets
+                    .get(packet_id)
+                    .is_some_and(|packet| self.packet_is_stream_seek_boundary(stream_index, packet))
+                    && self.packet_readable_in_current_generation(*packet_id)
+            })
+            .collect::<VecDeque<_>>();
+        if rebuilt.is_empty() {
+            range.stream_seek_boundaries.remove(&stream_index);
+        } else {
+            range.stream_seek_boundaries.insert(stream_index, rebuilt);
+        }
+        true
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn refresh_range_seek_boundaries(
@@ -1075,25 +1105,37 @@ impl DemuxPacketCacheState {
     }
 }
 
-fn packet_queue_lower_bound(queue: &VecDeque<PacketId>, packet_id: PacketId) -> usize {
-    let mut left = 0usize;
-    let mut right = queue.len();
-    while left < right {
-        let middle = left + (right - left) / 2;
-        if queue
-            .get(middle)
-            .is_some_and(|candidate| *candidate < packet_id)
-        {
-            left = middle.saturating_add(1);
-        } else {
-            right = middle;
-        }
-    }
-    left
-}
-
 struct SeekableTimeRangesReport {
     ranges: Vec<PlaybackCacheTimeRange>,
     bof_cached: bool,
     eof_cached: bool,
+}
+
+fn merge_overlapping_seekable_time_ranges(
+    mut ranges: Vec<PlaybackCacheTimeRange>,
+) -> Vec<PlaybackCacheTimeRange> {
+    ranges.retain(|range| {
+        range.start.is_finite() && range.end.is_finite() && range.end >= range.start
+    });
+    ranges.sort_by(|left, right| {
+        left.start
+            .total_cmp(&right.start)
+            .then_with(|| left.end.total_cmp(&right.end))
+    });
+
+    // mpv attempts to join positively-overlapping demux cache ranges before
+    // exposing seekable-ranges to the OSC. Tiny keeps the packet ranges
+    // independent, so publish the equivalent non-overlapping union while
+    // retaining merely adjacent ranges as separate entries.
+    let mut merged: Vec<PlaybackCacheTimeRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start < previous.end
+        {
+            previous.end = previous.end.max(range.end);
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
 }

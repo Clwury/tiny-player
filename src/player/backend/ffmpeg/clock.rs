@@ -215,6 +215,7 @@ pub(super) struct MappedTimestamp {
     pub(super) sink_nsecs: u64,
 }
 
+#[derive(Clone)]
 pub(super) struct TimestampMapper {
     start_nsecs: Option<u64>,
     fallback_first_nsecs: Option<u64>,
@@ -290,6 +291,10 @@ impl TimestampMapper {
             self.fallback_first_nsecs
                 .map(|first| first.saturating_sub(self.start_position_nsecs))
         })
+    }
+
+    pub(super) fn last_contiguous_end_nsecs(&self) -> Option<u64> {
+        self.last_contiguous_end_nsecs
     }
 
     fn timeline_from_timestamp(&mut self, nsecs: u64) -> u64 {

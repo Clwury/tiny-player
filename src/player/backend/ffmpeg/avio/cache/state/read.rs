@@ -82,15 +82,21 @@ impl HttpRingCacheState {
         offset: u64,
         range_kind: HttpCacheRangeKind,
     ) {
-        if !self.offset_in_active_range(offset) {
+        let offset_in_active_range = self.offset_in_active_range(offset);
+        let offset_cached = self.cached_range_contains(offset);
+        if !offset_in_active_range {
             self.byte_level_seeks = self.byte_level_seeks.saturating_add(1);
         }
         self.pending_seek_range_kind = Some((offset, range_kind));
         if range_kind == HttpCacheRangeKind::Playback {
-            if !self.offset_in_active_range(offset) {
+            self.restart_request = None;
+            if !offset_in_active_range {
                 self.demote_active_range_to_retained();
             }
             self.set_reader_offset(offset);
+            if !offset_cached {
+                self.request_active_playback_restart_at(offset);
+            }
         }
     }
 
