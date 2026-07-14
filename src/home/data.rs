@@ -295,7 +295,7 @@ impl HomeContent {
         }
     }
 
-    fn ensure_user_items_images(&mut self, items: &UserItems, cx: &mut Context<Self>) {
+    pub(super) fn ensure_user_items_images(&mut self, items: &UserItems, cx: &mut Context<Self>) {
         for item in &items.items {
             self.ensure_user_item_image(item.image_source(), cx);
         }

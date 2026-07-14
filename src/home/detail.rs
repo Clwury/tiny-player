@@ -7,12 +7,14 @@ pub(crate) use state::{SeriesDetailSelectKind, SeriesDetailState};
 use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, SharedString, Window, point, px};
 
 use crate::{
-    emby::{MediaItem, MediaItems, UserItem, playback::resolve_direct_stream_url},
+    emby::{
+        MediaItem, MediaItems, ResumeItem, UserItem, UserItems, playback::resolve_direct_stream_url,
+    },
     player::{PlaybackRequest, PlaybackTrack, PlaybackTrackSelection},
     server::CachedServer,
 };
 
-use super::{HomeContent, HomeContentEvent, LoadState};
+use super::{HomeContent, HomeContentEvent, LoadState, carousel::DETAIL_EPISODE_CARD_STEP_PX};
 
 struct SelectedPlayback {
     detail_id: String,
@@ -36,9 +38,35 @@ impl HomeContent {
             return;
         };
 
+        self.open_detail_state(detail, cx);
+    }
+
+    pub(super) fn open_resume_item_detail(&mut self, item: &ResumeItem, cx: &mut Context<Self>) {
+        match item.item_type.as_deref() {
+            Some("Movie") => {
+                let Some(detail) = SeriesDetailState::from_resume_movie(item) else {
+                    return;
+                };
+                self.open_detail_state(detail, cx);
+            }
+            Some("Episode") => {
+                let Some(detail) = SeriesDetailState::from_resume_episode(item) else {
+                    self.resume_detail_failed =
+                        Some("继续观看剧集缺少 SeriesId，无法打开详情".into());
+                    cx.notify();
+                    return;
+                };
+                self.open_detail_state(detail, cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn open_detail_state(&mut self, detail: SeriesDetailState, cx: &mut Context<Self>) {
+        self.resume_detail_failed = None;
+
         self.series_detail = Some(detail);
         self.main_scroll_handle.set_offset(point(px(0.0), px(0.0)));
-        self.main_scrollbar_drag = None;
         self.load_media_detail_effects(cx);
         cx.emit(HomeContentEvent::TitleChanged);
         cx.notify();
@@ -52,7 +80,6 @@ impl HomeContent {
     ) {
         self.series_detail = None;
         self.main_scroll_handle.set_offset(point(px(0.0), px(0.0)));
-        self.main_scrollbar_drag = None;
         cx.emit(HomeContentEvent::TitleChanged);
         cx.notify();
     }
@@ -181,13 +208,20 @@ impl HomeContent {
 
     fn load_media_detail_effects(&mut self, cx: &mut Context<Self>) {
         self.load_series_media_item_if_needed(cx);
+        self.load_similar_items_if_needed(cx);
         if self
             .series_detail
             .as_ref()
             .is_some_and(SeriesDetailState::is_series)
         {
             self.load_series_seasons_if_needed(cx);
-            self.load_series_next_up_if_needed(cx);
+            if self
+                .series_detail
+                .as_ref()
+                .is_some_and(SeriesDetailState::should_load_next_up)
+            {
+                self.load_series_next_up_if_needed(cx);
+            }
             self.load_series_episodes_if_needed(cx);
         }
     }
@@ -266,6 +300,73 @@ impl HomeContent {
         cx.notify();
     }
 
+    fn load_similar_items_if_needed(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = self.series_detail.as_mut() else {
+            return;
+        };
+        if !detail.effects.similar.can_start() {
+            return;
+        }
+
+        detail.effects.similar = LoadState::Loading;
+        let server = self.current_server.clone();
+        let client = self.emby_client.clone();
+        let item_id = detail.series_id.clone();
+        let task_item_id = item_id.clone();
+        let task = cx.background_spawn(async move { client.similar_items(&server, &task_item_id) });
+
+        cx.spawn(async move |page, cx| {
+            let result = task.await;
+            page.update(cx, |page, cx| {
+                page.finish_similar_items(item_id, result, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_similar_items(
+        &mut self,
+        item_id: String,
+        result: anyhow::Result<UserItems>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .series_detail
+            .as_ref()
+            .is_none_or(|detail| detail.series_id.as_str() != item_id.as_str())
+        {
+            return;
+        }
+
+        match result {
+            Ok(items) => {
+                self.ensure_user_items_images(&items, cx);
+                if let Some(detail) = self.series_detail.as_mut() {
+                    if detail.series_id.as_str() != item_id.as_str() {
+                        return;
+                    }
+
+                    detail.effects.similar = LoadState::Loaded;
+                    detail.similar_failed = None;
+                    detail.similar_items = Some(items);
+                }
+            }
+            Err(error) => {
+                if let Some(detail) = self.series_detail.as_mut() {
+                    if detail.series_id.as_str() != item_id.as_str() {
+                        return;
+                    }
+
+                    detail.effects.similar = LoadState::Failed;
+                    detail.similar_failed = Some(format!("加载相似作品失败：{error}").into());
+                }
+            }
+        }
+
+        cx.notify();
+    }
+
     fn load_series_seasons_if_needed(&mut self, cx: &mut Context<Self>) {
         let Some(detail) = self.series_detail.as_mut() else {
             return;
@@ -326,7 +427,7 @@ impl HomeContent {
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
-        if !detail.is_series() || !detail.effects.next_up.can_start() {
+        if !detail.should_load_next_up() || !detail.effects.next_up.can_start() {
             return;
         }
 
@@ -454,6 +555,15 @@ impl HomeContent {
                     detail.episodes_failed = None;
                     detail.episodes = Some(episodes);
                     detail.choose_episode_from_loaded_episodes();
+                    if detail.should_reveal_selected_episode()
+                        && let Some(index) = detail.selected_episode_index()
+                    {
+                        detail.episodes_carousel.set_scroll_offset(
+                            index as f32 * DETAIL_EPISODE_CARD_STEP_PX,
+                            f32::INFINITY,
+                        );
+                        detail.episodes_carousel.sync_previous_offset();
+                    }
                 }
             }
             Err(error) => {
@@ -479,13 +589,50 @@ impl HomeContent {
             return;
         };
         if detail.selected_season_id.as_deref() == Some(season_id.as_str()) {
+            detail.open_select = None;
+            cx.notify();
             return;
         }
 
         detail.selected_season_id = Some(season_id);
         detail.preferred_episode_id = None;
+        detail.open_select = None;
         detail.reset_episode_selection();
         self.load_series_episodes_if_needed(cx);
+        cx.notify();
+    }
+
+    pub(super) fn toggle_series_season_select(
+        &mut self,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(detail) = self.series_detail.as_mut() else {
+            return;
+        };
+        let Some(seasons) = detail.seasons.as_ref() else {
+            return;
+        };
+        if seasons.items.is_empty() {
+            return;
+        }
+
+        let opening = detail.open_select != Some(SeriesDetailSelectKind::Season);
+        if opening {
+            let selected_index = detail
+                .selected_season_id
+                .as_deref()
+                .and_then(|selected_id| {
+                    seasons
+                        .items
+                        .iter()
+                        .position(|season| season.id == selected_id)
+                })
+                .unwrap_or(0);
+            detail.season_scroll_handle.scroll_to_item(selected_index);
+        }
+        detail.open_select = opening.then_some(SeriesDetailSelectKind::Season);
         cx.notify();
     }
 
@@ -527,11 +674,13 @@ impl HomeContent {
             return;
         }
 
-        detail.open_select = if detail.open_select == Some(SeriesDetailSelectKind::MediaSource) {
-            None
-        } else {
-            Some(SeriesDetailSelectKind::MediaSource)
-        };
+        let opening = detail.open_select != Some(SeriesDetailSelectKind::MediaSource);
+        if opening {
+            detail
+                .media_source_scroll_handle
+                .scroll_to_item(detail.selected_media_source_index().unwrap_or(0));
+        }
+        detail.open_select = opening.then_some(SeriesDetailSelectKind::MediaSource);
         cx.notify();
     }
 
@@ -552,11 +701,13 @@ impl HomeContent {
             return;
         }
 
-        detail.open_select = if detail.open_select == Some(SeriesDetailSelectKind::Subtitle) {
-            None
-        } else {
-            Some(SeriesDetailSelectKind::Subtitle)
-        };
+        let opening = detail.open_select != Some(SeriesDetailSelectKind::Subtitle);
+        if opening {
+            detail
+                .subtitle_scroll_handle
+                .scroll_to_item(detail.selected_subtitle_index().unwrap_or(0));
+        }
+        detail.open_select = opening.then_some(SeriesDetailSelectKind::Subtitle);
         cx.notify();
     }
 
@@ -575,6 +726,9 @@ impl HomeContent {
 
         detail.selected_media_source_index = Some(index);
         detail.selected_subtitle_index = None;
+        detail
+            .subtitle_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
         detail.open_select = None;
         detail.reset_playback_request();
         detail.sync_media_source_selection();

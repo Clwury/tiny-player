@@ -71,15 +71,6 @@ struct UserViewItemsRow {
     carousel: CarouselState,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct MainScrollbarDragState {
-    cursor_offset_y: f32,
-    track_top: f32,
-    track_height: f32,
-    thumb_height: f32,
-    max_offset: f32,
-}
-
 #[derive(Clone, Debug)]
 pub struct HomePage {
     current_server: CachedServer,
@@ -98,11 +89,11 @@ struct HomeContent {
     user_views_carousel: CarouselState,
     resume_items: Option<ResumeItems>,
     resume_items_failed: Option<gpui::SharedString>,
+    resume_detail_failed: Option<gpui::SharedString>,
     resume_items_carousel: CarouselState,
     user_view_items_rows: HashMap<String, UserViewItemsRow>,
     series_detail: Option<SeriesDetailState>,
     main_scroll_handle: ScrollHandle,
-    main_scrollbar_drag: Option<MainScrollbarDragState>,
     image_loader: ImageLoader,
     snapshot_save_generation: u64,
 }
@@ -139,11 +130,11 @@ impl HomeContent {
             user_views_carousel: CarouselState::default(),
             resume_items: None,
             resume_items_failed: None,
+            resume_detail_failed: None,
             resume_items_carousel: CarouselState::default(),
             user_view_items_rows: HashMap::new(),
             series_detail: None,
             main_scroll_handle: ScrollHandle::new(),
-            main_scrollbar_drag: None,
             image_loader: ImageLoader::new(),
             snapshot_save_generation: 0,
         }
@@ -169,6 +160,7 @@ impl HomeContent {
         if let Some(detail) = &mut self.series_detail {
             detail.episodes_carousel.sync_previous_offset();
             detail.people_carousel.sync_previous_offset();
+            detail.similar_carousel.sync_previous_offset();
         }
     }
 }

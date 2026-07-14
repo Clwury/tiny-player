@@ -7,12 +7,18 @@ use tracing::instrument;
 
 use crate::server::CachedServer;
 
-use super::{EmbyClient, api_url};
+use super::{
+    EmbyClient, api_url,
+    user::{UserItemData, UserItems},
+};
 
 const SHOW_SEASONS_FIELDS: &str = "BasicSyncInfo,CommunityRating,ProductionYear,EndDate,Container";
 const SHOW_NEXT_UP_LIMIT: u32 = 1;
 const SHOW_EPISODES_ENABLE_IMAGE_TYPES: &str = "Primary,Backdrop,Thumb";
 const SHOW_EPISODES_FIELDS: &str = "BasicSyncInfo,RunTimeTicks,CommunityRating,ProviderIds,ProductionYear,EndDate,Container,Overview,UserData,MediaSources,People,CanDownload,DateCreated,MediaStreams,Path,ParentId,Studios,AlternateMediaSources";
+const SIMILAR_ITEMS_ENABLE_IMAGE_TYPES: &str = "Primary,Backdrop,Thumb";
+const SIMILAR_ITEMS_FIELDS: &str = "BasicSyncInfo,RunTimeTicks,ProductionYear,EndDate,PrimaryImageAspectRatio,Container,DateCreated,ProviderIds,SortName,CommunityRating,OfficialRating,PremiereDate";
+const SIMILAR_ITEMS_LIMIT: u32 = 15;
 
 impl EmbyClient {
     #[instrument(skip(self, server), fields(server = %server.endpoint.display_url(), item_id = %item_id))]
@@ -25,6 +31,15 @@ impl EmbyClient {
             &["Users", user_id, "Items", item_id],
             "解析 Emby 媒体详情响应失败",
         )
+    }
+
+    #[instrument(skip(self, server), fields(server = %server.endpoint.display_url(), item_id = %item_id))]
+    pub fn similar_items(&self, server: &CachedServer, item_id: &str) -> Result<UserItems> {
+        validate_item_id(item_id)?;
+        let user_id = authenticated_user_id(server)?;
+        let mut url = api_url(&server.endpoint, &["Items", item_id, "Similar"])?;
+        add_similar_items_query(&mut url, user_id);
+        self.send_authenticated_json_url(server, Method::GET, url, "解析 Emby 相似作品响应失败")
     }
 
     #[instrument(skip(self, server), fields(server = %server.endpoint.display_url(), series_id = %series_id))]
@@ -87,6 +102,7 @@ fn add_show_seasons_query(url: &mut url::Url, user_id: &str) {
 
 fn add_show_next_up_query(url: &mut url::Url, series_id: &str, user_id: &str) {
     url.query_pairs_mut()
+        .append_pair("EnableUserData", "true")
         .append_pair("Limit", &SHOW_NEXT_UP_LIMIT.to_string())
         .append_pair("SeriesId", series_id)
         .append_pair("UserId", user_id);
@@ -101,6 +117,15 @@ fn add_show_episodes_query(url: &mut url::Url, season_id: Option<&str>, user_id:
         query.append_pair("SeasonId", season_id);
     }
     query.append_pair("UserId", user_id);
+}
+
+fn add_similar_items_query(url: &mut url::Url, user_id: &str) {
+    url.query_pairs_mut()
+        .append_pair("EnableImageTypes", SIMILAR_ITEMS_ENABLE_IMAGE_TYPES)
+        .append_pair("Fields", SIMILAR_ITEMS_FIELDS)
+        .append_pair("Limit", &SIMILAR_ITEMS_LIMIT.to_string())
+        .append_pair("Recursive", "true")
+        .append_pair("UserId", user_id);
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -144,9 +169,27 @@ pub struct MediaItem {
     pub series_primary_image_tag: Option<String>,
     pub media_sources: Option<Vec<MediaSource>>,
     pub people: Option<Vec<MediaPerson>>,
+    pub studios: Option<Vec<MediaStudio>>,
+    pub external_urls: Option<Vec<MediaExternalUrl>>,
+    pub user_data: Option<UserItemData>,
 }
 
 impl MediaItem {
+    pub fn played_percentage(&self) -> Option<f64> {
+        self.user_data
+            .as_ref()
+            .and_then(|data| data.played_percentage)
+            .filter(|percentage| percentage.is_finite())
+            .map(|percentage| percentage.clamp(0.0, 100.0))
+    }
+
+    pub fn playback_position_ticks(&self) -> Option<u64> {
+        self.user_data
+            .as_ref()
+            .and_then(|data| data.playback_position_ticks)
+            .filter(|ticks| *ticks > 0)
+    }
+
     pub fn image_tag(&self, image_type: &str) -> Option<&str> {
         self.image_tags
             .as_ref()
@@ -180,6 +223,35 @@ impl MediaItem {
             Some(episode) => format!("E{episode}: {}", self.name),
             None => self.name.clone(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaStudio {
+    pub name: Option<String>,
+}
+
+impl MediaStudio {
+    pub fn name(&self) -> Option<&str> {
+        non_empty_str(self.name.as_deref())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaExternalUrl {
+    pub name: Option<String>,
+    pub url: Option<String>,
+}
+
+impl MediaExternalUrl {
+    pub fn name(&self) -> Option<&str> {
+        non_empty_str(self.name.as_deref())
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        non_empty_str(self.url.as_deref())
     }
 }
 
@@ -399,7 +471,7 @@ mod tests {
 
         assert_eq!(
             url.as_str(),
-            "https://example.com/emby/Shows/NextUp?Limit=1&SeriesId=771013&UserId=user-1"
+            "https://example.com/emby/Shows/NextUp?EnableUserData=true&Limit=1&SeriesId=771013&UserId=user-1"
         );
     }
 
@@ -411,6 +483,17 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "https://example.com/emby/Shows/771013/Episodes?EnableImageTypes=Primary%2CBackdrop%2CThumb&Fields=BasicSyncInfo%2CRunTimeTicks%2CCommunityRating%2CProviderIds%2CProductionYear%2CEndDate%2CContainer%2COverview%2CUserData%2CMediaSources%2CPeople%2CCanDownload%2CDateCreated%2CMediaStreams%2CPath%2CParentId%2CStudios%2CAlternateMediaSources&SeasonId=776641&UserId=user-1"
+        );
+    }
+
+    #[test]
+    fn builds_similar_items_url() {
+        let mut url = crate::emby::api_url(&endpoint(), &["Items", "850385", "Similar"]).unwrap();
+        add_similar_items_query(&mut url, "user-1");
+
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/emby/Items/850385/Similar?EnableImageTypes=Primary%2CBackdrop%2CThumb&Fields=BasicSyncInfo%2CRunTimeTicks%2CProductionYear%2CEndDate%2CPrimaryImageAspectRatio%2CContainer%2CDateCreated%2CProviderIds%2CSortName%2CCommunityRating%2COfficialRating%2CPremiereDate&Limit=15&Recursive=true&UserId=user-1"
         );
     }
 
@@ -429,6 +512,18 @@ mod tests {
                 "Logo": "logo-tag"
             },
             "BackdropImageTags": ["backdrop-tag"],
+            "Studios": [
+                {
+                    "Name": "原力动画",
+                    "Id": 123
+                }
+            ],
+            "ExternalUrls": [
+                {
+                    "Name": "IMDb",
+                    "Url": "https://www.imdb.com/title/tt1234567"
+                }
+            ],
             "People": [
                 {
                     "Name": "张三",
@@ -449,11 +544,19 @@ mod tests {
 
         let item: MediaItem = serde_json::from_str(json).unwrap();
         let people = item.people.as_deref().unwrap();
+        let studios = item.studios.as_deref().unwrap();
+        let external_urls = item.external_urls.as_deref().unwrap();
 
         assert_eq!(item.item_type.as_deref(), Some("Series"));
         assert_eq!(item.logo_image_tag(), Some("logo-tag"));
         assert_eq!(item.backdrop_image_tag(), Some("backdrop-tag"));
         assert_eq!(item.genres.as_deref().unwrap(), ["动画", "动作"]);
+        assert_eq!(studios[0].name(), Some("原力动画"));
+        assert_eq!(external_urls[0].name(), Some("IMDb"));
+        assert_eq!(
+            external_urls[0].url(),
+            Some("https://www.imdb.com/title/tt1234567")
+        );
         assert_eq!(people[0].display_name(), "张三");
         assert_eq!(people[0].role_label(), "陈平安");
         assert_eq!(people[0].type_label(), "Actor");
@@ -478,6 +581,10 @@ mod tests {
                     "ImageTags": {
                         "Primary": "episode-primary"
                     },
+                    "UserData": {
+                        "PlayedPercentage": 37.5,
+                        "PlaybackPositionTicks": 9000000000
+                    },
                     "MediaSources": [
                         {
                             "Id": "source-1",
@@ -501,6 +608,8 @@ mod tests {
 
         assert_eq!(items.total_record_count, 1);
         assert_eq!(episode.episode_label(), "S1E5: 止境");
+        assert_eq!(episode.played_percentage(), Some(37.5));
+        assert_eq!(episode.playback_position_ticks(), Some(9_000_000_000));
         assert_eq!(episode.primary_image_tag(), Some("episode-primary"));
         assert_eq!(source.display_name(0), "1080p - 8 Mbps");
         assert_eq!(source.name_label(0), "1080p - 8 Mbps");
@@ -514,6 +623,7 @@ mod tests {
         let server = server();
 
         assert!(client.media_item(&server, " ").is_err());
+        assert!(client.similar_items(&server, " ").is_err());
         assert!(client.show_seasons(&server, " ").is_err());
         assert!(client.show_next_up(&server, " ").is_err());
         assert!(

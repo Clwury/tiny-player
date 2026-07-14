@@ -1,14 +1,16 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyView, AppContext, Context, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Render, StatefulInteractiveElement, StyleRefinement, Styled,
-    Window, div, ease_in_out, point, prelude::FluentBuilder, px,
+    Animation, AnimationExt as _, AnyView, Context, InteractiveElement, IntoElement, ParentElement,
+    Render, StatefulInteractiveElement, StyleRefinement, Styled, Window, div, ease_in_out,
+    prelude::FluentBuilder, px,
 };
 
 use crate::{
+    app::WINDOW_RESIZE_EDGE_WIDTH_PX,
     emby::{ResumeItems, UserItems, UserView, UserViews},
     theme,
+    ui::scrollbar::Scrollbar,
 };
 
 use super::{
@@ -27,21 +29,16 @@ use super::{
 
 const HOME_ITEM_RENDER_OVERSCAN_BEFORE: usize = 2;
 const HOME_ITEM_RENDER_OVERSCAN_AFTER: usize = 4;
-const MAIN_SCROLLBAR_DRAG_NOTIFY_THRESHOLD_PX: f32 = 1.0;
-
-#[derive(Clone, Copy)]
-struct MainScrollbarThumbDrag;
-
-impl Render for MainScrollbarThumbDrag {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().hidden()
-    }
-}
 
 impl HomeContent {
     fn render_main_content(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let theme = theme::get(cx);
-        let rounded_window = !window.is_maximized();
+        let rounded_window = !window.is_maximized() && !window.is_fullscreen();
+        let scrollbar_right_inset = if rounded_window {
+            px(WINDOW_RESIZE_EDGE_WIDTH_PX)
+        } else {
+            px(0.0)
+        };
 
         div()
             .relative()
@@ -59,7 +56,12 @@ impl HomeContent {
             .when(self.series_detail.is_some(), |this| {
                 this.child(self.render_series_detail_back_button(cx))
             })
-            .child(self.render_main_scrollbar(cx))
+            .child(
+                Scrollbar::vertical(&self.main_scroll_handle)
+                    .id("home-main-scrollbar")
+                    .edge_inset(px(8.0))
+                    .right_inset(scrollbar_right_inset),
+            )
     }
 
     fn render_main_scrollable_content(
@@ -126,6 +128,9 @@ impl HomeContent {
             .when_some(self.resume_items_failed.clone(), |this, error| {
                 this.child(div().text_sm().text_color(theme.error).child(error))
             })
+            .when_some(self.resume_detail_failed.clone(), |this, error| {
+                this.child(div().text_sm().text_color(theme.error).child(error))
+            })
             .when(
                 self.home_effects.resume_items.is_loading() && self.resume_items.is_none(),
                 |this| {
@@ -163,115 +168,6 @@ impl HomeContent {
                     }),
                 )
             })
-    }
-
-    fn render_main_scrollbar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let theme = theme::get(cx);
-        let bounds = self.main_scroll_handle.bounds();
-        let viewport_height = f32::from(bounds.size.height);
-        let max_offset = f32::from(self.main_scroll_handle.max_offset().height);
-        let track_inset = 8.0;
-        let track_height = (viewport_height - track_inset * 2.0).max(0.0);
-        let offset_y = -f32::from(self.main_scroll_handle.offset().y);
-        let scroll_top = offset_y.clamp(0.0, max_offset);
-        let content_height = viewport_height + max_offset;
-        let thumb_height = if content_height > 0.0 && track_height > 0.0 {
-            (viewport_height / content_height * track_height)
-                .max(32.0)
-                .min(track_height)
-        } else {
-            0.0
-        };
-        let thumb_top = if max_offset > 0.0 && track_height > thumb_height {
-            track_inset + scroll_top / max_offset * (track_height - thumb_height)
-        } else {
-            track_inset
-        };
-        let show_scrollbar = max_offset > 0.0 && track_height > 0.0;
-        let track_window_top = f32::from(bounds.origin.y) + track_inset;
-        let thumb_window_top = f32::from(bounds.origin.y) + thumb_top;
-        let drag_state = super::MainScrollbarDragState {
-            cursor_offset_y: 0.0,
-            track_top: track_window_top,
-            track_height,
-            thumb_height,
-            max_offset,
-        };
-        let start_drag = cx.listener(
-            move |page: &mut HomeContent, event: &gpui::MouseDownEvent, _, cx| {
-                let mut drag_state = drag_state;
-                drag_state.cursor_offset_y =
-                    (f32::from(event.position.y) - thumb_window_top).clamp(0.0, thumb_height);
-                page.main_scrollbar_drag = Some(drag_state);
-                cx.stop_propagation();
-            },
-        );
-        let drag_thumb = cx.listener(
-            |page: &mut HomeContent, event: &gpui::DragMoveEvent<MainScrollbarThumbDrag>, _, cx| {
-                page.drag_main_scrollbar_thumb(event.event.position.y, cx);
-            },
-        );
-        let finish_drag = cx.listener(|page: &mut HomeContent, _: &gpui::MouseUpEvent, _, cx| {
-            page.main_scrollbar_drag = None;
-            cx.stop_propagation();
-        });
-        let finish_drag_out =
-            cx.listener(|page: &mut HomeContent, _: &gpui::MouseUpEvent, _, _| {
-                page.main_scrollbar_drag = None;
-            });
-
-        div().when(show_scrollbar, |this| {
-            this.absolute()
-                .top(px(track_inset))
-                .right(px(6.0))
-                .bottom(px(track_inset))
-                .w(px(6.0))
-                .rounded_full()
-                .bg(theme.input_border.opacity(0.22))
-                .on_drag_move(drag_thumb)
-                .on_mouse_up(MouseButton::Left, finish_drag)
-                .on_mouse_up_out(MouseButton::Left, finish_drag_out)
-                .child(
-                    div()
-                        .id("home-main-scrollbar-thumb")
-                        .absolute()
-                        .top(px(thumb_top - track_inset))
-                        .right_0()
-                        .w(px(6.0))
-                        .h(px(thumb_height))
-                        .rounded_full()
-                        .bg(theme.muted_foreground.opacity(0.72))
-                        .cursor_move()
-                        .on_mouse_down(MouseButton::Left, start_drag)
-                        .on_drag(MainScrollbarThumbDrag, |_, _, _, cx| {
-                            cx.new(|_| MainScrollbarThumbDrag)
-                        }),
-                )
-        })
-    }
-
-    fn drag_main_scrollbar_thumb(&mut self, cursor_y: gpui::Pixels, cx: &mut Context<Self>) {
-        let Some(drag) = self.main_scrollbar_drag else {
-            return;
-        };
-        let thumb_range = (drag.track_height - drag.thumb_height).max(0.0);
-        if thumb_range <= 0.0 || drag.max_offset <= 0.0 {
-            return;
-        }
-
-        let thumb_top =
-            (f32::from(cursor_y) - drag.track_top - drag.cursor_offset_y).clamp(0.0, thumb_range);
-        let scroll_top = thumb_top / thumb_range * drag.max_offset;
-        let current_offset = self.main_scroll_handle.offset();
-        if (f32::from(current_offset.y) + scroll_top).abs()
-            < MAIN_SCROLLBAR_DRAG_NOTIFY_THRESHOLD_PX
-        {
-            return;
-        }
-
-        self.main_scroll_handle
-            .set_offset(point(current_offset.x, px(-scroll_top)));
-        cx.notify();
     }
 
     fn render_user_views_row(
@@ -397,7 +293,19 @@ impl HomeContent {
                         let image_path = item
                             .image_source()
                             .and_then(|source| self.image_path_for_resume_image(source));
-                        resume_item_card(item, image_path, cx)
+                        let item_id = item.id.clone();
+                        let card = resume_item_card(item, image_path, cx)
+                            .id((gpui::ElementId::from("resume-item-card"), item_id));
+
+                        if matches!(item.item_type.as_deref(), Some("Episode" | "Movie")) {
+                            let item = item.clone();
+                            let on_click = cx.listener(move |page: &mut HomeContent, _, _, cx| {
+                                page.open_resume_item_detail(&item, cx);
+                            });
+                            card.cursor_pointer().on_click(on_click)
+                        } else {
+                            card
+                        }
                     }))
                     .with_animation(
                         ("resume-items-scroll", carousel.animation_id()),

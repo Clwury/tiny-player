@@ -1,7 +1,9 @@
 use gpui::{CursorStyle, Div, InteractiveElement, MouseButton, ResizeEdge, Styled, div, px};
 
+pub(crate) const WINDOW_RESIZE_EDGE_WIDTH_PX: f32 = 4.0;
+
 pub(super) fn resize_handles() -> Vec<Div> {
-    let edge_size = px(6.0);
+    let edge_size = px(WINDOW_RESIZE_EDGE_WIDTH_PX);
     let corner_size = px(12.0);
 
     vec![

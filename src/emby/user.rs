@@ -120,6 +120,7 @@ impl EmbyClient {
 fn add_resume_items_query(url: &mut url::Url) {
     url.query_pairs_mut()
         .append_pair("EnableImageTypes", "Primary,Backdrop,Thumb,Logo")
+        .append_pair("EnableUserData", "true")
         .append_pair(
             "Fields",
             "BasicSyncInfo,Overview,Container,CanDelete,ProviderIds,ProductionYear,Genres,DateCreated,ParentId,People,ProductionYear,MediaSources,MediaStreams",
@@ -308,6 +309,8 @@ pub struct UserItem {
 #[serde(rename_all = "PascalCase")]
 pub struct UserItemData {
     pub unplayed_item_count: Option<u32>,
+    pub played_percentage: Option<f64>,
+    pub playback_position_ticks: Option<u64>,
     #[serde(default)]
     pub is_favorite: bool,
 }
@@ -383,6 +386,7 @@ pub struct ResumeItem {
     #[serde(rename = "Type")]
     pub item_type: Option<String>,
     pub series_name: Option<String>,
+    pub series_id: Option<String>,
     pub parent_index_number: Option<u32>,
     pub index_number: Option<u32>,
     pub production_year: Option<u32>,
@@ -390,6 +394,7 @@ pub struct ResumeItem {
     pub backdrop_image_tags: Option<Vec<String>>,
     pub parent_backdrop_item_id: Option<String>,
     pub parent_backdrop_image_tags: Option<Vec<String>>,
+    pub user_data: Option<UserItemData>,
 }
 
 pub struct ResumeItemImageSource<'a> {
@@ -399,6 +404,14 @@ pub struct ResumeItemImageSource<'a> {
 }
 
 impl ResumeItem {
+    pub fn played_percentage(&self) -> Option<f64> {
+        self.user_data
+            .as_ref()
+            .and_then(|data| data.played_percentage)
+            .filter(|percentage| percentage.is_finite())
+            .map(|percentage| percentage.clamp(0.0, 100.0))
+    }
+
     pub fn primary_image_tag(&self) -> Option<&str> {
         self.image_tags
             .as_ref()
@@ -568,7 +581,7 @@ mod tests {
 
         assert_eq!(
             url.as_str(),
-            "https://example.com/emby/Users/user-1/Items/Resume?EnableImageTypes=Primary%2CBackdrop%2CThumb%2CLogo&Fields=BasicSyncInfo%2COverview%2CContainer%2CCanDelete%2CProviderIds%2CProductionYear%2CGenres%2CDateCreated%2CParentId%2CPeople%2CProductionYear%2CMediaSources%2CMediaStreams&Limit=30&MediaTypes=Video&Recursive=true"
+            "https://example.com/emby/Users/user-1/Items/Resume?EnableImageTypes=Primary%2CBackdrop%2CThumb%2CLogo&EnableUserData=true&Fields=BasicSyncInfo%2COverview%2CContainer%2CCanDelete%2CProviderIds%2CProductionYear%2CGenres%2CDateCreated%2CParentId%2CPeople%2CProductionYear%2CMediaSources%2CMediaStreams&Limit=30&MediaTypes=Video&Recursive=true"
         );
     }
 
@@ -696,6 +709,7 @@ mod tests {
                     "Name": "第一集",
                     "Type": "Episode",
                     "SeriesName": "示例剧集",
+                    "SeriesId": "series-1",
                     "ParentIndexNumber": 1,
                     "IndexNumber": 3,
                     "ImageTags": {
@@ -703,7 +717,11 @@ mod tests {
                     },
                     "BackdropImageTags": [
                         "episode-backdrop-tag"
-                    ]
+                    ],
+                    "UserData": {
+                        "PlayedPercentage": 37.5,
+                        "PlaybackPositionTicks": 9000000000
+                    }
                 },
                 {
                     "Id": "movie-1",
@@ -754,8 +772,17 @@ mod tests {
         assert_eq!(items.items[0].id, "episode-1");
         assert_eq!(items.items[0].item_type.as_deref(), Some("Episode"));
         assert_eq!(items.items[0].series_name.as_deref(), Some("示例剧集"));
+        assert_eq!(items.items[0].series_id.as_deref(), Some("series-1"));
         assert_eq!(items.items[0].parent_index_number, Some(1));
         assert_eq!(items.items[0].index_number, Some(3));
+        assert_eq!(items.items[0].played_percentage(), Some(37.5));
+        assert_eq!(
+            items.items[0]
+                .user_data
+                .as_ref()
+                .and_then(|data| data.playback_position_ticks),
+            Some(9_000_000_000)
+        );
         assert_eq!(items.items[0].primary_image_tag(), Some("episode-tag"));
         let image_source = items.items[0].image_source().unwrap();
         assert_eq!(image_source.item_id, "episode-1");

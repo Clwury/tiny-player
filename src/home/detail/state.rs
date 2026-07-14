@@ -1,6 +1,10 @@
-use crate::emby::{MediaItem, MediaItems, MediaSource, UserItem};
+use gpui::{ScrollHandle, point, px};
+
+use crate::emby::{MediaItem, MediaItems, MediaSource, ResumeItem, UserItem, UserItems};
 
 use super::super::LoadState;
+
+const EMBY_TICKS_PER_SECOND: u64 = 10_000_000;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SeriesDetailEffects {
@@ -8,10 +12,12 @@ pub(crate) struct SeriesDetailEffects {
     pub(crate) seasons: LoadState,
     pub(crate) next_up: LoadState,
     pub(crate) episodes: LoadState,
+    pub(crate) similar: LoadState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SeriesDetailSelectKind {
+    Season,
     MediaSource,
     Subtitle,
 }
@@ -22,9 +28,16 @@ enum SeriesDetailKind {
     Movie,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeriesDetailOrigin {
+    UserView,
+    Resume,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SeriesDetailState {
     kind: SeriesDetailKind,
+    origin: SeriesDetailOrigin,
     pub(crate) series_id: String,
     pub(crate) title: String,
     pub(crate) effects: SeriesDetailEffects,
@@ -34,8 +47,11 @@ pub(crate) struct SeriesDetailState {
     pub(crate) seasons_failed: Option<gpui::SharedString>,
     pub(crate) next_up: Option<MediaItems>,
     pub(crate) next_up_failed: Option<gpui::SharedString>,
+    resume_episode: Option<ResumeItem>,
     pub(crate) episodes: Option<MediaItems>,
     pub(crate) episodes_failed: Option<gpui::SharedString>,
+    pub(crate) similar_items: Option<UserItems>,
+    pub(crate) similar_failed: Option<gpui::SharedString>,
     pub(crate) playback_loading: bool,
     pub(crate) playback_failed: Option<gpui::SharedString>,
     pub(crate) selected_season_id: Option<String>,
@@ -44,9 +60,13 @@ pub(crate) struct SeriesDetailState {
     pub(crate) selected_media_source_index: Option<usize>,
     pub(crate) selected_subtitle_index: Option<usize>,
     pub(crate) open_select: Option<SeriesDetailSelectKind>,
+    pub(crate) season_scroll_handle: ScrollHandle,
+    pub(crate) media_source_scroll_handle: ScrollHandle,
+    pub(crate) subtitle_scroll_handle: ScrollHandle,
     pub(crate) episodes_request_season_id: Option<String>,
     pub(crate) episodes_carousel: super::super::carousel::CarouselState,
     pub(crate) people_carousel: super::super::carousel::CarouselState,
+    pub(crate) similar_carousel: super::super::carousel::CarouselState,
 }
 
 impl SeriesDetailState {
@@ -59,18 +79,74 @@ impl SeriesDetailState {
     }
 
     pub(crate) fn new_series(item: &UserItem) -> Self {
-        Self::new(item, SeriesDetailKind::Series)
+        Self::new(item, SeriesDetailKind::Series, SeriesDetailOrigin::UserView)
     }
 
     pub(crate) fn new_movie(item: &UserItem) -> Self {
-        Self::new(item, SeriesDetailKind::Movie)
+        Self::new(item, SeriesDetailKind::Movie, SeriesDetailOrigin::UserView)
     }
 
-    fn new(item: &UserItem, kind: SeriesDetailKind) -> Self {
+    pub(crate) fn from_resume_movie(item: &ResumeItem) -> Option<Self> {
+        if item.item_type.as_deref() != Some("Movie") {
+            return None;
+        }
+
+        Some(Self::new_with_identity(
+            item.id.clone(),
+            item.name.clone(),
+            SeriesDetailKind::Movie,
+            SeriesDetailOrigin::Resume,
+        ))
+    }
+
+    pub(crate) fn from_resume_episode(item: &ResumeItem) -> Option<Self> {
+        if item.item_type.as_deref() != Some("Episode") {
+            return None;
+        }
+
+        let series_id = item.series_id.as_deref()?.trim();
+        if series_id.is_empty() {
+            return None;
+        }
+        let series_id = series_id.to_string();
+        let episode_id = item.id.trim();
+        if episode_id.is_empty() {
+            return None;
+        }
+        let episode_id = episode_id.to_string();
+        let title = item
+            .series_name
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or(&item.name)
+            .to_string();
+        let mut detail = Self::new_with_identity(
+            series_id,
+            title,
+            SeriesDetailKind::Series,
+            SeriesDetailOrigin::Resume,
+        );
+        detail.selected_episode_id = Some(episode_id.clone());
+        detail.preferred_episode_id = Some(episode_id);
+        detail.resume_episode = Some(item.clone());
+        Some(detail)
+    }
+
+    fn new(item: &UserItem, kind: SeriesDetailKind, origin: SeriesDetailOrigin) -> Self {
+        Self::new_with_identity(item.id.clone(), item.name.clone(), kind, origin)
+    }
+
+    fn new_with_identity(
+        series_id: String,
+        title: String,
+        kind: SeriesDetailKind,
+        origin: SeriesDetailOrigin,
+    ) -> Self {
         Self {
             kind,
-            series_id: item.id.clone(),
-            title: item.name.clone(),
+            origin,
+            series_id,
+            title,
             effects: Default::default(),
             item: None,
             item_failed: None,
@@ -78,8 +154,11 @@ impl SeriesDetailState {
             seasons_failed: None,
             next_up: None,
             next_up_failed: None,
+            resume_episode: None,
             episodes: None,
             episodes_failed: None,
+            similar_items: None,
+            similar_failed: None,
             playback_loading: false,
             playback_failed: None,
             selected_season_id: None,
@@ -88,9 +167,13 @@ impl SeriesDetailState {
             selected_media_source_index: None,
             selected_subtitle_index: None,
             open_select: None,
+            season_scroll_handle: ScrollHandle::new(),
+            media_source_scroll_handle: ScrollHandle::new(),
+            subtitle_scroll_handle: ScrollHandle::new(),
             episodes_request_season_id: None,
             episodes_carousel: Default::default(),
             people_carousel: Default::default(),
+            similar_carousel: Default::default(),
         }
     }
 
@@ -100,6 +183,27 @@ impl SeriesDetailState {
 
     pub(crate) fn is_movie(&self) -> bool {
         self.kind == SeriesDetailKind::Movie
+    }
+
+    pub(crate) fn should_load_next_up(&self) -> bool {
+        self.is_series() && self.origin == SeriesDetailOrigin::UserView
+    }
+
+    pub(crate) fn opened_from_resume(&self) -> bool {
+        self.origin == SeriesDetailOrigin::Resume
+    }
+
+    pub(crate) fn should_reveal_selected_episode(&self) -> bool {
+        let Some(selected_episode_id) = self.selected_episode_id.as_deref() else {
+            return false;
+        };
+
+        if self.opened_from_resume() {
+            return self.preferred_episode_id.as_deref() == Some(selected_episode_id);
+        }
+
+        self.next_up_episode()
+            .is_some_and(|episode| episode.id == selected_episode_id)
     }
 
     pub(crate) fn next_up_episode(&self) -> Option<&MediaItem> {
@@ -127,8 +231,48 @@ impl SeriesDetailState {
     }
 
     fn preferred_season_id(&self) -> Option<String> {
-        self.next_up_episode()
-            .and_then(|episode| episode.season_id.clone())
+        self.resume_episode_for_preferred()
+            .and_then(|episode| episode.parent_index_number)
+            .and_then(|season_number| {
+                self.seasons.as_ref().and_then(|seasons| {
+                    seasons
+                        .items
+                        .iter()
+                        .find(|season| season.index_number == Some(season_number))
+                        .map(|season| season.id.clone())
+                })
+            })
+            .or_else(|| {
+                self.next_up_episode()
+                    .and_then(|episode| episode.season_id.clone())
+            })
+    }
+
+    fn resume_episode_for_preferred(&self) -> Option<&ResumeItem> {
+        let preferred_episode_id = self.preferred_episode_id.as_deref()?;
+        self.resume_episode
+            .as_ref()
+            .filter(|episode| episode.id == preferred_episode_id)
+    }
+
+    pub(crate) fn playback_position_seconds(&self) -> Option<u64> {
+        let selected = self.selected_playback_item()?;
+        let selected_id = selected.id.as_str();
+        let ticks = self
+            .resume_episode
+            .as_ref()
+            .filter(|episode| episode.id == selected_id)
+            .and_then(|episode| episode.user_data.as_ref())
+            .and_then(|data| data.playback_position_ticks)
+            .filter(|ticks| *ticks > 0)
+            .or_else(|| {
+                self.next_up_episode()
+                    .filter(|episode| episode.id == selected_id)
+                    .and_then(MediaItem::playback_position_ticks)
+            })
+            .or_else(|| selected.playback_position_ticks())?;
+
+        Some(ticks / EMBY_TICKS_PER_SECOND)
     }
 
     fn fallback_season_id(&self) -> Option<String> {
@@ -158,6 +302,15 @@ impl SeriesDetailState {
                     .find(|episode| episode.id == episode_id)
             })
             .or_else(|| episodes.items.first())
+    }
+
+    pub(crate) fn selected_episode_index(&self) -> Option<usize> {
+        let selected_episode_id = self.selected_episode_id.as_deref()?;
+        self.episodes
+            .as_ref()?
+            .items
+            .iter()
+            .position(|episode| episode.id == selected_episode_id)
     }
 
     pub(crate) fn selected_media_source(&self) -> Option<&MediaSource> {
@@ -305,6 +458,7 @@ impl SeriesDetailState {
             self.selected_media_source_index = None;
             self.selected_subtitle_index = None;
             self.open_select = None;
+            self.reset_select_scroll_offsets();
             self.reset_playback_request();
         }
         self.sync_media_source_selection();
@@ -319,6 +473,7 @@ impl SeriesDetailState {
         self.selected_media_source_index = None;
         self.selected_subtitle_index = None;
         self.open_select = None;
+        self.reset_select_scroll_offsets();
         self.episodes_carousel = Default::default();
         self.reset_playback_request();
     }
@@ -326,6 +481,12 @@ impl SeriesDetailState {
     pub(crate) fn reset_playback_request(&mut self) {
         self.playback_loading = false;
         self.playback_failed = None;
+    }
+
+    fn reset_select_scroll_offsets(&self) {
+        let origin = point(px(0.0), px(0.0));
+        self.media_source_scroll_handle.set_offset(origin);
+        self.subtitle_scroll_handle.set_offset(origin);
     }
 
     pub(crate) fn sync_media_source_selection(&mut self) {
@@ -368,7 +529,7 @@ impl SeriesDetailState {
 
 #[cfg(test)]
 mod tests {
-    use crate::emby::{MediaItems, UserItem};
+    use crate::emby::{MediaItems, ResumeItem, UserItem, UserItemData};
 
     use super::*;
 
@@ -421,6 +582,27 @@ mod tests {
             series_primary_image_tag: None,
             media_sources: None,
             people: None,
+            studios: None,
+            external_urls: None,
+            user_data: None,
+        }
+    }
+
+    fn resume_episode(id: &str, name: &str, series_id: &str, season_number: u32) -> ResumeItem {
+        ResumeItem {
+            id: id.to_string(),
+            name: name.to_string(),
+            item_type: Some("Episode".to_string()),
+            series_name: Some("示例剧集".to_string()),
+            series_id: Some(series_id.to_string()),
+            parent_index_number: Some(season_number),
+            index_number: None,
+            production_year: None,
+            image_tags: None,
+            backdrop_image_tags: None,
+            parent_backdrop_item_id: None,
+            parent_backdrop_image_tags: None,
+            user_data: None,
         }
     }
 
@@ -428,6 +610,7 @@ mod tests {
     fn chooses_next_up_episode_when_loaded_episodes_include_it() {
         let mut detail = SeriesDetailState {
             kind: SeriesDetailKind::Series,
+            origin: SeriesDetailOrigin::UserView,
             series_id: "series-1".to_string(),
             title: "Series".to_string(),
             effects: Default::default(),
@@ -440,6 +623,7 @@ mod tests {
                 total_record_count: 2,
             }),
             next_up_failed: None,
+            resume_episode: None,
             episodes: Some(MediaItems {
                 items: vec![
                     media_item("episode-1", "第一集"),
@@ -448,6 +632,8 @@ mod tests {
                 total_record_count: 2,
             }),
             episodes_failed: None,
+            similar_items: None,
+            similar_failed: None,
             playback_loading: false,
             playback_failed: None,
             selected_season_id: None,
@@ -456,14 +642,19 @@ mod tests {
             selected_media_source_index: None,
             selected_subtitle_index: None,
             open_select: None,
+            season_scroll_handle: ScrollHandle::new(),
+            media_source_scroll_handle: ScrollHandle::new(),
+            subtitle_scroll_handle: ScrollHandle::new(),
             episodes_request_season_id: None,
             episodes_carousel: Default::default(),
             people_carousel: Default::default(),
+            similar_carousel: Default::default(),
         };
 
         detail.choose_episode_from_loaded_episodes();
 
         assert_eq!(detail.selected_episode_id.as_deref(), Some("episode-2"));
+        assert!(detail.should_reveal_selected_episode());
     }
 
     #[test]
@@ -486,6 +677,7 @@ mod tests {
             detail.hero_episode().map(|episode| episode.id.as_str()),
             Some("episode-1")
         );
+        assert!(!detail.should_reveal_selected_episode());
     }
 
     fn media_source(id: &str, name: &str) -> MediaSource {
@@ -506,6 +698,12 @@ mod tests {
         let mut item = media_item("movie-1", "电影");
         item.item_type = Some("Movie".to_string());
         item.media_sources = Some(vec![media_source("source-1", "4K HDR")]);
+        item.user_data = Some(UserItemData {
+            unplayed_item_count: None,
+            played_percentage: Some(25.0),
+            playback_position_ticks: Some(10_800_000_000),
+            is_favorite: false,
+        });
         detail.item = Some(item);
 
         detail.sync_media_source_selection();
@@ -517,6 +715,7 @@ mod tests {
             detail.selected_playback_item().map(|item| item.id.as_str()),
             Some("movie-1")
         );
+        assert_eq!(detail.playback_position_seconds(), Some(1_080));
     }
 
     #[test]
@@ -532,5 +731,69 @@ mod tests {
         );
         assert!(SeriesDetailState::from_user_item(&movie).is_some_and(|detail| detail.is_movie()));
         assert!(SeriesDetailState::from_user_item(&folder).is_none());
+    }
+
+    #[test]
+    fn resume_episode_entry_defers_media_loading_and_selects_current_episode() {
+        let mut episode = resume_episode("episode-2", "第二集", "series-1", 2);
+        episode.user_data = Some(UserItemData {
+            unplayed_item_count: None,
+            played_percentage: Some(50.0),
+            playback_position_ticks: Some(9_050_000_000),
+            is_favorite: false,
+        });
+
+        let mut detail = SeriesDetailState::from_resume_episode(&episode).expect("valid episode");
+        let mut season_one = media_item("season-1", "第一季");
+        season_one.index_number = Some(1);
+        let mut season_two = media_item("season-2", "第二季");
+        season_two.index_number = Some(2);
+        detail.seasons = Some(MediaItems {
+            items: vec![season_one, season_two],
+            total_record_count: 2,
+        });
+        detail.choose_season_if_needed();
+        detail.episodes = Some(MediaItems {
+            items: vec![
+                media_item("episode-1", "第一集"),
+                media_item("episode-2", "第二集"),
+            ],
+            total_record_count: 2,
+        });
+        detail.choose_episode_from_loaded_episodes();
+
+        assert!(detail.opened_from_resume());
+        assert!(!detail.should_load_next_up());
+        assert_eq!(detail.effects.item, LoadState::Idle);
+        assert!(detail.item.is_none());
+        assert_eq!(detail.selected_season_id.as_deref(), Some("season-2"));
+        assert_eq!(detail.selected_episode_id.as_deref(), Some("episode-2"));
+        assert_eq!(detail.selected_episode_index(), Some(1));
+        assert!(detail.should_reveal_selected_episode());
+        assert_eq!(detail.playback_position_seconds(), Some(905));
+    }
+
+    #[test]
+    fn next_up_position_drives_user_view_resume_minutes() {
+        let mut detail = SeriesDetailState::new_series(&user_item("series-1", "示例剧集"));
+        let mut next_up = media_item("episode-2", "第二集");
+        next_up.user_data = Some(UserItemData {
+            unplayed_item_count: None,
+            played_percentage: None,
+            playback_position_ticks: Some(12_000_000_000),
+            is_favorite: false,
+        });
+        detail.next_up = Some(MediaItems {
+            items: vec![next_up],
+            total_record_count: 1,
+        });
+        detail.episodes = Some(MediaItems {
+            items: vec![media_item("episode-2", "第二集")],
+            total_record_count: 1,
+        });
+        detail.selected_episode_id = Some("episode-2".to_string());
+
+        assert!(detail.should_load_next_up());
+        assert_eq!(detail.playback_position_seconds(), Some(1_200));
     }
 }

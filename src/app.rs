@@ -12,6 +12,8 @@ use std::collections::{HashMap, HashSet};
 
 use gpui::{Entity, SharedString};
 
+pub(crate) use resize::WINDOW_RESIZE_EDGE_WIDTH_PX;
+
 use crate::{
     emby::{EmbyClient, ItemCounts},
     home::HomePage,

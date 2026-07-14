@@ -21,6 +21,9 @@ use super::carousel::{
     USER_VIEW_CARD_IMAGE_HEIGHT_PX, USER_VIEW_CARD_PADDING_PX, USER_VIEW_CARD_WIDTH_PX,
 };
 
+const IMAGE_PROGRESS_BAR_HEIGHT_PX: f32 = 4.0;
+const IMAGE_PROGRESS_BAR_HORIZONTAL_INSET_PX: f32 = 8.0;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CoverImageSource {
     path: PathBuf,
@@ -242,13 +245,64 @@ fn user_view_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl
         })
 }
 
+fn resume_item_card_image<T>(
+    image_path: Option<PathBuf>,
+    played_fraction: Option<f32>,
+    cx: &Context<T>,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+    let has_image = image_path.is_some();
+
+    div()
+        .relative()
+        .w(px(USER_VIEW_CARD_WIDTH_PX))
+        .rounded_lg()
+        .overflow_hidden()
+        .when_some(image_path, |this, path| {
+            this.child(img(path).w(px(USER_VIEW_CARD_WIDTH_PX)).rounded_lg())
+        })
+        .when(!has_image, |this| {
+            this.flex()
+                .h(px(USER_VIEW_CARD_IMAGE_HEIGHT_PX))
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+        })
+        .when_some(played_fraction, |this, fraction| {
+            this.child(image_progress_bar(USER_VIEW_CARD_WIDTH_PX, fraction, cx))
+        })
+}
+
+fn image_progress_bar<T>(image_width: f32, played_fraction: f32, cx: &Context<T>) -> gpui::Div {
+    let theme = theme::get(cx);
+    let track_width = (image_width - IMAGE_PROGRESS_BAR_HORIZONTAL_INSET_PX * 2.0).max(0.0);
+
+    div()
+        .absolute()
+        .left(px(IMAGE_PROGRESS_BAR_HORIZONTAL_INSET_PX))
+        .right(px(IMAGE_PROGRESS_BAR_HORIZONTAL_INSET_PX))
+        .bottom_0()
+        .h(px(IMAGE_PROGRESS_BAR_HEIGHT_PX))
+        .bg(theme.background.opacity(0.72))
+        .child(
+            div()
+                .h_full()
+                .w(px(track_width * played_fraction.clamp(0.0, 1.0)))
+                .bg(theme.input_border_focused),
+        )
+}
+
 pub(super) fn resume_item_card<T>(
     item: &ResumeItem,
     image_path: Option<PathBuf>,
     cx: &Context<T>,
-) -> impl IntoElement {
+) -> gpui::Div {
     let theme = theme::get(cx);
     let (title, subtitle) = resume_item_card_text(item);
+    let played_fraction = item
+        .played_percentage()
+        .map(|percentage| (percentage / 100.0) as f32);
 
     div()
         .flex()
@@ -258,7 +312,7 @@ pub(super) fn resume_item_card<T>(
         .rounded_lg()
         .p(px(USER_VIEW_CARD_PADDING_PX))
         .hover(move |style| style.bg(theme.secondary_hover))
-        .child(user_view_card_image(image_path, cx))
+        .child(resume_item_card_image(image_path, played_fraction, cx))
         .child(
             div()
                 .w(px(USER_VIEW_CARD_WIDTH_PX))
@@ -338,6 +392,13 @@ pub(super) fn episode_card<T>(
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
+    let played_fraction = if selected {
+        episode
+            .played_percentage()
+            .map(|percentage| (percentage / 100.0) as f32)
+    } else {
+        None
+    };
 
     div()
         .relative()
@@ -364,7 +425,7 @@ pub(super) fn episode_card<T>(
                     .border_color(theme.input_border_focused),
             )
         })
-        .child(episode_card_image(image_path, cx))
+        .child(episode_card_image(image_path, played_fraction, cx))
         .child(
             div()
                 .w(px(DETAIL_EPISODE_CARD_WIDTH_PX))
@@ -395,7 +456,11 @@ pub(super) fn episode_card<T>(
         )
 }
 
-fn episode_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl IntoElement {
+fn episode_card_image<T>(
+    image_path: Option<PathBuf>,
+    played_fraction: Option<f32>,
+    cx: &Context<T>,
+) -> impl IntoElement {
     let theme = theme::get(cx);
     let has_image = image_path.is_some();
 
@@ -420,6 +485,13 @@ fn episode_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl I
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child("暂无图片")
+        })
+        .when_some(played_fraction, |this, fraction| {
+            this.child(image_progress_bar(
+                DETAIL_EPISODE_CARD_WIDTH_PX,
+                fraction,
+                cx,
+            ))
         })
 }
 
@@ -642,6 +714,7 @@ mod tests {
             name: name.to_string(),
             item_type: Some(item_type.to_string()),
             series_name: None,
+            series_id: None,
             parent_index_number: None,
             index_number: None,
             production_year: None,
@@ -649,6 +722,7 @@ mod tests {
             backdrop_image_tags: None,
             parent_backdrop_item_id: None,
             parent_backdrop_image_tags: None,
+            user_data: None,
         }
     }
 
