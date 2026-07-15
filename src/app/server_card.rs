@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt as _, App, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, SharedString, Styled, Transformation, Window, div, percentage,
-    prelude::FluentBuilder, px, rgb, svg,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Transformation, Window, div,
+    percentage, prelude::FluentBuilder, px, rgb, svg,
 };
 
 use crate::{emby::ItemCounts, server::CachedServer, theme};
@@ -19,6 +19,42 @@ pub(super) struct ServerCardActions<Select, Toggle, Edit, Delete> {
     pub(super) on_menu_toggle: Toggle,
     pub(super) on_edit: Edit,
     pub(super) on_delete: Delete,
+}
+
+pub(super) fn add_server_card(
+    cx: &Context<TinyApp>,
+    on_add: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+
+    div()
+        .id("add-server-card")
+        .flex()
+        .w(px(SERVER_CARD_WIDTH_PX))
+        .h(px(SERVER_CARD_HEIGHT_PX))
+        .items_center()
+        .justify_center()
+        .rounded(theme.radius_lg)
+        .border_1()
+        .border_color(theme.input_border)
+        .bg(theme.dialog_background)
+        .text_color(theme.muted_foreground)
+        .hover(move |style| {
+            style
+                .bg(theme.secondary_hover.opacity(0.55))
+                .border_color(theme.input_border_focused)
+                .text_color(theme.foreground)
+        })
+        .child(
+            svg()
+                .path("icons/plus.svg")
+                .size(px(30.0))
+                .text_color(theme.foreground),
+        )
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            on_add(event, window, cx);
+        })
 }
 
 pub(super) fn server_card<Select, Toggle, Edit, Delete>(

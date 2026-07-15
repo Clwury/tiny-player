@@ -27,8 +27,8 @@ pub use show::{
 pub use system::PublicSystemInfo;
 pub use user::{
     AuthSession, AuthSessionInfo, AuthUser, ResumeItem, ResumeItemImageSource, ResumeItems,
-    SortOrder, UserItem, UserItemData, UserItemImageSource, UserItems, UserView, UserViewImageTags,
-    UserViews,
+    SortOrder, UserItem, UserItemData, UserItemImageSource, UserItems, UserItemsQuery,
+    UserItemsSort, UserView, UserViewImageTags, UserViews, VideoItemType,
 };
 
 pub(super) const CLIENT_NAME: &str = "Lenna";

@@ -105,6 +105,7 @@ impl AddServerDialogState {
             &address_input,
             |dialog: &mut AddServerDialogState, _, event, cx| match event {
                 TextInputEvent::Changed => dialog.auto_format_full_url(cx),
+                TextInputEvent::Submitted => {}
             },
         )
         .detach();

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Method;
@@ -77,10 +77,7 @@ impl EmbyClient {
 
     #[instrument(skip(self, server), fields(server = %server.endpoint.display_url()))]
     pub fn user_views(&self, server: &CachedServer) -> Result<UserViews> {
-        let user_id = server
-            .user_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
+        let user_id = authenticated_user_id(server)?;
         let mut url = api_url(&server.endpoint, &["Users", user_id, "Views"])?;
         url.query_pairs_mut()
             .append_pair("IncludeExternalContent", "false");
@@ -89,10 +86,7 @@ impl EmbyClient {
 
     #[instrument(skip(self, server), fields(server = %server.endpoint.display_url()))]
     pub fn resume_items(&self, server: &CachedServer) -> Result<ResumeItems> {
-        let user_id = server
-            .user_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
+        let user_id = authenticated_user_id(server)?;
         let mut url = api_url(&server.endpoint, &["Users", user_id, "Items", "Resume"])?;
         add_resume_items_query(&mut url);
         self.send_authenticated_json_url(server, Method::GET, url, "解析 Emby 继续观看响应失败")
@@ -107,52 +101,322 @@ impl EmbyClient {
         limit: u32,
         sort_order: SortOrder,
     ) -> Result<UserItems> {
-        let user_id = server
-            .user_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
+        self.query_user_items(
+            server,
+            &UserItemsQuery {
+                parent_id: Some(parent_id.to_string()),
+                include_item_types: vec![VideoItemType::Movie, VideoItemType::Series],
+                start_index,
+                limit,
+                sort_by: Some(UserItemsSort::DateLastContentAdded),
+                sort_order,
+                ..UserItemsQuery::default()
+            },
+        )
+    }
+
+    #[instrument(skip(self, server, query), fields(server = %server.endpoint.display_url()))]
+    pub fn query_user_items(
+        &self,
+        server: &CachedServer,
+        query: &UserItemsQuery,
+    ) -> Result<UserItems> {
+        let user_id = authenticated_user_id(server)?;
+        query.validate()?;
         let mut url = api_url(&server.endpoint, &["Users", user_id, "Items"])?;
-        add_user_items_query(&mut url, parent_id, start_index, limit, sort_order);
-        self.send_authenticated_json_url(server, Method::GET, url, "解析 Emby 媒体库项目响应失败")
+        add_query_user_items_query(&mut url, query);
+        self.send_authenticated_json_url(server, Method::GET, url, "解析 Emby 用户项目响应失败")
+    }
+
+    #[instrument(skip(self, server), fields(server = %server.endpoint.display_url(), search_term = %search_term))]
+    pub fn search_items(
+        &self,
+        server: &CachedServer,
+        search_term: &str,
+        start_index: u32,
+        limit: u32,
+    ) -> Result<UserItems> {
+        let query = search_user_items_query(search_term, start_index, limit)?;
+        self.query_user_items(server, &query)
+    }
+
+    #[instrument(skip(self, server, include_item_types), fields(server = %server.endpoint.display_url(), parent_id = %parent_id))]
+    pub fn latest_items(
+        &self,
+        server: &CachedServer,
+        parent_id: &str,
+        include_item_types: &[VideoItemType],
+        limit: u32,
+    ) -> Result<Vec<UserItem>> {
+        let user_id = authenticated_user_id(server)?;
+        validate_non_empty_id(parent_id, "Emby 媒体库 ID")?;
+        if limit == 0 {
+            bail!("Emby 项目查询 Limit 必须大于 0");
+        }
+        let mut url = api_url(&server.endpoint, &["Users", user_id, "Items", "Latest"])?;
+        add_latest_items_query(&mut url, parent_id, include_item_types, limit);
+        self.send_authenticated_json_url(server, Method::GET, url, "解析 Emby 最新项目响应失败")
+    }
+
+    #[instrument(skip(self, server), fields(server = %server.endpoint.display_url(), item_id = %item_id, favorite))]
+    pub fn set_favorite(
+        &self,
+        server: &CachedServer,
+        item_id: &str,
+        favorite: bool,
+    ) -> Result<UserItemData> {
+        let user_id = authenticated_user_id(server)?;
+        validate_non_empty_id(item_id, "Emby 项目 ID")?;
+        let url = favorite_item_url(&server.endpoint, user_id, item_id)?;
+        let method = favorite_method(favorite);
+        self.send_authenticated_json_url(server, method, url, "解析 Emby 收藏状态响应失败")
     }
 }
 
 fn add_resume_items_query(url: &mut url::Url) {
     url.query_pairs_mut()
+        .append_pair("EnableImages", "true")
         .append_pair("EnableImageTypes", "Primary,Backdrop,Thumb,Logo")
         .append_pair("EnableUserData", "true")
         .append_pair(
             "Fields",
-            "BasicSyncInfo,Overview,Container,CanDelete,ProviderIds,ProductionYear,Genres,DateCreated,ParentId,People,ProductionYear,MediaSources,MediaStreams",
+            "BasicSyncInfo,Overview,Container,CanDelete,ProviderIds,ProductionYear,Genres,DateCreated,ParentId,SeriesId,SeriesName,IndexNumber,ParentIndexNumber,MediaType,CommunityRating,PrimaryImageAspectRatio,CollectionType,UserData,People,MediaSources,MediaStreams",
         )
         .append_pair("Limit", "30")
         .append_pair("MediaTypes", "Video")
         .append_pair("Recursive", "true");
 }
 
-fn add_user_items_query(
-    url: &mut url::Url,
-    parent_id: &str,
+const USER_ITEM_FIELDS: &str = "BasicSyncInfo,CollectionType,PrimaryImageAspectRatio,UserData,CommunityRating,ProviderIds,ProductionYear,ChildCount,Container,CanDelete,ParentId,SeriesId,SeriesName,IndexNumber,ParentIndexNumber,MediaType";
+const SEARCH_USER_ITEM_FIELDS: &str =
+    "BasicSyncInfo,CommunityRating,ProductionYear,EndDate,Container";
+
+fn authenticated_user_id(server: &CachedServer) -> Result<&str> {
+    server
+        .user_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))
+}
+
+fn validate_non_empty_id(value: &str, label: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{label}不能为空");
+    }
+    Ok(())
+}
+
+fn search_user_items_query(
+    search_term: &str,
     start_index: u32,
     limit: u32,
-    sort_order: SortOrder,
-) {
-    let limit = limit.to_string();
-    let start_index = start_index.to_string();
+) -> Result<UserItemsQuery> {
+    let query = UserItemsQuery {
+        fields: Some(SEARCH_USER_ITEM_FIELDS.to_string()),
+        include_item_types: vec![VideoItemType::Movie, VideoItemType::Series],
+        group_programs_by_series: true,
+        search_term: Some(search_term.trim().to_string()),
+        recursive: true,
+        start_index,
+        limit,
+        sort_by: Some(UserItemsSort::DateCreated),
+        sort_order: SortOrder::Descending,
+        ..UserItemsQuery::default()
+    };
+    query.validate()?;
+    Ok(query)
+}
 
-    url.query_pairs_mut()
+fn favorite_item_url(
+    endpoint: &crate::server::ServerEndpoint,
+    user_id: &str,
+    item_id: &str,
+) -> Result<url::Url> {
+    api_url(endpoint, &["Users", user_id, "FavoriteItems", item_id])
+}
+
+fn favorite_method(favorite: bool) -> Method {
+    if favorite {
+        Method::POST
+    } else {
+        Method::DELETE
+    }
+}
+
+fn add_query_user_items_query(url: &mut url::Url, query: &UserItemsQuery) {
+    let ids = stable_non_empty_ids(&query.ids);
+    let include_types = item_types_query(&query.include_item_types);
+    let fields = query
+        .fields
+        .as_deref()
+        .map(str::trim)
+        .filter(|fields| !fields.is_empty())
+        .unwrap_or(USER_ITEM_FIELDS);
+    let mut pairs = url.query_pairs_mut();
+    pairs
+        .append_pair("EnableImages", "true")
         .append_pair("EnableImageTypes", "Primary,Backdrop,Thumb")
-        .append_pair(
-            "Fields",
-            "BasicSyncInfo,CollectionType,PrimaryImageAspectRatio,UserData,CommunityRating,ProviderIds,ProductionYear,ChildCount,Container,CanDelete",
-        )
-        .append_pair("IncludeItemTypes", "Series,Movie,Video,MusicVideo,MusicAlbum")
-        .append_pair("Limit", &limit)
-        .append_pair("ParentId", parent_id)
-        .append_pair("Recursive", "true")
-        .append_pair("SortBy", "DateLastContentAdded,DateCreated,SortName")
-        .append_pair("SortOrder", sort_order.as_str())
-        .append_pair("StartIndex", &start_index);
+        .append_pair("EnableUserData", "true")
+        .append_pair("Fields", fields)
+        .append_pair("Limit", &query.limit.to_string())
+        .append_pair("Recursive", if query.recursive { "true" } else { "false" })
+        .append_pair("SortOrder", query.sort_order.as_str())
+        .append_pair("StartIndex", &query.start_index.to_string());
+    if let Some(parent_id) = query.parent_id.as_deref() {
+        pairs.append_pair("ParentId", parent_id);
+    }
+    if !ids.is_empty() {
+        pairs.append_pair("Ids", &ids.join(","));
+    }
+    if !include_types.is_empty() {
+        pairs.append_pair("IncludeItemTypes", &include_types);
+    }
+    if let Some(is_favorite) = query.is_favorite {
+        pairs.append_pair("IsFavorite", if is_favorite { "true" } else { "false" });
+    }
+    if query.group_programs_by_series {
+        pairs.append_pair("GroupProgramsBySeries", "true");
+    }
+    if let Some(search_term) = query
+        .search_term
+        .as_deref()
+        .map(str::trim)
+        .filter(|search_term| !search_term.is_empty())
+    {
+        pairs.append_pair("SearchTerm", search_term);
+    }
+    if let Some(sort_by) = query.sort_by {
+        pairs.append_pair("SortBy", sort_by.as_str());
+    }
+}
+
+fn add_latest_items_query(
+    url: &mut url::Url,
+    parent_id: &str,
+    include_item_types: &[VideoItemType],
+    limit: u32,
+) {
+    let include_types = item_types_query(include_item_types);
+    let mut pairs = url.query_pairs_mut();
+    pairs
+        .append_pair("EnableImages", "true")
+        .append_pair("EnableImageTypes", "Primary,Backdrop,Thumb")
+        .append_pair("EnableUserData", "true")
+        .append_pair("Fields", USER_ITEM_FIELDS)
+        .append_pair("Limit", &limit.to_string())
+        .append_pair("ParentId", parent_id);
+    if !include_types.is_empty() {
+        pairs.append_pair("IncludeItemTypes", &include_types);
+    }
+}
+
+fn item_types_query(types: &[VideoItemType]) -> String {
+    let mut seen = HashSet::new();
+    types
+        .iter()
+        .copied()
+        .filter(|item_type| seen.insert(*item_type))
+        .map(VideoItemType::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn stable_non_empty_ids(ids: &[String]) -> Vec<&str> {
+    let mut seen = HashSet::new();
+    ids.iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .filter(|id| seen.insert((*id).to_string()))
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VideoItemType {
+    Movie,
+    Series,
+    Episode,
+}
+
+impl VideoItemType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Movie => "Movie",
+            Self::Series => "Series",
+            Self::Episode => "Episode",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserItemsSort {
+    SortName,
+    DateLastContentAdded,
+    DateCreated,
+}
+
+impl UserItemsSort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SortName => "SortName",
+            Self::DateLastContentAdded => "DateLastContentAdded,DateCreated,SortName",
+            Self::DateCreated => "DateCreated,DateLastContentAdded,SortName",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UserItemsQuery {
+    pub parent_id: Option<String>,
+    pub ids: Vec<String>,
+    pub fields: Option<String>,
+    pub include_item_types: Vec<VideoItemType>,
+    pub is_favorite: Option<bool>,
+    pub group_programs_by_series: bool,
+    pub search_term: Option<String>,
+    pub recursive: bool,
+    pub start_index: u32,
+    pub limit: u32,
+    pub sort_by: Option<UserItemsSort>,
+    pub sort_order: SortOrder,
+}
+
+impl Default for UserItemsQuery {
+    fn default() -> Self {
+        Self {
+            parent_id: None,
+            ids: Vec::new(),
+            fields: None,
+            include_item_types: Vec::new(),
+            is_favorite: None,
+            group_programs_by_series: false,
+            search_term: None,
+            recursive: true,
+            start_index: 0,
+            limit: 60,
+            sort_by: None,
+            sort_order: SortOrder::Ascending,
+        }
+    }
+}
+
+impl UserItemsQuery {
+    fn validate(&self) -> Result<()> {
+        if self.limit == 0 {
+            bail!("Emby 项目查询 Limit 必须大于 0");
+        }
+        if let Some(parent_id) = self.parent_id.as_deref() {
+            validate_non_empty_id(parent_id, "Emby 媒体库 ID")?;
+        }
+        if self
+            .search_term
+            .as_deref()
+            .is_some_and(|search_term| search_term.trim().is_empty())
+        {
+            bail!("Emby 搜索词不能为空");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,6 +556,12 @@ pub struct UserItem {
     pub name: String,
     #[serde(rename = "Type")]
     pub item_type: Option<String>,
+    pub media_type: Option<String>,
+    pub parent_id: Option<String>,
+    pub series_id: Option<String>,
+    pub series_name: Option<String>,
+    pub index_number: Option<u32>,
+    pub parent_index_number: Option<u32>,
     pub production_year: Option<u32>,
     pub community_rating: Option<f32>,
     pub image_tags: Option<HashMap<String, String>>,
@@ -305,7 +575,7 @@ pub struct UserItem {
     pub provider_ids: Option<HashMap<String, String>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserItemData {
     pub unplayed_item_count: Option<u32>,
@@ -359,6 +629,30 @@ impl UserItem {
         }
     }
 
+    pub fn episode_image_source(&self) -> UserItemImageSource<'_> {
+        if let Some(tag) = self.backdrop_image_tag() {
+            return UserItemImageSource {
+                item_id: self.id.as_str(),
+                image_type: EmbyImageType::Backdrop,
+                tag: Some(tag),
+            };
+        }
+        if let Some(tag) = self
+            .image_tags
+            .as_ref()
+            .and_then(|tags| tags.get("Thumb"))
+            .map(String::as_str)
+            .filter(|tag| !tag.trim().is_empty())
+        {
+            return UserItemImageSource {
+                item_id: self.id.as_str(),
+                image_type: EmbyImageType::Thumb,
+                tag: Some(tag),
+            };
+        }
+        self.image_source()
+    }
+
     pub fn unplayed_count(&self) -> Option<u32> {
         self.user_data
             .as_ref()
@@ -385,6 +679,7 @@ pub struct ResumeItem {
     pub name: String,
     #[serde(rename = "Type")]
     pub item_type: Option<String>,
+    pub parent_id: Option<String>,
     pub series_name: Option<String>,
     pub series_id: Option<String>,
     pub parent_index_number: Option<u32>,
@@ -404,6 +699,10 @@ pub struct ResumeItemImageSource<'a> {
 }
 
 impl ResumeItem {
+    pub fn is_favorite(&self) -> bool {
+        self.user_data.as_ref().is_some_and(|data| data.is_favorite)
+    }
+
     pub fn played_percentage(&self) -> Option<f64> {
         self.user_data
             .as_ref()
@@ -579,10 +878,28 @@ mod tests {
             crate::emby::api_url(&endpoint, &["Users", "user-1", "Items", "Resume"]).unwrap();
         add_resume_items_query(&mut url);
 
+        let pairs = url.query_pairs().collect::<HashMap<_, _>>();
         assert_eq!(
-            url.as_str(),
-            "https://example.com/emby/Users/user-1/Items/Resume?EnableImageTypes=Primary%2CBackdrop%2CThumb%2CLogo&EnableUserData=true&Fields=BasicSyncInfo%2COverview%2CContainer%2CCanDelete%2CProviderIds%2CProductionYear%2CGenres%2CDateCreated%2CParentId%2CPeople%2CProductionYear%2CMediaSources%2CMediaStreams&Limit=30&MediaTypes=Video&Recursive=true"
+            pairs.get("EnableImages").map(|value| value.as_ref()),
+            Some("true")
         );
+        assert_eq!(
+            pairs.get("EnableUserData").map(|value| value.as_ref()),
+            Some("true")
+        );
+        let fields = pairs.get("Fields").unwrap();
+        for field in [
+            "ParentId",
+            "SeriesId",
+            "SeriesName",
+            "IndexNumber",
+            "ParentIndexNumber",
+            "MediaType",
+            "UserData",
+        ] {
+            assert!(fields.split(',').any(|candidate| candidate == field));
+        }
+        assert_eq!(pairs.get("Limit").map(|value| value.as_ref()), Some("30"));
     }
 
     #[test]
@@ -594,12 +911,193 @@ mod tests {
             path: "/emby".to_string(),
         };
         let mut url = crate::emby::api_url(&endpoint, &["Users", "user-1", "Items"]).unwrap();
-        add_user_items_query(&mut url, "36089", 0, 30, SortOrder::Descending);
-
-        assert_eq!(
-            url.as_str(),
-            "https://example.com/emby/Users/user-1/Items?EnableImageTypes=Primary%2CBackdrop%2CThumb&Fields=BasicSyncInfo%2CCollectionType%2CPrimaryImageAspectRatio%2CUserData%2CCommunityRating%2CProviderIds%2CProductionYear%2CChildCount%2CContainer%2CCanDelete&IncludeItemTypes=Series%2CMovie%2CVideo%2CMusicVideo%2CMusicAlbum&Limit=30&ParentId=36089&Recursive=true&SortBy=DateLastContentAdded%2CDateCreated%2CSortName&SortOrder=Descending&StartIndex=0"
+        add_query_user_items_query(
+            &mut url,
+            &UserItemsQuery {
+                parent_id: Some("36089".to_string()),
+                include_item_types: vec![VideoItemType::Movie, VideoItemType::Series],
+                start_index: 60,
+                limit: 60,
+                sort_by: Some(UserItemsSort::SortName),
+                sort_order: SortOrder::Ascending,
+                ..UserItemsQuery::default()
+            },
         );
+
+        let pairs = url.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            pairs.get("ParentId").map(|value| value.as_ref()),
+            Some("36089")
+        );
+        assert_eq!(
+            pairs.get("IncludeItemTypes").map(|value| value.as_ref()),
+            Some("Movie,Series")
+        );
+        assert_eq!(
+            pairs.get("StartIndex").map(|value| value.as_ref()),
+            Some("60")
+        );
+        assert_eq!(pairs.get("Limit").map(|value| value.as_ref()), Some("60"));
+        assert_eq!(
+            pairs.get("SortBy").map(|value| value.as_ref()),
+            Some("SortName")
+        );
+        assert_eq!(
+            pairs.get("EnableUserData").map(|value| value.as_ref()),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn builds_search_user_items_url() {
+        let endpoint = ServerEndpoint {
+            protocol: Protocol::Https,
+            address: "example.com".to_string(),
+            port: 443,
+            path: "/emby".to_string(),
+        };
+        let query = search_user_items_query(" 你的名字 ", 0, 30).unwrap();
+        let mut url = crate::emby::api_url(&endpoint, &["Users", "user-1", "Items"]).unwrap();
+        add_query_user_items_query(&mut url, &query);
+
+        assert_eq!(url.path(), "/emby/Users/user-1/Items");
+        let pairs = url.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            pairs.get("EnableImageTypes").map(|value| value.as_ref()),
+            Some("Primary,Backdrop,Thumb")
+        );
+        assert_eq!(
+            pairs.get("Fields").map(|value| value.as_ref()),
+            Some(SEARCH_USER_ITEM_FIELDS)
+        );
+        assert_eq!(
+            pairs
+                .get("GroupProgramsBySeries")
+                .map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            pairs.get("IncludeItemTypes").map(|value| value.as_ref()),
+            Some("Movie,Series")
+        );
+        assert_eq!(pairs.get("Limit").map(|value| value.as_ref()), Some("30"));
+        assert_eq!(
+            pairs.get("Recursive").map(|value| value.as_ref()),
+            Some("true")
+        );
+        assert_eq!(
+            pairs.get("SearchTerm").map(|value| value.as_ref()),
+            Some("你的名字")
+        );
+        assert_eq!(
+            pairs.get("SortBy").map(|value| value.as_ref()),
+            Some("DateCreated,DateLastContentAdded,SortName")
+        );
+        assert_eq!(
+            pairs.get("SortOrder").map(|value| value.as_ref()),
+            Some("Descending")
+        );
+    }
+
+    #[test]
+    fn user_items_ids_are_filtered_and_stably_deduplicated() {
+        let endpoint = ServerEndpoint {
+            protocol: Protocol::Https,
+            address: "example.com".to_string(),
+            port: 443,
+            path: "/emby".to_string(),
+        };
+        let mut url = crate::emby::api_url(&endpoint, &["Users", "user-1", "Items"]).unwrap();
+        add_query_user_items_query(
+            &mut url,
+            &UserItemsQuery {
+                ids: vec!["b".into(), "".into(), "  a  ".into(), "b".into()],
+                include_item_types: vec![VideoItemType::Movie, VideoItemType::Episode],
+                limit: 40,
+                ..UserItemsQuery::default()
+            },
+        );
+
+        let ids = url.query_pairs().find(|(key, _)| key == "Ids").unwrap().1;
+        assert_eq!(ids, "b,a");
+    }
+
+    #[test]
+    fn builds_latest_items_url() {
+        let endpoint = ServerEndpoint {
+            protocol: Protocol::Https,
+            address: "example.com".to_string(),
+            port: 443,
+            path: "/emby".to_string(),
+        };
+        let mut latest =
+            crate::emby::api_url(&endpoint, &["Users", "user-1", "Items", "Latest"]).unwrap();
+        add_latest_items_query(
+            &mut latest,
+            "view-1",
+            &[VideoItemType::Series, VideoItemType::Episode],
+            30,
+        );
+        assert_eq!(
+            latest
+                .query_pairs()
+                .find(|(key, _)| key == "IncludeItemTypes")
+                .unwrap()
+                .1,
+            "Series,Episode"
+        );
+        assert_eq!(
+            latest
+                .query_pairs()
+                .find(|(key, _)| key == "ParentId")
+                .unwrap()
+                .1,
+            "view-1"
+        );
+        assert_eq!(
+            latest
+                .query_pairs()
+                .find(|(key, _)| key == "EnableUserData")
+                .unwrap()
+                .1,
+            "true"
+        );
+    }
+
+    #[test]
+    fn builds_favorite_query_and_endpoint() {
+        let endpoint = ServerEndpoint {
+            protocol: Protocol::Https,
+            address: "example.com".to_string(),
+            port: 443,
+            path: "/emby".to_string(),
+        };
+        let mut query_url = crate::emby::api_url(&endpoint, &["Users", "user-1", "Items"]).unwrap();
+        add_query_user_items_query(
+            &mut query_url,
+            &UserItemsQuery {
+                include_item_types: vec![VideoItemType::Movie, VideoItemType::Series],
+                is_favorite: Some(true),
+                sort_by: Some(UserItemsSort::SortName),
+                ..UserItemsQuery::default()
+            },
+        );
+        assert_eq!(
+            query_url
+                .query_pairs()
+                .find(|(key, _)| key == "IsFavorite")
+                .unwrap()
+                .1,
+            "true"
+        );
+
+        let favorite_url = favorite_item_url(&endpoint, "user-1", "item-1").unwrap();
+        assert_eq!(
+            favorite_url.as_str(),
+            "https://example.com/emby/Users/user-1/FavoriteItems/item-1"
+        );
+        assert_eq!(favorite_method(true), Method::POST);
+        assert_eq!(favorite_method(false), Method::DELETE);
     }
 
     #[test]
@@ -653,15 +1151,30 @@ mod tests {
                     "BackdropImageTags": [
                         "backdrop-tag-3"
                     ]
+                },
+                {
+                    "Id": "episode-4",
+                    "Name": "第四集",
+                    "Type": "Episode",
+                    "MediaType": "Video",
+                    "ParentId": "season-1",
+                    "SeriesId": "series-1",
+                    "SeriesName": "示例剧集",
+                    "ParentIndexNumber": 1,
+                    "IndexNumber": 4,
+                    "ImageTags": {
+                        "Thumb": "thumb-tag-4",
+                        "Primary": "primary-tag-4"
+                    }
                 }
             ],
-            "TotalRecordCount": 3
+            "TotalRecordCount": 4
         }
         "#;
 
         let items: UserItems = serde_json::from_str(json).unwrap();
 
-        assert_eq!(items.total_record_count, 3);
+        assert_eq!(items.total_record_count, 4);
         assert_eq!(items.items[0].id, "item-1");
         assert_eq!(items.items[0].name, "示例剧集");
         assert_eq!(items.items[0].item_type.as_deref(), Some("Series"));
@@ -697,6 +1210,60 @@ mod tests {
         assert_eq!(image_source.item_id, "item-3");
         assert_eq!(image_source.image_type, EmbyImageType::Backdrop);
         assert_eq!(image_source.tag, Some("backdrop-tag-3"));
+        assert_eq!(items.items[3].media_type.as_deref(), Some("Video"));
+        assert_eq!(items.items[3].parent_id.as_deref(), Some("season-1"));
+        assert_eq!(items.items[3].series_id.as_deref(), Some("series-1"));
+        assert_eq!(items.items[3].series_name.as_deref(), Some("示例剧集"));
+        assert_eq!(items.items[3].parent_index_number, Some(1));
+        assert_eq!(items.items[3].index_number, Some(4));
+        let episode_source = items.items[3].episode_image_source();
+        assert_eq!(episode_source.image_type, EmbyImageType::Thumb);
+        assert_eq!(episode_source.tag, Some("thumb-tag-4"));
+    }
+
+    #[test]
+    fn parses_favorite_user_item_data_response() {
+        let data: UserItemData = serde_json::from_str(
+            r#"{"UnplayedItemCount":2,"PlayedPercentage":25.0,"PlaybackPositionTicks":120000000,"IsFavorite":true}"#,
+        )
+        .unwrap();
+
+        assert!(data.is_favorite);
+        assert_eq!(data.unplayed_item_count, Some(2));
+        assert_eq!(data.played_percentage, Some(25.0));
+        assert_eq!(data.playback_position_ticks, Some(120_000_000));
+    }
+
+    #[test]
+    fn validates_query_limits_and_ids() {
+        let mut query = UserItemsQuery {
+            limit: 0,
+            ..UserItemsQuery::default()
+        };
+        assert!(query.validate().is_err());
+        query.limit = 60;
+        query.parent_id = Some("  ".to_string());
+        assert!(query.validate().is_err());
+        query.parent_id = None;
+        query.search_term = Some("  ".to_string());
+        assert!(query.validate().is_err());
+        assert!(validate_non_empty_id(" ", "Emby 项目 ID").is_err());
+    }
+
+    #[test]
+    fn video_item_types_serialize_to_emby_values() {
+        assert_eq!(
+            serde_json::to_string(&VideoItemType::Movie).unwrap(),
+            "\"Movie\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VideoItemType::Series).unwrap(),
+            "\"Series\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VideoItemType::Episode).unwrap(),
+            "\"Episode\""
+        );
     }
 
     #[test]
@@ -708,6 +1275,7 @@ mod tests {
                     "Id": "episode-1",
                     "Name": "第一集",
                     "Type": "Episode",
+                    "ParentId": "season-1",
                     "SeriesName": "示例剧集",
                     "SeriesId": "series-1",
                     "ParentIndexNumber": 1,
@@ -771,6 +1339,7 @@ mod tests {
         assert_eq!(items.total_record_count, 4);
         assert_eq!(items.items[0].id, "episode-1");
         assert_eq!(items.items[0].item_type.as_deref(), Some("Episode"));
+        assert_eq!(items.items[0].parent_id.as_deref(), Some("season-1"));
         assert_eq!(items.items[0].series_name.as_deref(), Some("示例剧集"));
         assert_eq!(items.items[0].series_id.as_deref(), Some("series-1"));
         assert_eq!(items.items[0].parent_index_number, Some(1));

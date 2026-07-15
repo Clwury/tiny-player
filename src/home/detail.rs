@@ -14,7 +14,10 @@ use crate::{
     server::CachedServer,
 };
 
-use super::{HomeContent, HomeContentEvent, LoadState, carousel::DETAIL_EPISODE_CARD_STEP_PX};
+use super::{
+    HomeContent, HomeContentEvent, LoadState, WorkspaceIdentity,
+    carousel::DETAIL_EPISODE_CARD_STEP_PX,
+};
 
 struct SelectedPlayback {
     detail_id: String,
@@ -64,9 +67,16 @@ impl HomeContent {
 
     fn open_detail_state(&mut self, detail: SeriesDetailState, cx: &mut Context<Self>) {
         self.resume_detail_failed = None;
-
+        self.favorite_failures.remove(&detail.series_id);
+        if let Some(current) = self.series_detail.take() {
+            self.detail_history.push(current);
+        }
+        self.navigation.push_detail(
+            detail.series_id.clone(),
+            detail.preferred_episode_id.clone(),
+        );
+        self.detail_generation = self.detail_generation.wrapping_add(1);
         self.series_detail = Some(detail);
-        self.main_scroll_handle.set_offset(point(px(0.0), px(0.0)));
         self.load_media_detail_effects(cx);
         cx.emit(HomeContentEvent::TitleChanged);
         cx.notify();
@@ -78,8 +88,28 @@ impl HomeContent {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.series_detail = None;
-        self.main_scroll_handle.set_offset(point(px(0.0), px(0.0)));
+        if !self.navigation.pop() {
+            return;
+        }
+        self.detail_generation = self.detail_generation.wrapping_add(1);
+        self.series_detail = if matches!(
+            self.navigation.current(),
+            super::navigation::HomeRoute::Detail { .. }
+        ) {
+            self.detail_history.pop()
+        } else {
+            self.detail_history.clear();
+            None
+        };
+        if let Some(detail) = self.series_detail.as_mut() {
+            detail.reset_in_flight_effects();
+            self.load_media_detail_effects(cx);
+        }
+        if self.navigation.current()
+            == &super::navigation::HomeRoute::Root(super::navigation::HomeRoot::Favorites)
+        {
+            self.enter_favorites_if_needed(cx);
+        }
         cx.emit(HomeContentEvent::TitleChanged);
         cx.notify();
     }
@@ -126,6 +156,8 @@ impl HomeContent {
         cx.notify();
 
         let server = self.current_server.clone();
+        let identity = self.request_identity();
+        let generation = self.detail_generation;
         let client = self.emby_client.clone();
         let task_server = server.clone();
         let task_item_id = selected.item_id.clone();
@@ -147,7 +179,7 @@ impl HomeContent {
         cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
-                page.finish_play_selected_media(selected, result, cx)
+                page.finish_play_selected_media(identity, generation, selected, result, cx)
             })
             .ok();
         })
@@ -156,11 +188,16 @@ impl HomeContent {
 
     fn finish_play_selected_media(
         &mut self,
+        identity: WorkspaceIdentity,
+        generation: u64,
         selected: SelectedPlayback,
         result: anyhow::Result<ResolvedPlayback>,
         cx: &mut Context<Self>,
     ) {
-        if !self.selected_playback_still_current(&selected) {
+        if self.detail_generation != generation
+            || !self.matches_request_identity(&identity)
+            || !self.selected_playback_still_current(&selected)
+        {
             return;
         }
 
@@ -227,6 +264,9 @@ impl HomeContent {
     }
 
     fn load_series_media_item_if_needed(&mut self, cx: &mut Context<Self>) {
+        let identity = self.request_identity();
+        let user_data_revision = self.user_data_request_revision();
+        let generation = self.detail_generation;
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -235,6 +275,7 @@ impl HomeContent {
         }
 
         detail.effects.item = LoadState::Loading;
+        detail.item_failed = None;
         let server = self.current_server.clone();
         let client = self.emby_client.clone();
         let series_id = detail.series_id.clone();
@@ -244,7 +285,14 @@ impl HomeContent {
         cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
-                page.finish_series_media_item(series_id, result, cx)
+                page.finish_series_media_item(
+                    identity,
+                    user_data_revision,
+                    generation,
+                    series_id,
+                    result,
+                    cx,
+                )
             })
             .ok();
         })
@@ -253,14 +301,19 @@ impl HomeContent {
 
     fn finish_series_media_item(
         &mut self,
+        identity: WorkspaceIdentity,
+        user_data_revision: u64,
+        generation: u64,
         series_id: String,
         result: anyhow::Result<MediaItem>,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .series_detail
-            .as_ref()
-            .is_none_or(|detail| detail.series_id.as_str() != series_id.as_str())
+        if self.detail_generation != generation
+            || !self.matches_request_identity(&identity)
+            || self
+                .series_detail
+                .as_ref()
+                .is_none_or(|detail| detail.series_id.as_str() != series_id.as_str())
         {
             return;
         }
@@ -268,6 +321,7 @@ impl HomeContent {
         match result {
             Ok(item) => {
                 self.ensure_series_media_item_images(&item, cx);
+                self.absorb_user_data(&item.id, item.user_data.as_ref(), user_data_revision);
                 if let Some(detail) = self.series_detail.as_mut() {
                     if detail.series_id.as_str() != series_id.as_str() {
                         return;
@@ -301,6 +355,9 @@ impl HomeContent {
     }
 
     fn load_similar_items_if_needed(&mut self, cx: &mut Context<Self>) {
+        let identity = self.request_identity();
+        let user_data_revision = self.user_data_request_revision();
+        let generation = self.detail_generation;
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -309,6 +366,7 @@ impl HomeContent {
         }
 
         detail.effects.similar = LoadState::Loading;
+        detail.similar_failed = None;
         let server = self.current_server.clone();
         let client = self.emby_client.clone();
         let item_id = detail.series_id.clone();
@@ -318,7 +376,14 @@ impl HomeContent {
         cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
-                page.finish_similar_items(item_id, result, cx)
+                page.finish_similar_items(
+                    identity,
+                    user_data_revision,
+                    generation,
+                    item_id,
+                    result,
+                    cx,
+                )
             })
             .ok();
         })
@@ -327,20 +392,31 @@ impl HomeContent {
 
     fn finish_similar_items(
         &mut self,
+        identity: WorkspaceIdentity,
+        user_data_revision: u64,
+        generation: u64,
         item_id: String,
         result: anyhow::Result<UserItems>,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .series_detail
-            .as_ref()
-            .is_none_or(|detail| detail.series_id.as_str() != item_id.as_str())
+        if self.detail_generation != generation
+            || !self.matches_request_identity(&identity)
+            || self
+                .series_detail
+                .as_ref()
+                .is_none_or(|detail| detail.series_id.as_str() != item_id.as_str())
         {
             return;
         }
 
         match result {
-            Ok(items) => {
+            Ok(mut items) => {
+                items.items.retain(|item| {
+                    !item.id.trim().is_empty()
+                        && matches!(item.item_type.as_deref(), Some("Movie" | "Series"))
+                });
+                items.total_record_count = items.items.len() as u32;
+                self.absorb_user_items_user_data(&items, user_data_revision);
                 self.ensure_user_items_images(&items, cx);
                 if let Some(detail) = self.series_detail.as_mut() {
                     if detail.series_id.as_str() != item_id.as_str() {
@@ -368,6 +444,8 @@ impl HomeContent {
     }
 
     fn load_series_seasons_if_needed(&mut self, cx: &mut Context<Self>) {
+        let identity = self.request_identity();
+        let generation = self.detail_generation;
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -376,6 +454,7 @@ impl HomeContent {
         }
 
         detail.effects.seasons = LoadState::Loading;
+        detail.seasons_failed = None;
         let server = self.current_server.clone();
         let client = self.emby_client.clone();
         let series_id = detail.series_id.clone();
@@ -386,7 +465,7 @@ impl HomeContent {
         cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
-                page.finish_series_seasons(series_id, result, cx)
+                page.finish_series_seasons(identity, generation, series_id, result, cx)
             })
             .ok();
         })
@@ -395,10 +474,15 @@ impl HomeContent {
 
     fn finish_series_seasons(
         &mut self,
+        identity: WorkspaceIdentity,
+        generation: u64,
         series_id: String,
         result: anyhow::Result<MediaItems>,
         cx: &mut Context<Self>,
     ) {
+        if self.detail_generation != generation || !self.matches_request_identity(&identity) {
+            return;
+        }
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -424,6 +508,8 @@ impl HomeContent {
     }
 
     fn load_series_next_up_if_needed(&mut self, cx: &mut Context<Self>) {
+        let identity = self.request_identity();
+        let generation = self.detail_generation;
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -432,6 +518,7 @@ impl HomeContent {
         }
 
         detail.effects.next_up = LoadState::Loading;
+        detail.next_up_failed = None;
         let server = self.current_server.clone();
         let client = self.emby_client.clone();
         let series_id = detail.series_id.clone();
@@ -442,7 +529,7 @@ impl HomeContent {
         cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
-                page.finish_series_next_up(series_id, result, cx)
+                page.finish_series_next_up(identity, generation, series_id, result, cx)
             })
             .ok();
         })
@@ -451,10 +538,15 @@ impl HomeContent {
 
     fn finish_series_next_up(
         &mut self,
+        identity: WorkspaceIdentity,
+        generation: u64,
         series_id: String,
         result: anyhow::Result<MediaItems>,
         cx: &mut Context<Self>,
     ) {
+        if self.detail_generation != generation || !self.matches_request_identity(&identity) {
+            return;
+        }
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -482,6 +574,8 @@ impl HomeContent {
     }
 
     fn load_series_episodes_if_needed(&mut self, cx: &mut Context<Self>) {
+        let identity = self.request_identity();
+        let generation = self.detail_generation;
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -518,7 +612,7 @@ impl HomeContent {
         cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
-                page.finish_series_episodes(series_id, season_id, result, cx)
+                page.finish_series_episodes(identity, generation, series_id, season_id, result, cx)
             })
             .ok();
         })
@@ -527,16 +621,21 @@ impl HomeContent {
 
     fn finish_series_episodes(
         &mut self,
+        identity: WorkspaceIdentity,
+        generation: u64,
         series_id: String,
         season_id: String,
         result: anyhow::Result<MediaItems>,
         cx: &mut Context<Self>,
     ) {
-        if self.series_detail.as_ref().is_none_or(|detail| {
-            detail.series_id.as_str() != series_id.as_str()
-                || detail.selected_season_id.as_deref() != Some(season_id.as_str())
-                || detail.episodes_request_season_id.as_deref() != Some(season_id.as_str())
-        }) {
+        if self.detail_generation != generation
+            || !self.matches_request_identity(&identity)
+            || self.series_detail.as_ref().is_none_or(|detail| {
+                detail.series_id.as_str() != series_id.as_str()
+                    || detail.selected_season_id.as_deref() != Some(season_id.as_str())
+                    || detail.episodes_request_season_id.as_deref() != Some(season_id.as_str())
+            })
+        {
             return;
         }
 
@@ -596,6 +695,7 @@ impl HomeContent {
 
         detail.selected_season_id = Some(season_id);
         detail.preferred_episode_id = None;
+        detail.clear_preferred_season_hint();
         detail.open_select = None;
         detail.reset_episode_selection();
         self.load_series_episodes_if_needed(cx);
@@ -964,6 +1064,7 @@ mod tests {
             id: Some("mediasource_1126227".to_string()),
             name: None,
             path: None,
+            source_type: None,
             container: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(3),
@@ -979,9 +1080,11 @@ mod tests {
                 delivery_method: Some("External".to_string()),
                 is_external: Some(true),
                 is_default: Some(false),
+                is_forced: Some(false),
                 is_text_subtitle_stream: Some(true),
                 supports_external_stream: Some(true),
             }]),
+            default_subtitle_stream_index: None,
         };
 
         let tracks = playback_subtitle_tracks(&source, &server(), "1126227", "mediasource_1126227");
@@ -1004,6 +1107,7 @@ mod tests {
             id: Some("mediasource_1126227".to_string()),
             name: None,
             path: None,
+            source_type: None,
             container: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(3),
@@ -1016,9 +1120,11 @@ mod tests {
                 delivery_method: Some("External".to_string()),
                 is_external: Some(true),
                 is_default: Some(false),
+                is_forced: Some(false),
                 is_text_subtitle_stream: Some(true),
                 supports_external_stream: Some(true),
             }]),
+            default_subtitle_stream_index: None,
         };
 
         let tracks = playback_subtitle_tracks(&source, &server(), "1126227", "mediasource_1126227");
@@ -1039,6 +1145,7 @@ mod tests {
             id: Some("mediasource_1126227".to_string()),
             name: None,
             path: None,
+            source_type: None,
             container: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(2),
@@ -1051,9 +1158,11 @@ mod tests {
                 delivery_method: Some("Embed".to_string()),
                 is_external: Some(false),
                 is_default: Some(true),
+                is_forced: Some(false),
                 is_text_subtitle_stream: Some(true),
                 supports_external_stream: Some(true),
             }]),
+            default_subtitle_stream_index: None,
         };
 
         let tracks = playback_subtitle_tracks(&source, &server(), "1126227", "mediasource_1126227");
@@ -1071,6 +1180,7 @@ mod tests {
             id: Some("mediasource_824061".to_string()),
             name: None,
             path: None,
+            source_type: None,
             container: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(2),
@@ -1083,9 +1193,11 @@ mod tests {
                 delivery_method: Some("Embed".to_string()),
                 is_external: Some(false),
                 is_default: Some(true),
+                is_forced: Some(false),
                 is_text_subtitle_stream: Some(true),
                 supports_external_stream: Some(true),
             }]),
+            default_subtitle_stream_index: None,
         };
 
         let tracks = playback_subtitle_tracks(&source, &server(), "824061", "mediasource_824061");

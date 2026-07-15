@@ -5,7 +5,7 @@ use gpui::{
 
 use crate::{server::CachedServer, theme};
 
-use super::{HomePage, HomeSection, carousel::HOME_SIDEBAR_WIDTH_PX};
+use super::{HomePage, carousel::HOME_SIDEBAR_WIDTH_PX, navigation::HomeRoot};
 
 impl HomePage {
     pub(super) fn render_sidebar(
@@ -19,6 +19,7 @@ impl HomePage {
     ) -> impl IntoElement {
         let theme = theme::get(cx);
         let username = self.current_server.username.clone();
+        let active_root = self.home_content.read(cx).root();
 
         div()
             .flex()
@@ -38,24 +39,24 @@ impl HomePage {
             .child(sidebar_nav_item(
                 "home-section",
                 "icons/home.svg",
-                HomeSection::Home.title(),
-                self.active_section == HomeSection::Home,
+                HomeRoot::Home.title(),
+                active_root == HomeRoot::Home,
                 cx,
                 on_home,
             ))
             .child(sidebar_nav_item(
                 "favorites-section",
                 "icons/heart.svg",
-                HomeSection::Favorites.title(),
-                self.active_section == HomeSection::Favorites,
+                HomeRoot::Favorites.title(),
+                active_root == HomeRoot::Favorites,
                 cx,
                 on_favorites,
             ))
             .child(sidebar_nav_item(
                 "search-section",
                 "icons/search.svg",
-                HomeSection::Search.title(),
-                self.active_section == HomeSection::Search,
+                HomeRoot::Search.title(),
+                active_root == HomeRoot::Search,
                 cx,
                 on_search,
             ))

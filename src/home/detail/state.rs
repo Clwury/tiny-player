@@ -50,6 +50,7 @@ pub(crate) struct SeriesDetailState {
     resume_episode: Option<ResumeItem>,
     pub(crate) episodes: Option<MediaItems>,
     pub(crate) episodes_failed: Option<gpui::SharedString>,
+    pub(crate) episode_selection_warning: Option<gpui::SharedString>,
     pub(crate) similar_items: Option<UserItems>,
     pub(crate) similar_failed: Option<gpui::SharedString>,
     pub(crate) playback_loading: bool,
@@ -57,9 +58,11 @@ pub(crate) struct SeriesDetailState {
     pub(crate) selected_season_id: Option<String>,
     pub(crate) selected_episode_id: Option<String>,
     pub(crate) preferred_episode_id: Option<String>,
+    preferred_season_id_hint: Option<String>,
     pub(crate) selected_media_source_index: Option<usize>,
     pub(crate) selected_subtitle_index: Option<usize>,
     pub(crate) open_select: Option<SeriesDetailSelectKind>,
+    pub(crate) scroll_handle: ScrollHandle,
     pub(crate) season_scroll_handle: ScrollHandle,
     pub(crate) media_source_scroll_handle: ScrollHandle,
     pub(crate) subtitle_scroll_handle: ScrollHandle,
@@ -74,8 +77,60 @@ impl SeriesDetailState {
         match item.item_type.as_deref() {
             Some("Series") => Some(Self::new_series(item)),
             Some("Movie") => Some(Self::new_movie(item)),
+            Some("Episode") => Self::from_user_episode(item),
             _ => None,
         }
+    }
+
+    fn from_user_episode(item: &UserItem) -> Option<Self> {
+        let series_id = item
+            .series_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())?
+            .to_string();
+        let episode_id = item.id.trim();
+        if episode_id.is_empty() {
+            return None;
+        }
+        let title = item
+            .series_name
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or(&item.name)
+            .to_string();
+        let resume = ResumeItem {
+            id: item.id.clone(),
+            name: item.name.clone(),
+            item_type: Some("Episode".to_string()),
+            parent_id: item.parent_id.clone(),
+            series_name: item.series_name.clone(),
+            series_id: Some(series_id.clone()),
+            parent_index_number: item.parent_index_number,
+            index_number: item.index_number,
+            production_year: item.production_year,
+            image_tags: item.image_tags.clone(),
+            backdrop_image_tags: item.backdrop_image_tags.clone(),
+            parent_backdrop_item_id: None,
+            parent_backdrop_image_tags: None,
+            user_data: item.user_data.clone(),
+        };
+        let mut detail = Self::new_with_identity(
+            series_id,
+            title,
+            SeriesDetailKind::Series,
+            SeriesDetailOrigin::Resume,
+        );
+        detail.selected_episode_id = Some(episode_id.to_string());
+        detail.preferred_episode_id = Some(episode_id.to_string());
+        detail.preferred_season_id_hint = item
+            .parent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToString::to_string);
+        detail.resume_episode = Some(resume);
+        Some(detail)
     }
 
     pub(crate) fn new_series(item: &UserItem) -> Self {
@@ -128,6 +183,12 @@ impl SeriesDetailState {
         );
         detail.selected_episode_id = Some(episode_id.clone());
         detail.preferred_episode_id = Some(episode_id);
+        detail.preferred_season_id_hint = item
+            .parent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToString::to_string);
         detail.resume_episode = Some(item.clone());
         Some(detail)
     }
@@ -157,6 +218,7 @@ impl SeriesDetailState {
             resume_episode: None,
             episodes: None,
             episodes_failed: None,
+            episode_selection_warning: None,
             similar_items: None,
             similar_failed: None,
             playback_loading: false,
@@ -164,9 +226,11 @@ impl SeriesDetailState {
             selected_season_id: None,
             selected_episode_id: None,
             preferred_episode_id: None,
+            preferred_season_id_hint: None,
             selected_media_source_index: None,
             selected_subtitle_index: None,
             open_select: None,
+            scroll_handle: ScrollHandle::new(),
             season_scroll_handle: ScrollHandle::new(),
             media_source_scroll_handle: ScrollHandle::new(),
             subtitle_scroll_handle: ScrollHandle::new(),
@@ -231,16 +295,29 @@ impl SeriesDetailState {
     }
 
     fn preferred_season_id(&self) -> Option<String> {
-        self.resume_episode_for_preferred()
-            .and_then(|episode| episode.parent_index_number)
-            .and_then(|season_number| {
-                self.seasons.as_ref().and_then(|seasons| {
+        self.preferred_season_id_hint
+            .as_ref()
+            .filter(|preferred_id| {
+                self.seasons.as_ref().is_some_and(|seasons| {
                     seasons
                         .items
                         .iter()
-                        .find(|season| season.index_number == Some(season_number))
-                        .map(|season| season.id.clone())
+                        .any(|season| season.id == **preferred_id)
                 })
+            })
+            .cloned()
+            .or_else(|| {
+                self.resume_episode_for_preferred()
+                    .and_then(|episode| episode.parent_index_number)
+                    .and_then(|season_number| {
+                        self.seasons.as_ref().and_then(|seasons| {
+                            seasons
+                                .items
+                                .iter()
+                                .find(|season| season.index_number == Some(season_number))
+                                .map(|season| season.id.clone())
+                        })
+                    })
             })
             .or_else(|| {
                 self.next_up_episode()
@@ -321,36 +398,24 @@ impl SeriesDetailState {
     }
 
     pub(crate) fn selected_media_source_index(&self) -> Option<usize> {
-        let source_count = self
+        let sources = self
             .selected_playback_item()
-            .and_then(|item| item.media_sources.as_ref())
-            .map(Vec::len)
-            .unwrap_or(0);
-        if source_count == 0 {
-            return None;
-        }
-
-        Some(
-            self.selected_media_source_index
-                .filter(|index| *index < source_count)
-                .unwrap_or(0),
-        )
+            .and_then(|item| item.media_sources.as_deref())?;
+        self.selected_media_source_index
+            .filter(|index| *index < sources.len())
+            .or_else(|| preferred_media_source_index(sources))
     }
 
     pub(crate) fn selected_subtitle_index(&self) -> Option<usize> {
-        let subtitle_count = self
-            .selected_media_source()
-            .map(|source| source.subtitle_streams().len())
-            .unwrap_or(0);
+        let source = self.selected_media_source()?;
+        let subtitle_count = source.subtitle_streams().len();
         if subtitle_count == 0 {
             return None;
         }
 
-        Some(
-            self.selected_subtitle_index
-                .filter(|index| *index < subtitle_count)
-                .unwrap_or(0),
-        )
+        self.selected_subtitle_index
+            .filter(|index| *index < subtitle_count)
+            .or_else(|| source.preferred_subtitle_stream_position())
     }
 
     pub(crate) fn selected_media_source_label(&self) -> String {
@@ -436,6 +501,13 @@ impl SeriesDetailState {
             })
             .unwrap_or_default();
 
+        let preferred_missing = self
+            .preferred_episode_id
+            .as_ref()
+            .is_some_and(|episode_id| !episode_ids.iter().any(|id| id == episode_id));
+        self.episode_selection_warning =
+            preferred_missing.then(|| "原单集已不可用，已选择当前可播放单集".into());
+
         let selected = self
             .preferred_episode_id
             .as_ref()
@@ -467,6 +539,7 @@ impl SeriesDetailState {
     pub(crate) fn reset_episode_selection(&mut self) {
         self.episodes = None;
         self.episodes_failed = None;
+        self.episode_selection_warning = None;
         self.effects.episodes = LoadState::Idle;
         self.episodes_request_season_id = None;
         self.selected_episode_id = None;
@@ -478,9 +551,31 @@ impl SeriesDetailState {
         self.reset_playback_request();
     }
 
+    pub(crate) fn clear_preferred_season_hint(&mut self) {
+        self.preferred_season_id_hint = None;
+    }
+
     pub(crate) fn reset_playback_request(&mut self) {
         self.playback_loading = false;
         self.playback_failed = None;
+    }
+
+    pub(crate) fn reset_in_flight_effects(&mut self) {
+        for state in [
+            &mut self.effects.item,
+            &mut self.effects.seasons,
+            &mut self.effects.next_up,
+            &mut self.effects.episodes,
+            &mut self.effects.similar,
+        ] {
+            if *state == LoadState::Loading {
+                *state = LoadState::Idle;
+            }
+        }
+        if self.effects.episodes == LoadState::Idle {
+            self.episodes_request_season_id = None;
+        }
+        self.playback_loading = false;
     }
 
     fn reset_select_scroll_offsets(&self) {
@@ -490,29 +585,24 @@ impl SeriesDetailState {
     }
 
     pub(crate) fn sync_media_source_selection(&mut self) {
-        let source_count = self
-            .selected_playback_item()
-            .and_then(|item| item.media_sources.as_ref())
-            .map(Vec::len)
-            .unwrap_or(0);
-        if source_count == 0 {
+        let selected_media_source_index = self.selected_media_source_index();
+        if selected_media_source_index.is_none() {
             self.selected_media_source_index = None;
             self.selected_subtitle_index = None;
             self.open_select = None;
             return;
         }
+        self.selected_media_source_index = selected_media_source_index;
 
-        if self
-            .selected_media_source_index
-            .is_none_or(|index| index >= source_count)
-        {
-            self.selected_media_source_index = Some(0);
-        }
-
-        let subtitle_count = self
+        let (subtitle_count, preferred_subtitle_index) = self
             .selected_media_source()
-            .map(|source| source.subtitle_streams().len())
-            .unwrap_or(0);
+            .map(|source| {
+                (
+                    source.subtitle_streams().len(),
+                    source.preferred_subtitle_stream_position(),
+                )
+            })
+            .unwrap_or((0, None));
         if subtitle_count == 0 {
             self.selected_subtitle_index = None;
             if self.open_select == Some(SeriesDetailSelectKind::Subtitle) {
@@ -522,9 +612,25 @@ impl SeriesDetailState {
             .selected_subtitle_index
             .is_none_or(|index| index >= subtitle_count)
         {
-            self.selected_subtitle_index = Some(0);
+            self.selected_subtitle_index = preferred_subtitle_index;
         }
     }
+}
+
+fn preferred_media_source_index(sources: &[MediaSource]) -> Option<usize> {
+    if sources.is_empty() {
+        return None;
+    }
+
+    sources
+        .iter()
+        .position(MediaSource::is_default_source)
+        .or_else(|| {
+            sources
+                .iter()
+                .position(MediaSource::has_default_video_stream)
+        })
+        .or(Some(0))
 }
 
 #[cfg(test)]
@@ -538,6 +644,12 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             item_type: Some("Series".to_string()),
+            media_type: None,
+            parent_id: None,
+            series_id: None,
+            series_name: None,
+            index_number: None,
+            parent_index_number: None,
             production_year: None,
             community_rating: None,
             image_tags: None,
@@ -593,6 +705,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             item_type: Some("Episode".to_string()),
+            parent_id: None,
             series_name: Some("示例剧集".to_string()),
             series_id: Some(series_id.to_string()),
             parent_index_number: Some(season_number),
@@ -632,6 +745,7 @@ mod tests {
                 total_record_count: 2,
             }),
             episodes_failed: None,
+            episode_selection_warning: None,
             similar_items: None,
             similar_failed: None,
             playback_loading: false,
@@ -639,9 +753,11 @@ mod tests {
             selected_season_id: None,
             selected_episode_id: None,
             preferred_episode_id: Some("episode-2".to_string()),
+            preferred_season_id_hint: None,
             selected_media_source_index: None,
             selected_subtitle_index: None,
             open_select: None,
+            scroll_handle: ScrollHandle::new(),
             season_scroll_handle: ScrollHandle::new(),
             media_source_scroll_handle: ScrollHandle::new(),
             subtitle_scroll_handle: ScrollHandle::new(),
@@ -685,9 +801,174 @@ mod tests {
             id: Some(id.to_string()),
             name: Some(name.to_string()),
             path: None,
+            source_type: None,
             container: None,
             media_streams: None,
+            default_subtitle_stream_index: None,
         }
+    }
+
+    #[test]
+    fn media_selection_uses_default_source_and_default_subtitle_stream_index() {
+        let mut movie = user_item("movie-1", "电影");
+        movie.item_type = Some("Movie".to_string());
+        let mut detail = SeriesDetailState::new_movie(&movie);
+        let mut item = media_item("movie-1", "电影");
+        item.item_type = Some("Movie".to_string());
+        item.media_sources = Some(
+            serde_json::from_value(serde_json::json!([
+                {
+                    "Id": "source-1",
+                    "Type": "Grouping",
+                    "MediaStreams": [
+                        { "Index": 0, "Type": "Video", "IsDefault": false }
+                    ]
+                },
+                {
+                    "Id": "source-2",
+                    "Type": "Default",
+                    "DefaultSubtitleStreamIndex": 6,
+                    "MediaStreams": [
+                        { "Index": 0, "Type": "Video", "IsDefault": true },
+                        { "Index": 4, "Type": "Subtitle", "DisplayTitle": "英文", "IsDefault": true },
+                        { "Index": 6, "Type": "Subtitle", "DisplayTitle": "简体中文", "IsDefault": false }
+                    ]
+                }
+            ]))
+            .unwrap(),
+        );
+        detail.item = Some(item);
+
+        detail.sync_media_source_selection();
+
+        assert_eq!(detail.selected_media_source_index(), Some(1));
+        assert_eq!(detail.selected_subtitle_index(), Some(1));
+        assert_eq!(detail.selected_subtitle_label(), "简体中文");
+    }
+
+    #[test]
+    fn media_selection_falls_back_to_default_stream_flags() {
+        let mut movie = user_item("movie-1", "电影");
+        movie.item_type = Some("Movie".to_string());
+        let mut detail = SeriesDetailState::new_movie(&movie);
+        let mut item = media_item("movie-1", "电影");
+        item.item_type = Some("Movie".to_string());
+        item.media_sources = Some(
+            serde_json::from_value(serde_json::json!([
+                {
+                    "Id": "source-1",
+                    "MediaStreams": [
+                        { "Index": 0, "Type": "Video", "IsDefault": false }
+                    ]
+                },
+                {
+                    "Id": "source-2",
+                    "MediaStreams": [
+                        { "Index": 0, "Type": "Video", "IsDefault": true },
+                        { "Index": 2, "Type": "Subtitle", "DisplayTitle": "英文强制", "IsDefault": false, "IsForced": true },
+                        { "Index": 3, "Type": "Subtitle", "DisplayTitle": "简体中文", "IsDefault": true }
+                    ]
+                }
+            ]))
+            .unwrap(),
+        );
+        detail.item = Some(item);
+
+        detail.sync_media_source_selection();
+
+        assert_eq!(detail.selected_media_source_index(), Some(1));
+        assert_eq!(detail.selected_subtitle_index(), Some(1));
+    }
+
+    #[test]
+    fn media_selection_uses_forced_subtitle_as_the_last_fallback() {
+        let mut movie = user_item("movie-1", "电影");
+        movie.item_type = Some("Movie".to_string());
+        let mut detail = SeriesDetailState::new_movie(&movie);
+        let mut item = media_item("movie-1", "电影");
+        item.item_type = Some("Movie".to_string());
+        item.media_sources = Some(
+            serde_json::from_value(serde_json::json!([
+                {
+                    "Id": "source-1",
+                    "Type": "Default",
+                    "MediaStreams": [
+                        { "Index": 0, "Type": "Video", "IsDefault": true },
+                        { "Index": 2, "Type": "Subtitle", "DisplayTitle": "普通字幕", "IsDefault": false, "IsForced": false },
+                        { "Index": 3, "Type": "Subtitle", "DisplayTitle": "强制字幕", "IsDefault": false, "IsForced": true }
+                    ]
+                }
+            ]))
+            .unwrap(),
+        );
+        detail.item = Some(item);
+
+        detail.sync_media_source_selection();
+
+        assert_eq!(detail.selected_subtitle_index(), Some(1));
+        assert_eq!(detail.selected_subtitle_label(), "强制字幕");
+    }
+
+    #[test]
+    fn media_selection_falls_back_to_first_available_subtitle() {
+        let mut movie = user_item("movie-1", "电影");
+        movie.item_type = Some("Movie".to_string());
+        let mut detail = SeriesDetailState::new_movie(&movie);
+        let mut item = media_item("movie-1", "电影");
+        item.item_type = Some("Movie".to_string());
+        item.media_sources = Some(
+            serde_json::from_value(serde_json::json!([
+                {
+                    "Id": "source-1",
+                    "Type": "Default",
+                    "MediaStreams": [
+                        { "Index": 0, "Type": "Video", "IsDefault": true },
+                        { "Index": 2, "Type": "Subtitle", "DisplayTitle": "第一字幕", "IsDefault": false, "IsForced": false },
+                        { "Index": 3, "Type": "Subtitle", "DisplayTitle": "第二字幕", "IsDefault": false, "IsForced": false }
+                    ]
+                }
+            ]))
+            .unwrap(),
+        );
+        detail.item = Some(item);
+
+        assert_eq!(detail.selected_subtitle_index(), Some(0));
+        assert_eq!(detail.selected_subtitle_label(), "第一字幕");
+
+        detail.sync_media_source_selection();
+
+        assert_eq!(detail.selected_subtitle_index, Some(0));
+    }
+
+    #[test]
+    fn negative_default_subtitle_index_continues_to_available_stream_fallbacks() {
+        let mut movie = user_item("movie-1", "电影");
+        movie.item_type = Some("Movie".to_string());
+        let mut detail = SeriesDetailState::new_movie(&movie);
+        let mut item = media_item("movie-1", "电影");
+        item.item_type = Some("Movie".to_string());
+        item.media_sources = Some(
+            serde_json::from_value(serde_json::json!([
+                {
+                    "Id": "source-1",
+                    "Type": "Default",
+                    "DefaultSubtitleStreamIndex": -1,
+                    "MediaStreams": [
+                        { "Index": 0, "Type": "Video", "IsDefault": true },
+                        { "Index": 2, "Type": "Subtitle", "DisplayTitle": "普通字幕", "IsDefault": false, "IsForced": false },
+                        { "Index": 3, "Type": "Subtitle", "DisplayTitle": "简体中文", "IsDefault": true, "IsForced": false }
+                    ]
+                }
+            ]))
+            .unwrap(),
+        );
+        detail.item = Some(item);
+
+        detail.sync_media_source_selection();
+
+        assert_eq!(detail.selected_media_source_index(), Some(0));
+        assert_eq!(detail.selected_subtitle_index(), Some(1));
+        assert_eq!(detail.selected_subtitle_label(), "简体中文");
     }
 
     #[test]
@@ -719,18 +1000,95 @@ mod tests {
     }
 
     #[test]
-    fn from_user_item_accepts_series_and_movie_only() {
+    fn from_user_item_accepts_series_movie_and_routable_episode() {
         let series = user_item("series-1", "剧集");
         let mut movie = user_item("movie-1", "电影");
         movie.item_type = Some("Movie".to_string());
         let mut folder = user_item("folder-1", "合集");
         folder.item_type = Some("Folder".to_string());
+        let episode: UserItem = serde_json::from_value(serde_json::json!({
+            "Id": "episode-1",
+            "Name": "第一集",
+            "Type": "Episode",
+            "SeriesId": "series-1",
+            "SeriesName": "剧集",
+            "ParentIndexNumber": 1,
+            "IndexNumber": 1
+        }))
+        .unwrap();
 
         assert!(
             SeriesDetailState::from_user_item(&series).is_some_and(|detail| detail.is_series())
         );
         assert!(SeriesDetailState::from_user_item(&movie).is_some_and(|detail| detail.is_movie()));
+        assert!(
+            SeriesDetailState::from_user_item(&episode).is_some_and(|detail| {
+                detail.is_series() && detail.preferred_episode_id.as_deref() == Some("episode-1")
+            })
+        );
         assert!(SeriesDetailState::from_user_item(&folder).is_none());
+    }
+
+    #[test]
+    fn episode_parent_id_selects_the_exact_season_without_an_index_number() {
+        let episode: UserItem = serde_json::from_value(serde_json::json!({
+            "Id": "episode-2",
+            "Name": "第二集",
+            "Type": "Episode",
+            "SeriesId": "series-1",
+            "SeriesName": "剧集",
+            "ParentId": "season-2",
+            "IndexNumber": 2
+        }))
+        .unwrap();
+        let mut detail = SeriesDetailState::from_user_item(&episode).unwrap();
+        let mut season_one = media_item("season-1", "第一季");
+        season_one.index_number = Some(1);
+        let mut season_two = media_item("season-2", "第二季");
+        season_two.index_number = Some(2);
+        detail.seasons = Some(MediaItems {
+            items: vec![season_one, season_two],
+            total_record_count: 2,
+        });
+
+        detail.choose_season_if_needed();
+
+        assert_eq!(detail.selected_season_id.as_deref(), Some("season-2"));
+    }
+
+    #[test]
+    fn resume_episode_parent_id_selects_the_exact_season_without_an_index_number() {
+        let mut episode = resume_episode("episode-2", "第二集", "series-1", 2);
+        episode.parent_id = Some("season-2".to_string());
+        episode.parent_index_number = None;
+        let mut detail = SeriesDetailState::from_resume_episode(&episode).unwrap();
+        let mut season_one = media_item("season-1", "第一季");
+        season_one.index_number = Some(1);
+        let mut season_two = media_item("season-2", "第二季");
+        season_two.index_number = Some(2);
+        detail.seasons = Some(MediaItems {
+            items: vec![season_one, season_two],
+            total_record_count: 2,
+        });
+
+        detail.choose_season_if_needed();
+
+        assert_eq!(detail.selected_season_id.as_deref(), Some("season-2"));
+    }
+
+    #[test]
+    fn deleted_preferred_episode_falls_back_and_sets_warning() {
+        let episode = resume_episode("deleted-episode", "已删除", "series-1", 1);
+        let mut detail = SeriesDetailState::from_resume_episode(&episode).unwrap();
+        detail.episodes = Some(MediaItems {
+            items: vec![media_item("episode-1", "第一集")],
+            total_record_count: 1,
+        });
+
+        detail.choose_episode_from_loaded_episodes();
+
+        assert_eq!(detail.selected_episode_id.as_deref(), Some("episode-1"));
+        assert!(detail.episode_selection_warning.is_some());
     }
 
     #[test]

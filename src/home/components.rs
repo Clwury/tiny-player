@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf, sync::Arc};
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{
     App, Asset, ClickEvent, Context, ImageCacheError, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, RenderImage, StatefulInteractiveElement, Styled, Window, div, img,
+    ParentElement, RenderImage, StatefulInteractiveElement, Styled, StyledImage, Window, div, img,
     prelude::FluentBuilder, px, svg,
 };
 use image::{Frame, imageops::FilterType};
@@ -107,26 +107,6 @@ fn cover_crop_bounds(
     }
 }
 
-pub(super) fn section_placeholder<T>(
-    title: &'static str,
-    message: &'static str,
-    cx: &Context<T>,
-) -> impl IntoElement {
-    let theme = theme::get(cx);
-
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(home_section_title(title, cx))
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child(message),
-        )
-}
-
 pub(super) fn home_section_title<T>(title: &'static str, cx: &Context<T>) -> gpui::Div {
     home_section_title_text(title, cx)
 }
@@ -202,7 +182,7 @@ pub(super) fn user_view_card<T>(
     name: String,
     image_path: Option<PathBuf>,
     cx: &Context<T>,
-) -> impl IntoElement {
+) -> gpui::Div {
     let theme = theme::get(cx);
 
     div()
@@ -242,12 +222,14 @@ fn user_view_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl
                 .justify_center()
                 .text_xs()
                 .text_color(theme.muted_foreground)
+                .child("暂无图片")
         })
 }
 
 fn resume_item_card_image<T>(
     image_path: Option<PathBuf>,
     played_fraction: Option<f32>,
+    is_favorite: bool,
     cx: &Context<T>,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
@@ -268,9 +250,30 @@ fn resume_item_card_image<T>(
                 .justify_center()
                 .text_xs()
                 .text_color(theme.muted_foreground)
+                .child("暂无图片")
         })
         .when_some(played_fraction, |this, fraction| {
             this.child(image_progress_bar(USER_VIEW_CARD_WIDTH_PX, fraction, cx))
+        })
+        .when(is_favorite, |this| {
+            this.child(
+                div()
+                    .absolute()
+                    .left(px(6.0))
+                    .bottom(px(6.0))
+                    .flex()
+                    .size(px(24.0))
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(theme.dialog_background.opacity(0.86))
+                    .child(
+                        svg()
+                            .path("icons/heart.svg")
+                            .size(px(14.0))
+                            .text_color(theme.error),
+                    ),
+            )
         })
 }
 
@@ -312,7 +315,12 @@ pub(super) fn resume_item_card<T>(
         .rounded_lg()
         .p(px(USER_VIEW_CARD_PADDING_PX))
         .hover(move |style| style.bg(theme.secondary_hover))
-        .child(resume_item_card_image(image_path, played_fraction, cx))
+        .child(resume_item_card_image(
+            image_path,
+            played_fraction,
+            item.is_favorite(),
+            cx,
+        ))
         .child(
             div()
                 .w(px(USER_VIEW_CARD_WIDTH_PX))
@@ -382,6 +390,99 @@ pub(super) fn user_item_card<T>(
                             .child(year.to_string()),
                     )
                 }),
+        )
+}
+
+pub(super) fn user_episode_card<T>(
+    item: &UserItem,
+    image_path: Option<PathBuf>,
+    cx: &Context<T>,
+) -> gpui::Div {
+    let theme = theme::get(cx);
+    let has_image = image_path.is_some();
+    let played_fraction = item
+        .user_data
+        .as_ref()
+        .and_then(|data| data.played_percentage)
+        .filter(|percentage| percentage.is_finite())
+        .map(|percentage| (percentage.clamp(0.0, 100.0) / 100.0) as f32);
+    let episode_number = match (item.parent_index_number, item.index_number) {
+        (Some(season), Some(episode)) => Some(format!("S{season:02}E{episode:02}")),
+        (None, Some(episode)) => Some(format!("E{episode:02}")),
+        _ => None,
+    };
+    let title = item
+        .series_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&item.name)
+        .to_string();
+    let subtitle = match episode_number {
+        Some(number) if title != item.name => format!("{number} · {}", item.name),
+        Some(number) => number,
+        None if title != item.name => item.name.clone(),
+        None => "单集".to_string(),
+    };
+
+    div()
+        .flex()
+        .flex_none()
+        .flex_col()
+        .gap_2()
+        .rounded_lg()
+        .p(px(HOME_ITEM_CARD_PADDING_PX))
+        .hover(move |style| style.bg(theme.secondary_hover))
+        .child(
+            div()
+                .relative()
+                .w(px(HOME_ITEM_CARD_WIDTH_PX))
+                .h(px(HOME_ITEM_CARD_WIDTH_PX * 9.0 / 16.0))
+                .rounded_lg()
+                .overflow_hidden()
+                .bg(theme.input_background)
+                .when_some(image_path, |this, path| {
+                    this.child(
+                        img(path)
+                            .w_full()
+                            .h_full()
+                            .object_fit(gpui::ObjectFit::Cover),
+                    )
+                })
+                .when(!has_image, |this| {
+                    this.flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("暂无图片")
+                })
+                .when_some(played_fraction, |this, fraction| {
+                    this.child(image_progress_bar(HOME_ITEM_CARD_WIDTH_PX, fraction, cx))
+                }),
+        )
+        .child(
+            div()
+                .w(px(HOME_ITEM_CARD_WIDTH_PX))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .truncate()
+                        .text_center()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_center()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(subtitle),
+                ),
         )
 }
 
@@ -713,6 +814,7 @@ mod tests {
             id: "item-1".to_string(),
             name: name.to_string(),
             item_type: Some(item_type.to_string()),
+            parent_id: None,
             series_name: None,
             series_id: None,
             parent_index_number: None,

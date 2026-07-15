@@ -8,7 +8,7 @@ use crate::{theme, ui::titlebar::app_titlebar};
 use super::{
     Page, TinyApp,
     resize::resize_handles,
-    server_card::{ServerCardActions, server_card},
+    server_card::{ServerCardActions, add_server_card, server_card},
 };
 
 impl TinyApp {
@@ -52,58 +52,37 @@ impl TinyApp {
     }
 
     fn render_servers_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = theme::get(cx);
+        let add_server = cx.listener(Self::open_add_server_dialog);
 
-        div()
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .size_full()
-            .p_4()
-            .when(self.servers.is_empty(), |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
-                        .left_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_base()
-                        .text_color(theme.muted_foreground)
-                        .child("点击右上角 + 添加 Emby 服务器"),
-                )
-            })
-            .when(!self.servers.is_empty(), |this| {
-                this.child(div().flex().flex_wrap().gap_3().children(
-                    self.servers.iter().cloned().map(|server| {
-                        let menu_open =
-                            self.open_server_menu.as_deref() == Some(server.id.as_str());
-                        let counts = self.item_counts.get(&server.id).cloned();
-                        let loading =
-                            self.selecting_server_id.as_deref() == Some(server.id.as_str());
-                        let select_server = cx.listener(Self::select_server);
-                        let toggle_menu = cx.listener(Self::toggle_server_menu);
-                        let edit_server = cx.listener(Self::open_edit_server_dialog);
-                        let delete_server = cx.listener(Self::delete_server);
-                        server_card(
-                            server,
-                            counts,
-                            menu_open,
-                            loading,
-                            cx,
-                            ServerCardActions {
-                                on_select: select_server,
-                                on_menu_toggle: toggle_menu,
-                                on_edit: edit_server,
-                                on_delete: delete_server,
-                            },
-                        )
-                    }),
-                ))
-            })
+        div().relative().flex_1().min_h_0().size_full().p_4().child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_3()
+                .children(self.servers.iter().cloned().map(|server| {
+                    let menu_open = self.open_server_menu.as_deref() == Some(server.id.as_str());
+                    let counts = self.item_counts.get(&server.id).cloned();
+                    let loading = self.selecting_server_id.as_deref() == Some(server.id.as_str());
+                    let select_server = cx.listener(Self::select_server);
+                    let toggle_menu = cx.listener(Self::toggle_server_menu);
+                    let edit_server = cx.listener(Self::open_edit_server_dialog);
+                    let delete_server = cx.listener(Self::delete_server);
+                    server_card(
+                        server,
+                        counts,
+                        menu_open,
+                        loading,
+                        cx,
+                        ServerCardActions {
+                            on_select: select_server,
+                            on_menu_toggle: toggle_menu,
+                            on_edit: edit_server,
+                            on_delete: delete_server,
+                        },
+                    )
+                }))
+                .child(add_server_card(cx, add_server)),
+        )
     }
 }
 
@@ -113,8 +92,6 @@ impl Render for TinyApp {
 
         let theme = theme::get(cx);
         let title = self.title(cx);
-        let add_server = cx.listener(Self::open_add_server_dialog);
-        let show_add_server = !matches!(self.page, Page::Playback { .. });
         let playback_fullscreen =
             window.is_fullscreen() && matches!(self.page, Page::Playback { .. });
         let rounded_window = !window.is_maximized() && !window.is_fullscreen();
@@ -140,9 +117,11 @@ impl Render for TinyApp {
                         this.rounded(theme.radius_lg).overflow_hidden()
                     })
                     .when(!playback_fullscreen, |this| {
-                        this.child(div().on_mouse_down(MouseButton::Left, close_menu).child(
-                            app_titlebar(window, cx, title, show_add_server.then_some(add_server)),
-                        ))
+                        this.child(
+                            div()
+                                .on_mouse_down(MouseButton::Left, close_menu)
+                                .child(app_titlebar(window, cx, title)),
+                        )
                     })
                     .child(self.render_content(rounded_window, cx)),
             )

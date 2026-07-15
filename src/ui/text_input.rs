@@ -4,12 +4,13 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId,
-    InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, ShapedLine,
-    SharedString, Style, Styled, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, point, px, relative, rgba, size,
+    App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    GlobalElementId, InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
+    ShapedLine, SharedString, StatefulInteractiveElement, Style, Styled, TextRun, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, point, prelude::FluentBuilder, px, relative, rgba,
+    size, svg,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -30,6 +31,7 @@ actions!(
         Paste,
         Cut,
         Copy,
+        Submit,
     ]
 );
 
@@ -88,6 +90,7 @@ fn selected_range_for_marked_text(
 #[derive(Clone, Copy, Debug)]
 pub enum TextInputEvent {
     Changed,
+    Submitted,
 }
 
 pub struct TextInput {
@@ -105,6 +108,7 @@ pub struct TextInput {
     digits_only: bool,
     max_chars: Option<usize>,
     borderless: bool,
+    clearable: bool,
 }
 
 impl TextInput {
@@ -126,6 +130,7 @@ impl TextInput {
             KeyBinding::new("ctrl-x", Cut, None),
             KeyBinding::new("home", Home, None),
             KeyBinding::new("end", End, None),
+            KeyBinding::new("enter", Submit, None),
         ]);
     }
 
@@ -145,6 +150,7 @@ impl TextInput {
             digits_only: false,
             max_chars: None,
             borderless: false,
+            clearable: false,
         }
     }
 
@@ -178,6 +184,11 @@ impl TextInput {
         self
     }
 
+    pub fn clearable(mut self) -> Self {
+        self.clearable = true;
+        self
+    }
+
     pub fn value(&self) -> SharedString {
         self.content.clone()
     }
@@ -193,6 +204,11 @@ impl TextInput {
     pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
         self.masked = masked;
         cx.notify();
+    }
+
+    fn clear(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        self.set_value("", cx);
     }
 
     pub fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -290,6 +306,10 @@ impl TextInput {
             ));
             self.replace_text_in_range(None, "", window, cx)
         }
+    }
+
+    fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(TextInputEvent::Submitted);
     }
 
     fn on_mouse_down(
@@ -844,6 +864,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::submit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -865,6 +886,31 @@ impl Render for TextInput {
                     .overflow_hidden()
                     .child(TextElement { input: cx.entity() }),
             )
+            .when(self.clearable && !self.content.is_empty(), |this| {
+                this.child(
+                    div()
+                        .id("text-input-clear-button")
+                        .flex()
+                        .flex_none()
+                        .size(px(24.0))
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(theme.secondary_hover))
+                        .child(
+                            svg()
+                                .path("icons/window-close.svg")
+                                .size(px(14.0))
+                                .text_color(theme.muted_foreground),
+                        )
+                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        })
+                        .on_click(cx.listener(Self::clear)),
+                )
+            })
     }
 }
 

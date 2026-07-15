@@ -1,7 +1,7 @@
 use gpui::{
-    Animation, AnimationExt as _, Context, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage, Window, deferred,
-    div, ease_in_out, img, prelude::FluentBuilder, px, svg,
+    Animation, AnimationExt as _, App, ClickEvent, Context, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage,
+    Window, deferred, div, ease_in_out, img, prelude::FluentBuilder, px, svg,
 };
 
 use crate::{
@@ -60,7 +60,13 @@ impl HomeContent {
             .id("home-media-detail")
             .overflow_y_scroll()
             .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
-            .track_scroll(&self.main_scroll_handle)
+            .track_scroll(
+                &self
+                    .series_detail
+                    .as_ref()
+                    .expect("detail route has detail state")
+                    .scroll_handle,
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(Self::close_series_detail_select),
@@ -76,7 +82,14 @@ impl HomeContent {
                                 .flex_col()
                                 .gap_5()
                                 .when_some(detail.item_failed.clone(), |this, error| {
-                                    this.child(div().text_sm().text_color(theme.error).child(error))
+                                    this.child(detail_error_with_retry(
+                                        "retry-detail-item",
+                                        error,
+                                        cx.listener(|page, _, _, cx| {
+                                            page.load_series_media_item_if_needed(cx)
+                                        }),
+                                        cx,
+                                    ))
                                 })
                                 .when(
                                     detail.effects.item.is_loading() && detail.item.is_none(),
@@ -94,9 +107,14 @@ impl HomeContent {
                                 })
                                 .when(detail.is_series(), |this| {
                                     this.when_some(detail.next_up_failed.clone(), |this, error| {
-                                        this.child(
-                                            div().text_sm().text_color(theme.error).child(error),
-                                        )
+                                        this.child(detail_error_with_retry(
+                                            "retry-detail-next-up",
+                                            error,
+                                            cx.listener(|page, _, _, cx| {
+                                                page.load_series_next_up_if_needed(cx)
+                                            }),
+                                            cx,
+                                        ))
                                     })
                                     .when(
                                         detail.effects.next_up.is_loading()
@@ -111,9 +129,14 @@ impl HomeContent {
                                         },
                                     )
                                     .when_some(detail.seasons_failed.clone(), |this, error| {
-                                        this.child(
-                                            div().text_sm().text_color(theme.error).child(error),
-                                        )
+                                        this.child(detail_error_with_retry(
+                                            "retry-detail-seasons",
+                                            error,
+                                            cx.listener(|page, _, _, cx| {
+                                                page.load_series_seasons_if_needed(cx)
+                                            }),
+                                            cx,
+                                        ))
                                     })
                                     .when(
                                         detail.effects.seasons.is_loading()
@@ -133,10 +156,26 @@ impl HomeContent {
                                         ))
                                     })
                                     .when_some(detail.episodes_failed.clone(), |this, error| {
-                                        this.child(
-                                            div().text_sm().text_color(theme.error).child(error),
-                                        )
+                                        this.child(detail_error_with_retry(
+                                            "retry-detail-episodes",
+                                            error,
+                                            cx.listener(|page, _, _, cx| {
+                                                page.load_series_episodes_if_needed(cx)
+                                            }),
+                                            cx,
+                                        ))
                                     })
+                                    .when_some(
+                                        detail.episode_selection_warning.clone(),
+                                        |this, warning| {
+                                            this.child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(warning),
+                                            )
+                                        },
+                                    )
                                     .when(
                                         detail.effects.episodes.is_loading()
                                             && detail.episodes.is_none(),
@@ -213,6 +252,7 @@ impl HomeContent {
             .items_center()
             .justify_center()
             .rounded_md()
+            .occlude()
             .hover(move |style| style.bg(theme.secondary_hover))
             .child(
                 svg()
@@ -406,6 +446,17 @@ impl HomeContent {
         let play = cx.listener(Self::play_selected_media);
         let toggle_video = cx.listener(Self::toggle_series_media_source_select);
         let toggle_subtitle = cx.listener(Self::toggle_series_subtitle_select);
+        let toggle_favorite = cx.listener(Self::toggle_detail_favorite);
+        let favorite = self
+            .effective_user_data(
+                &detail.series_id,
+                detail
+                    .item
+                    .as_ref()
+                    .and_then(|item| item.user_data.as_ref()),
+            )
+            .is_some_and(|data| data.is_favorite);
+        let favorite_pending = self.favorite_is_pending(&detail.series_id);
         let media_sources = detail
             .selected_playback_item()
             .and_then(|item| item.media_sources.as_deref())
@@ -470,6 +521,41 @@ impl HomeContent {
                             .child(play_label)
                             .when(can_play, |this| this.cursor_pointer().on_click(play))
                             .when(!can_play, |this| this.cursor_default().opacity(0.62)),
+                    )
+                    .child(
+                        div()
+                            .id("series-detail-favorite-button")
+                            .flex()
+                            .size(px(32.0))
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(theme.input_border)
+                            .bg(theme.input_background)
+                            .child(
+                                svg()
+                                    .path(if favorite {
+                                        "icons/heart.svg"
+                                    } else {
+                                        "icons/heart-off.svg"
+                                    })
+                                    .size(px(14.0))
+                                    .text_color(if favorite {
+                                        theme.error
+                                    } else {
+                                        theme.foreground
+                                    }),
+                            )
+                            .when(!favorite_pending, |this| {
+                                this.cursor_pointer()
+                                    .hover(move |style| style.bg(theme.secondary_hover))
+                                    .on_click(toggle_favorite)
+                            })
+                            .when(favorite_pending, |this| {
+                                this.cursor_default().opacity(0.55)
+                            }),
                     )
                     .child(
                         div()
@@ -579,6 +665,9 @@ impl HomeContent {
             .when_some(detail.playback_failed.clone(), |this, error| {
                 this.child(div().text_sm().text_color(theme.error).child(error))
             })
+            .when_some(self.detail_favorite_error(), |this, error| {
+                this.child(div().text_sm().text_color(theme.error).child(error))
+            })
     }
 
     fn render_series_detail_season_selector(
@@ -633,6 +722,7 @@ impl HomeContent {
                                 ),
                                 cx,
                             )
+                            .text_center()
                             .on_click(on_click)
                         }),
                     ))
@@ -926,7 +1016,12 @@ impl HomeContent {
             .gap_3()
             .child(home_section_title("相似作品", cx))
             .when_some(detail.similar_failed.clone(), |this, error| {
-                this.child(div().text_sm().text_color(theme.error).child(error))
+                this.child(detail_error_with_retry(
+                    "retry-detail-similar",
+                    error,
+                    cx.listener(|page, _, _, cx| page.load_similar_items_if_needed(cx)),
+                    cx,
+                ))
             })
             .when(
                 detail.effects.similar.is_loading() && items.is_none(),
@@ -1032,9 +1127,10 @@ impl HomeContent {
                         items.items[visible_range.start..visible_range.end]
                             .iter()
                             .map(|item| {
-                                let image_path = self.image_path_for_user_item(item);
+                                let item = self.effective_user_item(item);
+                                let image_path = self.image_path_for_user_item(&item);
                                 let item_id = item.id.clone();
-                                let card = user_item_card(item, image_path, cx).id((
+                                let card = user_item_card(&item, image_path, cx).id((
                                     gpui::ElementId::from("series-detail-similar-card"),
                                     item_id,
                                 ));
@@ -1045,7 +1141,7 @@ impl HomeContent {
                                         cx.listener(move |page: &mut HomeContent, _, _, cx| {
                                             page.open_media_detail(&item, cx);
                                         });
-                                    card.on_click(on_click)
+                                    card.cursor_pointer().on_click(on_click)
                                 } else {
                                     card
                                 }
@@ -1190,6 +1286,35 @@ fn detail_tag<T>(label: String, clickable: bool, cx: &Context<T>) -> gpui::Div {
                 .hover(move |style| style.bg(theme.secondary_hover))
         })
         .child(label)
+}
+
+fn detail_error_with_retry<T>(
+    id: &'static str,
+    error: gpui::SharedString,
+    retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &Context<T>,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .child(div().text_sm().text_color(theme.error).child(error))
+        .child(
+            div()
+                .id(id)
+                .rounded_md()
+                .px_2()
+                .py_1()
+                .text_sm()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.input_border_focused)
+                .hover(move |style| style.bg(theme.secondary_hover))
+                .cursor_pointer()
+                .child("重试")
+                .on_click(retry),
+        )
 }
 
 fn detail_select_box<T>(
@@ -1411,7 +1536,7 @@ fn detail_select_option<T>(
         .when(show_tooltip, |this| {
             this.tooltip(move |_, cx| text_tooltip(tooltip_label.clone(), cx))
         })
-        .child(div().flex_1().min_w_0().text_ellipsis().child(label))
+        .child(div().flex_1().min_w_0().truncate().child(label))
 }
 
 fn detail_select_label_needs_tooltip(label: &str) -> bool {

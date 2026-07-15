@@ -1,17 +1,11 @@
 use gpui::{
-    App, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, WindowControlArea, div, prelude::FluentBuilder, px,
-    svg,
+    App, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window,
+    WindowControlArea, div, prelude::FluentBuilder, px, svg,
 };
 
 use crate::theme;
 
-pub fn app_titlebar(
-    window: &Window,
-    cx: &App,
-    title: SharedString,
-    on_add_server: Option<impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static>,
-) -> impl IntoElement {
+pub fn app_titlebar(window: &Window, cx: &App, title: SharedString) -> impl IntoElement {
     let theme = theme::get(cx);
 
     div()
@@ -71,14 +65,6 @@ pub fn app_titlebar(
                 .flex()
                 .items_center()
                 .gap_1()
-                .when_some(on_add_server, |this, on_add_server| {
-                    this.child(action_button(
-                        "add-server",
-                        "icons/plus.svg",
-                        cx,
-                        on_add_server,
-                    ))
-                })
                 .child(window_control_button(
                     "minimize",
                     "icons/window-minimize.svg",
@@ -107,23 +93,6 @@ pub fn app_titlebar(
         )
 }
 
-fn action_button(
-    id: &'static str,
-    icon_path: &'static str,
-    cx: &App,
-    action: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    action_button_base(id, icon_path.into(), cx)
-        .on_mouse_down(MouseButton::Left, |_, window, cx| {
-            window.prevent_default();
-            cx.stop_propagation();
-        })
-        .on_click(move |event, window, cx| {
-            cx.stop_propagation();
-            action(event, window, cx);
-        })
-}
-
 fn window_control_button(
     id: &'static str,
     icon_path: &'static str,
@@ -138,31 +107,6 @@ fn window_control_button(
             cx.stop_propagation();
             action(window, cx);
         })
-}
-
-fn action_button_base(
-    id: &'static str,
-    icon_path: SharedString,
-    cx: &App,
-) -> gpui::Stateful<gpui::Div> {
-    let theme = theme::get(cx);
-
-    div()
-        .id(id)
-        .flex()
-        .h(px(28.0))
-        .w(px(28.0))
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .text_color(theme.foreground)
-        .hover(move |style| style.rounded_md().bg(theme.secondary_hover))
-        .child(
-            svg()
-                .path(icon_path)
-                .size(px(16.0))
-                .text_color(theme.foreground),
-        )
 }
 
 fn button_base(id: &'static str, icon_path: SharedString, cx: &App) -> gpui::Stateful<gpui::Div> {

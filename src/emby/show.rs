@@ -294,8 +294,11 @@ pub struct MediaSource {
     pub id: Option<String>,
     pub name: Option<String>,
     pub path: Option<String>,
+    #[serde(rename = "Type")]
+    pub source_type: Option<String>,
     pub container: Option<String>,
     pub media_streams: Option<Vec<MediaStream>>,
+    pub default_subtitle_stream_index: Option<i32>,
 }
 
 impl MediaSource {
@@ -333,6 +336,45 @@ impl MediaSource {
             .filter(|stream| stream.is_audio())
             .collect()
     }
+
+    pub fn is_default_source(&self) -> bool {
+        self.source_type
+            .as_deref()
+            .is_some_and(|source_type| source_type.eq_ignore_ascii_case("Default"))
+    }
+
+    pub fn has_default_video_stream(&self) -> bool {
+        self.media_streams
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|stream| stream.is_video() && stream.is_default.unwrap_or(false))
+    }
+
+    pub fn preferred_subtitle_stream_position(&self) -> Option<usize> {
+        let subtitles = self.subtitle_streams();
+        if let Some(default_index) = self
+            .default_subtitle_stream_index
+            .filter(|index| *index >= 0)
+            && let Some(position) = subtitles.iter().position(|stream| {
+                stream
+                    .index
+                    .is_some_and(|index| i64::from(index) == i64::from(default_index))
+            })
+        {
+            return Some(position);
+        }
+
+        subtitles
+            .iter()
+            .position(|stream| stream.is_default.unwrap_or(false))
+            .or_else(|| {
+                subtitles
+                    .iter()
+                    .position(|stream| stream.is_forced.unwrap_or(false))
+            })
+            .or_else(|| (!subtitles.is_empty()).then_some(0))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -349,6 +391,7 @@ pub struct MediaStream {
     pub delivery_method: Option<String>,
     pub is_external: Option<bool>,
     pub is_default: Option<bool>,
+    pub is_forced: Option<bool>,
     pub is_text_subtitle_stream: Option<bool>,
     pub supports_external_stream: Option<bool>,
 }
@@ -364,6 +407,12 @@ impl MediaStream {
         self.stream_type
             .as_deref()
             .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Audio"))
+    }
+
+    pub fn is_video(&self) -> bool {
+        self.stream_type
+            .as_deref()
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Video"))
     }
 
     pub fn display_label(&self, index: usize) -> String {

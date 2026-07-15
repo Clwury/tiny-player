@@ -14,7 +14,7 @@ use crate::{
     server::CachedServer,
 };
 
-const HOME_SNAPSHOT_VERSION: u32 = 1;
+const HOME_SNAPSHOT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct HomeSnapshot {
@@ -28,7 +28,7 @@ pub(super) struct HomeSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) resume_items: Option<CachedSection<ResumeItems>>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub(super) user_view_items: HashMap<String, CachedSection<UserItems>>,
+    pub(super) latest_items_by_view: HashMap<String, CachedSection<UserItems>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -42,7 +42,7 @@ impl HomeSnapshot {
         server: &CachedServer,
         user_views: Option<UserViews>,
         resume_items: Option<ResumeItems>,
-        user_view_items: HashMap<String, UserItems>,
+        latest_items_by_view: HashMap<String, UserItems>,
     ) -> Self {
         let saved_at_unix = current_unix_time();
         Self {
@@ -53,7 +53,7 @@ impl HomeSnapshot {
             saved_at_unix,
             user_views: user_views.map(|data| CachedSection::new(data, saved_at_unix)),
             resume_items: resume_items.map(|data| CachedSection::new(data, saved_at_unix)),
-            user_view_items: user_view_items
+            latest_items_by_view: latest_items_by_view
                 .into_iter()
                 .map(|(view_id, data)| (view_id, CachedSection::new(data, saved_at_unix)))
                 .collect(),
@@ -262,13 +262,68 @@ mod tests {
         save_snapshot_to(&path, &snapshot).unwrap();
         let loaded = load_snapshot_from(&path, &server).unwrap().unwrap();
 
+        assert_eq!(loaded.version, HOME_SNAPSHOT_VERSION);
         assert_eq!(loaded.server_id, "server-local");
+        assert_eq!(
+            loaded.user_views.as_ref().unwrap().saved_at_unix,
+            loaded.saved_at_unix
+        );
+        assert_eq!(
+            loaded.resume_items.as_ref().unwrap().saved_at_unix,
+            loaded.saved_at_unix
+        );
+        assert_eq!(
+            loaded
+                .latest_items_by_view
+                .get("movies")
+                .unwrap()
+                .saved_at_unix,
+            loaded.saved_at_unix
+        );
         assert_eq!(
             loaded.user_views.unwrap().data.items[0].name,
             "电影".to_string()
         );
         assert!(loaded.resume_items.is_some());
-        assert!(loaded.user_view_items.contains_key("movies"));
+        assert!(loaded.latest_items_by_view.contains_key("movies"));
+    }
+
+    #[test]
+    fn replaces_existing_snapshot_without_leaving_a_temp_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("account").join("snapshot.json");
+        let server = server("server-local", Some("user-1"));
+        let first = HomeSnapshot::new(&server, Some(user_views()), None, HashMap::new());
+        let second = HomeSnapshot::new(&server, None, None, HashMap::new());
+
+        save_snapshot_to(&path, &first).unwrap();
+        save_snapshot_to(&path, &second).unwrap();
+
+        let loaded = load_snapshot_from(&path, &server).unwrap().unwrap();
+        assert!(loaded.user_views.is_none());
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_account_directory_and_file_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("account").join("snapshot.json");
+        let server = server("server-local", Some("user-1"));
+        let snapshot = HomeSnapshot::new(&server, None, None, HashMap::new());
+
+        save_snapshot_to(&path, &snapshot).unwrap();
+
+        let directory_mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
     }
 
     #[test]
@@ -290,9 +345,67 @@ mod tests {
     }
 
     #[test]
+    fn ignores_snapshot_for_different_local_or_remote_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("snapshot.json");
+        let original = server("server-local", Some("user-1"));
+        let different_local = server("server-other", Some("user-1"));
+        let mut different_remote = server("server-local", Some("user-1"));
+        different_remote.server_id = Some("remote-server-2".to_string());
+        let snapshot = HomeSnapshot::new(&original, None, None, HashMap::new());
+        save_snapshot_to(&path, &snapshot).unwrap();
+
+        assert!(
+            load_snapshot_from(&path, &different_local)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_snapshot_from(&path, &different_remote)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn sanitizes_snapshot_path_segments() {
         assert_eq!(sanitize_segment("server/local"), "server_local");
         assert_eq!(sanitize_segment(".."), "unknown");
         assert_eq!(sanitize_segment("///"), "unknown");
+    }
+
+    #[test]
+    fn ignores_v1_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("snapshot.json");
+        let server = server("server-local", Some("user-1"));
+        let snapshot = serde_json::json!({
+            "version": 1,
+            "server_id": "server-local",
+            "remote_server_id": "remote-server-1",
+            "user_id": "user-1",
+            "saved_at_unix": 1,
+            "user_view_items": {}
+        });
+        fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        assert!(load_snapshot_from(&path, &server).unwrap().is_none());
+    }
+
+    #[test]
+    fn ignores_unknown_snapshot_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("snapshot.json");
+        let server = server("server-local", Some("user-1"));
+        let snapshot = serde_json::json!({
+            "version": 99,
+            "server_id": "server-local",
+            "remote_server_id": "remote-server-1",
+            "user_id": "user-1",
+            "saved_at_unix": 1
+        });
+        fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        assert!(load_snapshot_from(&path, &server).unwrap().is_none());
     }
 }
