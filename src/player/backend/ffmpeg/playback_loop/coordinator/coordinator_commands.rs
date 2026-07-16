@@ -22,7 +22,7 @@ use super::track_switch::{TrackSwitchPipelineState, service_track_switch_pipelin
 use super::{
     DemuxPacketCache, FfmpegCommand, FfmpegControl, FfmpegPlaybackInput, HttpRingCache,
     PlaybackSession, StreamCatalog, coalesce_playback_seek_commands, drain_playback_commands,
-    select_audio_stream_for_selection_from_catalog,
+    playback_audio_info_from_stream, select_audio_stream_for_selection_from_catalog,
     select_subtitle_stream_for_selection_from_catalog, should_cache_http_url,
 };
 use crate::player::backend::ffmpeg::worker::{PendingSeek, PendingTrackSelection};
@@ -238,6 +238,14 @@ fn service_track_selection_command(
     context.pipeline.audio_stream = next_audio_stream;
     context.pipeline.audio_output = next_audio_output;
     context.pipeline.audio_decode_pipeline = next_audio_decode_pipeline;
+    let playback_audio_info = playback_audio_info_from_stream(
+        context.pipeline.audio_stream,
+        context.pipeline.audio_output.as_ref(),
+    );
+    let _ = context.event_tx.send(BackendEvent::new(
+        context.session.id(),
+        BackendEventKind::PlaybackAudioInfoChanged(playback_audio_info),
+    ));
 
     service_playback_position_state_reset(PlaybackPositionStateResetContext {
         position_seconds,

@@ -10,7 +10,10 @@ use crate::{
     emby::{
         MediaItem, MediaItems, ResumeItem, UserItem, UserItems, playback::resolve_direct_stream_url,
     },
-    player::{PlaybackRequest, PlaybackTrack, PlaybackTrackSelection},
+    player::{
+        EmbyPlaybackContext, PlaybackQueue, PlaybackQueueItem, PlaybackRequest, PlaybackTrack,
+        PlaybackTrackSelection, playback_initial_position_seconds,
+    },
     server::CachedServer,
 };
 
@@ -27,12 +30,23 @@ struct SelectedPlayback {
     audio_tracks: Vec<PlaybackTrack>,
     subtitle_tracks: Vec<PlaybackTrack>,
     selected_tracks: PlaybackTrackSelection,
+    run_time_ticks: Option<u64>,
+    playback_position_ticks: Option<u64>,
+    queue: PlaybackQueue,
 }
 
 struct ResolvedPlayback {
     url: String,
     http_headers: Vec<(String, String)>,
     content_length: Option<u64>,
+    media_source_id: String,
+    play_session_id: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct DetailRequestRevisions {
+    detail: u64,
+    user_data: u64,
 }
 
 impl HomeContent {
@@ -169,10 +183,19 @@ impl HomeContent {
             let direct_stream_url = source.direct_stream_url()?;
             let playback_url = resolve_direct_stream_url(&task_server, direct_stream_url)?;
             let http_headers = client.playback_http_headers(&task_server)?;
+            let media_source_id = source
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .unwrap_or(task_media_source_id.as_str())
+                .to_string();
             Ok::<_, anyhow::Error>(ResolvedPlayback {
                 url: playback_url.to_string(),
                 http_headers,
                 content_length: source.size,
+                media_source_id,
+                play_session_id: playback_info.play_session_id,
             })
         });
 
@@ -208,6 +231,10 @@ impl HomeContent {
         match result {
             Ok(playback) => {
                 detail.playback_failed = None;
+                let initial_position_seconds = playback_initial_position_seconds(
+                    selected.playback_position_ticks,
+                    selected.run_time_ticks,
+                );
                 cx.emit(HomeContentEvent::OpenPlayback(Box::new(PlaybackRequest {
                     title: selected.title,
                     url: playback.url,
@@ -216,6 +243,18 @@ impl HomeContent {
                     audio_tracks: selected.audio_tracks,
                     subtitle_tracks: selected.subtitle_tracks,
                     selected_tracks: selected.selected_tracks,
+                    initial_position_seconds,
+                    queue: selected.queue,
+                    emby: EmbyPlaybackContext {
+                        client: self.emby_client.clone(),
+                        server: self.current_server.clone(),
+                        item_id: selected.item_id,
+                        media_source_id: playback.media_source_id,
+                        play_session_id: playback
+                            .play_session_id
+                            .filter(|id| !id.trim().is_empty()),
+                        run_time_ticks: selected.run_time_ticks,
+                    },
                 })));
             }
             Err(error) => {
@@ -263,7 +302,7 @@ impl HomeContent {
         }
     }
 
-    fn load_series_media_item_if_needed(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn load_series_media_item_if_needed(&mut self, cx: &mut Context<Self>) {
         let identity = self.request_identity();
         let user_data_revision = self.user_data_request_revision();
         let generation = self.detail_generation;
@@ -319,9 +358,12 @@ impl HomeContent {
         }
 
         match result {
-            Ok(item) => {
+            Ok(mut item) => {
                 self.ensure_series_media_item_images(&item, cx);
                 self.absorb_user_data(&item.id, item.user_data.as_ref(), user_data_revision);
+                if let Some(data) = self.user_data_overrides.get(&item.id) {
+                    item.user_data = Some(data.clone());
+                }
                 if let Some(detail) = self.series_detail.as_mut() {
                     if detail.series_id.as_str() != series_id.as_str() {
                         return;
@@ -555,7 +597,8 @@ impl HomeContent {
         }
 
         match result {
-            Ok(next_up) => {
+            Ok(mut next_up) => {
+                apply_media_item_user_data_overrides(&mut next_up.items, &self.user_data_overrides);
                 detail.effects.next_up = LoadState::Loaded;
                 detail.next_up_failed = None;
                 detail.next_up = Some(next_up);
@@ -573,9 +616,12 @@ impl HomeContent {
         cx.notify();
     }
 
-    fn load_series_episodes_if_needed(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn load_series_episodes_if_needed(&mut self, cx: &mut Context<Self>) {
         let identity = self.request_identity();
-        let generation = self.detail_generation;
+        let revisions = DetailRequestRevisions {
+            detail: self.detail_generation,
+            user_data: self.user_data_request_revision(),
+        };
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -612,7 +658,7 @@ impl HomeContent {
         cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
-                page.finish_series_episodes(identity, generation, series_id, season_id, result, cx)
+                page.finish_series_episodes(identity, revisions, series_id, season_id, result, cx)
             })
             .ok();
         })
@@ -622,13 +668,13 @@ impl HomeContent {
     fn finish_series_episodes(
         &mut self,
         identity: WorkspaceIdentity,
-        generation: u64,
+        revisions: DetailRequestRevisions,
         series_id: String,
         season_id: String,
         result: anyhow::Result<MediaItems>,
         cx: &mut Context<Self>,
     ) {
-        if self.detail_generation != generation
+        if self.detail_generation != revisions.detail
             || !self.matches_request_identity(&identity)
             || self.series_detail.as_ref().is_none_or(|detail| {
                 detail.series_id.as_str() != series_id.as_str()
@@ -640,7 +686,18 @@ impl HomeContent {
         }
 
         match result {
-            Ok(episodes) => {
+            Ok(mut episodes) => {
+                for episode in &episodes.items {
+                    self.absorb_user_data(
+                        &episode.id,
+                        episode.user_data.as_ref(),
+                        revisions.user_data,
+                    );
+                }
+                apply_media_item_user_data_overrides(
+                    &mut episodes.items,
+                    &self.user_data_overrides,
+                );
                 self.ensure_series_episode_images(&episodes, cx);
                 if let Some(detail) = self.series_detail.as_mut() {
                     if detail.series_id.as_str() != series_id.as_str()
@@ -884,6 +941,11 @@ fn selected_playback(
     let audio_tracks = playback_audio_tracks(source);
     let subtitle_tracks = playback_subtitle_tracks(source, server, &item.id, &media_source_id);
     let selected_tracks = playback_track_selection(detail, source, &subtitle_tracks);
+    let playback_position_ticks = detail.playback_position_ticks();
+    let mut queue = playback_queue(detail, item, &title);
+    if let Some(current) = queue.items.get_mut(queue.current_index) {
+        current.playback_position_ticks = playback_position_ticks;
+    }
 
     Ok(SelectedPlayback {
         detail_id: detail.series_id.clone(),
@@ -893,23 +955,122 @@ fn selected_playback(
         audio_tracks,
         subtitle_tracks,
         selected_tracks,
+        run_time_ticks: item.run_time_ticks,
+        playback_position_ticks,
+        queue,
     })
 }
 
-fn playback_audio_tracks(source: &crate::emby::MediaSource) -> Vec<PlaybackTrack> {
-    source
-        .audio_streams()
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, stream)| {
-            let stream_index = usize::try_from(stream.index?).ok()?;
-            Some(PlaybackTrack::new(
-                stream_index,
-                stream.audio_label(index),
-                stream.is_external.unwrap_or(false),
-            ))
+fn playback_queue(
+    detail: &SeriesDetailState,
+    selected_item: &MediaItem,
+    selected_title: &str,
+) -> PlaybackQueue {
+    if detail.is_movie() {
+        return PlaybackQueue::new(
+            vec![playback_queue_item(
+                selected_item,
+                selected_title.to_string().into(),
+                None,
+                None,
+            )],
+            0,
+        );
+    }
+
+    let series_name = detail
+        .item
+        .as_ref()
+        .map(|item| item.name.as_str())
+        .unwrap_or(detail.title.as_str());
+    let selected_season_id = detail.selected_season_id.clone();
+    let mut items = detail
+        .episodes
+        .as_ref()
+        .map(|episodes| {
+            episodes
+                .items
+                .iter()
+                .filter(|episode| {
+                    playback_queue_episode_is_valid(episode)
+                        && episode.season_id.as_deref().is_none_or(|season_id| {
+                            Some(season_id) == selected_season_id.as_deref()
+                        })
+                })
+                .map(|episode| {
+                    playback_queue_item(
+                        episode,
+                        format!("{series_name} {}", episode.episode_label()).into(),
+                        Some(detail.series_id.clone()),
+                        episode
+                            .season_id
+                            .clone()
+                            .or_else(|| selected_season_id.clone()),
+                    )
+                })
+                .collect::<Vec<_>>()
         })
-        .collect()
+        .unwrap_or_default();
+    let current_index = items
+        .iter()
+        .position(|item| item.item_id == selected_item.id);
+    if let Some(current_index) = current_index {
+        return PlaybackQueue::new(items, current_index);
+    }
+
+    items.clear();
+    items.push(playback_queue_item(
+        selected_item,
+        selected_title.to_string().into(),
+        Some(detail.series_id.clone()),
+        selected_item.season_id.clone().or(selected_season_id),
+    ));
+    PlaybackQueue::new(items, 0)
+}
+
+fn playback_queue_episode_is_valid(item: &MediaItem) -> bool {
+    !item.id.trim().is_empty()
+        && item
+            .item_type
+            .as_deref()
+            .is_none_or(|item_type| item_type.eq_ignore_ascii_case("Episode"))
+        && item.media_sources.as_ref().is_some_and(|sources| {
+            sources
+                .iter()
+                .any(|source| source.id.as_deref().is_some_and(|id| !id.trim().is_empty()))
+        })
+}
+
+fn playback_queue_item(
+    item: &MediaItem,
+    title: SharedString,
+    series_id: Option<String>,
+    season_id: Option<String>,
+) -> PlaybackQueueItem {
+    PlaybackQueueItem {
+        item_id: item.id.clone(),
+        title,
+        series_id,
+        season_id,
+        run_time_ticks: item.run_time_ticks,
+        playback_position_ticks: item.playback_position_ticks(),
+        media_sources: item.media_sources.clone().unwrap_or_default(),
+    }
+}
+
+fn apply_media_item_user_data_overrides(
+    items: &mut [MediaItem],
+    overrides: &std::collections::HashMap<String, crate::emby::UserItemData>,
+) {
+    for item in items {
+        if let Some(data) = overrides.get(&item.id) {
+            item.user_data = Some(data.clone());
+        }
+    }
+}
+
+fn playback_audio_tracks(source: &crate::emby::MediaSource) -> Vec<PlaybackTrack> {
+    crate::player::playback_audio_tracks_for_source(source)
 }
 
 fn playback_subtitle_tracks(
@@ -918,85 +1079,7 @@ fn playback_subtitle_tracks(
     item_id: &str,
     media_source_id: &str,
 ) -> Vec<PlaybackTrack> {
-    source
-        .subtitle_streams()
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, stream)| {
-            let stream_index = usize::try_from(stream.index?).ok()?;
-            let external_url =
-                playback_subtitle_external_url(stream, server, item_id, media_source_id);
-            Some(
-                PlaybackTrack::new(
-                    stream_index,
-                    stream.display_title_label(index),
-                    stream.is_external.unwrap_or(false),
-                )
-                .with_external_url(external_url)
-                .with_codec(stream.codec.clone()),
-            )
-        })
-        .collect()
-}
-
-fn playback_subtitle_external_url(
-    stream: &crate::emby::MediaStream,
-    server: &CachedServer,
-    item_id: &str,
-    media_source_id: &str,
-) -> Option<String> {
-    if !is_external_subtitle_stream(stream) {
-        return None;
-    }
-
-    let delivery_url = stream
-        .delivery_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| fallback_external_subtitle_delivery_url(stream, item_id, media_source_id))?;
-    let mut url = resolve_direct_stream_url(server, &delivery_url).ok()?;
-    if !url.query_pairs().any(|(name, _)| name == "api_key")
-        && let Some(access_token) = server
-            .access_token
-            .as_deref()
-            .filter(|token| !token.is_empty())
-    {
-        url.query_pairs_mut().append_pair("api_key", access_token);
-    }
-    Some(url.to_string())
-}
-
-fn is_external_subtitle_stream(stream: &crate::emby::MediaStream) -> bool {
-    stream.is_external.unwrap_or(false)
-        || stream
-            .delivery_method
-            .as_deref()
-            .is_some_and(|method| method.eq_ignore_ascii_case("External"))
-}
-
-fn fallback_external_subtitle_delivery_url(
-    stream: &crate::emby::MediaStream,
-    item_id: &str,
-    media_source_id: &str,
-) -> Option<String> {
-    let stream_index = stream.index?;
-    let extension = external_subtitle_extension(stream.codec.as_deref())?;
-    Some(format!(
-        "/Videos/{item_id}/{media_source_id}/Subtitles/{stream_index}/0/Stream.{extension}"
-    ))
-}
-
-fn external_subtitle_extension(codec: Option<&str>) -> Option<&'static str> {
-    match codec?.trim().to_ascii_lowercase().as_str() {
-        "ass" => Some("ass"),
-        "ssa" => Some("ssa"),
-        "subrip" | "srt" => Some("srt"),
-        "vtt" | "webvtt" => Some("vtt"),
-        "sub" => Some("sub"),
-        _ => None,
-    }
+    crate::player::playback_subtitle_tracks_for_source(source, server, item_id, media_source_id)
 }
 
 fn playback_track_selection(
@@ -1016,9 +1099,9 @@ fn playback_track_selection(
             .into_iter()
             .find_map(|stream| stream.index.and_then(|index| usize::try_from(index).ok()))
     });
-    let selected_subtitle = detail
-        .selected_subtitle_index()
-        .and_then(|index| subtitle_tracks.get(index));
+    let selected_subtitle = detail.selected_subtitle_index().and_then(|position| {
+        crate::player::playback_subtitle_track_at_position(source, subtitle_tracks, position)
+    });
 
     let mut selection = PlaybackTrackSelection {
         audio_stream_index,
@@ -1032,7 +1115,7 @@ fn playback_track_selection(
 #[cfg(test)]
 mod tests {
     use crate::{
-        emby::{MediaSource, MediaStream},
+        emby::{MediaItems, MediaSource, MediaStream, UserItem},
         server::{Protocol, ServerEndpoint},
     };
 
@@ -1056,6 +1139,68 @@ mod tests {
             item_counts: None,
             added_at_unix: 123,
         }
+    }
+
+    #[test]
+    fn playback_queue_keeps_server_order_and_current_season_only() {
+        let series: UserItem = serde_json::from_value(serde_json::json!({
+            "Id": "series-1",
+            "Name": "Series",
+            "Type": "Series"
+        }))
+        .unwrap();
+        let mut detail = SeriesDetailState::new_series(&series);
+        detail.selected_season_id = Some("season-1".to_string());
+        detail.episodes = Some(
+            serde_json::from_value::<MediaItems>(serde_json::json!({
+                "Items": [
+                    {
+                        "Id": "episode-2",
+                        "Name": "Second",
+                        "Type": "Episode",
+                        "SeasonId": "season-1",
+                        "MediaSources": [{ "Id": "source-2" }]
+                    },
+                    {
+                        "Id": "episode-1",
+                        "Name": "First",
+                        "Type": "Episode",
+                        "SeasonId": "season-1",
+                        "MediaSources": [{ "Id": "source-1" }]
+                    },
+                    {
+                        "Id": "episode-next-season",
+                        "Name": "Next Season",
+                        "Type": "Episode",
+                        "SeasonId": "season-2",
+                        "MediaSources": [{ "Id": "source-3" }]
+                    },
+                    {
+                        "Id": "episode-no-source",
+                        "Name": "Unavailable",
+                        "Type": "Episode",
+                        "SeasonId": "season-1"
+                    }
+                ],
+                "TotalRecordCount": 4
+            }))
+            .unwrap(),
+        );
+        detail.selected_episode_id = Some("episode-1".to_string());
+        let selected = detail.selected_episode().unwrap();
+
+        let queue = playback_queue(&detail, selected, "Series S1E1");
+
+        assert_eq!(
+            queue
+                .items
+                .iter()
+                .map(|item| item.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["episode-2", "episode-1"]
+        );
+        assert_eq!(queue.current_index, 1);
+        assert_eq!(queue.next_index(), None);
     }
 
     #[test]

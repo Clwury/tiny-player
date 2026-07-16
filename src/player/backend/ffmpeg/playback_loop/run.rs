@@ -11,7 +11,7 @@ use std::os::raw::c_int;
 use ffmpeg_sys_next as ffi;
 
 use crate::player::{
-    backend::{BackendEvent, BackendEventKind, PlaybackVideoInfo},
+    backend::{BackendEvent, BackendEventKind},
     render_host::VideoOutputQueue,
 };
 
@@ -28,34 +28,14 @@ use super::{
     PlaybackCoordinatorGateContext, PlaybackEofDrainContext, PlaybackEofDrainStatus,
     PlaybackGeneration, PlaybackOutputScheduler, PlaybackPipelineServices, PlaybackPipelineState,
     PlaybackScheduler, PlaybackSession, PlaybackTickContext, PlaybackTickStatus, PositionReporter,
-    StreamInfo, SubtitlePipeline, TimestampMapper, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-    VideoDecodePipeline, VideoDecodeRecovery, VideoDecodeWorkerInfo, VideoFramePrepareWorker,
-    audio_codec_requires_recovery_point, duration_nsecs, nsecs_to_seconds,
-    open_playback_input_with_fallback, preroll_seek_position_seconds,
-    service_hevc_startup_stall_watchdog_if_due, service_playback_commands,
-    service_playback_eof_drain, service_playback_tick, should_cache_http_url,
-    video_seek_preroll_nsecs,
+    SubtitlePipeline, TimestampMapper, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VideoDecodePipeline,
+    VideoDecodeRecovery, VideoFramePrepareWorker, audio_codec_requires_recovery_point,
+    duration_nsecs, nsecs_to_seconds, open_playback_input_with_fallback,
+    playback_audio_info_from_stream, playback_video_info_from_worker,
+    preroll_seek_position_seconds, service_hevc_startup_stall_watchdog_if_due,
+    service_playback_commands, service_playback_eof_drain, service_playback_tick,
+    should_cache_http_url, video_seek_preroll_nsecs,
 };
-
-fn frame_rate_from_duration(frame_duration_nsecs: Option<u64>) -> Option<f64> {
-    let duration = frame_duration_nsecs?;
-    if duration == 0 {
-        return None;
-    }
-    Some(1_000_000_000.0 / duration as f64)
-}
-
-fn playback_video_info_from_worker(
-    video_stream: StreamInfo,
-    video_decoder: &VideoDecodeWorkerInfo,
-) -> Option<PlaybackVideoInfo> {
-    Some(PlaybackVideoInfo {
-        decoder: video_decoder.decoder_name.clone(),
-        size: video_decoder.size?,
-        frame_rate: frame_rate_from_duration(video_stream.frame_duration_nsecs),
-        hardware_accelerated: video_decoder.hardware_accelerated,
-    })
-}
 
 pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
     mut source: FfmpegPlaybackInput,
@@ -77,6 +57,7 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
         subtitle_stream,
         subtitle_decoder,
     } = open_playback_input_with_fallback(&source, Arc::clone(&control), &event_tx)?;
+    let initial_playback_file_info = input.playback_file_info();
     let video_decode_pipeline = VideoDecodePipeline::spawn(video_decoder)?;
     let initial_playback_video_info =
         playback_video_info_from_worker(video_stream, video_decode_pipeline.info());
@@ -184,6 +165,8 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
     if let Some(output) = &audio_output {
         output.reset_clock(current_start_position_nsecs);
     }
+    let initial_playback_audio_info =
+        playback_audio_info_from_stream(audio_stream, audio_output.as_ref());
 
     if let Some(duration) = duration_seconds {
         let _ = event_tx.send(BackendEvent::new(
@@ -193,7 +176,15 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
     }
     let _ = event_tx.send(BackendEvent::new(
         session.id(),
+        BackendEventKind::PlaybackFileInfoChanged(initial_playback_file_info),
+    ));
+    let _ = event_tx.send(BackendEvent::new(
+        session.id(),
         BackendEventKind::PlaybackInfoChanged(initial_playback_video_info),
+    ));
+    let _ = event_tx.send(BackendEvent::new(
+        session.id(),
+        BackendEventKind::PlaybackAudioInfoChanged(initial_playback_audio_info),
     ));
     let emit_playback_buffered_events = false;
     let buffered_reporter =

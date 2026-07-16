@@ -12,6 +12,8 @@ pub(in crate::player::backend::ffmpeg) struct AudioOutput {
     pub(in crate::player::backend::ffmpeg::audio) _stream: cpal::Stream,
     pub(in crate::player::backend::ffmpeg::audio) sample_rate: c_int,
     pub(in crate::player::backend::ffmpeg::audio) channels: c_int,
+    pub(in crate::player::backend::ffmpeg::audio) sample_format: String,
+    pub(in crate::player::backend::ffmpeg::audio) device_name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

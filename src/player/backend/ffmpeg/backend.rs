@@ -71,6 +71,7 @@ impl FfmpegBackend {
         self.video_output_queue.clone()
     }
 
+    #[allow(dead_code)]
     pub fn load_url(
         &mut self,
         url: &str,
@@ -87,17 +88,15 @@ impl FfmpegBackend {
             url: url.to_string(),
             http_headers,
             content_length,
+            start_position_seconds: 0.0,
             selected_tracks,
             cache_config: self.cache_config.clone(),
         };
-        self.start_playback(request, 0.0)
+        self.start_playback(request)
     }
 
-    fn start_playback(
-        &mut self,
-        mut request: BackendLoadRequest,
-        start_position_seconds: f64,
-    ) -> Result<()> {
+    fn start_playback(&mut self, mut request: BackendLoadRequest) -> Result<()> {
+        let start_position_seconds = request.start_position_seconds.max(0.0);
         request.cache_config = request.cache_config.clone().normalized();
         let session_id = self.advance_session();
         self.video_output_queue.begin_session(session_id);
@@ -481,11 +480,23 @@ impl BackendControl for FfmpegBackend {
             url,
             http_headers,
             content_length,
+            start_position_seconds,
             selected_tracks,
             cache_config,
         } = request;
+        let url = url.trim();
+        if url.is_empty() {
+            return Err(BackendError::EmptyUrl);
+        }
         self.cache_config = cache_config;
-        self.load_url(&url, http_headers, content_length, selected_tracks)
+        self.start_playback(BackendLoadRequest {
+            url: url.to_string(),
+            http_headers,
+            content_length,
+            start_position_seconds,
+            selected_tracks,
+            cache_config: self.cache_config.clone(),
+        })
     }
 
     fn seek(&mut self, position_seconds: f64) -> Result<()> {

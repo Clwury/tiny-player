@@ -3,7 +3,7 @@ use std::time::Duration;
 use gpui::{
     Animation, AnimationExt as _, AnyView, Context, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Render, ScrollHandle, StatefulInteractiveElement, StyleRefinement, Styled,
-    Window, div, ease_in_out, prelude::FluentBuilder, px, svg,
+    Window, div, ease_in_out, prelude::FluentBuilder, px,
 };
 
 use crate::{
@@ -569,18 +569,16 @@ impl HomeContent {
                                 .id(view_all_action_id)
                                 .flex()
                                 .flex_none()
-                                .size(px(28.0))
+                                .h(px(28.0))
+                                .px_2()
                                 .items_center()
                                 .justify_center()
                                 .rounded_md()
+                                .text_sm()
+                                .text_color(theme.foreground)
                                 .hover(move |style| style.bg(theme.secondary_hover))
                                 .cursor_pointer()
-                                .child(
-                                    svg()
-                                        .path("icons/ellipsis.svg")
-                                        .size(px(18.0))
-                                        .text_color(theme.foreground),
-                                )
+                                .child("更多")
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })

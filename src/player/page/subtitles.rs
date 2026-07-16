@@ -25,12 +25,15 @@ impl PlaybackPage {
             .unwrap_or(0.0)
     }
 
-    pub(super) fn default_subtitle_vertical_offset_fraction(&self, window: &Window) -> Option<f32> {
+    pub(super) fn default_subtitle_vertical_offset_fraction(
+        &self,
+        _window: &Window,
+    ) -> Option<f32> {
         let (video_bounds, video_fitted_bounds) = self.current_video_layout_bounds()?;
         let default_bottom = subtitle_overlay_bottom(
             video_fitted_bounds,
             video_bounds,
-            self.progress_bar_visible(window.is_fullscreen()),
+            self.progress_bar_visible(),
         );
 
         Some(subtitle_vertical_offset_fraction(

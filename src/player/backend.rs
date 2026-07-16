@@ -7,9 +7,10 @@ use super::tracks::{PlaybackTrack, PlaybackTrackSelection};
 #[allow(unused_imports)]
 pub use events::{
     BackendError, BackendEvent, BackendEventKind, BackendSubtitleBitmap, BackendSubtitleCue,
-    ByteCacheState, CacheUnlinkPolicy, DemuxCacheState, PlaybackCacheByteRange,
+    ByteCacheState, CacheUnlinkPolicy, DemuxCacheState, PlaybackAudioInfo, PlaybackCacheByteRange,
     PlaybackCacheConfig, PlaybackCacheMode, PlaybackCacheState, PlaybackCacheTimeRange,
-    PlaybackSeekableCacheMode, PlaybackVideoInfo, Result, StreamCacheKind, StreamCacheState,
+    PlaybackFileInfo, PlaybackSeekableCacheMode, PlaybackVideoInfo, Result, StreamCacheKind,
+    StreamCacheState,
 };
 pub use ffmpeg::FfmpegBackend;
 
@@ -18,6 +19,7 @@ pub struct BackendLoadRequest {
     pub url: String,
     pub http_headers: Vec<(String, String)>,
     pub content_length: Option<u64>,
+    pub start_position_seconds: f64,
     pub selected_tracks: PlaybackTrackSelection,
     pub cache_config: PlaybackCacheConfig,
 }

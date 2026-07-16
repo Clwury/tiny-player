@@ -367,13 +367,13 @@ impl MediaSource {
 
         subtitles
             .iter()
-            .position(|stream| stream.is_default.unwrap_or(false))
+            .position(|stream| stream.index.is_some() && stream.is_default.unwrap_or(false))
             .or_else(|| {
                 subtitles
                     .iter()
-                    .position(|stream| stream.is_forced.unwrap_or(false))
+                    .position(|stream| stream.index.is_some() && stream.is_forced.unwrap_or(false))
             })
-            .or_else(|| (!subtitles.is_empty()).then_some(0))
+            .or_else(|| subtitles.iter().position(|stream| stream.index.is_some()))
     }
 }
 

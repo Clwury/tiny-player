@@ -13,27 +13,35 @@ use crate::theme;
 use super::{
     backend::{
         BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest,
-        BackendSubtitleBitmap, BackendSubtitleCue, FfmpegBackend, PlaybackCacheState,
-        PlaybackSeekMode, PlaybackVideoInfo, StreamCacheKind,
+        BackendSubtitleBitmap, BackendSubtitleCue, FfmpegBackend, PlaybackAudioInfo,
+        PlaybackCacheState, PlaybackFileInfo, PlaybackSeekMode, PlaybackVideoInfo, StreamCacheKind,
     },
     render_host::RenderSize,
     tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection},
-    video_presenter::VideoPresenter,
+    video_presenter::{VideoPresenter, VideoPresenterSnapshot},
 };
 
 mod backend_events;
 mod controls;
 mod fullscreen;
 mod progress;
+mod queue;
 mod render;
 mod request;
 mod runtime;
+mod session;
 mod shortcuts;
 mod state;
 mod subtitles;
 mod video_element;
 
-pub use request::PlaybackRequest;
+pub(crate) use request::playback_subtitle_track_at_position;
+pub use request::{
+    EmbyPlaybackContext, PlaybackQueue, PlaybackQueueItem, PlaybackRequest,
+    playback_initial_position_seconds,
+};
+pub(crate) use request::{playback_audio_tracks_for_source, playback_subtitle_tracks_for_source};
+pub use session::{PlaybackStateUpdate, PlaybackStopCompletion, PlaybackStopResult};
 
 use progress::{
     ProgressBarDrag, buffered_until_after_seek, cache_range_fractions, cached_seek_target,
@@ -53,9 +61,18 @@ use state::{
 use subtitles::defer_drop_subtitle;
 use video_element::VideoFrameElement;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum PlaybackEvent {
-    Back,
+    Update {
+        update: PlaybackStateUpdate,
+    },
+    Back {
+        update: PlaybackStateUpdate,
+    },
+    Replace {
+        request: Box<PlaybackRequest>,
+        update: PlaybackStateUpdate,
+    },
 }
 
 pub struct PlaybackPage {
@@ -64,9 +81,17 @@ pub struct PlaybackPage {
     video: ShutdownOrder<PlaybackBackend, VideoPresenter>,
     frame: PlaybackFrameState,
     timeline: PlaybackTimelineState,
-    playback_info_overlay_visible: bool,
+    playback_details_visible: bool,
     fullscreen: FullscreenControlsState,
+    source_protocol: Option<String>,
+    content_length: Option<u64>,
+    playback_file_info: Option<PlaybackFileInfo>,
     playback_info: Option<PlaybackVideoInfo>,
+    playback_audio_info: Option<PlaybackAudioInfo>,
+    queue: PlaybackQueue,
+    emby: EmbyPlaybackContext,
+    reporting: session::PlaybackReportingState,
+    queue_switch: queue::PlaybackQueueSwitchState,
     tracks: TrackSelectState,
     subtitle: SubtitleOverlayState,
     volume: PlaybackVolumeState,
@@ -80,6 +105,9 @@ impl PlaybackPage {
     pub fn new(request: PlaybackRequest, cx: &mut Context<Self>) -> Self {
         let mut error_message = None;
         let status_message = "正在加载视频…".into();
+        let source_protocol = playback_protocol(&request.url);
+        let content_length = request.content_length;
+        let reporting = session::PlaybackReportingState::new(&request.emby);
 
         let (backend, video_presenter) = match FfmpegBackend::new() {
             Ok(mut backend) => {
@@ -89,6 +117,7 @@ impl PlaybackPage {
                             url: request.url.clone(),
                             http_headers: request.http_headers.clone(),
                             content_length: request.content_length,
+                            start_position_seconds: request.initial_position_seconds,
                             selected_tracks: request.selected_tracks.clone(),
                             cache_config: Default::default(),
                         };
@@ -112,17 +141,28 @@ impl PlaybackPage {
             }
         };
 
-        let timeline = PlaybackTimelineState::default();
+        let timeline = PlaybackTimelineState {
+            position: valid_playback_time(request.initial_position_seconds),
+            ..PlaybackTimelineState::default()
+        };
 
-        Self {
+        let mut page = Self {
             focus_handle: cx.focus_handle(),
             title: request.title,
             video: ShutdownOrder::new(backend, video_presenter),
             frame: PlaybackFrameState::default(),
             timeline,
-            playback_info_overlay_visible: false,
+            playback_details_visible: false,
             fullscreen: FullscreenControlsState::default(),
+            source_protocol,
+            content_length,
+            playback_file_info: None,
             playback_info: None,
+            playback_audio_info: None,
+            queue: request.queue,
+            emby: request.emby,
+            reporting,
+            queue_switch: queue::PlaybackQueueSwitchState::default(),
             tracks: TrackSelectState::new(
                 request.audio_tracks,
                 request.subtitle_tracks,
@@ -132,7 +172,11 @@ impl PlaybackPage {
             volume: PlaybackVolumeState::default(),
             error_message,
             status_message,
+        };
+        if page.error_message.is_some() {
+            let _ = page.close_playback_reporting(true, false);
         }
+        page
     }
 
     pub fn title(&self) -> SharedString {
@@ -151,8 +195,11 @@ impl PlaybackPage {
     }
 
     fn back_to_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_queue_switch();
+        self.report_playback_progress(true);
+        let update = self.close_playback_reporting(false, self.timeline.ended);
         self.clear_visible_frame(window, cx);
-        cx.emit(PlaybackEvent::Back);
+        cx.emit(PlaybackEvent::Back { update });
     }
 
     fn press_back_button(
@@ -306,6 +353,13 @@ impl PlaybackPage {
     }
 }
 
+fn playback_protocol(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .map(|url| url.scheme().trim().to_ascii_lowercase())
+        .filter(|protocol| !protocol.is_empty())
+}
+
 fn clamp_playback_volume(volume: f32) -> f32 {
     let volume = if volume.is_finite() { volume } else { 1.0 };
     volume.clamp(0.0, 1.0)
@@ -340,7 +394,7 @@ impl Render for PlaybackPage {
         let message_text = self.message_text();
         let theme = theme::get(cx);
         let is_fullscreen = window.is_fullscreen();
-        let progress_bar_visible = self.progress_bar_visible(is_fullscreen);
+        let progress_bar_visible = self.progress_bar_visible();
         let view = cx.entity().downgrade();
         let viewport_observer = canvas(
             |bounds, _, _| bounds,
@@ -415,18 +469,24 @@ impl Render for PlaybackPage {
             })
             .child(viewport_observer)
             .child(self.render_mouse_capture(is_fullscreen, cx))
-            .when(self.playback_info_overlay_visible, |this| {
-                this.child(self.render_playback_info_overlay(cx))
+            .when(self.playback_details_visible, |this| {
+                this.child(self.render_playback_details_overlay(window, cx))
             })
             .child(self.render_subtitle_overlay(progress_bar_visible))
             .when(self.volume.indicator_visible, |this| {
                 this.child(self.render_volume_indicator(cx))
             })
+            .child(self.render_queue_switch_status(cx))
+            .child(self.render_queue_switch_error(cx))
             .when(progress_bar_visible, |this| {
                 this.child(self.render_progress_bar(cx))
             })
-            .when(!is_fullscreen, |this| {
-                this.child(self.render_back_button(cx))
-            })
+            .when(
+                fullscreen::playback_back_button_visible(
+                    is_fullscreen,
+                    self.fullscreen.controls_visible,
+                ),
+                |this| this.child(self.render_back_button(cx)),
+            )
     }
 }

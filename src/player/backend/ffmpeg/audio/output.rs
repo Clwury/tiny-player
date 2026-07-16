@@ -59,6 +59,7 @@ impl AudioOutput {
         ));
         let config: cpal::StreamConfig = supported_config.clone().into();
         let sample_format = supported_config.sample_format();
+        let sample_format_name = format!("{sample_format:?}").to_ascii_lowercase();
         tracing::debug!(
             device = %device_name,
             sample_rate,
@@ -115,6 +116,8 @@ impl AudioOutput {
             _stream: stream,
             sample_rate,
             channels,
+            sample_format: sample_format_name,
+            device_name,
         })
     }
 
@@ -124,6 +127,14 @@ impl AudioOutput {
 
     pub(in crate::player::backend::ffmpeg) fn channels(&self) -> c_int {
         self.channels
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn sample_format(&self) -> &str {
+        &self.sample_format
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn device_name(&self) -> &str {
+        &self.device_name
     }
 
     pub(in crate::player::backend::ffmpeg) fn misaligned_audio_buffer_count(&self) -> u64 {

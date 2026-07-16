@@ -537,9 +537,9 @@ impl HomeContent {
                             .child(
                                 svg()
                                     .path(if favorite {
-                                        "icons/heart.svg"
+                                        "icons/heart-filled.svg"
                                     } else {
-                                        "icons/heart-off.svg"
+                                        "icons/heart.svg"
                                     })
                                     .size(px(14.0))
                                     .text_color(if favorite {

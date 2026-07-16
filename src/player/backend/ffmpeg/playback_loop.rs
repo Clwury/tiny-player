@@ -146,6 +146,7 @@ mod video_frame_prepare_worker;
 mod video_output_gate;
 
 mod input;
+mod media_info;
 mod run;
 mod seek;
 mod subtitle_timeline;
@@ -183,6 +184,7 @@ use input::{
     select_audio_stream_for_selection_from_catalog,
     select_subtitle_stream_for_selection_from_catalog,
 };
+use media_info::{playback_audio_info_from_stream, playback_video_info_from_worker};
 pub(super) use output_gate::{PlaybackOutputScheduler, PlaybackOutputSnapshot};
 #[cfg(test)]
 pub(super) use output_rebuffer::{

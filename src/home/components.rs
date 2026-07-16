@@ -287,11 +287,14 @@ fn image_progress_bar<T>(image_width: f32, played_fraction: f32, cx: &Context<T>
         .right(px(IMAGE_PROGRESS_BAR_HORIZONTAL_INSET_PX))
         .bottom_0()
         .h(px(IMAGE_PROGRESS_BAR_HEIGHT_PX))
+        .rounded_full()
+        .overflow_hidden()
         .bg(theme.background.opacity(0.72))
         .child(
             div()
                 .h_full()
                 .w(px(track_width * played_fraction.clamp(0.0, 1.0)))
+                .rounded_full()
                 .bg(theme.input_border_focused),
         )
 }

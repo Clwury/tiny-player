@@ -7,6 +7,7 @@ mod favorites;
 mod library;
 mod navigation;
 mod paged_items;
+mod playback;
 mod render;
 mod search;
 mod sidebar;
@@ -126,6 +127,7 @@ struct HomeContent {
     home_scroll_handle: ScrollHandle,
     image_loader: ImageLoader,
     snapshot_save_generation: u64,
+    playback_refresh_generation: u64,
 }
 
 #[derive(Debug)]
@@ -202,6 +204,7 @@ impl HomeContent {
             home_scroll_handle: ScrollHandle::new(),
             image_loader: ImageLoader::new(),
             snapshot_save_generation: 0,
+            playback_refresh_generation: 0,
         }
     }
 
@@ -374,5 +377,15 @@ impl HomePage {
 
     fn back_to_servers(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(HomeEvent::BackToServers);
+    }
+
+    pub(crate) fn apply_playback_update(
+        &mut self,
+        update: crate::player::PlaybackStateUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        self.home_content.update(cx, |content, cx| {
+            content.apply_playback_update(update, cx);
+        });
     }
 }

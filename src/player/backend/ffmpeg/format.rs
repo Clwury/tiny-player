@@ -1,12 +1,14 @@
 use super::avio::{CachedAvio, CachedInputSource, input_format_options};
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     os::raw::{c_int, c_void},
     ptr,
     sync::Arc,
 };
 
 use ffmpeg_sys_next as ffi;
+
+use crate::player::backend::PlaybackFileInfo;
 
 use super::{
     FfmpegControl, HttpRingCache, InputProbeProfile, ffmpeg_error, ffmpeg_interrupt_callback,
@@ -193,6 +195,23 @@ impl FormatContext {
         Some(duration as f64 / ffi::AV_TIME_BASE as f64)
     }
 
+    pub(super) fn playback_file_info(&self) -> PlaybackFileInfo {
+        let format = unsafe { self.ptr.as_ref().map(|context| context.iformat) }
+            .filter(|format| !format.is_null());
+        let format_name = format.and_then(|format| unsafe { non_empty_c_string((*format).name) });
+        let format_description =
+            format.and_then(|format| unsafe { non_empty_c_string((*format).long_name) });
+        let bitrate = unsafe { self.ptr.as_ref().map(|context| context.bit_rate) }
+            .filter(|bitrate| *bitrate > 0)
+            .and_then(|bitrate| u64::try_from(bitrate).ok());
+
+        PlaybackFileInfo {
+            format_name,
+            format_description,
+            bitrate,
+        }
+    }
+
     pub(super) fn cached_io_cache(&self) -> Option<HttpRingCache> {
         self._cached_io.as_ref().map(CachedAvio::cache)
     }
@@ -230,6 +249,15 @@ impl FormatContext {
     pub(super) fn as_mut_ptr(&mut self) -> *mut ffi::AVFormatContext {
         self.ptr
     }
+}
+
+unsafe fn non_empty_c_string(value: *const std::os::raw::c_char) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    let value = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 unsafe impl Send for FormatContext {}

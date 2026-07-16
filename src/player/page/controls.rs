@@ -1,14 +1,34 @@
-use super::fullscreen::{PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX, PLAYBACK_PROGRESS_BAR_HEIGHT_PX};
+use super::fullscreen::{
+    PLAYBACK_BACK_BUTTON_OFFSET_PX, PLAYBACK_BACK_BUTTON_SIZE_PX,
+    PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX, PLAYBACK_PROGRESS_BAR_HEIGHT_PX,
+};
 use super::state::effective_playback_paused;
 use super::*;
 
 const TRACK_SELECT_MENU_MAX_HEIGHT_PX: f32 = 260.0;
 const VOLUME_INDICATOR_HIDE_DELAY: Duration = Duration::from_millis(1200);
 const VOLUME_INDICATOR_BAR_HEIGHT_PX: f32 = 192.0;
+const PLAYBACK_DETAILS_WIDTH_PX: f32 = 500.0;
+const PLAYBACK_DETAILS_TOP_PX: f32 = 56.0;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlaybackDetailRow {
+    label: String,
+    value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlaybackDetailSection {
+    title: &'static str,
+    summary: String,
+    rows: Vec<PlaybackDetailRow>,
+}
 
 #[derive(Clone, Copy)]
 struct PlaybackControlsRenderState {
+    can_switch_previous: bool,
     can_toggle_playback: bool,
+    can_switch_next: bool,
     play_pause_icon: &'static str,
     cache_status_enabled: bool,
     cache_status_open: bool,
@@ -77,7 +97,8 @@ impl PlaybackPage {
             return;
         }
 
-        let user_paused = !self.timeline.user_paused;
+        let previous_user_paused = self.timeline.user_paused;
+        let user_paused = !previous_user_paused;
         let Some(backend) = self.video.owner_mut() else {
             return;
         };
@@ -87,9 +108,12 @@ impl PlaybackPage {
             BackendCommand::Resume
         };
         if let Err(error) = backend.command(command) {
-            self.timeline.user_paused = true;
-            self.timeline.paused = true;
-            self.timeline.buffering = false;
+            self.timeline.user_paused = previous_user_paused;
+            self.timeline.paused =
+                effective_playback_paused(previous_user_paused, self.timeline.paused_for_cache);
+            if self.timeline.paused {
+                self.timeline.buffering = false;
+            }
             self.error_message = Some(format!("控制播放失败：{error}").into());
         } else {
             self.timeline.user_paused = user_paused;
@@ -98,6 +122,7 @@ impl PlaybackPage {
             if self.timeline.paused {
                 self.timeline.buffering = false;
             }
+            self.report_playback_progress(true);
         }
         cx.notify();
     }
@@ -110,12 +135,16 @@ impl PlaybackPage {
         }
 
         let previous_volume = self.volume.level;
+        let was_muted = previous_volume <= f32::EPSILON;
         self.volume.level = volume;
         if let Some(backend) = self.video.owner_mut()
             && let Err(error) = backend.command(BackendCommand::SetVolume { volume })
         {
             self.volume.level = previous_volume;
             self.error_message = Some(format!("调整音量失败：{error}").into());
+        }
+        if was_muted != (self.volume.level <= f32::EPSILON) {
+            self.report_playback_progress(true);
         }
         self.show_volume_indicator(cx);
     }
@@ -195,15 +224,26 @@ impl PlaybackPage {
         self.timeline.buffering = self.timeline.loaded;
         self.status_message = "正在切换轨道…".into();
 
-        if let Some(backend) = self.video.owner_mut()
-            && let Err(error) = backend.command(BackendCommand::SetAudioTrack {
+        let command_succeeded = if let Some(backend) = self.video.owner_mut() {
+            match backend.command(BackendCommand::SetAudioTrack {
                 track_index,
                 position_seconds,
-            })
-        {
+            }) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.tracks.selected_audio_stream_index = previous_audio;
+                    self.timeline.buffering = false;
+                    self.error_message = Some(format!("切换轨道失败：{error}").into());
+                    false
+                }
+            }
+        } else {
             self.tracks.selected_audio_stream_index = previous_audio;
             self.timeline.buffering = false;
-            self.error_message = Some(format!("切换轨道失败：{error}").into());
+            false
+        };
+        if command_succeeded {
+            self.report_playback_progress(true);
         }
         cx.notify();
     }
@@ -227,17 +267,30 @@ impl PlaybackPage {
         self.timeline.buffering = self.timeline.loaded;
         self.status_message = "正在切换轨道…".into();
 
-        if let Some(backend) = self.video.owner_mut()
-            && let Err(error) = backend.command(BackendCommand::SetSubtitleTrack {
+        let command_succeeded = if let Some(backend) = self.video.owner_mut() {
+            match backend.command(BackendCommand::SetSubtitleTrack {
                 track,
                 position_seconds,
-            })
-        {
+            }) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.tracks.selected_audio_stream_index = previous_audio;
+                    self.tracks.selected_subtitle_stream_index = previous_subtitle;
+                    self.subtitle.active = previous_active_subtitle.take();
+                    self.timeline.buffering = false;
+                    self.error_message = Some(format!("切换轨道失败：{error}").into());
+                    false
+                }
+            }
+        } else {
             self.tracks.selected_audio_stream_index = previous_audio;
             self.tracks.selected_subtitle_stream_index = previous_subtitle;
             self.subtitle.active = previous_active_subtitle.take();
             self.timeline.buffering = false;
-            self.error_message = Some(format!("切换轨道失败：{error}").into());
+            false
+        };
+        if command_succeeded {
+            self.report_playback_progress(true);
         }
         defer_drop_subtitle(previous_active_subtitle, window);
         cx.notify();
@@ -340,6 +393,8 @@ impl PlaybackPage {
             .map(|duration| clamp_playback_position(position, duration))
             .unwrap_or(position);
         let previous_position = self.timeline.position;
+        let previous_buffered_until = self.timeline.buffered_until;
+        let previous_ended = self.timeline.ended;
         let cached_seek_expected = cached_seek_target(
             self.timeline.cache_state.as_ref(),
             self.timeline.buffered_until,
@@ -363,16 +418,32 @@ impl PlaybackPage {
             presenter.discard_pending_frames();
         }
 
-        if let Some(backend) = self.video.owner_mut()
-            && let Err(error) = backend.command(BackendCommand::Seek {
+        let command_succeeded = if let Some(backend) = self.video.owner_mut() {
+            match backend.command(BackendCommand::Seek {
                 position_seconds: position,
                 mode: seek_mode,
-            })
-        {
+            }) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.timeline.pending_seek_position = None;
+                    self.timeline.pending_seek_keeps_frame = false;
+                    self.timeline.buffering = false;
+                    self.error_message = Some(format!("跳转播放位置失败：{error}").into());
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if command_succeeded {
+            self.report_playback_progress(true);
+        } else {
+            self.timeline.position = previous_position;
+            self.timeline.buffered_until = previous_buffered_until;
+            self.timeline.ended = previous_ended;
             self.timeline.pending_seek_position = None;
             self.timeline.pending_seek_keeps_frame = false;
             self.timeline.buffering = false;
-            self.error_message = Some(format!("跳转播放位置失败：{error}").into());
         }
         cx.notify();
     }
@@ -418,47 +489,79 @@ impl PlaybackPage {
             .child(svg().path(icon_path).size(icon_size).text_color(color))
     }
 
-    pub(super) fn render_playback_info_overlay(&self, cx: &Context<Self>) -> impl IntoElement {
-        let Some(info) = self.playback_info.as_ref() else {
-            return div().id("playback-info-overlay-empty").into_any_element();
-        };
-
+    pub(super) fn render_playback_details_overlay(
+        &self,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let theme = theme::get(cx);
-        playback_info_segments(info)
-            .into_iter()
-            .fold(
-                div()
-                    .id("playback-info-overlay")
-                    .absolute()
-                    .right_4()
-                    .top_4()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(theme.input_border.opacity(0.42))
-                    .bg(rgba(0x000000a8))
-                    .px_3()
-                    .py_2()
-                    .shadow_lg()
-                    .occlude()
-                    .text_xs()
-                    .text_color(theme.foreground.opacity(0.9)),
-                |this, segment| {
-                    this.child(
-                        div()
-                            .h(px(18.0))
-                            .flex()
-                            .items_center()
-                            .rounded(px(4.0))
-                            .bg(theme.foreground.opacity(0.08))
-                            .px_2()
-                            .child(segment),
-                    )
-                },
-            )
-            .into_any_element()
+        let presenter_snapshot = self.video.dependent().map(VideoPresenter::snapshot);
+        let viewport_size = window.viewport_size();
+        let display_size = RenderSize {
+            width: f32::from(viewport_size.width).round().max(0.0) as u32,
+            height: f32::from(viewport_size.height).round().max(0.0) as u32,
+        };
+        let output_size = self
+            .frame
+            .viewport_bounds
+            .zip(self.frame.source_size)
+            .and_then(|(viewport, source)| render_output_size(viewport, source));
+        let sections = vec![
+            playback_file_detail_section(
+                self.title.as_ref(),
+                self.content_length,
+                self.source_protocol.as_deref(),
+                self.playback_file_info.as_ref(),
+                self.timeline.duration,
+                self.timeline.cache_state.as_ref(),
+            ),
+            playback_display_detail_section(display_size, output_size, presenter_snapshot),
+            playback_video_detail_section(self.playback_info.as_ref(), self.timeline.loaded),
+            playback_audio_detail_section(
+                self.playback_audio_info.as_ref(),
+                self.timeline.loaded,
+                self.volume.level,
+            ),
+        ];
+
+        sections.into_iter().fold(
+            div()
+                .id("playback-details-overlay")
+                .absolute()
+                .left_4()
+                .top(px(if window.is_fullscreen() {
+                    16.0
+                } else {
+                    PLAYBACK_DETAILS_TOP_PX
+                }))
+                .flex()
+                .flex_col()
+                .w(px(PLAYBACK_DETAILS_WIDTH_PX))
+                .max_w(relative(0.82))
+                .max_h(relative(if window.is_fullscreen() { 0.92 } else { 0.82 }))
+                .gap_3()
+                .overflow_y_scroll()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(theme.input_border.opacity(0.42))
+                .bg(rgba(0x000000c8))
+                .px_3()
+                .py_3()
+                .shadow_lg()
+                .occlude()
+                .text_xs()
+                .text_color(theme.foreground.opacity(0.92))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_scroll_wheel(|_, _, cx| {
+                    cx.stop_propagation();
+                }),
+            |this, section| this.child(playback_detail_section_element(section, cx)),
+        )
     }
 
     pub(super) fn render_track_select_menu(
@@ -557,15 +660,17 @@ impl PlaybackPage {
         div()
             .id("playback-back-button")
             .absolute()
-            .left_4()
-            .top_4()
+            .left(px(PLAYBACK_BACK_BUTTON_OFFSET_PX))
+            .top(px(PLAYBACK_BACK_BUTTON_OFFSET_PX))
             .flex()
-            .size(px(32.0))
+            .size(px(PLAYBACK_BACK_BUTTON_SIZE_PX))
             .items_center()
             .justify_center()
             .rounded_md()
             .hover(move |style| style.bg(theme.secondary_hover))
             .occlude()
+            .on_hover(cx.listener(Self::handle_back_button_hover))
+            .on_mouse_move(cx.listener(Self::handle_back_button_mouse_move))
             .child(
                 svg()
                     .path("icons/chevron-left.svg")
@@ -641,8 +746,10 @@ impl PlaybackPage {
             .w_full()
             .h(px(34.0))
             .child(self.render_primary_transport_controls(
+                state.can_switch_previous,
                 state.can_toggle_playback,
                 state.play_pause_icon,
+                state.can_switch_next,
                 cx,
             ))
             .child(self.render_track_control_buttons(state, cx))
@@ -650,8 +757,10 @@ impl PlaybackPage {
 
     fn render_primary_transport_controls(
         &self,
+        can_switch_previous: bool,
         can_toggle_playback: bool,
         play_pause_icon: &'static str,
+        can_switch_next: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -663,14 +772,22 @@ impl PlaybackPage {
             .items_center()
             .justify_center()
             .gap_3()
-            .child(Self::playback_control_button(
-                "playback-previous-button",
-                "icons/previous.svg",
-                px(30.0),
-                px(16.0),
-                false,
-                cx,
-            ))
+            .child(
+                Self::playback_control_button(
+                    "playback-previous-button",
+                    "icons/previous.svg",
+                    px(30.0),
+                    px(16.0),
+                    can_switch_previous,
+                    cx,
+                )
+                .when(can_switch_previous, |this| {
+                    this.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(Self::switch_to_previous_episode),
+                    )
+                }),
+            )
             .child(
                 Self::playback_control_button(
                     "playback-play-pause-button",
@@ -684,14 +801,19 @@ impl PlaybackPage {
                     this.on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_playback_pause))
                 }),
             )
-            .child(Self::playback_control_button(
-                "playback-next-button",
-                "icons/next.svg",
-                px(30.0),
-                px(16.0),
-                false,
-                cx,
-            ))
+            .child(
+                Self::playback_control_button(
+                    "playback-next-button",
+                    "icons/next.svg",
+                    px(30.0),
+                    px(16.0),
+                    can_switch_next,
+                    cx,
+                )
+                .when(can_switch_next, |this| {
+                    this.on_mouse_down(MouseButton::Left, cx.listener(Self::switch_to_next_episode))
+                }),
+            )
     }
 
     fn render_track_control_buttons(
@@ -921,7 +1043,9 @@ impl PlaybackPage {
         let can_select_subtitle = !self.tracks.subtitles.is_empty()
             || self.tracks.selected_subtitle_stream_index.is_some();
         let controls = PlaybackControlsRenderState {
+            can_switch_previous: self.can_switch_to_previous_episode(),
             can_toggle_playback,
+            can_switch_next: self.can_switch_to_next_episode(),
             play_pause_icon,
             cache_status_enabled,
             cache_status_open: self.timeline.cache_status_open,
@@ -1027,20 +1151,359 @@ fn progress_track_observer(cx: &Context<PlaybackPage>) -> impl IntoElement {
     .size_full()
 }
 
-pub(super) fn playback_info_segments(info: &PlaybackVideoInfo) -> Vec<String> {
-    let mut segments = vec![
-        info.decoder.clone(),
-        format!("{}x{}", info.size.width, info.size.height),
-    ];
-    if let Some(frame_rate) = info.frame_rate.and_then(valid_frame_rate) {
-        segments.push(format!("{frame_rate:.2} FPS"));
+impl PlaybackDetailRow {
+    fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+        }
     }
-    segments.push(if info.hardware_accelerated {
-        "HW".to_string()
-    } else {
-        "SW".to_string()
+}
+
+fn playback_detail_section_element<T>(
+    section: PlaybackDetailSection,
+    cx: &Context<T>,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child(format!("{}:", section.title)),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(section.summary),
+                ),
+        )
+        .children(section.rows.into_iter().map(|row| {
+            div()
+                .flex()
+                .items_start()
+                .gap_2()
+                .pl_2()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(112.0))
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{}:", row.label)),
+                )
+                .child(div().min_w_0().flex_1().child(row.value))
+        }))
+}
+
+fn playback_file_detail_section(
+    title: &str,
+    content_length: Option<u64>,
+    protocol: Option<&str>,
+    file_info: Option<&PlaybackFileInfo>,
+    duration: Option<f64>,
+    cache_state: Option<&PlaybackCacheState>,
+) -> PlaybackDetailSection {
+    let mut rows = Vec::new();
+    let content_length = content_length.or_else(|| {
+        cache_state.and_then(|state| state.byte.as_ref().and_then(|cache| cache.content_length))
     });
-    segments
+    if let Some(size) = content_length.filter(|size| *size > 0) {
+        rows.push(PlaybackDetailRow::new("Size", format_cache_bytes(size)));
+    }
+    if let Some(format_protocol) = playback_format_protocol(file_info, protocol) {
+        rows.push(PlaybackDetailRow::new("Format/Protocol", format_protocol));
+    }
+    if let Some(duration) = duration.filter(|duration| duration.is_finite() && *duration > 0.0) {
+        rows.push(PlaybackDetailRow::new(
+            "Duration",
+            format_playback_time(duration),
+        ));
+    }
+    if let Some(bitrate) = file_info.and_then(|info| info.bitrate) {
+        rows.push(PlaybackDetailRow::new(
+            "Overall Bitrate",
+            format_bitrate(bitrate),
+        ));
+    }
+    if let Some(total_cache) = playback_total_cache(cache_state) {
+        rows.push(PlaybackDetailRow::new("Total Cache", total_cache));
+    }
+
+    PlaybackDetailSection {
+        title: "File",
+        summary: title.to_string(),
+        rows,
+    }
+}
+
+fn playback_display_detail_section(
+    display_size: RenderSize,
+    output_size: Option<RenderSize>,
+    presenter: Option<VideoPresenterSnapshot>,
+) -> PlaybackDetailSection {
+    let mut rows = vec![
+        PlaybackDetailRow::new("Context", "libplacebo / Vulkan"),
+        PlaybackDetailRow::new("Resolution", format_render_size(display_size)),
+    ];
+    if let Some(output_size) = output_size {
+        rows.push(PlaybackDetailRow::new(
+            "Output Resolution",
+            format_render_size(output_size),
+        ));
+    }
+    if let Some(presenter) = presenter {
+        rows.push(PlaybackDetailRow::new(
+            "Dropped Frames",
+            presenter.dropped_frames.to_string(),
+        ));
+        rows.push(PlaybackDetailRow::new(
+            "Frame Queue",
+            format!("{} / {}", presenter.queued, presenter.queue_capacity),
+        ));
+        if presenter.average_render_ms.is_finite() && presenter.average_render_ms > 0.0 {
+            rows.push(PlaybackDetailRow::new(
+                "Render Time",
+                format!("{:.2} ms", presenter.average_render_ms),
+            ));
+        }
+    }
+
+    PlaybackDetailSection {
+        title: "Display",
+        summary: "GPUI video output".to_string(),
+        rows,
+    }
+}
+
+fn playback_video_detail_section(
+    info: Option<&PlaybackVideoInfo>,
+    loaded: bool,
+) -> PlaybackDetailSection {
+    let Some(info) = info else {
+        return PlaybackDetailSection {
+            title: "Video",
+            summary: if loaded { "Unavailable" } else { "Loading…" }.to_string(),
+            rows: Vec::new(),
+        };
+    };
+
+    let mut rows = vec![PlaybackDetailRow::new("Decoder", info.decoder.clone())];
+    rows.push(PlaybackDetailRow::new(
+        "Decode Mode",
+        if info.hardware_accelerated {
+            "Vulkan HW"
+        } else {
+            "Software"
+        },
+    ));
+    if let Some(frame_rate) = info.frame_rate.and_then(valid_frame_rate) {
+        rows.push(PlaybackDetailRow::new(
+            "Frame Rate",
+            format!("{frame_rate:.3} fps"),
+        ));
+    }
+    let mut resolution = format_render_size(info.size);
+    if let Some((numerator, denominator)) = info
+        .sample_aspect_ratio
+        .filter(|(numerator, denominator)| *numerator != *denominator)
+    {
+        resolution.push_str(&format!("  SAR {numerator}:{denominator}"));
+    }
+    rows.push(PlaybackDetailRow::new("Resolution", resolution));
+    push_optional_detail(&mut rows, "Format", info.pixel_format.as_deref());
+    push_optional_detail(&mut rows, "Levels", info.color_range.as_deref());
+    push_optional_detail(&mut rows, "Chroma Loc", info.chroma_location.as_deref());
+    push_optional_detail(&mut rows, "Colormatrix", info.color_space.as_deref());
+    push_optional_detail(&mut rows, "Primaries", info.color_primaries.as_deref());
+    push_optional_detail(&mut rows, "Transfer", info.color_transfer.as_deref());
+    if let Some(bitrate) = info.bitrate {
+        rows.push(PlaybackDetailRow::new("Bitrate", format_bitrate(bitrate)));
+    }
+
+    PlaybackDetailSection {
+        title: "Video",
+        summary: codec_summary(
+            &info.codec,
+            info.codec_description.as_deref(),
+            info.profile.as_deref(),
+        ),
+        rows,
+    }
+}
+
+fn playback_audio_detail_section(
+    info: Option<&PlaybackAudioInfo>,
+    loaded: bool,
+    volume: f32,
+) -> PlaybackDetailSection {
+    let Some(info) = info else {
+        return PlaybackDetailSection {
+            title: "Audio",
+            summary: if loaded { "No audio" } else { "Loading…" }.to_string(),
+            rows: Vec::new(),
+        };
+    };
+
+    let mut rows = vec![PlaybackDetailRow::new("Decoder", info.decoder.clone())];
+    let has_audio_output = info.output_device.is_some()
+        || info.output_channels.is_some()
+        || info.output_sample_format.is_some()
+        || info.output_sample_rate.is_some();
+    if has_audio_output {
+        rows.push(PlaybackDetailRow::new("AO", "cpal"));
+        push_optional_detail(&mut rows, "Device", info.output_device.as_deref());
+        rows.push(PlaybackDetailRow::new(
+            "AO Volume",
+            format!("{}%", playback_volume_percent(volume)),
+        ));
+    }
+
+    let input_channels = audio_channel_description(info.channels, info.channel_layout.as_deref());
+    let output_channels = info.output_channels.map(|channels| channels.to_string());
+    if let Some(channels) = transition_value(input_channels, output_channels) {
+        rows.push(PlaybackDetailRow::new("Channels", channels));
+    }
+    if let Some(format) = transition_value(
+        info.sample_format.clone(),
+        info.output_sample_format.clone(),
+    ) {
+        rows.push(PlaybackDetailRow::new("Format", format));
+    }
+    if let Some(sample_rate) = transition_value(
+        info.sample_rate.map(|rate| rate.to_string()),
+        info.output_sample_rate.map(|rate| rate.to_string()),
+    ) {
+        rows.push(PlaybackDetailRow::new(
+            "Sample Rate",
+            format!("{sample_rate} Hz"),
+        ));
+    }
+    if let Some(bitrate) = info.bitrate {
+        rows.push(PlaybackDetailRow::new("Bitrate", format_bitrate(bitrate)));
+    }
+
+    PlaybackDetailSection {
+        title: "Audio",
+        summary: codec_summary(
+            &info.codec,
+            info.codec_description.as_deref(),
+            info.profile.as_deref(),
+        ),
+        rows,
+    }
+}
+
+fn push_optional_detail(rows: &mut Vec<PlaybackDetailRow>, label: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        rows.push(PlaybackDetailRow::new(label, value));
+    }
+}
+
+fn playback_format_protocol(
+    file_info: Option<&PlaybackFileInfo>,
+    protocol: Option<&str>,
+) -> Option<String> {
+    let format = file_info.and_then(|info| {
+        match (
+            info.format_description.as_deref(),
+            info.format_name.as_deref(),
+        ) {
+            (Some(description), Some(name)) if !description.eq_ignore_ascii_case(name) => {
+                Some(format!("{description} ({name})"))
+            }
+            (Some(description), _) => Some(description.to_string()),
+            (_, Some(name)) => Some(name.to_string()),
+            _ => None,
+        }
+    });
+    transition_value(format, protocol.map(ToString::to_string))
+        .map(|value| value.replace(" → ", " / "))
+}
+
+fn playback_total_cache(cache_state: Option<&PlaybackCacheState>) -> Option<String> {
+    let cache_state = cache_state?;
+    let bytes = cache_state.demux.forward_bytes;
+    let duration = cache_state
+        .demux
+        .cache_duration
+        .filter(|duration| duration.is_finite() && *duration > 0.0);
+    if bytes == 0 && duration.is_none() {
+        return None;
+    }
+    match (bytes > 0, duration) {
+        (true, Some(duration)) => {
+            Some(format!("{} ({duration:.1} sec)", format_cache_bytes(bytes)))
+        }
+        (true, None) => Some(format_cache_bytes(bytes)),
+        (false, Some(duration)) => Some(format!("{duration:.1} sec")),
+        (false, None) => None,
+    }
+}
+
+fn codec_summary(codec: &str, description: Option<&str>, profile: Option<&str>) -> String {
+    let mut summary = description
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .unwrap_or(codec)
+        .to_string();
+    if let Some(profile) = profile.map(str::trim).filter(|profile| !profile.is_empty()) {
+        summary.push_str(&format!(" [{profile}]"));
+    }
+    summary
+}
+
+fn audio_channel_description(channels: Option<u32>, layout: Option<&str>) -> Option<String> {
+    match (
+        channels,
+        layout.map(str::trim).filter(|layout| !layout.is_empty()),
+    ) {
+        (Some(channels), Some(layout)) => Some(format!("{layout} ({channels})")),
+        (Some(channels), None) => Some(channels.to_string()),
+        (None, Some(layout)) => Some(layout.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn transition_value(input: Option<String>, output: Option<String>) -> Option<String> {
+    match (input, output) {
+        (Some(input), Some(output)) if input != output => Some(format!("{input} → {output}")),
+        (Some(input), _) => Some(input),
+        (None, Some(output)) => Some(output),
+        (None, None) => None,
+    }
+}
+
+fn format_render_size(size: RenderSize) -> String {
+    format!("{}x{}", size.width, size.height)
+}
+
+fn format_bitrate(bits_per_second: u64) -> String {
+    const KILOBIT: f64 = 1_000.0;
+    const MEGABIT: f64 = 1_000_000.0;
+    const GIGABIT: f64 = 1_000_000_000.0;
+    let bitrate = bits_per_second as f64;
+    if bitrate >= GIGABIT {
+        format!("{:.2} Gb/s", bitrate / GIGABIT)
+    } else if bitrate >= MEGABIT {
+        format!("{:.2} Mb/s", bitrate / MEGABIT)
+    } else if bitrate >= KILOBIT {
+        format!("{:.1} kb/s", bitrate / KILOBIT)
+    } else {
+        format!("{bits_per_second} b/s")
+    }
 }
 
 fn play_pause_icon_for_user_pause(user_paused: bool) -> &'static str {
@@ -1172,8 +1635,8 @@ pub(super) fn valid_frame_rate(frame_rate: f64) -> Option<f64> {
 mod tests {
     use crate::player::{
         backend::{
-            ByteCacheState, DemuxCacheState, PlaybackCacheState, PlaybackVideoInfo,
-            StreamCacheState,
+            ByteCacheState, DemuxCacheState, PlaybackAudioInfo, PlaybackCacheState,
+            PlaybackFileInfo, PlaybackVideoInfo, StreamCacheState,
         },
         page::state::user_pause_from_effective_pause_event,
         render_host::RenderSize,
@@ -1182,51 +1645,128 @@ mod tests {
     use super::*;
 
     #[test]
-    fn playback_info_segments_include_hw_badge_and_frame_rate() {
+    fn video_detail_section_contains_mpv_style_status() {
         let info = PlaybackVideoInfo {
+            codec: "hevc".to_string(),
+            codec_description: Some("HEVC (High Efficiency Video Coding)".to_string()),
+            profile: Some("Main 10".to_string()),
             decoder: "hevc".to_string(),
             size: RenderSize {
                 width: 3840,
                 height: 2160,
             },
+            sample_aspect_ratio: Some((1, 1)),
             frame_rate: Some(23.976),
+            pixel_format: Some("yuv420p10le".to_string()),
+            color_range: Some("tv".to_string()),
+            chroma_location: Some("left".to_string()),
+            color_space: Some("bt2020nc".to_string()),
+            color_primaries: Some("bt2020".to_string()),
+            color_transfer: Some("smpte2084".to_string()),
+            bitrate: Some(18_500_000),
             hardware_accelerated: true,
         };
 
+        let section = playback_video_detail_section(Some(&info), true);
+
+        assert_eq!(section.title, "Video");
         assert_eq!(
-            playback_info_segments(&info),
-            vec![
-                "hevc".to_string(),
-                "3840x2160".to_string(),
-                "23.98 FPS".to_string(),
-                "HW".to_string()
-            ]
+            section.summary,
+            "HEVC (High Efficiency Video Coding) [Main 10]"
+        );
+        assert_eq!(detail_row_value(&section, "Decoder"), Some("hevc"));
+        assert_eq!(detail_row_value(&section, "Decode Mode"), Some("Vulkan HW"));
+        assert_eq!(detail_row_value(&section, "Frame Rate"), Some("23.976 fps"));
+        assert_eq!(detail_row_value(&section, "Resolution"), Some("3840x2160"));
+        assert_eq!(detail_row_value(&section, "Format"), Some("yuv420p10le"));
+        assert_eq!(detail_row_value(&section, "Colormatrix"), Some("bt2020nc"));
+        assert_eq!(detail_row_value(&section, "Bitrate"), Some("18.50 Mb/s"));
+    }
+
+    #[test]
+    fn audio_detail_section_reports_input_to_output_transforms() {
+        let info = PlaybackAudioInfo {
+            codec: "eac3".to_string(),
+            codec_description: Some("ATSC A/52B (AC-3, E-AC-3)".to_string()),
+            profile: None,
+            decoder: "eac3".to_string(),
+            channels: Some(6),
+            channel_layout: Some("5.1(side)".to_string()),
+            sample_format: Some("fltp".to_string()),
+            sample_rate: Some(48_000),
+            output_channels: Some(2),
+            output_sample_format: Some("f32".to_string()),
+            output_sample_rate: Some(48_000),
+            output_device: Some("Built-in Audio".to_string()),
+            bitrate: Some(768_000),
+        };
+
+        let section = playback_audio_detail_section(Some(&info), true, 0.75);
+
+        assert_eq!(section.title, "Audio");
+        assert_eq!(detail_row_value(&section, "AO"), Some("cpal"));
+        assert_eq!(detail_row_value(&section, "AO Volume"), Some("75%"));
+        assert_eq!(
+            detail_row_value(&section, "Channels"),
+            Some("5.1(side) (6) → 2")
+        );
+        assert_eq!(detail_row_value(&section, "Format"), Some("fltp → f32"));
+        assert_eq!(detail_row_value(&section, "Sample Rate"), Some("48000 Hz"));
+        assert_eq!(detail_row_value(&section, "Bitrate"), Some("768.0 kb/s"));
+    }
+
+    #[test]
+    fn file_detail_section_combines_format_protocol_and_cache() {
+        let file_info = PlaybackFileInfo {
+            format_name: Some("matroska,webm".to_string()),
+            format_description: Some("Matroska / WebM".to_string()),
+            bitrate: Some(20_000_000),
+        };
+        let cache_state = PlaybackCacheState {
+            demux: DemuxCacheState {
+                forward_bytes: 32 * 1024 * 1024,
+                cache_duration: Some(12.5),
+                ..DemuxCacheState::default()
+            },
+            ..PlaybackCacheState::default()
+        };
+
+        let section = playback_file_detail_section(
+            "示例视频",
+            Some(2 * 1024 * 1024 * 1024),
+            Some("https"),
+            Some(&file_info),
+            Some(3661.0),
+            Some(&cache_state),
+        );
+
+        assert_eq!(section.title, "File");
+        assert_eq!(section.summary, "示例视频");
+        assert_eq!(detail_row_value(&section, "Size"), Some("2.0 GiB"));
+        assert_eq!(
+            detail_row_value(&section, "Format/Protocol"),
+            Some("Matroska / WebM (matroska,webm) / https")
+        );
+        assert_eq!(detail_row_value(&section, "Duration"), Some("1:01:01"));
+        assert_eq!(
+            detail_row_value(&section, "Total Cache"),
+            Some("32.0 MiB (12.5 sec)")
         );
     }
 
     #[test]
-    fn playback_info_segments_mark_software_and_skip_invalid_rate() {
-        let info = PlaybackVideoInfo {
-            decoder: "h264".to_string(),
-            size: RenderSize {
-                width: 1920,
-                height: 1080,
-            },
-            frame_rate: Some(f64::NAN),
-            hardware_accelerated: false,
-        };
-
-        assert_eq!(
-            playback_info_segments(&info),
-            vec![
-                "h264".to_string(),
-                "1920x1080".to_string(),
-                "SW".to_string()
-            ]
-        );
+    fn playback_detail_helpers_reject_invalid_frame_rates() {
         assert_eq!(valid_frame_rate(0.0), None);
         assert_eq!(valid_frame_rate(f64::INFINITY), None);
         assert_eq!(valid_frame_rate(60.0), Some(60.0));
+    }
+
+    fn detail_row_value<'a>(section: &'a PlaybackDetailSection, label: &str) -> Option<&'a str> {
+        section
+            .rows
+            .iter()
+            .find(|row| row.label == label)
+            .map(|row| row.value.as_str())
     }
 
     #[test]

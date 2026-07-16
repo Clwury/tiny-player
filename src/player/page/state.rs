@@ -72,6 +72,7 @@ pub(super) struct FullscreenControlsState {
     pub(super) cursor_visible: bool,
     pub(super) controls_visible: bool,
     pub(super) mouse_in_controls: bool,
+    pub(super) mouse_in_back_button: bool,
     pub(super) hide_generation: u64,
 }
 

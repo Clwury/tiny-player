@@ -20,7 +20,10 @@ pub mod user;
 
 pub use image::{DownloadedImage, EmbyImageRequest, EmbyImageType, ImageQuality};
 pub use item::ItemCounts;
-pub use playback::{PlaybackInfo, PlaybackMediaSource};
+pub use playback::{
+    PlaybackInfo, PlaybackMediaSource, PlaybackProgressReport, PlaybackQueueReportItem,
+    PlaybackStartReport, PlaybackStopReport,
+};
 pub use show::{
     MediaExternalUrl, MediaItem, MediaItems, MediaPerson, MediaSource, MediaStream, MediaStudio,
 };

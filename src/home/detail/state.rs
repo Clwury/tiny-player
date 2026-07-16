@@ -333,10 +333,13 @@ impl SeriesDetailState {
     }
 
     pub(crate) fn playback_position_seconds(&self) -> Option<u64> {
+        Some(self.playback_position_ticks()? / EMBY_TICKS_PER_SECOND)
+    }
+
+    pub(crate) fn playback_position_ticks(&self) -> Option<u64> {
         let selected = self.selected_playback_item()?;
         let selected_id = selected.id.as_str();
-        let ticks = self
-            .resume_episode
+        self.resume_episode
             .as_ref()
             .filter(|episode| episode.id == selected_id)
             .and_then(|episode| episode.user_data.as_ref())
@@ -347,9 +350,7 @@ impl SeriesDetailState {
                     .filter(|episode| episode.id == selected_id)
                     .and_then(MediaItem::playback_position_ticks)
             })
-            .or_else(|| selected.playback_position_ticks())?;
-
-        Some(ticks / EMBY_TICKS_PER_SECOND)
+            .or_else(|| selected.playback_position_ticks())
     }
 
     fn fallback_season_id(&self) -> Option<String> {
@@ -388,6 +389,96 @@ impl SeriesDetailState {
             .items
             .iter()
             .position(|episode| episode.id == selected_episode_id)
+    }
+
+    pub(crate) fn playback_user_data(&self, item_id: &str) -> Option<&crate::emby::UserItemData> {
+        self.item
+            .as_ref()
+            .filter(|item| item.id == item_id)
+            .and_then(|item| item.user_data.as_ref())
+            .or_else(|| {
+                self.episodes
+                    .as_ref()
+                    .and_then(|items| items.items.iter().find(|item| item.id == item_id))
+                    .and_then(|item| item.user_data.as_ref())
+            })
+            .or_else(|| {
+                self.next_up
+                    .as_ref()
+                    .and_then(|items| items.items.iter().find(|item| item.id == item_id))
+                    .and_then(|item| item.user_data.as_ref())
+            })
+            .or_else(|| {
+                self.resume_episode
+                    .as_ref()
+                    .filter(|item| item.id == item_id)
+                    .and_then(|item| item.user_data.as_ref())
+            })
+    }
+
+    pub(crate) fn apply_playback_update(
+        &mut self,
+        update: &crate::player::PlaybackStateUpdate,
+        user_data: &crate::emby::UserItemData,
+    ) {
+        if let Some(item) = self.item.as_mut().filter(|item| item.id == update.item_id) {
+            item.user_data = Some(user_data.clone());
+        }
+        if let Some(items) = self.episodes.as_mut() {
+            set_media_item_user_data(&mut items.items, &update.item_id, user_data);
+        }
+        if let Some(items) = self.next_up.as_mut() {
+            set_media_item_user_data(&mut items.items, &update.item_id, user_data);
+        }
+        if let Some(item) = self
+            .resume_episode
+            .as_mut()
+            .filter(|item| item.id == update.item_id)
+        {
+            item.user_data = Some(user_data.clone());
+        }
+
+        let Some(selected_item_id) = update.selected_item_id.as_ref() else {
+            return;
+        };
+        if update.series_id.as_deref() != Some(self.series_id.as_str())
+            || update.season_id.as_deref() != self.selected_season_id.as_deref()
+            || self.episodes.as_ref().is_none_or(|episodes| {
+                !episodes
+                    .items
+                    .iter()
+                    .any(|episode| episode.id == *selected_item_id)
+            })
+        {
+            return;
+        }
+
+        self.preferred_episode_id = Some(selected_item_id.clone());
+        self.apply_selected_episode(Some(selected_item_id.clone()));
+        if let Some(index) = self.selected_episode_index() {
+            self.episodes_carousel.set_scroll_offset(
+                index as f32 * super::super::carousel::DETAIL_EPISODE_CARD_STEP_PX,
+                f32::INFINITY,
+            );
+            self.episodes_carousel.sync_previous_offset();
+        }
+    }
+
+    pub(crate) fn mark_episodes_for_playback_refresh(&mut self) {
+        if self.effects.episodes == LoadState::Loading {
+            return;
+        }
+        self.effects.episodes = LoadState::Idle;
+        self.episodes_request_season_id = None;
+        self.episodes_failed = None;
+    }
+
+    pub(crate) fn mark_item_for_playback_refresh(&mut self) {
+        if self.effects.item == LoadState::Loading {
+            return;
+        }
+        self.effects.item = LoadState::Idle;
+        self.item_failed = None;
     }
 
     pub(crate) fn selected_media_source(&self) -> Option<&MediaSource> {
@@ -614,6 +705,16 @@ impl SeriesDetailState {
         {
             self.selected_subtitle_index = preferred_subtitle_index;
         }
+    }
+}
+
+fn set_media_item_user_data(
+    items: &mut [MediaItem],
+    item_id: &str,
+    user_data: &crate::emby::UserItemData,
+) {
+    if let Some(item) = items.iter_mut().find(|item| item.id == item_id) {
+        item.user_data = Some(user_data.clone());
     }
 }
 
@@ -1153,5 +1254,47 @@ mod tests {
 
         assert!(detail.should_load_next_up());
         assert_eq!(detail.playback_position_seconds(), Some(1_200));
+    }
+
+    #[test]
+    fn playback_update_selects_replacement_episode_and_updates_closed_item() {
+        let mut detail = SeriesDetailState::new_series(&user_item("series-1", "Series"));
+        detail.selected_season_id = Some("season-1".to_string());
+        detail.episodes = Some(MediaItems {
+            items: vec![
+                media_item("episode-1", "First"),
+                media_item("episode-2", "Second"),
+            ],
+            total_record_count: 2,
+        });
+        detail.selected_episode_id = Some("episode-1".to_string());
+        let update = crate::player::PlaybackStateUpdate {
+            item_id: "episode-1".to_string(),
+            series_id: Some("series-1".to_string()),
+            season_id: Some("season-1".to_string()),
+            position_ticks: 250,
+            run_time_ticks: Some(1_000),
+            ended: false,
+            failed: false,
+            selected_item_id: Some("episode-2".to_string()),
+            stop_completion: None,
+        };
+        let user_data = UserItemData {
+            playback_position_ticks: Some(250),
+            played_percentage: Some(25.0),
+            ..UserItemData::default()
+        };
+
+        detail.apply_playback_update(&update, &user_data);
+
+        assert_eq!(detail.selected_episode_id.as_deref(), Some("episode-2"));
+        assert_eq!(
+            detail
+                .episodes
+                .as_ref()
+                .and_then(|episodes| episodes.items.first())
+                .and_then(|episode| episode.playback_position_ticks()),
+            Some(250)
+        );
     }
 }

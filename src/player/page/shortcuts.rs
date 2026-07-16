@@ -53,7 +53,7 @@ impl PlaybackPage {
                 self.seek_relative(KEYBOARD_SEEK_STEP_SECONDS, window, cx);
             }
             PlaybackShortcut::ToggleInfoOverlay => {
-                self.playback_info_overlay_visible = !self.playback_info_overlay_visible;
+                self.playback_details_visible = !self.playback_details_visible;
                 cx.notify();
             }
             PlaybackShortcut::RaiseSubtitle => {

@@ -29,11 +29,17 @@ impl PlaybackPage {
     ) {
         match event.kind {
             BackendEventKind::PlaybackRestart => {
+                if self.playback_reporting_closed() {
+                    return;
+                }
                 apply_playback_restart_to_timeline(&mut self.timeline);
                 self.status_message = "".into();
                 self.error_message = None;
+                self.handle_playback_restart_reporting(cx);
             }
             BackendEventKind::LoadFailed(message) => {
+                self.cancel_queue_switch();
+                let _ = self.close_playback_reporting(true, false);
                 self.reset_after_backend_failure(
                     format!("加载视频失败：{message}").into(),
                     window,
@@ -41,6 +47,8 @@ impl PlaybackPage {
                 );
             }
             BackendEventKind::Fatal(message) => {
+                self.cancel_queue_switch();
+                let _ = self.close_playback_reporting(true, false);
                 self.reset_after_backend_failure(
                     format!("播放后端错误：{message}").into(),
                     window,
@@ -48,7 +56,18 @@ impl PlaybackPage {
                 );
             }
             BackendEventKind::PlaybackEnded => {
+                if self.timeline.ended || self.playback_reporting_closed() {
+                    return;
+                }
+                self.prepare_playback_end_report();
+                self.report_playback_progress(true);
+                let update = self.close_playback_reporting(false, true);
                 self.finish_playback(window, cx);
+                if self.can_switch_to_next_episode() {
+                    self.switch_to_next_episode_after_end(window, cx);
+                } else {
+                    cx.emit(PlaybackEvent::Update { update });
+                }
             }
             BackendEventKind::Pause(paused) => {
                 self.timeline.user_paused = user_pause_from_effective_pause_event(
@@ -60,6 +79,7 @@ impl PlaybackPage {
                     self.timeline.user_paused,
                     self.timeline.paused_for_cache,
                 );
+                self.report_playback_progress(false);
             }
             BackendEventKind::Buffering(buffering) => {
                 let hidden_by_soft_seek = buffering
@@ -73,6 +93,12 @@ impl PlaybackPage {
             }
             BackendEventKind::PlaybackInfoChanged(info) => {
                 self.playback_info = info;
+            }
+            BackendEventKind::PlaybackFileInfoChanged(info) => {
+                self.playback_file_info = Some(info);
+            }
+            BackendEventKind::PlaybackAudioInfoChanged(info) => {
+                self.playback_audio_info = info;
             }
             BackendEventKind::SubtitleChanged(cue) => {
                 if self.subtitle.active != cue {
@@ -191,13 +217,28 @@ impl PlaybackPage {
         self.timeline.paused_for_cache = false;
         self.timeline.cache_buffering_percent = None;
         self.tracks.open = None;
-        self.frame.source_size = None;
-        self.playback_info = None;
         self.timeline.user_paused = true;
         self.status_message = "".into();
         self.error_message = None;
         defer_drop_subtitle(self.subtitle.active.take(), window);
-        self.clear_visible_frame(window, cx);
+        cx.notify();
+    }
+
+    fn prepare_playback_end_report(&mut self) {
+        self.timeline.progress_drag_position = None;
+        self.timeline.pending_seek_position = None;
+        self.timeline.pending_seek_keeps_frame = false;
+        let terminal_position = self.timeline.duration.or_else(|| {
+            self.emby
+                .run_time_ticks
+                .filter(|ticks| *ticks > 0)
+                .map(|ticks| ticks as f64 / request::EMBY_TICKS_PER_SECOND as f64)
+                .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        });
+        if let Some(position) = terminal_position {
+            self.timeline.position = Some(position);
+            self.timeline.buffered_until = Some(position);
+        }
     }
 
     fn reset_after_backend_failure(
@@ -209,7 +250,9 @@ impl PlaybackPage {
         self.timeline.loaded = false;
         self.timeline.ended = false;
         self.frame.source_size = None;
+        self.playback_file_info = None;
         self.playback_info = None;
+        self.playback_audio_info = None;
         self.timeline.user_paused = true;
         self.timeline.paused = true;
         self.timeline.buffering = false;
@@ -278,6 +321,8 @@ impl PlaybackPage {
                 Err(error) => {
                     self.timeline.user_paused = true;
                     self.timeline.paused = true;
+                    self.cancel_queue_switch();
+                    let _ = self.close_playback_reporting(true, false);
                     self.clear_visible_frame(window, cx);
                     self.error_message = Some(format!("渲染视频失败：{error}").into());
                 }
@@ -299,11 +344,14 @@ fn cache_state_needs_poll(state: &PlaybackCacheState) -> bool {
 }
 
 fn apply_playback_restart_to_timeline(timeline: &mut PlaybackTimelineState) {
+    let first_restart = !timeline.loaded;
     let paused_for_cache = timeline.paused_for_cache;
     let cache_buffering_percent = timeline.cache_buffering_percent;
     timeline.loaded = true;
     timeline.ended = false;
-    timeline.user_paused = false;
+    if first_restart {
+        timeline.user_paused = false;
+    }
     timeline.paused = effective_playback_paused(timeline.user_paused, paused_for_cache);
     timeline.buffering = false;
     // A restart also marks the first frame after a seek. The cache state emitted
@@ -461,6 +509,23 @@ mod tests {
         assert!(!timeline.cache_status_open);
         assert_eq!(timeline.pending_seek_position, None);
         assert!(!timeline.pending_seek_keeps_frame);
+    }
+
+    #[test]
+    fn playback_restart_preserves_user_pause_after_initial_load() {
+        let mut timeline = PlaybackTimelineState {
+            loaded: true,
+            user_paused: true,
+            paused: true,
+            pending_seek_position: Some(60.0),
+            ..PlaybackTimelineState::default()
+        };
+
+        apply_playback_restart_to_timeline(&mut timeline);
+
+        assert!(timeline.user_paused);
+        assert!(timeline.paused);
+        assert_eq!(timeline.pending_seek_position, None);
     }
 
     #[test]

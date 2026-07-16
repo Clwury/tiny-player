@@ -194,7 +194,11 @@ impl TinyApp {
         cx.subscribe(
             &playback_page,
             |app: &mut TinyApp, _, event, cx| match event {
-                PlaybackEvent::Back => app.return_to_playback_origin(cx),
+                PlaybackEvent::Update { update } => app.update_playback_origin(update.clone(), cx),
+                PlaybackEvent::Back { update } => app.return_to_playback_origin(update.clone(), cx),
+                PlaybackEvent::Replace { request, update } => {
+                    app.replace_playback_page(request.as_ref().clone(), update.clone(), cx)
+                }
             },
         )
         .detach();
@@ -205,12 +209,48 @@ impl TinyApp {
         cx.notify();
     }
 
-    fn return_to_playback_origin(&mut self, cx: &mut Context<Self>) {
+    fn return_to_playback_origin(
+        &mut self,
+        update: crate::player::PlaybackStateUpdate,
+        cx: &mut Context<Self>,
+    ) {
         let Page::Playback { return_to, .. } = &self.page else {
             return;
         };
+        return_to.update(cx, |page, cx| {
+            page.apply_playback_update(update, cx);
+        });
         self.page = Page::Home(return_to.clone());
         cx.notify();
+    }
+
+    fn update_playback_origin(
+        &mut self,
+        update: crate::player::PlaybackStateUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        let Page::Playback { return_to, .. } = &self.page else {
+            return;
+        };
+        return_to.update(cx, |page, cx| {
+            page.apply_playback_update(update, cx);
+        });
+    }
+
+    fn replace_playback_page(
+        &mut self,
+        request: PlaybackRequest,
+        update: crate::player::PlaybackStateUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        let Page::Playback { return_to, .. } = &self.page else {
+            return;
+        };
+        let return_to = return_to.clone();
+        return_to.update(cx, |page, cx| {
+            page.apply_playback_update(update, cx);
+        });
+        self.open_playback_page(return_to, request, cx);
     }
 
     fn is_selecting_server(&self, server_id: &str) -> bool {

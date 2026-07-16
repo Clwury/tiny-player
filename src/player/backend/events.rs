@@ -8,10 +8,45 @@ const NETWORK_CACHE_PAUSE_WAIT_SECONDS: f64 = 3.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackVideoInfo {
+    pub codec: String,
+    pub codec_description: Option<String>,
+    pub profile: Option<String>,
     pub decoder: String,
     pub size: RenderSize,
+    pub sample_aspect_ratio: Option<(u32, u32)>,
     pub frame_rate: Option<f64>,
+    pub pixel_format: Option<String>,
+    pub color_range: Option<String>,
+    pub chroma_location: Option<String>,
+    pub color_space: Option<String>,
+    pub color_primaries: Option<String>,
+    pub color_transfer: Option<String>,
+    pub bitrate: Option<u64>,
     pub hardware_accelerated: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlaybackFileInfo {
+    pub format_name: Option<String>,
+    pub format_description: Option<String>,
+    pub bitrate: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaybackAudioInfo {
+    pub codec: String,
+    pub codec_description: Option<String>,
+    pub profile: Option<String>,
+    pub decoder: String,
+    pub channels: Option<u32>,
+    pub channel_layout: Option<String>,
+    pub sample_format: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub output_channels: Option<u32>,
+    pub output_sample_format: Option<String>,
+    pub output_sample_rate: Option<u32>,
+    pub output_device: Option<String>,
+    pub bitrate: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -308,6 +343,8 @@ pub enum BackendEventKind {
     PlaybackEnded,
     PlaybackRestart,
     PlaybackInfoChanged(Option<PlaybackVideoInfo>),
+    PlaybackFileInfoChanged(PlaybackFileInfo),
+    PlaybackAudioInfoChanged(Option<PlaybackAudioInfo>),
     VideoSizeChanged(Option<RenderSize>),
     Buffering(bool),
     PositionChanged(f64),
