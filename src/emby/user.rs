@@ -171,6 +171,23 @@ impl EmbyClient {
         let method = favorite_method(favorite);
         self.send_authenticated_json_url(server, method, url, "解析 Emby 收藏状态响应失败")
     }
+
+    #[instrument(skip(self, server), fields(server = %server.endpoint.display_url(), item_id = %item_id))]
+    pub fn mark_item_played(&self, server: &CachedServer, item_id: &str) -> Result<UserItemData> {
+        let user_id = authenticated_user_id(server)?;
+        validate_non_empty_id(item_id, "Emby 项目 ID")?;
+        let url = played_item_url(&server.endpoint, user_id, item_id)?;
+        self.send_authenticated_json_url(server, Method::POST, url, "解析 Emby 已观看状态响应失败")
+    }
+
+    #[instrument(skip(self, server), fields(server = %server.endpoint.display_url(), item_id = %item_id))]
+    pub fn hide_item_from_resume(&self, server: &CachedServer, item_id: &str) -> Result<()> {
+        let user_id = authenticated_user_id(server)?;
+        validate_non_empty_id(item_id, "Emby 项目 ID")?;
+        let url = hide_from_resume_url(&server.endpoint, user_id, item_id)?;
+        self.send_authenticated_url(server, Method::POST, url)?;
+        Ok(())
+    }
 }
 
 fn add_resume_items_query(url: &mut url::Url) {
@@ -233,6 +250,27 @@ fn favorite_item_url(
     item_id: &str,
 ) -> Result<url::Url> {
     api_url(endpoint, &["Users", user_id, "FavoriteItems", item_id])
+}
+
+fn played_item_url(
+    endpoint: &crate::server::ServerEndpoint,
+    user_id: &str,
+    item_id: &str,
+) -> Result<url::Url> {
+    api_url(endpoint, &["Users", user_id, "PlayedItems", item_id])
+}
+
+fn hide_from_resume_url(
+    endpoint: &crate::server::ServerEndpoint,
+    user_id: &str,
+    item_id: &str,
+) -> Result<url::Url> {
+    let mut url = api_url(
+        endpoint,
+        &["Users", user_id, "Items", item_id, "HideFromResume"],
+    )?;
+    url.query_pairs_mut().append_pair("Hide", "true");
+    Ok(url)
 }
 
 fn favorite_method(favorite: bool) -> Method {
@@ -353,6 +391,14 @@ pub enum UserItemsSort {
     SortName,
     DateLastContentAdded,
     DateCreated,
+    PremiereDate,
+    ProductionYear,
+    CommunityRating,
+    CriticRating,
+    DatePlayed,
+    PlayCount,
+    Random,
+    OfficialRating,
 }
 
 impl UserItemsSort {
@@ -361,6 +407,14 @@ impl UserItemsSort {
             Self::SortName => "SortName",
             Self::DateLastContentAdded => "DateLastContentAdded,DateCreated,SortName",
             Self::DateCreated => "DateCreated,DateLastContentAdded,SortName",
+            Self::PremiereDate => "PremiereDate",
+            Self::ProductionYear => "ProductionYear",
+            Self::CommunityRating => "CommunityRating",
+            Self::CriticRating => "CriticRating",
+            Self::DatePlayed => "DatePlayed",
+            Self::PlayCount => "PlayCount",
+            Self::Random => "Random",
+            Self::OfficialRating => "OfficialRating",
         }
     }
 }
@@ -903,6 +957,27 @@ mod tests {
     }
 
     #[test]
+    fn serializes_library_sort_options() {
+        assert_eq!(UserItemsSort::SortName.as_str(), "SortName");
+        assert_eq!(
+            UserItemsSort::DateLastContentAdded.as_str(),
+            "DateLastContentAdded,DateCreated,SortName"
+        );
+        assert_eq!(
+            UserItemsSort::DateCreated.as_str(),
+            "DateCreated,DateLastContentAdded,SortName"
+        );
+        assert_eq!(UserItemsSort::PremiereDate.as_str(), "PremiereDate");
+        assert_eq!(UserItemsSort::ProductionYear.as_str(), "ProductionYear");
+        assert_eq!(UserItemsSort::CommunityRating.as_str(), "CommunityRating");
+        assert_eq!(UserItemsSort::CriticRating.as_str(), "CriticRating");
+        assert_eq!(UserItemsSort::DatePlayed.as_str(), "DatePlayed");
+        assert_eq!(UserItemsSort::PlayCount.as_str(), "PlayCount");
+        assert_eq!(UserItemsSort::Random.as_str(), "Random");
+        assert_eq!(UserItemsSort::OfficialRating.as_str(), "OfficialRating");
+    }
+
+    #[test]
     fn builds_user_items_url() {
         let endpoint = ServerEndpoint {
             protocol: Protocol::Https,
@@ -1098,6 +1173,28 @@ mod tests {
         );
         assert_eq!(favorite_method(true), Method::POST);
         assert_eq!(favorite_method(false), Method::DELETE);
+    }
+
+    #[test]
+    fn builds_played_and_hide_from_resume_endpoints() {
+        let endpoint = ServerEndpoint {
+            protocol: Protocol::Https,
+            address: "example.com".to_string(),
+            port: 443,
+            path: "/emby".to_string(),
+        };
+
+        let played = played_item_url(&endpoint, "user-1", "item-1").unwrap();
+        assert_eq!(
+            played.as_str(),
+            "https://example.com/emby/Users/user-1/PlayedItems/item-1"
+        );
+
+        let hidden = hide_from_resume_url(&endpoint, "user-1", "item-1").unwrap();
+        assert_eq!(
+            hidden.as_str(),
+            "https://example.com/emby/Users/user-1/Items/item-1/HideFromResume?Hide=true"
+        );
     }
 
     #[test]

@@ -81,6 +81,7 @@ impl HomeContent {
 
     fn open_detail_state(&mut self, detail: SeriesDetailState, cx: &mut Context<Self>) {
         self.resume_detail_failed = None;
+        self.resume_item_context_menu = None;
         self.favorite_failures.remove(&detail.series_id);
         if let Some(current) = self.series_detail.take() {
             self.detail_history.push(current);

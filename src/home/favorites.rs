@@ -271,7 +271,7 @@ impl HomeContent {
         self.user_data_revision
     }
 
-    fn bump_user_data_revision(&mut self, item_id: &str) {
+    pub(super) fn bump_user_data_revision(&mut self, item_id: &str) {
         self.user_data_revision = self.user_data_revision.wrapping_add(1);
         self.user_data_item_revisions
             .insert(item_id.to_string(), self.user_data_revision);

@@ -9,6 +9,7 @@ mod navigation;
 mod paged_items;
 mod playback;
 mod render;
+mod resume_actions;
 mod search;
 mod sidebar;
 mod workspace_render;
@@ -27,6 +28,7 @@ use favorites::FavoriteRollback;
 use library::LibraryState;
 use navigation::{HomeNavigation, HomeRoot, HomeRoute};
 use paged_items::PagedItemsState;
+use resume_actions::ResumeItemContextMenu;
 use search::SearchState;
 
 pub(crate) use detail::SeriesDetailState;
@@ -107,7 +109,10 @@ struct HomeContent {
     resume_items: Option<ResumeItems>,
     resume_items_failed: Option<gpui::SharedString>,
     resume_detail_failed: Option<gpui::SharedString>,
+    resume_action_failed: Option<gpui::SharedString>,
     resume_items_carousel: CarouselState,
+    resume_item_context_menu: Option<ResumeItemContextMenu>,
+    resume_item_requests: HashSet<String>,
     user_view_items_rows: HashMap<String, UserViewItemsRow>,
     latest_queue: VecDeque<String>,
     latest_in_flight: HashSet<(String, u64)>,
@@ -184,7 +189,10 @@ impl HomeContent {
             resume_items: None,
             resume_items_failed: None,
             resume_detail_failed: None,
+            resume_action_failed: None,
             resume_items_carousel: CarouselState::default(),
+            resume_item_context_menu: None,
+            resume_item_requests: HashSet::new(),
             user_view_items_rows: HashMap::new(),
             latest_queue: VecDeque::new(),
             latest_in_flight: HashSet::new(),
@@ -247,6 +255,7 @@ impl HomeContent {
         self.series_detail = None;
         self.detail_history.clear();
         self.favorite_failures.clear();
+        self.resume_item_context_menu = None;
         match root {
             HomeRoot::Home => self.start_effects(cx),
             HomeRoot::Favorites if self.authentication_error.is_none() => {

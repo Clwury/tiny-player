@@ -401,7 +401,10 @@ fn select_subtitle_stream_for_selection(
     };
     input
         .stream_by_index(stream_index, ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE)
-        .map(Some)
+        .map(|stream| {
+            log_selected_subtitle_stream(selected_tracks, stream);
+            Some(stream)
+        })
         .map_err(|error| format!("FFmpeg 选择指定字幕流失败：{error}"))
 }
 
@@ -417,8 +420,26 @@ pub(super) fn select_subtitle_stream_for_selection_from_catalog(
     };
     catalog
         .stream_by_index(stream_index, ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE)
-        .map(Some)
+        .map(|stream| {
+            log_selected_subtitle_stream(selected_tracks, stream);
+            Some(stream)
+        })
         .map_err(|error| format!("FFmpeg 选择指定字幕流失败：{error}"))
+}
+
+fn log_selected_subtitle_stream(
+    selected_tracks: &crate::player::PlaybackTrackSelection,
+    stream: StreamInfo,
+) {
+    tracing::debug!(
+        requested_subtitle_stream_index = ?selected_tracks.subtitle_stream_index,
+        ffmpeg_subtitle_stream_index = stream.index,
+        subtitle_codec = %ffmpeg_codec_name(stream.codec_id),
+        subtitle_time_base_num = stream.time_base.num,
+        subtitle_time_base_den = stream.time_base.den,
+        subtitle_start_nsecs = ?stream.start_nsecs,
+        "selected FFmpeg subtitle stream"
+    );
 }
 
 pub(super) fn open_audio_decoder(

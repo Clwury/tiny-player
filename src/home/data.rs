@@ -168,6 +168,8 @@ impl HomeContent {
         self.resume_items = None;
         self.resume_items_failed = None;
         self.resume_detail_failed = None;
+        self.resume_action_failed = None;
+        self.resume_item_context_menu = None;
         self.resume_items_carousel = Default::default();
         self.user_view_items_rows.clear();
         self.latest_queue.clear();
@@ -301,6 +303,9 @@ impl HomeContent {
                 self.absorb_resume_items_user_data(&items, user_data_revision);
                 self.home_effects.resume_items = super::LoadState::Loaded;
                 self.resume_items_failed = None;
+                if self.resume_item_requests.is_empty() {
+                    self.resume_action_failed = None;
+                }
                 self.ensure_resume_item_images(&items, cx);
                 self.resume_items = Some(items);
                 self.schedule_home_snapshot_save(cx);

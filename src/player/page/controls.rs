@@ -605,11 +605,13 @@ impl PlaybackPage {
                     .min_w(px(190.0))
                     .max_w(px(280.0))
                     .max_h(px(TRACK_SELECT_MENU_MAX_HEIGHT_PX))
+                    .gap_1()
                     .overflow_y_scroll()
                     .rounded(px(8.0))
                     .border_1()
-                    .border_color(theme.input_border.opacity(0.62))
-                    .bg(rgba(0x000000dd))
+                    .border_color(theme.input_border.opacity(0.72))
+                    .bg(rgba(0x000000e6))
+                    .p(px(4.0))
                     .shadow_lg()
                     .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -1603,25 +1605,39 @@ pub(super) fn track_select_option(
     cx: &Context<PlaybackPage>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
+    let hover_background = if selected {
+        theme.input_border_focused.opacity(0.34)
+    } else {
+        theme.foreground.opacity(0.12)
+    };
+
     div()
         .flex()
         .flex_none()
         .h(px(32.0))
         .min_h(px(32.0))
         .items_center()
-        .justify_between()
-        .gap_3()
-        .px_3()
-        .text_xs()
-        .text_color(theme.foreground.opacity(if selected { 1.0 } else { 0.82 }))
-        .bg(if selected {
-            theme.foreground.opacity(0.14)
+        .rounded(px(6.0))
+        .px_1()
+        .text_sm()
+        .font_weight(if selected {
+            gpui::FontWeight::SEMIBOLD
         } else {
-            theme.background.opacity(0.0)
+            gpui::FontWeight::NORMAL
+        })
+        .text_color(if selected {
+            theme.foreground
+        } else {
+            theme.foreground.opacity(0.86)
+        })
+        .bg(if selected {
+            theme.input_border_focused.opacity(0.24)
+        } else {
+            theme.foreground.opacity(0.0)
         })
         .cursor_pointer()
-        .hover(move |style| style.bg(theme.foreground.opacity(0.12)))
-        .child(div().min_w_0().truncate().child(label.into()))
+        .hover(move |style| style.bg(hover_background))
+        .child(div().flex_1().min_w_0().truncate().child(label.into()))
 }
 
 pub(super) fn valid_frame_rate(frame_rate: f64) -> Option<f64> {

@@ -7,6 +7,7 @@ use std::time::Duration;
 use ffmpeg_sys_next as ffi;
 
 use crate::player::{
+    PlaybackTrackSelection,
     backend::{BackendEvent, BackendEventKind, PlaybackCacheConfig, PlaybackSeekMode},
     render_host::VideoOutputQueue,
 };
@@ -28,6 +29,7 @@ use super::{
 use crate::player::backend::ffmpeg::worker::{PendingSeek, PendingTrackSelection};
 
 const HEVC_CONTINUOUS_SEEK_COALESCE_QUIET_PERIOD: Duration = Duration::from_millis(180);
+const SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON: &str = "internal_subtitle_track_change";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PlaybackCommandServiceStatus {
@@ -190,6 +192,8 @@ fn service_track_selection_command(
     pending_track_selection: PendingTrackSelection,
 ) -> std::result::Result<(), String> {
     let selected_tracks = pending_track_selection.selected_tracks.clone();
+    let low_level_seek_reason =
+        track_selection_low_level_seek_reason(&context.source.selected_tracks, &selected_tracks);
     let demux_audio_stream = select_audio_stream_for_selection_from_catalog(
         &selected_tracks,
         context.stream_catalog,
@@ -209,8 +213,8 @@ fn service_track_selection_command(
         position_seconds,
         seek_mode: PlaybackSeekMode::Precise,
         seek_generation: pending_track_selection.generation,
-        force_low_level_seek: false,
-        low_level_seek_reason: None,
+        force_low_level_seek: low_level_seek_reason.is_some(),
+        low_level_seek_reason,
         session_id: context.session.id(),
         vo_queue: context.vo_queue,
         demux_cache: context.demux_cache,
@@ -282,13 +286,38 @@ fn service_track_selection_command(
     Ok(())
 }
 
+fn track_selection_low_level_seek_reason(
+    previous: &PlaybackTrackSelection,
+    next: &PlaybackTrackSelection,
+) -> Option<&'static str> {
+    let previous_internal_subtitle = internal_subtitle_stream_index(previous);
+    let next_internal_subtitle = internal_subtitle_stream_index(next);
+
+    // The demux cache only indexes the currently selected subtitle stream. A cached seek after
+    // selecting another internal stream therefore has no historical packets for the new track and
+    // would resume that stream from the demuxer's already-prefetched append position instead.
+    (next_internal_subtitle.is_some() && next_internal_subtitle != previous_internal_subtitle)
+        .then_some(SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON)
+}
+
+fn internal_subtitle_stream_index(selection: &PlaybackTrackSelection) -> Option<usize> {
+    if selection.subtitle_external_url.is_some() {
+        None
+    } else {
+        selection.subtitle_stream_index
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::player::{backend::PlaybackSeekMode, render_host::PlaybackSessionId};
+    use crate::player::{
+        PlaybackTrackSelection, backend::PlaybackSeekMode, render_host::PlaybackSessionId,
+    };
 
     use super::{
         FfmpegControl, HEVC_CONTINUOUS_SEEK_COALESCE_QUIET_PERIOD, PendingSeek,
-        pending_seek_is_latest_generation,
+        SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON, pending_seek_is_latest_generation,
+        track_selection_low_level_seek_reason,
     };
 
     fn pending_seek(generation: u64, position_seconds: f64) -> PendingSeek {
@@ -319,6 +348,79 @@ mod tests {
     fn hevc_seek_coalesce_window_covers_keyboard_repeat_interval() {
         assert!(
             HEVC_CONTINUOUS_SEEK_COALESCE_QUIET_PERIOD >= std::time::Duration::from_millis(180)
+        );
+    }
+
+    #[test]
+    fn changing_internal_subtitle_track_forces_low_level_seek() {
+        let previous = PlaybackTrackSelection {
+            subtitle_stream_index: Some(2),
+            subtitle_codec: Some("subrip".to_string()),
+            ..PlaybackTrackSelection::default()
+        };
+        let next = PlaybackTrackSelection {
+            subtitle_stream_index: Some(4),
+            subtitle_codec: Some("subrip".to_string()),
+            ..PlaybackTrackSelection::default()
+        };
+
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &next),
+            Some(SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON)
+        );
+    }
+
+    #[test]
+    fn enabling_internal_subtitle_track_forces_low_level_seek() {
+        let previous = PlaybackTrackSelection::default();
+        let next = PlaybackTrackSelection {
+            subtitle_stream_index: Some(4),
+            subtitle_codec: Some("subrip".to_string()),
+            ..PlaybackTrackSelection::default()
+        };
+
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &next),
+            Some(SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON)
+        );
+    }
+
+    #[test]
+    fn audio_only_or_external_subtitle_changes_keep_cached_seek() {
+        let previous = PlaybackTrackSelection {
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(4),
+            subtitle_codec: Some("subrip".to_string()),
+            ..PlaybackTrackSelection::default()
+        };
+        let audio_change = PlaybackTrackSelection {
+            audio_stream_index: Some(5),
+            ..previous.clone()
+        };
+        let external_subtitle = PlaybackTrackSelection {
+            subtitle_stream_index: Some(7),
+            subtitle_external_url: Some("https://example.com/subtitle.ass".to_string()),
+            subtitle_codec: Some("ass".to_string()),
+            ..previous.clone()
+        };
+        let subtitles_off = PlaybackTrackSelection {
+            subtitle_stream_index: None,
+            subtitle_external_url: None,
+            subtitle_codec: None,
+            ..previous.clone()
+        };
+
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &audio_change),
+            None
+        );
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &external_subtitle),
+            None
+        );
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &subtitles_off),
+            None
         );
     }
 }

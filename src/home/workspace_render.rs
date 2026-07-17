@@ -1,20 +1,28 @@
 use gpui::{
     App, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    ScrollHandle, StatefulInteractiveElement, Styled, Window, canvas, div, prelude::FluentBuilder,
-    px,
+    ScrollHandle, StatefulInteractiveElement, Styled, Window, canvas, deferred, div,
+    prelude::FluentBuilder, px, svg,
 };
 
-use crate::{emby::UserItem, theme};
+use crate::{
+    emby::{SortOrder, UserItem, UserItemsSort},
+    theme,
+};
 
 use super::{
     HomeContent,
     carousel::HOME_MAIN_SCROLLBAR_WIDTH_PX,
     components::{user_episode_card, user_item_card},
+    library::{LibraryState, available_library_sorts},
     navigation::HomeRoute,
     paged_items::PagedItemsState,
 };
 
 const LIBRARY_AUTO_LOAD_MIN_THRESHOLD_PX: f32 = 480.0;
+const LIBRARY_FIXED_HEADER_HEIGHT_PX: f32 = 64.0;
+const LIBRARY_SORT_SELECT_WIDTH_PX: f32 = 232.0;
+const LIBRARY_SORT_OPTION_HEIGHT_PX: f32 = 30.0;
+const LIBRARY_SORT_ORDERS: [SortOrder; 2] = [SortOrder::Ascending, SortOrder::Descending];
 
 impl HomeContent {
     pub(super) fn render_library_scrollable_content(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -31,6 +39,8 @@ impl HomeContent {
             .paged
             .total_record_count
             .map(|total| format!("共 {total} 项"));
+        let sort_select = self.render_library_sort_select(view_id, state, cx);
+        let back = cx.listener(Self::close_series_detail);
         let retry_refresh = cx.listener(|page, _, _, cx| page.retry_current_library(cx));
         let retry_initial = cx.listener(|page, _, _, cx| page.retry_current_library(cx));
 
@@ -41,72 +51,216 @@ impl HomeContent {
             .bottom_0()
             .left_0()
             .id("home-library-content")
-            .overflow_y_scroll()
-            .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
-            .track_scroll(&state.paged.scroll_handle)
-            .px_6()
-            .pt_4()
-            .pb_6()
+            .flex()
+            .flex_col()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|page, _, _, cx| page.close_current_library_sort_menu(cx)),
+            )
             .child(
                 div()
-                    .ml_10()
-                    .mb_5()
+                    .id("home-library-fixed-header")
                     .flex()
-                    .h(px(32.0))
-                    .items_center()
-                    .when_some(total, |this, total| {
-                        this.child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child(total),
-                        )
-                    }),
-            )
-            .when_some(state.paged.refresh_error.clone(), |this, error| {
-                this.child(self.render_inline_error(
-                    error,
-                    "retry-library-refresh",
-                    retry_refresh,
-                    cx,
-                ))
-            })
-            .when(
-                state.paged.initial.is_loading() && state.paged.items.is_empty(),
-                |this| this.child(self.render_center_message("加载媒体库中…", false, cx)),
-            )
-            .when_some(
-                state
-                    .paged
-                    .initial_error
-                    .clone()
-                    .filter(|_| state.paged.items.is_empty()),
-                |this, error| {
-                    this.child(
+                    .h(px(LIBRARY_FIXED_HEADER_HEIGHT_PX))
+                    .flex_none()
+                    .items_start()
+                    .gap_3()
+                    .bg(theme.background)
+                    .px_4()
+                    .pt_4()
+                    .child(library_back_button(back, cx))
+                    .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .items_start()
-                            .gap_3()
-                            .child(div().text_sm().text_color(theme.error).child(error))
-                            .child(self.render_text_action(
-                                "retry-library-initial",
-                                "重试",
-                                retry_initial,
-                                cx,
-                            )),
+                            .h(px(32.0))
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .child(div().min_w_0().when_some(total, |this, total| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child(total),
+                                )
+                            }))
+                            .child(sort_select),
+                    ),
+            )
+            .child(
+                div()
+                    .id("home-library-scroll-content")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
+                    .track_scroll(&state.paged.scroll_handle)
+                    .px_6()
+                    .pb_6()
+                    .when_some(state.paged.refresh_error.clone(), |this, error| {
+                        this.child(self.render_inline_error(
+                            error,
+                            "retry-library-refresh",
+                            retry_refresh,
+                            cx,
+                        ))
+                    })
+                    .when(
+                        state.paged.initial.is_loading() && state.paged.items.is_empty(),
+                        |this| this.child(self.render_center_message("加载媒体库中…", false, cx)),
                     )
-                },
+                    .when_some(
+                        state
+                            .paged
+                            .initial_error
+                            .clone()
+                            .filter(|_| state.paged.items.is_empty()),
+                        |this, error| {
+                            this.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .items_start()
+                                    .gap_3()
+                                    .child(div().text_sm().text_color(theme.error).child(error))
+                                    .child(self.render_text_action(
+                                        "retry-library-initial",
+                                        "重试",
+                                        retry_initial,
+                                        cx,
+                                    )),
+                            )
+                        },
+                    )
+                    .when(
+                        state.paged.initial != super::LoadState::Loading
+                            && state.paged.initial_error.is_none()
+                            && state.paged.items.is_empty(),
+                        |this| {
+                            this.child(self.render_center_message("该媒体库暂无内容", false, cx))
+                        },
+                    )
+                    .when(!state.paged.items.is_empty(), |this| {
+                        this.child(self.render_items_grid(
+                            &state.paged.items,
+                            "library-grid-item",
+                            cx,
+                        ))
+                        .child(self.render_library_paged_footer(&state.paged, view_id, cx))
+                    }),
             )
-            .when(
-                state.paged.initial != super::LoadState::Loading
-                    && state.paged.initial_error.is_none()
-                    && state.paged.items.is_empty(),
-                |this| this.child(self.render_center_message("该媒体库暂无内容", false, cx)),
+    }
+
+    fn render_library_sort_select(
+        &self,
+        view_id: &str,
+        state: &LibraryState,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = theme::get(cx);
+        let sort_by = state.sort_by;
+        let sort_order = state.sort_order;
+        let menu_open = state.sort_menu_open;
+        let trigger_label = format!(
+            "{} · {}",
+            library_sort_label(sort_by),
+            library_sort_order_label(sort_order)
+        );
+        let toggle = cx.listener(|page, _, _, cx| page.toggle_current_library_sort_menu(cx));
+        let sort_options = available_library_sorts(&state.item_types)
+            .enumerate()
+            .map(|(index, candidate)| {
+                let option_view_id = view_id.to_string();
+                let select = cx.listener(move |page, _, _, cx| {
+                    page.select_library_sort_by(option_view_id.clone(), candidate, cx);
+                });
+                library_sort_option(
+                    library_sort_label(candidate),
+                    candidate == sort_by,
+                    (
+                        gpui::ElementId::from("library-sort-option"),
+                        index.to_string(),
+                    ),
+                    cx,
+                )
+                .on_click(select)
+            })
+            .collect::<Vec<_>>();
+        let order_options = LIBRARY_SORT_ORDERS
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let option_view_id = view_id.to_string();
+                let select = cx.listener(move |page, _, _, cx| {
+                    page.select_library_sort_order(option_view_id.clone(), candidate, cx);
+                });
+                library_sort_option(
+                    library_sort_order_label(candidate),
+                    candidate == sort_order,
+                    (
+                        gpui::ElementId::from("library-sort-order-option"),
+                        index.to_string(),
+                    ),
+                    cx,
+                )
+                .on_click(select)
+            })
+            .collect::<Vec<_>>();
+        div()
+            .relative()
+            .flex_none()
+            .child(
+                library_sort_trigger(trigger_label, menu_open, cx)
+                    .id("library-sort-select")
+                    .on_click(toggle),
             )
-            .when(!state.paged.items.is_empty(), |this| {
-                this.child(self.render_items_grid(&state.paged.items, "library-grid-item", cx))
-                    .child(self.render_library_paged_footer(&state.paged, view_id, cx))
+            .when(menu_open, |this| {
+                this.child(
+                    deferred(
+                        div()
+                            .id("library-sort-menu")
+                            .absolute()
+                            .top(px(40.0))
+                            .right_0()
+                            .flex()
+                            .w(px(LIBRARY_SORT_SELECT_WIDTH_PX))
+                            .flex_col()
+                            .overflow_hidden()
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(theme.input_border_focused)
+                            .bg(theme.dialog_background)
+                            .shadow_lg()
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(library_sort_group_label("排序方式", cx))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .px_1()
+                                    .pb_1()
+                                    .children(sort_options),
+                            )
+                            .child(div().mx_2().h(px(1.0)).bg(theme.input_border))
+                            .child(library_sort_group_label("排列顺序", cx))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .px_1()
+                                    .pb_1()
+                                    .children(order_options),
+                            ),
+                    )
+                    .with_priority(2),
+                )
             })
     }
 
@@ -478,6 +632,156 @@ impl HomeContent {
     }
 }
 
+fn library_back_button(
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &Context<HomeContent>,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+
+    div()
+        .id("home-library-back-button")
+        .flex()
+        .size(px(32.0))
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .occlude()
+        .cursor_pointer()
+        .hover(move |style| style.bg(theme.secondary_hover))
+        .child(
+            svg()
+                .path("icons/chevron-left.svg")
+                .size(px(18.0))
+                .text_color(theme.foreground),
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_click(on_click)
+}
+
+fn library_sort_trigger<T>(label: String, menu_open: bool, cx: &Context<T>) -> gpui::Div {
+    let theme = theme::get(cx);
+
+    div()
+        .flex()
+        .h(px(32.0))
+        .w(px(LIBRARY_SORT_SELECT_WIDTH_PX))
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(if menu_open {
+            theme.input_border_focused
+        } else {
+            theme.input_border
+        })
+        .bg(theme.dialog_background.opacity(0.88))
+        .px_3()
+        .text_sm()
+        .text_color(theme.foreground)
+        .cursor_pointer()
+        .hover(move |style| style.bg(theme.secondary_hover))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .child(div().min_w_0().truncate().child(label))
+        .child(
+            svg()
+                .path("icons/chevron-right.svg")
+                .size(px(14.0))
+                .text_color(theme.muted_foreground),
+        )
+}
+
+fn library_sort_group_label<T>(label: &'static str, cx: &Context<T>) -> gpui::Div {
+    let theme = theme::get(cx);
+
+    div()
+        .flex()
+        .h(px(28.0))
+        .flex_none()
+        .items_center()
+        .px_3()
+        .text_xs()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme.muted_foreground)
+        .child(label)
+}
+
+fn library_sort_option<T>(
+    label: &'static str,
+    selected: bool,
+    id: impl Into<gpui::ElementId>,
+    cx: &Context<T>,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = theme::get(cx);
+
+    div()
+        .id(id)
+        .flex()
+        .h(px(LIBRARY_SORT_OPTION_HEIGHT_PX))
+        .flex_none()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .rounded(px(6.0))
+        .px_2()
+        .text_sm()
+        .font_weight(if selected {
+            gpui::FontWeight::SEMIBOLD
+        } else {
+            gpui::FontWeight::NORMAL
+        })
+        .text_color(if selected {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        })
+        .bg(if selected {
+            theme.secondary_hover
+        } else {
+            theme.dialog_background
+        })
+        .cursor_pointer()
+        .hover(move |style| style.bg(theme.secondary_hover))
+        .child(div().min_w_0().truncate().child(label))
+        .when(selected, |this| {
+            this.child(
+                div()
+                    .flex_none()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.input_border_focused)
+                    .child("✓"),
+            )
+        })
+}
+
+fn library_sort_label(sort_by: UserItemsSort) -> &'static str {
+    match sort_by {
+        UserItemsSort::SortName => "名称",
+        UserItemsSort::DateCreated => "添加日期",
+        UserItemsSort::PremiereDate => "发行日期",
+        UserItemsSort::ProductionYear => "年份",
+        UserItemsSort::CommunityRating => "社区评分",
+        UserItemsSort::CriticRating => "影评人评分",
+        UserItemsSort::DatePlayed => "播放日期",
+        UserItemsSort::DateLastContentAdded => "最后一集添加日期",
+        UserItemsSort::PlayCount => "播放次数",
+        UserItemsSort::Random => "随机",
+        UserItemsSort::OfficialRating => "分级",
+    }
+}
+
+fn library_sort_order_label(sort_order: SortOrder) -> &'static str {
+    match sort_order {
+        SortOrder::Ascending => "升序",
+        SortOrder::Descending => "降序",
+    }
+}
+
 fn library_scroll_is_near_end(scroll_handle: &ScrollHandle) -> bool {
     let scroll_top = -f32::from(scroll_handle.offset().y);
     let max_offset = f32::from(scroll_handle.max_offset().height);
@@ -510,5 +814,17 @@ mod tests {
     #[test]
     fn library_auto_loads_again_when_content_does_not_fill_the_viewport() {
         assert!(library_scroll_position_is_near_end(0.0, 0.0, 800.0));
+    }
+
+    #[test]
+    fn library_sort_controls_use_requested_labels() {
+        assert_eq!(library_sort_label(UserItemsSort::SortName), "名称");
+        assert_eq!(
+            library_sort_label(UserItemsSort::DateLastContentAdded),
+            "最后一集添加日期"
+        );
+        assert_eq!(library_sort_label(UserItemsSort::OfficialRating), "分级");
+        assert_eq!(library_sort_order_label(SortOrder::Ascending), "升序");
+        assert_eq!(library_sort_order_label(SortOrder::Descending), "降序");
     }
 }
