@@ -14,17 +14,21 @@ use crate::player::{
 
 use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
 use super::decoder_packet_queue::DecoderPacketQueues;
+use super::scheduled_video_queue::{
+    VIDEO_TIMESTAMP_ROUNDING_TOLERANCE_NSECS, video_timestamp_gap_within_threshold,
+};
 use super::video_decode_worker::{
     VideoDecodeDrainResult, VideoDecodeEnqueueResult, VideoDecodePacketStatus, VideoDecodeWorker,
     VideoDecodeWorkerInfo, VideoDecodeWorkerSnapshot, VideoDecodeWorkerState, VideoDecodedFrame,
 };
+use super::video_frame_prepare_worker::DecodedVideoFrameDiagnostic;
 use super::{
-    AvPacket, CORRUPT_VIDEO_FRAME_RECOVERY_ERROR, Decoder, DemuxReaderWatermark, DoviPipeline,
-    HardwareDecodeMode, PlaybackBlockReason, PlaybackGeneration, PlaybackOutputSnapshot,
-    StreamInfo, VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS,
-    VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-    VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, duration_nsecs, packet_is_video_recovery_point,
-    packet_is_video_seek_point, timestamp_to_nsecs,
+    AvPacket, AvPacketReadDiagnostic, CORRUPT_VIDEO_FRAME_RECOVERY_ERROR, Decoder,
+    DemuxReaderWatermark, DoviPipeline, HardwareDecodeMode, PlaybackBlockReason,
+    PlaybackGeneration, PlaybackOutputSnapshot, StreamInfo,
+    VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, duration_nsecs,
+    packet_is_video_recovery_point, packet_is_video_seek_point, timestamp_to_nsecs,
 };
 
 const VIDEO_DECODE_PENDING_INPUT_QUEUE_CAPACITY: usize = 8;
@@ -34,13 +38,22 @@ const HEVC_DECODE_CHAIN_ZERO_OUTPUT_PACKET_LEAD_NSECS: u64 = 500_000_000;
 const HEVC_DECODE_CHAIN_REBUFFER_HARD_PACKET_LEAD_NSECS: u64 = 1_000_000_000;
 const HEVC_DECODE_RECOVERY_WAIT_HARD_SKIP_NSECS: u64 = 1_000_000_000;
 const HEVC_POST_FALLBACK_REBUFFER_UNDERFILL_NSECS: u64 = 250_000_000;
-const HEVC_POST_FALLBACK_REBUFFER_RECOVERY_AFTER: Duration = Duration::from_millis(750);
+const HEVC_POST_FALLBACK_REBUFFER_RECOVERY_AFTER: Duration = Duration::from_millis(1_500);
 const HEVC_STARTUP_ZERO_OUTPUT_HARD_PACKET_LIMIT: u64 = 32;
 const HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER: Duration = Duration::from_millis(2_000);
+const HEVC_SOFTWARE_STARTUP_ZERO_OUTPUT_BASE_AFTER: Duration = Duration::from_millis(8_000);
+const HEVC_SOFTWARE_STARTUP_ZERO_OUTPUT_MAX_AFTER: Duration = Duration::from_millis(30_000);
 const HEVC_STARTUP_ZERO_OUTPUT_HARD_MIN_FORWARD_NSECS: u64 = 1_000_000_000;
 const HEVC_STARTUP_IN_FLIGHT_HARD_AFTER: Duration = Duration::from_millis(2_000);
+const HEVC_STARTUP_WATCHDOG_RETRY_AFTER: Duration = Duration::from_millis(25);
+const HEVC_STARTUP_WATCHDOG_REJECTION_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const HEVC_STARTUP_PROBE_PACKET_LIMIT: usize = 32;
 const HEVC_RECENT_GAP_EVIDENCE_CLEAR_AFTER_NSECS: u64 = 500_000_000;
+const HEVC_HARDWARE_RECOVERY_PROGRESS_GRACE: Duration = Duration::from_millis(750);
+const HEVC_SOFTWARE_RECOVERY_PROGRESS_GRACE: Duration = Duration::from_millis(2_000);
+const HEVC_FALLBACK_SAME_TARGET_TOLERANCE_NSECS: u64 = 500_000_000;
+const HEVC_RECOVERABLE_DECODE_GAP_MAX_NSECS: u64 = 500_000_000;
+const HEVC_DECODE_PACKET_DIAGNOSTIC_WINDOW_CAPACITY: usize = 32;
 
 pub(super) struct PendingVideoDecodePacket {
     pub(super) generation: u64,
@@ -59,6 +72,8 @@ pub(super) enum HevcDecodeChainRecoveryAction {
 pub(super) enum HevcDecodedFrameGapAction {
     Admit,
     AdmitSynchronizedTimelineGap,
+    AdmitAndBridgeDecodeGap,
+    DeferFallback,
     DropForFallback,
 }
 
@@ -98,6 +113,17 @@ impl HevcDecodeChainFallbackReason {
                 | Self::RecoveryWaitRebuffer
                 | Self::PostFallbackRebufferUnderfill
                 | Self::PtsGapAfterZeroOutput
+        )
+    }
+
+    pub(super) fn invalidated_by_video_progress(self) -> bool {
+        true
+    }
+
+    pub(super) fn requires_repeat_before_hardware_downgrade(self) -> bool {
+        matches!(
+            self,
+            Self::RecoveryWaitRebuffer | Self::PostFallbackRebufferUnderfill
         )
     }
 }
@@ -160,6 +186,9 @@ pub(super) struct HevcDecodedFrameGapObservation {
     pub(super) audio_timeline_gap: Option<AudioTimelineGapEvidence>,
     pub(super) recovery_waiting: bool,
     pub(super) output_snapshot: PlaybackOutputSnapshot,
+    pub(super) demux_watermark: DemuxReaderWatermark,
+    pub(super) source_frame_diagnostic: DecodedVideoFrameDiagnostic,
+    pub(super) recent_cache_read_anomaly: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -202,6 +231,141 @@ pub(super) struct HevcDecodeChainStats {
     pub(super) soft_recovery_attempted: bool,
     pub(super) recent_soft_recovery_attempted: bool,
     pub(super) pending_fallback_reason: Option<HevcDecodeChainFallbackReason>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HevcPacketDiagnosticFields {
+    stream_index: i32,
+    pts: Option<i64>,
+    dts: Option<i64>,
+    pts_nsecs: Option<u64>,
+    dts_nsecs: Option<u64>,
+    duration: Option<i64>,
+    duration_nsecs: Option<u64>,
+    flags: i32,
+    key_frame: bool,
+    recovery_point: bool,
+    safe_seek_point: bool,
+    byte_len: usize,
+    cache_read: Option<AvPacketReadDiagnostic>,
+}
+
+impl HevcPacketDiagnosticFields {
+    fn from_packet(
+        packet: &AvPacket,
+        codec_id: ffi::AVCodecID,
+        time_base: ffi::AVRational,
+    ) -> Self {
+        let pts = packet.pts();
+        let dts = packet.dts();
+        let duration = packet.duration();
+        let cache_read = packet.read_diagnostic();
+        Self {
+            stream_index: packet.stream_index(),
+            pts,
+            dts,
+            pts_nsecs: pts.and_then(|pts| timestamp_to_nsecs(pts, time_base)),
+            dts_nsecs: dts.and_then(|dts| timestamp_to_nsecs(dts, time_base)),
+            duration,
+            duration_nsecs: duration.and_then(|duration| timestamp_to_nsecs(duration, time_base)),
+            flags: packet.flags(),
+            key_frame: packet.is_key(),
+            recovery_point: cache_read
+                .map(|cache| cache.recovery_point)
+                .unwrap_or_else(|| packet_is_video_recovery_point(packet, codec_id)),
+            safe_seek_point: cache_read
+                .map(|cache| cache.safe_seek_point)
+                .unwrap_or_else(|| packet_is_video_seek_point(packet, codec_id)),
+            byte_len: packet.byte_len(),
+            cache_read,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HevcDecodePacketDiagnostic {
+    ordinal: u64,
+    generation: u64,
+    hardware_accelerated: bool,
+    packet: HevcPacketDiagnosticFields,
+    pts_delta_nsecs: Option<i128>,
+    dts_delta_nsecs: Option<i128>,
+    decoded_frames: u64,
+    zero_output_run_packets: u64,
+    decode_ok: bool,
+    decode_error: Option<String>,
+    decode_elapsed_micros: u64,
+    drained: bool,
+}
+
+#[derive(Default)]
+struct HevcDecodePacketDiagnosticWindow {
+    // Retained only for on-demand gap logging; watchdog decisions do not inspect this window.
+    next_ordinal: u64,
+    packets: VecDeque<HevcDecodePacketDiagnostic>,
+}
+
+impl HevcDecodePacketDiagnosticWindow {
+    fn record(
+        &mut self,
+        status: &VideoDecodePacketStatus,
+        packet: &AvPacket,
+        video_stream: StreamInfo,
+        zero_output_run_packets: u64,
+        hardware_accelerated: bool,
+    ) {
+        self.next_ordinal = self.next_ordinal.saturating_add(1);
+        let packet = HevcPacketDiagnosticFields::from_packet(
+            packet,
+            video_stream.codec_id,
+            video_stream.time_base,
+        );
+        let previous = self.packets.back().map(|previous| previous.packet);
+        let pts_delta_nsecs = packet
+            .pts_nsecs
+            .zip(previous.and_then(|previous| previous.pts_nsecs))
+            .map(|(current, previous)| i128::from(current) - i128::from(previous));
+        let dts_delta_nsecs = packet
+            .dts_nsecs
+            .zip(previous.and_then(|previous| previous.dts_nsecs))
+            .map(|(current, previous)| i128::from(current) - i128::from(previous));
+        let decode_elapsed_micros = u64::try_from(status.elapsed.as_micros()).unwrap_or(u64::MAX);
+        if self.packets.len() >= HEVC_DECODE_PACKET_DIAGNOSTIC_WINDOW_CAPACITY {
+            self.packets.pop_front();
+        }
+        self.packets.push_back(HevcDecodePacketDiagnostic {
+            ordinal: self.next_ordinal,
+            generation: status.generation,
+            hardware_accelerated,
+            packet,
+            pts_delta_nsecs,
+            dts_delta_nsecs,
+            decoded_frames: status.decoded_frames,
+            zero_output_run_packets,
+            decode_ok: status.result.is_ok(),
+            decode_error: status.result.as_ref().err().cloned(),
+            decode_elapsed_micros,
+            drained: status.drained,
+        });
+    }
+
+    fn clear(&mut self) {
+        self.next_ordinal = 0;
+        self.packets.clear();
+    }
+
+    fn has_cache_read_anomaly(&self) -> bool {
+        self.packets.iter().any(|packet| {
+            let Some(cache) = packet.packet.cache_read else {
+                return false;
+            };
+            cache.sequence_contiguous == Some(false)
+                || (cache.previous_read_generation == Some(cache.cache_generation)
+                    && cache.previous_read_packet_id == Some(cache.packet_id))
+                || (packet.dts_delta_nsecs.is_some_and(|delta| delta < 0)
+                    && cache.sequence_contiguous == Some(true))
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -483,6 +647,11 @@ struct HevcDecodeChainWatchdog {
     post_fallback_rebuffer_underfill_started_at: Option<Instant>,
     first_zero_output_at: Option<Instant>,
     startup_in_flight_stall_started_at: Option<Instant>,
+    startup_watchdog_retry_not_before: Option<Instant>,
+    startup_watchdog_last_rejection_at: Option<Instant>,
+    startup_watchdog_last_rejection_reason: Option<&'static str>,
+    startup_watchdog_suppressed_rejections: u64,
+    last_video_progress_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -546,6 +715,7 @@ struct HevcDecodeChainWatchdogInput {
     packet_nsecs: Option<u64>,
     decoded_frames: u64,
     decode_ok: bool,
+    hardware_accelerated: bool,
     output_snapshot: PlaybackOutputSnapshot,
     demux_watermark: DemuxReaderWatermark,
     has_audio_output: bool,
@@ -558,8 +728,7 @@ impl HevcDecodeChainWatchdog {
         *self = Self::default();
     }
 
-    fn reset_transient_after_progress(&mut self, admitted_progress_nsecs: u64) {
-        let pending_fallback = self.pending_fallback;
+    fn reset_transient_after_progress(&mut self, admitted_progress_nsecs: u64, now: Instant) {
         let recent_zero_output_packets = self.recent_zero_output_packets;
         let recent_soft_recovery_attempted = self.recent_soft_recovery_attempted;
         let recent_packet_lead_exceeded = self.recent_packet_lead_exceeded;
@@ -571,11 +740,11 @@ impl HevcDecodeChainWatchdog {
                 .saturating_add(admitted_progress_nsecs)
         });
         self.reset();
-        self.pending_fallback = pending_fallback;
         self.recent_zero_output_packets = recent_zero_output_packets;
         self.recent_soft_recovery_attempted = recent_soft_recovery_attempted;
         self.recent_packet_lead_exceeded = recent_packet_lead_exceeded;
         self.healthy_admitted_progress_nsecs = healthy_admitted_progress_nsecs.unwrap_or_default();
+        self.last_video_progress_at = Some(now);
         if self.healthy_admitted_progress_nsecs >= HEVC_RECENT_GAP_EVIDENCE_CLEAR_AFTER_NSECS {
             self.clear_recent_gap_evidence();
         }
@@ -602,13 +771,55 @@ impl HevcDecodeChainWatchdog {
         }
     }
 
-    fn has_decoded_frame_gap_evidence(&self, recovery_waiting: bool) -> bool {
-        recovery_waiting
-            || self.zero_output_packets > 0
-            || self.soft_recovery_attempted
-            || self.recent_zero_output_packets > 0
-            || self.recent_soft_recovery_attempted
-            || self.recent_packet_lead_exceeded
+    fn has_strong_decoded_frame_gap_evidence(
+        &self,
+        input: &HevcDecodedFrameGapObservation,
+    ) -> bool {
+        input.recovery_waiting
+            || input.source_frame_diagnostic.corrupt
+            || input.source_frame_diagnostic.decode_error_flags != 0
+            || self.zero_output_packets >= HEVC_DECODE_CHAIN_ZERO_OUTPUT_SOFT_PACKET_LIMIT
+            || (self.soft_recovery_attempted
+                && (self.zero_output_packets > 0 || self.recent_packet_lead_exceeded))
+            || (self.recent_soft_recovery_attempted && self.recent_packet_lead_exceeded)
+    }
+
+    fn decoded_frame_gap_demux_is_healthy(
+        input: &HevcDecodedFrameGapObservation,
+        gap_nsecs: u64,
+    ) -> bool {
+        let demux_underrun = input.demux_watermark.underrun
+            || input.demux_watermark.video_underrun
+            || input.demux_watermark.audio_underrun;
+        let minimum_forward_nsecs =
+            gap_nsecs.max(duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION));
+        !demux_underrun
+            && !input.recent_cache_read_anomaly
+            && input
+                .demux_watermark
+                .selected_min_forward_nsecs
+                .or(input.demux_watermark.video_forward_nsecs)
+                .is_some_and(|forward| forward >= minimum_forward_nsecs)
+    }
+
+    fn decoded_frame_gap_output_is_stable(input: &HevcDecodedFrameGapObservation) -> bool {
+        let queued_video_contiguous_forward_nsecs = input
+            .output_snapshot
+            .queued_video_contiguous_forward_nsecs
+            .or(input.output_snapshot.queued_video_forward_nsecs)
+            .unwrap_or(input.output_snapshot.queued_video_duration_nsecs);
+        !input.output_snapshot.first_video_frame_pending
+            && !input.output_snapshot.rebuffering
+            && !input.output_snapshot.video_output_low_water
+            && !input.output_snapshot.video_decode_underfill
+            && queued_video_contiguous_forward_nsecs
+                > duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
+    }
+
+    fn decoded_frame_gap_has_demux_underrun(input: &HevcDecodedFrameGapObservation) -> bool {
+        input.demux_watermark.underrun
+            || input.demux_watermark.video_underrun
+            || input.demux_watermark.audio_underrun
     }
 
     fn clear_recent_gap_evidence(&mut self) {
@@ -616,6 +827,16 @@ impl HevcDecodeChainWatchdog {
         self.recent_soft_recovery_attempted = false;
         self.recent_packet_lead_exceeded = false;
         self.healthy_admitted_progress_nsecs = 0;
+    }
+
+    fn recovery_progress_grace_active(&self, now: Instant, hardware_accelerated: bool) -> bool {
+        let grace = if hardware_accelerated {
+            HEVC_HARDWARE_RECOVERY_PROGRESS_GRACE
+        } else {
+            HEVC_SOFTWARE_RECOVERY_PROGRESS_GRACE
+        };
+        self.last_video_progress_at
+            .is_some_and(|progress_at| now.saturating_duration_since(progress_at) < grace)
     }
 
     fn observe_startup_stall(
@@ -644,6 +865,7 @@ impl HevcDecodeChainWatchdog {
             input.now,
             input.demux_watermark,
             input.fallback_target_nsecs,
+            input.hardware_accelerated,
         ) {
             self.pending_fallback = Some(HevcDecodeChainFallback {
                 target_nsecs: input.fallback_target_nsecs,
@@ -800,7 +1022,7 @@ impl HevcDecodeChainWatchdog {
             .zip(input.before_queue_end_nsecs)
             .map(|(after, before)| after.saturating_sub(before))
             .unwrap_or_default();
-        self.reset_transient_after_progress(admitted_progress_nsecs);
+        self.reset_transient_after_progress(admitted_progress_nsecs, Instant::now());
         true
     }
 
@@ -830,7 +1052,7 @@ impl HevcDecodeChainWatchdog {
                 "resetting HEVC decode chain watchdog after seek preroll decoded progress"
             );
         }
-        self.reset_transient_after_progress(0);
+        self.reset_transient_after_progress(0, Instant::now());
     }
 
     fn observe_post_fallback_rebuffer_underfill(
@@ -913,9 +1135,6 @@ impl HevcDecodeChainWatchdog {
             self.clear_recent_gap_evidence();
             return HevcDecodedFrameGapAction::Admit;
         }
-        if self.pending_fallback.is_some() {
-            return HevcDecodedFrameGapAction::DropForFallback;
-        }
 
         let positive_gap_nsecs = input
             .previous_gap_nsecs
@@ -923,7 +1142,7 @@ impl HevcDecodeChainWatchdog {
         let Some(gap_nsecs) = positive_gap_nsecs else {
             return HevcDecodedFrameGapAction::Admit;
         };
-        if gap_nsecs <= input.max_gap_nsecs {
+        if video_timestamp_gap_within_threshold(gap_nsecs, input.max_gap_nsecs) {
             return HevcDecodedFrameGapAction::Admit;
         }
 
@@ -932,7 +1151,9 @@ impl HevcDecodeChainWatchdog {
             && audio_gap
                 .next_start_nsecs
                 .checked_sub(audio_gap.previous_end_nsecs)
-                .is_some_and(|audio_gap_nsecs| audio_gap_nsecs > input.max_gap_nsecs)
+                .is_some_and(|audio_gap_nsecs| {
+                    !video_timestamp_gap_within_threshold(audio_gap_nsecs, input.max_gap_nsecs)
+                })
             && audio_gap
                 .previous_end_nsecs
                 .abs_diff(previous_expected_next_nsecs)
@@ -940,7 +1161,7 @@ impl HevcDecodeChainWatchdog {
             && audio_gap.next_start_nsecs.abs_diff(input.timeline_nsecs)
                 <= duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE)
         {
-            self.clear_recent_gap_evidence();
+            self.reset();
             tracing::debug!(
                 session_id = ?input.session_id,
                 codec = ?input.codec_id,
@@ -966,8 +1187,49 @@ impl HevcDecodeChainWatchdog {
             return HevcDecodedFrameGapAction::AdmitSynchronizedTimelineGap;
         }
 
-        let has_evidence = self.has_decoded_frame_gap_evidence(input.recovery_waiting);
+        let clean_recovery_frame = input.source_frame_diagnostic.key_frame
+            && !input.source_frame_diagnostic.corrupt
+            && input.source_frame_diagnostic.decode_error_flags == 0;
+        let recoverable_decode_gap =
+            video_timestamp_gap_within_threshold(gap_nsecs, HEVC_RECOVERABLE_DECODE_GAP_MAX_NSECS)
+                && clean_recovery_frame
+                && Self::decoded_frame_gap_demux_is_healthy(&input, gap_nsecs);
+        if recoverable_decode_gap {
+            let cancelled_fallback_reason = self
+                .pending_fallback
+                .map(|fallback| fallback.reason.as_str());
+            self.reset();
+            tracing::debug!(
+                session_id = ?input.session_id,
+                codec = ?input.codec_id,
+                pts = input.timeline_nsecs,
+                duration_nsecs = input.duration_nsecs,
+                previous_expected_next_nsecs = ?input.previous_expected_next_nsecs,
+                previous_gap_ms = gap_nsecs as f64 / 1_000_000.0,
+                recoverable_gap_limit_ms =
+                    HEVC_RECOVERABLE_DECODE_GAP_MAX_NSECS as f64 / 1_000_000.0,
+                timestamp_rounding_tolerance_nsecs =
+                    VIDEO_TIMESTAMP_ROUNDING_TOLERANCE_NSECS,
+                frame_key = input.source_frame_diagnostic.key_frame,
+                frame_corrupt = input.source_frame_diagnostic.corrupt,
+                frame_decode_error_flags = input.source_frame_diagnostic.decode_error_flags,
+                demux_selected_min_forward_ms = ?input
+                    .demux_watermark
+                    .selected_min_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                recent_cache_read_anomaly = input.recent_cache_read_anomaly,
+                cancelled_fallback_reason,
+                "admitting clean HEVC recovery keyframe and bridging small decode gap"
+            );
+            return HevcDecodedFrameGapAction::AdmitAndBridgeDecodeGap;
+        }
+
+        let has_evidence = self.has_strong_decoded_frame_gap_evidence(&input);
         if !has_evidence {
+            let cleared_pending_fallback = self
+                .pending_fallback
+                .take()
+                .map(|fallback| fallback.reason.as_str());
             tracing::debug!(
                 session_id = ?input.session_id,
                 codec = ?input.codec_id,
@@ -977,6 +1239,10 @@ impl HevcDecodeChainWatchdog {
                 previous_gap_ms = gap_nsecs as f64 / 1_000_000.0,
                 max_gap_ms = input.max_gap_nsecs as f64 / 1_000_000.0,
                 recovery_waiting = input.recovery_waiting,
+                frame_key = input.source_frame_diagnostic.key_frame,
+                frame_corrupt = input.source_frame_diagnostic.corrupt,
+                frame_decode_error_flags = input.source_frame_diagnostic.decode_error_flags,
+                cleared_pending_fallback,
                 queued_video_contiguous_forward_ms = ?input
                     .output_snapshot
                     .queued_video_contiguous_forward_nsecs
@@ -988,6 +1254,43 @@ impl HevcDecodeChainWatchdog {
                 "observed HEVC decoded frame PTS gap without decode-chain evidence"
             );
             return HevcDecodedFrameGapAction::Admit;
+        }
+
+        let output_stable = Self::decoded_frame_gap_output_is_stable(&input);
+        let demux_underrun = Self::decoded_frame_gap_has_demux_underrun(&input);
+        if output_stable || demux_underrun {
+            let deferred_pending_fallback = self
+                .pending_fallback
+                .take()
+                .map(|fallback| fallback.reason.as_str());
+            tracing::debug!(
+                session_id = ?input.session_id,
+                codec = ?input.codec_id,
+                pts = input.timeline_nsecs,
+                duration_nsecs = input.duration_nsecs,
+                previous_expected_next_nsecs = ?input.previous_expected_next_nsecs,
+                previous_gap_ms = gap_nsecs as f64 / 1_000_000.0,
+                output_stable,
+                demux_underrun,
+                deferred_pending_fallback,
+                recovery_waiting = input.recovery_waiting,
+                frame_key = input.source_frame_diagnostic.key_frame,
+                frame_corrupt = input.source_frame_diagnostic.corrupt,
+                frame_decode_error_flags = input.source_frame_diagnostic.decode_error_flags,
+                queued_video_contiguous_forward_ms = ?input
+                    .output_snapshot
+                    .queued_video_contiguous_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                output_video_low_water = input.output_snapshot.video_output_low_water,
+                video_decode_underfill = input.output_snapshot.video_decode_underfill,
+                output_rebuffering = input.output_snapshot.rebuffering,
+                "deferred HEVC decode-gap fallback until output reaches low water"
+            );
+            return HevcDecodedFrameGapAction::DeferFallback;
+        }
+
+        if self.pending_fallback.is_some() {
+            return HevcDecodedFrameGapAction::DropForFallback;
         }
 
         let target_nsecs = input
@@ -1039,6 +1342,8 @@ impl HevcDecodeChainWatchdog {
         }
         if input.decoded_frames > 0 {
             self.startup_in_flight_stall_started_at = None;
+            self.startup_watchdog_retry_not_before = None;
+            self.last_video_progress_at = Some(input.now);
             tracing::trace!(
                 session_id = ?input.session_id,
                 decoded_frames = input.decoded_frames,
@@ -1055,6 +1360,7 @@ impl HevcDecodeChainWatchdog {
         if self.zero_output_packets == 0 {
             self.first_zero_output_packet_nsecs = input.packet_nsecs;
             self.first_zero_output_at = Some(input.now);
+            self.startup_watchdog_retry_not_before = None;
         }
         self.healthy_admitted_progress_nsecs = 0;
         self.zero_output_packets = self.zero_output_packets.saturating_add(1);
@@ -1140,11 +1446,16 @@ impl HevcDecodeChainWatchdog {
             return HevcDecodeChainRecoveryAction::None;
         }
 
+        if self.recovery_progress_grace_active(input.now, input.hardware_accelerated) {
+            return HevcDecodeChainRecoveryAction::None;
+        }
+
         if startup_zero_output_context {
             if self.startup_hard_fallback_ready(
                 input.now,
                 input.demux_watermark,
                 input.fallback_target_nsecs,
+                input.hardware_accelerated,
             ) {
                 self.pending_fallback = Some(HevcDecodeChainFallback {
                     target_nsecs: input.fallback_target_nsecs,
@@ -1234,6 +1545,7 @@ impl HevcDecodeChainWatchdog {
         now: Instant,
         demux_watermark: DemuxReaderWatermark,
         fallback_target_nsecs: u64,
+        hardware_accelerated: bool,
     ) -> bool {
         let demux_ready = demux_watermark
             .selected_min_forward_nsecs
@@ -1248,10 +1560,17 @@ impl HevcDecodeChainWatchdog {
         {
             return false;
         }
-        self.zero_output_packets >= HEVC_STARTUP_ZERO_OUTPUT_HARD_PACKET_LIMIT
-            || self.first_zero_output_at.is_some_and(|started_at| {
-                now.saturating_duration_since(started_at) >= HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER
-            })
+        let packet_budget_exhausted = hardware_accelerated
+            && self.zero_output_packets >= HEVC_STARTUP_ZERO_OUTPUT_HARD_PACKET_LIMIT;
+        let timeout = hevc_startup_zero_output_timeout(
+            hardware_accelerated,
+            fallback_target_nsecs,
+            self.first_zero_output_packet_nsecs,
+        );
+        packet_budget_exhausted
+            || self
+                .first_zero_output_at
+                .is_some_and(|started_at| now.saturating_duration_since(started_at) >= timeout)
     }
 
     fn startup_in_flight_deadline(&self) -> Option<Instant> {
@@ -1259,13 +1578,73 @@ impl HevcDecodeChainWatchdog {
             .map(|started_at| started_at + HEVC_STARTUP_IN_FLIGHT_HARD_AFTER)
     }
 
-    fn startup_watchdog_deadline(&self) -> Option<Instant> {
-        min_instant(
+    fn startup_watchdog_deadline(&self, hardware_accelerated: bool) -> Option<Instant> {
+        if !hardware_accelerated {
+            return None;
+        }
+        let deadline = min_instant(
             self.first_zero_output_at
                 .map(|started_at| started_at + HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER),
             self.startup_in_flight_deadline(),
-        )
+        );
+        match (deadline, self.startup_watchdog_retry_not_before) {
+            (Some(deadline), Some(not_before)) => Some(deadline.max(not_before)),
+            (Some(deadline), None) => Some(deadline),
+            (None, _) => None,
+        }
     }
+
+    fn defer_startup_watchdog_after_no_action(&mut self, now: Instant) {
+        let raw_deadline = min_instant(
+            self.first_zero_output_at
+                .map(|started_at| started_at + HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER),
+            self.startup_in_flight_deadline(),
+        );
+        if raw_deadline.is_some_and(|deadline| deadline <= now) {
+            self.startup_watchdog_retry_not_before = Some(now + HEVC_STARTUP_WATCHDOG_RETRY_AFTER);
+        }
+    }
+
+    fn record_startup_watchdog_rejection(
+        &mut self,
+        reason: &'static str,
+        now: Instant,
+    ) -> Option<u64> {
+        let reason_changed = self.startup_watchdog_last_rejection_reason != Some(reason);
+        let interval_elapsed = self
+            .startup_watchdog_last_rejection_at
+            .is_none_or(|logged_at| {
+                now.saturating_duration_since(logged_at)
+                    >= HEVC_STARTUP_WATCHDOG_REJECTION_LOG_INTERVAL
+            });
+        if reason_changed || interval_elapsed {
+            let suppressed = std::mem::take(&mut self.startup_watchdog_suppressed_rejections);
+            self.startup_watchdog_last_rejection_at = Some(now);
+            self.startup_watchdog_last_rejection_reason = Some(reason);
+            return Some(suppressed);
+        }
+        self.startup_watchdog_suppressed_rejections = self
+            .startup_watchdog_suppressed_rejections
+            .saturating_add(1);
+        None
+    }
+}
+
+pub(super) fn hevc_startup_zero_output_timeout(
+    hardware_accelerated: bool,
+    fallback_target_nsecs: u64,
+    first_zero_output_packet_nsecs: Option<u64>,
+) -> Duration {
+    if hardware_accelerated {
+        return HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER;
+    }
+    let preroll = first_zero_output_packet_nsecs
+        .map(|packet_nsecs| fallback_target_nsecs.saturating_sub(packet_nsecs))
+        .map(Duration::from_nanos)
+        .unwrap_or_default();
+    HEVC_SOFTWARE_STARTUP_ZERO_OUTPUT_BASE_AFTER
+        .saturating_add(preroll.saturating_mul(2))
+        .min(HEVC_SOFTWARE_STARTUP_ZERO_OUTPUT_MAX_AFTER)
 }
 
 fn min_instant(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
@@ -1330,6 +1709,7 @@ pub(super) struct VideoDecodePipeline {
     packets: VideoDecodePacketQueues,
     hevc_startup_probe_replay: VecDeque<PendingVideoDecodePacket>,
     hevc_decode_chain_watchdog: HevcDecodeChainWatchdog,
+    hevc_decode_packet_diagnostics: HevcDecodePacketDiagnosticWindow,
     hevc_startup_probe_packets: HevcStartupProbePackets,
     last_hevc_decode_chain_fallback: Option<HevcDecodeChainFallbackRecord>,
 }
@@ -1341,6 +1721,7 @@ impl VideoDecodePipeline {
             packets: VideoDecodePacketQueues::default(),
             hevc_startup_probe_replay: VecDeque::new(),
             hevc_decode_chain_watchdog: HevcDecodeChainWatchdog::default(),
+            hevc_decode_packet_diagnostics: HevcDecodePacketDiagnosticWindow::default(),
             hevc_startup_probe_packets: HevcStartupProbePackets::default(),
             last_hevc_decode_chain_fallback: None,
         })
@@ -1541,6 +1922,7 @@ impl VideoDecodePipeline {
         let packet_nsecs = packet
             .best_timestamp()
             .and_then(|timestamp| timestamp_to_nsecs(timestamp, context.video_stream.time_base));
+        let hardware_accelerated = self.info().hardware_accelerated;
         let recovery_skipping_packet = recovery.should_skip_packet(packet, codec_id);
         tracing::trace!(
             session_id = ?context.session_id,
@@ -1577,6 +1959,9 @@ impl VideoDecodePipeline {
                 && context.output_snapshot.rebuffering
                 && !context.output_snapshot.video_decode_underfill
                 && self.hevc_decode_chain_watchdog.pending_fallback.is_none()
+                && !self
+                    .hevc_decode_chain_watchdog
+                    .recovery_progress_grace_active(Instant::now(), hardware_accelerated)
                 && (skipped_span_nsecs
                     .is_some_and(|span| span >= HEVC_DECODE_RECOVERY_WAIT_HARD_SKIP_NSECS)
                     || skipped_packets > VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS)
@@ -1834,32 +2219,239 @@ impl VideoDecodePipeline {
     ) -> HevcDecodeChainRecoveryAction {
         if observation.video_stream.codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
             self.hevc_decode_chain_watchdog.reset();
+            self.hevc_decode_packet_diagnostics.clear();
             self.hevc_startup_probe_packets.clear();
             return HevcDecodeChainRecoveryAction::None;
         }
         let packet_nsecs = observation.packet.best_timestamp().and_then(|timestamp| {
             timestamp_to_nsecs(timestamp, observation.video_stream.time_base)
         });
-        self.hevc_decode_chain_watchdog
+        let hardware_accelerated = self.info().hardware_accelerated;
+        let action = self
+            .hevc_decode_chain_watchdog
             .observe_packet(HevcDecodeChainWatchdogInput {
                 session_id: observation.session_id,
                 packet_nsecs,
                 decoded_frames: observation.status.decoded_frames,
                 decode_ok: observation.status.result.is_ok(),
+                hardware_accelerated,
                 output_snapshot: observation.output_snapshot,
                 demux_watermark: observation.demux_watermark,
                 has_audio_output: observation.has_audio_output,
                 fallback_target_nsecs: observation.fallback_target_nsecs,
                 now: Instant::now(),
-            })
+            });
+        let zero_output_run_packets = if observation.status.decoded_frames == 0 {
+            self.hevc_decode_chain_watchdog.zero_output_packets
+        } else {
+            0
+        };
+        self.hevc_decode_packet_diagnostics.record(
+            observation.status,
+            observation.packet,
+            observation.video_stream,
+            zero_output_run_packets,
+            hardware_accelerated,
+        );
+        action
     }
 
     pub(super) fn observe_hevc_decoded_frame_gap(
         &mut self,
-        observation: HevcDecodedFrameGapObservation,
+        mut observation: HevcDecodedFrameGapObservation,
     ) -> HevcDecodedFrameGapAction {
-        self.hevc_decode_chain_watchdog
-            .observe_decoded_frame_gap(observation)
+        observation.recent_cache_read_anomaly =
+            self.hevc_decode_packet_diagnostics.has_cache_read_anomaly();
+        let action = self
+            .hevc_decode_chain_watchdog
+            .observe_decoded_frame_gap(observation);
+        if observation.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC
+            && observation
+                .previous_gap_nsecs
+                .and_then(|gap| u64::try_from(gap).ok())
+                .is_some_and(|gap| {
+                    !video_timestamp_gap_within_threshold(gap, observation.max_gap_nsecs)
+                })
+        {
+            self.log_hevc_decoded_frame_gap_diagnostics(observation, action);
+        }
+        action
+    }
+
+    fn log_hevc_decoded_frame_gap_diagnostics(
+        &self,
+        observation: HevcDecodedFrameGapObservation,
+        action: HevcDecodedFrameGapAction,
+    ) {
+        let frame = observation.source_frame_diagnostic;
+        let front_generation = self.front_generation();
+        let front_packet = self.front_packet().map(|packet| {
+            HevcPacketDiagnosticFields::from_packet(
+                packet,
+                observation.codec_id,
+                self.info().time_base,
+            )
+        });
+        let non_contiguous_cache_reads = self
+            .hevc_decode_packet_diagnostics
+            .packets
+            .iter()
+            .filter(|packet| {
+                packet
+                    .packet
+                    .cache_read
+                    .is_some_and(|cache| cache.sequence_contiguous == Some(false))
+            })
+            .count();
+        let packets_without_cache_diagnostic = self
+            .hevc_decode_packet_diagnostics
+            .packets
+            .iter()
+            .filter(|packet| packet.packet.cache_read.is_none())
+            .count();
+        let non_monotonic_dts_contiguous_cache_packets = self
+            .hevc_decode_packet_diagnostics
+            .packets
+            .iter()
+            .filter(|packet| {
+                packet.dts_delta_nsecs.is_some_and(|delta| delta < 0)
+                    && packet
+                        .packet
+                        .cache_read
+                        .is_some_and(|cache| cache.sequence_contiguous == Some(true))
+            })
+            .count();
+        let repeated_cache_packet_reads = self
+            .hevc_decode_packet_diagnostics
+            .packets
+            .iter()
+            .filter(|packet| {
+                packet.packet.cache_read.is_some_and(|cache| {
+                    cache.previous_read_generation == Some(cache.cache_generation)
+                        && cache.previous_read_packet_id == Some(cache.packet_id)
+                })
+            })
+            .count();
+        tracing::debug!(
+            session_id = ?observation.session_id,
+            action = ?action,
+            decoder_name = %self.info().decoder_name,
+            hardware_accelerated = self.info().hardware_accelerated,
+            video_time_base_num = self.info().time_base.num,
+            video_time_base_den = self.info().time_base.den,
+            frame_timeline_nsecs = observation.timeline_nsecs,
+            frame_duration_nsecs = observation.duration_nsecs,
+            previous_expected_next_nsecs = ?observation.previous_expected_next_nsecs,
+            previous_gap_ms = ?observation
+                .previous_gap_nsecs
+                .map(|gap| gap as f64 / 1_000_000.0),
+            max_gap_ms = observation.max_gap_nsecs as f64 / 1_000_000.0,
+            frame_best_effort_timestamp = frame.best_effort_timestamp,
+            frame_pts = frame.pts,
+            frame_packet_dts = frame.packet_dts,
+            frame_raw_duration = frame.duration,
+            frame_flags = frame.flags,
+            frame_key = frame.key_frame,
+            frame_corrupt = frame.corrupt,
+            frame_picture_type = frame.picture_type,
+            frame_decode_error_flags = frame.decode_error_flags,
+            frame_width = frame.width,
+            frame_height = frame.height,
+            frame_pixel_format = frame.pixel_format,
+            recovery_waiting = observation.recovery_waiting,
+            demux_underrun = observation.demux_watermark.underrun,
+            demux_video_underrun = observation.demux_watermark.video_underrun,
+            demux_audio_underrun = observation.demux_watermark.audio_underrun,
+            demux_video_forward_ms = ?observation
+                .demux_watermark
+                .video_forward_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
+            demux_audio_forward_ms = ?observation
+                .demux_watermark
+                .audio_forward_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
+            demux_selected_min_forward_ms = ?observation
+                .demux_watermark
+                .selected_min_forward_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
+            recent_completed_packet_diagnostics =
+                self.hevc_decode_packet_diagnostics.packets.len(),
+            non_contiguous_cache_reads,
+            repeated_cache_packet_reads,
+            packets_without_cache_diagnostic,
+            non_monotonic_dts_contiguous_cache_packets,
+            current_front_generation = ?front_generation,
+            current_front_stream_index = ?front_packet.map(|packet| packet.stream_index),
+            current_front_pts = ?front_packet.and_then(|packet| packet.pts),
+            current_front_dts = ?front_packet.and_then(|packet| packet.dts),
+            current_front_pts_nsecs = ?front_packet.and_then(|packet| packet.pts_nsecs),
+            current_front_dts_nsecs = ?front_packet.and_then(|packet| packet.dts_nsecs),
+            current_front_duration = ?front_packet.and_then(|packet| packet.duration),
+            current_front_flags = ?front_packet.map(|packet| packet.flags),
+            current_front_key = ?front_packet.map(|packet| packet.key_frame),
+            current_front_recovery_point = ?front_packet.map(|packet| packet.recovery_point),
+            current_front_safe_seek_point = ?front_packet.map(|packet| packet.safe_seek_point),
+            current_front_packet_bytes = ?front_packet.map(|packet| packet.byte_len),
+            current_front_cache_read = ?front_packet.and_then(|packet| packet.cache_read),
+            "HEVC decoded frame PTS gap diagnostic snapshot"
+        );
+
+        for packet in &self.hevc_decode_packet_diagnostics.packets {
+            let cache = packet.packet.cache_read;
+            tracing::debug!(
+                session_id = ?observation.session_id,
+                diagnostic_ordinal = packet.ordinal,
+                generation = packet.generation,
+                hardware_accelerated = packet.hardware_accelerated,
+                packet_stream_index = packet.packet.stream_index,
+                packet_pts = ?packet.packet.pts,
+                packet_dts = ?packet.packet.dts,
+                packet_pts_nsecs = ?packet.packet.pts_nsecs,
+                packet_dts_nsecs = ?packet.packet.dts_nsecs,
+                packet_duration = ?packet.packet.duration,
+                packet_duration_nsecs = ?packet.packet.duration_nsecs,
+                packet_pts_delta_ms = ?packet
+                    .pts_delta_nsecs
+                    .map(|delta| delta as f64 / 1_000_000.0),
+                packet_dts_delta_ms = ?packet
+                    .dts_delta_nsecs
+                    .map(|delta| delta as f64 / 1_000_000.0),
+                packet_flags = packet.packet.flags,
+                packet_key = packet.packet.key_frame,
+                packet_recovery_point = packet.packet.recovery_point,
+                packet_safe_seek_point = packet.packet.safe_seek_point,
+                packet_bytes = packet.packet.byte_len,
+                decoded_frames = packet.decoded_frames,
+                zero_output_run_packets = packet.zero_output_run_packets,
+                decode_ok = packet.decode_ok,
+                decode_error = ?packet.decode_error,
+                decode_elapsed_ms = packet.decode_elapsed_micros as f64 / 1_000.0,
+                drained = packet.drained,
+                cache_read_sequence = ?cache.map(|cache| cache.read_sequence),
+                cache_generation = ?cache.map(|cache| cache.cache_generation),
+                cache_read_range_id = ?cache.map(|cache| cache.read_range_id),
+                cache_packet_id = ?cache.map(|cache| cache.packet_id),
+                cache_stream_offset = ?cache.map(|cache| cache.stream_offset),
+                cache_storage = ?cache.map(|cache| cache.storage),
+                cache_read_index_before = ?cache.map(|cache| cache.read_index_before),
+                cache_read_index_after = ?cache.map(|cache| cache.read_index_after),
+                cache_reader_head_before = ?cache.and_then(|cache| cache.reader_head_before),
+                cache_reader_head_after = ?cache.and_then(|cache| cache.reader_head_after),
+                cache_previous_read_packet_id =
+                    ?cache.and_then(|cache| cache.previous_read_packet_id),
+                cache_previous_read_generation =
+                    ?cache.and_then(|cache| cache.previous_read_generation),
+                cache_previous_expected_next_packet_id =
+                    ?cache.and_then(|cache| cache.previous_expected_next_packet_id),
+                cache_sequence_contiguous = ?cache.and_then(|cache| cache.sequence_contiguous),
+                cache_packet_start_nsecs = ?cache.and_then(|cache| cache.packet_start_nsecs),
+                cache_packet_end_nsecs = ?cache.and_then(|cache| cache.packet_end_nsecs),
+                cache_timeline_anchor = ?cache.map(|cache| cache.timeline_anchor),
+                cache_recovery_point = ?cache.map(|cache| cache.recovery_point),
+                cache_safe_seek_point = ?cache.map(|cache| cache.safe_seek_point),
+                "HEVC decoded frame PTS gap recent decode packet diagnostic"
+            );
+        }
     }
 
     pub(super) fn observe_hevc_seek_preroll_progress(
@@ -1887,6 +2479,15 @@ impl VideoDecodePipeline {
         &mut self,
         observation: HevcPostFallbackRebufferObservation,
     ) {
+        let hardware_accelerated = self.info().hardware_accelerated;
+        if self
+            .hevc_decode_chain_watchdog
+            .recovery_progress_grace_active(observation.now, hardware_accelerated)
+        {
+            self.hevc_decode_chain_watchdog
+                .post_fallback_rebuffer_underfill_started_at = None;
+            return;
+        }
         self.hevc_decode_chain_watchdog
             .observe_post_fallback_rebuffer_underfill(observation);
     }
@@ -1900,7 +2501,27 @@ impl VideoDecodePipeline {
     }
 
     pub(super) fn hevc_startup_stall_watchdog_deadline(&self) -> Option<Instant> {
-        self.hevc_decode_chain_watchdog.startup_watchdog_deadline()
+        self.hevc_decode_chain_watchdog
+            .startup_watchdog_deadline(self.info().hardware_accelerated)
+    }
+
+    pub(super) fn defer_hevc_startup_stall_watchdog_after_no_action(&mut self, now: Instant) {
+        self.hevc_decode_chain_watchdog
+            .defer_startup_watchdog_after_no_action(now);
+    }
+
+    pub(super) fn record_hevc_startup_stall_watchdog_rejection(
+        &mut self,
+        reason: &'static str,
+        now: Instant,
+    ) -> Option<u64> {
+        self.hevc_decode_chain_watchdog
+            .record_startup_watchdog_rejection(reason, now)
+    }
+
+    pub(super) fn hevc_recent_video_progress_grace_active(&self, now: Instant) -> bool {
+        self.hevc_decode_chain_watchdog
+            .recovery_progress_grace_active(now, self.info().hardware_accelerated)
     }
 
     pub(super) fn hevc_decode_chain_stats(&self) -> HevcDecodeChainStats {
@@ -1924,6 +2545,16 @@ impl VideoDecodePipeline {
             fallback,
             self.info().hardware_accelerated,
         )
+    }
+
+    pub(super) fn has_prior_matching_hevc_decode_chain_fallback(
+        &self,
+        fallback: HevcDecodeChainFallback,
+    ) -> bool {
+        self.last_hevc_decode_chain_fallback.is_some_and(|last| {
+            hevc_fallback_targets_match(last.last_target_nsecs, fallback.target_nsecs)
+                && last.last_reason == fallback.reason
+        })
     }
 
     pub(super) fn remember_hevc_decode_chain_fallback(
@@ -2099,6 +2730,9 @@ fn hevc_decode_chain_fallback_loop_action(
     let Some(last) = last else {
         return HevcDecodeChainFallbackLoopAction::Proceed;
     };
+    if !hevc_fallback_targets_match(last.last_target_nsecs, fallback.target_nsecs) {
+        return HevcDecodeChainFallbackLoopAction::Proceed;
+    }
     if hardware_accelerated {
         return HevcDecodeChainFallbackLoopAction::ForceSoftware;
     }
@@ -2124,7 +2758,9 @@ fn hevc_decode_chain_fallback_record_after(
     hardware_accelerated: bool,
     recorded_at: Instant,
 ) -> HevcDecodeChainFallbackRecord {
-    let mut record = last.unwrap_or(HevcDecodeChainFallbackRecord {
+    let matching_last = last
+        .filter(|last| hevc_fallback_targets_match(last.last_target_nsecs, fallback.target_nsecs));
+    let mut record = matching_last.unwrap_or(HevcDecodeChainFallbackRecord {
         root_target_nsecs: fallback.target_nsecs,
         last_target_nsecs: fallback.target_nsecs,
         last_reason: fallback.reason,
@@ -2139,6 +2775,10 @@ fn hevc_decode_chain_fallback_record_after(
     record.hardware_accelerated = hardware_accelerated;
     record.recorded_at = recorded_at;
     record
+}
+
+fn hevc_fallback_targets_match(left: u64, right: u64) -> bool {
+    left.abs_diff(right) <= HEVC_FALLBACK_SAME_TARGET_TOLERANCE_NSECS
 }
 
 fn hevc_decode_chain_recovery_record_after_reset(
@@ -2579,29 +3219,32 @@ mod tests {
     use crate::player::render_host::{PlaybackSessionId, RenderSize};
 
     use super::super::{
-        DemuxReaderWatermark, PlaybackOutputSnapshot, PlaybackOutputState,
+        DemuxReaderWatermark, PlaybackOutputSnapshot, PlaybackOutputState, StreamInfo,
         VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VideoFrameConvertContext,
         packet_is_video_recovery_point, packet_is_video_seek_point,
     };
     use super::{
-        AudioTimelineGapEvidence, DoviFrameMetadata, DoviRpuNalInspection,
+        AudioTimelineGapEvidence, DecodedVideoFrameDiagnostic, DoviFrameMetadata,
+        DoviRpuNalInspection, HEVC_DECODE_PACKET_DIAGNOSTIC_WINDOW_CAPACITY,
         HEVC_POST_FALLBACK_REBUFFER_RECOVERY_AFTER, HEVC_RECENT_GAP_EVIDENCE_CLEAR_AFTER_NSECS,
         HEVC_STARTUP_IN_FLIGHT_HARD_AFTER, HEVC_STARTUP_PROBE_PACKET_LIMIT,
+        HEVC_STARTUP_WATCHDOG_REJECTION_LOG_INTERVAL, HEVC_STARTUP_WATCHDOG_RETRY_AFTER,
         HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER, HEVC_STARTUP_ZERO_OUTPUT_HARD_PACKET_LIMIT,
         HevcAdmittedVideoProgressObservation, HevcDecodeChainFallback,
         HevcDecodeChainFallbackLoopAction, HevcDecodeChainFallbackReason,
         HevcDecodeChainFallbackRecord, HevcDecodeChainRecoveryAction, HevcDecodeChainResetScope,
-        HevcDecodeChainWatchdog, HevcDecodeChainWatchdogInput, HevcDecodedFrameGapAction,
-        HevcDecodedFrameGapObservation, HevcPostFallbackRebufferObservation,
-        HevcSeekPrerollProgressObservation, HevcStartupProbePackets, HevcStartupStallObservation,
-        HevcStreamFormat, PlaybackBlockReason, PlaybackGeneration, StrippedHevcDoviDecodeAction,
+        HevcDecodeChainWatchdog, HevcDecodeChainWatchdogInput, HevcDecodePacketDiagnosticWindow,
+        HevcDecodedFrameGapAction, HevcDecodedFrameGapObservation,
+        HevcPostFallbackRebufferObservation, HevcSeekPrerollProgressObservation,
+        HevcStartupProbePackets, HevcStartupStallObservation, HevcStreamFormat,
+        PlaybackBlockReason, PlaybackGeneration, StrippedHevcDoviDecodeAction,
         VIDEO_DECODE_PENDING_INPUT_QUEUE_CAPACITY, VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS,
-        VideoDecodePipeline, VideoDecodeRecovery, VideoDecodeWorkerInfo, VideoDecodeWorkerSnapshot,
-        VideoDecodeWorkerState, hevc_decode_chain_fallback_loop_action,
+        VideoDecodePacketStatus, VideoDecodePipeline, VideoDecodeRecovery, VideoDecodeWorkerInfo,
+        VideoDecodeWorkerSnapshot, VideoDecodeWorkerState, hevc_decode_chain_fallback_loop_action,
         hevc_decode_chain_fallback_record_after, hevc_decode_chain_recovery_record_after_reset,
         hevc_dovi_decode_action_for_inspection, hevc_startup_in_flight_packet_should_arm,
         hevc_startup_probe_packet_should_record, hevc_startup_probe_replay_packets,
-        video_decode_pending_input_snapshot,
+        hevc_startup_zero_output_timeout, video_decode_pending_input_snapshot,
     };
 
     fn snapshot(
@@ -2641,6 +3284,56 @@ mod tests {
         let props = crate::player::backend::ffmpeg::AvPacket::new().expect("packet props allocate");
         crate::player::backend::ffmpeg::AvPacket::from_data_and_props(data, &props)
             .expect("packet data allocates")
+    }
+
+    #[test]
+    fn hevc_decode_packet_diagnostic_window_keeps_recent_packet_deltas() {
+        let video_stream = StreamInfo {
+            index: 0,
+            stream: std::ptr::null_mut(),
+            decoder: std::ptr::null(),
+            codec_id: ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            time_base: ffi::AVRational { num: 1, den: 1_000 },
+            start_nsecs: None,
+            frame_duration_nsecs: Some(40_000_000),
+        };
+        let mut diagnostics = HevcDecodePacketDiagnosticWindow::default();
+        for index in 0..HEVC_DECODE_PACKET_DIAGNOSTIC_WINDOW_CAPACITY + 2 {
+            let mut packet = packet_from_data(&[0, 0, 1, 0x02, index as u8]);
+            unsafe {
+                (*packet.as_mut_ptr()).pts = 1_000 + i64::try_from(index).unwrap() * 40;
+                (*packet.as_mut_ptr()).dts = 960 + i64::try_from(index).unwrap() * 40;
+                (*packet.as_mut_ptr()).duration = 40;
+            }
+            diagnostics.record(
+                &VideoDecodePacketStatus {
+                    generation: u64::try_from(index).unwrap(),
+                    result: Ok(()),
+                    decoded_frames: 0,
+                    elapsed: Duration::from_micros(250),
+                    drained: false,
+                },
+                &packet,
+                video_stream,
+                u64::try_from(index + 1).unwrap(),
+                true,
+            );
+        }
+
+        assert_eq!(
+            diagnostics.packets.len(),
+            HEVC_DECODE_PACKET_DIAGNOSTIC_WINDOW_CAPACITY
+        );
+        assert_eq!(diagnostics.packets.front().unwrap().ordinal, 3);
+        let latest = diagnostics.packets.back().unwrap();
+        assert_eq!(latest.pts_delta_nsecs, Some(40_000_000));
+        assert_eq!(latest.dts_delta_nsecs, Some(40_000_000));
+        assert_eq!(latest.packet.duration_nsecs, Some(40_000_000));
+        assert!(latest.hardware_accelerated);
+        assert_eq!(
+            latest.zero_output_run_packets,
+            u64::try_from(HEVC_DECODE_PACKET_DIAGNOSTIC_WINDOW_CAPACITY + 2).unwrap()
+        );
     }
 
     fn output_snapshot(
@@ -2694,6 +3387,7 @@ mod tests {
             packet_nsecs: Some(packet_nsecs),
             decoded_frames: 0,
             decode_ok: true,
+            hardware_accelerated: true,
             output_snapshot,
             demux_watermark,
             has_audio_output: true,
@@ -2719,6 +3413,9 @@ mod tests {
             audio_timeline_gap: None,
             recovery_waiting: false,
             output_snapshot,
+            demux_watermark: DemuxReaderWatermark::default(),
+            source_frame_diagnostic: DecodedVideoFrameDiagnostic::default(),
+            recent_cache_read_anomaly: false,
         }
     }
 
@@ -3129,6 +3826,124 @@ mod tests {
 
         assert_eq!(watchdog.take_fallback(), None);
         assert_eq!(watchdog.startup_in_flight_deadline(), None);
+    }
+
+    #[test]
+    fn software_decoder_does_not_publish_hevc_startup_deadline() {
+        let now = Instant::now();
+        let watchdog = HevcDecodeChainWatchdog {
+            first_zero_output_at: Some(now - HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER),
+            ..Default::default()
+        };
+
+        assert_eq!(watchdog.startup_watchdog_deadline(false), None);
+        assert!(watchdog.startup_watchdog_deadline(true).is_some());
+    }
+
+    #[test]
+    fn rejected_hevc_startup_deadline_is_rearmed_in_the_future() {
+        let now = Instant::now();
+        let mut watchdog = HevcDecodeChainWatchdog {
+            first_zero_output_at: Some(
+                now - HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER - Duration::from_millis(1),
+            ),
+            ..Default::default()
+        };
+
+        assert!(watchdog.startup_watchdog_deadline(true).unwrap() <= now);
+        watchdog.defer_startup_watchdog_after_no_action(now);
+        assert_eq!(
+            watchdog.startup_watchdog_deadline(true),
+            Some(now + HEVC_STARTUP_WATCHDOG_RETRY_AFTER)
+        );
+    }
+
+    #[test]
+    fn hevc_startup_rejection_logging_is_rate_limited() {
+        let now = Instant::now();
+        let mut watchdog = HevcDecodeChainWatchdog::default();
+
+        assert_eq!(
+            watchdog.record_startup_watchdog_rejection("decoder_not_decoding", now),
+            Some(0)
+        );
+        assert_eq!(
+            watchdog.record_startup_watchdog_rejection(
+                "decoder_not_decoding",
+                now + Duration::from_millis(1),
+            ),
+            None
+        );
+        assert_eq!(
+            watchdog.record_startup_watchdog_rejection(
+                "decoder_not_decoding",
+                now + HEVC_STARTUP_WATCHDOG_REJECTION_LOG_INTERVAL,
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn software_long_gop_startup_timeout_scales_with_preroll_distance() {
+        let target_nsecs = 669_625_000_000;
+        let first_packet_nsecs = 663_833_000_000;
+        let timeout =
+            hevc_startup_zero_output_timeout(false, target_nsecs, Some(first_packet_nsecs));
+
+        assert_eq!(timeout, Duration::from_millis(19_584));
+        assert!(timeout > HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER);
+    }
+
+    #[test]
+    fn software_long_gop_zero_output_does_not_fallback_at_hardware_timeout() {
+        let mut watchdog = HevcDecodeChainWatchdog::default();
+        let startup = output_snapshot(PlaybackOutputState::Syncing, false, false, None, None);
+        let target_nsecs = 669_625_000_000;
+        let first_packet_nsecs = 663_833_000_000;
+        let now = Instant::now();
+        let mut first = hevc_watchdog_input(
+            first_packet_nsecs,
+            startup,
+            demux_watermark(false),
+            target_nsecs,
+        );
+        first.hardware_accelerated = false;
+        first.now = now;
+        assert_eq!(
+            watchdog.observe_packet(first),
+            HevcDecodeChainRecoveryAction::None
+        );
+
+        let mut target =
+            hevc_watchdog_input(target_nsecs, startup, demux_watermark(false), target_nsecs);
+        target.hardware_accelerated = false;
+        target.now = now + HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER + Duration::from_millis(1);
+        assert_eq!(
+            watchdog.observe_packet(target),
+            HevcDecodeChainRecoveryAction::None
+        );
+        assert_eq!(watchdog.take_fallback(), None);
+
+        let timeout =
+            hevc_startup_zero_output_timeout(false, target_nsecs, Some(first_packet_nsecs));
+        watchdog.observe_startup_stall(HevcStartupStallObservation {
+            session_id: PlaybackSessionId(1),
+            codec_id: ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            hardware_accelerated: false,
+            video_decode_snapshot: snapshot(VideoDecodeWorkerState::NeedPacket, 0, 0),
+            now: now + timeout + Duration::from_millis(1),
+            output_snapshot: startup,
+            demux_watermark: demux_watermark(false),
+            has_audio_output: true,
+            fallback_target_nsecs: target_nsecs,
+        });
+        assert_eq!(
+            watchdog.take_fallback(),
+            Some(HevcDecodeChainFallback {
+                target_nsecs,
+                reason: HevcDecodeChainFallbackReason::ZeroOutputRebuffer,
+            })
+        );
     }
 
     #[test]
@@ -3783,7 +4598,67 @@ mod tests {
     }
 
     #[test]
-    fn hevc_recent_zero_output_evidence_survives_single_frame_before_gap() {
+    fn recent_software_video_progress_defers_packet_lead_recovery() {
+        let now = Instant::now();
+        let mut watchdog = HevcDecodeChainWatchdog {
+            last_video_progress_at: Some(now),
+            ..Default::default()
+        };
+        let snapshot = output_snapshot(
+            PlaybackOutputState::Rebuffering,
+            true,
+            false,
+            Some((1_000_000_000, 1_100_000_000)),
+            Some(100_000_000),
+        );
+        let mut during_grace = hevc_watchdog_input(
+            1_800_000_000,
+            snapshot,
+            demux_watermark(false),
+            1_000_000_000,
+        );
+        during_grace.hardware_accelerated = false;
+        during_grace.now = now + Duration::from_millis(1_999);
+
+        assert_eq!(
+            watchdog.observe_packet(during_grace),
+            HevcDecodeChainRecoveryAction::None
+        );
+        assert!(!watchdog.soft_recovery_attempted);
+
+        let mut after_grace = during_grace;
+        after_grace.packet_nsecs = Some(1_833_000_000);
+        after_grace.now = now + Duration::from_millis(2_001);
+        assert_eq!(
+            watchdog.observe_packet(after_grace),
+            HevcDecodeChainRecoveryAction::SoftRecovery
+        );
+    }
+
+    #[test]
+    fn admitted_video_progress_cancels_transient_rebuffer_fallback() {
+        let mut watchdog = HevcDecodeChainWatchdog {
+            pending_fallback: Some(HevcDecodeChainFallback {
+                target_nsecs: 1_000_000_000,
+                reason: HevcDecodeChainFallbackReason::RecoveryWaitRebuffer,
+            }),
+            ..Default::default()
+        };
+
+        watchdog.observe_admitted_video_progress(HevcAdmittedVideoProgressObservation {
+            session_id: PlaybackSessionId(1),
+            codec_id: ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            frame_timeline_nsecs: 1_000_000_000,
+            current_start_position_nsecs: 1_000_000_000,
+            before_queue_end_nsecs: None,
+            after_queue_end_nsecs: Some(1_041_666_666),
+        });
+
+        assert_eq!(watchdog.take_fallback(), None);
+    }
+
+    #[test]
+    fn hevc_recent_zero_output_evidence_alone_does_not_trigger_gap_fallback() {
         let mut watchdog = HevcDecodeChainWatchdog {
             zero_output_packets: 178,
             recent_zero_output_packets: 178,
@@ -3822,12 +4697,177 @@ mod tests {
 
         assert_eq!(
             watchdog.observe_decoded_frame_gap(gap),
+            HevcDecodedFrameGapAction::Admit
+        );
+        assert_eq!(watchdog.take_fallback(), None);
+    }
+
+    #[test]
+    fn clean_hevc_keyframe_bridges_small_decode_gap_without_fallback() {
+        let mut watchdog = HevcDecodeChainWatchdog {
+            zero_output_packets: 3,
+            recent_zero_output_packets: 12,
+            ..Default::default()
+        };
+        let snapshot = output_snapshot(
+            PlaybackOutputState::Playing,
+            false,
+            false,
+            Some((118_816_666_667, 119_649_999_999)),
+            Some(847_832_951),
+        );
+        let mut gap = decoded_frame_gap_observation(ffi::AVCodecID::AV_CODEC_ID_HEVC, snapshot);
+        gap.timeline_nsecs = 119_866_666_667;
+        gap.duration_nsecs = 16_666_666;
+        gap.previous_expected_next_nsecs = Some(119_649_999_999);
+        gap.previous_gap_nsecs = Some(216_666_668);
+        gap.max_gap_nsecs = 200_000_000;
+        gap.fallback_target_nsecs = 119_649_999_999;
+        gap.audio_played_timeline_nsecs = Some(118_802_167_048);
+        gap.demux_watermark = demux_watermark(false);
+        gap.source_frame_diagnostic = DecodedVideoFrameDiagnostic {
+            key_frame: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            watchdog.observe_decoded_frame_gap(gap),
+            HevcDecodedFrameGapAction::AdmitAndBridgeDecodeGap
+        );
+        assert_eq!(watchdog.take_fallback(), None);
+        assert_eq!(watchdog.zero_output_packets, 0);
+        assert_eq!(watchdog.recent_zero_output_packets, 0);
+    }
+
+    #[test]
+    fn clean_hevc_keyframe_bridges_rounding_edge_decode_gap_from_seek_log() {
+        let mut watchdog = HevcDecodeChainWatchdog {
+            zero_output_packets: 3,
+            recent_zero_output_packets: 12,
+            ..Default::default()
+        };
+        let snapshot = output_snapshot(
+            PlaybackOutputState::Syncing,
+            false,
+            false,
+            Some((174_066_666_667, 174_116_666_666)),
+            Some(49_999_999),
+        );
+        let mut gap = decoded_frame_gap_observation(ffi::AVCodecID::AV_CODEC_ID_HEVC, snapshot);
+        gap.timeline_nsecs = 174_616_666_667;
+        gap.duration_nsecs = 16_666_666;
+        gap.previous_expected_next_nsecs = Some(174_116_666_666);
+        gap.previous_gap_nsecs = Some(500_000_001);
+        gap.max_gap_nsecs = 200_000_000;
+        gap.fallback_target_nsecs = 174_116_666_666;
+        gap.audio_played_timeline_nsecs = Some(174_066_666_667);
+        gap.demux_watermark = demux_watermark(false);
+        gap.source_frame_diagnostic = DecodedVideoFrameDiagnostic {
+            key_frame: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            watchdog.observe_decoded_frame_gap(gap),
+            HevcDecodedFrameGapAction::AdmitAndBridgeDecodeGap
+        );
+        assert_eq!(watchdog.take_fallback(), None);
+        assert_eq!(watchdog.zero_output_packets, 0);
+        assert_eq!(watchdog.recent_zero_output_packets, 0);
+    }
+
+    #[test]
+    fn clean_hevc_keyframe_does_not_bridge_decode_gap_beyond_rounding_tolerance() {
+        let mut watchdog = HevcDecodeChainWatchdog::default();
+        let snapshot = output_snapshot(
+            PlaybackOutputState::Syncing,
+            false,
+            false,
+            Some((174_066_666_667, 174_116_666_666)),
+            Some(49_999_999),
+        );
+        let mut gap = decoded_frame_gap_observation(ffi::AVCodecID::AV_CODEC_ID_HEVC, snapshot);
+        gap.timeline_nsecs = 174_616_667_667;
+        gap.duration_nsecs = 16_666_666;
+        gap.previous_expected_next_nsecs = Some(174_116_666_666);
+        gap.previous_gap_nsecs = Some(500_001_001);
+        gap.max_gap_nsecs = 200_000_000;
+        gap.fallback_target_nsecs = 174_116_666_666;
+        gap.audio_played_timeline_nsecs = Some(174_066_666_667);
+        gap.demux_watermark = demux_watermark(false);
+        gap.source_frame_diagnostic = DecodedVideoFrameDiagnostic {
+            key_frame: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            watchdog.observe_decoded_frame_gap(gap),
+            HevcDecodedFrameGapAction::Admit
+        );
+        assert_eq!(watchdog.take_fallback(), None);
+    }
+
+    #[test]
+    fn strong_hevc_gap_evidence_defers_fallback_while_output_queue_is_healthy() {
+        let mut watchdog = HevcDecodeChainWatchdog {
+            recent_zero_output_packets: 24,
+            recent_soft_recovery_attempted: true,
+            recent_packet_lead_exceeded: true,
+            ..Default::default()
+        };
+        let snapshot = output_snapshot(
+            PlaybackOutputState::Playing,
+            false,
+            false,
+            Some((1_000_000_000, 1_800_000_000)),
+            Some(800_000_000),
+        );
+        let mut gap = decoded_frame_gap_observation(ffi::AVCodecID::AV_CODEC_ID_HEVC, snapshot);
+        gap.source_frame_diagnostic = DecodedVideoFrameDiagnostic {
+            corrupt: true,
+            decode_error_flags: 1,
+            ..Default::default()
+        };
+        gap.demux_watermark = demux_watermark(false);
+
+        assert_eq!(
+            watchdog.observe_decoded_frame_gap(gap),
+            HevcDecodedFrameGapAction::DeferFallback
+        );
+        assert_eq!(watchdog.take_fallback(), None);
+    }
+
+    #[test]
+    fn strong_hevc_gap_evidence_requests_fallback_at_output_low_water() {
+        let mut watchdog = HevcDecodeChainWatchdog {
+            recent_zero_output_packets: 24,
+            recent_soft_recovery_attempted: true,
+            recent_packet_lead_exceeded: true,
+            ..Default::default()
+        };
+        let snapshot = output_snapshot(
+            PlaybackOutputState::Playing,
+            false,
+            true,
+            Some((1_000_000_000, 1_120_000_000)),
+            Some(120_000_000),
+        );
+        let mut gap = decoded_frame_gap_observation(ffi::AVCodecID::AV_CODEC_ID_HEVC, snapshot);
+        gap.source_frame_diagnostic = DecodedVideoFrameDiagnostic {
+            corrupt: true,
+            decode_error_flags: 1,
+            ..Default::default()
+        };
+        gap.demux_watermark = demux_watermark(false);
+
+        assert_eq!(
+            watchdog.observe_decoded_frame_gap(gap),
             HevcDecodedFrameGapAction::DropForFallback
         );
         assert_eq!(
             watchdog.take_fallback(),
             Some(HevcDecodeChainFallback {
-                target_nsecs: 144_733_333_333,
+                target_nsecs: 252_920_000_000,
                 reason: HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
             })
         );
@@ -3944,7 +4984,7 @@ mod tests {
     }
 
     #[test]
-    fn hevc_zero_output_pts_gap_fallback_survives_admitted_video_progress() {
+    fn hevc_zero_output_pts_gap_fallback_is_cancelled_by_admitted_video_progress() {
         let mut watchdog = HevcDecodeChainWatchdog::default();
         let snapshot = output_snapshot(
             PlaybackOutputState::Playing,
@@ -3979,17 +5019,11 @@ mod tests {
             after_queue_end_nsecs: Some(257_760_000_000),
         });
 
-        assert_eq!(
-            watchdog.take_fallback(),
-            Some(HevcDecodeChainFallback {
-                target_nsecs: 252_920_000_000,
-                reason: HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
-            })
-        );
+        assert_eq!(watchdog.take_fallback(), None);
     }
 
     #[test]
-    fn hevc_zero_output_pts_gap_fallback_survives_seek_preroll_progress() {
+    fn hevc_zero_output_pts_gap_fallback_is_cancelled_by_seek_preroll_progress() {
         let mut watchdog = HevcDecodeChainWatchdog::default();
         let snapshot = output_snapshot(
             PlaybackOutputState::Playing,
@@ -4022,13 +5056,7 @@ mod tests {
             preroll_frames: 1,
         });
 
-        assert_eq!(
-            watchdog.take_fallback(),
-            Some(HevcDecodeChainFallback {
-                target_nsecs: 252_920_000_000,
-                reason: HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
-            })
-        );
+        assert_eq!(watchdog.take_fallback(), None);
     }
 
     #[test]
@@ -4088,7 +5116,7 @@ mod tests {
     }
 
     #[test]
-    fn video_only_pts_gap_still_requests_decode_chain_fallback() {
+    fn video_only_pts_gap_with_weak_recent_evidence_does_not_fallback() {
         let mut watchdog = HevcDecodeChainWatchdog {
             recent_zero_output_packets: 19,
             recent_packet_lead_exceeded: true,
@@ -4109,15 +5137,9 @@ mod tests {
 
         assert_eq!(
             watchdog.observe_decoded_frame_gap(gap),
-            HevcDecodedFrameGapAction::DropForFallback
+            HevcDecodedFrameGapAction::Admit
         );
-        assert_eq!(
-            watchdog.take_fallback(),
-            Some(HevcDecodeChainFallback {
-                target_nsecs: 1_254_127_708_333,
-                reason: HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
-            })
-        );
+        assert_eq!(watchdog.take_fallback(), None);
     }
 
     #[test]

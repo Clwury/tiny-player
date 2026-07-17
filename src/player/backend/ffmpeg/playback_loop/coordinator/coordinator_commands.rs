@@ -15,7 +15,7 @@ use super::commands::{begin_seek, begin_track_switch};
 use super::playback_pipeline_state::PlaybackPipelineState;
 use super::playback_reset_service::{
     PlaybackGenerationFlushContext, PlaybackPositionResetKind, PlaybackPositionStateResetContext,
-    PlaybackSeekResetContext, service_playback_generation_seek,
+    PlaybackSeekBufferingPolicy, PlaybackSeekResetContext, service_playback_generation_seek,
     service_playback_position_state_reset, service_playback_seek_reset,
 };
 use super::track_switch::{TrackSwitchPipelineState, service_track_switch_pipelines};
@@ -159,6 +159,7 @@ pub(super) fn service_playback_commands(
             demux_cache: context.demux_cache,
             pipeline: context.pipeline,
             emit_playback_buffered_events: context.emit_playback_buffered_events,
+            buffering_policy: PlaybackSeekBufferingPolicy::Emit,
             control: context.control,
             event_tx: context.event_tx,
         })?;

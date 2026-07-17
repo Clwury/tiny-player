@@ -3,6 +3,7 @@ use std::sync::{
     atomic::AtomicBool,
     mpsc::{Receiver, Sender},
 };
+use std::time::Instant;
 
 #[cfg(test)]
 use std::os::raw::c_int;
@@ -16,7 +17,9 @@ use crate::player::{
 };
 
 use super::playback_pipeline_state::CachedSeekRecoveryFallbackAction;
-use super::playback_reset_service::{PlaybackSeekResetContext, service_playback_seek_reset};
+use super::playback_reset_service::{
+    PlaybackSeekBufferingPolicy, PlaybackSeekResetContext, service_playback_seek_reset,
+};
 use super::video_decode_pipeline::{
     HevcDecodeChainFallbackLoopAction, HevcDecodeChainFallbackReason,
 };
@@ -26,15 +29,16 @@ use super::{
     END_OF_PLAYBACK_READ_ERROR_TOLERANCE_SECONDS, FfmpegCommand, FfmpegControl,
     FfmpegPlaybackInput, OpenedPlaybackInput, PlaybackCommandContext, PlaybackCommandServiceStatus,
     PlaybackCoordinatorGateContext, PlaybackEofDrainContext, PlaybackEofDrainStatus,
-    PlaybackGeneration, PlaybackOutputScheduler, PlaybackPipelineServices, PlaybackPipelineState,
-    PlaybackScheduler, PlaybackSession, PlaybackTickContext, PlaybackTickStatus, PositionReporter,
-    SubtitlePipeline, TimestampMapper, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VideoDecodePipeline,
-    VideoDecodeRecovery, VideoFramePrepareWorker, audio_codec_requires_recovery_point,
-    duration_nsecs, nsecs_to_seconds, open_playback_input_with_fallback,
-    playback_audio_info_from_stream, playback_video_info_from_worker,
-    preroll_seek_position_seconds, service_hevc_startup_stall_watchdog_if_due,
-    service_playback_commands, service_playback_eof_drain, service_playback_tick,
-    should_cache_http_url, video_seek_preroll_nsecs,
+    PlaybackGeneration, PlaybackOutputScheduler, PlaybackOutputSnapshot, PlaybackPipelineServices,
+    PlaybackPipelineState, PlaybackScheduler, PlaybackSession, PlaybackTickContext,
+    PlaybackTickStatus, PositionReporter, SubtitlePipeline, TimestampMapper,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VideoDecodePipeline, VideoDecodeRecovery,
+    VideoFramePrepareWorker, audio_codec_requires_recovery_point, duration_nsecs, nsecs_to_seconds,
+    open_playback_input_with_fallback, playback_audio_info_from_stream,
+    playback_video_info_from_worker, preroll_seek_position_seconds,
+    service_hevc_startup_stall_watchdog_if_due, service_playback_commands,
+    service_playback_eof_drain, service_playback_tick, should_cache_http_url,
+    video_seek_preroll_nsecs,
 };
 
 pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
@@ -423,6 +427,21 @@ fn rebuffer_audio_realign_can_preserve_video_queue(
             || queued_video_covers_target)
 }
 
+fn internal_recovery_seek_buffering_policy(
+    output_snapshot: PlaybackOutputSnapshot,
+) -> PlaybackSeekBufferingPolicy {
+    let can_preserve_visible_frame = !output_snapshot.first_video_frame_pending
+        && !output_snapshot.rebuffering
+        && !output_snapshot.video_output_low_water
+        && !output_snapshot.video_decode_underfill
+        && output_snapshot.queued_video_frames > 0;
+    if can_preserve_visible_frame {
+        PlaybackSeekBufferingPolicy::PreserveVisibleFrame
+    } else {
+        PlaybackSeekBufferingPolicy::Emit
+    }
+}
+
 fn service_rebuffer_audio_realign_seek_if_needed(
     session: &mut PlaybackSession,
     control: &FfmpegControl,
@@ -614,6 +633,7 @@ fn service_rebuffer_audio_realign_seek_if_needed(
         demux_cache,
         pipeline,
         emit_playback_buffered_events,
+        buffering_policy: internal_recovery_seek_buffering_policy(output_snapshot),
         control,
         event_tx,
     })?;
@@ -691,6 +711,12 @@ fn service_cached_seek_recovery_fallback_if_needed(
         let position_seconds = nsecs_to_seconds(fallback.target_nsecs);
         control.set_cache_paused(false);
         match fallback.action {
+            CachedSeekRecoveryFallbackAction::RecoveryExhausted => {
+                return Err(format!(
+                    "HEVC cached seek recovery exhausted at {:.3}s after soft recovery, software fallback and low-level seek",
+                    position_seconds
+                ));
+            }
             CachedSeekRecoveryFallbackAction::SoftRecover => {
                 let requeued_probe_packets =
                     pipeline.soft_recover_cached_seek_hevc_decode_chain(session.id())?;
@@ -808,6 +834,8 @@ fn service_cached_seek_recovery_fallback_if_needed(
             demux_selected_min_forward_nsecs = ?demux_watermark.selected_min_forward_nsecs,
             "handling HEVC cached seek recovery fallback with low-level seek"
         );
+        let buffering_policy =
+            internal_recovery_seek_buffering_policy(pipeline.output_scheduler.snapshot());
         let demux_seek_result = service_playback_seek_reset(PlaybackSeekResetContext {
             position_seconds,
             seek_mode: crate::player::backend::PlaybackSeekMode::Precise,
@@ -819,6 +847,7 @@ fn service_cached_seek_recovery_fallback_if_needed(
             demux_cache,
             pipeline,
             emit_playback_buffered_events,
+            buffering_policy,
             control,
             event_tx,
         })?;
@@ -847,6 +876,49 @@ fn service_cached_seek_recovery_fallback_if_needed(
     };
     let position_seconds = nsecs_to_seconds(fallback.target_nsecs);
     control.set_cache_paused(false);
+
+    if fallback.reason.invalidated_by_video_progress()
+        && pipeline
+            .video_decode_pipeline
+            .hevc_recent_video_progress_grace_active(Instant::now())
+    {
+        pipeline.video_decode_recovery.reset();
+        pipeline
+            .video_decode_pipeline
+            .reset_hevc_decode_chain_transient_state();
+        tracing::debug!(
+            session_id = ?session.id(),
+            position_seconds,
+            target_nsecs = fallback.target_nsecs,
+            reason = fallback.reason.as_str(),
+            "discarded stale HEVC decode chain fallback after recent decoded video progress"
+        );
+        return Ok(true);
+    }
+
+    if pipeline.video_decode_pipeline.info().hardware_accelerated
+        && fallback.reason.requires_repeat_before_hardware_downgrade()
+        && !pipeline
+            .video_decode_pipeline
+            .has_prior_matching_hevc_decode_chain_fallback(fallback)
+    {
+        pipeline.video_decode_recovery.reset();
+        pipeline
+            .video_decode_pipeline
+            .reset_hevc_decode_chain_transient_state();
+        pipeline
+            .video_decode_pipeline
+            .remember_hevc_decode_chain_fallback(fallback);
+        pipeline.begin_cached_seek_recovery_watchdog(fallback.target_nsecs, session.id());
+        tracing::warn!(
+            session_id = ?session.id(),
+            position_seconds,
+            target_nsecs = fallback.target_nsecs,
+            reason = fallback.reason.as_str(),
+            "deferred HEVC hardware decoder downgrade until recovery failure repeats"
+        );
+        return Ok(true);
+    }
 
     let loop_action = pipeline
         .video_decode_pipeline
@@ -1040,6 +1112,7 @@ fn service_cached_seek_recovery_fallback_if_needed(
         demux_cache,
         pipeline,
         emit_playback_buffered_events,
+        buffering_policy: internal_recovery_seek_buffering_policy(output_snapshot),
         control,
         event_tx,
     })?;
@@ -1071,6 +1144,7 @@ fn hevc_decode_chain_fallback_reopens_software(reason: HevcDecodeChainFallbackRe
         reason,
         HevcDecodeChainFallbackReason::ZeroOutputRebuffer
             | HevcDecodeChainFallbackReason::StartupInFlightStall
+            | HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput
             | HevcDecodeChainFallbackReason::RecoveryWaitRebuffer
             | HevcDecodeChainFallbackReason::PostFallbackRebufferUnderfill
     )
@@ -1147,13 +1221,42 @@ pub(super) fn playback_buffered_near_duration(
 #[cfg(test)]
 mod tests {
     use super::{
-        DemuxReaderWatermark, HevcDecodeChainFallbackReason,
-        demux_reader_unusable_for_hevc_low_level_seek, hevc_decode_chain_fallback_reopens_software,
+        DemuxReaderWatermark, HevcDecodeChainFallbackReason, PlaybackOutputSnapshot,
+        PlaybackSeekBufferingPolicy, demux_reader_unusable_for_hevc_low_level_seek,
+        hevc_decode_chain_fallback_reopens_software,
         hevc_decode_chain_fallback_requires_boundary_reset,
         hevc_decode_chain_fallback_should_suppress_low_level_seek,
-        rebuffer_audio_realign_can_preserve_video_queue,
+        internal_recovery_seek_buffering_policy, rebuffer_audio_realign_can_preserve_video_queue,
         rebuffer_audio_realign_requires_low_level_seek,
     };
+    use crate::player::backend::ffmpeg::playback_loop::PlaybackOutputState;
+
+    fn output_snapshot(
+        state: PlaybackOutputState,
+        queued_video_frames: usize,
+        rebuffering: bool,
+        video_output_low_water: bool,
+        video_decode_underfill: bool,
+    ) -> PlaybackOutputSnapshot {
+        PlaybackOutputSnapshot {
+            state,
+            first_video_frame_pending: state.first_video_frame_pending(),
+            rebuffering,
+            queued_video_frames,
+            queued_video_duration_nsecs: 800_000_000,
+            queued_video_range_nsecs: Some((1_000_000_000, 1_800_000_000)),
+            queued_video_forward_nsecs: Some(800_000_000),
+            queued_video_contiguous_forward_nsecs: Some(800_000_000),
+            queued_video_largest_gap_nsecs: None,
+            video_output_low_water,
+            pending_start_audio_frames: 0,
+            pending_start_audio_nsecs: 0,
+            video_output_rebuffer_anchor: None,
+            video_bootstrap_after_seek: false,
+            video_decode_underfill,
+            rebuffer_empty_audio_output_blocked: false,
+        }
+    }
 
     #[test]
     fn hevc_startup_zero_output_hard_fallbacks_to_software() {
@@ -1174,6 +1277,47 @@ mod tests {
         assert!(hevc_decode_chain_fallback_reopens_software(
             HevcDecodeChainFallbackReason::RecoveryWaitRebuffer
         ));
+    }
+
+    #[test]
+    fn hevc_pts_gap_fallback_reopens_software_before_seek() {
+        assert!(hevc_decode_chain_fallback_reopens_software(
+            HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput
+        ));
+    }
+
+    #[test]
+    fn internal_recovery_suppresses_buffering_while_visible_output_is_healthy() {
+        assert_eq!(
+            internal_recovery_seek_buffering_policy(output_snapshot(
+                PlaybackOutputState::Playing,
+                48,
+                false,
+                false,
+                false,
+            )),
+            PlaybackSeekBufferingPolicy::PreserveVisibleFrame
+        );
+        assert_eq!(
+            internal_recovery_seek_buffering_policy(output_snapshot(
+                PlaybackOutputState::Playing,
+                3,
+                false,
+                true,
+                false,
+            )),
+            PlaybackSeekBufferingPolicy::Emit
+        );
+        assert_eq!(
+            internal_recovery_seek_buffering_policy(output_snapshot(
+                PlaybackOutputState::Rebuffering,
+                0,
+                true,
+                true,
+                true,
+            )),
+            PlaybackSeekBufferingPolicy::Emit
+        );
     }
 
     #[test]

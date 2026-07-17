@@ -49,6 +49,18 @@ pub(super) struct PlaybackPositionStateResetContext<'a> {
     pub(super) event_tx: &'a Sender<BackendEvent>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlaybackSeekBufferingPolicy {
+    Emit,
+    PreserveVisibleFrame,
+}
+
+impl PlaybackSeekBufferingPolicy {
+    fn emits_buffering_start(self) -> bool {
+        matches!(self, Self::Emit)
+    }
+}
+
 pub(super) struct PlaybackSeekResetContext<'a> {
     pub(super) position_seconds: f64,
     pub(super) seek_mode: PlaybackSeekMode,
@@ -60,6 +72,7 @@ pub(super) struct PlaybackSeekResetContext<'a> {
     pub(super) demux_cache: &'a DemuxPacketCache,
     pub(super) pipeline: &'a mut PlaybackPipelineState,
     pub(super) emit_playback_buffered_events: bool,
+    pub(super) buffering_policy: PlaybackSeekBufferingPolicy,
     pub(super) control: &'a FfmpegControl,
     pub(super) event_tx: &'a Sender<BackendEvent>,
 }
@@ -214,6 +227,7 @@ pub(super) fn service_playback_seek_reset(
         demux_cache,
         pipeline,
         emit_playback_buffered_events,
+        buffering_policy,
         control,
         event_tx,
     } = context;
@@ -259,9 +273,31 @@ pub(super) fn service_playback_seek_reset(
     } else {
         pipeline.clear_cached_seek_recovery_watchdog();
     }
-    let _ = event_tx.send(BackendEvent::new(
-        session_id,
-        BackendEventKind::Buffering(true),
-    ));
+    if buffering_policy.emits_buffering_start() {
+        let _ = event_tx.send(BackendEvent::new(
+            session_id,
+            BackendEventKind::Buffering(true),
+        ));
+    } else {
+        tracing::debug!(
+            session_id = ?session_id,
+            position_seconds,
+            seek_mode = ?seek_mode,
+            force_low_level_seek,
+            low_level_seek_reason,
+            "suppressed user-visible buffering for internal playback repair"
+        );
+    }
     Ok(flush_result.demux_seek_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlaybackSeekBufferingPolicy;
+
+    #[test]
+    fn internal_repair_can_preserve_visible_frame_without_buffering_event() {
+        assert!(!PlaybackSeekBufferingPolicy::PreserveVisibleFrame.emits_buffering_start());
+        assert!(PlaybackSeekBufferingPolicy::Emit.emits_buffering_start());
+    }
 }

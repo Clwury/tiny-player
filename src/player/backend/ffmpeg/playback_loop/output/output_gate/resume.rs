@@ -23,6 +23,7 @@ use super::{
 
 pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) const
     MAX_REBUFFER_AUDIO_LEAD_NSECS: u64 = 2_000_000_000;
+const HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) enum StaleRebufferPendingAudio {
@@ -87,6 +88,29 @@ fn hevc_startup_recent_zero_output_or_recovery(stats: HevcDecodeChainStats) -> b
         || stats.pending_fallback_reason.is_some()
 }
 
+fn hevc_startup_active_recovery(stats: HevcDecodeChainStats) -> bool {
+    stats.zero_output_packets > 0
+        || stats.soft_recovery_attempted
+        || stats.pending_fallback_reason.is_some()
+}
+
+fn hevc_startup_hard_bounded_start_ready(
+    after: PlaybackResumeWaterline,
+    queued_video_frames: usize,
+    hevc_decode_chain_stats: HevcDecodeChainStats,
+    startup_sync_elapsed: Option<Duration>,
+) -> bool {
+    // Historical recovery evidence must not keep a healthy, decoded startup in
+    // Syncing forever. Active recovery and pending fallback still take priority.
+    queued_video_frames >= 2
+        && after
+            .decoded_video_forward_nsecs
+            .is_some_and(|forward_nsecs| forward_nsecs > 0)
+        && startup_sync_elapsed
+            .is_some_and(|elapsed| elapsed >= HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER)
+        && !hevc_startup_active_recovery(hevc_decode_chain_stats)
+}
+
 fn hevc_startup_gate_defer_reason(
     video_is_hevc: bool,
     before: PlaybackResumeWaterline,
@@ -98,7 +122,15 @@ fn hevc_startup_gate_defer_reason(
     if !video_is_hevc || before.decoded_video_ready || !after.decoded_video_ready {
         return None;
     }
-    if hevc_startup_recent_zero_output_or_recovery(hevc_decode_chain_stats) {
+    let hard_bounded_start_ready = hevc_startup_hard_bounded_start_ready(
+        after,
+        queued_video_frames,
+        hevc_decode_chain_stats,
+        startup_sync_elapsed,
+    );
+    if hevc_startup_recent_zero_output_or_recovery(hevc_decode_chain_stats)
+        && !hard_bounded_start_ready
+    {
         return Some("recent_zero_output_or_recovery");
     }
     if queued_video_frames < 2 {
@@ -111,6 +143,7 @@ fn hevc_startup_gate_defer_reason(
             .is_some_and(|elapsed| elapsed >= VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER);
     if decoded_video_forward_nsecs < duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
         && !bounded_startup_fallback_ready
+        && !hard_bounded_start_ready
     {
         return Some("decoded_video_below_hevc_startup_waterline");
     }
@@ -995,6 +1028,13 @@ where
             initial_sync_decision,
             output_scheduler.startup_sync_elapsed(),
         );
+        let hevc_hard_bounded_start_ready = video_is_hevc
+            && hevc_startup_hard_bounded_start_ready(
+                first_frame_waterline,
+                output_scheduler.scheduled_video_queue.len(),
+                hevc_decode_chain_stats,
+                output_scheduler.startup_sync_elapsed(),
+            );
         if let Some(reason) = hevc_startup_gate_defer_reason(
             video_is_hevc,
             waterline,
@@ -1014,6 +1054,7 @@ where
                 recent_zero_output = hevc_startup_recent_zero_output_or_recovery(
                     hevc_decode_chain_stats,
                 ),
+                hard_bounded_start_ready = hevc_hard_bounded_start_ready,
                 reason,
                 startup_wait_ms = output_scheduler
                     .startup_sync_elapsed()
@@ -1050,6 +1091,7 @@ where
                     .map(|duration| duration as f64 / 1_000_000.0),
                 demux_read_index,
                 video_decoder_pending_packets,
+                hevc_hard_bounded_start_ready,
                 "startup output gate first video frame fallback; presenting first frame with cached demux ready"
             );
         }
@@ -1759,6 +1801,78 @@ mod tests {
                     ..Default::default()
                 },
                 Some(VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER),
+            ),
+            Some("recent_zero_output_or_recovery")
+        );
+    }
+
+    #[test]
+    fn hevc_startup_gate_hard_fallback_ignores_stale_recovery_evidence() {
+        let before = startup_gate_waterline(49_999_999, false);
+        let after = startup_gate_waterline(49_999_999, true);
+        let stats = HevcDecodeChainStats {
+            recent_zero_output_packets: 12,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            hevc_startup_gate_defer_reason(
+                true,
+                before,
+                after,
+                51,
+                stats,
+                Some(HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER - Duration::from_millis(1),),
+            ),
+            Some("recent_zero_output_or_recovery")
+        );
+        assert_eq!(
+            hevc_startup_gate_defer_reason(
+                true,
+                before,
+                after,
+                51,
+                stats,
+                Some(HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hevc_startup_gate_hard_fallback_does_not_bypass_active_recovery() {
+        let before = startup_gate_waterline(49_999_999, false);
+        let after = startup_gate_waterline(49_999_999, true);
+
+        assert_eq!(
+            hevc_startup_gate_defer_reason(
+                true,
+                before,
+                after,
+                51,
+                HevcDecodeChainStats {
+                    zero_output_packets: 1,
+                    recent_zero_output_packets: 12,
+                    ..Default::default()
+                },
+                Some(HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER),
+            ),
+            Some("recent_zero_output_or_recovery")
+        );
+        assert_eq!(
+            hevc_startup_gate_defer_reason(
+                true,
+                before,
+                after,
+                51,
+                HevcDecodeChainStats {
+                    recent_zero_output_packets: 12,
+                    pending_fallback_reason: Some(
+                        HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
+                    ),
+                    ..Default::default()
+                },
+                Some(HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER),
             ),
             Some("recent_zero_output_or_recovery")
         );

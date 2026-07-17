@@ -5,7 +5,8 @@ use std::{
 };
 
 use super::{
-    DEMUX_CACHE_LOCK_TIMING_LOG_AFTER, DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT,
+    AvPacketReadDiagnostic, DEMUX_CACHE_LOCK_TIMING_LOG_AFTER,
+    DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT, DemuxPacketCacheLastRead,
     DemuxPacketCacheReadTiming, DemuxPacketCacheState, DemuxPacketQueueSnapshot,
     DemuxPacketReadSource, DemuxStreamPacketQueueSnapshot, DemuxStreamReaderRealignResult,
     PacketId, StreamCacheKind, audio_codec_requires_recovery_point,
@@ -51,13 +52,77 @@ impl DemuxPacketCacheState {
             let Some(packet_id) = self.next_packet_id_for_stream(stream_index) else {
                 continue;
             };
-            let packet = self.packet_read_source(packet_id, stream_offset)?;
+            let read_index_before = self.read_index;
+            let read_range_id = self.read_range_id;
+            let cache_generation = self.generation;
+            let reader_head_before = self.reader_heads.get(&stream_index).copied();
+            let previous_read = self.last_packet_reads.get(&stream_index).copied();
+            let (
+                storage,
+                packet_start_nsecs,
+                packet_end_nsecs,
+                timeline_anchor,
+                recovery_point,
+                safe_seek_point,
+            ) = {
+                let Some(packet) = self.packets.get(&packet_id) else {
+                    return Err("FFmpeg demux packet cache entry missing".to_string());
+                };
+                (
+                    packet.storage_kind(),
+                    packet.start_nsecs,
+                    packet.end_nsecs,
+                    packet.timeline_anchor,
+                    packet.recovery_point,
+                    packet.safe_seek_point,
+                )
+            };
+            let mut packet = self.packet_read_source(packet_id, stream_offset)?;
             if let Some(end_nsecs) = self.packet_end_nsecs(packet_id)
                 && self.stream_advances_global_reader(stream_index)
             {
                 self.reader_nsecs = self.reader_nsecs.max(end_nsecs);
             }
             self.consume_packet_id_with_trim(packet_id, timing, trim_allowed);
+            self.next_packet_read_sequence = self.next_packet_read_sequence.saturating_add(1);
+            let reader_head_after = self.reader_heads.get(&stream_index).copied();
+            let sequence_contiguous = previous_read
+                .filter(|previous| previous.generation == cache_generation)
+                .and_then(|previous| {
+                    previous
+                        .expected_next_packet_id
+                        .map(|expected| expected == packet_id)
+                });
+            packet.set_diagnostic(AvPacketReadDiagnostic {
+                read_sequence: self.next_packet_read_sequence,
+                cache_generation,
+                read_range_id,
+                packet_id,
+                stream_offset,
+                storage,
+                read_index_before,
+                read_index_after: self.read_index,
+                reader_head_before,
+                reader_head_after,
+                previous_read_packet_id: previous_read.map(|previous| previous.packet_id),
+                previous_read_generation: previous_read.map(|previous| previous.generation),
+                previous_expected_next_packet_id: previous_read
+                    .and_then(|previous| previous.expected_next_packet_id),
+                sequence_contiguous,
+                packet_start_nsecs,
+                packet_end_nsecs,
+                timeline_anchor,
+                recovery_point,
+                safe_seek_point,
+            });
+            self.last_packet_reads.insert(
+                stream_index,
+                DemuxPacketCacheLastRead {
+                    generation: cache_generation,
+                    packet_id,
+                    expected_next_packet_id: reader_head_after,
+                },
+            );
             timing.take_packet += started_at.elapsed();
             return Ok(Some(packet));
         }

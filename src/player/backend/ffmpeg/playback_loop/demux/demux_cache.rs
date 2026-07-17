@@ -22,15 +22,16 @@ use crate::player::{
 #[cfg(test)]
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::DEMUX_PACKET_CACHE_MEMORY_BYTES;
 use super::{
-    AvPacket, BufferedReporter, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
-    DEMUX_CACHE_LOCK_TIMING_LOG_AFTER, DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_AFTER,
-    DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL, DEMUX_PACKET_CACHE_STALL_LOG_AFTER,
-    DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL, DEMUX_PACKET_CACHE_WAIT_INTERVAL, FfmpegControl,
-    FormatContext, StreamInfo, TimestampMapper, audio_codec_requires_recovery_point,
-    duration_nsecs, ffmpeg_error, nsecs_to_seconds, optional_buffered_value_changed,
-    packet_duration_nsecs, packet_is_audio_recovery_point, packet_is_video_recovery_point,
-    packet_is_video_seek_point, playback_buffered_near_duration, preroll_seek_position_seconds,
-    seconds_to_nsecs, video_cached_seek_preroll_nsecs, video_seek_preroll_nsecs,
+    AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, BufferedReporter,
+    DEFAULT_VIDEO_FRAME_DURATION_NSECS, DEMUX_CACHE_LOCK_TIMING_LOG_AFTER,
+    DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_AFTER, DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
+    DEMUX_PACKET_CACHE_STALL_LOG_AFTER, DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL,
+    DEMUX_PACKET_CACHE_WAIT_INTERVAL, FfmpegControl, FormatContext, StreamInfo, TimestampMapper,
+    audio_codec_requires_recovery_point, duration_nsecs, ffmpeg_error, nsecs_to_seconds,
+    optional_buffered_value_changed, packet_duration_nsecs, packet_is_audio_recovery_point,
+    packet_is_video_recovery_point, packet_is_video_seek_point, playback_buffered_near_duration,
+    preroll_seek_position_seconds, seconds_to_nsecs, video_cached_seek_preroll_nsecs,
+    video_seek_preroll_nsecs,
 };
 
 #[path = "demux_cache/cache.rs"]
@@ -106,6 +107,9 @@ struct DemuxPacketCacheState {
     reader_heads: BTreeMap<c_int, PacketId>,
     reader_head_positions: BTreeMap<c_int, usize>,
     reader_head_generations: BTreeMap<c_int, u64>,
+    // Diagnostic-only history; packet selection never reads these fields.
+    last_packet_reads: BTreeMap<c_int, DemuxPacketCacheLastRead>,
+    next_packet_read_sequence: u64,
     #[cfg(test)]
     reader_tracking_full_refresh_count: u64,
     forward_streams: BTreeMap<c_int, StreamForwardState>,
@@ -154,6 +158,13 @@ struct DemuxPacketCacheState {
     generation: u64,
     error: Option<String>,
     shutdown: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DemuxPacketCacheLastRead {
+    generation: u64,
+    packet_id: PacketId,
+    expected_next_packet_id: Option<PacketId>,
 }
 
 #[cfg(test)]

@@ -13,6 +13,8 @@ use super::{
     SCHEDULER_POLL_INTERVAL, SubtitlePipeline, VideoDecodePipeline, VideoFramePrepareWorker,
 };
 
+const EXPIRED_HEVC_WATCHDOG_MIN_WAIT: Duration = Duration::from_millis(2);
+
 #[derive(Default)]
 pub(super) struct PlaybackPipelineWaitService;
 
@@ -75,8 +77,11 @@ impl PlaybackLoopDeadline {
     }
 
     pub(super) fn hevc_startup_stall_watchdog_remaining(self) -> Option<Duration> {
-        self.hevc_startup_stall_watchdog_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        self.hevc_startup_stall_watchdog_deadline.map(|deadline| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(EXPIRED_HEVC_WATCHDOG_MIN_WAIT)
+        })
     }
 
     fn cap_wait_duration(self, duration: Duration) -> Duration {
@@ -204,7 +209,7 @@ fn wait_for_stall_duration(duration: Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::PlaybackLoopDeadline;
+    use super::{EXPIRED_HEVC_WATCHDOG_MIN_WAIT, PlaybackLoopDeadline};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -251,5 +256,17 @@ mod tests {
 
         assert!(capped <= Duration::from_millis(75));
         assert!(capped > Duration::ZERO);
+    }
+
+    #[test]
+    fn expired_hevc_watchdog_keeps_a_bounded_non_zero_wait() {
+        let deadline = PlaybackLoopDeadline::default().with_hevc_startup_stall_watchdog_deadline(
+            Some(Instant::now() - Duration::from_millis(1)),
+        );
+
+        assert_eq!(
+            deadline.cap_wait_duration(Duration::from_secs(5)),
+            EXPIRED_HEVC_WATCHDOG_MIN_WAIT
+        );
     }
 }

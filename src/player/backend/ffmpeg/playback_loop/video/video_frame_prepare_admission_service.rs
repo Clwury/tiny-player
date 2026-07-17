@@ -11,8 +11,8 @@ use super::decoded_video_frame::{DecodedVideoFrameStartAction, decoded_video_fra
 use super::video_decode_pipeline::SeekPrerollFrameProgress;
 use super::video_decode_worker::VideoDecodedFrame;
 use super::video_frame_prepare_worker::{
-    VideoFramePrepareDiagnosticContext, VideoFramePrepareEnqueueResult, VideoFramePrepareInput,
-    VideoFramePrepareWorker,
+    DecodedVideoFrameDiagnostic, VideoFramePrepareDiagnosticContext,
+    VideoFramePrepareEnqueueResult, VideoFramePrepareInput, VideoFramePrepareWorker,
 };
 use super::{
     AudioOutput, BufferedReporter, DoviPipeline, FfmpegControl, PlaybackOutputScheduler,
@@ -227,6 +227,7 @@ pub(super) fn enqueue_decoded_video_frame_prepare(
     convert_context: &VideoFrameConvertContext,
 ) -> std::result::Result<DecodedVideoFramePrepareStatus, String> {
     let frame = decoded_frame.as_mut_ptr();
+    let frame_diagnostic = DecodedVideoFrameDiagnostic::from_frame(frame);
     if drop_corrupt_video_frame_if_needed(frame, frame_pts, dovi_pipeline) {
         return Ok(DecodedVideoFramePrepareStatus::DroppedCorrupt);
     }
@@ -235,6 +236,7 @@ pub(super) fn enqueue_decoded_video_frame_prepare(
     match video_frame_prepare_worker.try_enqueue(VideoFramePrepareInput {
         generation,
         diagnostic,
+        frame_diagnostic,
         frame: decoded_frame,
         frame_pts,
         timeline_nsecs,

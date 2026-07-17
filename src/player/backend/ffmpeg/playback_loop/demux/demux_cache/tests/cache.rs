@@ -24,17 +24,17 @@ use crate::player::{
 
 use super::super::DEMUX_PACKET_CACHE_MEMORY_BYTES;
 use super::{
-    AvPacket, CachedDemuxPacket, CachedDemuxPacketPayload, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
-    DEMUX_PACKET_APPEND_TRIM_INTERVAL, DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT,
-    DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS, DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL,
-    DEMUX_PACKET_READ_TRIM_INTERVAL, DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL,
-    DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT, DEMUX_PACKET_TRIM_MAX_PACKETS_PER_STEP,
-    DEMUX_STREAM_PACKET_QUEUE_LIMIT, DemuxPacketCache, DemuxPacketCacheMonitorSnapshot,
-    DemuxPacketCacheReadTiming, DemuxPacketCacheShared, DemuxPacketCacheState,
-    DemuxPacketDiskCache, DemuxPacketTimeline, DemuxReadResult, DemuxSeekRequest, DemuxSeekResult,
-    DemuxSelectedStreams, FfmpegControl, PacketId, StreamInfo, demux_cache_blocked_on,
-    demux_packet_cache_hysteresis_nsecs, demux_packet_cache_readahead_nsecs, duration_nsecs,
-    seconds_to_nsecs,
+    AvPacket, AvPacketStorageKind, CachedDemuxPacket, CachedDemuxPacketPayload,
+    DEFAULT_VIDEO_FRAME_DURATION_NSECS, DEMUX_PACKET_APPEND_TRIM_INTERVAL,
+    DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT, DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS,
+    DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL, DEMUX_PACKET_READ_TRIM_INTERVAL,
+    DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL, DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT,
+    DEMUX_PACKET_TRIM_MAX_PACKETS_PER_STEP, DEMUX_STREAM_PACKET_QUEUE_LIMIT, DemuxPacketCache,
+    DemuxPacketCacheMonitorSnapshot, DemuxPacketCacheReadTiming, DemuxPacketCacheShared,
+    DemuxPacketCacheState, DemuxPacketDiskCache, DemuxPacketTimeline, DemuxReadResult,
+    DemuxSeekRequest, DemuxSeekResult, DemuxSelectedStreams, FfmpegControl, PacketId, StreamInfo,
+    demux_cache_blocked_on, demux_packet_cache_hysteresis_nsecs,
+    demux_packet_cache_readahead_nsecs, duration_nsecs, seconds_to_nsecs,
 };
 
 fn cached_anchor(start_nsecs: u64, end_nsecs: u64) -> CachedDemuxPacket {
@@ -2433,6 +2433,59 @@ fn demux_packet_cache_round_robin_polls_selected_stream_queues_only() {
     };
     assert_eq!(packet.stream_index(), 2);
     assert_eq!(stream_offset, Some(0));
+}
+
+#[test]
+fn demux_packet_cache_attaches_sequential_reader_diagnostics() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let mut config = cache_config_for_test();
+    config.cache_pause = false;
+    let (shared, _) = shared_with_config_for_test(control, config);
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        guard.append_packet(cached_anchor(0, 1_000_000_000));
+        guard.append_packet(cached_packet(
+            0,
+            true,
+            Some(1_000_000_000),
+            Some(2_000_000_000),
+        ));
+    }
+    let cache = DemuxPacketCache {
+        shared: Arc::new(shared),
+        handle: None,
+    };
+
+    let first = match cache.poll_packet(0) {
+        DemuxReadResult::Packet(packet) => packet,
+        _ => panic!("expected first video packet"),
+    };
+    let first = first
+        .read_diagnostic()
+        .expect("first cache packet has read diagnostic");
+    assert_eq!(first.read_sequence, 1);
+    assert_eq!(first.packet_id, 0);
+    assert_eq!(first.storage, AvPacketStorageKind::Memory);
+    assert_eq!(first.reader_head_before, Some(0));
+    assert_eq!(first.reader_head_after, Some(1));
+    assert_eq!(first.previous_read_packet_id, None);
+    assert_eq!(first.sequence_contiguous, None);
+
+    let second = match cache.poll_packet(0) {
+        DemuxReadResult::Packet(packet) => packet,
+        _ => panic!("expected second video packet"),
+    };
+    let second = second
+        .read_diagnostic()
+        .expect("second cache packet has read diagnostic");
+    assert_eq!(second.read_sequence, 2);
+    assert_eq!(second.packet_id, 1);
+    assert_eq!(second.previous_read_packet_id, Some(0));
+    assert_eq!(second.previous_expected_next_packet_id, Some(1));
+    assert_eq!(second.sequence_contiguous, Some(true));
 }
 
 #[test]

@@ -728,7 +728,7 @@ pub(super) fn service_hevc_startup_stall_watchdog_if_due(
         output_snapshot.queued_video_frames,
         video_decode_snapshot,
     );
-    tracing::debug!(
+    tracing::trace!(
         session_id = ?session_id,
         checkpoint,
         overdue_ms = now.saturating_duration_since(deadline).as_secs_f64() * 1000.0,
@@ -745,23 +745,32 @@ pub(super) fn service_hevc_startup_stall_watchdog_if_due(
 
     let status = service_hevc_startup_stall_watchdog(session_id, pipeline, demux_watermark)?;
     if status.is_none() {
-        tracing::warn!(
-            session_id = ?session_id,
-            checkpoint,
-            overdue_ms = now.saturating_duration_since(deadline).as_secs_f64() * 1000.0,
-            video_decode_state = ?video_decode_snapshot.state,
-            in_flight_packets = video_decode_snapshot.in_flight_packets,
-            completed_packets = video_decode_snapshot.completed_packets,
-            decoded_queued_frames = video_decode_snapshot.queued_frames,
-            queued_video_frames = output_snapshot.queued_video_frames,
-            output_rebuffering = output_snapshot.rebuffering,
-            fallback_pending_before,
-            fallback_pending_after = pipeline
-                .video_decode_pipeline
-                .hevc_decode_chain_fallback_pending(),
-            reject_reason,
-            "HEVC startup watchdog deadline reached but did not trigger fallback"
-        );
+        pipeline
+            .video_decode_pipeline
+            .defer_hevc_startup_stall_watchdog_after_no_action(now);
+        if let Some(suppressed_rejections) = pipeline
+            .video_decode_pipeline
+            .record_hevc_startup_stall_watchdog_rejection(reject_reason, now)
+        {
+            tracing::warn!(
+                session_id = ?session_id,
+                checkpoint,
+                overdue_ms = now.saturating_duration_since(deadline).as_secs_f64() * 1000.0,
+                video_decode_state = ?video_decode_snapshot.state,
+                in_flight_packets = video_decode_snapshot.in_flight_packets,
+                completed_packets = video_decode_snapshot.completed_packets,
+                decoded_queued_frames = video_decode_snapshot.queued_frames,
+                queued_video_frames = output_snapshot.queued_video_frames,
+                output_rebuffering = output_snapshot.rebuffering,
+                fallback_pending_before,
+                fallback_pending_after = pipeline
+                    .video_decode_pipeline
+                    .hevc_decode_chain_fallback_pending(),
+                reject_reason,
+                suppressed_rejections,
+                "HEVC startup watchdog deadline reached but did not trigger fallback"
+            );
+        }
     }
     Ok(status)
 }

@@ -11,7 +11,9 @@ use crate::player::{
 use ffmpeg_sys_next as ffi;
 
 use super::audio_decode_pipeline::AudioDecodePipeline;
-use super::scheduled_video_queue::queued_video_continuity_gap_threshold_nsecs;
+use super::scheduled_video_queue::{
+    queued_video_continuity_gap_threshold_nsecs, video_timestamp_gap_within_threshold,
+};
 use super::video_decode_pipeline::{
     AudioTimelineGapEvidence, HevcAdmittedVideoProgressObservation, HevcDecodeChainRecoveryAction,
     HevcDecodePacketObservation, HevcDecodedFrameGapAction, HevcDecodedFrameGapObservation,
@@ -43,11 +45,18 @@ use super::{
 fn hevc_decoded_frame_gap_allows_scheduled_queue_admission(
     action: HevcDecodedFrameGapAction,
 ) -> bool {
-    action != HevcDecodedFrameGapAction::DropForFallback
+    !matches!(
+        action,
+        HevcDecodedFrameGapAction::DeferFallback | HevcDecodedFrameGapAction::DropForFallback
+    )
 }
 
 fn hevc_decoded_frame_gap_bridges_scheduled_queue(action: HevcDecodedFrameGapAction) -> bool {
-    action == HevcDecodedFrameGapAction::AdmitSynchronizedTimelineGap
+    matches!(
+        action,
+        HevcDecodedFrameGapAction::AdmitSynchronizedTimelineGap
+            | HevcDecodedFrameGapAction::AdmitAndBridgeDecodeGap
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -69,7 +78,7 @@ fn synchronized_audio_timeline_gap_evidence(
     else {
         return Ok(None);
     };
-    if previous_gap_nsecs <= max_gap_nsecs {
+    if video_timestamp_gap_within_threshold(previous_gap_nsecs, max_gap_nsecs) {
         return Ok(None);
     }
     let Some(previous_video_end_nsecs) = previous_expected_next_nsecs else {
@@ -589,6 +598,17 @@ where
                     let fallback_target_nsecs = previous_expected_next_nsecs
                         .or(audio_played_timeline_nsecs)
                         .unwrap_or(*current_start_position_nsecs);
+                    let gap_demux_watermark = if video_stream.codec_id
+                        == ffi::AVCodecID::AV_CODEC_ID_HEVC
+                        && previous_gap_nsecs
+                            .and_then(|gap| u64::try_from(gap).ok())
+                            .is_some_and(|gap| {
+                                !video_timestamp_gap_within_threshold(gap, max_gap_nsecs)
+                            }) {
+                        demux_reader_watermark()
+                    } else {
+                        DemuxReaderWatermark::default()
+                    };
                     let gap_action = video_decode_pipeline.observe_hevc_decoded_frame_gap(
                         HevcDecodedFrameGapObservation {
                             session_id,
@@ -603,6 +623,9 @@ where
                             audio_timeline_gap,
                             recovery_waiting: video_decode_recovery.waiting_for_keyframe(),
                             output_snapshot,
+                            demux_watermark: gap_demux_watermark,
+                            source_frame_diagnostic: prepared_frame.source_frame_diagnostic,
+                            recent_cache_read_anomaly: false,
                         },
                     );
                     if !hevc_decoded_frame_gap_allows_scheduled_queue_admission(gap_action) {
@@ -616,7 +639,8 @@ where
                                 .hevc_decode_chain_stats()
                                 .pending_fallback_reason
                                 .map(|reason| reason.as_str()),
-                            "dropped prepared HEVC video frame after decode-chain gap fallback"
+                            action = ?gap_action,
+                            "withheld prepared HEVC video frame after decode-chain gap decision"
                         );
                         break;
                     }
@@ -640,7 +664,8 @@ where
                             bridged_gap_ms = extended_duration_nsecs
                                 .saturating_sub(previous_duration_nsecs) as f64
                                 / 1_000_000.0,
-                            "extended previous video frame across synchronized media timeline gap"
+                            action = ?gap_action,
+                            "extended previous video frame across accepted timeline gap"
                         );
                     }
                     let stage_started_at = Instant::now();
@@ -980,8 +1005,17 @@ mod tests {
         assert!(hevc_decoded_frame_gap_allows_scheduled_queue_admission(
             HevcDecodedFrameGapAction::AdmitSynchronizedTimelineGap
         ));
+        assert!(hevc_decoded_frame_gap_allows_scheduled_queue_admission(
+            HevcDecodedFrameGapAction::AdmitAndBridgeDecodeGap
+        ));
+        assert!(!hevc_decoded_frame_gap_allows_scheduled_queue_admission(
+            HevcDecodedFrameGapAction::DeferFallback
+        ));
         assert!(hevc_decoded_frame_gap_bridges_scheduled_queue(
             HevcDecodedFrameGapAction::AdmitSynchronizedTimelineGap
+        ));
+        assert!(hevc_decoded_frame_gap_bridges_scheduled_queue(
+            HevcDecodedFrameGapAction::AdmitAndBridgeDecodeGap
         ));
     }
 }

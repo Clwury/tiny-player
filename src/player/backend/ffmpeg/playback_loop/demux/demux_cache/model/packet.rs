@@ -6,7 +6,8 @@ use std::{
 };
 
 use super::{
-    AvPacket, DemuxPacketCacheReadTiming, DemuxPacketDiskCache, read_demux_packet_disk_payload,
+    AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, DemuxPacketCacheReadTiming,
+    DemuxPacketDiskCache, read_demux_packet_disk_payload,
 };
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct CachedDemuxPacket {
@@ -33,6 +34,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) enum CachedDe
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxPacketReadSource {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_offset: usize,
     payload: DemuxPacketReadPayload,
+    diagnostic: Option<AvPacketReadDiagnostic>,
 }
 
 enum DemuxPacketReadPayload {
@@ -51,7 +53,7 @@ impl DemuxPacketReadSource {
         timing: &mut DemuxPacketCacheReadTiming,
     ) -> std::result::Result<(AvPacket, usize), String> {
         let started_at = Instant::now();
-        let packet = match self.payload {
+        let mut packet = match self.payload {
             DemuxPacketReadPayload::Memory(packet) => {
                 let packet = packet
                     .lock()
@@ -74,8 +76,18 @@ impl DemuxPacketReadSource {
                 AvPacket::from_data_and_props(&data, &props)?
             }
         };
+        if let Some(diagnostic) = self.diagnostic {
+            packet.set_read_diagnostic(diagnostic);
+        }
         timing.packet_ref += started_at.elapsed();
         Ok((packet, self.stream_offset))
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_diagnostic(
+        &mut self,
+        diagnostic: AvPacketReadDiagnostic,
+    ) {
+        self.diagnostic = Some(diagnostic);
     }
 }
 
@@ -137,7 +149,17 @@ impl CachedDemuxPacket {
         Ok(DemuxPacketReadSource {
             stream_offset,
             payload,
+            diagnostic: None,
         })
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn storage_kind(
+        &self,
+    ) -> AvPacketStorageKind {
+        match &self.payload {
+            CachedDemuxPacketPayload::Memory(_) => AvPacketStorageKind::Memory,
+            CachedDemuxPacketPayload::Disk { .. } => AvPacketStorageKind::Disk,
+        }
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn spill_to_disk(

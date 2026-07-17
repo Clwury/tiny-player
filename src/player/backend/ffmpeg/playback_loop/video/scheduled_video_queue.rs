@@ -35,6 +35,9 @@ pub(in crate::player::backend::ffmpeg) struct AudioClockedVideoPopResult {
 const VIDEO_CONTIGUITY_MIN_GAP_NSECS: u64 = 200_000_000;
 const VIDEO_CONTIGUITY_MAX_GAP_NSECS: u64 = 500_000_000;
 const VIDEO_CONTIGUITY_GAP_FRAME_MULTIPLIER: u64 = 3;
+// Rational FFmpeg timestamps converted to integer nanoseconds can differ by a few
+// nanoseconds at an otherwise exact continuity boundary.
+pub(in crate::player::backend::ffmpeg) const VIDEO_TIMESTAMP_ROUNDING_TOLERANCE_NSECS: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) struct QueuedVideoContinuity {
@@ -52,6 +55,13 @@ pub(in crate::player::backend::ffmpeg) fn queued_video_continuity_gap_threshold_
             VIDEO_CONTIGUITY_MIN_GAP_NSECS,
             VIDEO_CONTIGUITY_MAX_GAP_NSECS,
         )
+}
+
+pub(in crate::player::backend::ffmpeg) fn video_timestamp_gap_within_threshold(
+    gap_nsecs: u64,
+    max_gap_nsecs: u64,
+) -> bool {
+    gap_nsecs <= max_gap_nsecs.saturating_add(VIDEO_TIMESTAMP_ROUNDING_TOLERANCE_NSECS)
 }
 
 pub(in crate::player::backend::ffmpeg) fn discard_queued_video_before(
@@ -137,7 +147,7 @@ fn queued_video_contiguous_buffered_until_from_nsecs_with_gap(
         let max_gap_nsecs = fixed_max_gap_nsecs.unwrap_or_else(|| {
             queued_video_continuity_gap_threshold_nsecs(previous_duration_nsecs)
         });
-        if gap_nsecs > max_gap_nsecs {
+        if !video_timestamp_gap_within_threshold(gap_nsecs, max_gap_nsecs) {
             break;
         }
         buffered_until =
@@ -675,6 +685,35 @@ mod tests {
         assert_eq!(
             queued_video_contiguous_buffered_until_from_nsecs(&queue, 1_000_000_000, 200_000_000),
             Some(1_230_000_000)
+        );
+    }
+
+    #[test]
+    fn continuity_threshold_tolerates_nanosecond_timestamp_rounding() {
+        let previous_expected_next_nsecs = 174_116_666_666_u64;
+        let next_timeline_nsecs = 174_616_666_667_u64;
+        let gap_nsecs = next_timeline_nsecs.saturating_sub(previous_expected_next_nsecs);
+
+        assert_eq!(gap_nsecs, 500_000_001);
+        assert!(video_timestamp_gap_within_threshold(
+            gap_nsecs,
+            VIDEO_CONTIGUITY_MAX_GAP_NSECS,
+        ));
+        assert!(!video_timestamp_gap_within_threshold(
+            VIDEO_CONTIGUITY_MAX_GAP_NSECS + VIDEO_TIMESTAMP_ROUNDING_TOLERANCE_NSECS + 1,
+            VIDEO_CONTIGUITY_MAX_GAP_NSECS,
+        ));
+    }
+
+    #[test]
+    fn explicit_continuity_scan_applies_timestamp_rounding_tolerance() {
+        let mut queue = VecDeque::new();
+        queue.push_back(queued_video_frame(1_000_000_000, 40_000_000));
+        queue.push_back(queued_video_frame(1_240_000_001, 40_000_000));
+
+        assert_eq!(
+            queued_video_contiguous_buffered_until_from_nsecs(&queue, 1_000_000_000, 200_000_000),
+            Some(1_280_000_001)
         );
     }
 

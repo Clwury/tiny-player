@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::player::{
-    backend::BackendEvent,
+    backend::{BackendEvent, BackendEventKind},
     render_host::{DecodedFrame, PlaybackSessionId, VideoOutputQueue, VideoOutputQueueAdmission},
 };
 
@@ -33,6 +33,16 @@ pub(in crate::player::backend::ffmpeg) enum AudioClockedVideoDrainStatus {
     Drained,
     WaitingAudio { made_progress: bool },
     Interrupted,
+}
+
+fn report_first_video_frame_presented(
+    session_id: PlaybackSessionId,
+    event_tx: &Sender<BackendEvent>,
+) {
+    let _ = event_tx.send(BackendEvent::new(
+        session_id,
+        BackendEventKind::Buffering(false),
+    ));
 }
 
 impl AudioClockedVideoDrainStatus {
@@ -88,7 +98,7 @@ pub(in crate::player::backend::ffmpeg) fn admit_decoded_video_frame_to_vo(
     frame_presented: &AtomicBool,
     position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
-) {
+) -> bool {
     let started_at = Instant::now();
     let admission = vo_queue.admit_presented_frame(session_id, frame);
     let admission_elapsed = started_at.elapsed();
@@ -106,7 +116,7 @@ pub(in crate::player::backend::ffmpeg) fn admit_decoded_video_frame_to_vo(
             render_last_ms = backpressure.last_render_nsecs as f64 / 1_000_000.0,
             "VO dropped non-key video frame because rendering is backlogged"
         );
-        return;
+        return false;
     }
     if !admission.accepted() {
         tracing::debug!(
@@ -114,7 +124,7 @@ pub(in crate::player::backend::ffmpeg) fn admit_decoded_video_frame_to_vo(
             pts = timeline_nsecs,
             "dropped FFmpeg video frame for inactive playback session"
         );
-        return;
+        return false;
     }
     let count = FFMPEG_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count == 1 || count.is_multiple_of(60) {
@@ -137,6 +147,7 @@ pub(in crate::player::backend::ffmpeg) fn admit_decoded_video_frame_to_vo(
     }
     frame_presented.store(true, Ordering::Relaxed);
     position_reporter.report(timeline_nsecs, session_id, event_tx);
+    true
 }
 
 fn log_vo_admission_timing(
@@ -475,7 +486,7 @@ where
         duration_nsecs: frame.duration_nsecs,
     };
     before_present(timing, output_scheduler);
-    admit_decoded_video_frame_to_vo(
+    let admitted = admit_decoded_video_frame_to_vo(
         frame.frame,
         session_id,
         timing.timeline_nsecs,
@@ -484,6 +495,9 @@ where
         position_reporter,
         event_tx,
     );
+    if admitted {
+        report_first_video_frame_presented(session_id, event_tx);
+    }
     output_scheduler.set_state(PlaybackOutputState::Playing);
     Some(timing)
 }
@@ -911,10 +925,26 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
+    use crate::player::{backend::BackendEventKind, render_host::PlaybackSessionId};
+
     use super::{
-        AudioClockAvailability, AudioClockedVideoDrainStatus,
+        AudioClockAvailability, AudioClockedVideoDrainStatus, report_first_video_frame_presented,
         video_clock_drain_allowed_while_audio_unavailable,
     };
+
+    #[test]
+    fn first_presented_video_frame_finishes_visible_buffering() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let session_id = PlaybackSessionId(7);
+
+        report_first_video_frame_presented(session_id, &event_tx);
+
+        let event = event_rx.try_recv().expect("buffering completion event");
+        assert_eq!(event.session_id, session_id);
+        assert!(matches!(event.kind, BackendEventKind::Buffering(false)));
+    }
 
     #[test]
     fn audio_clocked_video_drain_status_tracks_progress() {

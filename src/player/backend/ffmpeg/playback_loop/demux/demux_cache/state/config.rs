@@ -50,6 +50,8 @@ impl DemuxPacketCacheState {
             reader_heads: BTreeMap::new(),
             reader_head_positions: BTreeMap::new(),
             reader_head_generations: BTreeMap::new(),
+            last_packet_reads: BTreeMap::new(),
+            next_packet_read_sequence: 0,
             #[cfg(test)]
             reader_tracking_full_refresh_count: 0,
             forward_streams: BTreeMap::new(),

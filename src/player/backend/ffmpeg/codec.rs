@@ -640,8 +640,38 @@ fn decoder_name(decoder: *const ffi::AVCodec) -> String {
         .unwrap_or_else(|| "<unknown>".to_string())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AvPacketStorageKind {
+    Memory,
+    Disk,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AvPacketReadDiagnostic {
+    pub(super) read_sequence: u64,
+    pub(super) cache_generation: u64,
+    pub(super) read_range_id: u64,
+    pub(super) packet_id: u64,
+    pub(super) stream_offset: usize,
+    pub(super) storage: AvPacketStorageKind,
+    pub(super) read_index_before: usize,
+    pub(super) read_index_after: usize,
+    pub(super) reader_head_before: Option<u64>,
+    pub(super) reader_head_after: Option<u64>,
+    pub(super) previous_read_packet_id: Option<u64>,
+    pub(super) previous_read_generation: Option<u64>,
+    pub(super) previous_expected_next_packet_id: Option<u64>,
+    pub(super) sequence_contiguous: Option<bool>,
+    pub(super) packet_start_nsecs: Option<u64>,
+    pub(super) packet_end_nsecs: Option<u64>,
+    pub(super) timeline_anchor: bool,
+    pub(super) recovery_point: bool,
+    pub(super) safe_seek_point: bool,
+}
+
 pub(super) struct AvPacket {
     ptr: *mut ffi::AVPacket,
+    read_diagnostic: Option<Arc<AvPacketReadDiagnostic>>,
 }
 
 impl AvPacket {
@@ -650,20 +680,24 @@ impl AvPacket {
         if ptr.is_null() {
             return Err("FFmpeg 分配 packet 失败".to_string());
         }
-        Ok(Self { ptr })
+        Ok(Self {
+            ptr,
+            read_diagnostic: None,
+        })
     }
 
     pub(super) fn ref_from(packet: &Self) -> std::result::Result<Self, String> {
-        let clone = Self::new()?;
+        let mut clone = Self::new()?;
         let result = unsafe { ffi::av_packet_ref(clone.ptr, packet.ptr) };
         if result < 0 {
             return Err(format!("FFmpeg 复制 packet 失败：{}", ffmpeg_error(result)));
         }
+        clone.read_diagnostic = packet.read_diagnostic.clone();
         Ok(clone)
     }
 
     pub(super) fn props_from(packet: &Self) -> std::result::Result<Self, String> {
-        let props = Self::new()?;
+        let mut props = Self::new()?;
         let result = unsafe { ffi::av_packet_copy_props(props.ptr, packet.ptr) };
         if result < 0 {
             return Err(format!(
@@ -674,6 +708,7 @@ impl AvPacket {
         unsafe {
             (*props.ptr).stream_index = (*packet.ptr).stream_index;
         }
+        props.read_diagnostic = packet.read_diagnostic.clone();
         Ok(props)
     }
 
@@ -681,7 +716,7 @@ impl AvPacket {
         data: &[u8],
         props: &Self,
     ) -> std::result::Result<Self, String> {
-        let packet = Self::new()?;
+        let mut packet = Self::new()?;
         if !data.is_empty() {
             let size = c_int::try_from(data.len())
                 .map_err(|_| "FFmpeg packet payload 过大".to_string())?;
@@ -708,6 +743,7 @@ impl AvPacket {
         unsafe {
             (*packet.ptr).stream_index = (*props.ptr).stream_index;
         }
+        packet.read_diagnostic = props.read_diagnostic.clone();
         Ok(packet)
     }
 
@@ -721,6 +757,16 @@ impl AvPacket {
 
     pub(super) fn stream_index(&self) -> c_int {
         unsafe { (*self.ptr).stream_index }
+    }
+
+    pub(super) fn pts(&self) -> Option<i64> {
+        let pts = unsafe { (*self.ptr).pts };
+        (pts != ffi::AV_NOPTS_VALUE).then_some(pts)
+    }
+
+    pub(super) fn dts(&self) -> Option<i64> {
+        let dts = unsafe { (*self.ptr).dts };
+        (dts != ffi::AV_NOPTS_VALUE).then_some(dts)
     }
 
     pub(super) fn best_timestamp(&self) -> Option<i64> {
@@ -742,6 +788,18 @@ impl AvPacket {
 
     pub(super) fn is_key(&self) -> bool {
         unsafe { (*self.ptr).flags & ffi::AV_PKT_FLAG_KEY != 0 }
+    }
+
+    pub(super) fn flags(&self) -> c_int {
+        unsafe { (*self.ptr).flags }
+    }
+
+    pub(super) fn read_diagnostic(&self) -> Option<AvPacketReadDiagnostic> {
+        self.read_diagnostic.as_deref().copied()
+    }
+
+    pub(super) fn set_read_diagnostic(&mut self, diagnostic: AvPacketReadDiagnostic) {
+        self.read_diagnostic = Some(Arc::new(diagnostic));
     }
 
     pub(super) fn size(&self) -> Option<u64> {
@@ -1101,14 +1159,50 @@ mod tests {
     use ffmpeg_sys_next as ffi;
 
     use super::{
-        AvPacket, audio_codec_requires_recovery_point, packet_is_audio_recovery_point,
-        packet_is_video_recovery_point, packet_is_video_seek_point, video_error_recognition,
-        vulkan_decode_codec_needs_single_thread,
+        AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, audio_codec_requires_recovery_point,
+        packet_is_audio_recovery_point, packet_is_video_recovery_point, packet_is_video_seek_point,
+        video_error_recognition, vulkan_decode_codec_needs_single_thread,
     };
 
     fn packet_from_data(data: &[u8]) -> AvPacket {
         let props = AvPacket::new().expect("packet props allocate");
         AvPacket::from_data_and_props(data, &props).expect("packet data allocates")
+    }
+
+    #[test]
+    fn packet_read_diagnostic_survives_packet_clones_and_payload_rebuilds() {
+        let mut packet = packet_from_data(&[1, 2, 3, 4]);
+        let diagnostic = AvPacketReadDiagnostic {
+            read_sequence: 7,
+            cache_generation: 3,
+            read_range_id: 2,
+            packet_id: 41,
+            stream_offset: 1,
+            storage: AvPacketStorageKind::Disk,
+            read_index_before: 8,
+            read_index_after: 9,
+            reader_head_before: Some(41),
+            reader_head_after: Some(44),
+            previous_read_packet_id: Some(38),
+            previous_read_generation: Some(3),
+            previous_expected_next_packet_id: Some(41),
+            sequence_contiguous: Some(true),
+            packet_start_nsecs: Some(1_000_000_000),
+            packet_end_nsecs: Some(1_040_000_000),
+            timeline_anchor: true,
+            recovery_point: false,
+            safe_seek_point: false,
+        };
+        packet.set_read_diagnostic(diagnostic);
+
+        let cloned = AvPacket::ref_from(&packet).expect("packet clone succeeds");
+        let props = AvPacket::props_from(&cloned).expect("packet props clone succeeds");
+        let rebuilt =
+            AvPacket::from_data_and_props(&[5, 6], &props).expect("packet rebuild succeeds");
+
+        assert_eq!(cloned.read_diagnostic(), Some(diagnostic));
+        assert_eq!(props.read_diagnostic(), Some(diagnostic));
+        assert_eq!(rebuilt.read_diagnostic(), Some(diagnostic));
     }
 
     #[test]

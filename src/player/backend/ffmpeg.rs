@@ -54,8 +54,8 @@ use clock::{
     queued_video_target_frames, seconds_to_nsecs, stream_frame_duration_nsecs, timestamp_to_nsecs,
 };
 use codec::{
-    AudioResampler, AvFrame, AvPacket, DecodedAudio, Decoder, VideoScaler,
-    audio_codec_requires_recovery_point, packet_is_audio_recovery_point,
+    AudioResampler, AvFrame, AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, DecodedAudio,
+    Decoder, VideoScaler, audio_codec_requires_recovery_point, packet_is_audio_recovery_point,
     packet_is_video_recovery_point, packet_is_video_seek_point,
 };
 use constants::*;

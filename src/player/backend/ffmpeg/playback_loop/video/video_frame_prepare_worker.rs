@@ -34,6 +34,7 @@ pub(super) struct VideoFramePrepareWorker {
 pub(super) struct VideoFramePrepareInput {
     pub(super) generation: u64,
     pub(super) diagnostic: VideoFramePrepareDiagnosticContext,
+    pub(super) frame_diagnostic: DecodedVideoFrameDiagnostic,
     pub(super) frame: VideoDecodedFrame,
     pub(super) frame_pts: FramePts,
     pub(super) timeline_nsecs: u64,
@@ -47,6 +48,48 @@ pub(super) struct PreparedVideoFrame {
     pub(super) frame: DecodedFrame,
     pub(super) timeline_nsecs: u64,
     pub(super) duration_nsecs: u64,
+    pub(super) source_frame_diagnostic: DecodedVideoFrameDiagnostic,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct DecodedVideoFrameDiagnostic {
+    pub(super) best_effort_timestamp: i64,
+    pub(super) pts: i64,
+    pub(super) packet_dts: i64,
+    pub(super) duration: i64,
+    pub(super) flags: i32,
+    pub(super) key_frame: bool,
+    pub(super) corrupt: bool,
+    pub(super) picture_type: i32,
+    pub(super) decode_error_flags: i32,
+    pub(super) width: i32,
+    pub(super) height: i32,
+    pub(super) pixel_format: i32,
+}
+
+impl DecodedVideoFrameDiagnostic {
+    pub(super) fn from_frame(frame: *mut ffmpeg_sys_next::AVFrame) -> Self {
+        if frame.is_null() {
+            return Self::default();
+        }
+        unsafe {
+            Self {
+                best_effort_timestamp: (*frame).best_effort_timestamp,
+                pts: (*frame).pts,
+                packet_dts: (*frame).pkt_dts,
+                duration: (*frame).duration,
+                flags: (*frame).flags,
+                key_frame: (*frame).flags & ffmpeg_sys_next::AV_FRAME_FLAG_KEY != 0,
+                corrupt: (*frame).flags & ffmpeg_sys_next::AV_FRAME_FLAG_CORRUPT != 0
+                    || (*frame).decode_error_flags != 0,
+                picture_type: (*frame).pict_type as i32,
+                decode_error_flags: (*frame).decode_error_flags,
+                width: (*frame).width,
+                height: (*frame).height,
+                pixel_format: (*frame).format,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -439,6 +482,7 @@ fn prepare_video_frame(
     input: VideoFramePrepareInput,
 ) -> std::result::Result<PreparedVideoFrame, String> {
     let generation = input.generation;
+    let source_frame_diagnostic = input.frame_diagnostic;
     let mut frame = video_converter.convert_with_context(
         &input.convert_context,
         input.frame.as_mut_ptr(),
@@ -450,6 +494,7 @@ fn prepare_video_frame(
         frame,
         timeline_nsecs: input.timeline_nsecs,
         duration_nsecs: input.duration_nsecs,
+        source_frame_diagnostic,
     })
 }
 
@@ -615,6 +660,8 @@ mod tests {
         }
         let buffer_result = unsafe { ffi::av_frame_get_buffer(av_frame.as_mut_ptr(), 1) };
         assert!(buffer_result >= 0, "FFmpeg frame buffer allocates");
+        let frame_diagnostic =
+            super::DecodedVideoFrameDiagnostic::from_frame(av_frame.as_mut_ptr());
         let frame = FfmpegFrameRef::new_ref(av_frame.as_mut_ptr()).expect("FFmpeg frame refs");
 
         VideoFramePrepareInput {
@@ -631,6 +678,7 @@ mod tests {
                 queued_video_range_nsecs: None,
                 pending_start_audio_nsecs: 0,
             },
+            frame_diagnostic,
             frame: VideoDecodedFrame::new_for_test(frame),
             frame_pts: FramePts { nsecs: generation },
             timeline_nsecs: generation,
@@ -638,6 +686,46 @@ mod tests {
             convert_context: VideoFrameConvertContext::new_for_test(size),
             dovi_metadata: None,
         }
+    }
+
+    #[test]
+    fn decoded_video_frame_diagnostic_captures_decoder_frame_properties() {
+        let mut frame = AvFrame::new().expect("FFmpeg frame allocates");
+        unsafe {
+            (*frame.as_mut_ptr()).best_effort_timestamp = 208_000;
+            (*frame.as_mut_ptr()).pts = 208_001;
+            (*frame.as_mut_ptr()).pkt_dts = 207_960;
+            (*frame.as_mut_ptr()).duration = 40;
+            (*frame.as_mut_ptr()).flags = ffi::AV_FRAME_FLAG_KEY;
+            (*frame.as_mut_ptr()).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+            (*frame.as_mut_ptr()).decode_error_flags = ffi::FF_DECODE_ERROR_MISSING_REFERENCE;
+            (*frame.as_mut_ptr()).width = 3840;
+            (*frame.as_mut_ptr()).height = 2160;
+            (*frame.as_mut_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_VULKAN as c_int;
+        }
+
+        let diagnostic = super::DecodedVideoFrameDiagnostic::from_frame(frame.as_mut_ptr());
+
+        assert_eq!(diagnostic.best_effort_timestamp, 208_000);
+        assert_eq!(diagnostic.pts, 208_001);
+        assert_eq!(diagnostic.packet_dts, 207_960);
+        assert_eq!(diagnostic.duration, 40);
+        assert!(diagnostic.key_frame);
+        assert!(diagnostic.corrupt);
+        assert_eq!(
+            diagnostic.picture_type,
+            ffi::AVPictureType::AV_PICTURE_TYPE_I as i32
+        );
+        assert_eq!(
+            diagnostic.decode_error_flags,
+            ffi::FF_DECODE_ERROR_MISSING_REFERENCE
+        );
+        assert_eq!(diagnostic.width, 3840);
+        assert_eq!(diagnostic.height, 2160);
+        assert_eq!(
+            diagnostic.pixel_format,
+            ffi::AVPixelFormat::AV_PIX_FMT_VULKAN as c_int
+        );
     }
 
     #[test]
