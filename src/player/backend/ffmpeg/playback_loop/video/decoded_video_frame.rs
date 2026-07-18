@@ -128,12 +128,16 @@ pub(in crate::player::backend::ffmpeg) fn decoded_video_frame_start_action(
     frame_timeline_nsecs: u64,
     current_start_position_nsecs: u64,
     recovery_realign: bool,
+    exact_seek_output: bool,
 ) -> DecodedVideoFrameStartAction {
     if recovery_realign {
         return DecodedVideoFrameStartAction::Use { realign: true };
     }
-    let earliest_accepted_start_nsecs =
-        current_start_position_nsecs.saturating_sub(DECODED_VIDEO_FRAME_START_TOLERANCE_NSECS);
+    let earliest_accepted_start_nsecs = if exact_seek_output {
+        current_start_position_nsecs
+    } else {
+        current_start_position_nsecs.saturating_sub(DECODED_VIDEO_FRAME_START_TOLERANCE_NSECS)
+    };
     if frame_timeline_nsecs < earliest_accepted_start_nsecs {
         return DecodedVideoFrameStartAction::DropBeforeStart;
     }

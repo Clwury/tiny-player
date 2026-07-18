@@ -720,7 +720,11 @@ fn service_cached_seek_recovery_fallback_if_needed(
             CachedSeekRecoveryFallbackAction::SoftRecover => {
                 let requeued_probe_packets =
                     pipeline.soft_recover_cached_seek_hevc_decode_chain(session.id())?;
-                pipeline.begin_cached_seek_recovery_watchdog(fallback.target_nsecs, session.id());
+                pipeline.rearm_cached_seek_recovery_watchdog(
+                    fallback.target_nsecs,
+                    fallback.cached_seek,
+                    session.id(),
+                );
                 tracing::debug!(
                     session_id = ?session.id(),
                     position_seconds,
@@ -756,8 +760,9 @@ fn service_cached_seek_recovery_fallback_if_needed(
                         pipeline.output_scheduler.reset(control);
                         pipeline.video_decode_recovery.reset();
                         pipeline.dovi_pipeline.reset();
-                        pipeline.begin_cached_seek_recovery_watchdog(
+                        pipeline.rearm_cached_seek_recovery_watchdog(
                             fallback.target_nsecs,
+                            fallback.cached_seek,
                             session.id(),
                         );
                         tracing::debug!(
@@ -778,8 +783,11 @@ fn service_cached_seek_recovery_fallback_if_needed(
                         pipeline.current_start_position_nsecs,
                     );
                     pipeline.dovi_pipeline.reset();
-                    pipeline
-                        .begin_cached_seek_recovery_watchdog(fallback.target_nsecs, session.id());
+                    pipeline.rearm_cached_seek_recovery_watchdog(
+                        fallback.target_nsecs,
+                        fallback.cached_seek,
+                        session.id(),
+                    );
                     tracing::warn!(
                         session_id = ?session.id(),
                         position_seconds,
@@ -798,10 +806,33 @@ fn service_cached_seek_recovery_fallback_if_needed(
             fallback.action,
             CachedSeekRecoveryFallbackAction::LowLevelSeek
         );
+        let failed_cra_cached_seek = fallback
+            .cached_seek
+            .filter(|info| info.uses_cra_anchor() && low_level_seek_required);
+        if let Some(info) = failed_cra_cached_seek {
+            demux_cache.exclude_failed_cached_seek_range(info, fallback.reason.as_str());
+            tracing::warn!(
+                session_id = ?session.id(),
+                range_id = info.range_id,
+                anchor_packet_id = info.anchor_packet_id,
+                anchor_kind = info.anchor_kind.as_str(),
+                anchor_nsecs = info.anchor_nsecs,
+                target_nsecs = info.target_nsecs,
+                preroll_nsecs = info.preroll_nsecs,
+                reason = fallback.reason.as_str(),
+                cached_seek_succeeded = false,
+                low_level_fallback = true,
+                "CRA cached seek recovery failed; performing its single low-level fallback"
+            );
+        }
         if !low_level_seek_required
             && !demux_reader_unusable_for_hevc_low_level_seek(demux_watermark)
         {
-            pipeline.begin_cached_seek_recovery_watchdog(fallback.target_nsecs, session.id());
+            pipeline.rearm_cached_seek_recovery_watchdog(
+                fallback.target_nsecs,
+                fallback.cached_seek,
+                session.id(),
+            );
             tracing::debug!(
                 session_id = ?session.id(),
                 position_seconds,
@@ -834,8 +865,11 @@ fn service_cached_seek_recovery_fallback_if_needed(
             demux_selected_min_forward_nsecs = ?demux_watermark.selected_min_forward_nsecs,
             "handling HEVC cached seek recovery fallback with low-level seek"
         );
-        let buffering_policy =
-            internal_recovery_seek_buffering_policy(pipeline.output_scheduler.snapshot());
+        let buffering_policy = if failed_cra_cached_seek.is_some() {
+            PlaybackSeekBufferingPolicy::PreserveVisibleFrame
+        } else {
+            internal_recovery_seek_buffering_policy(pipeline.output_scheduler.snapshot())
+        };
         let demux_seek_result = service_playback_seek_reset(PlaybackSeekResetContext {
             position_seconds,
             seek_mode: crate::player::backend::PlaybackSeekMode::Precise,
@@ -876,6 +910,60 @@ fn service_cached_seek_recovery_fallback_if_needed(
     };
     let position_seconds = nsecs_to_seconds(fallback.target_nsecs);
     control.set_cache_paused(false);
+
+    if let Some(info) = pipeline.active_cra_cached_seek() {
+        let position_seconds = nsecs_to_seconds(info.target_nsecs);
+        pipeline.clear_cached_seek_recovery_watchdog();
+        demux_cache.exclude_failed_cached_seek_range(info, fallback.reason.as_str());
+        let seek_generation = control.request_seek();
+        session.reset_to(session.id(), position_seconds);
+        pipeline.current_start_position_nsecs = session.start_position_nsecs();
+        tracing::warn!(
+            session_id = ?session.id(),
+            position_seconds,
+            range_id = info.range_id,
+            anchor_packet_id = info.anchor_packet_id,
+            anchor_kind = info.anchor_kind.as_str(),
+            anchor_nsecs = info.anchor_nsecs,
+            target_nsecs = info.target_nsecs,
+            preroll_nsecs = info.preroll_nsecs,
+            reason = fallback.reason.as_str(),
+            seek_generation,
+            cached_seek_succeeded = false,
+            low_level_fallback = true,
+            preserve_visible_frame = true,
+            "CRA cached seek decode chain failed; performing its single low-level fallback"
+        );
+        let demux_seek_result = service_playback_seek_reset(PlaybackSeekResetContext {
+            position_seconds,
+            seek_mode: crate::player::backend::PlaybackSeekMode::Precise,
+            seek_generation,
+            force_low_level_seek: true,
+            low_level_seek_reason: Some(fallback.reason.as_str()),
+            session_id: session.id(),
+            vo_queue,
+            demux_cache,
+            pipeline,
+            emit_playback_buffered_events,
+            buffering_policy: PlaybackSeekBufferingPolicy::PreserveVisibleFrame,
+            control,
+            event_tx,
+        })?;
+        pipeline
+            .video_decode_pipeline
+            .remember_hevc_recovery_low_level_seek_target(info.target_nsecs);
+        tracing::debug!(
+            session_id = ?session.id(),
+            range_id = info.range_id,
+            anchor_packet_id = info.anchor_packet_id,
+            anchor_kind = info.anchor_kind.as_str(),
+            target_nsecs = info.target_nsecs,
+            seek_generation,
+            ?demux_seek_result,
+            "completed CRA cached seek decode-error low-level fallback transaction"
+        );
+        return Ok(true);
+    }
 
     if fallback.reason.invalidated_by_video_progress()
         && pipeline

@@ -249,6 +249,39 @@ impl DemuxPacketCacheState {
         }
         range.mark_seekable_dirty();
         self.refresh_range_seek_boundaries(range_id);
+        if is_eof {
+            let eof_anchor = self.ranges.get(&range_id).and_then(|range| {
+                range
+                    .stream_queues
+                    .get(&self.timeline_anchor_stream_index)
+                    .into_iter()
+                    .flat_map(|queue| queue.iter().rev().copied())
+                    .find_map(|packet_id| {
+                        let packet = self.packets.get(&packet_id)?;
+                        (packet.timeline_anchor && packet.recovery_point)
+                            .then_some((packet_id, packet))
+                    })
+            });
+            if let Some((anchor_packet_id, anchor)) = eof_anchor {
+                let boundary = self
+                    .ranges
+                    .get(&range_id)
+                    .map(|range| range.stream_boundary(self.timeline_anchor_stream_index));
+                tracing::debug!(
+                    session_id = ?self.session_id,
+                    range_id,
+                    stream_index = self.timeline_anchor_stream_index,
+                    closure_reason = "EOF",
+                    anchor_packet_id,
+                    anchor_kind = anchor.recovery_kind.as_str(),
+                    anchor_nsecs = ?anchor.start_nsecs,
+                    preroll_nsecs = self.cached_seek_preroll_nsecs,
+                    seek_start_nsecs = ?boundary.and_then(|boundary| boundary.seek_start_nsecs),
+                    seek_end_nsecs = ?boundary.and_then(|boundary| boundary.seek_end_nsecs),
+                    "closed FFmpeg demux cached seek interval"
+                );
+            }
+        }
     }
 
     #[cfg(test)]

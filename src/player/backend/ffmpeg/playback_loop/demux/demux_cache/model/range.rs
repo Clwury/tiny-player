@@ -4,6 +4,7 @@ use std::{
     os::raw::c_int,
 };
 
+use super::VideoRecoveryPointKind;
 use super::types::{PacketId, RangeId};
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxCachedRange {
@@ -175,12 +176,16 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct Archiv
 
 #[derive(Clone, Debug)]
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxCachedSeekHit {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) range_id: RangeId,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) reader_heads:
         BTreeMap<c_int, PacketId>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) buffered_until_nsecs: u64,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) target_nsecs: u64,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) anchor_nsecs: u64,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) anchor_packet_id: PacketId,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) anchor_kind:
+        VideoRecoveryPointKind,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) preroll_nsecs: u64,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) video_reader_head: PacketId,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) anchor_is_recovery_point:
         bool,

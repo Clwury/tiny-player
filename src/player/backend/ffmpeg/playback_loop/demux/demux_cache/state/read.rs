@@ -63,6 +63,7 @@ impl DemuxPacketCacheState {
                 packet_end_nsecs,
                 timeline_anchor,
                 recovery_point,
+                recovery_kind,
                 safe_seek_point,
             ) = {
                 let Some(packet) = self.packets.get(&packet_id) else {
@@ -74,6 +75,7 @@ impl DemuxPacketCacheState {
                     packet.end_nsecs,
                     packet.timeline_anchor,
                     packet.recovery_point,
+                    packet.recovery_kind,
                     packet.safe_seek_point,
                 )
             };
@@ -113,6 +115,7 @@ impl DemuxPacketCacheState {
                 packet_end_nsecs,
                 timeline_anchor,
                 recovery_point,
+                recovery_kind,
                 safe_seek_point,
             });
             self.last_packet_reads.insert(

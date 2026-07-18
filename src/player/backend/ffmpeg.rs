@@ -55,8 +55,9 @@ use clock::{
 };
 use codec::{
     AudioResampler, AvFrame, AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, DecodedAudio,
-    Decoder, VideoScaler, audio_codec_requires_recovery_point, packet_is_audio_recovery_point,
-    packet_is_video_recovery_point, packet_is_video_seek_point,
+    Decoder, VideoRecoveryPointKind, VideoScaler, audio_codec_requires_recovery_point,
+    packet_is_audio_recovery_point, packet_is_video_recovery_point, packet_is_video_seek_point,
+    packet_video_recovery_point_kind,
 };
 use constants::*;
 use dovi::{DoviPipeline, ffmpeg_dovi_metadata_from_frame};

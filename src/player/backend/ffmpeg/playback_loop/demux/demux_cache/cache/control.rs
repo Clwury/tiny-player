@@ -2,9 +2,9 @@ use std::time::Instant;
 
 use super::{
     BackendEvent, BackendEventKind, DEMUX_PACKET_CACHE_STALL_LOG_AFTER,
-    DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL, DEMUX_PACKET_CACHE_WAIT_INTERVAL, DemuxPacketCache,
-    DemuxSeekResult, PlaybackCacheConfig, PlaybackSeekMode, PlaybackSessionId, nsecs_to_seconds,
-    seconds_to_nsecs,
+    DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL, DEMUX_PACKET_CACHE_WAIT_INTERVAL, DemuxCachedSeekInfo,
+    DemuxPacketCache, DemuxSeekResult, PlaybackCacheConfig, PlaybackSeekMode, PlaybackSessionId,
+    nsecs_to_seconds, seconds_to_nsecs,
 };
 
 impl DemuxPacketCache {
@@ -40,6 +40,16 @@ impl DemuxPacketCache {
                 session_id,
                 seek_generation,
             ) {
+                let cached_seek_info = DemuxCachedSeekInfo {
+                    range_id: hit.range_id,
+                    target_nsecs: hit.target_nsecs,
+                    anchor_nsecs: hit.anchor_nsecs,
+                    preroll_nsecs: hit.preroll_nsecs,
+                    anchor_packet_id: hit.anchor_packet_id,
+                    anchor_kind: hit.anchor_kind,
+                    anchor_is_safe_seek_point: hit.anchor_is_safe_seek_point,
+                    requires_precise_trim: hit.requires_precise_trim,
+                };
                 let buffered_until = nsecs_to_seconds(hit.buffered_until_nsecs);
                 let audio_reader_head = guard
                     .selected_streams
@@ -62,13 +72,14 @@ impl DemuxPacketCache {
                     cached_seek_target_nsecs = hit.target_nsecs,
                     anchor_nsecs = hit.anchor_nsecs,
                     anchor_packet_id = hit.anchor_packet_id,
+                    anchor_kind = hit.anchor_kind.as_str(),
                     video_reader_head = hit.video_reader_head,
                     ?audio_reader_head,
                     ?subtitle_reader_head,
                     ?subtitle_reader_head_start_nsecs,
                     anchor_is_recovery_point = hit.anchor_is_recovery_point,
                     anchor_is_safe_seek_point = hit.anchor_is_safe_seek_point,
-                    cached_seek_preroll_nsecs = guard.cached_seek_preroll_nsecs,
+                    cached_seek_preroll_nsecs = hit.preroll_nsecs,
                     requires_precise_trim = hit.requires_precise_trim,
                     seek_generation,
                     buffered_until,
@@ -84,7 +95,7 @@ impl DemuxPacketCache {
                 guard.record_emitted_seekable_ranges(cache_snapshot.seekable_ranges().clone());
                 self.shared.refresh_monitor_snapshot(&guard);
                 (
-                    DemuxSeekResult::Cached,
+                    DemuxSeekResult::Cached(cached_seek_info),
                     false,
                     cache_snapshot,
                     buffered_changed,
@@ -167,6 +178,60 @@ impl DemuxPacketCache {
             self.shared.enter_initial_cache_pause_if_needed();
         }
         DemuxSeekResult::Requested
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn exclude_failed_cached_seek_range(
+        &self,
+        info: DemuxCachedSeekInfo,
+        reason: &'static str,
+    ) -> bool {
+        let emit = {
+            let mut guard = self
+                .shared
+                .state
+                .lock()
+                .expect("FFmpeg demux packet cache poisoned");
+            if !guard.exclude_failed_cached_seek_range(info) {
+                tracing::debug!(
+                    session_id = ?guard.session_id,
+                    range_id = info.range_id,
+                    anchor_packet_id = info.anchor_packet_id,
+                    anchor_kind = info.anchor_kind.as_str(),
+                    reason,
+                    "failed cached seek range exclusion did not change authoritative ranges"
+                );
+                None
+            } else {
+                let snapshot = guard.cache_report_snapshot(self.shared.control.is_cache_paused());
+                let buffered_changed =
+                    guard.take_buffered_changed_for_cache_end(snapshot.cache_end());
+                guard.record_cache_state_emit(Instant::now());
+                guard.record_emitted_seekable_ranges(snapshot.seekable_ranges().clone());
+                self.shared.refresh_monitor_snapshot(&guard);
+                Some((snapshot, buffered_changed))
+            }
+        };
+        let Some((snapshot, buffered_changed)) = emit else {
+            return false;
+        };
+        let session_id = snapshot.session_id;
+        self.shared.send_cache_state_events(
+            session_id,
+            snapshot.into_cache_state(),
+            buffered_changed,
+        );
+        tracing::warn!(
+            ?session_id,
+            range_id = info.range_id,
+            anchor_packet_id = info.anchor_packet_id,
+            anchor_kind = info.anchor_kind.as_str(),
+            anchor_nsecs = info.anchor_nsecs,
+            target_nsecs = info.target_nsecs,
+            preroll_nsecs = info.preroll_nsecs,
+            reason,
+            "published cached seek ranges after excluding failed recovery anchor"
+        );
+        true
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop) fn shutdown(&self) {

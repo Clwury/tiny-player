@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 use crate::player::backend::{DemuxCacheState, PlaybackCacheTimeRange};
 
 use super::{
-    AvPacket, FormatContext, PlaybackCacheConfig, PlaybackCacheState, PlaybackSessionId, StreamInfo,
+    AvPacket, FormatContext, PlaybackCacheConfig, PlaybackCacheState, PlaybackSessionId,
+    StreamInfo, VideoRecoveryPointKind,
 };
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) type PacketId = u64;
@@ -51,8 +52,26 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) enum DemuxCac
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxCachedSeekInfo {
+    pub(in crate::player::backend::ffmpeg::playback_loop) range_id: RangeId,
+    pub(in crate::player::backend::ffmpeg::playback_loop) target_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop) anchor_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop) preroll_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop) anchor_packet_id: PacketId,
+    pub(in crate::player::backend::ffmpeg::playback_loop) anchor_kind: VideoRecoveryPointKind,
+    pub(in crate::player::backend::ffmpeg::playback_loop) anchor_is_safe_seek_point: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop) requires_precise_trim: bool,
+}
+
+impl DemuxCachedSeekInfo {
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn uses_cra_anchor(self) -> bool {
+        matches!(self.anchor_kind, VideoRecoveryPointKind::Cra)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg::playback_loop) enum DemuxSeekResult {
-    Cached,
+    Cached(DemuxCachedSeekInfo),
     Requested,
 }
 

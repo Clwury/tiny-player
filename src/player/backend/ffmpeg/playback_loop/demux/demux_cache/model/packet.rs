@@ -7,7 +7,7 @@ use std::{
 
 use super::{
     AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, DemuxPacketCacheReadTiming,
-    DemuxPacketDiskCache, read_demux_packet_disk_payload,
+    DemuxPacketDiskCache, VideoRecoveryPointKind, read_demux_packet_disk_payload,
 };
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct CachedDemuxPacket {
@@ -16,10 +16,21 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct Cached
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_index: c_int,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) timeline_anchor: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) recovery_point: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) recovery_kind:
+        VideoRecoveryPointKind,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) safe_seek_point: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) start_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) end_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) byte_len: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct CachedDemuxPacketRecovery
+{
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) recovery_point: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) recovery_kind:
+        VideoRecoveryPointKind,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) safe_seek_point: bool,
 }
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) enum CachedDemuxPacketPayload {
@@ -96,8 +107,7 @@ impl CachedDemuxPacket {
         packet: &AvPacket,
         stream_index: c_int,
         timeline_anchor: bool,
-        recovery_point: bool,
-        safe_seek_point: bool,
+        recovery: CachedDemuxPacketRecovery,
         start_nsecs: Option<u64>,
         end_nsecs: Option<u64>,
     ) -> std::result::Result<Self, String> {
@@ -107,8 +117,9 @@ impl CachedDemuxPacket {
             )?))),
             stream_index,
             timeline_anchor,
-            recovery_point,
-            safe_seek_point,
+            recovery_point: recovery.recovery_point,
+            recovery_kind: recovery.recovery_kind,
+            safe_seek_point: recovery.safe_seek_point,
             start_nsecs,
             end_nsecs,
             byte_len: packet.byte_len(),

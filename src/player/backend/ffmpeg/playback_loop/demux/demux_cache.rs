@@ -27,11 +27,11 @@ use super::{
     DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_AFTER, DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
     DEMUX_PACKET_CACHE_STALL_LOG_AFTER, DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL,
     DEMUX_PACKET_CACHE_WAIT_INTERVAL, FfmpegControl, FormatContext, StreamInfo, TimestampMapper,
-    audio_codec_requires_recovery_point, duration_nsecs, ffmpeg_error, nsecs_to_seconds,
-    optional_buffered_value_changed, packet_duration_nsecs, packet_is_audio_recovery_point,
-    packet_is_video_recovery_point, packet_is_video_seek_point, playback_buffered_near_duration,
-    preroll_seek_position_seconds, seconds_to_nsecs, video_cached_seek_preroll_nsecs,
-    video_seek_preroll_nsecs,
+    VideoRecoveryPointKind, audio_codec_requires_recovery_point, duration_nsecs, ffmpeg_error,
+    nsecs_to_seconds, optional_buffered_value_changed, packet_duration_nsecs,
+    packet_is_audio_recovery_point, packet_is_video_seek_point, packet_video_recovery_point_kind,
+    playback_buffered_near_duration, preroll_seek_position_seconds, seconds_to_nsecs,
+    video_cached_seek_preroll_nsecs, video_seek_preroll_nsecs,
 };
 
 #[path = "demux_cache/cache.rs"]
@@ -53,6 +53,8 @@ mod telemetry;
 
 #[cfg(test)]
 use model::CachedDemuxPacketPayload;
+#[cfg(test)]
+use model::CachedDemuxPacketRecovery;
 use model::{
     ArchivedStreamPruneCandidate, CachePauseRefresh, CacheStateEmit, CachedDemuxPacket,
     DemuxCacheLockWait, DemuxCacheReportSnapshot, DemuxCachedRange, DemuxCachedSeekHit,
@@ -62,7 +64,9 @@ use model::{
     PacketId, RangeId, SeekableTimelineSummary, StreamCacheRangeState, StreamForwardState,
     StreamForwardWindow, ordered_duration_seconds,
 };
-pub(super) use model::{DemuxPacketCacheInput, DemuxReadResult, DemuxSeekResult};
+pub(super) use model::{
+    DemuxCachedSeekInfo, DemuxPacketCacheInput, DemuxReadResult, DemuxSeekResult,
+};
 use policy::*;
 use runtime::run_demux_packet_cache;
 use storage::{
@@ -122,7 +126,7 @@ struct DemuxPacketCacheState {
     stream_kinds: BTreeMap<c_int, StreamCacheKind>,
     selected_streams: DemuxSelectedStreams,
     cached_seek_preroll_nsecs: u64,
-    cached_seek_requires_safe_point: bool,
+    failed_cached_seek_ranges: HashMap<RangeId, DemuxCachedSeekInfo>,
     memory_limit_bytes: usize,
     backbuffer_limit_bytes: usize,
     donate_backbuffer: bool,

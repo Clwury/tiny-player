@@ -64,8 +64,7 @@ impl DemuxPacketCacheState {
             stream_kinds,
             selected_streams: DemuxSelectedStreams::default(),
             cached_seek_preroll_nsecs: video_cached_seek_preroll_nsecs(timeline_anchor_codec_id),
-            cached_seek_requires_safe_point: timeline_anchor_codec_id
-                == ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            failed_cached_seek_ranges: HashMap::new(),
             memory_limit_bytes,
             backbuffer_limit_bytes,
             donate_backbuffer: cache_config.demuxer_donate_buffer,

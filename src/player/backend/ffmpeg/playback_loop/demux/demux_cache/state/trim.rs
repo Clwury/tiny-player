@@ -665,7 +665,6 @@ impl DemuxPacketCacheState {
             self.timeline_anchor_stream_index,
             stream_index,
             packet,
-            self.cached_seek_requires_safe_point,
             self.stream_requires_recovery_point(stream_index),
         )
     }
@@ -674,16 +673,10 @@ impl DemuxPacketCacheState {
         timeline_anchor_stream_index: c_int,
         stream_index: c_int,
         packet: &CachedDemuxPacket,
-        require_safe_seek_point: bool,
         require_recovery_point: bool,
     ) -> bool {
         if stream_index == timeline_anchor_stream_index {
-            let seek_boundary = if require_safe_seek_point {
-                packet.safe_seek_point
-            } else {
-                packet.recovery_point
-            };
-            return packet.timeline_anchor && seek_boundary && packet.start_nsecs.is_some();
+            return packet.timeline_anchor && packet.recovery_point && packet.start_nsecs.is_some();
         }
         if require_recovery_point {
             return packet.recovery_point && packet.start_nsecs.is_some();

@@ -27,8 +27,9 @@ use super::{
     DemuxReaderWatermark, DoviPipeline, HardwareDecodeMode, PlaybackBlockReason,
     PlaybackGeneration, PlaybackOutputSnapshot, StreamInfo,
     VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
-    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, duration_nsecs,
-    packet_is_video_recovery_point, packet_is_video_seek_point, timestamp_to_nsecs,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE,
+    VideoRecoveryPointKind, duration_nsecs, packet_is_video_recovery_point,
+    packet_is_video_seek_point, packet_video_recovery_point_kind, timestamp_to_nsecs,
 };
 
 const VIDEO_DECODE_PENDING_INPUT_QUEUE_CAPACITY: usize = 8;
@@ -245,6 +246,7 @@ struct HevcPacketDiagnosticFields {
     flags: i32,
     key_frame: bool,
     recovery_point: bool,
+    recovery_kind: VideoRecoveryPointKind,
     safe_seek_point: bool,
     byte_len: usize,
     cache_read: Option<AvPacketReadDiagnostic>,
@@ -273,6 +275,9 @@ impl HevcPacketDiagnosticFields {
             recovery_point: cache_read
                 .map(|cache| cache.recovery_point)
                 .unwrap_or_else(|| packet_is_video_recovery_point(packet, codec_id)),
+            recovery_kind: cache_read
+                .map(|cache| cache.recovery_kind)
+                .unwrap_or_else(|| packet_video_recovery_point_kind(packet, codec_id)),
             safe_seek_point: cache_read
                 .map(|cache| cache.safe_seek_point)
                 .unwrap_or_else(|| packet_is_video_seek_point(packet, codec_id)),
@@ -400,6 +405,8 @@ pub(super) struct VideoPacketAdmissionPressure {
 #[derive(Default)]
 pub(in crate::player::backend::ffmpeg) struct VideoDecodeRecovery {
     waiting_for_keyframe: bool,
+    allow_hevc_cached_recovery_point: bool,
+    exact_cached_seek_output: bool,
     realign_on_next_frame: bool,
     realign_after_recovery_point: bool,
     skipped_packets: u64,
@@ -423,6 +430,8 @@ pub(in crate::player::backend::ffmpeg) struct SeekPrerollFrameProgress {
 impl VideoDecodeRecovery {
     pub(in crate::player::backend::ffmpeg) fn reset(&mut self) {
         self.waiting_for_keyframe = false;
+        self.allow_hevc_cached_recovery_point = false;
+        self.exact_cached_seek_output = false;
         self.realign_on_next_frame = false;
         self.realign_after_recovery_point = false;
         self.skipped_packets = 0;
@@ -447,6 +456,17 @@ impl VideoDecodeRecovery {
         self.waiting_for_keyframe
     }
 
+    pub(in crate::player::backend::ffmpeg) fn enable_hevc_cached_recovery_point(&mut self) {
+        if self.waiting_for_keyframe {
+            self.allow_hevc_cached_recovery_point = true;
+            self.exact_cached_seek_output = true;
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn requires_exact_cached_seek_output(&self) -> bool {
+        self.exact_cached_seek_output
+    }
+
     pub(in crate::player::backend::ffmpeg) fn skipped_packets(&self) -> u64 {
         self.skipped_packets
     }
@@ -456,7 +476,9 @@ impl VideoDecodeRecovery {
         packet: &AvPacket,
         codec_id: ffi::AVCodecID,
     ) -> bool {
-        if !self.waiting_for_keyframe || packet_is_video_decode_recovery_point(packet, codec_id) {
+        if !self.waiting_for_keyframe
+            || self.packet_is_video_decode_recovery_point(packet, codec_id)
+        {
             return false;
         }
         if self.can_accept_hevc_recovery_point_after_wait_limit(packet, codec_id) {
@@ -527,7 +549,9 @@ impl VideoDecodeRecovery {
         packet: &AvPacket,
         codec_id: ffi::AVCodecID,
     ) -> bool {
-        if !self.waiting_for_keyframe || !packet_is_video_decode_recovery_point(packet, codec_id) {
+        if !self.waiting_for_keyframe
+            || !self.packet_is_video_decode_recovery_point(packet, codec_id)
+        {
             return false;
         }
 
@@ -595,6 +619,7 @@ impl VideoDecodeRecovery {
         self.seek_bootstrap_preroll_frames = 0;
         self.seek_bootstrap_first_preroll_frame_nsecs = None;
         self.seek_bootstrap_last_preroll_frame_nsecs = None;
+        self.exact_cached_seek_output = false;
     }
 
     fn can_accept_hevc_recovery_point_after_wait_limit(
@@ -617,19 +642,26 @@ impl VideoDecodeRecovery {
 
     fn accept_waited_recovery_point(&mut self) {
         self.waiting_for_keyframe = false;
+        self.allow_hevc_cached_recovery_point = false;
         self.realign_on_next_frame = self.realign_after_recovery_point;
         self.realign_after_recovery_point = false;
         self.skipped_packets = 0;
         self.first_skipped_packet_nsecs = None;
         self.last_skipped_packet_nsecs = None;
     }
-}
 
-fn packet_is_video_decode_recovery_point(packet: &AvPacket, codec_id: ffi::AVCodecID) -> bool {
-    if codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC {
-        return packet_is_video_seek_point(packet, codec_id);
+    fn packet_is_video_decode_recovery_point(
+        &self,
+        packet: &AvPacket,
+        codec_id: ffi::AVCodecID,
+    ) -> bool {
+        if codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
+            return packet_is_video_recovery_point(packet, codec_id);
+        }
+        packet_is_video_seek_point(packet, codec_id)
+            || (self.allow_hevc_cached_recovery_point
+                && packet_is_video_recovery_point(packet, codec_id))
     }
-    packet_is_video_recovery_point(packet, codec_id)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1948,6 +1980,7 @@ impl VideoDecodePipeline {
                     codec = ?codec_id,
                     packet_bytes = packet.byte_len(),
                     recovery_point = packet_is_video_recovery_point(packet, codec_id),
+                    recovery_kind = packet_video_recovery_point_kind(packet, codec_id).as_str(),
                     safe_seek_point = packet_is_video_seek_point(packet, codec_id),
                     skipped_packets,
                     skipped_span_ms =
@@ -1998,7 +2031,9 @@ impl VideoDecodePipeline {
                 codec = ?codec_id,
                 packet_bytes = packet.byte_len(),
                 recovery_point = packet_is_video_recovery_point(packet, codec_id),
+                recovery_kind = packet_video_recovery_point_kind(packet, codec_id).as_str(),
                 safe_seek_point = packet_is_video_seek_point(packet, codec_id),
+                cached_seek_cra_allowed = recovery.requires_exact_cached_seek_output(),
                 "resuming FFmpeg video decode at recovery point"
             );
             let generation = playback_generation.advance();
@@ -2013,6 +2048,7 @@ impl VideoDecodePipeline {
                     codec = ?codec_id,
                     packet_bytes = packet.byte_len(),
                     recovery_point = packet_is_video_recovery_point(packet, codec_id),
+                    recovery_kind = packet_video_recovery_point_kind(packet, codec_id).as_str(),
                     safe_seek_point = packet_is_video_seek_point(packet, codec_id),
                     skipped_packets,
                     skipped_span_ms =
@@ -2030,6 +2066,7 @@ impl VideoDecodePipeline {
                     codec = ?codec_id,
                     packet_bytes = packet.byte_len(),
                     recovery_point = packet_is_video_recovery_point(packet, codec_id),
+                    recovery_kind = packet_video_recovery_point_kind(packet, codec_id).as_str(),
                     safe_seek_point = packet_is_video_seek_point(packet, codec_id),
                     max_skipped_packets = VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS,
                     "resuming FFmpeg video decode after recovery point wait limit"
@@ -3176,6 +3213,7 @@ fn log_video_decode_packet_if_needed(
     recovery: &VideoDecodeRecovery,
 ) {
     let recovery_point = packet_is_video_recovery_point(packet, codec_id);
+    let recovery_kind = packet_video_recovery_point_kind(packet, codec_id);
     let safe_seek_point = packet_is_video_seek_point(packet, codec_id);
     if video_packet_count != 1
         && !video_packet_count.is_multiple_of(120)
@@ -3194,6 +3232,7 @@ fn log_video_decode_packet_if_needed(
         codec = ?codec_id,
         packet_bytes = packet.byte_len(),
         recovery_point,
+        recovery_kind = recovery_kind.as_str(),
         safe_seek_point,
         recovery_waiting = recovery.waiting_for_keyframe(),
         recovery_skipped_packets = recovery.skipped_packets(),

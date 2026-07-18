@@ -349,18 +349,88 @@ fn video_error_recognition(codec_id: ffi::AVCodecID) -> Option<c_int> {
     }
 }
 
-pub(super) fn packet_is_video_recovery_point(packet: &AvPacket, codec_id: ffi::AVCodecID) -> bool {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum VideoRecoveryPointKind {
+    #[default]
+    None,
+    Cra,
+    Idr,
+    Bla,
+    Keyframe,
+}
+
+impl VideoRecoveryPointKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Cra => "CRA",
+            Self::Idr => "IDR",
+            Self::Bla => "BLA",
+            Self::Keyframe => "KEYFRAME",
+        }
+    }
+
+    pub(super) fn is_recovery_point(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+pub(super) fn packet_video_recovery_point_kind(
+    packet: &AvPacket,
+    codec_id: ffi::AVCodecID,
+) -> VideoRecoveryPointKind {
     match codec_id {
         ffi::AVCodecID::AV_CODEC_ID_H264 => packet
             .data()
-            .map(|data| h264_access_unit_recovery_state(data).unwrap_or_else(|| packet.is_key()))
-            .unwrap_or_else(|| packet.is_key()),
+            .map(|data| {
+                h264_access_unit_recovery_state(data)
+                    .map(|recovery| {
+                        if recovery {
+                            VideoRecoveryPointKind::Idr
+                        } else {
+                            VideoRecoveryPointKind::None
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        if packet.is_key() {
+                            VideoRecoveryPointKind::Keyframe
+                        } else {
+                            VideoRecoveryPointKind::None
+                        }
+                    })
+            })
+            .unwrap_or_else(|| {
+                if packet.is_key() {
+                    VideoRecoveryPointKind::Keyframe
+                } else {
+                    VideoRecoveryPointKind::None
+                }
+            }),
         ffi::AVCodecID::AV_CODEC_ID_HEVC => packet
             .data()
-            .map(|data| hevc_access_unit_recovery_state(data).unwrap_or_else(|| packet.is_key()))
-            .unwrap_or_else(|| packet.is_key()),
-        _ => packet.is_key(),
+            .map(|data| {
+                hevc_access_unit_recovery_kind(data).unwrap_or_else(|| {
+                    if packet.is_key() {
+                        VideoRecoveryPointKind::Keyframe
+                    } else {
+                        VideoRecoveryPointKind::None
+                    }
+                })
+            })
+            .unwrap_or_else(|| {
+                if packet.is_key() {
+                    VideoRecoveryPointKind::Keyframe
+                } else {
+                    VideoRecoveryPointKind::None
+                }
+            }),
+        _ if packet.is_key() => VideoRecoveryPointKind::Keyframe,
+        _ => VideoRecoveryPointKind::None,
     }
+}
+
+pub(super) fn packet_is_video_recovery_point(packet: &AvPacket, codec_id: ffi::AVCodecID) -> bool {
+    packet_video_recovery_point_kind(packet, codec_id).is_recovery_point()
 }
 
 pub(super) fn packet_is_video_seek_point(packet: &AvPacket, codec_id: ffi::AVCodecID) -> bool {
@@ -405,12 +475,23 @@ fn h264_access_unit_recovery_state(data: &[u8]) -> Option<bool> {
     })
 }
 
-fn hevc_access_unit_recovery_state(data: &[u8]) -> Option<bool> {
+fn hevc_access_unit_recovery_kind(data: &[u8]) -> Option<VideoRecoveryPointKind> {
+    let mut recovery_kind = VideoRecoveryPointKind::None;
     access_unit_nal_recovery_state(data, |nal| {
-        nal.first()
-            .map(|header| hevc_nal_is_recovery_point(hevc_nal_type(*header)))
-            .unwrap_or(false)
+        let Some(header) = nal.first() else {
+            return false;
+        };
+        recovery_kind = match hevc_nal_type(*header) {
+            HEVC_NAL_BLA_W_LP | HEVC_NAL_BLA_W_RADL | HEVC_NAL_BLA_N_LP => {
+                VideoRecoveryPointKind::Bla
+            }
+            HEVC_NAL_IDR_W_RADL | HEVC_NAL_IDR_N_LP => VideoRecoveryPointKind::Idr,
+            HEVC_NAL_CRA => VideoRecoveryPointKind::Cra,
+            _ => VideoRecoveryPointKind::None,
+        };
+        recovery_kind.is_recovery_point()
     })
+    .map(|_| recovery_kind)
 }
 
 fn hevc_access_unit_seek_state(data: &[u8]) -> Option<bool> {
@@ -446,10 +527,6 @@ fn hevc_nal_type(header: u8) -> u8 {
 
 fn hevc_nal_is_vcl(nal_type: u8) -> bool {
     nal_type <= 31
-}
-
-fn hevc_nal_is_recovery_point(nal_type: u8) -> bool {
-    hevc_nal_is_safe_seek_point(nal_type) || nal_type == HEVC_NAL_CRA
 }
 
 fn hevc_nal_is_safe_seek_point(nal_type: u8) -> bool {
@@ -666,6 +743,7 @@ pub(super) struct AvPacketReadDiagnostic {
     pub(super) packet_end_nsecs: Option<u64>,
     pub(super) timeline_anchor: bool,
     pub(super) recovery_point: bool,
+    pub(super) recovery_kind: VideoRecoveryPointKind,
     pub(super) safe_seek_point: bool,
 }
 
@@ -1159,9 +1237,11 @@ mod tests {
     use ffmpeg_sys_next as ffi;
 
     use super::{
-        AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, audio_codec_requires_recovery_point,
-        packet_is_audio_recovery_point, packet_is_video_recovery_point, packet_is_video_seek_point,
-        video_error_recognition, vulkan_decode_codec_needs_single_thread,
+        AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, VideoRecoveryPointKind,
+        audio_codec_requires_recovery_point, packet_is_audio_recovery_point,
+        packet_is_video_recovery_point, packet_is_video_seek_point,
+        packet_video_recovery_point_kind, video_error_recognition,
+        vulkan_decode_codec_needs_single_thread,
     };
 
     fn packet_from_data(data: &[u8]) -> AvPacket {
@@ -1191,6 +1271,7 @@ mod tests {
             packet_end_nsecs: Some(1_040_000_000),
             timeline_anchor: true,
             recovery_point: false,
+            recovery_kind: VideoRecoveryPointKind::None,
             safe_seek_point: false,
         };
         packet.set_read_diagnostic(diagnostic);
@@ -1285,6 +1366,21 @@ mod tests {
             &packet,
             ffi::AVCodecID::AV_CODEC_ID_HEVC
         ));
+    }
+
+    #[test]
+    fn hevc_recovery_point_classifies_cra_idr_and_bla() {
+        for (header, expected) in [
+            (0x2a, VideoRecoveryPointKind::Cra),
+            (0x26, VideoRecoveryPointKind::Idr),
+            (0x20, VideoRecoveryPointKind::Bla),
+        ] {
+            let packet = packet_from_data(&[0, 0, 0, 3, header, 0x01, 0xaa]);
+            assert_eq!(
+                packet_video_recovery_point_kind(&packet, ffi::AVCodecID::AV_CODEC_ID_HEVC),
+                expected
+            );
+        }
     }
 
     #[test]

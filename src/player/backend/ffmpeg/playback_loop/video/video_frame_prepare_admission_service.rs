@@ -94,6 +94,7 @@ pub(super) fn service_decoded_video_frame_start(
         timestamp.timeline_nsecs,
         *current_start_position_nsecs,
         realign_on_next_frame,
+        video_decode_recovery.requires_exact_cached_seek_output(),
     );
     match start_action {
         DecodedVideoFrameStartAction::DropBeforeStart => {

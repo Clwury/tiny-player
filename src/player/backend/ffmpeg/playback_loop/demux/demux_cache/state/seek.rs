@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, os::raw::c_int};
 
 use super::{
-    DemuxCachedRange, DemuxCachedSeekHit, DemuxPacketCacheState, DemuxPacketRangeView,
-    DemuxSeekRequest, PacketId, PlaybackSeekMode, PlaybackSessionId, RangeId, nsecs_to_seconds,
+    DemuxCachedRange, DemuxCachedSeekHit, DemuxCachedSeekInfo, DemuxPacketCacheState,
+    DemuxPacketRangeView, DemuxSeekRequest, PacketId, PlaybackSeekMode, PlaybackSessionId, RangeId,
+    nsecs_to_seconds,
 };
 
 impl DemuxPacketCacheState {
@@ -43,7 +44,11 @@ impl DemuxPacketCacheState {
         session_id: PlaybackSessionId,
         seek_generation: u64,
     ) -> Option<DemuxCachedSeekHit> {
-        let current_hit = self.seek_cached_in_range(self.read_range(), target_nsecs, mode);
+        let current_hit = (!self
+            .failed_cached_seek_ranges
+            .contains_key(&self.read_range_id))
+        .then(|| self.seek_cached_in_range(self.read_range(), target_nsecs, mode))
+        .flatten();
         if let Some(hit) = current_hit {
             let result = hit.clone();
             self.generation = self.generation.saturating_add(1);
@@ -63,6 +68,9 @@ impl DemuxPacketCacheState {
 
         let detached_append_range_id = self.detached_append_range_id();
         let detached_hit = detached_append_range_id.and_then(|range_id| {
+            if self.failed_cached_seek_ranges.contains_key(&range_id) {
+                return None;
+            }
             self.ranges.get(&range_id).and_then(|range| {
                 self.seek_cached_in_range(range, target_nsecs, mode)
                     .map(|hit| (range_id, hit))
@@ -90,6 +98,7 @@ impl DemuxPacketCacheState {
             .iter()
             .filter(|(range_id, _)| **range_id != self.read_range_id)
             .filter(|(range_id, _)| Some(**range_id) != detached_append_range_id)
+            .filter(|(range_id, _)| !self.failed_cached_seek_ranges.contains_key(range_id))
             .find_map(|(range_id, range)| {
                 self.seek_cached_in_range(range, target_nsecs, mode)
                     .map(|hit| (*range_id, hit))
@@ -115,6 +124,38 @@ impl DemuxPacketCacheState {
         Some(result)
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn exclude_failed_cached_seek_range(
+        &mut self,
+        info: DemuxCachedSeekInfo,
+    ) -> bool {
+        let before = self.seekable_time_ranges();
+        self.failed_cached_seek_ranges.insert(info.range_id, info);
+        let after = self.seekable_time_ranges();
+        let changed = before != after;
+        tracing::warn!(
+            session_id = ?self.session_id,
+            range_id = info.range_id,
+            anchor_packet_id = info.anchor_packet_id,
+            anchor_kind = info.anchor_kind.as_str(),
+            anchor_nsecs = info.anchor_nsecs,
+            target_nsecs = info.target_nsecs,
+            preroll_nsecs = info.preroll_nsecs,
+            seekable_ranges_before = ?before,
+            seekable_ranges_after = ?after,
+            changed,
+            "temporarily excluded failed cached seek recovery anchor for playback session"
+        );
+        changed
+    }
+
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn failed_cached_seek_range(
+        &self,
+        range_id: RangeId,
+    ) -> Option<DemuxCachedSeekInfo> {
+        self.failed_cached_seek_ranges.get(&range_id).copied()
+    }
+
     fn seek_cached_in_range(
         &self,
         range: &DemuxCachedRange,
@@ -129,9 +170,9 @@ impl DemuxPacketCacheState {
         };
         let mut hit = Self::seek_cached_in_packet_range(
             &self.packets,
+            range.id,
             self.timeline_anchor_stream_index,
             cached_seek_preroll_nsecs,
-            self.cached_seek_requires_safe_point,
             self.recovery_point_stream_index(),
             DemuxPacketRangeView {
                 stream_queues: &stream_queues,

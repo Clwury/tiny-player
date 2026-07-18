@@ -253,6 +253,24 @@ pub(super) fn service_playback_seek_reset(
         control,
         event_tx,
     });
+    if let DemuxSeekResult::Cached(info) = flush_result.demux_seek_result
+        && info.uses_cra_anchor()
+    {
+        pipeline
+            .video_decode_recovery
+            .enable_hevc_cached_recovery_point();
+        tracing::debug!(
+            ?session_id,
+            range_id = info.range_id,
+            anchor_packet_id = info.anchor_packet_id,
+            anchor_kind = info.anchor_kind.as_str(),
+            anchor_nsecs = info.anchor_nsecs,
+            target_nsecs = info.target_nsecs,
+            preroll_nsecs = info.preroll_nsecs,
+            exact_output_gate = true,
+            "enabled CRA recovery point for closed cached seek transaction"
+        );
+    }
     if hevc_seek_starts_video_bootstrap(
         pipeline.video_stream.codec_id,
         force_low_level_seek,
@@ -264,12 +282,11 @@ pub(super) fn service_playback_seek_reset(
             low_level_seek_reason.unwrap_or("hevc_low_level_seek_recovery"),
         );
     }
-    if matches!(flush_result.demux_seek_result, DemuxSeekResult::Cached)
+    if let DemuxSeekResult::Cached(info) = flush_result.demux_seek_result
         && !force_low_level_seek
-        && matches!(seek_mode, PlaybackSeekMode::Precise)
+        && (matches!(seek_mode, PlaybackSeekMode::Precise) || info.uses_cra_anchor())
     {
-        pipeline
-            .begin_cached_seek_recovery_watchdog(pipeline.current_start_position_nsecs, session_id);
+        pipeline.begin_cached_seek_recovery_watchdog_for_hit(info, session_id);
     } else {
         pipeline.clear_cached_seek_recovery_watchdog();
     }

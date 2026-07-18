@@ -25,15 +25,16 @@ use crate::player::{
 use super::super::DEMUX_PACKET_CACHE_MEMORY_BYTES;
 use super::{
     AvPacket, AvPacketStorageKind, CachedDemuxPacket, CachedDemuxPacketPayload,
-    DEFAULT_VIDEO_FRAME_DURATION_NSECS, DEMUX_PACKET_APPEND_TRIM_INTERVAL,
-    DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT, DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS,
-    DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL, DEMUX_PACKET_READ_TRIM_INTERVAL,
-    DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL, DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT,
-    DEMUX_PACKET_TRIM_MAX_PACKETS_PER_STEP, DEMUX_STREAM_PACKET_QUEUE_LIMIT, DemuxPacketCache,
+    CachedDemuxPacketRecovery, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+    DEMUX_PACKET_APPEND_TRIM_INTERVAL, DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT,
+    DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS, DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL,
+    DEMUX_PACKET_READ_TRIM_INTERVAL, DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL,
+    DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT, DEMUX_PACKET_TRIM_MAX_PACKETS_PER_STEP,
+    DEMUX_STREAM_PACKET_QUEUE_LIMIT, DemuxCachedSeekInfo, DemuxPacketCache,
     DemuxPacketCacheMonitorSnapshot, DemuxPacketCacheReadTiming, DemuxPacketCacheShared,
     DemuxPacketCacheState, DemuxPacketDiskCache, DemuxPacketTimeline, DemuxReadResult,
     DemuxSeekRequest, DemuxSeekResult, DemuxSelectedStreams, FfmpegControl, PacketId, StreamInfo,
-    demux_cache_blocked_on, demux_packet_cache_hysteresis_nsecs,
+    VideoRecoveryPointKind, demux_cache_blocked_on, demux_packet_cache_hysteresis_nsecs,
     demux_packet_cache_readahead_nsecs, duration_nsecs, seconds_to_nsecs,
 };
 
@@ -93,6 +94,18 @@ fn cached_key_packet(
     cached_packet_with_keyframe(stream_index, timeline_anchor, true, start_nsecs, end_nsecs)
 }
 
+fn cached_video_recovery_packet(
+    kind: VideoRecoveryPointKind,
+    safe_seek_point: bool,
+    start_nsecs: u64,
+    end_nsecs: u64,
+) -> CachedDemuxPacket {
+    let mut packet = cached_key_packet(0, true, Some(start_nsecs), Some(end_nsecs));
+    packet.recovery_kind = kind;
+    packet.safe_seek_point = safe_seek_point;
+    packet
+}
+
 fn cached_packet_with_keyframe(
     stream_index: c_int,
     timeline_anchor: bool,
@@ -109,6 +122,11 @@ fn cached_packet_with_keyframe(
         stream_index,
         timeline_anchor,
         recovery_point: keyframe,
+        recovery_kind: if keyframe {
+            VideoRecoveryPointKind::Keyframe
+        } else {
+            VideoRecoveryPointKind::None
+        },
         safe_seek_point: keyframe,
         start_nsecs,
         end_nsecs,
@@ -3798,8 +3816,7 @@ fn demux_packet_cache_state_precise_hevc_cached_seek_uses_safe_point_before_prer
 }
 
 #[test]
-fn demux_packet_cache_state_precise_hevc_cached_seek_rejects_recovery_point_without_safe_seek_point()
- {
+fn demux_packet_cache_state_precise_hevc_cached_seek_uses_closed_cra_recovery_anchor() {
     let mut state = DemuxPacketCacheState::new(
         0,
         0,
@@ -3807,9 +3824,12 @@ fn demux_packet_cache_state_precise_hevc_cached_seek_rejects_recovery_point_with
         PlaybackSessionId(1),
         cache_config_for_test(),
     );
-    let mut recovery_only_packet =
-        cached_key_packet(0, true, Some(2_000_000_000), Some(3_000_000_000));
-    recovery_only_packet.safe_seek_point = false;
+    let recovery_only_packet = cached_video_recovery_packet(
+        VideoRecoveryPointKind::Cra,
+        false,
+        2_000_000_000,
+        3_000_000_000,
+    );
     state.append_packet(recovery_only_packet);
     state.append_packet(cached_packet(
         0,
@@ -3819,10 +3839,88 @@ fn demux_packet_cache_state_precise_hevc_cached_seek_rejects_recovery_point_with
     ));
     close_seek_range(&mut state, 4_000_000_000);
 
-    assert_eq!(state.seek_cached(3_500_000_000, PlaybackSessionId(2)), None);
+    let hit = state
+        .seek_cached_with_generation_hit(
+            3_500_000_000,
+            PlaybackSeekMode::Precise,
+            PlaybackSessionId(2),
+            0,
+        )
+        .expect("closed CRA interval supports cached seek");
+    assert_eq!(hit.anchor_kind, VideoRecoveryPointKind::Cra);
+    assert_eq!(hit.anchor_nsecs, 2_000_000_000);
+    assert_eq!(hit.target_nsecs, 3_500_000_000);
+    assert_eq!(hit.preroll_nsecs, 500_000_000);
+    assert!(!hit.anchor_is_safe_seek_point);
+    assert!(hit.requires_precise_trim);
     assert_eq!(state.read_index, 0);
-    assert_eq!(state.reader_nsecs, 0);
-    assert_eq!(state.cached_seeks, 0);
+    assert_eq!(state.reader_nsecs, 2_000_000_000);
+    assert_eq!(state.cached_seeks, 1);
+}
+
+#[test]
+fn failed_cra_anchor_is_excluded_from_ranges_and_future_cached_seeks() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.append_packet(cached_video_recovery_packet(
+        VideoRecoveryPointKind::Cra,
+        false,
+        2_000_000_000,
+        3_000_000_000,
+    ));
+    state.append_packet(cached_packet(
+        0,
+        true,
+        Some(3_000_000_000),
+        Some(4_000_000_000),
+    ));
+    close_seek_range(&mut state, 4_000_000_000);
+
+    let hit = state
+        .seek_cached_with_generation_hit(
+            3_500_000_000,
+            PlaybackSeekMode::Precise,
+            PlaybackSessionId(2),
+            0,
+        )
+        .expect("CRA cached seek initially hits");
+    let failed = DemuxCachedSeekInfo {
+        range_id: hit.range_id,
+        target_nsecs: hit.target_nsecs,
+        anchor_nsecs: hit.anchor_nsecs,
+        preroll_nsecs: hit.preroll_nsecs,
+        anchor_packet_id: hit.anchor_packet_id,
+        anchor_kind: hit.anchor_kind,
+        anchor_is_safe_seek_point: hit.anchor_is_safe_seek_point,
+        requires_precise_trim: hit.requires_precise_trim,
+    };
+
+    assert!(state.exclude_failed_cached_seek_range(failed));
+    assert_eq!(state.failed_cached_seek_range(hit.range_id), Some(failed));
+    assert!(
+        state
+            .playback_cache_state(false)
+            .demux
+            .seekable_ranges
+            .is_empty()
+    );
+    assert!(!state.exclude_failed_cached_seek_range(failed));
+    assert!(
+        state
+            .seek_cached_with_generation_hit(
+                3_500_000_000,
+                PlaybackSeekMode::Precise,
+                PlaybackSessionId(3),
+                1,
+            )
+            .is_none(),
+        "a failed CRA interval cannot loop back into cached seek"
+    );
 }
 
 #[test]
@@ -3862,6 +3960,61 @@ fn demux_packet_cache_state_precise_hevc_cached_seek_uses_latest_safe_point_befo
     assert!(hit.anchor_is_safe_seek_point);
     assert_eq!(state.read_index, 0);
     assert_eq!(state.reader_nsecs, 2_000_000_000);
+}
+
+#[test]
+fn hevc_cached_seek_keeps_idr_and_bla_priority_over_later_cra() {
+    for safe_kind in [VideoRecoveryPointKind::Idr, VideoRecoveryPointKind::Bla] {
+        let mut state = DemuxPacketCacheState::new(
+            0,
+            0,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            PlaybackSessionId(1),
+            cache_config_for_test(),
+        );
+        state.append_packet(cached_video_recovery_packet(
+            safe_kind,
+            true,
+            0,
+            1_000_000_000,
+        ));
+        state.append_packet(cached_packet(
+            0,
+            true,
+            Some(1_000_000_000),
+            Some(2_000_000_000),
+        ));
+        state.append_packet(cached_video_recovery_packet(
+            VideoRecoveryPointKind::Cra,
+            false,
+            2_000_000_000,
+            3_000_000_000,
+        ));
+        state.append_packet(cached_packet(
+            0,
+            true,
+            Some(3_000_000_000),
+            Some(4_000_000_000),
+        ));
+        state.append_packet(cached_video_recovery_packet(
+            VideoRecoveryPointKind::Cra,
+            false,
+            4_000_000_000,
+            5_000_000_000,
+        ));
+
+        let hit = state
+            .seek_cached_with_generation_hit(
+                3_500_000_000,
+                PlaybackSeekMode::Precise,
+                PlaybackSessionId(2),
+                0,
+            )
+            .expect("closed HEVC range supports cached seek");
+        assert_eq!(hit.anchor_kind, safe_kind);
+        assert!(hit.anchor_is_safe_seek_point);
+        assert_eq!(hit.anchor_nsecs, 0);
+    }
 }
 
 #[test]
@@ -4076,6 +4229,116 @@ fn demux_packet_cache_state_reports_hevc_seekable_range_after_cached_seek_prerol
         Some(2_000_000_000),
     ));
     close_seek_range(&mut state, 2_000_000_000);
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 0.5,
+            end: 2.0,
+        }]
+    );
+}
+
+#[test]
+fn hevc_cra_only_range_closes_when_second_cra_arrives() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.append_packet(cached_video_recovery_packet(
+        VideoRecoveryPointKind::Cra,
+        false,
+        0,
+        1_000_000_000,
+    ));
+    state.append_packet(cached_packet(
+        0,
+        true,
+        Some(1_000_000_000),
+        Some(2_000_000_000),
+    ));
+
+    assert!(
+        state
+            .playback_cache_state(false)
+            .demux
+            .seekable_ranges
+            .is_empty(),
+        "an open CRA segment is not yet a no-delay cached seek interval"
+    );
+
+    state.append_packet(cached_video_recovery_packet(
+        VideoRecoveryPointKind::Cra,
+        false,
+        2_000_000_000,
+        3_000_000_000,
+    ));
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![PlaybackCacheTimeRange {
+            start: 0.5,
+            end: 2.0,
+        }]
+    );
+}
+
+#[test]
+fn hevc_single_unclosed_cra_does_not_publish_seekable_range() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.append_packet(cached_video_recovery_packet(
+        VideoRecoveryPointKind::Cra,
+        false,
+        0,
+        1_000_000_000,
+    ));
+    state.append_packet(cached_packet(
+        0,
+        true,
+        Some(1_000_000_000),
+        Some(2_000_000_000),
+    ));
+
+    assert!(
+        state
+            .playback_cache_state(false)
+            .demux
+            .seekable_ranges
+            .is_empty()
+    );
+}
+
+#[test]
+fn hevc_eof_closes_last_cra_seekable_range() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.append_packet(cached_video_recovery_packet(
+        VideoRecoveryPointKind::Cra,
+        false,
+        0,
+        1_000_000_000,
+    ));
+    state.append_packet(cached_packet(
+        0,
+        true,
+        Some(1_000_000_000),
+        Some(2_000_000_000),
+    ));
+    state.mark_eof();
 
     assert_eq!(
         state.playback_cache_state(false).demux.seekable_ranges,
@@ -4384,9 +4647,19 @@ fn demux_packet_cache_state_materializes_disk_packet_after_reader_advance() {
     unsafe {
         (*packet.as_mut_ptr()).stream_index = 0;
     }
-    let cached =
-        CachedDemuxPacket::from_packet(&packet, 0, true, true, true, Some(0), Some(1_000_000_000))
-            .expect("packet caches");
+    let cached = CachedDemuxPacket::from_packet(
+        &packet,
+        0,
+        true,
+        CachedDemuxPacketRecovery {
+            recovery_point: true,
+            recovery_kind: VideoRecoveryPointKind::Keyframe,
+            safe_seek_point: true,
+        },
+        Some(0),
+        Some(1_000_000_000),
+    )
+    .expect("packet caches");
     let mut state = DemuxPacketCacheState::new(
         0,
         0,
@@ -6105,6 +6378,37 @@ fn demux_packet_cache_state_merges_overlapping_ranges_after_backward_seek() {
 }
 
 #[test]
+fn demux_packet_cache_state_keeps_adjacent_physical_ranges_independent() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.append_packet(cached_anchor(0, 1_000_000_000));
+    close_seek_range(&mut state, 1_000_000_000);
+    state.request_seek(1.0, PlaybackSessionId(2), 1, 1_000_000_000);
+    state.append_packet(cached_anchor(1_000_000_000, 2_000_000_000));
+    close_seek_range(&mut state, 2_000_000_000);
+
+    assert_eq!(
+        state.playback_cache_state(false).demux.seekable_ranges,
+        vec![
+            PlaybackCacheTimeRange {
+                start: 0.0,
+                end: 1.0,
+            },
+            PlaybackCacheTimeRange {
+                start: 1.0,
+                end: 2.0,
+            },
+        ],
+        "only positive overlap is merged; touching ranges retain mpv-style boundaries"
+    );
+}
+
+#[test]
 fn demux_packet_cache_state_reports_stream_kinds() {
     let mut state = DemuxPacketCacheState::new(
         0,
@@ -7148,8 +7452,19 @@ fn demux_packet_cache_state_indexes_packets_by_stream() {
 fn demux_packet_disk_cache_restores_packet_payload() {
     let props = AvPacket::new().expect("packet allocates");
     let packet = AvPacket::from_data_and_props(b"packet-payload", &props).expect("packet has data");
-    let mut cached = CachedDemuxPacket::from_packet(&packet, 0, true, true, true, Some(0), Some(1))
-        .expect("packet caches");
+    let mut cached = CachedDemuxPacket::from_packet(
+        &packet,
+        0,
+        true,
+        CachedDemuxPacketRecovery {
+            recovery_point: true,
+            recovery_kind: VideoRecoveryPointKind::Keyframe,
+            safe_seek_point: true,
+        },
+        Some(0),
+        Some(1),
+    )
+    .expect("packet caches");
     let mut disk_cache = DemuxPacketDiskCache::new(1024, None, CacheUnlinkPolicy::WhenDone)
         .expect("disk cache creates");
 

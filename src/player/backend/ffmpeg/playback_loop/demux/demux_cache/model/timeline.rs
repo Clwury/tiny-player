@@ -3,10 +3,10 @@ use std::{os::raw::c_int, sync::mpsc::Sender};
 use ffmpeg_sys_next as ffi;
 
 use super::{
-    AvPacket, BackendEvent, BufferedReporter, CachedDemuxPacket,
+    AvPacket, BackendEvent, BufferedReporter, CachedDemuxPacket, CachedDemuxPacketRecovery,
     DEFAULT_VIDEO_FRAME_DURATION_NSECS, DemuxSelectedStreams, PlaybackSessionId, StreamInfo,
-    TimestampMapper, packet_duration_nsecs, packet_is_audio_recovery_point,
-    packet_is_video_recovery_point, packet_is_video_seek_point, seconds_to_nsecs,
+    TimestampMapper, VideoRecoveryPointKind, packet_duration_nsecs, packet_is_audio_recovery_point,
+    packet_is_video_seek_point, packet_video_recovery_point_kind, seconds_to_nsecs,
 };
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxPacketTimeline {
@@ -135,8 +135,11 @@ impl DemuxPacketTimeline {
                 event_tx,
             );
         }
-        let video_recovery_point = packet.stream_index() == self.video_stream.index
-            && packet_is_video_recovery_point(packet, self.video_stream.codec_id);
+        let video_recovery_kind = if packet.stream_index() == self.video_stream.index {
+            packet_video_recovery_point_kind(packet, self.video_stream.codec_id)
+        } else {
+            VideoRecoveryPointKind::None
+        };
         let audio_recovery_point = self.audio_stream.is_some_and(|stream| {
             packet.stream_index() == stream.index
                 && packet_is_audio_recovery_point(packet, stream.codec_id)
@@ -145,9 +148,12 @@ impl DemuxPacketTimeline {
             packet,
             packet.stream_index(),
             packet.stream_index() == self.video_stream.index,
-            video_recovery_point || audio_recovery_point,
-            packet.stream_index() == self.video_stream.index
-                && packet_is_video_seek_point(packet, self.video_stream.codec_id),
+            CachedDemuxPacketRecovery {
+                recovery_point: video_recovery_kind.is_recovery_point() || audio_recovery_point,
+                recovery_kind: video_recovery_kind,
+                safe_seek_point: packet.stream_index() == self.video_stream.index
+                    && packet_is_video_seek_point(packet, self.video_stream.codec_id),
+            },
             start_nsecs,
             end_nsecs,
         )

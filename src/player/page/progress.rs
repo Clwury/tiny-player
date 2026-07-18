@@ -81,14 +81,12 @@ pub(super) fn cached_seek_target(
     };
     if let Some(cache_state) = cache_state {
         let ranges = &cache_state.demux.seekable_ranges;
-        if !ranges.is_empty() {
-            return ranges.iter().any(|range| {
-                range.start.is_finite()
-                    && range.end.is_finite()
-                    && target >= range.start
-                    && target <= range.end
-            });
-        }
+        return ranges.iter().any(|range| {
+            range.start.is_finite()
+                && range.end.is_finite()
+                && target >= range.start
+                && target <= range.end
+        });
     }
 
     let Some(reader_position) = reader_position.and_then(valid_playback_time) else {
@@ -145,7 +143,10 @@ pub(super) fn format_playback_time(seconds: f64) -> String {
 mod tests {
     use gpui::{Bounds, point, px, size};
 
-    use crate::player::backend::{DemuxCacheState, PlaybackCacheState, PlaybackCacheTimeRange};
+    use crate::player::backend::{
+        ByteCacheState, DemuxCacheState, PlaybackCacheByteRange, PlaybackCacheState,
+        PlaybackCacheTimeRange,
+    };
 
     use super::*;
 
@@ -287,6 +288,35 @@ mod tests {
         assert!(!cached_seek_target(None, Some(50.0), Some(10.0), 5.0));
         assert!(!cached_seek_target(None, Some(50.0), Some(10.0), 60.0));
         assert!(!cached_seek_target(None, Some(f64::NAN), Some(10.0), 30.0));
+    }
+
+    #[test]
+    fn authoritative_empty_seekable_ranges_ignore_byte_and_forward_cache() {
+        let state = PlaybackCacheState {
+            demux: DemuxCacheState {
+                cache_end: Some(50.0),
+                reader_pts: Some(10.0),
+                forward_bytes: 32 * 1024 * 1024,
+                ..DemuxCacheState::default()
+            },
+            byte: Some(ByteCacheState {
+                ranges: vec![PlaybackCacheByteRange {
+                    start_fraction: 0.0,
+                    end_fraction: 1.0,
+                }],
+                cached_bytes: 128 * 1024 * 1024,
+                ..ByteCacheState::default()
+            }),
+            ..PlaybackCacheState::default()
+        };
+
+        assert!(cache_range_fractions(Some(&state), 100.0).is_empty());
+        assert!(!cached_seek_target(
+            Some(&state),
+            Some(50.0),
+            Some(10.0),
+            30.0,
+        ));
     }
 
     #[test]

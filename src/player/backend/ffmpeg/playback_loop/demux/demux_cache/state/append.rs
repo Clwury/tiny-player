@@ -76,7 +76,6 @@ impl DemuxPacketCacheState {
                 self.timeline_anchor_stream_index,
                 stream_index,
                 packet,
-                self.cached_seek_requires_safe_point,
                 self.stream_requires_recovery_point(stream_index),
             )
         });

@@ -4282,6 +4282,65 @@ fn video_decode_recovery_hevc_requires_safe_key_recovery_point() {
 }
 
 #[test]
+fn video_decode_recovery_cached_hevc_transaction_accepts_cra_only_for_that_seek() {
+    let mut recovery = VideoDecodeRecovery::default();
+    let mut cra_packet = test_packet_from_data(&[0, 0, 0, 3, 0x2a, 0x01, 0xaa]);
+    unsafe {
+        (*cra_packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+    }
+
+    recovery.reset_for_timeline_start(ffi::AVCodecID::AV_CODEC_ID_HEVC, 3_500_000_000);
+    assert!(recovery.should_skip_packet(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+    assert!(!recovery.accept_recovery_point(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+
+    recovery.enable_hevc_cached_recovery_point();
+    assert!(recovery.requires_exact_cached_seek_output());
+    assert!(!recovery.should_skip_packet(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+    assert!(recovery.accept_recovery_point(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+    assert!(!recovery.waiting_for_keyframe());
+    assert!(recovery.requires_exact_cached_seek_output());
+
+    recovery.reset_for_timeline_start(ffi::AVCodecID::AV_CODEC_ID_HEVC, 4_500_000_000);
+    assert!(recovery.should_skip_packet(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+}
+
+#[test]
+fn cra_cached_seek_exact_output_gate_drops_every_frame_before_target() {
+    let mut recovery = VideoDecodeRecovery::default();
+    let target_nsecs = 3_500_000_000;
+    recovery.reset_for_timeline_start(ffi::AVCodecID::AV_CODEC_ID_HEVC, target_nsecs);
+    recovery.enable_hevc_cached_recovery_point();
+
+    assert_eq!(
+        decoded_video_frame_start_action(
+            target_nsecs - 1,
+            target_nsecs,
+            false,
+            recovery.requires_exact_cached_seek_output(),
+        ),
+        DecodedVideoFrameStartAction::DropBeforeStart
+    );
+    assert!(
+        recovery
+            .observe_seek_preroll_frame(target_nsecs - 1)
+            .is_some()
+    );
+    assert_eq!(
+        decoded_video_frame_start_action(
+            target_nsecs,
+            target_nsecs,
+            false,
+            recovery.requires_exact_cached_seek_output(),
+        ),
+        DecodedVideoFrameStartAction::Use { realign: false }
+    );
+    recovery
+        .finish_seek_bootstrap_after_target_frame(target_nsecs)
+        .expect("target frame closes exact CRA output gate");
+    assert!(!recovery.requires_exact_cached_seek_output());
+}
+
+#[test]
 fn video_decode_recovery_has_bounded_wait_for_recovery_point() {
     let mut recovery = VideoDecodeRecovery::default();
     let delta_packet = AvPacket::new().expect("packet allocates");
@@ -4318,20 +4377,29 @@ fn video_decode_recovery_hevc_does_not_resume_after_wait_limit() {
 #[test]
 fn recovered_video_frame_realigns_before_start_gate() {
     assert_eq!(
-        decoded_video_frame_start_action(9_000_000_000, 10_000_000_000, false),
+        decoded_video_frame_start_action(9_000_000_000, 10_000_000_000, false, false),
         DecodedVideoFrameStartAction::DropBeforeStart
     );
     assert_eq!(
-        decoded_video_frame_start_action(9_996_000_000, 10_000_000_000, false),
+        decoded_video_frame_start_action(9_996_000_000, 10_000_000_000, false, false),
         DecodedVideoFrameStartAction::Use { realign: false }
     );
     assert_eq!(
-        decoded_video_frame_start_action(9_000_000_000, 10_000_000_000, true),
+        decoded_video_frame_start_action(9_000_000_000, 10_000_000_000, true, false),
         DecodedVideoFrameStartAction::Use { realign: true }
     );
     assert_eq!(
-        decoded_video_frame_start_action(11_000_000_000, 10_000_000_000, true),
+        decoded_video_frame_start_action(11_000_000_000, 10_000_000_000, true, false),
         DecodedVideoFrameStartAction::Use { realign: true }
+    );
+    assert_eq!(
+        decoded_video_frame_start_action(9_996_000_000, 10_000_000_000, false, true),
+        DecodedVideoFrameStartAction::DropBeforeStart,
+        "CRA cached seek must not expose a frame before its exact target"
+    );
+    assert_eq!(
+        decoded_video_frame_start_action(10_000_000_000, 10_000_000_000, false, true),
+        DecodedVideoFrameStartAction::Use { realign: false }
     );
 }
 

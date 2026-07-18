@@ -30,11 +30,11 @@ use super::video_decode_worker::{VideoDecodeDrainResult, VideoDecodeWorkerSnapsh
 use super::{
     AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN,
     AudioDecodePipeline, AudioOutput, AudioResumeWaterline, AvPacket, BufferedReporter,
-    DoviPipeline, FfmpegControl, PlaybackBlockReason, PlaybackGeneration, PlaybackOutputScheduler,
-    PlaybackOutputSnapshot, PlaybackScheduler, PositionReporter, StreamInfo, SubtitleDecodeContext,
-    SubtitlePipeline, TimestampMapper, VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS,
-    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VideoDecodePipeline, VideoDecodeRecovery,
-    VideoFramePrepareWorker, duration_nsecs,
+    DemuxCachedSeekInfo, DoviPipeline, FfmpegControl, PlaybackBlockReason, PlaybackGeneration,
+    PlaybackOutputScheduler, PlaybackOutputSnapshot, PlaybackScheduler, PositionReporter,
+    StreamInfo, SubtitleDecodeContext, SubtitlePipeline, TimestampMapper,
+    VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    VideoDecodePipeline, VideoDecodeRecovery, VideoFramePrepareWorker, duration_nsecs,
 };
 
 const CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_millis(2_500);
@@ -81,6 +81,7 @@ impl CachedSeekRecoveryFallbackAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CachedSeekRecoveryFallback {
     pub(super) target_nsecs: u64,
+    pub(super) cached_seek: Option<DemuxCachedSeekInfo>,
     pub(super) reason: CachedSeekRecoveryFallbackReason,
     pub(super) action: CachedSeekRecoveryFallbackAction,
 }
@@ -95,6 +96,7 @@ enum CachedSeekRecoveryWatchdogDecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CachedSeekRecoveryWatchdog {
     target_nsecs: u64,
+    cached_seek: Option<DemuxCachedSeekInfo>,
     started_at: Instant,
     last_progress_at: Instant,
     start_video_packet_count: u64,
@@ -332,6 +334,40 @@ impl PlaybackPipelineState {
         target_nsecs: u64,
         session_id: PlaybackSessionId,
     ) {
+        self.begin_cached_seek_recovery_watchdog_with_context(target_nsecs, None, session_id);
+    }
+
+    pub(super) fn begin_cached_seek_recovery_watchdog_for_hit(
+        &mut self,
+        cached_seek: DemuxCachedSeekInfo,
+        session_id: PlaybackSessionId,
+    ) {
+        self.begin_cached_seek_recovery_watchdog_with_context(
+            cached_seek.target_nsecs,
+            Some(cached_seek),
+            session_id,
+        );
+    }
+
+    pub(super) fn rearm_cached_seek_recovery_watchdog(
+        &mut self,
+        target_nsecs: u64,
+        cached_seek: Option<DemuxCachedSeekInfo>,
+        session_id: PlaybackSessionId,
+    ) {
+        self.begin_cached_seek_recovery_watchdog_with_context(
+            target_nsecs,
+            cached_seek,
+            session_id,
+        );
+    }
+
+    fn begin_cached_seek_recovery_watchdog_with_context(
+        &mut self,
+        target_nsecs: u64,
+        cached_seek: Option<DemuxCachedSeekInfo>,
+        session_id: PlaybackSessionId,
+    ) {
         if self.video_stream.codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
             self.cached_seek_recovery_watchdog = None;
             return;
@@ -342,6 +378,7 @@ impl PlaybackPipelineState {
         let (watchdog, started) = cached_seek_recovery_watchdog_after_begin(
             self.cached_seek_recovery_watchdog,
             target_nsecs,
+            cached_seek,
             Instant::now(),
             self.video_packet_count,
         );
@@ -350,6 +387,11 @@ impl PlaybackPipelineState {
             tracing::debug!(
                 ?session_id,
                 target_nsecs,
+                range_id = ?cached_seek.map(|info| info.range_id),
+                anchor_packet_id = ?cached_seek.map(|info| info.anchor_packet_id),
+                anchor_kind = ?cached_seek.map(|info| info.anchor_kind.as_str()),
+                anchor_nsecs = ?cached_seek.map(|info| info.anchor_nsecs),
+                preroll_nsecs = ?cached_seek.map(|info| info.preroll_nsecs),
                 video_packet_count = self.video_packet_count,
                 "started HEVC cached seek recovery watchdog"
             );
@@ -358,6 +400,9 @@ impl PlaybackPipelineState {
                 ?session_id,
                 previous_target_nsecs,
                 target_nsecs,
+                range_id = ?watchdog.cached_seek.map(|info| info.range_id),
+                anchor_packet_id = ?watchdog.cached_seek.map(|info| info.anchor_packet_id),
+                anchor_kind = ?watchdog.cached_seek.map(|info| info.anchor_kind.as_str()),
                 total_elapsed_ms = watchdog.started_at.elapsed().as_secs_f64() * 1000.0,
                 video_packets_since_start = self
                     .video_packet_count
@@ -370,6 +415,12 @@ impl PlaybackPipelineState {
     pub(super) fn clear_cached_seek_recovery_watchdog(&mut self) {
         self.cached_seek_recovery_watchdog = None;
         self.cached_seek_recovery_attempt = None;
+    }
+
+    pub(super) fn active_cra_cached_seek(&self) -> Option<DemuxCachedSeekInfo> {
+        self.cached_seek_recovery_watchdog
+            .and_then(|watchdog| watchdog.cached_seek)
+            .filter(|info| info.uses_cra_anchor())
     }
 
     pub(super) fn cached_seek_recovery_watchdog_deadline(&self) -> Option<Instant> {
@@ -449,6 +500,11 @@ impl PlaybackPipelineState {
         tracing::trace!(
             ?session_id,
             target_nsecs = watchdog.target_nsecs,
+            range_id = ?watchdog.cached_seek.map(|info| info.range_id),
+            anchor_packet_id = ?watchdog.cached_seek.map(|info| info.anchor_packet_id),
+            anchor_kind = ?watchdog.cached_seek.map(|info| info.anchor_kind.as_str()),
+            anchor_nsecs = ?watchdog.cached_seek.map(|info| info.anchor_nsecs),
+            preroll_nsecs = ?watchdog.cached_seek.map(|info| info.preroll_nsecs),
             elapsed_ms = elapsed.as_secs_f64() * 1000.0,
             stalled_ms = stalled.as_secs_f64() * 1000.0,
             remaining_ms = timeout.saturating_sub(stalled).as_secs_f64() * 1000.0,
@@ -470,21 +526,30 @@ impl PlaybackPipelineState {
                 tracing::debug!(
                     ?session_id,
                     target_nsecs = watchdog.target_nsecs,
+                    range_id = ?watchdog.cached_seek.map(|info| info.range_id),
+                    anchor_packet_id = ?watchdog.cached_seek.map(|info| info.anchor_packet_id),
+                    anchor_kind = ?watchdog.cached_seek.map(|info| info.anchor_kind.as_str()),
                     elapsed_ms = elapsed.as_secs_f64() * 1000.0,
                     stalled_ms = stalled.as_secs_f64() * 1000.0,
                     video_packets_since_seek,
                     queued_video_frames = output_snapshot.queued_video_frames,
-                    "cleared HEVC cached seek recovery watchdog after first video frame"
+                    cached_seek_succeeded = true,
+                    low_level_fallback = false,
+                    "completed HEVC cached seek recovery at first target video frame"
                 );
                 self.cached_seek_recovery_watchdog = None;
                 self.cached_seek_recovery_attempt = None;
                 None
             }
             CachedSeekRecoveryWatchdogDecision::Fallback(reason) => {
-                let action = self.cached_seek_recovery_next_action(watchdog.target_nsecs);
+                let action = self
+                    .cached_seek_recovery_next_action(watchdog.target_nsecs, watchdog.cached_seek);
                 tracing::debug!(
                     ?session_id,
                     target_nsecs = watchdog.target_nsecs,
+                    range_id = ?watchdog.cached_seek.map(|info| info.range_id),
+                    anchor_packet_id = ?watchdog.cached_seek.map(|info| info.anchor_packet_id),
+                    anchor_kind = ?watchdog.cached_seek.map(|info| info.anchor_kind.as_str()),
                     reason = reason.as_str(),
                     action = action.as_str(),
                     elapsed_ms = elapsed.as_secs_f64() * 1000.0,
@@ -508,6 +573,7 @@ impl PlaybackPipelineState {
                 self.cached_seek_recovery_watchdog = None;
                 Some(CachedSeekRecoveryFallback {
                     target_nsecs: watchdog.target_nsecs,
+                    cached_seek: watchdog.cached_seek,
                     reason,
                     action,
                 })
@@ -518,11 +584,13 @@ impl PlaybackPipelineState {
     fn cached_seek_recovery_next_action(
         &mut self,
         target_nsecs: u64,
+        cached_seek: Option<DemuxCachedSeekInfo>,
     ) -> CachedSeekRecoveryFallbackAction {
         cached_seek_recovery_next_action_for_attempt(
             &mut self.cached_seek_recovery_attempt,
             target_nsecs,
             self.video_decode_pipeline.info().hardware_accelerated,
+            cached_seek.is_some_and(DemuxCachedSeekInfo::uses_cra_anchor),
         )
     }
 
@@ -934,11 +1002,13 @@ fn cached_seek_recovery_timeout(
 fn cached_seek_recovery_watchdog_after_begin(
     existing: Option<CachedSeekRecoveryWatchdog>,
     target_nsecs: u64,
+    cached_seek: Option<DemuxCachedSeekInfo>,
     now: Instant,
     video_packet_count: u64,
 ) -> (CachedSeekRecoveryWatchdog, bool) {
     if let Some(mut watchdog) = existing {
         watchdog.target_nsecs = target_nsecs;
+        watchdog.cached_seek = cached_seek.or(watchdog.cached_seek);
         watchdog.last_progress_at = now;
         watchdog.start_video_packet_count = video_packet_count;
         watchdog.last_seek_preroll_frames = 0;
@@ -947,6 +1017,7 @@ fn cached_seek_recovery_watchdog_after_begin(
     (
         CachedSeekRecoveryWatchdog {
             target_nsecs,
+            cached_seek,
             started_at: now,
             last_progress_at: now,
             start_video_packet_count: video_packet_count,
@@ -960,6 +1031,7 @@ fn cached_seek_recovery_next_action_for_attempt(
     attempt: &mut Option<CachedSeekRecoveryAttempt>,
     target_nsecs: u64,
     hardware_accelerated: bool,
+    cra_anchor: bool,
 ) -> CachedSeekRecoveryFallbackAction {
     let reset_attempt = attempt.is_none_or(|attempt| attempt.target_nsecs != target_nsecs);
     if reset_attempt {
@@ -971,6 +1043,13 @@ fn cached_seek_recovery_next_action_for_attempt(
     let attempt = attempt
         .as_mut()
         .expect("cached seek recovery attempt exists");
+    if cra_anchor {
+        if attempt.low_level_seeks == 0 {
+            attempt.low_level_seeks = attempt.low_level_seeks.saturating_add(1);
+            return CachedSeekRecoveryFallbackAction::LowLevelSeek;
+        }
+        return CachedSeekRecoveryFallbackAction::RecoveryExhausted;
+    }
     if attempt.soft_recoveries == 0 {
         attempt.soft_recoveries = attempt.soft_recoveries.saturating_add(1);
         return CachedSeekRecoveryFallbackAction::SoftRecover;
@@ -1188,6 +1267,7 @@ mod tests {
         let started_at = std::time::Instant::now();
         let existing = CachedSeekRecoveryWatchdog {
             target_nsecs: 123_000_000_000,
+            cached_seek: None,
             started_at,
             last_progress_at: started_at,
             start_video_packet_count: 100,
@@ -1197,6 +1277,7 @@ mod tests {
         let (watchdog, started) = cached_seek_recovery_watchdog_after_begin(
             Some(existing),
             123_360_000_000,
+            None,
             started_at + Duration::from_secs(1),
             180,
         );
@@ -1253,19 +1334,19 @@ mod tests {
         let mut attempt = None::<CachedSeekRecoveryAttempt>;
 
         assert_eq!(
-            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true),
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true, false,),
             CachedSeekRecoveryFallbackAction::SoftRecover
         );
         assert_eq!(
-            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true),
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true, false,),
             CachedSeekRecoveryFallbackAction::ReopenSoftware
         );
         assert_eq!(
-            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true),
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true, false,),
             CachedSeekRecoveryFallbackAction::LowLevelSeek
         );
         assert_eq!(
-            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true),
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true, false,),
             CachedSeekRecoveryFallbackAction::RecoveryExhausted
         );
     }
@@ -1280,7 +1361,7 @@ mod tests {
         });
 
         assert_eq!(
-            cached_seek_recovery_next_action_for_attempt(&mut attempt, 83_000_000_000, true),
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 83_000_000_000, true, false,),
             CachedSeekRecoveryFallbackAction::SoftRecover
         );
     }
@@ -1290,17 +1371,47 @@ mod tests {
         let mut attempt = None::<CachedSeekRecoveryAttempt>;
 
         assert_eq!(
-            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, false),
+            cached_seek_recovery_next_action_for_attempt(
+                &mut attempt,
+                35_000_000_000,
+                false,
+                false,
+            ),
             CachedSeekRecoveryFallbackAction::SoftRecover
         );
         assert_eq!(
-            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, false),
+            cached_seek_recovery_next_action_for_attempt(
+                &mut attempt,
+                35_000_000_000,
+                false,
+                false,
+            ),
             CachedSeekRecoveryFallbackAction::LowLevelSeek
         );
         assert_eq!(
-            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, false),
+            cached_seek_recovery_next_action_for_attempt(
+                &mut attempt,
+                35_000_000_000,
+                false,
+                false,
+            ),
             CachedSeekRecoveryFallbackAction::RecoveryExhausted
         );
+    }
+
+    #[test]
+    fn cra_cached_seek_failure_permits_exactly_one_low_level_fallback() {
+        let mut attempt = None::<CachedSeekRecoveryAttempt>;
+
+        assert_eq!(
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true, true,),
+            CachedSeekRecoveryFallbackAction::LowLevelSeek
+        );
+        assert_eq!(
+            cached_seek_recovery_next_action_for_attempt(&mut attempt, 35_000_000_000, true, true,),
+            CachedSeekRecoveryFallbackAction::RecoveryExhausted
+        );
+        assert_eq!(attempt.expect("attempt recorded").low_level_seeks, 1);
     }
 
     #[test]
