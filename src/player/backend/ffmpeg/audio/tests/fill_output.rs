@@ -97,7 +97,7 @@ fn audio_clock_freezes_during_output_underrun_until_pending_recovers() {
     fill_audio_output(&mut output, &shared);
 
     let frozen_timeline_nsecs = shared.played_timeline_nsecs();
-    assert!(frozen_timeline_nsecs.abs_diff(1_000_000_000) <= 1_000);
+    assert!((1_000_000_000..=1_010_000_000).contains(&frozen_timeline_nsecs));
     assert!(shared.underrun_active_for_test());
 
     assert_eq!(

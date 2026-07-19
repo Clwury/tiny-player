@@ -901,6 +901,7 @@ impl DemuxPacketPump {
             video_decode_blocked_on,
             Some(
                 PlaybackBlockReason::PacketQueueFull
+                    | PlaybackBlockReason::DecoderRecovery
                     | PlaybackBlockReason::DecoderInFlight
                     | PlaybackBlockReason::DecoderOutputPending
                     | PlaybackBlockReason::DecodedVideoQueue
@@ -2228,14 +2229,18 @@ mod tests {
     }
 
     fn audio_resume_waterline(ready: bool) -> AudioResumeWaterline {
+        let forward_nsecs = if ready { 1_000_000_000 } else { 500_000_000 };
         AudioResumeWaterline {
             resume_timeline_nsecs: 1_000_000_000,
             target_nsecs: 1_000_000_000,
+            audio_accepted_start_timeline_nsecs: Some(1_000_000_000),
+            audio_accepted_start_gap_nsecs: Some(0),
+            accepted_contiguous_coverage_nsecs: Some(forward_nsecs),
             audio_output_buffered_until_nsecs: None,
             audio_output_pending_nsecs: None,
             pending_audio_start_nsecs: Some(1_000_000_000),
-            pending_audio_forward_nsecs: Some(if ready { 1_000_000_000 } else { 500_000_000 }),
-            decoded_audio_forward_nsecs: Some(if ready { 1_000_000_000 } else { 500_000_000 }),
+            pending_audio_forward_nsecs: Some(forward_nsecs),
+            decoded_audio_forward_nsecs: Some(forward_nsecs),
             audio_decode_queued_nsecs: 0,
             audio_decode_in_flight_packets: 0,
             demux_audio_forward_nsecs: None,
@@ -2269,6 +2274,9 @@ mod tests {
             video_bootstrap_after_seek: false,
             video_decode_underfill: false,
             rebuffer_empty_audio_output_blocked: false,
+            scheduler_dropped_video_frames: 0,
+            recent_coordinator_stall_nsecs: None,
+            recent_coordinator_stall_age_nsecs: None,
         }
     }
 
@@ -2293,6 +2301,9 @@ mod tests {
             video_bootstrap_after_seek: false,
             video_decode_underfill: false,
             rebuffer_empty_audio_output_blocked: false,
+            scheduler_dropped_video_frames: 0,
+            recent_coordinator_stall_nsecs: None,
+            recent_coordinator_stall_age_nsecs: None,
         }
     }
 

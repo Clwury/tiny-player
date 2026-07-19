@@ -1,10 +1,10 @@
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::{
     AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, BackendEvent, BufferedReporter,
     DEFAULT_VIDEO_FRAME_DURATION_NSECS, DemuxPacketCacheReadTiming, DemuxPacketDiskCache,
-    FormatContext, PlaybackCacheConfig, PlaybackCacheState, PlaybackSessionId, StreamInfo,
-    TimestampMapper, VideoRecoveryPointKind, packet_duration_nsecs, packet_is_audio_recovery_point,
-    packet_is_video_seek_point, packet_video_recovery_point_kind, read_demux_packet_disk_payload,
-    seconds_to_nsecs,
+    FormatContext, PlaybackCacheConfig, PlaybackCacheState, PlaybackCacheTimeRange,
+    PlaybackSessionId, StreamInfo, TimestampMapper, VideoRecoveryPointKind, packet_duration_nsecs,
+    packet_is_audio_recovery_point, packet_is_video_seek_point, packet_video_recovery_point_kind,
+    read_demux_packet_disk_payload, seconds_to_nsecs, timestamp_to_nsecs,
 };
 
 #[path = "model/packet.rs"]
@@ -26,8 +26,10 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use packet::{
     CachedDemuxPacket, CachedDemuxPacketRecovery, DemuxPacketReadSource,
 };
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use range::{
-    ArchivedStreamPruneCandidate, DemuxCachedRange, DemuxCachedSeekHit, DemuxPacketRangeView,
-    SeekableTimelineSummary,
+    ArchivedStreamPruneCandidate, CachedSeekMiss, CachedSeekMissReason, DemuxCachedRange,
+    DemuxCachedSeekHit, DemuxPacketRangeView, InternalPacketTimestampHole,
+    PreparedSeekableRangeReport, SeekableRangeValidationStats, SeekableTimelineSummary,
+    StreamRangeBoundary,
 };
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use seekable::ordered_duration_seconds;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use stream_window::{

@@ -4293,12 +4293,12 @@ fn video_decode_recovery_cached_hevc_transaction_accepts_cra_only_for_that_seek(
     assert!(recovery.should_skip_packet(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
     assert!(!recovery.accept_recovery_point(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
 
-    recovery.enable_hevc_cached_recovery_point();
-    assert!(recovery.requires_exact_cached_seek_output());
+    recovery.enable_hevc_cached_recovery_point(7, 3_500_000_000);
+    assert!(recovery.requires_exact_seek_output());
     assert!(!recovery.should_skip_packet(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
     assert!(recovery.accept_recovery_point(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
     assert!(!recovery.waiting_for_keyframe());
-    assert!(recovery.requires_exact_cached_seek_output());
+    assert!(recovery.requires_exact_seek_output());
 
     recovery.reset_for_timeline_start(ffi::AVCodecID::AV_CODEC_ID_HEVC, 4_500_000_000);
     assert!(recovery.should_skip_packet(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
@@ -4309,14 +4309,14 @@ fn cra_cached_seek_exact_output_gate_drops_every_frame_before_target() {
     let mut recovery = VideoDecodeRecovery::default();
     let target_nsecs = 3_500_000_000;
     recovery.reset_for_timeline_start(ffi::AVCodecID::AV_CODEC_ID_HEVC, target_nsecs);
-    recovery.enable_hevc_cached_recovery_point();
+    recovery.enable_hevc_cached_recovery_point(7, target_nsecs);
 
     assert_eq!(
         decoded_video_frame_start_action(
             target_nsecs - 1,
             target_nsecs,
             false,
-            recovery.requires_exact_cached_seek_output(),
+            recovery.requires_exact_seek_output(),
         ),
         DecodedVideoFrameStartAction::DropBeforeStart
     );
@@ -4330,14 +4330,14 @@ fn cra_cached_seek_exact_output_gate_drops_every_frame_before_target() {
             target_nsecs,
             target_nsecs,
             false,
-            recovery.requires_exact_cached_seek_output(),
+            recovery.requires_exact_seek_output(),
         ),
         DecodedVideoFrameStartAction::Use { realign: false }
     );
     recovery
         .finish_seek_bootstrap_after_target_frame(target_nsecs)
         .expect("target frame closes exact CRA output gate");
-    assert!(!recovery.requires_exact_cached_seek_output());
+    assert!(!recovery.requires_exact_seek_output());
 }
 
 #[test]

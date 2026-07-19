@@ -269,6 +269,8 @@ impl PlaybackOutputScheduler {
                 pending_audio: &self.pending_start_audio,
                 resume_timeline_nsecs: resume_decision.timeline_nsecs,
                 target_nsecs,
+                delayed_audio_start_timeline_nsecs: resume_decision
+                    .delayed_audio_start_timeline_nsecs,
                 audio_output_buffered_until_nsecs: resume_audio_output_buffered_until_nsecs,
                 audio_output_pending_nsecs: audio_snapshot
                     .map(|snapshot| snapshot.total_pending_nsecs),
@@ -300,6 +302,7 @@ impl PlaybackOutputScheduler {
                 pending_audio: &self.pending_start_audio,
                 resume_timeline_nsecs,
                 target_nsecs,
+                delayed_audio_start_timeline_nsecs: None,
                 audio_output_buffered_until_nsecs: None,
                 audio_output_pending_nsecs: audio_snapshot
                     .map(|snapshot| snapshot.total_pending_nsecs),

@@ -46,6 +46,7 @@ impl VideoOutputResourcePressure {
 pub(in crate::player::backend::ffmpeg) enum PlaybackBlockReason {
     DemuxCache,
     PacketQueueFull,
+    DecoderRecovery,
     DecoderInFlight,
     DecoderOutputPending,
     DecoderInputEmpty,
@@ -65,6 +66,7 @@ impl PlaybackBlockReason {
         match self {
             Self::DemuxCache => "demux_cache",
             Self::PacketQueueFull => "packet_queue_full",
+            Self::DecoderRecovery => "decoder_recovery",
             Self::DecoderInFlight => "decoder_in_flight",
             Self::DecoderOutputPending => "decoder_output_pending",
             Self::DecoderInputEmpty => "decoder_input_empty",

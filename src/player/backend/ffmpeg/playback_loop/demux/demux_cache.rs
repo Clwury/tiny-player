@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     os::raw::c_int,
     sync::{
@@ -31,7 +32,7 @@ use super::{
     nsecs_to_seconds, optional_buffered_value_changed, packet_duration_nsecs,
     packet_is_audio_recovery_point, packet_is_video_seek_point, packet_video_recovery_point_kind,
     playback_buffered_near_duration, preroll_seek_position_seconds, seconds_to_nsecs,
-    video_cached_seek_preroll_nsecs, video_seek_preroll_nsecs,
+    timestamp_to_nsecs, video_cached_seek_preroll_nsecs, video_seek_preroll_nsecs,
 };
 
 #[path = "demux_cache/cache.rs"]
@@ -57,12 +58,14 @@ use model::CachedDemuxPacketPayload;
 use model::CachedDemuxPacketRecovery;
 use model::{
     ArchivedStreamPruneCandidate, CachePauseRefresh, CacheStateEmit, CachedDemuxPacket,
-    DemuxCacheLockWait, DemuxCacheReportSnapshot, DemuxCachedRange, DemuxCachedSeekHit,
-    DemuxInputRateSample, DemuxPacketAppendOutcome, DemuxPacketAppendTiming,
-    DemuxPacketCacheThreadInput, DemuxPacketRangeView, DemuxPacketReadSource, DemuxPacketTimeline,
-    DemuxPacketTrimOutcome, DemuxSeekRequest, DemuxSelectedStreams, DemuxStreamReaderRealignResult,
-    PacketId, RangeId, SeekableTimelineSummary, StreamCacheRangeState, StreamForwardState,
-    StreamForwardWindow, ordered_duration_seconds,
+    CachedSeekMiss, CachedSeekMissReason, DemuxCacheLockWait, DemuxCacheReportSnapshot,
+    DemuxCachedRange, DemuxCachedSeekHit, DemuxInputRateSample, DemuxPacketAppendOutcome,
+    DemuxPacketAppendTiming, DemuxPacketCacheThreadInput, DemuxPacketRangeView,
+    DemuxPacketReadSource, DemuxPacketTimeline, DemuxPacketTrimOutcome, DemuxSeekRequest,
+    DemuxSelectedStreams, DemuxStreamReaderRealignResult, InternalPacketTimestampHole, PacketId,
+    PreparedSeekableRangeReport, RangeId, SeekableRangeValidationStats, SeekableTimelineSummary,
+    StreamCacheRangeState, StreamForwardState, StreamForwardWindow, StreamRangeBoundary,
+    ordered_duration_seconds,
 };
 pub(super) use model::{
     DemuxCachedSeekInfo, DemuxPacketCacheInput, DemuxReadResult, DemuxSeekResult,
@@ -127,6 +130,7 @@ struct DemuxPacketCacheState {
     selected_streams: DemuxSelectedStreams,
     cached_seek_preroll_nsecs: u64,
     failed_cached_seek_ranges: HashMap<RangeId, DemuxCachedSeekInfo>,
+    rejected_cached_seek_ranges: HashMap<RangeId, CachedSeekMiss>,
     memory_limit_bytes: usize,
     backbuffer_limit_bytes: usize,
     donate_backbuffer: bool,
@@ -158,6 +162,11 @@ struct DemuxPacketCacheState {
     last_reported_buffered_until: Option<Option<f64>>,
     last_cache_state_emit_at: Option<Instant>,
     last_emitted_seekable_ranges: Option<Vec<PlaybackCacheTimeRange>>,
+    last_emitted_demux_cache_state: Option<DemuxCacheState>,
+    prepared_seekable_report: RefCell<Option<PreparedSeekableRangeReport>>,
+    last_seekable_summary_prepare_at: RefCell<Option<Instant>>,
+    seekability_revision: u64,
+    last_emitted_seekability_revision: Option<u64>,
     cache_state_emit_dirty: bool,
     generation: u64,
     error: Option<String>,

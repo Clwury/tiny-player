@@ -53,6 +53,7 @@ impl AudioDecodePipeline {
         snapshot: AudioDecodeWorkerSnapshot,
     ) -> Option<PlaybackBlockReason> {
         match snapshot.state {
+            AudioDecodeWorkerState::Recovering => Some(PlaybackBlockReason::DecoderRecovery),
             AudioDecodeWorkerState::OutputFull => Some(PlaybackBlockReason::DecodedQueueFull),
             _ if snapshot.pending_input_full()
                 || snapshot.in_flight_packets >= snapshot.command_queue_capacity =>
@@ -92,6 +93,7 @@ impl AudioDecodePipeline {
         &mut self,
         session_id: PlaybackSessionId,
     ) -> std::result::Result<DecodeInputRetryStatus, String> {
+        self.worker.service()?;
         let Some(pending_packet) = self.take_pending_input() else {
             return Ok(DecodeInputRetryStatus::Idle);
         };
@@ -167,6 +169,15 @@ impl AudioDecodePipeline {
             audio_decode_pending_input_full = snapshot.pending_input_full(),
             audio_decode_in_flight_packets = snapshot.in_flight_packets,
             audio_decode_completed_packets = snapshot.completed_packets,
+            recovery_generation = ?snapshot.recovery_generation,
+            recovery_elapsed_ms = ?snapshot
+                .recovery_elapsed
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+            flush_command_sent = snapshot.flush_command_sent,
+            stale_results_discarded = snapshot.stale_results_discarded,
+            last_result_progress_ms = ?snapshot
+                .last_result_progress_elapsed
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
             "FFmpeg audio decoder wrapper input queue backpressured"
         );
     }
@@ -241,6 +252,10 @@ impl AudioDecodePipeline {
         Ok(())
     }
 
+    pub(super) fn service_worker(&mut self) -> std::result::Result<(), String> {
+        self.worker.service()
+    }
+
     pub(super) fn request_drain(&mut self, generation: u64) -> std::result::Result<(), String> {
         self.worker.request_drain(generation)
     }
@@ -307,6 +322,11 @@ mod tests {
             in_flight_packets: 0,
             command_queue_capacity: 4,
             completed_packets: 0,
+            recovery_generation: None,
+            recovery_elapsed: None,
+            flush_command_sent: false,
+            stale_results_discarded: 0,
+            last_result_progress_elapsed: None,
         }
     }
 
@@ -326,5 +346,15 @@ mod tests {
             AudioDecodePipeline::block_reason_for(snapshot(AudioDecodeWorkerState::NeedPacket, 1));
 
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn recovering_audio_decoder_reports_decoder_recovery() {
+        let reason = AudioDecodePipeline::block_reason_for(snapshot(
+            AudioDecodeWorkerState::Recovering,
+            AUDIO_DECODE_PENDING_INPUT_QUEUE_CAPACITY,
+        ));
+
+        assert_eq!(reason, Some(PlaybackBlockReason::DecoderRecovery));
     }
 }

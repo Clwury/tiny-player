@@ -136,6 +136,9 @@ impl VideoOutputUnderflowClassification {
 pub(in crate::player::backend::ffmpeg) struct AudioResumeWaterline {
     pub(in crate::player::backend::ffmpeg) resume_timeline_nsecs: u64,
     pub(in crate::player::backend::ffmpeg) target_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg) audio_accepted_start_timeline_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) audio_accepted_start_gap_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) accepted_contiguous_coverage_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg) audio_output_buffered_until_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg) audio_output_pending_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg) pending_audio_start_nsecs: Option<u64>,
@@ -166,10 +169,27 @@ impl AudioResumeWaterline {
             .pending_audio
             .buffered_until_from(pending_audio_anchor_nsecs)
             .map(|buffered_until| buffered_until.saturating_sub(input.resume_timeline_nsecs));
+        let direct_pending_audio_until_nsecs = input
+            .pending_audio
+            .buffered_until_from(input.resume_timeline_nsecs);
+        let audio_accepted_start_timeline_nsecs = direct_pending_audio_until_nsecs
+            .map(|_| input.resume_timeline_nsecs)
+            .or(input.delayed_audio_start_timeline_nsecs);
+        let accepted_contiguous_coverage_nsecs =
+            audio_accepted_start_timeline_nsecs.and_then(|accepted_start| {
+                input
+                    .pending_audio
+                    .buffered_until_from(accepted_start)
+                    .map(|buffered_until| buffered_until.saturating_sub(accepted_start))
+            });
 
         Self {
             resume_timeline_nsecs: input.resume_timeline_nsecs,
             target_nsecs: input.target_nsecs,
+            audio_accepted_start_timeline_nsecs,
+            audio_accepted_start_gap_nsecs: audio_accepted_start_timeline_nsecs
+                .map(|accepted_start| accepted_start.saturating_sub(input.resume_timeline_nsecs)),
+            accepted_contiguous_coverage_nsecs,
             audio_output_buffered_until_nsecs,
             audio_output_pending_nsecs: input.audio_output_pending_nsecs,
             pending_audio_start_nsecs: input.pending_audio.first_start_timeline_nsecs(),
@@ -202,6 +222,7 @@ pub(in crate::player::backend::ffmpeg) struct AudioResumeWaterlineInput<'a> {
     pub(in crate::player::backend::ffmpeg) pending_audio: &'a PendingStartAudio,
     pub(in crate::player::backend::ffmpeg) resume_timeline_nsecs: u64,
     pub(in crate::player::backend::ffmpeg) target_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg) delayed_audio_start_timeline_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg) audio_output_buffered_until_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg) audio_output_pending_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg) audio_decode_queued_nsecs: u64,
@@ -1206,13 +1227,14 @@ pub(in crate::player::backend::ffmpeg) fn rebuffer_playback_resume_waterline_aft
     mut waterline: PlaybackResumeWaterline,
     rebuffer_wait_elapsed: Option<Duration>,
     cache_paused: bool,
+    demux_consumer_drainable: bool,
 ) -> PlaybackResumeWaterline {
     if waterline.ready()
         || !cache_paused
         || !waterline.decoded_ready()
         || rebuffer_wait_elapsed
             .is_none_or(|elapsed| elapsed < VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER)
-        || !rebuffer_cache_pause_demux_fallback_ready(waterline)
+        || !rebuffer_cache_pause_demux_fallback_ready(waterline, demux_consumer_drainable)
     {
         return waterline;
     }
@@ -1221,11 +1243,18 @@ pub(in crate::player::backend::ffmpeg) fn rebuffer_playback_resume_waterline_aft
     waterline
 }
 
-fn rebuffer_cache_pause_demux_fallback_ready(waterline: PlaybackResumeWaterline) -> bool {
+fn rebuffer_cache_pause_demux_fallback_ready(
+    waterline: PlaybackResumeWaterline,
+    demux_consumer_drainable: bool,
+) -> bool {
+    // Decoded queues already cover the full resume target here. Requiring the
+    // demux queue to cover that same target would defeat this fallback when
+    // packet-duration quantization leaves it just below the exact waterline.
     waterline.demux_ready
-        || waterline.demux_min_forward_nsecs.is_some_and(|duration| {
-            duration >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
-        })
+        || (demux_consumer_drainable
+            && waterline
+                .demux_min_forward_nsecs
+                .is_some_and(|duration| duration > 0))
 }
 
 pub(in crate::player::backend::ffmpeg) fn initial_playback_resume_waterline_after_stale_audio_preroll_wait(
@@ -1355,6 +1384,9 @@ pub(in crate::player::backend::ffmpeg) fn playback_resume_waterline_with_target(
             pending_audio,
             resume_timeline_nsecs: audio_start_timeline_nsecs,
             target_nsecs,
+            delayed_audio_start_timeline_nsecs: options
+                .initial_delayed_audio_start_timeline_nsecs
+                .or(options.rebuffer_delayed_audio_start_timeline_nsecs),
             audio_output_buffered_until_nsecs: options.audio_output_buffered_until_nsecs,
             audio_output_pending_nsecs: None,
             audio_decode_queued_nsecs: 0,
@@ -1815,6 +1847,9 @@ mod tests {
             audio_resume_waterline: Some(AudioResumeWaterline {
                 resume_timeline_nsecs: 1_000_000_000,
                 target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+                audio_accepted_start_timeline_nsecs: Some(1_000_000_000),
+                audio_accepted_start_gap_nsecs: Some(0),
+                accepted_contiguous_coverage_nsecs: Some(decoded_audio_forward_nsecs),
                 audio_output_buffered_until_nsecs: None,
                 audio_output_pending_nsecs: None,
                 pending_audio_start_nsecs: Some(1_000_000_000),
@@ -1905,6 +1940,9 @@ mod tests {
             audio_resume_waterline: Some(AudioResumeWaterline {
                 resume_timeline_nsecs: 1_000_000_000,
                 target_nsecs,
+                audio_accepted_start_timeline_nsecs: Some(1_000_000_000),
+                audio_accepted_start_gap_nsecs: Some(0),
+                accepted_contiguous_coverage_nsecs: Some(decoded_audio_forward_nsecs),
                 audio_output_buffered_until_nsecs: None,
                 audio_output_pending_nsecs: None,
                 pending_audio_start_nsecs: Some(1_000_000_000),
@@ -1989,6 +2027,7 @@ mod tests {
             pending_audio: &pending_audio,
             resume_timeline_nsecs,
             target_nsecs,
+            delayed_audio_start_timeline_nsecs: None,
             audio_output_buffered_until_nsecs: Some(resume_timeline_nsecs + 250_000_000),
             audio_output_pending_nsecs: Some(250_000_000),
             audio_decode_queued_nsecs: 64_000_000,
@@ -2022,6 +2061,7 @@ mod tests {
             pending_audio: &pending_audio,
             resume_timeline_nsecs,
             target_nsecs,
+            delayed_audio_start_timeline_nsecs: None,
             audio_output_buffered_until_nsecs: None,
             audio_output_pending_nsecs: None,
             audio_decode_queued_nsecs: 0,
@@ -2505,6 +2545,7 @@ mod tests {
             waterline,
             Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
             true,
+            false,
         );
 
         assert!(!waterline.ready());
@@ -2512,7 +2553,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_pause_rebuffer_wait_keeps_waiting_with_low_water_demux_window() {
+    fn cache_pause_rebuffer_wait_allows_drainable_low_water_demux_window() {
         let waterline = rebuffer_waterline(
             duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
             duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
@@ -2524,18 +2565,19 @@ mod tests {
             waterline,
             Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
             true,
+            true,
         );
 
-        assert!(!waterline.ready());
-        assert!(!waterline.demux_ready);
+        assert!(waterline.ready());
+        assert!(waterline.demux_ready);
     }
 
     #[test]
-    fn cache_pause_rebuffer_wait_allows_stable_demux_window_to_resume() {
+    fn cache_pause_rebuffer_wait_allows_drainable_960ms_demux_window_to_resume() {
         let waterline = rebuffer_waterline(
             duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
             duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
-            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            960_000_000,
             false,
         );
 
@@ -2543,10 +2585,52 @@ mod tests {
             waterline,
             Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
             true,
+            true,
         );
 
         assert!(waterline.ready());
         assert!(waterline.demux_ready);
+    }
+
+    #[test]
+    fn cache_pause_rebuffer_wait_keeps_waiting_when_demux_consumer_is_not_drainable() {
+        let waterline = rebuffer_waterline(
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            960_000_000,
+            false,
+        );
+
+        let waterline = rebuffer_playback_resume_waterline_after_cache_pause(
+            waterline,
+            Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+            true,
+            false,
+        );
+
+        assert!(!waterline.ready());
+        assert!(!waterline.demux_ready);
+    }
+
+    #[test]
+    fn cache_pause_rebuffer_wait_keeps_waiting_with_insufficient_decoded_video() {
+        let waterline = rebuffer_waterline(
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION).saturating_sub(1),
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            960_000_000,
+            false,
+        );
+
+        let waterline = rebuffer_playback_resume_waterline_after_cache_pause(
+            waterline,
+            Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
+            true,
+            true,
+        );
+
+        assert!(!waterline.ready());
+        assert!(!waterline.decoded_video_ready);
+        assert!(!waterline.demux_ready);
     }
 
     #[test]
@@ -2562,9 +2646,21 @@ mod tests {
             waterline,
             Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
             false,
+            true,
         );
 
         assert!(!waterline.ready());
         assert!(!waterline.demux_ready);
+    }
+
+    #[test]
+    fn recovered_audio_coverage_allows_rebuffer_output_gate_to_resume() {
+        let target_nsecs = duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
+        let waterline = rebuffer_waterline(target_nsecs, target_nsecs, target_nsecs, true);
+
+        assert!(waterline.decoded_video_ready);
+        assert!(waterline.decoded_audio_ready);
+        assert!(waterline.demux_ready);
+        assert!(waterline.ready());
     }
 }

@@ -2,10 +2,13 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
     os::raw::c_int,
+    time::Duration,
 };
 
-use super::VideoRecoveryPointKind;
 use super::types::{PacketId, RangeId};
+use super::{PlaybackCacheTimeRange, VideoRecoveryPointKind};
+
+const MAX_INTERNAL_PACKET_TIMESTAMP_HOLE_DETAILS: usize = 16;
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxCachedRange {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) id: RangeId,
@@ -110,6 +113,46 @@ impl DemuxCachedRange {
         stats.seekable_generation = Some(generation);
         stats.seekable_dirty = false;
     }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn record_rounding_gap(
+        &self,
+    ) {
+        let mut stats = self.report_stats.borrow_mut();
+        stats.rounding_gaps_merged = stats.rounding_gaps_merged.saturating_add(1);
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn record_internal_packet_timestamp_hole(
+        &self,
+        hole: InternalPacketTimestampHole,
+    ) {
+        let mut stats = self.report_stats.borrow_mut();
+        stats.internal_packet_timestamp_hole_count =
+            stats.internal_packet_timestamp_hole_count.saturating_add(1);
+        if stats.internal_packet_timestamp_holes.len() < MAX_INTERNAL_PACKET_TIMESTAMP_HOLE_DETAILS
+        {
+            stats.internal_packet_timestamp_holes.push(hole);
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seekable_diagnostic_stats(
+        &self,
+    ) -> SeekableRangeValidationStats {
+        let stats = self.report_stats.borrow();
+        SeekableRangeValidationStats {
+            rounding_gaps_merged: stats.rounding_gaps_merged,
+            internal_packet_timestamp_holes: stats.internal_packet_timestamp_hole_count,
+            ..SeekableRangeValidationStats::default()
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn internal_packet_timestamp_hole_details(
+        &self,
+    ) -> Vec<InternalPacketTimestampHole> {
+        self.report_stats
+            .borrow()
+            .internal_packet_timestamp_holes
+            .clone()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -118,6 +161,32 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct RangeR
     seekable_summary: SeekableTimelineSummary,
     seekable_dirty: bool,
     seekable_generation: Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) rounding_gaps_merged: usize,
+    internal_packet_timestamp_hole_count: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) internal_packet_timestamp_holes:
+        Vec<InternalPacketTimestampHole>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct InternalPacketTimestampHole
+{
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_index: c_int,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) previous_packet_id: PacketId,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) packet_id: PacketId,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) previous_raw_pts:
+        Option<i64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) previous_raw_dts:
+        Option<i64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) raw_pts: Option<i64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) raw_dts: Option<i64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) previous_seek_timestamp_nsecs:
+        Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) seek_timestamp_nsecs:
+        Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) previous_mapped_end_nsecs:
+        u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) mapped_start_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) gap_nsecs: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,8 +222,58 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct Seekab
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) ranges: Vec<(u64, u64)>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) is_bof: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) is_eof: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) validation:
+        SeekableRangeValidationStats,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct PreparedSeekableRangeReport
+{
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) generation: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) revision: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) ranges:
+        Vec<PlaybackCacheTimeRange>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) bof_cached: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) eof_cached: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) validation:
+        SeekableRangeValidationStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct SeekableRangeValidationStats
+{
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) validation_packets: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) validation_probes: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) rounding_gaps_merged: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) internal_packet_timestamp_holes:
+        usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) elapsed: Duration,
+}
+
+impl SeekableRangeValidationStats {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn merged(
+        self,
+        other: Self,
+    ) -> Self {
+        Self {
+            validation_packets: self
+                .validation_packets
+                .saturating_add(other.validation_packets),
+            validation_probes: self
+                .validation_probes
+                .saturating_add(other.validation_probes),
+            rounding_gaps_merged: self
+                .rounding_gaps_merged
+                .saturating_add(other.rounding_gaps_merged),
+            internal_packet_timestamp_holes: self
+                .internal_packet_timestamp_holes
+                .saturating_add(other.internal_packet_timestamp_holes),
+            elapsed: self.elapsed.saturating_add(other.elapsed),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxPacketRangeView<'a> {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_queues:
         &'a BTreeMap<c_int, VecDeque<PacketId>>,
@@ -192,4 +311,34 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxC
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) anchor_is_safe_seek_point:
         bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) requires_precise_trim: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) enum CachedSeekMissReason {
+    TargetOutsideRange,
+    MissingPrerollAnchor,
+    MissingStreamReaderHead,
+    GenerationBlocked,
+    AnchorTrimmed,
+}
+
+impl CachedSeekMissReason {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn as_str(
+        self,
+    ) -> &'static str {
+        match self {
+            Self::TargetOutsideRange => "target_outside_range",
+            Self::MissingPrerollAnchor => "missing_preroll_anchor",
+            Self::MissingStreamReaderHead => "missing_stream_reader_head",
+            Self::GenerationBlocked => "generation_blocked",
+            Self::AnchorTrimmed => "anchor_trimmed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct CachedSeekMiss {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) range_id: Option<RangeId>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) target_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) reason: CachedSeekMissReason,
 }

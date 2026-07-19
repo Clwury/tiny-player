@@ -120,7 +120,7 @@ pub(super) fn service_playback_commands(
         context.pipeline.clear_cached_seek_recovery_watchdog();
         let position_seconds =
             begin_track_switch(context.session, context.control, &pending_track_selection);
-        context.pipeline.clear_rebuffer_audio_realign_attempt();
+        context.pipeline.clear_audio_realign_transaction();
         let switch_result = service_track_selection_command(
             &mut context,
             position_seconds,
@@ -145,7 +145,7 @@ pub(super) fn service_playback_commands(
         context.pipeline.clear_cached_seek_recovery_watchdog();
         let position_seconds = begin_seek(context.session, context.control, &pending_seek);
         context.pipeline.current_start_position_nsecs = context.session.start_position_nsecs();
-        context.pipeline.clear_rebuffer_audio_realign_attempt();
+        context.pipeline.clear_audio_realign_transaction();
         if !pending_seek_is_latest_generation(&pending_seek, context.control) {
             log_superseded_seek(&pending_seek, context.control, "before_seek_reset");
             return Ok(PlaybackCommandServiceStatus::Continue);
@@ -155,6 +155,8 @@ pub(super) fn service_playback_commands(
             seek_mode: pending_seek.mode,
             seek_generation: pending_seek.generation,
             force_low_level_seek: false,
+            cache_only: false,
+            recovery_transaction_id: None,
             low_level_seek_reason: None,
             session_id: context.session.id(),
             vo_queue: context.vo_queue,
@@ -214,6 +216,7 @@ fn service_track_selection_command(
         seek_mode: PlaybackSeekMode::Precise,
         seek_generation: pending_track_selection.generation,
         force_low_level_seek: low_level_seek_reason.is_some(),
+        cache_only: false,
         low_level_seek_reason,
         session_id: context.session.id(),
         vo_queue: context.vo_queue,

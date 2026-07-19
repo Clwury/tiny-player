@@ -572,6 +572,9 @@ mod tests {
             video_bootstrap_after_seek: false,
             video_decode_underfill: false,
             rebuffer_empty_audio_output_blocked: false,
+            scheduler_dropped_video_frames: 0,
+            recent_coordinator_stall_nsecs: None,
+            recent_coordinator_stall_age_nsecs: None,
         };
         let underrun_audio = AudioOutputSnapshot {
             played_timeline_nsecs: 1_000_000_000,
@@ -637,6 +640,9 @@ mod tests {
             video_bootstrap_after_seek: false,
             video_decode_underfill: false,
             rebuffer_empty_audio_output_blocked: false,
+            scheduler_dropped_video_frames: 0,
+            recent_coordinator_stall_nsecs: None,
+            recent_coordinator_stall_age_nsecs: None,
         };
         let recovered_audio = AudioOutputSnapshot {
             played_timeline_nsecs: 0,

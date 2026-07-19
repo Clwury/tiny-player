@@ -167,8 +167,8 @@ use coordinator_drain::{
 };
 use coordinator_gate::PlaybackCoordinatorGateContext;
 use coordinator_tick::{
-    PlaybackTickContext, PlaybackTickStatus, service_hevc_startup_stall_watchdog_if_due,
-    service_playback_tick,
+    PlaybackRecoveryRequest, PlaybackRecoverySource, PlaybackTickContext, PlaybackTickStatus,
+    service_hevc_startup_stall_watchdog_if_due, service_playback_tick,
 };
 use decode::PlaybackGeneration;
 #[cfg(test)]
@@ -186,7 +186,10 @@ use input::{
     select_subtitle_stream_for_selection_from_catalog,
 };
 use media_info::{playback_audio_info_from_stream, playback_video_info_from_worker};
-pub(super) use output_gate::{PlaybackOutputScheduler, PlaybackOutputSnapshot};
+pub(super) use output_gate::{
+    AudioRealignCoverage, PlaybackOutputScheduler, PlaybackOutputSnapshot,
+    RebufferAudioRealignRequest,
+};
 #[cfg(test)]
 pub(super) use output_rebuffer::{
     AudioClockResumeDecision, InitialOutputSyncDecision, RebufferResumeAnchor, ResumeAnchorSource,

@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use ffmpeg_sys_next as ffi;
 
@@ -24,6 +27,20 @@ use super::{
 #[derive(Default)]
 pub(in crate::player::backend::ffmpeg) struct ScheduledVideoQueue {
     frames: VecDeque<QueuedVideoFrame>,
+    scheduler_dropped_video_frames: u64,
+    recent_coordinator_stall: Option<CoordinatorStall>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CoordinatorStall {
+    elapsed: Duration,
+    completed_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) struct RecentCoordinatorStall {
+    pub(in crate::player::backend::ffmpeg) elapsed: Duration,
+    pub(in crate::player::backend::ffmpeg) age: Duration,
 }
 
 #[derive(Default)]
@@ -35,6 +52,8 @@ pub(in crate::player::backend::ffmpeg) struct AudioClockedVideoPopResult {
 const VIDEO_CONTIGUITY_MIN_GAP_NSECS: u64 = 200_000_000;
 const VIDEO_CONTIGUITY_MAX_GAP_NSECS: u64 = 500_000_000;
 const VIDEO_CONTIGUITY_GAP_FRAME_MULTIPLIER: u64 = 3;
+const COORDINATOR_STALL_RECORD_THRESHOLD: Duration = Duration::from_millis(20);
+const COORDINATOR_STALL_RECENT_WINDOW: Duration = Duration::from_secs(2);
 // Rational FFmpeg timestamps converted to integer nanoseconds can differ by a few
 // nanoseconds at an otherwise exact continuity boundary.
 pub(in crate::player::backend::ffmpeg) const VIDEO_TIMESTAMP_ROUNDING_TOLERANCE_NSECS: u64 = 1_000;
@@ -244,6 +263,8 @@ pub(in crate::player::backend::ffmpeg) fn audio_output_video_lead_until_from_nse
 impl ScheduledVideoQueue {
     pub(in crate::player::backend::ffmpeg) fn clear(&mut self) {
         self.frames.clear();
+        self.scheduler_dropped_video_frames = 0;
+        self.recent_coordinator_stall = None;
     }
 
     pub(in crate::player::backend::ffmpeg) fn len(&self) -> usize {
@@ -488,7 +509,42 @@ impl ScheduledVideoQueue {
         &mut self,
         played_until_nsecs: u64,
     ) -> AudioClockedVideoPopResult {
-        pop_audio_clocked_video_frame_with_policy(&mut self.frames, played_until_nsecs)
+        let result =
+            pop_audio_clocked_video_frame_with_policy(&mut self.frames, played_until_nsecs);
+        self.scheduler_dropped_video_frames = self
+            .scheduler_dropped_video_frames
+            .saturating_add(u64::try_from(result.dropped_frames).unwrap_or(u64::MAX));
+        result
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn scheduler_dropped_video_frames(&self) -> u64 {
+        self.scheduler_dropped_video_frames
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn record_coordinator_tick(
+        &mut self,
+        elapsed: Duration,
+        completed_at: Instant,
+    ) {
+        if elapsed < COORDINATOR_STALL_RECORD_THRESHOLD {
+            return;
+        }
+        self.recent_coordinator_stall = Some(CoordinatorStall {
+            elapsed,
+            completed_at,
+        });
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn recent_coordinator_stall(
+        &self,
+        now: Instant,
+    ) -> Option<RecentCoordinatorStall> {
+        let stall = self.recent_coordinator_stall?;
+        let age = now.saturating_duration_since(stall.completed_at);
+        (age <= COORDINATOR_STALL_RECENT_WINDOW).then_some(RecentCoordinatorStall {
+            elapsed: stall.elapsed,
+            age,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -733,5 +789,28 @@ mod tests {
             Some(1_874_000_000)
         );
         assert_eq!(queue.largest_gap_nsecs(), None);
+    }
+
+    #[test]
+    fn scheduler_drop_counter_is_distinct_and_keeps_recent_stall_metadata() {
+        let mut queue = ScheduledVideoQueue::default();
+        queue.push_queued(queued_video_frame(0, 40_000_000));
+        queue.push_queued(queued_video_frame(40_000_000, 40_000_000));
+        queue.push_queued(queued_video_frame(80_000_000, 40_000_000));
+        let now = Instant::now();
+        queue.record_coordinator_tick(Duration::from_millis(65), now);
+
+        let result = queue.pop_audio_clocked_frame(500_000_000);
+        assert_eq!(result.dropped_frames, 3);
+        assert_eq!(queue.scheduler_dropped_video_frames(), 3);
+        let stall = queue
+            .recent_coordinator_stall(now + Duration::from_millis(5))
+            .expect("65 ms coordinator delay remains recent");
+        assert_eq!(stall.elapsed, Duration::from_millis(65));
+        assert_eq!(stall.age, Duration::from_millis(5));
+
+        queue.clear();
+        assert_eq!(queue.scheduler_dropped_video_frames(), 0);
+        assert!(queue.recent_coordinator_stall(Instant::now()).is_none());
     }
 }

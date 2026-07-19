@@ -19,6 +19,15 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct Cached
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) recovery_kind:
         VideoRecoveryPointKind,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) safe_seek_point: bool,
+    /// Presentation timestamp mapped onto the media timeline without forcing
+    /// demux/decode-order packets to be monotonic. This is the timestamp used
+    /// for mpv-compatible cached-seek boundaries and anchor selection.
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) seek_timestamp_nsecs:
+        Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) raw_pts: Option<i64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) raw_dts: Option<i64>,
+    /// Monotonic packet window retained for forward-buffer accounting and
+    /// playback scheduling. It must not define OSC seekable ranges.
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) start_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) end_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) byte_len: usize,
@@ -103,6 +112,34 @@ impl DemuxPacketReadSource {
 }
 
 impl CachedDemuxPacket {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seek_end_nsecs(
+        &self,
+    ) -> Option<u64> {
+        let seek_start_nsecs = self.seek_timestamp_nsecs?;
+        let mapped_start_nsecs = self.start_nsecs?;
+        let duration_nsecs = self
+            .end_nsecs
+            .and_then(|end_nsecs| end_nsecs.checked_sub(mapped_start_nsecs))
+            .unwrap_or_default();
+        Some(seek_start_nsecs.saturating_add(duration_nsecs))
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seek_block_timestamp_nsecs(
+        &self,
+    ) -> Option<u64> {
+        let seek_timestamp_nsecs = self.seek_timestamp_nsecs?;
+        if self.raw_pts.is_some() || self.raw_dts.is_some() {
+            // Runtime packets match mpv's compute_keyframe_times(): only the
+            // packet PTS/DTS contributes to a closed recovery block's max.
+            Some(seek_timestamp_nsecs)
+        } else {
+            // State-level tests construct synthetic packets without AVPacket
+            // timestamps and use their explicit interval to model all frame
+            // timestamps represented by that fixture.
+            self.seek_end_nsecs().or(Some(seek_timestamp_nsecs))
+        }
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn from_packet(
         packet: &AvPacket,
         stream_index: c_int,
@@ -110,6 +147,7 @@ impl CachedDemuxPacket {
         recovery: CachedDemuxPacketRecovery,
         start_nsecs: Option<u64>,
         end_nsecs: Option<u64>,
+        seek_timestamp_nsecs: Option<u64>,
     ) -> std::result::Result<Self, String> {
         Ok(Self {
             payload: CachedDemuxPacketPayload::Memory(Arc::new(Mutex::new(AvPacket::ref_from(
@@ -120,6 +158,9 @@ impl CachedDemuxPacket {
             recovery_point: recovery.recovery_point,
             recovery_kind: recovery.recovery_kind,
             safe_seek_point: recovery.safe_seek_point,
+            seek_timestamp_nsecs,
+            raw_pts: packet.pts(),
+            raw_dts: packet.dts(),
             start_nsecs,
             end_nsecs,
             byte_len: packet.byte_len(),

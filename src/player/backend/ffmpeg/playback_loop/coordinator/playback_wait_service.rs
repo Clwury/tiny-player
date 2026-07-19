@@ -14,6 +14,7 @@ use super::{
 };
 
 const EXPIRED_HEVC_WATCHDOG_MIN_WAIT: Duration = Duration::from_millis(2);
+const MISSING_RECOVERY_REQUEST_MIN_WAIT: Duration = Duration::from_millis(2);
 
 #[derive(Default)]
 pub(super) struct PlaybackPipelineWaitService;
@@ -37,6 +38,7 @@ pub(super) struct PlaybackPipelineWaitContext<'a> {
 pub(super) struct PlaybackLoopDeadline {
     cached_seek_recovery_watchdog_deadline: Option<Instant>,
     hevc_startup_stall_watchdog_deadline: Option<Instant>,
+    audio_decode_recovery_watchdog_deadline: Option<Instant>,
     rebuffer_empty_audio_output_watchdog_deadline: Option<Instant>,
 }
 
@@ -45,6 +47,7 @@ impl PlaybackLoopDeadline {
         Self {
             cached_seek_recovery_watchdog_deadline: deadline,
             hevc_startup_stall_watchdog_deadline: None,
+            audio_decode_recovery_watchdog_deadline: None,
             rebuffer_empty_audio_output_watchdog_deadline: None,
         }
     }
@@ -54,6 +57,14 @@ impl PlaybackLoopDeadline {
         deadline: Option<Instant>,
     ) -> Self {
         self.hevc_startup_stall_watchdog_deadline = deadline;
+        self
+    }
+
+    pub(super) fn with_audio_decode_recovery_watchdog_deadline(
+        mut self,
+        deadline: Option<Instant>,
+    ) -> Self {
+        self.audio_decode_recovery_watchdog_deadline = deadline;
         self
     }
 
@@ -84,6 +95,11 @@ impl PlaybackLoopDeadline {
         })
     }
 
+    pub(super) fn audio_decode_recovery_watchdog_remaining(self) -> Option<Duration> {
+        self.audio_decode_recovery_watchdog_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
     fn cap_wait_duration(self, duration: Duration) -> Duration {
         let duration = self
             .cached_seek_recovery_watchdog_remaining()
@@ -93,6 +109,10 @@ impl PlaybackLoopDeadline {
             .hevc_startup_stall_watchdog_remaining()
             .map(|remaining| duration.min(remaining))
             .unwrap_or(duration);
+        let duration = self
+            .audio_decode_recovery_watchdog_remaining()
+            .map(|remaining| duration.min(remaining))
+            .unwrap_or(duration);
         self.rebuffer_empty_audio_output_watchdog_remaining()
             .map(|remaining| duration.min(remaining))
             .unwrap_or(duration)
@@ -100,6 +120,12 @@ impl PlaybackLoopDeadline {
 }
 
 impl PlaybackPipelineWaitService {
+    pub(super) fn wait_after_missing_recovery_request(&self, scheduler: &mut PlaybackScheduler) {
+        let waited_at = Instant::now();
+        wait_for_stall_duration(MISSING_RECOVERY_REQUEST_MIN_WAIT);
+        scheduler.delay_by(waited_at.elapsed());
+    }
+
     pub(super) fn wait_poll_interval_and_delay_scheduler_until(
         &self,
         scheduler: &mut PlaybackScheduler,
@@ -209,7 +235,9 @@ fn wait_for_stall_duration(duration: Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{EXPIRED_HEVC_WATCHDOG_MIN_WAIT, PlaybackLoopDeadline};
+    use super::{
+        EXPIRED_HEVC_WATCHDOG_MIN_WAIT, MISSING_RECOVERY_REQUEST_MIN_WAIT, PlaybackLoopDeadline,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -236,6 +264,12 @@ mod tests {
     }
 
     #[test]
+    fn missing_recovery_request_always_has_a_nonzero_bounded_wait() {
+        assert_eq!(MISSING_RECOVERY_REQUEST_MIN_WAIT, Duration::from_millis(2));
+        assert!(MISSING_RECOVERY_REQUEST_MIN_WAIT > Duration::ZERO);
+    }
+
+    #[test]
     fn rebuffer_empty_audio_watchdog_caps_wait_duration() {
         let deadline = PlaybackLoopDeadline::default()
             .with_rebuffer_empty_audio_output_watchdog_delay(Some(Duration::from_millis(100)));
@@ -243,6 +277,18 @@ mod tests {
         let capped = deadline.cap_wait_duration(Duration::from_secs(5));
 
         assert!(capped <= Duration::from_millis(100));
+        assert!(capped > Duration::ZERO);
+    }
+
+    #[test]
+    fn audio_decode_recovery_watchdog_caps_wait_duration() {
+        let remaining = Duration::from_millis(75);
+        let deadline = PlaybackLoopDeadline::default()
+            .with_audio_decode_recovery_watchdog_deadline(Some(Instant::now() + remaining));
+
+        let capped = deadline.cap_wait_duration(Duration::from_secs(5));
+
+        assert!(capped <= remaining);
         assert!(capped > Duration::ZERO);
     }
 

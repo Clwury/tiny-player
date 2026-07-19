@@ -80,7 +80,7 @@ impl DemuxPacketCacheState {
             .filter(|packet_id| {
                 self.low_level_append_blocked_packet_generations
                     .get(packet_id)
-                    .is_none_or(|blocked_generation| *blocked_generation != generation)
+                    .is_none_or(|blocked_generation| *blocked_generation > generation)
             })
             .collect::<VecDeque<_>>();
         let stream_queues = range
@@ -93,7 +93,7 @@ impl DemuxPacketCacheState {
                     .filter(|packet_id| {
                         self.low_level_append_blocked_packet_generations
                             .get(packet_id)
-                            .is_none_or(|blocked_generation| *blocked_generation != generation)
+                            .is_none_or(|blocked_generation| *blocked_generation > generation)
                     })
                     .collect::<VecDeque<_>>();
                 (!queue.is_empty()).then_some((*stream_index, queue))
@@ -228,6 +228,7 @@ impl DemuxPacketCacheState {
             range.is_bof = false;
         }
         range.mark_seekable_dirty();
+        self.bump_seekability_revision();
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_range_eof(
@@ -248,6 +249,7 @@ impl DemuxPacketCacheState {
             range.ensure_stream_boundary(stream_index).is_eof = is_eof;
         }
         range.mark_seekable_dirty();
+        self.bump_seekability_revision();
         self.refresh_range_seek_boundaries(range_id);
         if is_eof {
             let eof_anchor = self.ranges.get(&range_id).and_then(|range| {
@@ -274,7 +276,7 @@ impl DemuxPacketCacheState {
                     closure_reason = "EOF",
                     anchor_packet_id,
                     anchor_kind = anchor.recovery_kind.as_str(),
-                    anchor_nsecs = ?anchor.start_nsecs,
+                    anchor_nsecs = ?anchor.seek_timestamp_nsecs,
                     preroll_nsecs = self.cached_seek_preroll_nsecs,
                     seek_start_nsecs = ?boundary.and_then(|boundary| boundary.seek_start_nsecs),
                     seek_end_nsecs = ?boundary.and_then(|boundary| boundary.seek_end_nsecs),

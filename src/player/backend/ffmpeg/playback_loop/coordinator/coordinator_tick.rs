@@ -13,13 +13,16 @@ use super::decoder_input_service::{DecoderInputServiceContext, DecoderInputServi
 use super::output_gate_service::{OutputGateServiceContext, OutputGateServiceStatus};
 use super::output_queue_service::{OutputQueueAfterDecoderInputContext, OutputQueueServiceContext};
 use super::playback_services::PlaybackPipelineServices;
-use super::video_decode_pipeline::{HevcDecodeChainRecoveryAction, HevcStartupStallObservation};
+use super::video_decode_pipeline::{
+    HevcDecodeChainFallback, HevcDecodeChainFallbackReason, HevcDecodeChainRecoveryAction,
+    HevcStartupStallObservation,
+};
 use super::video_decode_worker::{VideoDecodeWorkerSnapshot, VideoDecodeWorkerState};
 use super::{
     DemuxPacketCache, DemuxReaderWatermark, FfmpegControl, HttpRingCache,
     PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER, PLAYBACK_COORDINATOR_TICK_TIMING_LOG_AFTER,
-    PlaybackBlockReason, PlaybackPipelineState, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-    duration_nsecs,
+    PlaybackBlockReason, PlaybackOutputScheduler, PlaybackPipelineState,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, duration_nsecs,
 };
 use ffmpeg_sys_next as ffi;
 
@@ -28,10 +31,30 @@ const STARTUP_FIRST_FRAME_DECODER_WARMUP_BUDGET: Duration = Duration::from_milli
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PlaybackTickStatus {
     Continue,
-    ForceLowLevelSeek,
+    RecoveryPending(PlaybackRecoveryRequest),
     ForceRebufferAudioRealign,
     Eof,
     Stopped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlaybackRecoverySource {
+    HevcDecodeChain(HevcDecodeChainFallbackReason),
+}
+
+impl PlaybackRecoverySource {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::HevcDecodeChain(_) => "hevc_decode_chain",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PlaybackRecoveryRequest {
+    pub(super) transaction_id: u64,
+    pub(super) source: PlaybackRecoverySource,
+    pub(super) target_nsecs: u64,
 }
 
 pub(super) struct PlaybackTickContext<'a> {
@@ -112,13 +135,15 @@ pub(super) fn service_playback_tick(
         return Ok(status);
     }
     if let Some(status) = hevc_decode_chain_fallback_tick_status(
+        context.pipeline.active_recovery_transaction_id(),
         context
             .pipeline
             .video_decode_pipeline
-            .hevc_decode_chain_fallback_pending(),
+            .pending_hevc_decode_chain_fallback(),
     ) {
         return Ok(finish_playback_tick(
             context.session_id,
+            &mut context.pipeline.output_scheduler,
             tick_started_at,
             timing,
             status,
@@ -133,6 +158,7 @@ pub(super) fn service_playback_tick(
     {
         return Ok(finish_playback_tick(
             context.session_id,
+            &mut context.pipeline.output_scheduler,
             tick_started_at,
             timing,
             PlaybackTickStatus::ForceRebufferAudioRealign,
@@ -154,6 +180,7 @@ pub(super) fn service_playback_tick(
         }
         return Ok(finish_playback_tick(
             context.session_id,
+            &mut context.pipeline.output_scheduler,
             tick_started_at,
             timing,
             PlaybackTickStatus::Continue,
@@ -216,6 +243,7 @@ pub(super) fn service_playback_tick(
     if output_queue_before_status.should_continue() {
         return Ok(finish_playback_tick(
             context.session_id,
+            &mut context.pipeline.output_scheduler,
             tick_started_at,
             timing,
             PlaybackTickStatus::Continue,
@@ -283,6 +311,7 @@ pub(super) fn service_playback_tick(
     )? {
         return Ok(finish_playback_tick(
             context.session_id,
+            &mut context.pipeline.output_scheduler,
             tick_started_at,
             timing,
             status,
@@ -293,6 +322,7 @@ pub(super) fn service_playback_tick(
     if output_gate_status.should_continue() {
         return Ok(finish_playback_tick(
             context.session_id,
+            &mut context.pipeline.output_scheduler,
             tick_started_at,
             timing,
             PlaybackTickStatus::Continue,
@@ -351,6 +381,7 @@ pub(super) fn service_playback_tick(
     )? {
         return Ok(finish_playback_tick(
             context.session_id,
+            &mut context.pipeline.output_scheduler,
             tick_started_at,
             timing,
             status,
@@ -377,6 +408,7 @@ pub(super) fn service_playback_tick(
             {
                 return Ok(finish_playback_tick(
                     context.session_id,
+                    &mut context.pipeline.output_scheduler,
                     tick_started_at,
                     timing,
                     status,
@@ -436,6 +468,7 @@ pub(super) fn service_playback_tick(
             }
             return Ok(finish_playback_tick(
                 context.session_id,
+                &mut context.pipeline.output_scheduler,
                 tick_started_at,
                 timing,
                 PlaybackTickStatus::Continue,
@@ -496,6 +529,7 @@ pub(super) fn service_playback_tick(
             }
             return Ok(finish_playback_tick(
                 context.session_id,
+                &mut context.pipeline.output_scheduler,
                 tick_started_at,
                 timing,
                 PlaybackTickStatus::Continue,
@@ -517,6 +551,7 @@ pub(super) fn service_playback_tick(
             }
             return Ok(finish_playback_tick(
                 context.session_id,
+                &mut context.pipeline.output_scheduler,
                 tick_started_at,
                 timing,
                 PlaybackTickStatus::Continue,
@@ -538,6 +573,7 @@ pub(super) fn service_playback_tick(
             }
             return Ok(finish_playback_tick(
                 context.session_id,
+                &mut context.pipeline.output_scheduler,
                 tick_started_at,
                 timing,
                 PlaybackTickStatus::Eof,
@@ -559,6 +595,7 @@ pub(super) fn service_playback_tick(
             }
             return Ok(finish_playback_tick(
                 context.session_id,
+                &mut context.pipeline.output_scheduler,
                 tick_started_at,
                 timing,
                 PlaybackTickStatus::Stopped,
@@ -581,6 +618,7 @@ pub(super) fn service_playback_tick(
         }
         return Ok(finish_playback_tick(
             context.session_id,
+            &mut context.pipeline.output_scheduler,
             tick_started_at,
             timing,
             PlaybackTickStatus::Continue,
@@ -644,6 +682,7 @@ pub(super) fn service_playback_tick(
     );
     Ok(finish_playback_tick(
         context.session_id,
+        &mut context.pipeline.output_scheduler,
         tick_started_at,
         timing,
         PlaybackTickStatus::Continue,
@@ -652,8 +691,17 @@ pub(super) fn service_playback_tick(
     ))
 }
 
-fn hevc_decode_chain_fallback_tick_status(pending: bool) -> Option<PlaybackTickStatus> {
-    pending.then_some(PlaybackTickStatus::ForceLowLevelSeek)
+fn hevc_decode_chain_fallback_tick_status(
+    transaction_id: u64,
+    fallback: Option<HevcDecodeChainFallback>,
+) -> Option<PlaybackTickStatus> {
+    fallback.map(|fallback| {
+        PlaybackTickStatus::RecoveryPending(PlaybackRecoveryRequest {
+            transaction_id,
+            source: PlaybackRecoverySource::HevcDecodeChain(fallback.reason),
+            target_nsecs: fallback.target_nsecs,
+        })
+    })
 }
 
 fn service_hevc_startup_stall_watchdog(
@@ -691,11 +739,13 @@ fn service_hevc_startup_stall_watchdog(
         }
     }
 
-    if pipeline
-        .video_decode_pipeline
-        .hevc_decode_chain_fallback_pending()
-    {
-        return Ok(Some(PlaybackTickStatus::ForceLowLevelSeek));
+    if let Some(status) = hevc_decode_chain_fallback_tick_status(
+        pipeline.active_recovery_transaction_id(),
+        pipeline
+            .video_decode_pipeline
+            .pending_hevc_decode_chain_fallback(),
+    ) {
+        return Ok(Some(status));
     }
     Ok(None)
 }
@@ -838,6 +888,7 @@ fn startup_first_frame_decoder_warmup_needed(
                     PlaybackBlockReason::DecoderInFlight
                         | PlaybackBlockReason::DecoderOutputPending
                         | PlaybackBlockReason::PacketQueueFull
+                        | PlaybackBlockReason::DecoderRecovery
                 )
             ))
 }
@@ -891,12 +942,14 @@ fn service_startup_first_frame_decoder_warmup(
             }
             return Ok(Some(PlaybackTickStatus::Continue));
         }
-        if context
-            .pipeline
-            .video_decode_pipeline
-            .hevc_decode_chain_fallback_pending()
-        {
-            return Ok(Some(PlaybackTickStatus::ForceLowLevelSeek));
+        if let Some(status) = hevc_decode_chain_fallback_tick_status(
+            context.pipeline.active_recovery_transaction_id(),
+            context
+                .pipeline
+                .video_decode_pipeline
+                .pending_hevc_decode_chain_fallback(),
+        ) {
+            return Ok(Some(status));
         }
 
         if let Some(status) = service_hevc_startup_stall_watchdog(
@@ -1166,6 +1219,7 @@ fn finish_if_hevc_startup_watchdog_deadline_elapsed(
     };
     Ok(Some(finish_playback_tick(
         session_id,
+        &mut pipeline.output_scheduler,
         tick_started_at,
         timing,
         status,
@@ -1176,7 +1230,7 @@ fn finish_if_hevc_startup_watchdog_deadline_elapsed(
 
 fn finish_if_cached_seek_watchdog_deadline_elapsed(
     session_id: PlaybackSessionId,
-    pipeline: &PlaybackPipelineState,
+    pipeline: &mut PlaybackPipelineState,
     tick_started_at: Instant,
     timing: PlaybackTickTiming,
     checkpoint: &'static str,
@@ -1201,6 +1255,7 @@ fn finish_if_cached_seek_watchdog_deadline_elapsed(
     }
     Some(finish_playback_tick(
         session_id,
+        &mut pipeline.output_scheduler,
         tick_started_at,
         timing,
         PlaybackTickStatus::Continue,
@@ -1211,15 +1266,18 @@ fn finish_if_cached_seek_watchdog_deadline_elapsed(
 
 fn finish_playback_tick(
     session_id: PlaybackSessionId,
+    output_scheduler: &mut PlaybackOutputScheduler,
     tick_started_at: Instant,
     timing: PlaybackTickTiming,
     status: PlaybackTickStatus,
     exit_reason: &'static str,
     decoder_input_outcome: Option<DecoderInputServiceOutcome>,
 ) -> PlaybackTickStatus {
+    let total = tick_started_at.elapsed();
+    output_scheduler.record_coordinator_tick(total);
     log_playback_tick_timing(
         session_id,
-        tick_started_at.elapsed(),
+        total,
         timing,
         status,
         exit_reason,
@@ -1280,8 +1338,9 @@ mod tests {
     use ffmpeg_sys_next as ffi;
 
     use super::{
-        PlaybackTickStatus, PlaybackWatchdogDeadline, VideoDecodeWorkerSnapshot,
-        VideoDecodeWorkerState, hevc_decode_chain_fallback_tick_status,
+        HevcDecodeChainFallback, HevcDecodeChainFallbackReason, PlaybackRecoveryRequest,
+        PlaybackRecoverySource, PlaybackTickStatus, PlaybackWatchdogDeadline,
+        VideoDecodeWorkerSnapshot, VideoDecodeWorkerState, hevc_decode_chain_fallback_tick_status,
         hevc_startup_watchdog_reject_reason, playback_watchdog_deadline_due,
     };
 
@@ -1304,12 +1363,26 @@ mod tests {
     }
 
     #[test]
-    fn hevc_pending_fallback_forces_low_level_seek_in_current_tick() {
+    fn hevc_pending_fallback_carries_atomic_recovery_request_in_current_tick() {
+        let transaction_id = 41;
+        let fallback = HevcDecodeChainFallback {
+            target_nsecs: 235_235_000_000,
+            reason: HevcDecodeChainFallbackReason::RecoveryWaitRebuffer,
+        };
         assert_eq!(
-            hevc_decode_chain_fallback_tick_status(true),
-            Some(PlaybackTickStatus::ForceLowLevelSeek)
+            hevc_decode_chain_fallback_tick_status(transaction_id, Some(fallback)),
+            Some(PlaybackTickStatus::RecoveryPending(
+                PlaybackRecoveryRequest {
+                    transaction_id,
+                    source: PlaybackRecoverySource::HevcDecodeChain(fallback.reason),
+                    target_nsecs: fallback.target_nsecs,
+                }
+            ))
         );
-        assert_eq!(hevc_decode_chain_fallback_tick_status(false), None);
+        assert_eq!(
+            hevc_decode_chain_fallback_tick_status(transaction_id, None),
+            None
+        );
     }
 
     #[test]

@@ -8,21 +8,76 @@ use super::{
     AUDIO_OUTPUT_QUEUE_LIMIT_DURATION, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
     AUDIO_REBUFFER_LOOP_DETECTION_WINDOW, AUDIO_REBUFFER_PREFILL_LOOP_TARGET,
     AUDIO_REBUFFER_PREFILL_TARGET, AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN, AudioOutput,
-    AudioOutputSnapshot, AudioResumeWaterline, Duration, FfmpegControl, Instant,
-    PENDING_AUDIO_CONTINUITY_TOLERANCE, PendingStartAudio, PendingStartAudioPressureLevel,
-    PlaybackOutputScheduler, PlaybackOutputState, PlaybackResumeWaterline, PlaybackSessionId,
-    RebufferAudioRealignRequest, ScheduledVideoQueue,
+    AudioOutputSnapshot, AudioReaderGapWatchdog, AudioRealignCoverage, AudioResumeWaterline,
+    Duration, FfmpegControl, Instant, PENDING_AUDIO_CONTINUITY_TOLERANCE, PendingStartAudio,
+    PendingStartAudioPressureLevel, PlaybackOutputScheduler, PlaybackOutputState,
+    PlaybackResumeWaterline, PlaybackSessionId, RebufferAudioRealignRequest, ScheduledVideoQueue,
     VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
-    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VideoOutputUnderflowClassification,
-    clear_video_output_rebuffer, duration_nsecs, enter_video_output_rebuffer,
-    finish_video_output_rebuffer_if_ready, video_output_rebuffer_should_enter,
-    video_output_underflow_classification,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE,
+    VideoOutputUnderflowClassification, clear_video_output_rebuffer, duration_nsecs,
+    enter_video_output_rebuffer, finish_video_output_rebuffer_if_ready,
+    video_output_rebuffer_should_enter, video_output_underflow_classification,
 };
 use ffmpeg_sys_next as ffi;
 
 const REBUFFER_EMPTY_AUDIO_OUTPUT_WAKE_INTERVAL: Duration = Duration::from_millis(100);
 const REBUFFER_AUDIO_REALIGN_AFTER_FAR_AHEAD_DROPS: u8 = 3;
 const AUDIO_GAP_RECOVERY_SUPPRESS_REBUFFER_FOR: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioReaderGapWatchdogDecision {
+    Covered,
+    InputPending,
+    Waiting,
+    Request,
+    RequestAlreadyIssued,
+}
+
+fn observe_audio_reader_gap_watchdog(
+    watchdog: &mut Option<AudioReaderGapWatchdog>,
+    target_timeline_nsecs: u64,
+    progress_nsecs: u64,
+    has_resume_coverage: bool,
+    input_can_fill_gap: bool,
+    now: Instant,
+) -> AudioReaderGapWatchdogDecision {
+    if has_resume_coverage {
+        *watchdog = None;
+        return AudioReaderGapWatchdogDecision::Covered;
+    }
+    if input_can_fill_gap {
+        *watchdog = None;
+        return AudioReaderGapWatchdogDecision::InputPending;
+    }
+    let current = watchdog.get_or_insert(AudioReaderGapWatchdog {
+        target_timeline_nsecs,
+        last_progress_nsecs: progress_nsecs,
+        last_progress_at: now,
+        request_issued: false,
+    });
+    if current.target_timeline_nsecs != target_timeline_nsecs {
+        *current = AudioReaderGapWatchdog {
+            target_timeline_nsecs,
+            last_progress_nsecs: progress_nsecs,
+            last_progress_at: now,
+            request_issued: false,
+        };
+    } else if progress_nsecs > current.last_progress_nsecs {
+        current.last_progress_nsecs = progress_nsecs;
+        current.last_progress_at = now;
+        current.request_issued = false;
+    }
+    if current.request_issued {
+        return AudioReaderGapWatchdogDecision::RequestAlreadyIssued;
+    }
+    if now.saturating_duration_since(current.last_progress_at)
+        < VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER
+    {
+        return AudioReaderGapWatchdogDecision::Waiting;
+    }
+    current.request_issued = true;
+    AudioReaderGapWatchdogDecision::Request
+}
 
 struct AudioGapRecoveryRebufferSuppressionInput {
     now: Instant,
@@ -35,6 +90,55 @@ struct AudioGapRecoveryRebufferSuppressionInput {
 }
 
 impl PlaybackOutputScheduler {
+    pub(in crate::player::backend::ffmpeg) fn record_coordinator_tick(
+        &mut self,
+        elapsed: Duration,
+    ) {
+        self.scheduled_video_queue
+            .record_coordinator_tick(elapsed, Instant::now());
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn audio_realign_coverage(
+        &self,
+        resume_timeline_nsecs: u64,
+        target_nsecs: u64,
+    ) -> AudioRealignCoverage {
+        let protected_target_nsecs =
+            target_nsecs.saturating_sub(duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN));
+        let direct_until_nsecs = self
+            .pending_start_audio
+            .buffered_until_from(resume_timeline_nsecs);
+        let delayed_range = direct_until_nsecs
+            .is_none()
+            .then(|| {
+                self.pending_start_audio
+                    .contiguous_range_nsecs()
+                    .filter(|(start_nsecs, _)| {
+                        *start_nsecs >= resume_timeline_nsecs
+                            && start_nsecs.saturating_sub(resume_timeline_nsecs)
+                                <= duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE)
+                    })
+            })
+            .flatten();
+        let audio_accepted_start_timeline_nsecs = direct_until_nsecs
+            .map(|_| resume_timeline_nsecs)
+            .or_else(|| delayed_range.map(|(start_nsecs, _)| start_nsecs));
+        let contiguous_coverage_nsecs = direct_until_nsecs
+            .map(|end_nsecs| end_nsecs.saturating_sub(resume_timeline_nsecs))
+            .or_else(|| {
+                delayed_range.map(|(start_nsecs, end_nsecs)| end_nsecs.saturating_sub(start_nsecs))
+            });
+        AudioRealignCoverage {
+            audio_accepted_start_timeline_nsecs,
+            start_gap_nsecs: audio_accepted_start_timeline_nsecs
+                .map(|accepted_start| accepted_start.saturating_sub(resume_timeline_nsecs)),
+            contiguous_coverage_nsecs,
+            protected_target_nsecs,
+            ready: contiguous_coverage_nsecs
+                .is_some_and(|coverage| coverage >= protected_target_nsecs),
+        }
+    }
+
     pub(in crate::player::backend::ffmpeg) fn new() -> Self {
         let playback_output_state = PlaybackOutputState::Syncing;
         Self {
@@ -49,6 +153,7 @@ impl PlaybackOutputScheduler {
             rebuffer_empty_audio_output_blocked: false,
             audio_sync_drop_before_timeline_nsecs: None,
             rebuffer_audio_realign_request: None,
+            audio_reader_gap_watchdog: None,
             syncing_started_at: Some(Instant::now()),
             defer_pending_start_audio_flush_once: false,
             startup_pending_audio_pressure_context_active: false,
@@ -81,6 +186,7 @@ impl PlaybackOutputScheduler {
         self.rebuffer_empty_audio_output_blocked = false;
         self.audio_sync_drop_before_timeline_nsecs = None;
         self.rebuffer_audio_realign_request = None;
+        self.audio_reader_gap_watchdog = None;
         self.rebuffer_far_ahead_audio_drop_count = 0;
         self.audio_gap_recovery_until = None;
         self.audio_gap_recovery_target_nsecs = None;
@@ -95,6 +201,7 @@ impl PlaybackOutputScheduler {
         self.video_decode_underfill = false;
         self.clear_video_bootstrap_after_seek("clear_rebuffer");
         self.rebuffer_empty_audio_output_blocked = false;
+        self.audio_reader_gap_watchdog = None;
         self.rebuffer_far_ahead_audio_drop_count = 0;
         self.sync_first_video_frame_pending();
     }
@@ -206,6 +313,58 @@ impl PlaybackOutputScheduler {
             })
             .unwrap_or(false);
         let audio_output_empty = audio_output_pending_nsecs == Some(0);
+        let audio_output_continuous = audio_output_pending_nsecs.is_some_and(|pending| pending > 0);
+        let pending_audio_continuous =
+            pending_audio_covers_target || pending_audio_near_resume_target;
+        let recent_coordinator_stall = self
+            .scheduled_video_queue
+            .recent_coordinator_stall(Instant::now());
+        if recent_coordinator_stall.is_some()
+            && (audio_output_continuous || pending_audio_continuous)
+        {
+            self.rebuffer_far_ahead_audio_drop_count = 0;
+            tracing::debug!(
+                session_id = ?session_id,
+                reason,
+                far_ahead_audio_timeline_nsecs,
+                target_timeline_nsecs,
+                audio_output_continuous,
+                pending_audio_continuous,
+                recent_coordinator_stall_ms = ?recent_coordinator_stall
+                    .map(|stall| stall.elapsed.as_secs_f64() * 1000.0),
+                recent_coordinator_stall_age_ms = ?recent_coordinator_stall
+                    .map(|stall| stall.age.as_secs_f64() * 1000.0),
+                "suppressed FFmpeg audio realign after coordinator stall with continuous audio"
+            );
+            return None;
+        }
+        let progress_nsecs = self
+            .pending_start_audio
+            .buffered_until_from(target_timeline_nsecs)
+            .map(|until| until.saturating_sub(target_timeline_nsecs))
+            .unwrap_or_default()
+            .max(audio_output_pending_nsecs.unwrap_or_default());
+        let gap_watchdog_decision = observe_audio_reader_gap_watchdog(
+            &mut self.audio_reader_gap_watchdog,
+            target_timeline_nsecs,
+            progress_nsecs,
+            pending_audio_continuous || audio_output_continuous,
+            false,
+            Instant::now(),
+        );
+        if gap_watchdog_decision != AudioReaderGapWatchdogDecision::Request {
+            tracing::trace!(
+                session_id = ?session_id,
+                target_timeline_nsecs,
+                far_ahead_audio_timeline_nsecs,
+                gap_watchdog_decision = ?gap_watchdog_decision,
+                pending_audio_continuous,
+                audio_output_continuous,
+                progress_ms = progress_nsecs as f64 / 1_000_000.0,
+                "deferred FFmpeg decoded-audio realign until continuity gap watchdog expires"
+            );
+            return None;
+        }
         let realign_needed = !pending_audio_near_resume_target
             && (force_immediate_realign || audio_output_empty || !pending_audio_covers_target);
         let bypass_drop_threshold = force_immediate_realign
@@ -299,16 +458,97 @@ impl PlaybackOutputScheduler {
         let protected_audio_target_nsecs = audio_waterline
             .target_nsecs
             .saturating_sub(duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN));
-        let pending_audio_near_target = pending_audio_buffered_until_nsecs
-            .map(|buffered_until_nsecs| {
-                buffered_until_nsecs.saturating_sub(audio_waterline.resume_timeline_nsecs)
-                    >= protected_audio_target_nsecs
-            })
-            .unwrap_or(false);
+        let accepted_start_within_tolerance = audio_waterline
+            .audio_accepted_start_timeline_nsecs
+            .is_some()
+            && audio_waterline
+                .audio_accepted_start_gap_nsecs
+                .is_some_and(|gap| gap <= duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE));
+        let pending_audio_near_target = accepted_start_within_tolerance
+            && audio_waterline
+                .accepted_contiguous_coverage_nsecs
+                .is_some_and(|coverage| coverage >= protected_audio_target_nsecs);
         if pending_audio_near_target {
+            self.audio_reader_gap_watchdog = None;
             return None;
         }
         let audio_output_empty = audio_waterline.audio_output_pending_nsecs == Some(0);
+        let audio_output_continuous = audio_waterline
+            .audio_output_pending_nsecs
+            .is_some_and(|pending| pending > 0);
+        let pending_audio_continuous = pending_audio_covers_resume || pending_audio_near_target;
+        let recent_coordinator_stall = self
+            .scheduled_video_queue
+            .recent_coordinator_stall(Instant::now());
+        if recent_coordinator_stall.is_some()
+            && (audio_output_continuous || pending_audio_continuous)
+        {
+            tracing::debug!(
+                session_id = ?session_id,
+                reader_head_start_nsecs,
+                resume_timeline_nsecs = audio_waterline.resume_timeline_nsecs,
+                audio_output_continuous,
+                pending_audio_continuous,
+                recent_coordinator_stall_ms = ?recent_coordinator_stall
+                    .map(|stall| stall.elapsed.as_secs_f64() * 1000.0),
+                recent_coordinator_stall_age_ms = ?recent_coordinator_stall
+                    .map(|stall| stall.age.as_secs_f64() * 1000.0),
+                "suppressed FFmpeg audio reader realign after coordinator stall with continuous audio"
+            );
+            return None;
+        }
+        let pending_resume_coverage = pending_audio_covers_resume
+            || (accepted_start_within_tolerance
+                && audio_waterline
+                    .accepted_contiguous_coverage_nsecs
+                    .is_some_and(|coverage| coverage > 0));
+        let decoded_resume_coverage = audio_waterline
+            .decoded_audio_forward_nsecs
+            .is_some_and(|coverage| coverage > 0);
+        let audio_output_resume_coverage = audio_waterline
+            .audio_output_buffered_until_nsecs
+            .is_some_and(|until| until > audio_waterline.resume_timeline_nsecs);
+        let has_resume_coverage =
+            pending_resume_coverage || decoded_resume_coverage || audio_output_resume_coverage;
+        let input_can_fill_gap = audio_waterline.audio_decode_in_flight_packets > 0;
+        let progress_nsecs = audio_waterline
+            .accepted_contiguous_coverage_nsecs
+            .unwrap_or_default()
+            .max(
+                audio_waterline
+                    .decoded_audio_forward_nsecs
+                    .unwrap_or_default(),
+            )
+            .max(
+                audio_waterline
+                    .audio_output_buffered_until_nsecs
+                    .map(|until| until.saturating_sub(audio_waterline.resume_timeline_nsecs))
+                    .unwrap_or_default(),
+            );
+        let gap_watchdog_decision = observe_audio_reader_gap_watchdog(
+            &mut self.audio_reader_gap_watchdog,
+            target_timeline_nsecs,
+            progress_nsecs,
+            has_resume_coverage,
+            input_can_fill_gap,
+            Instant::now(),
+        );
+        if gap_watchdog_decision != AudioReaderGapWatchdogDecision::Request {
+            tracing::trace!(
+                session_id = ?session_id,
+                target_timeline_nsecs,
+                reader_head_start_nsecs,
+                gap_watchdog_decision = ?gap_watchdog_decision,
+                has_resume_coverage,
+                pending_resume_coverage,
+                decoded_resume_coverage,
+                audio_output_resume_coverage,
+                input_can_fill_gap,
+                progress_ms = progress_nsecs as f64 / 1_000_000.0,
+                "deferred FFmpeg audio reader realign until a real continuity gap stalls"
+            );
+            return None;
+        }
         let blocked_rebuffer_recovery = self.rebuffer_empty_audio_output_blocked
             && self.playback_output_state.rebuffering()
             && audio_waterline.below_target()
@@ -398,7 +638,15 @@ impl PlaybackOutputScheduler {
             queued_video_range_nsecs = ?queued_video_range_nsecs,
             queued_video_covers_target,
             pending_audio_start_nsecs = ?audio_waterline.pending_audio_start_nsecs,
+            audio_accepted_start = ?audio_waterline.audio_accepted_start_timeline_nsecs,
+            start_gap_ms = ?audio_waterline
+                .audio_accepted_start_gap_nsecs
+                .map(|gap| gap as f64 / 1_000_000.0),
+            contiguous_coverage_ms = ?audio_waterline
+                .accepted_contiguous_coverage_nsecs
+                .map(|coverage| coverage as f64 / 1_000_000.0),
             pending_audio_covers_resume,
+            accepted_start_within_tolerance,
             pending_audio_near_target,
             protected_audio_target_ms = protected_audio_target_nsecs as f64 / 1_000_000.0,
             pending_contiguous_until_nsecs,
@@ -443,6 +691,18 @@ impl PlaybackOutputScheduler {
         request
     }
 
+    pub(in crate::player::backend::ffmpeg) fn defer_audio_reader_gap_watchdog_after_input_pending(
+        &mut self,
+        target_timeline_nsecs: u64,
+    ) {
+        if let Some(watchdog) = self.audio_reader_gap_watchdog.as_mut()
+            && watchdog.target_timeline_nsecs == target_timeline_nsecs
+        {
+            watchdog.last_progress_at = Instant::now();
+            watchdog.request_issued = false;
+        }
+    }
+
     pub(in crate::player::backend::ffmpeg) fn reset_audio_after_rebuffer_realign(
         &mut self,
         target_timeline_nsecs: u64,
@@ -455,6 +715,7 @@ impl PlaybackOutputScheduler {
         self.pending_start_audio.clear();
         self.rebuffer_empty_audio_output_blocked = false;
         self.rebuffer_audio_realign_request = None;
+        self.audio_reader_gap_watchdog = None;
         self.rebuffer_far_ahead_audio_drop_count = 0;
         self.set_audio_sync_drop_before_timeline_nsecs(target_timeline_nsecs, session_id, reason);
         tracing::debug!(
@@ -1043,6 +1304,14 @@ impl PlaybackOutputScheduler {
         started_at: Instant,
     ) {
         self.video_output_underrun_started_at = Some(started_at);
+    }
+
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg) fn expire_audio_reader_gap_watchdog_for_test(&mut self) {
+        if let Some(watchdog) = self.audio_reader_gap_watchdog.as_mut() {
+            watchdog.last_progress_at =
+                Instant::now() - VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER;
+        }
     }
 
     #[cfg(test)]

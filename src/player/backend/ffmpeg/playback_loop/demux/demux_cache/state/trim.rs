@@ -425,14 +425,11 @@ impl DemuxPacketCacheState {
         self.stream_seek_boundary_ids(range, stream_index)
             .find_map(|packet_id| {
                 let packet = self.packets.get(&packet_id)?;
-                let start_nsecs = packet.start_nsecs?;
-                let end_nsecs = packet.end_nsecs.unwrap_or(start_nsecs);
-                (end_nsecs >= start_nsecs).then(|| {
-                    if stream_index == self.timeline_anchor_stream_index {
-                        start_nsecs.saturating_add(self.cached_seek_preroll_nsecs)
-                    } else {
-                        start_nsecs
-                    }
+                let start_nsecs = packet.seek_timestamp_nsecs?;
+                Some(if stream_index == self.timeline_anchor_stream_index {
+                    start_nsecs.saturating_add(self.cached_seek_preroll_nsecs)
+                } else {
+                    start_nsecs
                 })
             })
     }
@@ -600,7 +597,7 @@ impl DemuxPacketCacheState {
                     queue
                         .get(*position)
                         .and_then(|packet_id| self.packets.get(packet_id))
-                        .and_then(|packet| packet.start_nsecs)
+                        .and_then(|packet| packet.seek_timestamp_nsecs)
                         .is_some_and(|next_start| next_start <= anchor_seek_start)
                 })
                 .last();
@@ -612,7 +609,7 @@ impl DemuxPacketCacheState {
             let Some(next_start) = self
                 .packets
                 .get(next_packet_id)
-                .and_then(|packet| packet.start_nsecs)
+                .and_then(|packet| packet.seek_timestamp_nsecs)
             else {
                 continue;
             };
@@ -676,12 +673,14 @@ impl DemuxPacketCacheState {
         require_recovery_point: bool,
     ) -> bool {
         if stream_index == timeline_anchor_stream_index {
-            return packet.timeline_anchor && packet.recovery_point && packet.start_nsecs.is_some();
+            return packet.timeline_anchor
+                && packet.recovery_point
+                && packet.seek_timestamp_nsecs.is_some();
         }
         if require_recovery_point {
-            return packet.recovery_point && packet.start_nsecs.is_some();
+            return packet.recovery_point && packet.seek_timestamp_nsecs.is_some();
         }
-        packet.start_nsecs.is_some()
+        packet.seek_timestamp_nsecs.is_some()
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn rebuild_range_stream_seek_boundaries(
@@ -750,12 +749,13 @@ impl DemuxPacketCacheState {
             }
         }
         range.mark_seekable_dirty();
+        self.bump_seekability_revision();
         let pruned_until_nsecs = removed
             .iter()
             .filter_map(|packet_id| {
                 self.packets
                     .get(packet_id)
-                    .and_then(|packet| packet.end_nsecs.or(packet.start_nsecs))
+                    .and_then(|packet| packet.seek_timestamp_nsecs)
             })
             .max();
         range.is_bof = false;

@@ -586,7 +586,7 @@ impl DemuxPacketCacheState {
                 && packets.contains_key(packet_id)
                 && blocked_packet_generations
                     .get(packet_id)
-                    .is_none_or(|blocked_generation| *blocked_generation != generation)
+                    .is_none_or(|blocked_generation| *blocked_generation > generation)
                 && stream_queues
                     .get(stream_index)
                     .is_some_and(|queue| queue.iter().any(|candidate| *candidate == *packet_id))
@@ -770,7 +770,7 @@ impl DemuxPacketCacheState {
     ) -> bool {
         self.low_level_append_blocked_packet_generations
             .get(&packet_id)
-            .is_some_and(|generation| *generation == self.generation)
+            .is_some_and(|generation| *generation <= self.generation)
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_reader_head_for_current_generation(

@@ -7,7 +7,10 @@ use crate::player::{
 };
 
 use super::demux_cache::DemuxSeekResult;
-use super::{BufferedReporter, DemuxPacketCache, FfmpegControl, reset_playback_timeline_state};
+use super::{
+    BufferedReporter, DemuxPacketCache, FfmpegControl, preroll_seek_position_seconds,
+    reset_playback_timeline_state, seconds_to_nsecs,
+};
 use ffmpeg_sys_next as ffi;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +34,7 @@ pub(super) struct PlaybackGenerationFlushContext<'a> {
     pub(super) seek_mode: PlaybackSeekMode,
     pub(super) seek_generation: u64,
     pub(super) force_low_level_seek: bool,
+    pub(super) cache_only: bool,
     pub(super) low_level_seek_reason: Option<&'static str>,
     pub(super) session_id: PlaybackSessionId,
     pub(super) vo_queue: &'a VideoOutputQueue,
@@ -66,6 +70,8 @@ pub(super) struct PlaybackSeekResetContext<'a> {
     pub(super) seek_mode: PlaybackSeekMode,
     pub(super) seek_generation: u64,
     pub(super) force_low_level_seek: bool,
+    pub(super) cache_only: bool,
+    pub(super) recovery_transaction_id: Option<u64>,
     pub(super) low_level_seek_reason: Option<&'static str>,
     pub(super) session_id: PlaybackSessionId,
     pub(super) vo_queue: &'a VideoOutputQueue,
@@ -101,6 +107,13 @@ fn flush_playback_generation_for_position_reset(
                 .low_level_seek_reason
                 .unwrap_or("forced_low_level_seek"),
         )
+    } else if context.cache_only {
+        context.demux_cache.seek_cached_only(
+            context.position_seconds,
+            context.seek_mode,
+            context.session_id,
+            context.seek_generation,
+        )
     } else {
         context.demux_cache.seek(
             context.position_seconds,
@@ -116,6 +129,7 @@ fn flush_playback_generation_for_position_reset(
         seek_mode = ?context.seek_mode,
         seek_generation = context.seek_generation,
         force_low_level_seek = context.force_low_level_seek,
+        cache_only = context.cache_only,
         low_level_seek_reason = ?context.low_level_seek_reason,
         playback_generation = generation,
         current_start_position_nsecs = context.pipeline.current_start_position_nsecs,
@@ -220,7 +234,9 @@ pub(super) fn service_playback_seek_reset(
         position_seconds,
         seek_mode,
         seek_generation,
-        force_low_level_seek,
+        force_low_level_seek: requested_force_low_level_seek,
+        cache_only: requested_cache_only,
+        recovery_transaction_id: requested_recovery_transaction_id,
         low_level_seek_reason,
         session_id,
         vo_queue,
@@ -231,12 +247,39 @@ pub(super) fn service_playback_seek_reset(
         control,
         event_tx,
     } = context;
+    let target_nsecs = seconds_to_nsecs(position_seconds);
+    let seek_position_nsecs = seconds_to_nsecs(preroll_seek_position_seconds(
+        pipeline.video_stream.codec_id,
+        position_seconds,
+    ));
+    let repeated_cra_low_level_tuple = pipeline.video_stream.codec_id
+        == ffi::AVCodecID::AV_CODEC_ID_HEVC
+        && pipeline
+            .video_decode_pipeline
+            .hevc_low_level_seek_would_repeat_cra(target_nsecs, seek_position_nsecs);
+    let force_low_level_seek = requested_force_low_level_seek && !repeated_cra_low_level_tuple;
+    let cache_only = requested_cache_only || repeated_cra_low_level_tuple;
+    let recovery_transaction_id =
+        requested_recovery_transaction_id.unwrap_or_else(|| pipeline.begin_recovery_transaction());
+    pipeline.continue_recovery_transaction(recovery_transaction_id);
+    if repeated_cra_low_level_tuple {
+        tracing::warn!(
+            ?session_id,
+            target_nsecs,
+            seek_position_nsecs,
+            requested_force_low_level_seek,
+            cache_only = true,
+            repeat_low_level_seek_suppressed = true,
+            "suppressed repeated HEVC low-level seek tuple; allowing cached recovery only"
+        );
+    }
     let flush_result = service_playback_generation_seek(PlaybackGenerationFlushContext {
         kind: PlaybackPositionResetKind::Seek,
         position_seconds,
         seek_mode,
         seek_generation,
         force_low_level_seek,
+        cache_only,
         low_level_seek_reason,
         session_id,
         vo_queue,
@@ -253,14 +296,39 @@ pub(super) fn service_playback_seek_reset(
         control,
         event_tx,
     });
+    if pipeline.video_stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC
+        && matches!(flush_result.demux_seek_result, DemuxSeekResult::Requested)
+    {
+        let reason = low_level_seek_reason.unwrap_or("cached_seek_miss");
+        let armed = pipeline
+            .video_decode_pipeline
+            .begin_hevc_low_level_seek_observation(
+                recovery_transaction_id,
+                target_nsecs,
+                seek_position_nsecs,
+                reason,
+            );
+        tracing::debug!(
+            ?session_id,
+            transaction_id = recovery_transaction_id,
+            recovery_scope = "exact_low_level_seek",
+            reason,
+            target_nsecs,
+            seek_position_nsecs,
+            armed,
+            "armed first-recovery observation for HEVC low-level seek"
+        );
+    }
     if let DemuxSeekResult::Cached(info) = flush_result.demux_seek_result
-        && info.uses_cra_anchor()
+        && matches!(seek_mode, PlaybackSeekMode::Precise)
     {
         pipeline
             .video_decode_recovery
-            .enable_hevc_cached_recovery_point();
+            .enable_hevc_cached_recovery_point(recovery_transaction_id, target_nsecs);
         tracing::debug!(
             ?session_id,
+            transaction_id = recovery_transaction_id,
+            recovery_scope = "exact_cached_seek",
             range_id = info.range_id,
             anchor_packet_id = info.anchor_packet_id,
             anchor_kind = info.anchor_kind.as_str(),
@@ -268,7 +336,7 @@ pub(super) fn service_playback_seek_reset(
             target_nsecs = info.target_nsecs,
             preroll_nsecs = info.preroll_nsecs,
             exact_output_gate = true,
-            "enabled CRA recovery point for closed cached seek transaction"
+            "enabled exact HEVC recovery point for closed cached seek transaction"
         );
     }
     if hevc_seek_starts_video_bootstrap(
@@ -301,6 +369,7 @@ pub(super) fn service_playback_seek_reset(
             position_seconds,
             seek_mode = ?seek_mode,
             force_low_level_seek,
+            cache_only,
             low_level_seek_reason,
             "suppressed user-visible buffering for internal playback repair"
         );

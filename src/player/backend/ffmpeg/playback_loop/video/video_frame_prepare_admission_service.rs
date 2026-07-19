@@ -94,7 +94,7 @@ pub(super) fn service_decoded_video_frame_start(
         timestamp.timeline_nsecs,
         *current_start_position_nsecs,
         realign_on_next_frame,
-        video_decode_recovery.requires_exact_cached_seek_output(),
+        video_decode_recovery.requires_exact_seek_output(),
     );
     match start_action {
         DecodedVideoFrameStartAction::DropBeforeStart => {
@@ -109,6 +109,8 @@ pub(super) fn service_decoded_video_frame_start(
                         raw_timestamp,
                         timeline_nsecs = timestamp.timeline_nsecs,
                         target_nsecs = progress.target_nsecs,
+                        transaction_id = ?progress.recovery_scope.transaction_id(),
+                        recovery_scope = progress.recovery_scope.as_str(),
                         first_preroll_frame_nsecs = ?progress.first_preroll_frame_nsecs,
                         last_preroll_frame_nsecs = ?progress.last_preroll_frame_nsecs,
                         current_start_position_nsecs = *current_start_position_nsecs,
@@ -175,6 +177,8 @@ pub(super) fn service_decoded_video_frame_start(
                     frame_count,
                     pts = frame_pts.nsecs,
                     target_nsecs = progress.target_nsecs,
+                    transaction_id = ?progress.recovery_scope.transaction_id(),
+                    recovery_scope = progress.recovery_scope.as_str(),
                     preroll_frames = progress.preroll_frames,
                     first_preroll_frame_nsecs = ?progress.first_preroll_frame_nsecs,
                     last_preroll_frame_nsecs = ?progress.last_preroll_frame_nsecs,

@@ -1100,10 +1100,18 @@ where
     timing.fallback += stage_started_at.elapsed();
     let stage_started_at = Instant::now();
     if output_scheduler.playback_output_state.rebuffering() && !waterline.ready() {
+        let demux_consumer_drainable = !waterline_demux_watermark.underrun
+            && !waterline_demux_watermark.video_underrun
+            && !waterline_demux_watermark.audio_underrun
+            && waterline_demux_watermark.forward_bytes > 0
+            && waterline
+                .demux_min_forward_nsecs
+                .is_some_and(|duration| duration > 0);
         let cache_pause_waterline = rebuffer_playback_resume_waterline_after_cache_pause(
             waterline,
             output_scheduler.rebuffer_wait_elapsed(),
             demux_cache.is_some() && control.is_cache_paused(),
+            demux_consumer_drainable,
         );
         if cache_pause_waterline.ready() {
             if let Some(demux_cache) = demux_cache {
@@ -1124,7 +1132,21 @@ where
                 demux_min_ms = ?cache_pause_waterline
                     .demux_min_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
-                "rebuffer cache pause stalled with decoded queues ready; resuming from decoded waterline"
+                demux_target_shortfall_ms = ?cache_pause_waterline
+                    .demux_min_forward_nsecs
+                    .map(|duration| cache_pause_waterline.target_nsecs.saturating_sub(duration)
+                        as f64
+                        / 1_000_000.0),
+                demux_video_ms = ?cache_pause_waterline
+                    .demux_video_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                demux_audio_ms = ?cache_pause_waterline
+                    .demux_audio_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                demux_forward_bytes = waterline_demux_watermark.forward_bytes,
+                demux_consumer_drainable,
+                resume_reason = "decoded_waterline_with_drainable_demux",
+                "rebuffer cache pause stalled with decoded queues ready and drainable demux packets; resuming from decoded waterline"
             );
             waterline = cache_pause_waterline;
         }

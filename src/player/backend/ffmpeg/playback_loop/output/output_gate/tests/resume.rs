@@ -229,21 +229,36 @@ fn far_ahead_rebuffer_audio_requests_video_master_realign_after_repeated_drops()
             )
             .is_none()
     );
+    assert!(
+        scheduler
+            .observe_rebuffer_far_ahead_audio_frame(
+                182_040_000_000,
+                5_640_000_000,
+                Some(0),
+                false,
+                PlaybackSessionId(1),
+                "test_far_ahead",
+            )
+            .is_none(),
+        "repeated drops arm the continuity watchdog but cannot bypass it"
+    );
+    scheduler.expire_audio_reader_gap_watchdog_for_test();
+
     let request = scheduler
         .observe_rebuffer_far_ahead_audio_frame(
-            182_040_000_000,
+            182_060_000_000,
             5_640_000_000,
             Some(0),
             false,
             PlaybackSessionId(1),
             "test_far_ahead",
         )
-        .expect("third far-ahead drop requests realign");
+        .expect("a persistent continuity gap requests realign after the watchdog expires");
 
     assert_eq!(request.target_timeline_nsecs, 5_680_000_000);
     assert_eq!(request.anchor_timeline_nsecs, 5_640_000_000);
     assert_eq!(request.first_video_timeline_nsecs, 5_680_000_000);
-    assert_eq!(request.far_ahead_drop_count, 3);
+    assert_eq!(request.far_ahead_drop_count, 4);
     assert_eq!(
         scheduler
             .take_rebuffer_audio_realign_request()
@@ -253,7 +268,118 @@ fn far_ahead_rebuffer_audio_requests_video_master_realign_after_repeated_drops()
 }
 
 #[test]
-fn reader_head_far_ahead_rebuffer_empty_audio_requests_realign_immediately() {
+fn coordinator_stall_with_continuous_audio_does_not_realign() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Rebuffering);
+    scheduler.set_video_output_rebuffer_anchor_for_test(RebufferResumeAnchor {
+        timeline_nsecs: 5_640_000_000,
+        reset_to_video_when_decoded_queue_misses_anchor: true,
+    });
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(5_680_000_000));
+    scheduler.record_coordinator_tick(Duration::from_millis(65));
+
+    assert!(
+        scheduler
+            .observe_rebuffer_far_ahead_audio_frame(
+                182_000_000_000,
+                5_640_000_000,
+                Some(500_000_000),
+                true,
+                PlaybackSessionId(1),
+                "test_coordinator_stall",
+            )
+            .is_none()
+    );
+    assert!(!scheduler.rebuffer_audio_realign_request_pending());
+}
+
+#[test]
+fn coordinator_stall_does_not_hide_real_audio_gap_or_duplicate_transaction() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Rebuffering);
+    scheduler.set_video_output_rebuffer_anchor_for_test(RebufferResumeAnchor {
+        timeline_nsecs: 5_640_000_000,
+        reset_to_video_when_decoded_queue_misses_anchor: true,
+    });
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(5_680_000_000));
+    scheduler.record_coordinator_tick(Duration::from_millis(65));
+
+    assert!(
+        scheduler
+            .observe_rebuffer_far_ahead_audio_frame(
+                182_000_000_000,
+                5_640_000_000,
+                Some(0),
+                true,
+                PlaybackSessionId(1),
+                "test_real_audio_gap",
+            )
+            .is_none(),
+        "empty coverage starts the real-gap watchdog instead of seeking immediately"
+    );
+    scheduler.expire_audio_reader_gap_watchdog_for_test();
+
+    let request = scheduler
+        .observe_rebuffer_far_ahead_audio_frame(
+            182_020_000_000,
+            5_640_000_000,
+            Some(0),
+            true,
+            PlaybackSessionId(1),
+            "test_real_audio_gap",
+        )
+        .expect("a real gap requests one realign after the watchdog expires");
+    assert!(
+        scheduler
+            .observe_rebuffer_far_ahead_audio_frame(
+                182_040_000_000,
+                5_640_000_000,
+                Some(0),
+                true,
+                PlaybackSessionId(1),
+                "test_real_audio_gap",
+            )
+            .is_none(),
+        "the same watchdog epoch cannot enqueue a duplicate realign"
+    );
+
+    assert_eq!(request.target_timeline_nsecs, 5_680_000_000);
+    assert!(scheduler.take_rebuffer_audio_realign_request().is_some());
+    assert!(scheduler.take_rebuffer_audio_realign_request().is_none());
+}
+
+#[test]
+fn coordinator_stall_with_audio_output_coverage_suppresses_reader_realign() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Rebuffering);
+    scheduler.set_video_output_rebuffer_anchor_for_test(RebufferResumeAnchor {
+        timeline_nsecs: 15_120_000_000,
+        reset_to_video_when_decoded_queue_misses_anchor: true,
+    });
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(15_120_000_000));
+    scheduler.record_coordinator_tick(Duration::from_millis(65));
+
+    assert!(
+        scheduler
+            .request_output_wait_audio_reader_head_realign_if_needed(
+                20_000_000_000,
+                AudioResumeWaterline {
+                    resume_timeline_nsecs: 15_120_000_000,
+                    target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+                    audio_output_pending_nsecs: Some(500_000_000),
+                    audio_output_buffered_until_nsecs: Some(15_620_000_000),
+                    ..AudioResumeWaterline::default()
+                },
+                15_120_000_000,
+                PlaybackSessionId(1),
+            )
+            .is_none()
+    );
+    assert!(!scheduler.rebuffer_audio_realign_request_pending());
+}
+
+#[test]
+fn reader_head_far_ahead_rebuffer_empty_audio_waits_for_real_gap_watchdog() {
     let mut scheduler = PlaybackOutputScheduler::new();
     scheduler.set_state(PlaybackOutputState::Rebuffering);
     scheduler.set_video_output_rebuffer_anchor_for_test(RebufferResumeAnchor {
@@ -264,21 +390,35 @@ fn reader_head_far_ahead_rebuffer_empty_audio_requests_realign_immediately() {
     scheduler.push_decoded_video_for_test(test_queued_video_frame(15_160_000_000));
     scheduler.set_rebuffer_empty_audio_output_blocked(true);
 
+    let waterline = AudioResumeWaterline {
+        resume_timeline_nsecs: 15_120_000_000,
+        target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+        audio_output_pending_nsecs: Some(0),
+        pending_audio_start_nsecs: Some(15_871_632_256),
+        demux_audio_forward_nsecs: Some(208_000_000_000),
+        ..AudioResumeWaterline::default()
+    };
+    assert!(
+        scheduler
+            .request_output_wait_audio_reader_head_realign_if_needed(
+                16_320_000_000,
+                waterline,
+                14_216_734_626,
+                PlaybackSessionId(1),
+            )
+            .is_none(),
+        "reader head alone cannot trigger realign before the no-progress watchdog expires"
+    );
+    scheduler.expire_audio_reader_gap_watchdog_for_test();
+
     let request = scheduler
         .request_output_wait_audio_reader_head_realign_if_needed(
             16_320_000_000,
-            AudioResumeWaterline {
-                resume_timeline_nsecs: 15_120_000_000,
-                target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
-                audio_output_pending_nsecs: Some(0),
-                pending_audio_start_nsecs: Some(15_871_632_256),
-                demux_audio_forward_nsecs: Some(208_000_000_000),
-                ..AudioResumeWaterline::default()
-            },
+            waterline,
             14_216_734_626,
             PlaybackSessionId(1),
         )
-        .expect("reader head far ahead requests immediate realign");
+        .expect("a real continuity gap requests realign after the watchdog expires");
 
     assert_eq!(request.reason, "rebuffer_audio_reader_far_ahead");
     assert_eq!(request.target_timeline_nsecs, 15_120_000_000);
@@ -291,6 +431,30 @@ fn reader_head_far_ahead_rebuffer_empty_audio_requests_realign_immediately() {
             .take_rebuffer_audio_realign_request()
             .map(|request| request.target_timeline_nsecs),
         Some(15_120_000_000)
+    );
+    scheduler.defer_audio_reader_gap_watchdog_after_input_pending(15_120_000_000);
+    assert!(
+        scheduler
+            .request_output_wait_audio_reader_head_realign_if_needed(
+                16_320_000_000,
+                waterline,
+                14_216_734_626,
+                PlaybackSessionId(1),
+            )
+            .is_none(),
+        "in-flight progress rearms the watchdog instead of losing the request forever"
+    );
+    scheduler.expire_audio_reader_gap_watchdog_for_test();
+    assert!(
+        scheduler
+            .request_output_wait_audio_reader_head_realign_if_needed(
+                16_320_000_000,
+                waterline,
+                14_216_734_626,
+                PlaybackSessionId(1),
+            )
+            .is_some(),
+        "a still-missing gap can request realign again after the rearmed watchdog expires"
     );
 }
 
@@ -351,6 +515,9 @@ fn near_complete_pending_audio_prevents_reader_realign_and_clear() {
                 AudioResumeWaterline {
                     resume_timeline_nsecs: 15_120_000_000,
                     target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+                    audio_accepted_start_timeline_nsecs: Some(15_120_000_000),
+                    audio_accepted_start_gap_nsecs: Some(0),
+                    accepted_contiguous_coverage_nsecs: Some(998_840_000),
                     audio_output_pending_nsecs: Some(0),
                     pending_audio_start_nsecs: Some(15_120_000_000),
                     pending_audio_forward_nsecs: Some(998_840_000),
@@ -367,6 +534,152 @@ fn near_complete_pending_audio_prevents_reader_realign_and_clear() {
 }
 
 #[test]
+fn delayed_audio_within_av_tolerance_and_protected_waterline_does_not_realign() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    let resume_nsecs = 62_521_000_000;
+    let delayed_start_nsecs = resume_nsecs + 71_000_000;
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(resume_nsecs));
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 1_056_000_000,
+        },
+        delayed_start_nsecs,
+        delayed_start_nsecs + 1_056_000_000,
+    );
+
+    let coverage = scheduler.audio_realign_coverage(
+        resume_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+    );
+
+    assert!(coverage.ready);
+    assert_eq!(
+        coverage.audio_accepted_start_timeline_nsecs,
+        Some(delayed_start_nsecs)
+    );
+    assert_eq!(coverage.start_gap_nsecs, Some(71_000_000));
+    assert_eq!(coverage.contiguous_coverage_nsecs, Some(1_056_000_000));
+    assert!(
+        scheduler
+            .request_output_wait_audio_reader_head_realign_if_needed(
+                resume_nsecs + 5_000_000_000,
+                AudioResumeWaterline {
+                    resume_timeline_nsecs: resume_nsecs,
+                    target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+                    audio_accepted_start_timeline_nsecs: coverage
+                        .audio_accepted_start_timeline_nsecs,
+                    audio_accepted_start_gap_nsecs: coverage.start_gap_nsecs,
+                    accepted_contiguous_coverage_nsecs: coverage.contiguous_coverage_nsecs,
+                    audio_output_pending_nsecs: Some(0),
+                    ..AudioResumeWaterline::default()
+                },
+                resume_nsecs,
+                PlaybackSessionId(1),
+            )
+            .is_none(),
+        "71ms delayed audio with 1.056s coverage must not reader-realign"
+    );
+}
+
+#[test]
+fn delayed_audio_beyond_av_tolerance_requires_a_stalled_gap_before_realign() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    let resume_nsecs = 62_521_000_000;
+    let delayed_start_nsecs = resume_nsecs + 81_000_000;
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(resume_nsecs));
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 1_056_000_000,
+        },
+        delayed_start_nsecs,
+        delayed_start_nsecs + 1_056_000_000,
+    );
+
+    let coverage = scheduler.audio_realign_coverage(
+        resume_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+    );
+    assert!(!coverage.ready);
+    assert_eq!(coverage.audio_accepted_start_timeline_nsecs, None);
+    let waterline = AudioResumeWaterline {
+        resume_timeline_nsecs: resume_nsecs,
+        target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+        audio_output_pending_nsecs: Some(0),
+        ..AudioResumeWaterline::default()
+    };
+    assert!(
+        scheduler
+            .request_output_wait_audio_reader_head_realign_if_needed(
+                resume_nsecs + 5_000_000_000,
+                waterline,
+                resume_nsecs,
+                PlaybackSessionId(1),
+            )
+            .is_none(),
+        "reader head first arms the no-progress watchdog"
+    );
+    scheduler.expire_audio_reader_gap_watchdog_for_test();
+    assert!(
+        scheduler
+            .request_output_wait_audio_reader_head_realign_if_needed(
+                resume_nsecs + 5_000_000_000,
+                waterline,
+                resume_nsecs,
+                PlaybackSessionId(1),
+            )
+            .is_some(),
+        "the confirmed stalled gap can realign after the watchdog expires"
+    );
+}
+
+#[test]
+fn delayed_audio_with_partial_resume_coverage_does_not_realign_from_reader_head() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    let resume_nsecs = 62_521_000_000;
+    let delayed_start_nsecs = resume_nsecs + 71_000_000;
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(resume_nsecs));
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 849_000_000,
+        },
+        delayed_start_nsecs,
+        delayed_start_nsecs + 849_000_000,
+    );
+
+    let coverage = scheduler.audio_realign_coverage(
+        resume_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+    );
+
+    assert!(!coverage.ready);
+    assert_eq!(coverage.start_gap_nsecs, Some(71_000_000));
+    assert_eq!(coverage.contiguous_coverage_nsecs, Some(849_000_000));
+    assert!(
+        scheduler
+            .request_output_wait_audio_reader_head_realign_if_needed(
+                resume_nsecs + 5_000_000_000,
+                AudioResumeWaterline {
+                    resume_timeline_nsecs: resume_nsecs,
+                    target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+                    audio_accepted_start_timeline_nsecs: coverage
+                        .audio_accepted_start_timeline_nsecs,
+                    audio_accepted_start_gap_nsecs: coverage.start_gap_nsecs,
+                    accepted_contiguous_coverage_nsecs: coverage.contiguous_coverage_nsecs,
+                    audio_output_pending_nsecs: Some(0),
+                    ..AudioResumeWaterline::default()
+                },
+                resume_nsecs,
+                PlaybackSessionId(1),
+            )
+            .is_none(),
+        "partial continuous coverage is consumed instead of treating the producer cursor as a gap"
+    );
+}
+
+#[test]
 fn startup_reader_head_gap_requests_realign_before_playback_resume() {
     let mut scheduler = PlaybackOutputScheduler::new();
     scheduler.push_decoded_video_for_test(test_queued_video_frame(202_550_000_000));
@@ -378,7 +691,7 @@ fn startup_reader_head_gap_requests_realign_before_playback_resume() {
         202_570_884_290,
         204_567_800_334,
     );
-    let waterline = AudioResumeWaterline {
+    let mut waterline = AudioResumeWaterline {
         resume_timeline_nsecs: 202_550_000_000,
         target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
         audio_output_pending_nsecs: Some(0),
@@ -400,6 +713,30 @@ fn startup_reader_head_gap_requests_realign_before_playback_resume() {
         "reader packets represented by queued/in-flight decode work are not a continuity gap"
     );
 
+    assert!(
+        scheduler
+            .request_output_wait_audio_reader_head_realign_if_needed(
+                212_021_405_896,
+                waterline,
+                202_549_751_669,
+                PlaybackSessionId(1),
+            )
+            .is_none(),
+        "in-flight decode work prevents reader-head realign regardless of producer distance"
+    );
+    waterline.audio_decode_in_flight_packets = 0;
+    waterline.audio_decode_queued_nsecs = 0;
+    assert!(
+        scheduler
+            .request_output_wait_audio_reader_head_realign_if_needed(
+                212_021_405_896,
+                waterline,
+                202_549_751_669,
+                PlaybackSessionId(1),
+            )
+            .is_none()
+    );
+    scheduler.expire_audio_reader_gap_watchdog_for_test();
     let request = scheduler
         .request_output_wait_audio_reader_head_realign_if_needed(
             212_021_405_896,
@@ -407,7 +744,7 @@ fn startup_reader_head_gap_requests_realign_before_playback_resume() {
             202_549_751_669,
             PlaybackSessionId(1),
         )
-        .expect("reader head beyond continuous and admitted audio requests realign");
+        .expect("a stalled gap with no queued or in-flight work requests realign");
 
     assert_eq!(request.reason, "output_wait_audio_reader_continuity_gap");
     assert_eq!(request.target_timeline_nsecs, 202_550_000_000);

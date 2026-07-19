@@ -1,4 +1,7 @@
-use std::sync::{atomic::AtomicBool, mpsc::Sender};
+use std::{
+    sync::{atomic::AtomicBool, mpsc::Sender},
+    time::Instant,
+};
 
 use crate::player::{
     backend::BackendEvent,
@@ -584,8 +587,15 @@ fn present_due_audio_clocked_frames_to_vo(
     let pop_result = queued_video_frames.pop_audio_clocked_frame(played_until_nsecs);
     let mut made_progress = pop_result.dropped_frames > 0;
     if pop_result.dropped_frames > 0 {
+        let recent_coordinator_stall = queued_video_frames.recent_coordinator_stall(Instant::now());
         tracing::debug!(
             dropped_video_frames = pop_result.dropped_frames,
+            scheduler_dropped_video_frames =
+                queued_video_frames.scheduler_dropped_video_frames(),
+            recent_coordinator_stall_ms = ?recent_coordinator_stall
+                .map(|stall| stall.elapsed.as_secs_f64() * 1000.0),
+            recent_coordinator_stall_age_ms = ?recent_coordinator_stall
+                .map(|stall| stall.age.as_secs_f64() * 1000.0),
             played_until_nsecs,
             queued_video_frames = queued_video_frames.len(),
             "VO admission dropped stale audio-clocked video frames"

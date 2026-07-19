@@ -2,7 +2,7 @@
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::{
     AvPacket, AvPacketStorageKind, CachedDemuxPacket, CachedDemuxPacketPayload,
-    CachedDemuxPacketRecovery, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+    CachedDemuxPacketRecovery, CachedSeekMissReason, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
     DEMUX_PACKET_APPEND_TRIM_INTERVAL, DEMUX_PACKET_APPEND_TRIM_STEP_LIMIT,
     DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS, DEMUX_PACKET_CACHE_STATE_REPORT_INTERVAL,
     DEMUX_PACKET_READ_TRIM_INTERVAL, DEMUX_PACKET_READ_TRIM_MEMORY_OVERRUN_INTERVAL,

@@ -362,6 +362,23 @@ impl PlaybackPipelineSnapshot {
             audio_decode_pending_input_capacity = ?audio_decode_pending_input_capacity,
             audio_decode_pending_input_full = ?audio_decode_pending_input_full,
             audio_decode_in_flight_packets = ?audio_decode_in_flight_packets,
+            audio_decode_recovery_generation = ?self
+                .audio_decode_snapshot
+                .and_then(|snapshot| snapshot.recovery_generation),
+            audio_decode_recovery_elapsed_ms = ?self
+                .audio_decode_snapshot
+                .and_then(|snapshot| snapshot.recovery_elapsed)
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+            audio_decode_flush_command_sent = ?self
+                .audio_decode_snapshot
+                .map(|snapshot| snapshot.flush_command_sent),
+            audio_decode_stale_results_discarded = ?self
+                .audio_decode_snapshot
+                .map(|snapshot| snapshot.stale_results_discarded),
+            audio_decode_last_result_progress_ms = ?self
+                .audio_decode_snapshot
+                .and_then(|snapshot| snapshot.last_result_progress_elapsed)
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
             subtitle_decode_state = ?subtitle_decode_state,
             subtitle_decode_blocked_on =
                 ?self.subtitle_decode_blocked_on.map(PlaybackBlockReason::as_str),
@@ -384,6 +401,16 @@ impl PlaybackPipelineSnapshot {
                 .output_snapshot
                 .queued_video_largest_gap_nsecs
                 .map(|gap| gap as f64 / 1_000_000.0),
+            scheduler_dropped_video_frames =
+                self.output_snapshot.scheduler_dropped_video_frames,
+            recent_coordinator_stall_ms = ?self
+                .output_snapshot
+                .recent_coordinator_stall_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
+            recent_coordinator_stall_age_ms = ?self
+                .output_snapshot
+                .recent_coordinator_stall_age_nsecs
+                .map(|duration| duration as f64 / 1_000_000.0),
             output_rebuffering = self.output_snapshot.rebuffering,
             output_video_low_water = self.output_snapshot.video_output_low_water,
             output_rebuffer_anchor = ?self.output_snapshot.video_output_rebuffer_anchor,
@@ -479,6 +506,7 @@ fn decoder_backpressure_reasons(
         matches!(
             reason,
             PlaybackBlockReason::PacketQueueFull
+                | PlaybackBlockReason::DecoderRecovery
                 | PlaybackBlockReason::DecoderInFlight
                 | PlaybackBlockReason::DecoderOutputPending
                 | PlaybackBlockReason::DecodedVideoQueue

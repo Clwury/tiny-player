@@ -113,6 +113,23 @@ pub(in crate::player::backend::ffmpeg) struct RebufferAudioRealignRequest {
     pub(in crate::player::backend::ffmpeg) reason: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) struct AudioRealignCoverage {
+    pub(in crate::player::backend::ffmpeg) audio_accepted_start_timeline_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) start_gap_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) contiguous_coverage_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) protected_target_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg) ready: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) struct AudioReaderGapWatchdog {
+    target_timeline_nsecs: u64,
+    last_progress_nsecs: u64,
+    last_progress_at: Instant,
+    request_issued: bool,
+}
+
 pub(in crate::player::backend::ffmpeg) struct PlaybackOutputScheduler {
     pub(in crate::player::backend::ffmpeg::playback_loop) scheduled_video_queue:
         ScheduledVideoQueue,
@@ -131,6 +148,8 @@ pub(in crate::player::backend::ffmpeg) struct PlaybackOutputScheduler {
         Option<u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop) rebuffer_audio_realign_request:
         Option<RebufferAudioRealignRequest>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) audio_reader_gap_watchdog:
+        Option<AudioReaderGapWatchdog>,
     syncing_started_at: Option<Instant>,
     defer_pending_start_audio_flush_once: bool,
     startup_pending_audio_pressure_context_active: bool,
@@ -164,4 +183,7 @@ pub(in crate::player::backend::ffmpeg) struct PlaybackOutputSnapshot {
     pub(in crate::player::backend::ffmpeg) video_bootstrap_after_seek: bool,
     pub(in crate::player::backend::ffmpeg) video_decode_underfill: bool,
     pub(in crate::player::backend::ffmpeg) rebuffer_empty_audio_output_blocked: bool,
+    pub(in crate::player::backend::ffmpeg) scheduler_dropped_video_frames: u64,
+    pub(in crate::player::backend::ffmpeg) recent_coordinator_stall_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) recent_coordinator_stall_age_nsecs: Option<u64>,
 }

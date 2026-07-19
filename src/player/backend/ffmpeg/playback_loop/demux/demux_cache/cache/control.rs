@@ -25,6 +25,27 @@ impl DemuxPacketCache {
         session_id: PlaybackSessionId,
         seek_generation: u64,
     ) -> DemuxSeekResult {
+        self.seek_with_policy(position_seconds, mode, session_id, seek_generation, true)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn seek_cached_only(
+        &self,
+        position_seconds: f64,
+        mode: PlaybackSeekMode,
+        session_id: PlaybackSessionId,
+        seek_generation: u64,
+    ) -> DemuxSeekResult {
+        self.seek_with_policy(position_seconds, mode, session_id, seek_generation, false)
+    }
+
+    fn seek_with_policy(
+        &self,
+        position_seconds: f64,
+        mode: PlaybackSeekMode,
+        session_id: PlaybackSessionId,
+        seek_generation: u64,
+        low_level_on_miss: bool,
+    ) -> DemuxSeekResult {
         let position_seconds = position_seconds.max(0.0);
         let target_nsecs = seconds_to_nsecs(position_seconds);
         let (result, should_enter_initial_cache_pause, cache_snapshot, buffered_changed) = {
@@ -34,96 +55,136 @@ impl DemuxPacketCache {
                 .lock()
                 .expect("FFmpeg demux packet cache poisoned");
             guard.error = None;
-            if let Some(hit) = guard.seek_cached_with_generation_hit(
+            match guard.seek_cached_with_generation_attempt(
                 target_nsecs,
                 mode,
                 session_id,
                 seek_generation,
             ) {
-                let cached_seek_info = DemuxCachedSeekInfo {
-                    range_id: hit.range_id,
-                    target_nsecs: hit.target_nsecs,
-                    anchor_nsecs: hit.anchor_nsecs,
-                    preroll_nsecs: hit.preroll_nsecs,
-                    anchor_packet_id: hit.anchor_packet_id,
-                    anchor_kind: hit.anchor_kind,
-                    anchor_is_safe_seek_point: hit.anchor_is_safe_seek_point,
-                    requires_precise_trim: hit.requires_precise_trim,
-                };
-                let buffered_until = nsecs_to_seconds(hit.buffered_until_nsecs);
-                let audio_reader_head = guard
-                    .selected_streams
-                    .audio_stream
-                    .and_then(|stream| hit.reader_heads.get(&stream.index).copied());
-                let subtitle_reader_head = guard
-                    .selected_streams
-                    .subtitle_stream
-                    .and_then(|stream| hit.reader_heads.get(&stream.index).copied());
-                let subtitle_reader_head_start_nsecs = guard
-                    .selected_streams
-                    .subtitle_stream
-                    .and_then(|stream| guard.stream_reader_head_timeline(stream.index))
-                    .and_then(|(_, start_nsecs, _)| start_nsecs);
-                tracing::debug!(
-                    ?session_id,
-                    position_seconds,
-                    ?mode,
-                    target_nsecs,
-                    cached_seek_target_nsecs = hit.target_nsecs,
-                    anchor_nsecs = hit.anchor_nsecs,
-                    anchor_packet_id = hit.anchor_packet_id,
-                    anchor_kind = hit.anchor_kind.as_str(),
-                    video_reader_head = hit.video_reader_head,
-                    ?audio_reader_head,
-                    ?subtitle_reader_head,
-                    ?subtitle_reader_head_start_nsecs,
-                    anchor_is_recovery_point = hit.anchor_is_recovery_point,
-                    anchor_is_safe_seek_point = hit.anchor_is_safe_seek_point,
-                    cached_seek_preroll_nsecs = hit.preroll_nsecs,
-                    requires_precise_trim = hit.requires_precise_trim,
-                    seek_generation,
-                    buffered_until,
-                    read_index = guard.read_index,
-                    generation = guard.generation,
-                    "FFmpeg demux packet cache seek hit"
-                );
-                let cache_snapshot =
-                    guard.cache_report_snapshot(self.shared.control.is_cache_paused());
-                let buffered_changed =
-                    guard.take_buffered_changed_for_cache_end(cache_snapshot.cache_end());
-                guard.record_cache_state_emit(Instant::now());
-                guard.record_emitted_seekable_ranges(cache_snapshot.seekable_ranges().clone());
-                self.shared.refresh_monitor_snapshot(&guard);
-                (
-                    DemuxSeekResult::Cached(cached_seek_info),
-                    false,
-                    cache_snapshot,
-                    buffered_changed,
-                )
-            } else {
-                guard.request_seek(position_seconds, session_id, seek_generation, target_nsecs);
-                tracing::debug!(
-                    ?session_id,
-                    position_seconds,
-                    ?mode,
-                    target_nsecs,
-                    seek_generation,
-                    generation = guard.generation,
-                    "FFmpeg demux packet cache seek miss; requested low-level seek"
-                );
-                let cache_snapshot =
-                    guard.cache_report_snapshot(self.shared.control.is_cache_paused());
-                let buffered_changed =
-                    guard.take_buffered_changed_for_cache_end(cache_snapshot.cache_end());
-                guard.record_cache_state_emit(Instant::now());
-                guard.record_emitted_seekable_ranges(cache_snapshot.seekable_ranges().clone());
-                self.shared.refresh_monitor_snapshot(&guard);
-                (
-                    DemuxSeekResult::Requested,
-                    guard.cache_pause_initial,
-                    cache_snapshot,
-                    buffered_changed,
-                )
+                Ok(hit) => {
+                    let cached_seek_info = DemuxCachedSeekInfo {
+                        range_id: hit.range_id,
+                        target_nsecs: hit.target_nsecs,
+                        anchor_nsecs: hit.anchor_nsecs,
+                        preroll_nsecs: hit.preroll_nsecs,
+                        anchor_packet_id: hit.anchor_packet_id,
+                        anchor_kind: hit.anchor_kind,
+                        anchor_is_safe_seek_point: hit.anchor_is_safe_seek_point,
+                        requires_precise_trim: hit.requires_precise_trim,
+                    };
+                    let buffered_until = nsecs_to_seconds(hit.buffered_until_nsecs);
+                    let audio_reader_head = guard
+                        .selected_streams
+                        .audio_stream
+                        .and_then(|stream| hit.reader_heads.get(&stream.index).copied());
+                    let subtitle_reader_head = guard
+                        .selected_streams
+                        .subtitle_stream
+                        .and_then(|stream| hit.reader_heads.get(&stream.index).copied());
+                    let subtitle_reader_head_start_nsecs = guard
+                        .selected_streams
+                        .subtitle_stream
+                        .and_then(|stream| guard.stream_reader_head_timeline(stream.index))
+                        .and_then(|(_, start_nsecs, _)| start_nsecs);
+                    tracing::debug!(
+                        ?session_id,
+                        position_seconds,
+                        ?mode,
+                        target_nsecs,
+                        cached_seek_target_nsecs = hit.target_nsecs,
+                        anchor_nsecs = hit.anchor_nsecs,
+                        anchor_packet_id = hit.anchor_packet_id,
+                        anchor_kind = hit.anchor_kind.as_str(),
+                        video_reader_head = hit.video_reader_head,
+                        ?audio_reader_head,
+                        ?subtitle_reader_head,
+                        ?subtitle_reader_head_start_nsecs,
+                        anchor_is_recovery_point = hit.anchor_is_recovery_point,
+                        anchor_is_safe_seek_point = hit.anchor_is_safe_seek_point,
+                        cached_seek_preroll_nsecs = hit.preroll_nsecs,
+                        requires_precise_trim = hit.requires_precise_trim,
+                        seek_generation,
+                        buffered_until,
+                        read_index = guard.read_index,
+                        generation = guard.generation,
+                        "FFmpeg demux packet cache seek hit"
+                    );
+                    let cache_snapshot =
+                        guard.cache_report_snapshot(self.shared.control.is_cache_paused());
+                    let buffered_changed =
+                        guard.take_buffered_changed_for_cache_end(cache_snapshot.cache_end());
+                    guard.record_cache_state_emit(Instant::now());
+                    guard.record_emitted_seekable_ranges(cache_snapshot.seekable_ranges().clone());
+                    self.shared.refresh_monitor_snapshot(&guard);
+                    (
+                        DemuxSeekResult::Cached(cached_seek_info),
+                        false,
+                        cache_snapshot,
+                        buffered_changed,
+                    )
+                }
+                Err(miss) => {
+                    if let Some(range_id) = miss.range_id {
+                        tracing::warn!(
+                            ?session_id,
+                            position_seconds,
+                            ?mode,
+                            target_nsecs,
+                            range_id,
+                            rejection_reason = miss.reason.as_str(),
+                            seek_generation,
+                            "cached seek target inside advertised range was rejected; retracting range"
+                        );
+                    }
+                    if low_level_on_miss {
+                        guard.request_seek(
+                            position_seconds,
+                            session_id,
+                            seek_generation,
+                            target_nsecs,
+                        );
+                        tracing::debug!(
+                            ?session_id,
+                            position_seconds,
+                            ?mode,
+                            target_nsecs,
+                            cached_seek_rejection_range_id = ?miss.range_id,
+                            cached_seek_rejection_reason = miss.reason.as_str(),
+                            seek_generation,
+                            generation = guard.generation,
+                            "FFmpeg demux packet cache seek miss; requested low-level seek"
+                        );
+                    } else {
+                        tracing::debug!(
+                            ?session_id,
+                            position_seconds,
+                            ?mode,
+                            target_nsecs,
+                            cached_seek_rejection_range_id = ?miss.range_id,
+                            cached_seek_rejection_reason = miss.reason.as_str(),
+                            seek_generation,
+                            generation = guard.generation,
+                            "FFmpeg demux packet cache-only seek unavailable; low-level seek suppressed"
+                        );
+                    }
+                    let cache_snapshot =
+                        guard.cache_report_snapshot(self.shared.control.is_cache_paused());
+                    let buffered_changed =
+                        guard.take_buffered_changed_for_cache_end(cache_snapshot.cache_end());
+                    guard.record_cache_state_emit(Instant::now());
+                    guard.record_emitted_seekable_ranges(cache_snapshot.seekable_ranges().clone());
+                    self.shared.refresh_monitor_snapshot(&guard);
+                    (
+                        if low_level_on_miss {
+                            DemuxSeekResult::Requested
+                        } else {
+                            DemuxSeekResult::Unavailable
+                        },
+                        low_level_on_miss && guard.cache_pause_initial,
+                        cache_snapshot,
+                        buffered_changed,
+                    )
+                }
             }
         };
         let cache_state = cache_snapshot.into_cache_state();

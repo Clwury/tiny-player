@@ -7,6 +7,7 @@ use super::{
     DEFAULT_VIDEO_FRAME_DURATION_NSECS, DemuxSelectedStreams, PlaybackSessionId, StreamInfo,
     TimestampMapper, VideoRecoveryPointKind, packet_duration_nsecs, packet_is_audio_recovery_point,
     packet_is_video_seek_point, packet_video_recovery_point_kind, seconds_to_nsecs,
+    timestamp_to_nsecs,
 };
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxPacketTimeline {
@@ -18,6 +19,9 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxP
     video_clock: TimestampMapper,
     audio_clock: TimestampMapper,
     subtitle_clock: TimestampMapper,
+    video_seek_clock: DemuxSeekTimestampMapper,
+    audio_seek_clock: DemuxSeekTimestampMapper,
+    subtitle_seek_clock: DemuxSeekTimestampMapper,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) buffered_reporter:
         BufferedReporter,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) session_id:
@@ -58,6 +62,18 @@ impl DemuxPacketTimeline {
                 current_start_position_nsecs,
                 None,
             ),
+            video_seek_clock: DemuxSeekTimestampMapper::new(
+                video_stream.start_nsecs,
+                current_start_position_nsecs,
+            ),
+            audio_seek_clock: DemuxSeekTimestampMapper::new(
+                audio_stream.and_then(|stream| stream.start_nsecs),
+                current_start_position_nsecs,
+            ),
+            subtitle_seek_clock: DemuxSeekTimestampMapper::new(
+                subtitle_stream.and_then(|stream| stream.start_nsecs),
+                current_start_position_nsecs,
+            ),
             buffered_reporter,
             session_id,
         }
@@ -86,6 +102,14 @@ impl DemuxPacketTimeline {
             self.current_start_position_nsecs,
             None,
         );
+        self.audio_seek_clock = DemuxSeekTimestampMapper::new(
+            self.audio_stream.and_then(|stream| stream.start_nsecs),
+            self.current_start_position_nsecs,
+        );
+        self.subtitle_seek_clock = DemuxSeekTimestampMapper::new(
+            self.subtitle_stream.and_then(|stream| stream.start_nsecs),
+            self.current_start_position_nsecs,
+        );
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn reset(
@@ -112,6 +136,18 @@ impl DemuxPacketTimeline {
             self.current_start_position_nsecs,
             None,
         );
+        self.video_seek_clock = DemuxSeekTimestampMapper::new(
+            self.video_stream.start_nsecs,
+            self.current_start_position_nsecs,
+        );
+        self.audio_seek_clock = DemuxSeekTimestampMapper::new(
+            self.audio_stream.and_then(|stream| stream.start_nsecs),
+            self.current_start_position_nsecs,
+        );
+        self.subtitle_seek_clock = DemuxSeekTimestampMapper::new(
+            self.subtitle_stream.and_then(|stream| stream.start_nsecs),
+            self.current_start_position_nsecs,
+        );
         self.buffered_reporter = BufferedReporter::new_with_events(false, false);
         self.buffered_reporter
             .reset_to(position_seconds, session_id, event_tx);
@@ -125,7 +161,9 @@ impl DemuxPacketTimeline {
         if !self.should_cache_stream(packet.stream_index()) {
             return Ok(None);
         }
-        let (start_nsecs, end_nsecs) = self.packet_timeline_range(packet);
+        let timestamps = self.packet_timestamps(packet);
+        let start_nsecs = timestamps.start_nsecs;
+        let end_nsecs = timestamps.end_nsecs;
         if packet.stream_index() == self.video_stream.index
             && let Some(end_nsecs) = end_nsecs
         {
@@ -156,6 +194,7 @@ impl DemuxPacketTimeline {
             },
             start_nsecs,
             end_nsecs,
+            timestamps.seek_timestamp_nsecs,
         )
         .map(Some)
     }
@@ -173,14 +212,27 @@ impl DemuxPacketTimeline {
                 .is_some_and(|stream| stream.index == stream_index)
     }
 
-    fn packet_timeline_range(&mut self, packet: &AvPacket) -> (Option<u64>, Option<u64>) {
+    fn packet_timestamps(&mut self, packet: &AvPacket) -> DemuxPacketTimestamps {
         if packet.stream_index() == self.video_stream.index {
-            let timestamp = packet.best_timestamp().unwrap_or(ffi::AV_NOPTS_VALUE);
+            let raw_timestamp = packet.best_timestamp();
+            let timestamp = raw_timestamp.unwrap_or(ffi::AV_NOPTS_VALUE);
             let mapped = self.video_clock.map(timestamp, self.video_stream.time_base);
-            let duration_nsecs = packet_duration_nsecs(packet, self.video_stream)
-                .unwrap_or(self.video_frame_duration_nsecs);
-            let end_nsecs = mapped.timeline_nsecs.saturating_add(duration_nsecs);
-            return (Some(mapped.timeline_nsecs), Some(end_nsecs));
+            let seek_timestamp_nsecs = self
+                .video_seek_clock
+                .map(raw_timestamp, self.video_stream.time_base);
+            let end_nsecs = packet_end_timeline_nsecs(
+                packet,
+                self.video_stream,
+                timestamp,
+                mapped.timeline_nsecs,
+                Some(self.video_frame_duration_nsecs),
+            )
+            .unwrap_or(mapped.timeline_nsecs);
+            return DemuxPacketTimestamps {
+                start_nsecs: Some(mapped.timeline_nsecs),
+                end_nsecs: Some(end_nsecs),
+                seek_timestamp_nsecs,
+            };
         }
         let Some(audio_stream) = self
             .audio_stream
@@ -190,22 +242,42 @@ impl DemuxPacketTimeline {
                 .subtitle_stream
                 .filter(|stream| packet.stream_index() == stream.index)
             else {
-                return (None, None);
+                return DemuxPacketTimestamps::default();
             };
-            let timestamp = packet.best_timestamp().unwrap_or(ffi::AV_NOPTS_VALUE);
+            let raw_timestamp = packet.best_timestamp();
+            let timestamp = raw_timestamp.unwrap_or(ffi::AV_NOPTS_VALUE);
             let mapped = self
                 .subtitle_clock
                 .map(timestamp, subtitle_stream.time_base);
-            let end_nsecs = packet_duration_nsecs(packet, subtitle_stream)
-                .map(|duration| mapped.timeline_nsecs.saturating_add(duration))
-                .or(Some(mapped.timeline_nsecs));
-            return (Some(mapped.timeline_nsecs), end_nsecs);
+            let seek_timestamp_nsecs = self
+                .subtitle_seek_clock
+                .map(raw_timestamp, subtitle_stream.time_base);
+            let end_nsecs = packet_end_timeline_nsecs(
+                packet,
+                subtitle_stream,
+                timestamp,
+                mapped.timeline_nsecs,
+                Some(0),
+            );
+            return DemuxPacketTimestamps {
+                start_nsecs: Some(mapped.timeline_nsecs),
+                end_nsecs,
+                seek_timestamp_nsecs,
+            };
         };
-        let timestamp = packet.best_timestamp().unwrap_or(ffi::AV_NOPTS_VALUE);
+        let raw_timestamp = packet.best_timestamp();
+        let timestamp = raw_timestamp.unwrap_or(ffi::AV_NOPTS_VALUE);
         let mapped = self.audio_clock.map(timestamp, audio_stream.time_base);
-        let end_nsecs = packet_duration_nsecs(packet, audio_stream)
-            .map(|duration| mapped.timeline_nsecs.saturating_add(duration));
-        (Some(mapped.timeline_nsecs), end_nsecs)
+        let seek_timestamp_nsecs = self
+            .audio_seek_clock
+            .map(raw_timestamp, audio_stream.time_base);
+        let end_nsecs =
+            packet_end_timeline_nsecs(packet, audio_stream, timestamp, mapped.timeline_nsecs, None);
+        DemuxPacketTimestamps {
+            start_nsecs: Some(mapped.timeline_nsecs),
+            end_nsecs,
+            seek_timestamp_nsecs,
+        }
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn buffered_until(
@@ -220,4 +292,70 @@ impl DemuxPacketTimeline {
     ) {
         self.session_id = session_id;
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DemuxPacketTimestamps {
+    start_nsecs: Option<u64>,
+    end_nsecs: Option<u64>,
+    seek_timestamp_nsecs: Option<u64>,
+}
+
+/// Maps valid packet PTS/DTS to the media timeline without rewriting legal
+/// presentation reordering. Missing timestamps stay missing, matching mpv's
+/// `compute_keyframe_times()` behavior for `MP_NOPTS_VALUE` packets.
+#[derive(Clone)]
+struct DemuxSeekTimestampMapper {
+    stream_start_nsecs: Option<u64>,
+    fallback_first_nsecs: Option<u64>,
+    start_position_nsecs: u64,
+}
+
+impl DemuxSeekTimestampMapper {
+    fn new(stream_start_nsecs: Option<u64>, start_position_nsecs: u64) -> Self {
+        Self {
+            stream_start_nsecs,
+            fallback_first_nsecs: None,
+            start_position_nsecs,
+        }
+    }
+
+    fn map(&mut self, timestamp: Option<i64>, time_base: ffi::AVRational) -> Option<u64> {
+        let timestamp_nsecs = timestamp_to_nsecs(timestamp?, time_base)?;
+        if let Some(stream_start_nsecs) = self.stream_start_nsecs {
+            return Some(timestamp_nsecs.saturating_sub(stream_start_nsecs));
+        }
+
+        let first_nsecs = *self.fallback_first_nsecs.get_or_insert(timestamp_nsecs);
+        Some(if timestamp_nsecs >= first_nsecs {
+            self.start_position_nsecs
+                .saturating_add(timestamp_nsecs - first_nsecs)
+        } else {
+            self.start_position_nsecs
+                .saturating_sub(first_nsecs - timestamp_nsecs)
+        })
+    }
+}
+
+fn packet_end_timeline_nsecs(
+    packet: &AvPacket,
+    stream: StreamInfo,
+    timestamp: i64,
+    start_timeline_nsecs: u64,
+    fallback_duration_nsecs: Option<u64>,
+) -> Option<u64> {
+    // Rescaling an absolute timestamp and a duration independently is not
+    // additive for rational time bases. Convert timestamp + duration instead,
+    // then apply that exact delta to the already-mapped packet start. This
+    // keeps adjacent packet boundaries identical without accumulating drift.
+    let exact_duration_nsecs = packet.duration().and_then(|duration| {
+        let end_timestamp = timestamp.checked_add(duration)?;
+        let start_nsecs = timestamp_to_nsecs(timestamp, stream.time_base)?;
+        let end_nsecs = timestamp_to_nsecs(end_timestamp, stream.time_base)?;
+        end_nsecs.checked_sub(start_nsecs)
+    });
+    exact_duration_nsecs
+        .or_else(|| packet_duration_nsecs(packet, stream))
+        .or(fallback_duration_nsecs)
+        .map(|duration| start_timeline_nsecs.saturating_add(duration))
 }

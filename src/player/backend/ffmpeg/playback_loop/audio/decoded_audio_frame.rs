@@ -263,6 +263,31 @@ struct ReadyAudioDecodeOutputTiming {
     completed_packets: u64,
 }
 
+trait AudioDecodeOutputDrainWorker {
+    fn service_for_output_drain(&mut self) -> std::result::Result<(), String>;
+    fn front_generation_for_output_drain(&self) -> Option<u64>;
+}
+
+impl AudioDecodeOutputDrainWorker for AudioDecodePipeline {
+    fn service_for_output_drain(&mut self) -> std::result::Result<(), String> {
+        self.service_worker()
+    }
+
+    fn front_generation_for_output_drain(&self) -> Option<u64> {
+        self.front_generation()
+    }
+}
+
+fn service_audio_worker_before_front_generation<W>(
+    worker: &mut W,
+) -> std::result::Result<Option<u64>, String>
+where
+    W: AudioDecodeOutputDrainWorker,
+{
+    worker.service_for_output_drain()?;
+    Ok(worker.front_generation_for_output_drain())
+}
+
 fn log_ready_audio_decode_output_timing(
     session_id: PlaybackSessionId,
     total: Duration,
@@ -335,7 +360,7 @@ pub(super) fn drain_ready_audio_decode_output(
         let Some(worker) = audio_decode_pipeline.as_deref_mut() else {
             break;
         };
-        let Some(front_generation) = worker.front_generation() else {
+        let Some(front_generation) = service_audio_worker_before_front_generation(worker)? else {
             break;
         };
         let stage_started_at = Instant::now();
@@ -531,9 +556,38 @@ pub(super) fn process_audio_decode_drain_result(
 #[cfg(test)]
 mod tests {
     use super::{
+        AudioDecodeOutputDrainWorker,
         decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before as drops_before_sync_watermark,
         far_ahead_audio_frame_is_contiguous, keep_filling_audio_resume_waterline,
+        service_audio_worker_before_front_generation,
     };
+
+    #[derive(Default)]
+    struct RecoveringWorkerWithoutTrackedGeneration {
+        serviced: bool,
+    }
+
+    impl AudioDecodeOutputDrainWorker for RecoveringWorkerWithoutTrackedGeneration {
+        fn service_for_output_drain(&mut self) -> std::result::Result<(), String> {
+            self.serviced = true;
+            Ok(())
+        }
+
+        fn front_generation_for_output_drain(&self) -> Option<u64> {
+            assert!(self.serviced, "worker recovery must be serviced first");
+            None
+        }
+    }
+
+    #[test]
+    fn audio_output_drain_services_recovery_without_front_generation() {
+        let mut worker = RecoveringWorkerWithoutTrackedGeneration::default();
+
+        let front_generation = service_audio_worker_before_front_generation(&mut worker).unwrap();
+
+        assert!(worker.serviced);
+        assert_eq!(front_generation, None);
+    }
 
     #[test]
     fn decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before() {

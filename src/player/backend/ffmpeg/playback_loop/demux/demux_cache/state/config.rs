@@ -1,14 +1,16 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     os::raw::c_int,
+    time::Instant,
 };
 
 use ffmpeg_sys_next as ffi;
 
 use super::{
     DemuxCachedRange, DemuxPacketCacheState, DemuxPacketDiskCache, DemuxSelectedStreams,
-    PlaybackCacheConfig, PlaybackCacheMode, PlaybackSessionId, StreamCacheKind,
-    audio_codec_requires_recovery_point, demux_packet_cache_hysteresis_nsecs,
+    PlaybackCacheConfig, PlaybackCacheMode, PlaybackSessionId, PreparedSeekableRangeReport,
+    StreamCacheKind, audio_codec_requires_recovery_point, demux_packet_cache_hysteresis_nsecs,
     demux_packet_cache_readahead_nsecs, demux_packet_disk_cache_enabled, seconds_to_nsecs,
     video_cached_seek_preroll_nsecs,
 };
@@ -65,6 +67,7 @@ impl DemuxPacketCacheState {
             selected_streams: DemuxSelectedStreams::default(),
             cached_seek_preroll_nsecs: video_cached_seek_preroll_nsecs(timeline_anchor_codec_id),
             failed_cached_seek_ranges: HashMap::new(),
+            rejected_cached_seek_ranges: HashMap::new(),
             memory_limit_bytes,
             backbuffer_limit_bytes,
             donate_backbuffer: cache_config.demuxer_donate_buffer,
@@ -96,6 +99,15 @@ impl DemuxPacketCacheState {
             last_reported_buffered_until: None,
             last_cache_state_emit_at: None,
             last_emitted_seekable_ranges: None,
+            last_emitted_demux_cache_state: None,
+            prepared_seekable_report: RefCell::new(Some(PreparedSeekableRangeReport {
+                generation: 1,
+                revision: 0,
+                ..PreparedSeekableRangeReport::default()
+            })),
+            last_seekable_summary_prepare_at: RefCell::new(Some(Instant::now())),
+            seekability_revision: 0,
+            last_emitted_seekability_revision: None,
             cache_state_emit_dirty: false,
             generation: 0,
             error: None,
@@ -204,9 +216,10 @@ impl DemuxPacketCacheState {
         self.refresh_readahead_hysteresis();
     }
 
-    fn mark_all_seekable_summaries_dirty(&self) {
+    fn mark_all_seekable_summaries_dirty(&mut self) {
         for range in self.ranges.values() {
             range.mark_seekable_dirty();
         }
+        self.bump_seekability_revision();
     }
 }

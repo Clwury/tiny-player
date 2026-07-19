@@ -1,5 +1,6 @@
 use super::{
-    PlaybackOutputScheduler, PlaybackOutputSnapshot, duration_nsecs, should_block_for_demux_read,
+    Instant, PlaybackOutputScheduler, PlaybackOutputSnapshot, duration_nsecs,
+    should_block_for_demux_read,
 };
 
 impl PlaybackOutputScheduler {
@@ -32,6 +33,9 @@ impl PlaybackOutputScheduler {
                 && !rebuffering
                 && self.scheduled_video_queue.low_water(played_until)
         });
+        let recent_coordinator_stall = self
+            .scheduled_video_queue
+            .recent_coordinator_stall(Instant::now());
 
         PlaybackOutputSnapshot {
             state: self.playback_output_state,
@@ -50,6 +54,13 @@ impl PlaybackOutputScheduler {
             video_bootstrap_after_seek: self.video_bootstrap_after_seek,
             video_decode_underfill: self.video_decode_underfill,
             rebuffer_empty_audio_output_blocked: self.rebuffer_empty_audio_output_blocked,
+            scheduler_dropped_video_frames: self
+                .scheduled_video_queue
+                .scheduler_dropped_video_frames(),
+            recent_coordinator_stall_nsecs: recent_coordinator_stall
+                .map(|stall| duration_nsecs(stall.elapsed)),
+            recent_coordinator_stall_age_nsecs: recent_coordinator_stall
+                .map(|stall| duration_nsecs(stall.age)),
         }
     }
 }

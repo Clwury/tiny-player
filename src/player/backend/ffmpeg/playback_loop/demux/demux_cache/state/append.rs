@@ -3,10 +3,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::seek_algorithm::DEMUX_PACKET_TIMESTAMP_ROUNDING_TOLERANCE_NSECS;
 use super::{
     CachedDemuxPacket, DEMUX_PACKET_APPEND_MAINTENANCE_INTERVAL, DemuxInputRateSample,
-    DemuxPacketAppendOutcome, DemuxPacketAppendTiming, DemuxPacketCacheState, PacketId,
-    StreamCacheKind,
+    DemuxPacketAppendOutcome, DemuxPacketAppendTiming, DemuxPacketCacheState,
+    InternalPacketTimestampHole, PacketId, StreamCacheKind,
 };
 
 const LOW_LEVEL_SEEK_APPEND_MAX_INITIAL_LEAD_NSECS: u64 = 2_000_000_000;
@@ -52,6 +53,19 @@ impl DemuxPacketCacheState {
         let packet_id = self.next_packet_id;
         self.next_packet_id = self.next_packet_id.saturating_add(1);
         let stream_index = packet.stream_index;
+        let previous_stream_packet_id = self
+            .ranges
+            .get(&self.append_range_id)
+            .and_then(|range| range.stream_queues.get(&stream_index))
+            .and_then(|queue| queue.back())
+            .copied();
+        if self
+            .rejected_cached_seek_ranges
+            .remove(&self.append_range_id)
+            .is_some()
+        {
+            self.bump_seekability_revision();
+        }
         let packet_forward_end_nsecs = packet.end_nsecs.or(packet.start_nsecs);
         let blocked_for_current_read =
             self.mark_low_level_seek_noncurrent_packet_if_needed(packet_id, &packet);
@@ -84,6 +98,12 @@ impl DemuxPacketCacheState {
             stream_index,
             packet_byte_len,
             packet_is_seek_boundary,
+        );
+        self.record_internal_packet_timestamp_gap(
+            self.append_range_id,
+            stream_index,
+            previous_stream_packet_id,
+            packet_id,
         );
         if !blocked_for_current_read {
             self.refresh_range_stream_seek_boundary_after_append(
@@ -231,8 +251,79 @@ impl DemuxPacketCacheState {
                 .push_back(packet_id);
         }
         range.add_report_bytes(byte_len);
-        range.mark_seekable_dirty();
         packet_position
+    }
+
+    fn record_internal_packet_timestamp_gap(
+        &self,
+        range_id: super::RangeId,
+        stream_index: c_int,
+        previous_packet_id: Option<PacketId>,
+        packet_id: PacketId,
+    ) {
+        if stream_index != self.timeline_anchor_stream_index {
+            return;
+        }
+        let Some(previous_packet_id) = previous_packet_id else {
+            return;
+        };
+        let Some(previous) = self.packets.get(&previous_packet_id) else {
+            return;
+        };
+        let Some(packet) = self.packets.get(&packet_id) else {
+            return;
+        };
+        let Some(previous_mapped_end_nsecs) = previous.end_nsecs.or(previous.start_nsecs) else {
+            return;
+        };
+        let Some(mapped_start_nsecs) = packet.start_nsecs else {
+            return;
+        };
+        if mapped_start_nsecs <= previous_mapped_end_nsecs {
+            return;
+        }
+        let gap_nsecs = mapped_start_nsecs - previous_mapped_end_nsecs;
+        let Some(range) = self.ranges.get(&range_id) else {
+            return;
+        };
+        if gap_nsecs <= DEMUX_PACKET_TIMESTAMP_ROUNDING_TOLERANCE_NSECS {
+            range.record_rounding_gap();
+            return;
+        }
+
+        let hole = InternalPacketTimestampHole {
+            stream_index,
+            previous_packet_id,
+            packet_id,
+            previous_raw_pts: previous.raw_pts,
+            previous_raw_dts: previous.raw_dts,
+            raw_pts: packet.raw_pts,
+            raw_dts: packet.raw_dts,
+            previous_seek_timestamp_nsecs: previous.seek_timestamp_nsecs,
+            seek_timestamp_nsecs: packet.seek_timestamp_nsecs,
+            previous_mapped_end_nsecs,
+            mapped_start_nsecs,
+            gap_nsecs,
+        };
+        range.record_internal_packet_timestamp_hole(hole);
+        tracing::debug!(
+            session_id = ?self.session_id,
+            range_id,
+            stream_index,
+            previous_packet_id,
+            packet_id,
+            previous_raw_pts = ?hole.previous_raw_pts,
+            previous_raw_dts = ?hole.previous_raw_dts,
+            raw_pts = ?hole.raw_pts,
+            raw_dts = ?hole.raw_dts,
+            previous_seek_timestamp_nsecs = ?hole.previous_seek_timestamp_nsecs,
+            seek_timestamp_nsecs = ?hole.seek_timestamp_nsecs,
+            previous_mapped_end_nsecs,
+            mapped_start_nsecs,
+            gap_nsecs,
+            osc_range_split = false,
+            "observed internal FFmpeg demux packet timestamp hole"
+        );
     }
 
     fn maybe_start_reader_head_for_appended_packet(

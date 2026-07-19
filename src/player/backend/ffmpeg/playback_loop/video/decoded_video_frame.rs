@@ -170,6 +170,7 @@ pub(super) fn service_decoded_video_frame<F>(
     _frame_presented: &AtomicBool,
     subtitle_pipeline: &mut SubtitlePipeline,
     video_frame_prepare_worker: &mut VideoFramePrepareWorker,
+    video_decode_skip_nonref_active: &mut bool,
     current_start_position_nsecs: &mut u64,
     _demux_reader_watermark: F,
 ) -> std::result::Result<bool, String>
@@ -281,6 +282,30 @@ where
             return Err(CORRUPT_VIDEO_FRAME_RECOVERY_ERROR.to_string());
         }
     };
+    if let Some(completion) = video_decode_recovery.take_exact_seek_completion() {
+        let landing =
+            video_decode_pipeline.finish_hevc_low_level_exact_recovery(completion.transaction_id);
+        if *video_decode_skip_nonref_active {
+            video_decode_pipeline.set_skip_nonref_frames(false)?;
+            *video_decode_skip_nonref_active = false;
+        }
+        tracing::debug!(
+            session_id = ?session_id,
+            transaction_id = completion.transaction_id,
+            recovery_scope = completion.recovery_scope.as_str(),
+            target_nsecs = completion.target_nsecs,
+            first_eligible_frame_nsecs = completion.first_eligible_frame_nsecs,
+            first_eligible_delta_nsecs = completion.first_eligible_delta_nsecs,
+            seek_position_nsecs = ?landing.map(|landing| landing.seek_position_nsecs),
+            actual_anchor_nsecs = ?landing.map(|landing| landing.anchor_nsecs),
+            actual_anchor_kind = ?landing.map(|landing| landing.anchor_kind.as_str()),
+            arbitration_outcome = "exact_seek_completed",
+            fallback_consumed = false,
+            fallback_cleared = false,
+            nonref_skip_restored = true,
+            "completed FFmpeg exact seek at first eligible video frame"
+        );
+    }
     let frame_pts = start_frame.frame_pts;
     let timeline_nsecs = start_frame.timeline_nsecs;
     let output_snapshot = output_scheduler.snapshot();
@@ -782,6 +807,7 @@ where
                 frame_presented,
                 subtitle_pipeline,
                 video_frame_prepare_worker,
+                video_decode_skip_nonref_active,
                 current_start_position_nsecs,
                 &mut demux_reader_watermark,
             );
@@ -890,6 +916,7 @@ where
                 has_audio_output: audio_output.is_some(),
                 fallback_target_nsecs,
                 session_id,
+                recovery_scope: video_decode_recovery.recovery_scope(),
             });
         if hevc_recovery_action == HevcDecodeChainRecoveryAction::SoftRecovery {
             if *video_decode_skip_nonref_active {
@@ -989,9 +1016,61 @@ fn log_video_frame_prepare_result_pending(
 #[cfg(test)]
 mod tests {
     use super::{
-        HevcDecodedFrameGapAction, hevc_decoded_frame_gap_allows_scheduled_queue_admission,
+        DecodedVideoFrameStartAction, HevcDecodedFrameGapAction, decoded_video_frame_start_action,
+        hevc_decoded_frame_gap_allows_scheduled_queue_admission,
         hevc_decoded_frame_gap_bridges_scheduled_queue,
     };
+
+    #[test]
+    fn exact_cached_seek_drops_every_frame_before_target() {
+        let target_nsecs = 12_800_000_000_u64;
+
+        assert_eq!(
+            decoded_video_frame_start_action(
+                target_nsecs.saturating_sub(1),
+                target_nsecs,
+                false,
+                true,
+            ),
+            DecodedVideoFrameStartAction::DropBeforeStart
+        );
+        assert_eq!(
+            decoded_video_frame_start_action(target_nsecs, target_nsecs, false, true),
+            DecodedVideoFrameStartAction::Use { realign: false }
+        );
+        assert_eq!(
+            decoded_video_frame_start_action(
+                target_nsecs.saturating_add(33_333_333),
+                target_nsecs,
+                false,
+                true,
+            ),
+            DecodedVideoFrameStartAction::Use { realign: false }
+        );
+    }
+
+    #[test]
+    fn cra_exact_seek_preroll_never_enters_the_scheduled_queue() {
+        let target_nsecs = 235_235_000_000_u64;
+        let frames = [
+            226_810_000_000,
+            234_985_000_000,
+            target_nsecs - 1,
+            target_nsecs,
+            target_nsecs + 41_708_333,
+        ];
+        let admitted = frames
+            .into_iter()
+            .filter(|frame| {
+                matches!(
+                    decoded_video_frame_start_action(*frame, target_nsecs, false, true),
+                    DecodedVideoFrameStartAction::Use { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(admitted, vec![target_nsecs, target_nsecs + 41_708_333]);
+    }
 
     #[test]
     fn hevc_pts_gap_fallback_drops_current_frame_before_scheduled_queue_admission() {

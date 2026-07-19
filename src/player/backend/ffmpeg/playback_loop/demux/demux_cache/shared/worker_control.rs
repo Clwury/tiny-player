@@ -87,6 +87,24 @@ impl DemuxPacketCacheShared {
                 return None;
             }
 
+            // The demux producer owns full seekable-range validation. Keep it
+            // off the coordinator/consumer path, but still prepare a dirty
+            // revision when prefetch is paused and no subsequent append would
+            // otherwise reach the normal 250 ms reporting cadence.
+            let now = Instant::now();
+            if !self.consumer_priority_active() && guard.seekable_summary_preparation_due(now) {
+                let emit =
+                    self.prepare_cache_state_emit_for(&mut guard, "prefetch-maintenance", false);
+                self.ready.notify_all();
+                drop(guard);
+                self.send_cache_state_emit(emit.into_emit());
+                guard = self
+                    .state
+                    .lock()
+                    .expect("FFmpeg demux packet cache poisoned");
+                continue;
+            }
+
             let recovery_demand = self.playback_recovery_demand();
             let recovery_critical = self.playback_recovery_critical();
             let any_consumer_drainable = guard.consumer_drainable_packet_available();

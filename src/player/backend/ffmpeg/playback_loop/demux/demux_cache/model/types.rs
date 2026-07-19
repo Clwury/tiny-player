@@ -4,7 +4,7 @@ use crate::player::backend::{DemuxCacheState, PlaybackCacheTimeRange};
 
 use super::{
     AvPacket, FormatContext, PlaybackCacheConfig, PlaybackCacheState, PlaybackSessionId,
-    StreamInfo, VideoRecoveryPointKind,
+    SeekableRangeValidationStats, StreamInfo, VideoRecoveryPointKind,
 };
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) type PacketId = u64;
@@ -73,6 +73,7 @@ impl DemuxCachedSeekInfo {
 pub(in crate::player::backend::ffmpeg::playback_loop) enum DemuxSeekResult {
     Cached(DemuxCachedSeekInfo),
     Requested,
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,6 +191,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct CacheS
         PlaybackCacheState,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) buffered_changed:
         Option<Option<f64>>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) notify_cache_state: bool,
 }
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxCacheReportSnapshot {
@@ -199,6 +201,9 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxC
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) paused_for_cache: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) buffering_percent:
         Option<u8>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) seekability_revision: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) validation:
+        SeekableRangeValidationStats,
 }
 
 impl DemuxCacheReportSnapshot {

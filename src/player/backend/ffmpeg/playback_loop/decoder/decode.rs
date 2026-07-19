@@ -8,6 +8,10 @@ impl PlaybackGeneration {
         self.next = self.next.saturating_add(1);
         self.next
     }
+
+    pub(super) fn current(&self) -> u64 {
+        self.next
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

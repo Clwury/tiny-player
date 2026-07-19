@@ -157,6 +157,39 @@ pub(super) struct HevcDecodeChainFallbackRecord {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) struct HevcLowLevelSeekLanding {
+    pub(super) transaction_id: u64,
+    pub(super) target_nsecs: u64,
+    pub(super) seek_position_nsecs: u64,
+    pub(super) anchor_nsecs: u64,
+    pub(super) anchor_kind: VideoRecoveryPointKind,
+    pub(super) range_id: Option<u64>,
+    pub(super) anchor_packet_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HevcLowLevelSeekObservation {
+    transaction_id: u64,
+    target_nsecs: u64,
+    seek_position_nsecs: u64,
+    reason: &'static str,
+    landing: Option<HevcLowLevelSeekLanding>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HevcLowLevelRecoveryObservationAction {
+    CraLanding {
+        landing: HevcLowLevelSeekLanding,
+        repeated: bool,
+        reason: &'static str,
+    },
+    SafeLanding {
+        landing: HevcLowLevelSeekLanding,
+        reason: &'static str,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HevcDecodeChainResetScope {
     Transient,
     RecoveryTransaction,
@@ -171,6 +204,7 @@ pub(super) struct HevcDecodePacketObservation<'a> {
     pub(super) has_audio_output: bool,
     pub(super) fallback_target_nsecs: u64,
     pub(super) session_id: PlaybackSessionId,
+    pub(super) recovery_scope: VideoDecodeRecoveryScope,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -402,11 +436,75 @@ pub(super) struct VideoPacketAdmissionPressure {
     pub(super) output_resource_pressure: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) enum VideoDecodeRecoveryScope {
+    #[default]
+    SafeBoundary,
+    ExactCachedSeek {
+        transaction_id: u64,
+        target_nsecs: u64,
+    },
+    ExactLowLevelSeek {
+        transaction_id: u64,
+        target_nsecs: u64,
+        seek_position_nsecs: u64,
+        actual_anchor_nsecs: u64,
+        actual_anchor_kind: VideoRecoveryPointKind,
+    },
+}
+
+impl VideoDecodeRecoveryScope {
+    pub(in crate::player::backend::ffmpeg) fn as_str(self) -> &'static str {
+        match self {
+            Self::SafeBoundary => "safe_boundary",
+            Self::ExactCachedSeek { .. } => "exact_cached_seek",
+            Self::ExactLowLevelSeek { .. } => "exact_low_level_seek",
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn transaction_id(self) -> Option<u64> {
+        match self {
+            Self::SafeBoundary => None,
+            Self::ExactCachedSeek { transaction_id, .. }
+            | Self::ExactLowLevelSeek { transaction_id, .. } => Some(transaction_id),
+        }
+    }
+
+    fn target_nsecs(self) -> Option<u64> {
+        match self {
+            Self::SafeBoundary => None,
+            Self::ExactCachedSeek { target_nsecs, .. }
+            | Self::ExactLowLevelSeek { target_nsecs, .. } => Some(target_nsecs),
+        }
+    }
+
+    fn accepts_hevc_recovery_point(self) -> bool {
+        !matches!(self, Self::SafeBoundary)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) struct ExactSeekPacketProgress {
+    pub(in crate::player::backend::ffmpeg) transaction_id: u64,
+    pub(in crate::player::backend::ffmpeg) recovery_scope: VideoDecodeRecoveryScope,
+    pub(in crate::player::backend::ffmpeg) target_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg) packet_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg) packet_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) struct ExactSeekCompletion {
+    pub(in crate::player::backend::ffmpeg) transaction_id: u64,
+    pub(in crate::player::backend::ffmpeg) recovery_scope: VideoDecodeRecoveryScope,
+    pub(in crate::player::backend::ffmpeg) target_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg) first_eligible_frame_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg) first_eligible_delta_nsecs: u64,
+}
+
 #[derive(Default)]
 pub(in crate::player::backend::ffmpeg) struct VideoDecodeRecovery {
     waiting_for_keyframe: bool,
-    allow_hevc_cached_recovery_point: bool,
-    exact_cached_seek_output: bool,
+    recovery_scope: VideoDecodeRecoveryScope,
     realign_on_next_frame: bool,
     realign_after_recovery_point: bool,
     skipped_packets: u64,
@@ -416,6 +514,9 @@ pub(in crate::player::backend::ffmpeg) struct VideoDecodeRecovery {
     seek_bootstrap_preroll_frames: u64,
     seek_bootstrap_first_preroll_frame_nsecs: Option<u64>,
     seek_bootstrap_last_preroll_frame_nsecs: Option<u64>,
+    exact_seek_packet_count: u64,
+    exact_seek_last_packet_nsecs: Option<u64>,
+    completed_exact_seek: Option<ExactSeekCompletion>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,13 +526,14 @@ pub(in crate::player::backend::ffmpeg) struct SeekPrerollFrameProgress {
     pub(in crate::player::backend::ffmpeg) preroll_frames: u64,
     pub(in crate::player::backend::ffmpeg) first_preroll_frame_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg) last_preroll_frame_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg) recovery_scope: VideoDecodeRecoveryScope,
 }
 
 impl VideoDecodeRecovery {
     pub(in crate::player::backend::ffmpeg) fn reset(&mut self) {
+        self.completed_exact_seek = None;
         self.waiting_for_keyframe = false;
-        self.allow_hevc_cached_recovery_point = false;
-        self.exact_cached_seek_output = false;
+        self.recovery_scope = VideoDecodeRecoveryScope::SafeBoundary;
         self.realign_on_next_frame = false;
         self.realign_after_recovery_point = false;
         self.skipped_packets = 0;
@@ -456,15 +558,44 @@ impl VideoDecodeRecovery {
         self.waiting_for_keyframe
     }
 
-    pub(in crate::player::backend::ffmpeg) fn enable_hevc_cached_recovery_point(&mut self) {
+    pub(in crate::player::backend::ffmpeg) fn enable_hevc_cached_recovery_point(
+        &mut self,
+        transaction_id: u64,
+        target_nsecs: u64,
+    ) {
         if self.waiting_for_keyframe {
-            self.allow_hevc_cached_recovery_point = true;
-            self.exact_cached_seek_output = true;
+            self.recovery_scope = VideoDecodeRecoveryScope::ExactCachedSeek {
+                transaction_id,
+                target_nsecs,
+            };
         }
     }
 
-    pub(in crate::player::backend::ffmpeg) fn requires_exact_cached_seek_output(&self) -> bool {
-        self.exact_cached_seek_output
+    pub(in crate::player::backend::ffmpeg) fn enable_hevc_low_level_recovery_point(
+        &mut self,
+        landing: HevcLowLevelSeekLanding,
+    ) {
+        if self.waiting_for_keyframe {
+            self.recovery_scope = VideoDecodeRecoveryScope::ExactLowLevelSeek {
+                transaction_id: landing.transaction_id,
+                target_nsecs: landing.target_nsecs,
+                seek_position_nsecs: landing.seek_position_nsecs,
+                actual_anchor_nsecs: landing.anchor_nsecs,
+                actual_anchor_kind: landing.anchor_kind,
+            };
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn recovery_scope(&self) -> VideoDecodeRecoveryScope {
+        self.recovery_scope
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn requires_exact_seek_output(&self) -> bool {
+        !matches!(self.recovery_scope, VideoDecodeRecoveryScope::SafeBoundary)
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn requires_seek_preroll_nonref_skip(&self) -> bool {
+        self.requires_exact_seek_output()
     }
 
     pub(in crate::player::backend::ffmpeg) fn skipped_packets(&self) -> u64 {
@@ -506,6 +637,33 @@ impl VideoDecodeRecovery {
             .map(|(first, last)| last.saturating_sub(first))
     }
 
+    pub(in crate::player::backend::ffmpeg) fn observe_exact_seek_packet_progress(
+        &mut self,
+        packet_nsecs: Option<u64>,
+    ) -> Option<ExactSeekPacketProgress> {
+        let packet_nsecs = packet_nsecs?;
+        let target_nsecs = self.recovery_scope.target_nsecs()?;
+        if packet_nsecs >= target_nsecs {
+            return None;
+        }
+        let transaction_id = self.recovery_scope.transaction_id()?;
+        if self
+            .exact_seek_last_packet_nsecs
+            .is_some_and(|previous| packet_nsecs <= previous)
+        {
+            return None;
+        }
+        self.exact_seek_last_packet_nsecs = Some(packet_nsecs);
+        self.exact_seek_packet_count = self.exact_seek_packet_count.saturating_add(1);
+        Some(ExactSeekPacketProgress {
+            transaction_id,
+            recovery_scope: self.recovery_scope,
+            target_nsecs,
+            packet_nsecs,
+            packet_count: self.exact_seek_packet_count,
+        })
+    }
+
     pub(in crate::player::backend::ffmpeg) fn seek_bootstrap_preroll_frames(&self) -> u64 {
         self.seek_bootstrap_preroll_frames
     }
@@ -525,6 +683,7 @@ impl VideoDecodeRecovery {
             preroll_frames: self.seek_bootstrap_preroll_frames,
             first_preroll_frame_nsecs: self.seek_bootstrap_first_preroll_frame_nsecs,
             last_preroll_frame_nsecs: self.seek_bootstrap_last_preroll_frame_nsecs,
+            recovery_scope: self.recovery_scope,
         })
     }
 
@@ -539,9 +698,25 @@ impl VideoDecodeRecovery {
             preroll_frames: self.seek_bootstrap_preroll_frames,
             first_preroll_frame_nsecs: self.seek_bootstrap_first_preroll_frame_nsecs,
             last_preroll_frame_nsecs: self.seek_bootstrap_last_preroll_frame_nsecs,
+            recovery_scope: self.recovery_scope,
         };
+        if let Some(transaction_id) = self.recovery_scope.transaction_id() {
+            self.completed_exact_seek = Some(ExactSeekCompletion {
+                transaction_id,
+                recovery_scope: self.recovery_scope,
+                target_nsecs,
+                first_eligible_frame_nsecs: frame_timeline_nsecs,
+                first_eligible_delta_nsecs: frame_timeline_nsecs.saturating_sub(target_nsecs),
+            });
+        }
         self.clear_seek_bootstrap();
         Some(progress)
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn take_exact_seek_completion(
+        &mut self,
+    ) -> Option<ExactSeekCompletion> {
+        self.completed_exact_seek.take()
     }
 
     pub(in crate::player::backend::ffmpeg) fn accept_recovery_point(
@@ -612,6 +787,9 @@ impl VideoDecodeRecovery {
         self.seek_bootstrap_preroll_frames = 0;
         self.seek_bootstrap_first_preroll_frame_nsecs = None;
         self.seek_bootstrap_last_preroll_frame_nsecs = None;
+        self.exact_seek_packet_count = 0;
+        self.exact_seek_last_packet_nsecs = None;
+        self.completed_exact_seek = None;
     }
 
     fn clear_seek_bootstrap(&mut self) {
@@ -619,7 +797,9 @@ impl VideoDecodeRecovery {
         self.seek_bootstrap_preroll_frames = 0;
         self.seek_bootstrap_first_preroll_frame_nsecs = None;
         self.seek_bootstrap_last_preroll_frame_nsecs = None;
-        self.exact_cached_seek_output = false;
+        self.exact_seek_packet_count = 0;
+        self.exact_seek_last_packet_nsecs = None;
+        self.recovery_scope = VideoDecodeRecoveryScope::SafeBoundary;
     }
 
     fn can_accept_hevc_recovery_point_after_wait_limit(
@@ -642,7 +822,6 @@ impl VideoDecodeRecovery {
 
     fn accept_waited_recovery_point(&mut self) {
         self.waiting_for_keyframe = false;
-        self.allow_hevc_cached_recovery_point = false;
         self.realign_on_next_frame = self.realign_after_recovery_point;
         self.realign_after_recovery_point = false;
         self.skipped_packets = 0;
@@ -659,7 +838,7 @@ impl VideoDecodeRecovery {
             return packet_is_video_recovery_point(packet, codec_id);
         }
         packet_is_video_seek_point(packet, codec_id)
-            || (self.allow_hevc_cached_recovery_point
+            || (self.recovery_scope.accepts_hevc_recovery_point()
                 && packet_is_video_recovery_point(packet, codec_id))
     }
 }
@@ -788,6 +967,10 @@ impl HevcDecodeChainWatchdog {
 
     fn has_pending_fallback(&self) -> bool {
         self.pending_fallback.is_some()
+    }
+
+    fn pending_fallback(&self) -> Option<HevcDecodeChainFallback> {
+        self.pending_fallback
     }
 
     fn stats(&self) -> HevcDecodeChainStats {
@@ -1085,6 +1268,44 @@ impl HevcDecodeChainWatchdog {
             );
         }
         self.reset_transient_after_progress(0, Instant::now());
+    }
+
+    fn observe_exact_seek_packet_progress(
+        &mut self,
+        session_id: PlaybackSessionId,
+        progress: ExactSeekPacketProgress,
+    ) {
+        if progress.packet_count == 1 || progress.packet_count.is_multiple_of(60) {
+            tracing::debug!(
+                session_id = ?session_id,
+                transaction_id = progress.transaction_id,
+                recovery_scope = progress.recovery_scope.as_str(),
+                target_nsecs = progress.target_nsecs,
+                packet_nsecs = progress.packet_nsecs,
+                packet_count = progress.packet_count,
+                packet_before_target = true,
+                watchdog_progress = true,
+                "observed HEVC exact-seek preroll packet progress"
+            );
+        }
+        self.reset_transient_after_progress(0, Instant::now());
+    }
+
+    fn observe_exact_seek_decoder_result(
+        &mut self,
+        recovery_scope: VideoDecodeRecoveryScope,
+        packet_nsecs: Option<u64>,
+        decode_ok: bool,
+        now: Instant,
+    ) -> bool {
+        let Some(target_nsecs) = recovery_scope.target_nsecs() else {
+            return false;
+        };
+        if !decode_ok || packet_nsecs.is_none_or(|packet_nsecs| packet_nsecs >= target_nsecs) {
+            return false;
+        }
+        self.reset_transient_after_progress(0, now);
+        true
     }
 
     fn observe_post_fallback_rebuffer_underfill(
@@ -1744,6 +1965,8 @@ pub(super) struct VideoDecodePipeline {
     hevc_decode_packet_diagnostics: HevcDecodePacketDiagnosticWindow,
     hevc_startup_probe_packets: HevcStartupProbePackets,
     last_hevc_decode_chain_fallback: Option<HevcDecodeChainFallbackRecord>,
+    hevc_low_level_seek_observation: Option<HevcLowLevelSeekObservation>,
+    last_hevc_cra_low_level_landing: Option<HevcLowLevelSeekLanding>,
 }
 
 impl VideoDecodePipeline {
@@ -1756,6 +1979,8 @@ impl VideoDecodePipeline {
             hevc_decode_packet_diagnostics: HevcDecodePacketDiagnosticWindow::default(),
             hevc_startup_probe_packets: HevcStartupProbePackets::default(),
             last_hevc_decode_chain_fallback: None,
+            hevc_low_level_seek_observation: None,
+            last_hevc_cra_low_level_landing: None,
         })
     }
 
@@ -1955,6 +2180,58 @@ impl VideoDecodePipeline {
             .best_timestamp()
             .and_then(|timestamp| timestamp_to_nsecs(timestamp, context.video_stream.time_base));
         let hardware_accelerated = self.info().hardware_accelerated;
+        if let Some(observation) =
+            self.observe_hevc_low_level_recovery_packet(packet, packet_nsecs, codec_id)
+        {
+            match observation {
+                HevcLowLevelRecoveryObservationAction::CraLanding {
+                    landing,
+                    repeated,
+                    reason,
+                } => {
+                    recovery.enable_hevc_low_level_recovery_point(landing);
+                    tracing::warn!(
+                        session_id = ?context.session_id,
+                        transaction_id = landing.transaction_id,
+                        recovery_scope = recovery.recovery_scope().as_str(),
+                        reason,
+                        target_nsecs = landing.target_nsecs,
+                        seek_position_nsecs = landing.seek_position_nsecs,
+                        actual_anchor_nsecs = landing.anchor_nsecs,
+                        actual_recovery_kind = landing.anchor_kind.as_str(),
+                        range_id = ?landing.range_id,
+                        anchor_packet_id = ?landing.anchor_packet_id,
+                        repeated_low_level_landing = repeated,
+                        repeat_low_level_seek_suppressed = repeated,
+                        awaiting_closed_cached_interval = false,
+                        arbitration_outcome = "decode_from_actual_landing",
+                        "accepted CRA as the exact low-level seek decode anchor"
+                    );
+                }
+                HevcLowLevelRecoveryObservationAction::SafeLanding { landing, reason } => {
+                    recovery.enable_hevc_low_level_recovery_point(landing);
+                    tracing::debug!(
+                        session_id = ?context.session_id,
+                        transaction_id = landing.transaction_id,
+                        recovery_scope = recovery.recovery_scope().as_str(),
+                        reason,
+                        target_nsecs = landing.target_nsecs,
+                        seek_position_nsecs = landing.seek_position_nsecs,
+                        actual_anchor_nsecs = landing.anchor_nsecs,
+                        actual_recovery_kind = landing.anchor_kind.as_str(),
+                        range_id = ?landing.range_id,
+                        anchor_packet_id = ?landing.anchor_packet_id,
+                        awaiting_closed_cached_interval = false,
+                        arbitration_outcome = "decode_from_actual_landing",
+                        "observed safe recovery point after low-level seek"
+                    );
+                }
+            }
+        }
+        if let Some(progress) = recovery.observe_exact_seek_packet_progress(packet_nsecs) {
+            self.hevc_decode_chain_watchdog
+                .observe_exact_seek_packet_progress(context.session_id, progress);
+        }
         let recovery_skipping_packet = recovery.should_skip_packet(packet, codec_id);
         tracing::trace!(
             session_id = ?context.session_id,
@@ -2033,7 +2310,8 @@ impl VideoDecodePipeline {
                 recovery_point = packet_is_video_recovery_point(packet, codec_id),
                 recovery_kind = packet_video_recovery_point_kind(packet, codec_id).as_str(),
                 safe_seek_point = packet_is_video_seek_point(packet, codec_id),
-                cached_seek_cra_allowed = recovery.requires_exact_cached_seek_output(),
+                recovery_scope = recovery.recovery_scope().as_str(),
+                exact_seek_output = recovery.requires_exact_seek_output(),
                 "resuming FFmpeg video decode at recovery point"
             );
             let generation = playback_generation.advance();
@@ -2103,13 +2381,18 @@ impl VideoDecodePipeline {
             return Ok(DecodePacketAdmissionStatus::Dropped);
         }
 
-        let skip_nonref_for_pressure = context.skip_nonref_for_pressure;
-        if skip_nonref_for_pressure != *skip_nonref_active {
-            self.set_skip_nonref_frames(skip_nonref_for_pressure)?;
-            *skip_nonref_active = skip_nonref_for_pressure;
+        let skip_nonref_for_exact_seek = recovery.requires_seek_preroll_nonref_skip();
+        let skip_nonref = context.skip_nonref_for_pressure || skip_nonref_for_exact_seek;
+        if skip_nonref != *skip_nonref_active {
+            self.set_skip_nonref_frames(skip_nonref)?;
+            *skip_nonref_active = skip_nonref;
             tracing::debug!(
                 session_id = ?context.session_id,
-                skip_nonref_for_pressure,
+                transaction_id = ?recovery.recovery_scope().transaction_id(),
+                recovery_scope = recovery.recovery_scope().as_str(),
+                skip_nonref,
+                skip_nonref_for_pressure = context.skip_nonref_for_pressure,
+                skip_nonref_for_exact_seek,
                 output_state = ?context.output_snapshot.state,
                 played_until_nsecs = context.played_until_nsecs,
                 queued_video_frames = context.output_snapshot.queued_video_frames,
@@ -2120,7 +2403,7 @@ impl VideoDecodePipeline {
                     .output_snapshot
                     .queued_video_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
-                "updated FFmpeg video decoder non-reference frame skipping for decode pressure"
+                "updated FFmpeg video decoder non-reference frame skipping"
             );
         }
 
@@ -2248,6 +2531,110 @@ impl VideoDecodePipeline {
             self.last_hevc_decode_chain_fallback,
             HevcDecodeChainResetScope::RecoveryTransaction,
         );
+        self.hevc_low_level_seek_observation = None;
+        self.last_hevc_cra_low_level_landing = None;
+    }
+
+    pub(super) fn begin_hevc_low_level_seek_observation(
+        &mut self,
+        transaction_id: u64,
+        target_nsecs: u64,
+        seek_position_nsecs: u64,
+        reason: &'static str,
+    ) -> bool {
+        if self.hevc_low_level_seek_would_repeat_cra(target_nsecs, seek_position_nsecs) {
+            return false;
+        }
+        self.hevc_low_level_seek_observation = Some(HevcLowLevelSeekObservation {
+            transaction_id,
+            target_nsecs,
+            seek_position_nsecs,
+            reason,
+            landing: None,
+        });
+        true
+    }
+
+    pub(super) fn hevc_low_level_seek_would_repeat_cra(
+        &self,
+        target_nsecs: u64,
+        seek_position_nsecs: u64,
+    ) -> bool {
+        hevc_low_level_seek_would_repeat_cra(
+            self.last_hevc_cra_low_level_landing,
+            target_nsecs,
+            seek_position_nsecs,
+        )
+    }
+
+    pub(super) fn finish_hevc_low_level_exact_recovery(
+        &mut self,
+        transaction_id: u64,
+    ) -> Option<HevcLowLevelSeekLanding> {
+        let observation = self.hevc_low_level_seek_observation?;
+        if observation.transaction_id != transaction_id {
+            return None;
+        }
+        self.hevc_low_level_seek_observation = None;
+        observation.landing
+    }
+
+    pub(super) fn clear_hevc_low_level_seek_recovery(&mut self) -> Option<HevcLowLevelSeekLanding> {
+        self.hevc_low_level_seek_observation
+            .take()
+            .and_then(|observation| observation.landing)
+    }
+
+    fn observe_hevc_low_level_recovery_packet(
+        &mut self,
+        packet: &AvPacket,
+        packet_nsecs: Option<u64>,
+        codec_id: ffi::AVCodecID,
+    ) -> Option<HevcLowLevelRecoveryObservationAction> {
+        let observation = self.hevc_low_level_seek_observation?;
+        if observation.landing.is_some() || codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
+            return None;
+        }
+        let cache_read = packet.read_diagnostic();
+        let recovery_kind = cache_read
+            .map(|diagnostic| diagnostic.recovery_kind)
+            .unwrap_or_else(|| packet_video_recovery_point_kind(packet, codec_id));
+        if !recovery_kind.is_recovery_point() {
+            return None;
+        }
+        let anchor_nsecs = cache_read
+            .and_then(|diagnostic| diagnostic.packet_start_nsecs)
+            .or(packet_nsecs)?;
+        let landing = HevcLowLevelSeekLanding {
+            transaction_id: observation.transaction_id,
+            target_nsecs: observation.target_nsecs,
+            seek_position_nsecs: observation.seek_position_nsecs,
+            anchor_nsecs,
+            anchor_kind: recovery_kind,
+            range_id: cache_read.map(|diagnostic| diagnostic.read_range_id),
+            anchor_packet_id: cache_read.map(|diagnostic| diagnostic.packet_id),
+        };
+        if recovery_kind == VideoRecoveryPointKind::Cra {
+            let repeated = self
+                .last_hevc_cra_low_level_landing
+                .is_some_and(|previous| hevc_cra_low_level_landing_repeats(previous, landing));
+            self.last_hevc_cra_low_level_landing = Some(landing);
+            if let Some(current) = self.hevc_low_level_seek_observation.as_mut() {
+                current.landing = Some(landing);
+            }
+            return Some(HevcLowLevelRecoveryObservationAction::CraLanding {
+                landing,
+                repeated,
+                reason: observation.reason,
+            });
+        }
+        if let Some(current) = self.hevc_low_level_seek_observation.as_mut() {
+            current.landing = Some(landing);
+        }
+        Some(HevcLowLevelRecoveryObservationAction::SafeLanding {
+            landing,
+            reason: observation.reason,
+        })
     }
 
     pub(super) fn observe_hevc_decode_packet_status(
@@ -2264,6 +2651,13 @@ impl VideoDecodePipeline {
             timestamp_to_nsecs(timestamp, observation.video_stream.time_base)
         });
         let hardware_accelerated = self.info().hardware_accelerated;
+        self.hevc_decode_chain_watchdog
+            .observe_exact_seek_decoder_result(
+                observation.recovery_scope,
+                packet_nsecs,
+                observation.status.result.is_ok(),
+                Instant::now(),
+            );
         let action = self
             .hevc_decode_chain_watchdog
             .observe_packet(HevcDecodeChainWatchdogInput {
@@ -2573,6 +2967,10 @@ impl VideoDecodePipeline {
         self.hevc_decode_chain_watchdog.has_pending_fallback()
     }
 
+    pub(super) fn pending_hevc_decode_chain_fallback(&self) -> Option<HevcDecodeChainFallback> {
+        self.hevc_decode_chain_watchdog.pending_fallback()
+    }
+
     pub(super) fn hevc_decode_chain_fallback_loop_action(
         &self,
         fallback: HevcDecodeChainFallback,
@@ -2816,6 +3214,29 @@ fn hevc_decode_chain_fallback_record_after(
 
 fn hevc_fallback_targets_match(left: u64, right: u64) -> bool {
     left.abs_diff(right) <= HEVC_FALLBACK_SAME_TARGET_TOLERANCE_NSECS
+}
+
+fn hevc_cra_low_level_landing_repeats(
+    previous: HevcLowLevelSeekLanding,
+    next: HevcLowLevelSeekLanding,
+) -> bool {
+    previous.anchor_kind == VideoRecoveryPointKind::Cra
+        && next.anchor_kind == VideoRecoveryPointKind::Cra
+        && previous.target_nsecs == next.target_nsecs
+        && previous.seek_position_nsecs == next.seek_position_nsecs
+        && previous.anchor_nsecs == next.anchor_nsecs
+}
+
+fn hevc_low_level_seek_would_repeat_cra(
+    previous: Option<HevcLowLevelSeekLanding>,
+    target_nsecs: u64,
+    seek_position_nsecs: u64,
+) -> bool {
+    previous.is_some_and(|landing| {
+        landing.anchor_kind == VideoRecoveryPointKind::Cra
+            && landing.target_nsecs == target_nsecs
+            && landing.seek_position_nsecs == seek_position_nsecs
+    })
 }
 
 fn hevc_decode_chain_recovery_record_after_reset(
@@ -3259,8 +3680,9 @@ mod tests {
 
     use super::super::{
         DemuxReaderWatermark, PlaybackOutputSnapshot, PlaybackOutputState, StreamInfo,
-        VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VideoFrameConvertContext,
-        packet_is_video_recovery_point, packet_is_video_seek_point,
+        VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VideoFrameConvertContext, VideoRecoveryPointKind,
+        decoded_video_frame_start_action, packet_is_video_recovery_point,
+        packet_is_video_seek_point,
     };
     use super::{
         AudioTimelineGapEvidence, DecodedVideoFrameDiagnostic, DoviFrameMetadata,
@@ -3273,18 +3695,69 @@ mod tests {
         HevcDecodeChainFallbackLoopAction, HevcDecodeChainFallbackReason,
         HevcDecodeChainFallbackRecord, HevcDecodeChainRecoveryAction, HevcDecodeChainResetScope,
         HevcDecodeChainWatchdog, HevcDecodeChainWatchdogInput, HevcDecodePacketDiagnosticWindow,
-        HevcDecodedFrameGapAction, HevcDecodedFrameGapObservation,
+        HevcDecodedFrameGapAction, HevcDecodedFrameGapObservation, HevcLowLevelSeekLanding,
         HevcPostFallbackRebufferObservation, HevcSeekPrerollProgressObservation,
         HevcStartupProbePackets, HevcStartupStallObservation, HevcStreamFormat,
         PlaybackBlockReason, PlaybackGeneration, StrippedHevcDoviDecodeAction,
         VIDEO_DECODE_PENDING_INPUT_QUEUE_CAPACITY, VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS,
-        VideoDecodePacketStatus, VideoDecodePipeline, VideoDecodeRecovery, VideoDecodeWorkerInfo,
-        VideoDecodeWorkerSnapshot, VideoDecodeWorkerState, hevc_decode_chain_fallback_loop_action,
-        hevc_decode_chain_fallback_record_after, hevc_decode_chain_recovery_record_after_reset,
-        hevc_dovi_decode_action_for_inspection, hevc_startup_in_flight_packet_should_arm,
+        VideoDecodePacketStatus, VideoDecodePipeline, VideoDecodeRecovery,
+        VideoDecodeRecoveryScope, VideoDecodeWorkerInfo, VideoDecodeWorkerSnapshot,
+        VideoDecodeWorkerState, hevc_cra_low_level_landing_repeats,
+        hevc_decode_chain_fallback_loop_action, hevc_decode_chain_fallback_record_after,
+        hevc_decode_chain_recovery_record_after_reset, hevc_dovi_decode_action_for_inspection,
+        hevc_low_level_seek_would_repeat_cra, hevc_startup_in_flight_packet_should_arm,
         hevc_startup_probe_packet_should_record, hevc_startup_probe_replay_packets,
         hevc_startup_zero_output_timeout, video_decode_pending_input_snapshot,
     };
+
+    #[test]
+    fn repeated_cra_low_level_landing_ignores_range_and_packet_identity() {
+        let first = HevcLowLevelSeekLanding {
+            transaction_id: 11,
+            target_nsecs: 62_521_000_000,
+            seek_position_nsecs: 61_521_000_000,
+            anchor_nsecs: 59_768_000_000,
+            anchor_kind: VideoRecoveryPointKind::Cra,
+            range_id: Some(2),
+            anchor_packet_id: Some(41),
+        };
+        let repeated = HevcLowLevelSeekLanding {
+            range_id: Some(3),
+            anchor_packet_id: Some(93),
+            ..first
+        };
+        assert!(hevc_cra_low_level_landing_repeats(first, repeated));
+
+        let different_anchor = HevcLowLevelSeekLanding {
+            anchor_nsecs: first.anchor_nsecs + 1,
+            ..repeated
+        };
+        assert!(!hevc_cra_low_level_landing_repeats(first, different_anchor));
+    }
+
+    #[test]
+    fn same_cra_tuple_suppresses_second_low_level_seek() {
+        let landing = HevcLowLevelSeekLanding {
+            transaction_id: 11,
+            target_nsecs: 62_521_000_000,
+            seek_position_nsecs: 61_521_000_000,
+            anchor_nsecs: 59_768_000_000,
+            anchor_kind: VideoRecoveryPointKind::Cra,
+            range_id: Some(2),
+            anchor_packet_id: Some(41),
+        };
+
+        assert!(hevc_low_level_seek_would_repeat_cra(
+            Some(landing),
+            landing.target_nsecs,
+            landing.seek_position_nsecs,
+        ));
+        assert!(!hevc_low_level_seek_would_repeat_cra(
+            Some(landing),
+            landing.target_nsecs + 1,
+            landing.seek_position_nsecs,
+        ));
+    }
 
     fn snapshot(
         state: VideoDecodeWorkerState,
@@ -3401,6 +3874,9 @@ mod tests {
             video_bootstrap_after_seek: false,
             video_decode_underfill: false,
             rebuffer_empty_audio_output_blocked: false,
+            scheduler_dropped_video_frames: 0,
+            recent_coordinator_stall_nsecs: None,
+            recent_coordinator_stall_age_nsecs: None,
         }
     }
 
@@ -4244,6 +4720,136 @@ mod tests {
             ffi::AVCodecID::AV_CODEC_ID_HEVC
         ));
         assert!(!recovery.waiting_for_keyframe());
+    }
+
+    #[test]
+    fn exact_low_level_seek_decodes_from_226s_cra_and_gates_output_at_235s_target() {
+        let transaction_id = 23;
+        let anchor_nsecs = 226_810_000_000;
+        let target_nsecs = 235_235_000_000;
+        let next_cra_nsecs = 237_237_000_000;
+        let mut recovery = VideoDecodeRecovery::default();
+        let mut cra_packet = packet_from_data(&[
+            0, 0, 0, 3, 0x2a, 0x01, 0xaa, // CRA_NUT
+        ]);
+        unsafe {
+            (*cra_packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
+        }
+        recovery.reset_for_timeline_start(ffi::AVCodecID::AV_CODEC_ID_HEVC, target_nsecs);
+        assert!(recovery.should_skip_packet(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+
+        let landing = HevcLowLevelSeekLanding {
+            transaction_id,
+            target_nsecs,
+            seek_position_nsecs: 234_235_000_000,
+            anchor_nsecs,
+            anchor_kind: VideoRecoveryPointKind::Cra,
+            range_id: Some(1),
+            anchor_packet_id: Some(430),
+        };
+        recovery.enable_hevc_low_level_recovery_point(landing);
+        assert!(matches!(
+            recovery.recovery_scope(),
+            VideoDecodeRecoveryScope::ExactLowLevelSeek { .. }
+        ));
+        assert!(recovery.requires_exact_seek_output());
+        assert!(recovery.requires_seek_preroll_nonref_skip());
+        assert!(
+            recovery
+                .observe_exact_seek_packet_progress(Some(anchor_nsecs))
+                .is_some()
+        );
+        assert!(
+            recovery
+                .observe_exact_seek_packet_progress(Some(anchor_nsecs))
+                .is_none(),
+            "duplicate packet PTS is not recovery progress"
+        );
+        assert!(
+            recovery
+                .observe_exact_seek_packet_progress(Some(anchor_nsecs - 1))
+                .is_none(),
+            "backward packet PTS is not recovery progress"
+        );
+        assert!(
+            recovery
+                .observe_exact_seek_packet_progress(Some(anchor_nsecs + 41_000_000))
+                .is_some(),
+            "forward packet PTS refreshes exact-seek recovery progress"
+        );
+        assert!(!recovery.should_skip_packet(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+        assert!(recovery.accept_recovery_point(&cra_packet, ffi::AVCodecID::AV_CODEC_ID_HEVC));
+
+        assert_eq!(
+            decoded_video_frame_start_action(
+                target_nsecs - 1,
+                target_nsecs,
+                false,
+                recovery.requires_exact_seek_output(),
+            ),
+            super::super::DecodedVideoFrameStartAction::DropBeforeStart
+        );
+        assert_eq!(
+            decoded_video_frame_start_action(
+                target_nsecs,
+                target_nsecs,
+                false,
+                recovery.requires_exact_seek_output(),
+            ),
+            super::super::DecodedVideoFrameStartAction::Use { realign: false }
+        );
+        assert!(target_nsecs < next_cra_nsecs);
+
+        recovery
+            .finish_seek_bootstrap_after_target_frame(target_nsecs)
+            .expect("target frame completes the exact low-level transaction");
+        let completion = recovery
+            .take_exact_seek_completion()
+            .expect("exact transaction records its first eligible frame");
+        assert_eq!(completion.transaction_id, transaction_id);
+        assert_eq!(completion.first_eligible_frame_nsecs, target_nsecs);
+        assert_eq!(completion.first_eligible_delta_nsecs, 0);
+        assert!(!recovery.requires_exact_seek_output());
+    }
+
+    #[test]
+    fn exact_seek_decoder_result_clears_stale_recovery_wait_only_before_target() {
+        let target_nsecs = 235_235_000_000;
+        let recovery_scope = VideoDecodeRecoveryScope::ExactLowLevelSeek {
+            transaction_id: 23,
+            target_nsecs,
+            seek_position_nsecs: 234_235_000_000,
+            actual_anchor_nsecs: 226_810_000_000,
+            actual_anchor_kind: VideoRecoveryPointKind::Cra,
+        };
+        let fallback = HevcDecodeChainFallback {
+            target_nsecs,
+            reason: HevcDecodeChainFallbackReason::RecoveryWaitRebuffer,
+        };
+        let now = Instant::now();
+        let mut watchdog = HevcDecodeChainWatchdog {
+            pending_fallback: Some(fallback),
+            zero_output_packets: 75,
+            ..HevcDecodeChainWatchdog::default()
+        };
+
+        assert!(watchdog.observe_exact_seek_decoder_result(
+            recovery_scope,
+            Some(231_000_000_000),
+            true,
+            now,
+        ));
+        assert_eq!(watchdog.take_fallback(), None);
+        assert_eq!(watchdog.last_video_progress_at, Some(now));
+
+        watchdog.pending_fallback = Some(fallback);
+        assert!(!watchdog.observe_exact_seek_decoder_result(
+            recovery_scope,
+            Some(target_nsecs),
+            true,
+            now + Duration::from_millis(1),
+        ));
+        assert_eq!(watchdog.take_fallback(), Some(fallback));
     }
 
     #[test]

@@ -11,7 +11,9 @@ use crate::player::{
     render_host::{PlaybackSessionId, RenderSize, VideoOutputQueue, VideoOutputQueueSnapshot},
 };
 
-use super::audio_decode_worker::{AudioDecodePacketResult, AudioDecodeWorkerSnapshot};
+use super::audio_decode_worker::{
+    AudioDecodePacketResult, AudioDecodeWorkerSnapshot, AudioDecodeWorkerState,
+};
 use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
 use super::decoded_audio_frame::process_audio_decode_drain_result;
 use super::drain_phase::{PlaybackDrainPhase, PlaybackDrainResults};
@@ -29,10 +31,11 @@ use super::video_decode_pipeline::{
 use super::video_decode_worker::{VideoDecodeDrainResult, VideoDecodeWorkerSnapshot};
 use super::{
     AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN,
-    AudioDecodePipeline, AudioOutput, AudioResumeWaterline, AvPacket, BufferedReporter,
-    DemuxCachedSeekInfo, DoviPipeline, FfmpegControl, PlaybackBlockReason, PlaybackGeneration,
-    PlaybackOutputScheduler, PlaybackOutputSnapshot, PlaybackScheduler, PositionReporter,
-    StreamInfo, SubtitleDecodeContext, SubtitlePipeline, TimestampMapper,
+    AudioDecodePipeline, AudioOutput, AudioRealignCoverage, AudioResumeWaterline, AvPacket,
+    BufferedReporter, DemuxCachedSeekInfo, DoviPipeline, FfmpegControl, PlaybackBlockReason,
+    PlaybackGeneration, PlaybackOutputScheduler, PlaybackOutputSnapshot, PlaybackOutputState,
+    PlaybackScheduler, PositionReporter, RebufferAudioRealignRequest, StreamInfo,
+    SubtitleDecodeContext, SubtitlePipeline, TimestampMapper,
     VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
     VideoDecodePipeline, VideoDecodeRecovery, VideoFramePrepareWorker, duration_nsecs,
 };
@@ -43,6 +46,9 @@ const CACHED_SEEK_SOFTWARE_UHD_EXTRA_TIMEOUT: Duration = Duration::from_millis(4
 const CACHED_SEEK_SOFTWARE_MAX_TIMEOUT: Duration = Duration::from_millis(30_000);
 const CACHED_SEEK_UHD_PIXEL_THRESHOLD: u64 = 6_000_000;
 const CACHED_SEEK_STARTUP_MAX_VIDEO_PACKETS: u64 = VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS;
+const AUDIO_REALIGN_TARGET_TOLERANCE_NSECS: u64 = 500_000_000;
+pub(super) const AUDIO_DECODE_RECOVERY_STALL_WARN_AFTER: Duration = Duration::from_millis(500);
+pub(super) const AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CachedSeekRecoveryFallbackReason {
@@ -176,6 +182,208 @@ pub(super) struct DecoderInputSnapshot {
     pub(super) video_decode_blocked_on: Option<PlaybackBlockReason>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AudioRealignTransaction {
+    pub(super) transaction_id: u64,
+    pub(super) target_timeline_nsecs: u64,
+    pub(super) generation: u64,
+    pub(super) started_at: Instant,
+    pub(super) attempts: u8,
+    pub(super) request: RebufferAudioRealignRequest,
+    pub(super) phase: AudioRealignPhase,
+    pub(super) coverage_nsecs: u64,
+    pub(super) coverage_target_nsecs: u64,
+    last_progress_at: Instant,
+    warning_emitted: bool,
+    fallback_exhausted_logged: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AudioRealignPhase {
+    Flushing,
+    AwaitingCoverage,
+    Covered,
+    FallbackUsed,
+}
+
+impl AudioRealignPhase {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Flushing => "flushing",
+            Self::AwaitingCoverage => "awaiting_coverage",
+            Self::Covered => "covered",
+            Self::FallbackUsed => "fallback_used",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AudioRealignCoalesceReason {
+    Flushing,
+    AwaitingCoverage,
+    CoverageSatisfied,
+    LowLevelFallbackAlreadyUsed,
+}
+
+impl AudioRealignCoalesceReason {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Flushing => "flushing",
+            Self::AwaitingCoverage => "awaiting_coverage",
+            Self::CoverageSatisfied => "coverage_satisfied",
+            Self::LowLevelFallbackAlreadyUsed => "low_level_fallback_already_used",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AudioRealignRequestAction {
+    Start,
+    Coalesce {
+        transaction: AudioRealignTransaction,
+        reason: AudioRealignCoalesceReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AudioRecoveryWatchdogAction {
+    Warn {
+        transaction: AudioRealignTransaction,
+        worker: AudioDecodeWorkerSnapshot,
+    },
+    LowLevelFallback {
+        transaction: AudioRealignTransaction,
+        worker: AudioDecodeWorkerSnapshot,
+        request: RebufferAudioRealignRequest,
+    },
+    FallbackExhausted {
+        transaction: AudioRealignTransaction,
+        worker: AudioDecodeWorkerSnapshot,
+    },
+}
+
+fn audio_realign_target_matches(left: u64, right: u64) -> bool {
+    left.abs_diff(right) <= AUDIO_REALIGN_TARGET_TOLERANCE_NSECS
+}
+
+fn observe_audio_realign_request(
+    transaction: &mut Option<AudioRealignTransaction>,
+    request: RebufferAudioRealignRequest,
+) -> AudioRealignRequestAction {
+    let Some(current) = transaction.as_mut() else {
+        return AudioRealignRequestAction::Start;
+    };
+    match current.phase {
+        AudioRealignPhase::Flushing => {
+            let mut merged_request = request;
+            merged_request.target_timeline_nsecs = current.target_timeline_nsecs;
+            current.request = merged_request;
+            AudioRealignRequestAction::Coalesce {
+                transaction: *current,
+                reason: AudioRealignCoalesceReason::Flushing,
+            }
+        }
+        AudioRealignPhase::AwaitingCoverage => {
+            let mut merged_request = request;
+            merged_request.target_timeline_nsecs = current.target_timeline_nsecs;
+            current.request = merged_request;
+            AudioRealignRequestAction::Coalesce {
+                transaction: *current,
+                reason: AudioRealignCoalesceReason::AwaitingCoverage,
+            }
+        }
+        AudioRealignPhase::FallbackUsed => AudioRealignRequestAction::Coalesce {
+            transaction: *current,
+            reason: AudioRealignCoalesceReason::LowLevelFallbackAlreadyUsed,
+        },
+        AudioRealignPhase::Covered => {
+            if audio_realign_target_matches(
+                current.target_timeline_nsecs,
+                request.target_timeline_nsecs,
+            ) {
+                current.request = request;
+                return AudioRealignRequestAction::Coalesce {
+                    transaction: *current,
+                    reason: AudioRealignCoalesceReason::CoverageSatisfied,
+                };
+            }
+            *transaction = None;
+            AudioRealignRequestAction::Start
+        }
+    }
+}
+
+fn update_audio_realign_progress(
+    transaction: &mut AudioRealignTransaction,
+    worker: AudioDecodeWorkerSnapshot,
+    coverage: AudioRealignCoverage,
+    now: Instant,
+) {
+    if transaction.phase == AudioRealignPhase::Flushing
+        && worker.state != AudioDecodeWorkerState::Recovering
+    {
+        transaction.phase = AudioRealignPhase::AwaitingCoverage;
+        transaction.last_progress_at = now;
+    }
+    if worker.state == AudioDecodeWorkerState::Recovering
+        && let Some(progress_elapsed) = worker.last_result_progress_elapsed
+        && let Some(progress_at) = now.checked_sub(progress_elapsed)
+        && progress_at > transaction.last_progress_at
+    {
+        transaction.last_progress_at = progress_at;
+    }
+    let coverage_nsecs = coverage.contiguous_coverage_nsecs.unwrap_or_default();
+    if coverage_nsecs > transaction.coverage_nsecs {
+        transaction.coverage_nsecs = coverage_nsecs;
+        transaction.last_progress_at = now;
+    }
+    if coverage.ready && transaction.phase != AudioRealignPhase::FallbackUsed {
+        transaction.phase = AudioRealignPhase::Covered;
+        transaction.last_progress_at = now;
+    }
+}
+
+fn poll_audio_recovery_watchdog(
+    transaction: &mut AudioRealignTransaction,
+    worker: AudioDecodeWorkerSnapshot,
+    now: Instant,
+) -> Option<AudioRecoveryWatchdogAction> {
+    if transaction.phase == AudioRealignPhase::Covered {
+        return None;
+    }
+    let stalled_for = now.saturating_duration_since(transaction.last_progress_at);
+    if stalled_for >= AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER {
+        if transaction.phase != AudioRealignPhase::FallbackUsed {
+            transaction.phase = AudioRealignPhase::FallbackUsed;
+            transaction.last_progress_at = now;
+            transaction.attempts = transaction.attempts.saturating_add(1);
+            let mut request = transaction.request;
+            request.reason = "audio_realign_coverage_timeout";
+            return Some(AudioRecoveryWatchdogAction::LowLevelFallback {
+                transaction: *transaction,
+                worker,
+                request,
+            });
+        }
+        if !transaction.fallback_exhausted_logged {
+            transaction.fallback_exhausted_logged = true;
+            return Some(AudioRecoveryWatchdogAction::FallbackExhausted {
+                transaction: *transaction,
+                worker,
+            });
+        }
+        return None;
+    }
+    if stalled_for >= AUDIO_DECODE_RECOVERY_STALL_WARN_AFTER && !transaction.warning_emitted {
+        transaction.warning_emitted = true;
+        return Some(AudioRecoveryWatchdogAction::Warn {
+            transaction: *transaction,
+            worker,
+        });
+    }
+    None
+}
+
 pub(super) struct PlaybackPipelineState {
     pub(super) video_stream: StreamInfo,
     pub(super) video_frame_duration_nsecs: u64,
@@ -203,13 +411,9 @@ pub(super) struct PlaybackPipelineState {
     pub(super) video_decode_skip_nonref_active: bool,
     pub(super) cached_seek_recovery_watchdog: Option<CachedSeekRecoveryWatchdog>,
     pub(super) cached_seek_recovery_attempt: Option<CachedSeekRecoveryAttempt>,
-    pub(super) rebuffer_audio_realign_attempt: Option<RebufferAudioRealignAttempt>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct RebufferAudioRealignAttempt {
-    pub(super) target_timeline_nsecs: u64,
-    pub(super) attempts: u8,
+    pub(super) audio_realign_transaction: Option<AudioRealignTransaction>,
+    pub(super) next_recovery_transaction_id: u64,
+    pub(super) active_recovery_transaction_id: u64,
 }
 
 fn mark_video_decode_skip_nonref_inactive(skip_nonref_active: &mut bool) -> bool {
@@ -219,6 +423,25 @@ fn mark_video_decode_skip_nonref_inactive(skip_nonref_active: &mut bool) -> bool
 }
 
 impl PlaybackPipelineState {
+    pub(super) fn begin_recovery_transaction(&mut self) -> u64 {
+        let transaction_id = self.next_recovery_transaction_id.max(1);
+        self.next_recovery_transaction_id = transaction_id.saturating_add(1).max(1);
+        self.active_recovery_transaction_id = transaction_id;
+        transaction_id
+    }
+
+    pub(super) fn active_recovery_transaction_id(&self) -> u64 {
+        self.active_recovery_transaction_id
+    }
+
+    pub(super) fn continue_recovery_transaction(&mut self, transaction_id: u64) {
+        let transaction_id = transaction_id.max(1);
+        self.active_recovery_transaction_id = transaction_id;
+        self.next_recovery_transaction_id = self
+            .next_recovery_transaction_id
+            .max(transaction_id.saturating_add(1).max(1));
+    }
+
     pub(super) fn advance_playback_generation(&mut self) -> u64 {
         self.playback_generation.advance()
     }
@@ -239,30 +462,117 @@ impl PlaybackPipelineState {
         Ok(())
     }
 
-    pub(super) fn observe_rebuffer_audio_realign_attempt(
+    pub(super) fn observe_rebuffer_audio_realign_request(
         &mut self,
-        target_timeline_nsecs: u64,
-    ) -> u8 {
-        let attempts = match self.rebuffer_audio_realign_attempt {
-            Some(previous)
-                if previous
-                    .target_timeline_nsecs
-                    .abs_diff(target_timeline_nsecs)
-                    <= 500_000_000 =>
-            {
-                previous.attempts.saturating_add(1)
-            }
-            _ => 1,
-        };
-        self.rebuffer_audio_realign_attempt = Some(RebufferAudioRealignAttempt {
-            target_timeline_nsecs,
-            attempts,
-        });
-        attempts
+        request: RebufferAudioRealignRequest,
+    ) -> AudioRealignRequestAction {
+        self.refresh_audio_realign_progress();
+        observe_audio_realign_request(&mut self.audio_realign_transaction, request)
     }
 
-    pub(super) fn clear_rebuffer_audio_realign_attempt(&mut self) {
-        self.rebuffer_audio_realign_attempt = None;
+    pub(super) fn begin_audio_realign_transaction(
+        &mut self,
+        transaction_id: u64,
+        request: RebufferAudioRealignRequest,
+        generation: u64,
+        started_at: Instant,
+    ) {
+        self.continue_recovery_transaction(transaction_id);
+        self.audio_realign_transaction = Some(AudioRealignTransaction {
+            transaction_id,
+            target_timeline_nsecs: request.target_timeline_nsecs,
+            generation,
+            started_at,
+            attempts: 1,
+            request,
+            phase: AudioRealignPhase::Flushing,
+            coverage_nsecs: 0,
+            coverage_target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+                .saturating_sub(duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)),
+            last_progress_at: started_at,
+            warning_emitted: false,
+            fallback_exhausted_logged: false,
+        });
+    }
+
+    pub(super) fn update_audio_realign_recovery_generation(&mut self, generation: u64) {
+        if let Some(transaction) = self.audio_realign_transaction.as_mut() {
+            transaction.generation = generation;
+            transaction.phase = AudioRealignPhase::FallbackUsed;
+            transaction.coverage_nsecs = 0;
+            transaction.last_progress_at = Instant::now();
+        }
+    }
+
+    pub(super) fn poll_audio_recovery_watchdog(&mut self) -> Option<AudioRecoveryWatchdogAction> {
+        self.refresh_audio_realign_progress();
+        let worker = self.audio_decode_pipeline.as_ref()?.snapshot();
+        let transaction = self.audio_realign_transaction.as_mut()?;
+        poll_audio_recovery_watchdog(transaction, worker, Instant::now())
+    }
+
+    fn refresh_audio_realign_progress(&mut self) {
+        let Some(transaction) = self.audio_realign_transaction else {
+            return;
+        };
+        let Some(worker) = self
+            .audio_decode_pipeline
+            .as_ref()
+            .map(AudioDecodePipeline::snapshot)
+        else {
+            return;
+        };
+        let coverage = self.output_scheduler.audio_realign_coverage(
+            transaction.target_timeline_nsecs,
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+        );
+        if let Some(transaction) = self.audio_realign_transaction.as_mut() {
+            let previous_phase = transaction.phase;
+            let previous_coverage_nsecs = transaction.coverage_nsecs;
+            update_audio_realign_progress(transaction, worker, coverage, Instant::now());
+            if transaction.phase != previous_phase
+                || transaction.coverage_nsecs != previous_coverage_nsecs
+            {
+                tracing::debug!(
+                    transaction_id = transaction.transaction_id,
+                    recovery_scope = "audio_realign",
+                    target_timeline_nsecs = transaction.target_timeline_nsecs,
+                    transaction_generation = transaction.generation,
+                    previous_phase = previous_phase.as_str(),
+                    phase = transaction.phase.as_str(),
+                    audio_accepted_start = ?coverage.audio_accepted_start_timeline_nsecs,
+                    start_gap_ms = ?coverage
+                        .start_gap_nsecs
+                        .map(|gap| gap as f64 / 1_000_000.0),
+                    contiguous_coverage_ms = ?coverage
+                        .contiguous_coverage_nsecs
+                        .map(|duration| duration as f64 / 1_000_000.0),
+                    coverage_target_ms = coverage.protected_target_nsecs as f64 / 1_000_000.0,
+                    recovery_satisfied = transaction.phase == AudioRealignPhase::Covered,
+                    fallback_eligible = false,
+                    "updated FFmpeg audio realign transaction coverage"
+                );
+            }
+        }
+    }
+
+    pub(super) fn clear_audio_realign_transaction(&mut self) {
+        self.audio_realign_transaction = None;
+    }
+
+    pub(super) fn clear_audio_realign_transaction_after_resume(
+        &mut self,
+    ) -> Option<AudioRealignTransaction> {
+        let output_resumed = self.output_scheduler.snapshot().state == PlaybackOutputState::Playing;
+        let recovery_complete = self
+            .audio_decode_pipeline
+            .as_ref()
+            .is_none_or(|pipeline| pipeline.snapshot().state != AudioDecodeWorkerState::Recovering);
+        if output_resumed && recovery_complete {
+            self.audio_realign_transaction.take()
+        } else {
+            None
+        }
     }
 
     pub(super) fn restore_video_decode_skip_nonref_default(
@@ -286,6 +596,12 @@ impl PlaybackPipelineState {
         &mut self,
         session_id: PlaybackSessionId,
     ) -> std::result::Result<(), String> {
+        let transaction_id = self
+            .video_decode_recovery
+            .recovery_scope()
+            .transaction_id()
+            .unwrap_or_else(|| self.begin_recovery_transaction());
+        self.active_recovery_transaction_id = transaction_id;
         if self.video_decode_skip_nonref_active {
             self.video_decode_pipeline.set_skip_nonref_frames(false)?;
             self.video_decode_skip_nonref_active = false;
@@ -297,6 +613,8 @@ impl PlaybackPipelineState {
         self.dovi_pipeline.reset();
         tracing::debug!(
             session_id = ?session_id,
+            transaction_id,
+            recovery_scope = self.video_decode_recovery.recovery_scope().as_str(),
             generation,
             "soft recovered HEVC decode chain while waiting for first decoded video frame"
         );
@@ -307,6 +625,12 @@ impl PlaybackPipelineState {
         &mut self,
         session_id: PlaybackSessionId,
     ) -> std::result::Result<usize, String> {
+        let transaction_id = self
+            .video_decode_recovery
+            .recovery_scope()
+            .transaction_id()
+            .unwrap_or_else(|| self.begin_recovery_transaction());
+        self.active_recovery_transaction_id = transaction_id;
         if self.video_decode_skip_nonref_active {
             self.video_decode_pipeline.set_skip_nonref_frames(false)?;
             self.video_decode_skip_nonref_active = false;
@@ -322,6 +646,8 @@ impl PlaybackPipelineState {
             .reset_hevc_decode_chain_transient_state();
         tracing::debug!(
             session_id = ?session_id,
+            transaction_id,
+            recovery_scope = self.video_decode_recovery.recovery_scope().as_str(),
             generation,
             requeued_probe_packets,
             "soft recovered HEVC cached seek decode chain without low-level seek"
@@ -448,6 +774,25 @@ impl PlaybackPipelineState {
             self.video_decode_pipeline
                 .hevc_startup_stall_watchdog_deadline(),
         )
+        .with_audio_decode_recovery_watchdog_deadline(
+            self.audio_decode_recovery_watchdog_deadline(),
+        )
+    }
+
+    fn audio_decode_recovery_watchdog_deadline(&self) -> Option<Instant> {
+        let transaction = self.audio_realign_transaction?;
+        if transaction.phase == AudioRealignPhase::Covered || transaction.fallback_exhausted_logged
+        {
+            return None;
+        }
+        let threshold = if transaction.warning_emitted
+            || transaction.phase == AudioRealignPhase::FallbackUsed
+        {
+            AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER
+        } else {
+            AUDIO_DECODE_RECOVERY_STALL_WARN_AFTER
+        };
+        Some(transaction.last_progress_at + threshold)
     }
 
     pub(super) fn cached_seek_recovery_watchdog_expired(&self) -> bool {
@@ -1102,6 +1447,7 @@ fn decoder_block_reason_blocks_packet_input(blocked_on: Option<PlaybackBlockReas
         blocked_on,
         Some(
             PlaybackBlockReason::PacketQueueFull
+                | PlaybackBlockReason::DecoderRecovery
                 | PlaybackBlockReason::DecoderInFlight
                 | PlaybackBlockReason::DecoderOutputPending
                 | PlaybackBlockReason::DecodedVideoQueue
@@ -1152,17 +1498,24 @@ fn push_decoder_input_stream_if_open(streams: &mut Vec<c_int>, stream: DecoderIn
 
 #[cfg(test)]
 mod tests {
-    use std::{os::raw::c_int, time::Duration};
+    use std::{
+        os::raw::c_int,
+        time::{Duration, Instant},
+    };
 
     use crate::player::render_host::RenderSize;
 
     use super::super::decode::DecodeInputRetryStatus;
     use super::super::{
         AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN, AudioResumeWaterline, PlaybackBlockReason,
-        PlaybackOutputSnapshot, PlaybackOutputState, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-        duration_nsecs,
+        PlaybackOutputSnapshot, PlaybackOutputState, RebufferAudioRealignRequest,
+        VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, duration_nsecs,
     };
     use super::{
+        AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER, AUDIO_DECODE_RECOVERY_STALL_WARN_AFTER,
+        AUDIO_REALIGN_TARGET_TOLERANCE_NSECS, AudioDecodeWorkerSnapshot, AudioDecodeWorkerState,
+        AudioRealignCoalesceReason, AudioRealignCoverage, AudioRealignPhase,
+        AudioRealignRequestAction, AudioRealignTransaction, AudioRecoveryWatchdogAction,
         CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT, CACHED_SEEK_STARTUP_MAX_VIDEO_PACKETS,
         CachedSeekRecoveryAttempt, CachedSeekRecoveryFallbackAction,
         CachedSeekRecoveryFallbackReason, CachedSeekRecoveryProgress, CachedSeekRecoveryWatchdog,
@@ -1172,7 +1525,248 @@ mod tests {
         cached_seek_recovery_watchdog_after_begin, cached_seek_recovery_watchdog_decision,
         decoder_block_reason_blocks_packet_input, decoder_input_retry_status_from_streams,
         decoder_input_streams_for_state, mark_video_decode_skip_nonref_inactive,
+        observe_audio_realign_request, poll_audio_recovery_watchdog, update_audio_realign_progress,
     };
+
+    fn audio_realign_request(target_timeline_nsecs: u64) -> RebufferAudioRealignRequest {
+        RebufferAudioRealignRequest {
+            target_timeline_nsecs,
+            anchor_timeline_nsecs: target_timeline_nsecs.saturating_sub(20_000_000),
+            first_video_timeline_nsecs: target_timeline_nsecs,
+            far_ahead_audio_timeline_nsecs: target_timeline_nsecs.saturating_add(2_000_000_000),
+            far_ahead_drop_count: 1,
+            reason: "test_audio_realign",
+        }
+    }
+
+    fn audio_realign_transaction(target_timeline_nsecs: u64) -> AudioRealignTransaction {
+        let started_at = Instant::now();
+        AudioRealignTransaction {
+            transaction_id: 7,
+            target_timeline_nsecs,
+            generation: 9,
+            started_at,
+            attempts: 1,
+            request: audio_realign_request(target_timeline_nsecs),
+            phase: AudioRealignPhase::Flushing,
+            coverage_nsecs: 0,
+            coverage_target_nsecs: 850_000_000,
+            last_progress_at: started_at,
+            warning_emitted: false,
+            fallback_exhausted_logged: false,
+        }
+    }
+
+    fn idle_audio_snapshot() -> AudioDecodeWorkerSnapshot {
+        AudioDecodeWorkerSnapshot {
+            state: AudioDecodeWorkerState::NeedPacket,
+            queued_frames: 0,
+            queued_duration_nsecs: 0,
+            duration_limit_nsecs: 1_000_000_000,
+            pending_input_packets: 0,
+            pending_input_capacity: 16,
+            in_flight_packets: 0,
+            command_queue_capacity: 4,
+            completed_packets: 0,
+            recovery_generation: None,
+            recovery_elapsed: None,
+            flush_command_sent: false,
+            stale_results_discarded: 0,
+            last_result_progress_elapsed: None,
+        }
+    }
+
+    #[test]
+    fn flush_ack_waits_for_coverage_and_only_marks_covered_at_protected_waterline() {
+        let target = 18_060_000_000;
+        let now = Instant::now();
+        let mut transaction = audio_realign_transaction(target);
+
+        update_audio_realign_progress(
+            &mut transaction,
+            idle_audio_snapshot(),
+            AudioRealignCoverage {
+                audio_accepted_start_timeline_nsecs: Some(target + 71_000_000),
+                start_gap_nsecs: Some(71_000_000),
+                contiguous_coverage_nsecs: Some(849_000_000),
+                protected_target_nsecs: 850_000_000,
+                ready: false,
+            },
+            now,
+        );
+        assert_eq!(transaction.phase, AudioRealignPhase::AwaitingCoverage);
+        assert_eq!(transaction.coverage_nsecs, 849_000_000);
+
+        let mut wrapped = Some(transaction);
+        assert!(matches!(
+            observe_audio_realign_request(&mut wrapped, audio_realign_request(target)),
+            AudioRealignRequestAction::Coalesce {
+                reason: AudioRealignCoalesceReason::AwaitingCoverage,
+                ..
+            }
+        ));
+
+        update_audio_realign_progress(
+            wrapped.as_mut().unwrap(),
+            idle_audio_snapshot(),
+            AudioRealignCoverage {
+                audio_accepted_start_timeline_nsecs: Some(target + 71_000_000),
+                start_gap_nsecs: Some(71_000_000),
+                contiguous_coverage_nsecs: Some(1_056_000_000),
+                protected_target_nsecs: 850_000_000,
+                ready: true,
+            },
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(wrapped.unwrap().phase, AudioRealignPhase::Covered);
+    }
+
+    #[test]
+    fn audio_realign_covered_is_terminal_and_never_falls_back_from_repeat_requests() {
+        let target = 18_060_000_000;
+        let mut transaction = Some(audio_realign_transaction(target));
+
+        for _ in 0..8 {
+            let recovering_action =
+                observe_audio_realign_request(&mut transaction, audio_realign_request(target));
+            assert!(matches!(
+                recovering_action,
+                AudioRealignRequestAction::Coalesce {
+                    reason: AudioRealignCoalesceReason::Flushing,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(transaction.unwrap().attempts, 1);
+
+        transaction.as_mut().unwrap().phase = AudioRealignPhase::AwaitingCoverage;
+        let awaiting_action =
+            observe_audio_realign_request(&mut transaction, audio_realign_request(target));
+        assert!(matches!(
+            awaiting_action,
+            AudioRealignRequestAction::Coalesce {
+                reason: AudioRealignCoalesceReason::AwaitingCoverage,
+                ..
+            }
+        ));
+
+        transaction.as_mut().unwrap().phase = AudioRealignPhase::Covered;
+        for _ in 0..8 {
+            let covered_action =
+                observe_audio_realign_request(&mut transaction, audio_realign_request(target));
+            assert!(matches!(
+                covered_action,
+                AudioRealignRequestAction::Coalesce {
+                    reason: AudioRealignCoalesceReason::CoverageSatisfied,
+                    ..
+                }
+            ));
+        }
+        let transaction = transaction.unwrap();
+        assert_eq!(transaction.attempts, 1);
+        assert_eq!(transaction.phase, AudioRealignPhase::Covered);
+    }
+
+    #[test]
+    fn covered_938ms_audio_rejects_stale_239s_reader_request_without_second_seek() {
+        let target = 237_237_000_000;
+        let mut transaction = Some(audio_realign_transaction(target));
+        transaction.as_mut().unwrap().phase = AudioRealignPhase::AwaitingCoverage;
+        update_audio_realign_progress(
+            transaction.as_mut().unwrap(),
+            idle_audio_snapshot(),
+            AudioRealignCoverage {
+                audio_accepted_start_timeline_nsecs: Some(target),
+                start_gap_nsecs: Some(0),
+                contiguous_coverage_nsecs: Some(938_999_996),
+                protected_target_nsecs: 850_000_000,
+                ready: true,
+            },
+            Instant::now(),
+        );
+        let mut stale_request = audio_realign_request(target);
+        stale_request.far_ahead_audio_timeline_nsecs = 239_136_000_000;
+
+        assert!(matches!(
+            observe_audio_realign_request(&mut transaction, stale_request),
+            AudioRealignRequestAction::Coalesce {
+                reason: AudioRealignCoalesceReason::CoverageSatisfied,
+                ..
+            }
+        ));
+        let transaction = transaction.unwrap();
+        assert_eq!(transaction.phase, AudioRealignPhase::Covered);
+        assert_eq!(transaction.attempts, 1);
+    }
+
+    #[test]
+    fn changed_target_while_coverage_is_pending_is_coalesced() {
+        let initial_target = 18_060_000_000;
+        let changed_target = initial_target + AUDIO_REALIGN_TARGET_TOLERANCE_NSECS + 1;
+        let mut transaction = Some(audio_realign_transaction(initial_target));
+
+        transaction.as_mut().unwrap().phase = AudioRealignPhase::AwaitingCoverage;
+        let action =
+            observe_audio_realign_request(&mut transaction, audio_realign_request(changed_target));
+
+        assert!(matches!(
+            action,
+            AudioRealignRequestAction::Coalesce {
+                reason: AudioRealignCoalesceReason::AwaitingCoverage,
+                ..
+            }
+        ));
+        let transaction = transaction.unwrap();
+        assert_eq!(transaction.target_timeline_nsecs, initial_target);
+        assert_eq!(transaction.request.target_timeline_nsecs, initial_target);
+        assert_eq!(transaction.attempts, 1);
+    }
+
+    #[test]
+    fn audio_recovery_watchdog_warns_then_falls_back_only_once() {
+        let mut transaction = audio_realign_transaction(18_060_000_000);
+        transaction.phase = AudioRealignPhase::AwaitingCoverage;
+        let now = Instant::now();
+        transaction.last_progress_at = now - AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER;
+
+        let warning = poll_audio_recovery_watchdog(
+            &mut transaction,
+            idle_audio_snapshot(),
+            now - AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER
+                + AUDIO_DECODE_RECOVERY_STALL_WARN_AFTER,
+        );
+        assert!(matches!(
+            warning,
+            Some(AudioRecoveryWatchdogAction::Warn { .. })
+        ));
+        assert!(
+            poll_audio_recovery_watchdog(
+                &mut transaction,
+                idle_audio_snapshot(),
+                now - AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER
+                    + AUDIO_DECODE_RECOVERY_STALL_WARN_AFTER,
+            )
+            .is_none()
+        );
+
+        let fallback = poll_audio_recovery_watchdog(&mut transaction, idle_audio_snapshot(), now);
+        assert!(matches!(
+            fallback,
+            Some(AudioRecoveryWatchdogAction::LowLevelFallback { .. })
+        ));
+
+        let after_fallback = now + AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER;
+        let exhausted =
+            poll_audio_recovery_watchdog(&mut transaction, idle_audio_snapshot(), after_fallback);
+        assert!(matches!(
+            exhausted,
+            Some(AudioRecoveryWatchdogAction::FallbackExhausted { .. })
+        ));
+        assert!(
+            poll_audio_recovery_watchdog(&mut transaction, idle_audio_snapshot(), after_fallback,)
+                .is_none()
+        );
+    }
 
     fn stream(stream_index: c_int, packet_input_blocked: bool) -> DecoderInputStreamState {
         DecoderInputStreamState {
@@ -1185,6 +1779,9 @@ mod tests {
         AudioResumeWaterline {
             resume_timeline_nsecs: 1_000_000_000,
             target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            audio_accepted_start_timeline_nsecs: Some(1_000_000_000),
+            audio_accepted_start_gap_nsecs: Some(0),
+            accepted_contiguous_coverage_nsecs: decoded_audio_forward_nsecs,
             audio_output_buffered_until_nsecs: None,
             audio_output_pending_nsecs: None,
             pending_audio_start_nsecs: Some(1_000_000_000),
@@ -1221,6 +1818,9 @@ mod tests {
             video_bootstrap_after_seek: false,
             video_decode_underfill: false,
             rebuffer_empty_audio_output_blocked: false,
+            scheduler_dropped_video_frames: 0,
+            recent_coordinator_stall_nsecs: None,
+            recent_coordinator_stall_age_nsecs: None,
         }
     }
 
@@ -1642,6 +2242,9 @@ mod tests {
     fn decoder_block_reason_blocks_only_packet_input_pressure() {
         assert!(decoder_block_reason_blocks_packet_input(Some(
             PlaybackBlockReason::PacketQueueFull
+        )));
+        assert!(decoder_block_reason_blocks_packet_input(Some(
+            PlaybackBlockReason::DecoderRecovery
         )));
         assert!(decoder_block_reason_blocks_packet_input(Some(
             PlaybackBlockReason::DecoderInFlight

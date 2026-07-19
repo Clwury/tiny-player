@@ -34,6 +34,9 @@ pub(super) struct AudioDecodeWorker {
     completed_drains: VecDeque<QueuedAudioDecodeDrainResult>,
     draining: bool,
     recovering: bool,
+    recovery_started_at: Option<Instant>,
+    last_result_progress_at: Option<Instant>,
+    stale_results_discarded: u64,
     eof: bool,
 }
 
@@ -74,6 +77,11 @@ pub(super) struct AudioDecodeWorkerSnapshot {
     pub(super) in_flight_packets: usize,
     pub(super) command_queue_capacity: usize,
     pub(super) completed_packets: usize,
+    pub(super) recovery_generation: Option<u64>,
+    pub(super) recovery_elapsed: Option<Duration>,
+    pub(super) flush_command_sent: bool,
+    pub(super) stale_results_discarded: u64,
+    pub(super) last_result_progress_elapsed: Option<Duration>,
 }
 
 impl AudioDecodeWorkerSnapshot {
@@ -193,6 +201,9 @@ impl AudioDecodeWorker {
             completed_drains: VecDeque::new(),
             draining: false,
             recovering: false,
+            recovery_started_at: None,
+            last_result_progress_at: None,
+            stale_results_discarded: 0,
             eof: false,
         })
     }
@@ -202,6 +213,7 @@ impl AudioDecodeWorker {
     }
 
     pub(super) fn snapshot(&self) -> AudioDecodeWorkerSnapshot {
+        let now = Instant::now();
         AudioDecodeWorkerSnapshot {
             state: self.state(),
             queued_frames: self.decoded_frames.len(),
@@ -212,7 +224,28 @@ impl AudioDecodeWorker {
             in_flight_packets: self.in_flight_packets,
             command_queue_capacity: AUDIO_DECODE_COMMAND_QUEUE_CAPACITY,
             completed_packets: self.completed_packets.len(),
+            recovery_generation: self.recovering.then_some(self.flush_generation).flatten(),
+            recovery_elapsed: self
+                .recovering
+                .then(|| {
+                    self.recovery_started_at
+                        .map(|started_at| now.saturating_duration_since(started_at))
+                })
+                .flatten(),
+            flush_command_sent: self.recovering && self.flush_command_sent,
+            stale_results_discarded: self.stale_results_discarded,
+            last_result_progress_elapsed: self
+                .recovering
+                .then(|| {
+                    self.last_result_progress_at
+                        .map(|progress_at| now.saturating_duration_since(progress_at))
+                })
+                .flatten(),
         }
+    }
+
+    pub(super) fn service(&mut self) -> std::result::Result<(), String> {
+        self.pump_available_results()
     }
 
     pub(super) fn try_enqueue_packet(
@@ -296,12 +329,16 @@ impl AudioDecodeWorker {
     }
 
     pub(super) fn flush_buffers(&mut self, generation: u64) -> std::result::Result<(), String> {
+        let now = Instant::now();
         self.decoded_frames.clear();
         self.completed_packets.clear();
         self.drain_frames.clear();
         self.completed_drains.clear();
         self.decoded_duration_nsecs = 0;
         self.recovering = true;
+        self.recovery_started_at = Some(now);
+        self.last_result_progress_at = Some(now);
+        self.stale_results_discarded = 0;
         self.draining = false;
         self.eof = false;
         self.flush_generation = Some(generation);
@@ -398,12 +435,15 @@ impl AudioDecodeWorker {
 
     fn record_result(&mut self, result: AudioDecodeResult) {
         if self.recovering {
+            self.last_result_progress_at = Some(Instant::now());
             match result {
                 AudioDecodeResult::Flushed { generation }
                     if self.flush_generation == Some(generation) =>
                 {
                     self.in_flight_packets = 0;
                     self.recovering = false;
+                    self.recovery_started_at = None;
+                    self.last_result_progress_at = None;
                     self.draining = false;
                     self.flush_generation = None;
                     self.flush_command_sent = false;
@@ -417,8 +457,11 @@ impl AudioDecodeWorker {
                 }
                 AudioDecodeResult::PacketDone { .. } | AudioDecodeResult::Drained { .. } => {
                     self.in_flight_packets = self.in_flight_packets.saturating_sub(1);
+                    self.stale_results_discarded = self.stale_results_discarded.saturating_add(1);
                 }
-                AudioDecodeResult::Frame { .. } | AudioDecodeResult::Flushed { .. } => {}
+                AudioDecodeResult::Frame { .. } | AudioDecodeResult::Flushed { .. } => {
+                    self.stale_results_discarded = self.stale_results_discarded.saturating_add(1);
+                }
             }
             return;
         }
@@ -474,6 +517,8 @@ impl AudioDecodeWorker {
             AudioDecodeResult::Flushed { .. } => {
                 self.in_flight_packets = 0;
                 self.recovering = false;
+                self.recovery_started_at = None;
+                self.last_result_progress_at = None;
                 self.draining = false;
                 self.eof = false;
                 self.flush_generation = None;
@@ -640,43 +685,148 @@ fn run_audio_decode_worker(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::mpsc};
+    use std::{collections::VecDeque, sync::mpsc, time::Duration};
 
     use ffmpeg_sys_next as ffi;
 
     use super::{
-        AUDIO_DECODE_QUEUE_LIMIT_DURATION, AudioDecodeWorker, AudioDecodeWorkerInfo,
-        AudioDecodeWorkerState, duration_nsecs,
+        AUDIO_DECODE_QUEUE_LIMIT_DURATION, AudioDecodeCommand, AudioDecodeEnqueueResult,
+        AudioDecodeResult, AudioDecodeWorker, AudioDecodeWorkerInfo, AudioDecodeWorkerState,
+        AvPacket, duration_nsecs,
     };
 
     fn worker_for_test() -> AudioDecodeWorker {
-        let (command_tx, _command_rx) = mpsc::sync_channel(1);
-        let (_result_tx, result_rx) = mpsc::sync_channel(1);
-        AudioDecodeWorker {
-            command_tx,
-            result_rx,
-            handle: None,
-            info: AudioDecodeWorkerInfo {
-                stream_index: 1,
-                time_base: ffi::AVRational { num: 1, den: 1000 },
-                output_rate: 48_000,
-                output_channels: 2,
+        worker_with_channels(1, 1).0
+    }
+
+    fn worker_with_channels(
+        command_capacity: usize,
+        result_capacity: usize,
+    ) -> (
+        AudioDecodeWorker,
+        mpsc::SyncSender<AudioDecodeResult>,
+        mpsc::Receiver<AudioDecodeCommand>,
+    ) {
+        let (command_tx, command_rx) = mpsc::sync_channel(command_capacity);
+        let (result_tx, result_rx) = mpsc::sync_channel(result_capacity);
+        (
+            AudioDecodeWorker {
+                command_tx,
+                result_rx,
+                handle: None,
+                info: AudioDecodeWorkerInfo {
+                    stream_index: 1,
+                    time_base: ffi::AVRational { num: 1, den: 1000 },
+                    output_rate: 48_000,
+                    output_channels: 2,
+                },
+                decoded_frames: VecDeque::new(),
+                completed_packets: VecDeque::new(),
+                decoded_duration_nsecs: 0,
+                decoded_duration_limit_nsecs: duration_nsecs(AUDIO_DECODE_QUEUE_LIMIT_DURATION),
+                in_flight_packets: 0,
+                flush_generation: None,
+                flush_command_sent: false,
+                drain_generation: None,
+                drain_command_sent: false,
+                drain_frames: Vec::new(),
+                completed_drains: VecDeque::new(),
+                draining: false,
+                recovering: false,
+                recovery_started_at: None,
+                last_result_progress_at: None,
+                stale_results_discarded: 0,
+                eof: false,
             },
-            decoded_frames: VecDeque::new(),
-            completed_packets: VecDeque::new(),
-            decoded_duration_nsecs: 0,
-            decoded_duration_limit_nsecs: duration_nsecs(AUDIO_DECODE_QUEUE_LIMIT_DURATION),
-            in_flight_packets: 0,
-            flush_generation: None,
-            flush_command_sent: false,
-            drain_generation: None,
-            drain_command_sent: false,
-            drain_frames: Vec::new(),
-            completed_drains: VecDeque::new(),
-            draining: false,
-            recovering: false,
-            eof: false,
+            result_tx,
+            command_rx,
+        )
+    }
+
+    #[test]
+    fn service_pumps_full_queue_recovery_after_tracked_packets_are_cleared() {
+        let (mut worker, result_tx, command_rx) = worker_with_channels(4, 8);
+        let recovery_generation = 9;
+        for generation in 1..=4 {
+            worker
+                .command_tx
+                .try_send(AudioDecodeCommand::FlushBuffers { generation })
+                .unwrap();
         }
+        worker.in_flight_packets = 4;
+
+        worker.flush_buffers(recovery_generation).unwrap();
+        let pending_snapshot = worker.snapshot();
+        assert_eq!(pending_snapshot.state, AudioDecodeWorkerState::Recovering);
+        assert_eq!(
+            pending_snapshot.recovery_generation,
+            Some(recovery_generation)
+        );
+        assert!(!pending_snapshot.flush_command_sent);
+
+        let _ = command_rx.try_recv().expect("one command slot is released");
+        worker.service().unwrap();
+        assert!(worker.snapshot().flush_command_sent);
+
+        for generation in 1..=4 {
+            result_tx
+                .send(AudioDecodeResult::PacketDone {
+                    generation,
+                    result: Ok(()),
+                    decoded_frames: 0,
+                    elapsed: Duration::from_millis(1),
+                })
+                .unwrap();
+        }
+        result_tx
+            .send(AudioDecodeResult::Flushed {
+                generation: recovery_generation,
+            })
+            .unwrap();
+        worker.service().unwrap();
+
+        let recovered_snapshot = worker.snapshot();
+        assert_eq!(recovered_snapshot.state, AudioDecodeWorkerState::NeedPacket);
+        assert_eq!(recovered_snapshot.in_flight_packets, 0);
+        assert_eq!(recovered_snapshot.stale_results_discarded, 4);
+
+        while command_rx.try_recv().is_ok() {}
+        let packet = AvPacket::new().expect("packet allocates");
+        assert_eq!(
+            worker
+                .try_enqueue_packet(&packet, recovery_generation + 1)
+                .unwrap(),
+            AudioDecodeEnqueueResult::Queued
+        );
+    }
+
+    #[test]
+    fn stale_flush_ack_does_not_complete_current_audio_recovery() {
+        let (mut worker, result_tx, _command_rx) = worker_with_channels(4, 4);
+        let recovery_generation = 9;
+        worker.flush_buffers(recovery_generation).unwrap();
+
+        result_tx
+            .send(AudioDecodeResult::Flushed {
+                generation: recovery_generation - 1,
+            })
+            .unwrap();
+        worker.service().unwrap();
+        let stale_snapshot = worker.snapshot();
+        assert_eq!(stale_snapshot.state, AudioDecodeWorkerState::Recovering);
+        assert_eq!(
+            stale_snapshot.recovery_generation,
+            Some(recovery_generation)
+        );
+        assert_eq!(stale_snapshot.stale_results_discarded, 1);
+
+        result_tx
+            .send(AudioDecodeResult::Flushed {
+                generation: recovery_generation,
+            })
+            .unwrap();
+        worker.service().unwrap();
+        assert_eq!(worker.snapshot().state, AudioDecodeWorkerState::NeedPacket);
     }
 
     #[test]

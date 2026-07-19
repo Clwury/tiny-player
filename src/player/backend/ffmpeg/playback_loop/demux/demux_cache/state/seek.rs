@@ -1,10 +1,18 @@
 use std::{collections::BTreeMap, os::raw::c_int};
 
+use super::seek_algorithm::CachedSeekPacketRangeContext;
 use super::{
-    DemuxCachedRange, DemuxCachedSeekHit, DemuxCachedSeekInfo, DemuxPacketCacheState,
-    DemuxPacketRangeView, DemuxSeekRequest, PacketId, PlaybackSeekMode, PlaybackSessionId, RangeId,
-    nsecs_to_seconds,
+    CachedSeekMiss, CachedSeekMissReason, DemuxCachedRange, DemuxCachedSeekHit,
+    DemuxCachedSeekInfo, DemuxPacketCacheState, DemuxPacketRangeView, DemuxSeekRequest, PacketId,
+    PlaybackSeekMode, PlaybackSessionId, RangeId, StreamCacheKind, nsecs_to_seconds,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CachedSeekRangeLocation {
+    Current,
+    Detached,
+    Archived,
+}
 
 impl DemuxPacketCacheState {
     #[cfg(test)]
@@ -37,6 +45,7 @@ impl DemuxPacketCacheState {
             .map(|hit| nsecs_to_seconds(hit.buffered_until_nsecs))
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seek_cached_with_generation_hit(
         &mut self,
         target_nsecs: u64,
@@ -44,94 +53,141 @@ impl DemuxPacketCacheState {
         session_id: PlaybackSessionId,
         seek_generation: u64,
     ) -> Option<DemuxCachedSeekHit> {
-        let current_hit = (!self
-            .failed_cached_seek_ranges
-            .contains_key(&self.read_range_id))
-        .then(|| self.seek_cached_in_range(self.read_range(), target_nsecs, mode))
-        .flatten();
-        if let Some(hit) = current_hit {
-            let result = hit.clone();
-            self.generation = self.generation.saturating_add(1);
-            self.set_reader_heads_for_current_generation(hit.reader_heads);
-            self.refresh_reader_tracking();
-            self.reader_nsecs = hit.anchor_nsecs;
-            self.session_id = session_id;
-            self.seek_request = None;
-            self.seeking = false;
-            self.resume_append_skip_until_nsecs = None;
-            self.low_level_append_guard_target_nsecs = None;
-            self.trim_to_limit();
-            self.cached_seeks = self.cached_seeks.saturating_add(1);
-            self.refresh_readahead_hysteresis();
-            return Some(result);
-        }
+        self.seek_cached_with_generation_attempt(target_nsecs, mode, session_id, seek_generation)
+            .ok()
+    }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seek_cached_with_generation_attempt(
+        &mut self,
+        target_nsecs: u64,
+        mode: PlaybackSeekMode,
+        session_id: PlaybackSessionId,
+        seek_generation: u64,
+    ) -> Result<DemuxCachedSeekHit, CachedSeekMiss> {
         let detached_append_range_id = self.detached_append_range_id();
-        let detached_hit = detached_append_range_id.and_then(|range_id| {
-            if self.failed_cached_seek_ranges.contains_key(&range_id) {
-                return None;
+        let mut ordered_ranges = vec![(self.read_range_id, CachedSeekRangeLocation::Current)];
+        if let Some(range_id) = detached_append_range_id {
+            ordered_ranges.push((range_id, CachedSeekRangeLocation::Detached));
+        }
+        ordered_ranges.extend(
+            self.ranges
+                .keys()
+                .copied()
+                .filter(|range_id| *range_id != self.read_range_id)
+                .filter(|range_id| Some(*range_id) != detached_append_range_id)
+                .map(|range_id| (range_id, CachedSeekRangeLocation::Archived)),
+        );
+
+        let mut rejections = Vec::new();
+        for (range_id, location) in ordered_ranges {
+            if self.failed_cached_seek_ranges.contains_key(&range_id)
+                || self.rejected_cached_seek_ranges.contains_key(&range_id)
+            {
+                continue;
             }
-            self.ranges.get(&range_id).and_then(|range| {
-                self.seek_cached_in_range(range, target_nsecs, mode)
-                    .map(|hit| (range_id, hit))
-            })
-        });
-        if let Some((range_id, hit)) = detached_hit {
-            let result = hit.clone();
-            self.preserve_current_range();
-            self.generation = self.generation.saturating_add(1);
-            self.activate_range_for_read_with_heads(range_id, hit.reader_heads);
-            self.reader_nsecs = hit.anchor_nsecs;
-            self.session_id = session_id;
-            self.seek_request = None;
-            self.seeking = false;
-            self.resume_append_skip_until_nsecs = None;
-            self.low_level_append_guard_target_nsecs = None;
-            self.trim_to_limit();
-            self.cached_seeks = self.cached_seeks.saturating_add(1);
-            self.refresh_readahead_hysteresis();
-            return Some(result);
+            let Some(range) = self.ranges.get(&range_id) else {
+                continue;
+            };
+            if self.range_cached_seek_target(range, target_nsecs).is_none() {
+                continue;
+            }
+            match self.seek_cached_in_range_diagnostic(range, target_nsecs, mode) {
+                Ok(hit) => {
+                    for miss in rejections {
+                        self.record_cached_seek_rejection(miss);
+                    }
+                    return Ok(self.commit_cached_seek_hit(
+                        hit,
+                        location,
+                        session_id,
+                        seek_generation,
+                    ));
+                }
+                Err(miss) => {
+                    rejections.push(miss);
+                }
+            }
         }
 
-        let hit = self
-            .ranges
-            .iter()
-            .filter(|(range_id, _)| **range_id != self.read_range_id)
-            .filter(|(range_id, _)| Some(**range_id) != detached_append_range_id)
-            .filter(|(range_id, _)| !self.failed_cached_seek_ranges.contains_key(range_id))
-            .find_map(|(range_id, range)| {
-                self.seek_cached_in_range(range, target_nsecs, mode)
-                    .map(|hit| (*range_id, hit))
-            });
-        let (range_id, hit) = hit?;
+        let miss = rejections.first().copied().unwrap_or(CachedSeekMiss {
+            range_id: None,
+            target_nsecs,
+            reason: CachedSeekMissReason::TargetOutsideRange,
+        });
+        for rejection in rejections {
+            self.record_cached_seek_rejection(rejection);
+        }
+        Err(miss)
+    }
+
+    fn record_cached_seek_rejection(&mut self, miss: CachedSeekMiss) {
+        let Some(range_id) = miss.range_id else {
+            return;
+        };
+        self.rejected_cached_seek_ranges.insert(range_id, miss);
+        if let Some(range) = self.ranges.get(&range_id) {
+            range.mark_seekable_dirty();
+        }
+        self.bump_seekability_revision();
+        tracing::warn!(
+            session_id = ?self.session_id,
+            range_id,
+            target_nsecs = miss.target_nsecs,
+            rejection_reason = miss.reason.as_str(),
+            "invalidated advertised FFmpeg cached seek range after exact seek rejection"
+        );
+    }
+
+    fn commit_cached_seek_hit(
+        &mut self,
+        hit: DemuxCachedSeekHit,
+        location: CachedSeekRangeLocation,
+        session_id: PlaybackSessionId,
+        seek_generation: u64,
+    ) -> DemuxCachedSeekHit {
         let result = hit.clone();
         let buffered_until_nsecs = hit.buffered_until_nsecs;
-        self.preserve_current_range();
+        if location != CachedSeekRangeLocation::Current {
+            self.preserve_current_range();
+        }
         self.generation = self.generation.saturating_add(1);
-        self.activate_range_for_read_with_heads(range_id, hit.reader_heads);
+        self.bump_seekability_revision();
+        if location == CachedSeekRangeLocation::Current {
+            self.set_reader_heads_for_current_generation(hit.reader_heads);
+            self.refresh_reader_tracking();
+        } else {
+            self.activate_range_for_read_with_heads(hit.range_id, hit.reader_heads);
+        }
         self.reader_nsecs = hit.anchor_nsecs;
         self.session_id = session_id;
         self.seek_request = None;
         self.seeking = false;
         self.resume_append_skip_until_nsecs = None;
         self.low_level_append_guard_target_nsecs = None;
-        if !self.read_range_eof() {
+        if location == CachedSeekRangeLocation::Archived && !self.read_range_eof() {
             self.queue_resume_seek_after_cached_range(buffered_until_nsecs, seek_generation);
         }
         self.trim_to_limit();
         self.cached_seeks = self.cached_seeks.saturating_add(1);
         self.refresh_readahead_hysteresis();
-        Some(result)
+        result
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn exclude_failed_cached_seek_range(
         &mut self,
         info: DemuxCachedSeekInfo,
     ) -> bool {
-        let before = self.seekable_time_ranges();
-        self.failed_cached_seek_ranges.insert(info.range_id, info);
-        let after = self.seekable_time_ranges();
-        let changed = before != after;
+        let changed = self
+            .failed_cached_seek_ranges
+            .insert(info.range_id, info)
+            .is_none()
+            && self.ranges.contains_key(&info.range_id);
+        if changed {
+            if let Some(range) = self.ranges.get(&info.range_id) {
+                range.mark_seekable_dirty();
+            }
+            self.bump_seekability_revision();
+        }
         tracing::warn!(
             session_id = ?self.session_id,
             range_id = info.range_id,
@@ -140,8 +196,12 @@ impl DemuxPacketCacheState {
             anchor_nsecs = info.anchor_nsecs,
             target_nsecs = info.target_nsecs,
             preroll_nsecs = info.preroll_nsecs,
-            seekable_ranges_before = ?before,
-            seekable_ranges_after = ?after,
+            previous_range_count = self
+                .last_emitted_seekable_ranges
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            seekability_revision = self.seekability_revision(),
             changed,
             "temporarily excluded failed cached seek recovery anchor for playback session"
         );
@@ -156,39 +216,125 @@ impl DemuxPacketCacheState {
         self.failed_cached_seek_ranges.get(&range_id).copied()
     }
 
-    fn seek_cached_in_range(
+    fn seek_cached_in_range_diagnostic(
         &self,
         range: &DemuxCachedRange,
         target_nsecs: u64,
         mode: PlaybackSeekMode,
-    ) -> Option<DemuxCachedSeekHit> {
-        let seek_target = self.range_cached_seek_target(range, target_nsecs)?;
+    ) -> Result<DemuxCachedSeekHit, CachedSeekMiss> {
+        let seek_target =
+            self.range_cached_seek_target(range, target_nsecs)
+                .ok_or(CachedSeekMiss {
+                    range_id: None,
+                    target_nsecs,
+                    reason: CachedSeekMissReason::TargetOutsideRange,
+                })?;
         let (_, stream_queues) = self.next_generation_range_view(range);
+        let required_stream_indices = self
+            .stream_kinds
+            .iter()
+            .filter_map(|(stream_index, kind)| {
+                matches!(kind, StreamCacheKind::Video | StreamCacheKind::Audio)
+                    .then_some(*stream_index)
+            })
+            .collect::<Vec<_>>();
         let cached_seek_preroll_nsecs = match mode {
             PlaybackSeekMode::Precise => self.cached_seek_preroll_nsecs,
             PlaybackSeekMode::Fast => 0,
         };
-        let mut hit = Self::seek_cached_in_packet_range(
-            &self.packets,
-            range.id,
-            self.timeline_anchor_stream_index,
-            cached_seek_preroll_nsecs,
-            self.recovery_point_stream_index(),
-            DemuxPacketRangeView {
-                stream_queues: &stream_queues,
-                subtitle_stream_index: self
-                    .selected_streams
-                    .subtitle_stream
-                    .map(|stream| stream.index),
-                is_bof: seek_target.is_bof,
-                is_eof: seek_target.is_eof,
+        let attempt = Self::seek_cached_in_packet_range_diagnostic(
+            CachedSeekPacketRangeContext {
+                packets: &self.packets,
+                range_id: range.id,
+                timeline_anchor_stream_index: self.timeline_anchor_stream_index,
+                cached_seek_preroll_nsecs,
+                recovery_point_stream_index: self.recovery_point_stream_index(),
+                required_stream_indices: &required_stream_indices,
+                range: DemuxPacketRangeView {
+                    stream_queues: &stream_queues,
+                    subtitle_stream_index: self
+                        .selected_streams
+                        .subtitle_stream
+                        .map(|stream| stream.index),
+                    is_bof: seek_target.is_bof,
+                    is_eof: seek_target.is_eof,
+                },
             },
             seek_target.target_nsecs,
-        )?;
+        );
+        let mut hit = match attempt {
+            Ok(hit) => hit,
+            Err(reason) => {
+                let reason = self.classify_cached_seek_miss(
+                    range,
+                    seek_target.target_nsecs,
+                    cached_seek_preroll_nsecs,
+                    &required_stream_indices,
+                    reason,
+                );
+                return Err(CachedSeekMiss {
+                    range_id: Some(range.id),
+                    target_nsecs: seek_target.target_nsecs,
+                    reason,
+                });
+            }
+        };
         hit.buffered_until_nsecs = hit
             .buffered_until_nsecs
             .min(seek_target.seekable_until_nsecs);
-        Some(hit)
+        Ok(hit)
+    }
+
+    fn classify_cached_seek_miss(
+        &self,
+        range: &DemuxCachedRange,
+        target_nsecs: u64,
+        cached_seek_preroll_nsecs: u64,
+        required_stream_indices: &[c_int],
+        reason: CachedSeekMissReason,
+    ) -> CachedSeekMissReason {
+        let next_generation = self.generation.saturating_add(1);
+        let has_next_generation_block = range.global_order.iter().any(|packet_id| {
+            self.low_level_append_blocked_packet_generations
+                .get(packet_id)
+                .is_some_and(|generation| *generation <= next_generation)
+        });
+        if has_next_generation_block
+            && Self::seek_cached_in_packet_range_diagnostic(
+                CachedSeekPacketRangeContext {
+                    packets: &self.packets,
+                    range_id: range.id,
+                    timeline_anchor_stream_index: self.timeline_anchor_stream_index,
+                    cached_seek_preroll_nsecs,
+                    recovery_point_stream_index: self.recovery_point_stream_index(),
+                    required_stream_indices,
+                    range: DemuxPacketRangeView {
+                        stream_queues: &range.stream_queues,
+                        subtitle_stream_index: self
+                            .selected_streams
+                            .subtitle_stream
+                            .map(|stream| stream.index),
+                        is_bof: range.is_bof,
+                        is_eof: range.is_eof,
+                    },
+                },
+                target_nsecs,
+            )
+            .is_ok()
+        {
+            return CachedSeekMissReason::GenerationBlocked;
+        }
+        if matches!(
+            reason,
+            CachedSeekMissReason::MissingPrerollAnchor | CachedSeekMissReason::AnchorTrimmed
+        ) && range
+            .stream_boundary(self.timeline_anchor_stream_index)
+            .pruned_packet_count
+            > 0
+        {
+            return CachedSeekMissReason::AnchorTrimmed;
+        }
+        reason
     }
 
     fn range_cached_seek_target(
@@ -314,6 +460,7 @@ impl DemuxPacketCacheState {
         self.resume_append_skip_until_nsecs = None;
         self.low_level_append_guard_target_nsecs = Some(target_nsecs);
         self.generation = self.generation.saturating_add(1);
+        self.bump_seekability_revision();
         self.start_new_current_range(target_nsecs == 0);
         self.seeking = true;
         self.low_level_seeks = self.low_level_seeks.saturating_add(1);
@@ -341,6 +488,7 @@ impl DemuxPacketCacheState {
         self.resume_append_skip_until_nsecs = None;
         self.low_level_append_guard_target_nsecs = Some(self.reader_nsecs);
         self.generation = self.generation.saturating_add(1);
+        self.bump_seekability_revision();
         self.start_new_current_range(false);
         self.seeking = true;
         self.low_level_seeks = self.low_level_seeks.saturating_add(1);
