@@ -671,10 +671,15 @@ impl DemuxPacketCacheState {
         }
         stream_ids.sort_unstable();
 
-        let forward_by_kind = self
+        let reader_window_by_kind = self
             .reader_stream_forward_windows()
             .into_iter()
-            .map(|window| (window.kind, window.duration_nsecs()))
+            .map(|window| (window.kind, window))
+            .collect::<Vec<_>>();
+        let active_window_by_kind = self
+            .active_stream_forward_windows()
+            .into_iter()
+            .map(|window| (window.kind, window))
             .collect::<Vec<_>>();
         let mut streams = Vec::new();
         for stream_index in stream_ids {
@@ -693,9 +698,22 @@ impl DemuxPacketCacheState {
             let reader_head_available = self.next_packet_id_for_stream(stream_index).is_some();
             let consumer_drainable = readable_packets_for_stream > 0;
             let queued_bytes = self.queued_bytes_for_stream(stream_index);
-            let forward_nsecs = forward_by_kind
+            let reader_window = reader_window_by_kind
                 .iter()
-                .find_map(|(window_kind, duration)| (*window_kind == kind).then_some(*duration));
+                .find_map(|(window_kind, window)| (*window_kind == kind).then_some(*window));
+            let active_window = active_window_by_kind
+                .iter()
+                .find_map(|(window_kind, window)| (*window_kind == kind).then_some(*window));
+            let reader_nsecs = reader_window.map(|window| window.reader_nsecs);
+            let cached_end_nsecs = active_window.map(|window| window.end_nsecs);
+            let target_coverage_nsecs = cached_end_nsecs.map(|end_nsecs| {
+                end_nsecs.saturating_sub(
+                    reader_nsecs
+                        .unwrap_or(self.reader_nsecs)
+                        .max(self.exact_seek_target_nsecs),
+                )
+            });
+            let forward_nsecs = reader_window.map(|window| window.duration_nsecs());
             streams.push(DemuxStreamPacketQueueSnapshot {
                 stream_index,
                 kind,
@@ -707,14 +725,19 @@ impl DemuxPacketCacheState {
                 reader_head_available,
                 consumer_drainable,
                 queued_bytes,
+                reader_nsecs,
+                cached_end_nsecs,
+                target_coverage_nsecs,
                 forward_nsecs,
             });
         }
         DemuxPacketQueueSnapshot {
+            cache_generation: self.next_packet_id,
             total_packets: streams.iter().map(|stream| stream.queued_packets).sum(),
             total_bytes: streams.iter().map(|stream| stream.queued_bytes).sum(),
             memory_limit_bytes: self.memory_limit_bytes,
             read_index: self.read_index,
+            exact_seek_target_nsecs: self.exact_seek_target_nsecs,
             streams,
         }
     }

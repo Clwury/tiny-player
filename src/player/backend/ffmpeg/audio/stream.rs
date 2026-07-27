@@ -1,7 +1,7 @@
 use super::{
-    AUDIO_CALLBACK_GAP_LOG_AFTER, Arc, AudioClockMode, AudioShared, DeviceTrait, Duration,
-    FromSample, Ordering, Sample, SizedSample, audio_elements_duration, audio_frames_for_elements,
-    duration_nsecs,
+    AUDIO_CALLBACK_GAP_LOG_AFTER, Arc, AudioClockMode, AudioOutputDecision, AudioShared,
+    DeviceTrait, Duration, FromSample, Ordering, Sample, SizedSample, audio_elements_duration,
+    audio_frames_for_elements, duration_nsecs,
 };
 
 pub(in crate::player::backend::ffmpeg::audio) fn build_audio_output_stream<T>(
@@ -26,7 +26,18 @@ pub(in crate::player::backend::ffmpeg) fn fill_audio_output<T>(data: &mut [T], s
 where
     T: Sample + FromSample<f32>,
 {
-    fill_audio_output_samples(data, shared, None);
+    fill_audio_output_samples(data, shared, None, || {});
+}
+
+#[cfg(test)]
+pub(in crate::player::backend::ffmpeg::audio) fn fill_audio_output_with_publish_hook_for_test<T>(
+    data: &mut [T],
+    shared: &AudioShared,
+    before_publish: impl FnOnce(),
+) where
+    T: Sample + FromSample<f32>,
+{
+    fill_audio_output_samples(data, shared, None, before_publish);
 }
 
 pub(in crate::player::backend::ffmpeg::audio) fn fill_audio_output_with_timing<T>(
@@ -38,13 +49,14 @@ pub(in crate::player::backend::ffmpeg::audio) fn fill_audio_output_with_timing<T
 {
     let timestamp = info.timestamp();
     let playback_delay = timestamp.playback.duration_since(&timestamp.callback);
-    fill_audio_output_samples(data, shared, playback_delay);
+    fill_audio_output_samples(data, shared, playback_delay, || {});
 }
 
 fn fill_audio_output_samples<T>(
     data: &mut [T],
     shared: &AudioShared,
     playback_delay: Option<Duration>,
+    before_publish: impl FnOnce(),
 ) where
     T: Sample + FromSample<f32>,
 {
@@ -68,25 +80,53 @@ fn fill_audio_output_samples<T>(
         }
     }
 
-    let mut guard = shared.buffer.lock().expect("audio output buffer poisoned");
-    if shared.control.should_pause_audio_output() {
+    let mut guard = shared
+        .buffer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let callback_epoch = guard.epoch;
+    let output_state = shared.control.audio_output_control_snapshot();
+    if output_state.decision() == AudioOutputDecision::Silence
+        || !shared.timeline.active()
+        || !shared.timeline.is_current_epoch(callback_epoch)
+    {
         for sample in data.iter_mut() {
             *sample = T::from_sample(0.0);
         }
+        drop(guard);
+        let mut silenced_callback_count = shared.silenced_callback_count.load(Ordering::Relaxed);
+        if let Ok(_publish_guard) = shared.callback_publish_guard.try_lock() {
+            if shared.timeline.is_current_epoch(callback_epoch) {
+                let _mutation = shared.timeline.begin_mutation();
+                silenced_callback_count = shared
+                    .silenced_callback_count
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                shared.update_output_delay_unfenced(Duration::ZERO);
+            } else {
+                shared.timeline.record_stale_callback_publication();
+            }
+        }
         tracing::trace!(
             callback_index,
+            silenced_callback_count,
             output_samples = data.len(),
-            silence_fill_reason = "paused",
+            audio_output_lifecycle = output_state.lifecycle().as_str(),
+            paused_by_user = output_state.paused_by_user(),
+            paused_by_cache = output_state.paused_by_cache(),
+            paused_by_rebuffer = output_state.paused_by_rebuffer(),
+            paused_by_seek_transition = output_state.paused_by_seek_transition(),
+            silence_fill_reason = "audio_output_state",
             clock_mode = AudioClockMode::AudioStarted.as_str(),
             misaligned_audio_buffer_count =
                 shared.misaligned_audio_buffer_count.load(Ordering::Relaxed),
             "native audio output callback filled silence while paused"
         );
-        shared.update_output_delay(Duration::ZERO);
         shared.ready.notify_all();
         return;
     }
 
+    let _callback_mutation = shared.timeline.begin_mutation();
     let volume = shared.control.volume();
     let mut played = 0u64;
     let output_samples = data.len();
@@ -104,29 +144,42 @@ fn fill_audio_output_samples<T>(
     }
     let queued_samples_after = guard.len();
     drop(guard);
+    before_publish();
 
+    let Ok(_publish_guard) = shared.callback_publish_guard.try_lock() else {
+        shared.ready.notify_all();
+        return;
+    };
+    if !shared.timeline.is_current_epoch(callback_epoch) {
+        shared.timeline.record_stale_callback_publication();
+        shared.ready.notify_all();
+        return;
+    }
     if played > 0 {
+        shared
+            .consumed_callback_count
+            .fetch_add(1, Ordering::Relaxed);
         shared.played_samples.fetch_add(played, Ordering::Relaxed);
         let played_duration = audio_elements_duration(
             usize::try_from(played).unwrap_or(usize::MAX),
             shared.sample_rate,
             shared.channels,
         );
-        shared.update_output_delay(
+        shared.update_output_delay_unfenced(
             playback_delay
                 .unwrap_or_default()
                 .saturating_add(played_duration),
         );
     } else {
-        shared.update_output_delay(Duration::ZERO);
+        shared.update_output_delay_unfenced(Duration::ZERO);
     }
+    let queued_duration_after_nsecs = duration_nsecs(audio_elements_duration(
+        queued_samples_after,
+        shared.sample_rate,
+        shared.channels,
+    ));
     let underrun_samples = output_samples.saturating_sub(usize::try_from(played).unwrap_or(0));
     if underrun_samples > 0 {
-        let queued_duration_after_nsecs = duration_nsecs(audio_elements_duration(
-            queued_samples_after,
-            shared.sample_rate,
-            shared.channels,
-        ));
         let audio_gap_frames = audio_frames_for_elements(underrun_samples, shared.channels);
         let underrun_timeline_nsecs =
             shared.played_timeline_nsecs_from_pending(queued_duration_after_nsecs);
@@ -155,5 +208,9 @@ fn fill_audio_output_samples<T>(
             );
         }
     }
+    shared.published_played_timeline_nsecs.store(
+        shared.played_timeline_nsecs_for_pending(queued_duration_after_nsecs),
+        Ordering::Release,
+    );
     shared.ready.notify_all();
 }

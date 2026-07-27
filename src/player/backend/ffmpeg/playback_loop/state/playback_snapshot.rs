@@ -13,12 +13,13 @@ use super::video_decode_worker::VideoDecodeWorkerSnapshot;
 use super::video_frame_prepare_worker::VideoFramePrepareWorkerSnapshot;
 use super::{
     AUDIO_OUTPUT_DELAY_LIMIT, AudioDecodePipeline, AudioOutput, AudioOutputSnapshot,
-    DemuxPacketCache, DemuxReaderWatermark, PlaybackBlockReason, PlaybackOutputScheduler,
-    PlaybackOutputSnapshot, PlaybackOutputState, SubtitlePipeline, VideoDecodePipeline,
-    VideoFramePrepareWorker,
+    AudioOutputStableSnapshot, DemuxPacketCache, DemuxReaderWatermark, PlaybackBlockReason,
+    PlaybackOutputScheduler, PlaybackOutputSnapshot, PlaybackOutputState, PrestartAudioOwnership,
+    PrestartAudioOwnershipInput, SubtitlePipeline, VideoDecodePipeline, VideoFramePrepareWorker,
+    classify_prestart_audio_ownership,
 };
 
-const PLAYBACK_PIPELINE_SNAPSHOT_LOG_INTERVAL: Duration = Duration::from_millis(250);
+const PLAYBACK_PIPELINE_SNAPSHOT_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(super) struct PlaybackPipelineSnapshotContext<'a> {
     pub(super) demux_cache: &'a DemuxPacketCache,
@@ -49,6 +50,9 @@ pub(super) struct PlaybackPipelineSnapshot {
     output_snapshot: PlaybackOutputSnapshot,
     vo_snapshot: VideoOutputQueueSnapshot,
     audio_output_snapshot: Option<AudioOutputSnapshot>,
+    prestart_audio_single_ledger_invariant_holds: bool,
+    prestart_audio_ownership: PrestartAudioOwnership,
+    owned_vulkan_frames: usize,
     demux_snapshot_unavailable: bool,
     demux_read_blocked_for: Option<Duration>,
 }
@@ -60,15 +64,61 @@ impl PlaybackPipelineSnapshot {
         let demux_read_blocked_for = context.demux_cache.demux_read_blocked_for();
         let video_decode_snapshot = context.video_decode_pipeline.snapshot();
         let vo_snapshot = context.vo_queue.snapshot();
-        let audio_output_snapshot = context
+        let stable_audio_output_snapshot = context
             .audio_output
-            .and_then(|output| output.snapshot().ok());
+            .and_then(|output| output.stable_snapshot().ok());
+        let audio_output_snapshot = match stable_audio_output_snapshot {
+            Some(AudioOutputStableSnapshot::Stable(snapshot)) => Some(snapshot),
+            Some(AudioOutputStableSnapshot::SnapshotUnstable(_)) | None => context
+                .audio_output
+                .and_then(|output| output.snapshot().ok()),
+        };
+        let prestart_audio_ownership = if !context.output_scheduler.restart_pending() {
+            PrestartAudioOwnership::CollectingEmpty
+        } else {
+            context
+                .audio_output
+                .map_or(PrestartAudioOwnership::CollectingEmpty, |output| {
+                    let Some(stable_snapshot) = stable_audio_output_snapshot else {
+                        return PrestartAudioOwnership::SnapshotUnstable;
+                    };
+                    classify_prestart_audio_ownership(PrestartAudioOwnershipInput {
+                        phase: context.output_scheduler.initial_audio_prepare_phase(),
+                        token: context.output_scheduler.initial_audio_prepare_token(),
+                        current_audio_epoch: output.audio_epoch(),
+                        current_seek_generation: output.control_seek_generation(),
+                        target_nsecs: context
+                            .output_scheduler
+                            .initial_audio_prepare_target_nsecs()
+                            .unwrap_or_default(),
+                        snapshot: stable_snapshot,
+                    })
+                })
+        };
         let output_snapshot = context.output_scheduler.snapshot_for_played_until(
             audio_output_snapshot.map(|snapshot| snapshot.played_timeline_nsecs),
         );
+        let prestart_audio_single_ledger_invariant_holds = !output_snapshot
+            .initial_av_start_pending
+            || matches!(
+                prestart_audio_ownership,
+                PrestartAudioOwnership::CollectingEmpty
+                    | PrestartAudioOwnership::PreparedCurrentEpoch
+            );
         let scheduled_video_queue_limit_reached = context
             .output_scheduler
             .scheduled_video_queue_limit_reached(context.subtitle_pipeline.needs_prefetch());
+        let video_frame_prepare_snapshot = context
+            .video_frame_prepare_worker
+            .map(VideoFramePrepareWorker::snapshot);
+        let prepare_worker_frames = video_frame_prepare_snapshot
+            .map(|snapshot| {
+                snapshot
+                    .pending_input_frames
+                    .saturating_add(snapshot.in_flight_frames)
+                    .saturating_add(snapshot.completed_frames)
+            })
+            .unwrap_or_default();
         let video_decode_blocked_on = video_decode_block_reason_with_output_queue(
             VideoDecodePipeline::block_reason_for(
                 video_decode_snapshot,
@@ -77,9 +127,18 @@ impl PlaybackPipelineSnapshot {
             video_output_resource_pressure(VideoOutputResourcePressure {
                 scheduled_video_frames: context.output_scheduler.scheduled_video_queue_len(),
                 decoded_video_frames: video_decode_snapshot.queued_frames,
-                in_flight_video_packets: video_decode_snapshot.in_flight_packets,
+                submitted_not_consumed_video_packets: video_decode_snapshot
+                    .submitted_not_consumed_packets,
+                prepare_worker_frames,
+                recovery_staging_frames: context.output_scheduler.recovery_staging_frames(),
                 hardware_accelerated: context.video_decode_pipeline.info().hardware_accelerated,
                 scheduled_video_queue_limit_reached,
+                decode_recovery_video_admission_blocked: context
+                    .output_scheduler
+                    .decode_recovery_video_admission_blocked()
+                    || context
+                        .video_decode_pipeline
+                        .hevc_resource_pressure_demux_admission_stopped(),
                 fill_phase_for_output_start: context.output_scheduler.output_fill_phase(),
                 video_frame_duration_nsecs: context.video_frame_duration_nsecs,
                 vo_queue_capacity: vo_snapshot.queue_capacity,
@@ -90,9 +149,6 @@ impl PlaybackPipelineSnapshot {
                 render_backlogged: vo_snapshot.render_backlogged(),
             }),
         );
-        let video_frame_prepare_snapshot = context
-            .video_frame_prepare_worker
-            .map(VideoFramePrepareWorker::snapshot);
         let video_frame_prepare_blocked_on =
             video_frame_prepare_snapshot.and_then(VideoFramePrepareWorkerSnapshot::block_reason);
         let audio_decode_snapshot = context
@@ -137,6 +193,16 @@ impl PlaybackPipelineSnapshot {
             output_snapshot,
             vo_snapshot,
             audio_output_snapshot,
+            prestart_audio_single_ledger_invariant_holds,
+            prestart_audio_ownership,
+            owned_vulkan_frames: context
+                .output_scheduler
+                .scheduled_video_queue_len()
+                .saturating_add(video_decode_snapshot.queued_frames)
+                .saturating_add(video_decode_snapshot.submitted_not_consumed_packets)
+                .saturating_add(prepare_worker_frames)
+                .saturating_add(context.output_scheduler.recovery_staging_frames())
+                .saturating_add(vo_snapshot.queued_frames),
             demux_snapshot_unavailable,
             demux_read_blocked_for,
         }
@@ -238,7 +304,9 @@ impl PlaybackPipelineSnapshot {
         self,
         session_id: PlaybackSessionId,
         stall_reason: &'static str,
+        stall_reason_class: &'static str,
         planned_wait: Option<Duration>,
+        suppressed_repeats: u64,
     ) {
         let blocked_on_all = self
             .blocked_reasons
@@ -297,7 +365,10 @@ impl PlaybackPipelineSnapshot {
             .map(|snapshot| snapshot.total_pending_nsecs as f64 / 1_000_000.0);
         let audio_output_shared_ms = self
             .audio_output_snapshot
-            .map(|snapshot| snapshot.shared_pending_nsecs as f64 / 1_000_000.0);
+            .map(|snapshot| snapshot.shared_payload_nsecs as f64 / 1_000_000.0);
+        let audio_output_driver_delay_ms = self
+            .audio_output_snapshot
+            .map(|snapshot| snapshot.driver_delay_nsecs as f64 / 1_000_000.0);
         let audio_output_queue_ms = self
             .audio_output_snapshot
             .map(|snapshot| snapshot.queue_pending_nsecs as f64 / 1_000_000.0);
@@ -307,10 +378,24 @@ impl PlaybackPipelineSnapshot {
         let audio_output_queue_generation = self
             .audio_output_snapshot
             .map(|snapshot| snapshot.queue_generation);
+        let audio_output_epoch = self
+            .audio_output_snapshot
+            .map(|snapshot| snapshot.audio_epoch);
+        let audio_output_stable_version = self
+            .audio_output_snapshot
+            .and_then(|snapshot| snapshot.stable_version);
+        let audio_output_worker_in_flight_ms = self
+            .audio_output_snapshot
+            .map(|snapshot| snapshot.worker_in_flight_nsecs as f64 / 1_000_000.0);
+        let audio_output_prepared_range = self
+            .audio_output_snapshot
+            .and_then(|snapshot| snapshot.payload_range_nsecs);
 
         tracing::debug!(
             session_id = ?session_id,
             stall_reason,
+            stall_reason_class,
+            suppressed_repeats,
             planned_wait_ms = ?planned_wait.map(|duration| duration.as_secs_f64() * 1000.0),
             blocked_on = self.blocked_on.as_str(),
             blocked_on_all = ?blocked_on_all,
@@ -344,7 +429,7 @@ impl PlaybackPipelineSnapshot {
             video_decode_pending_input_packets = self.video_decode_snapshot.pending_input_packets,
             video_decode_pending_input_capacity = self.video_decode_snapshot.pending_input_capacity,
             video_decode_pending_input_full = self.video_decode_snapshot.pending_input_full(),
-            video_decode_in_flight_packets = self.video_decode_snapshot.in_flight_packets,
+            video_decode_submitted_not_consumed_packets = self.video_decode_snapshot.submitted_not_consumed_packets,
             video_frame_prepare_state = ?video_frame_prepare_state,
             video_frame_prepare_blocked_on =
                 ?self.video_frame_prepare_blocked_on.map(PlaybackBlockReason::as_str),
@@ -387,6 +472,20 @@ impl PlaybackPipelineSnapshot {
             subtitle_decode_pending_input_full = ?subtitle_decode_pending_input_full,
             subtitle_decode_in_flight_packets = ?subtitle_decode_in_flight_packets,
             queued_video_frames = self.output_snapshot.queued_video_frames,
+            recovery_staging_frames = self.output_snapshot.recovery_staging_frames,
+            recovery_staging_frame_budget = ?self
+                .output_snapshot
+                .recovery_staging_frame_budget,
+            owned_vulkan_frames = self.owned_vulkan_frames,
+            committed_output_high_water_nsecs = ?self
+                .output_snapshot
+                .committed_output_high_water_nsecs,
+            recovery_staged_high_water_nsecs = ?self
+                .output_snapshot
+                .recovery_staged_high_water_nsecs,
+            decode_recovery_audio_ready_latched = self
+                .output_snapshot
+                .decode_recovery_audio_ready_latched,
             queued_video_ms = self.output_snapshot.queued_video_duration_nsecs as f64 / 1_000_000.0,
             queued_video_range = ?self.output_snapshot.queued_video_range_nsecs,
             queued_video_forward_ms = ?self
@@ -418,9 +517,17 @@ impl PlaybackPipelineSnapshot {
             pending_start_audio_ms = self.output_snapshot.pending_start_audio_nsecs as f64 / 1_000_000.0,
             audio_output_pending_ms = ?audio_output_pending_ms,
             audio_output_shared_ms = ?audio_output_shared_ms,
+            audio_output_driver_delay_ms = ?audio_output_driver_delay_ms,
             audio_output_queue_ms = ?audio_output_queue_ms,
+            audio_output_worker_in_flight_ms = ?audio_output_worker_in_flight_ms,
             audio_output_queue_frames = ?audio_output_queue_frames,
             audio_output_queue_generation = ?audio_output_queue_generation,
+            audio_output_epoch = ?audio_output_epoch,
+            audio_output_stable_version = ?audio_output_stable_version,
+            audio_output_prepared_range = ?audio_output_prepared_range,
+            prestart_audio_ownership = self.prestart_audio_ownership.as_str(),
+            prestart_audio_single_ledger_invariant_holds =
+                self.prestart_audio_single_ledger_invariant_holds,
             vo_queued_frames = self.vo_snapshot.queued_frames,
             vo_queue_capacity = self.vo_snapshot.queue_capacity,
             vo_dropped_frames = self.vo_snapshot.dropped_frames,
@@ -440,7 +547,9 @@ pub(super) struct PlaybackPipelineTelemetry {
     last_logged_at: Option<Instant>,
     last_blocked_on: Option<PlaybackBlockReason>,
     last_block_reasons: Vec<PlaybackBlockReason>,
-    last_stall_reason: Option<&'static str>,
+    last_output_state: Option<PlaybackOutputState>,
+    last_stall_reason_class: Option<&'static str>,
+    suppressed_repeats: u64,
 }
 
 impl PlaybackPipelineTelemetry {
@@ -462,27 +571,65 @@ impl PlaybackPipelineTelemetry {
     ) {
         let now = Instant::now();
         let blocked_on = snapshot.blocked_on();
-        let blocked_reasons_changed =
-            self.last_block_reasons.as_slice() != snapshot.block_reasons();
-        let should_log = self.last_blocked_on != Some(blocked_on)
-            || blocked_reasons_changed
-            || self.last_stall_reason != Some(stall_reason)
+        let output_state = snapshot.output_state;
+        let stall_reason_class = playback_stall_reason_class(stall_reason);
+        let state_changed = playback_stall_state_changed(
+            self.last_blocked_on,
+            self.last_block_reasons.as_slice(),
+            self.last_output_state,
+            self.last_stall_reason_class,
+            blocked_on,
+            snapshot.block_reasons(),
+            output_state,
+            stall_reason_class,
+        );
+        let should_log = state_changed
             || self.last_logged_at.is_none_or(|last_logged_at| {
                 now.saturating_duration_since(last_logged_at)
                     >= PLAYBACK_PIPELINE_SNAPSHOT_LOG_INTERVAL
             });
         if !should_log {
+            self.suppressed_repeats = self.suppressed_repeats.saturating_add(1);
             return;
         }
 
+        let suppressed_repeats = std::mem::take(&mut self.suppressed_repeats);
         self.last_logged_at = Some(now);
         self.last_blocked_on = Some(blocked_on);
         self.last_block_reasons.clear();
         self.last_block_reasons
             .extend_from_slice(snapshot.block_reasons());
-        self.last_stall_reason = Some(stall_reason);
-        snapshot.log(session_id, stall_reason, planned_wait);
+        self.last_output_state = Some(output_state);
+        self.last_stall_reason_class = Some(stall_reason_class);
+        snapshot.log(
+            session_id,
+            stall_reason,
+            stall_reason_class,
+            planned_wait,
+            suppressed_repeats,
+        );
     }
+}
+
+fn playback_stall_reason_class(reason: &'static str) -> &'static str {
+    reason.strip_suffix("_wait").unwrap_or(reason)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn playback_stall_state_changed(
+    previous_blocked_on: Option<PlaybackBlockReason>,
+    previous_block_reasons: &[PlaybackBlockReason],
+    previous_output_state: Option<PlaybackOutputState>,
+    previous_stall_reason_class: Option<&'static str>,
+    blocked_on: PlaybackBlockReason,
+    block_reasons: &[PlaybackBlockReason],
+    output_state: PlaybackOutputState,
+    stall_reason_class: &'static str,
+) -> bool {
+    previous_blocked_on != Some(blocked_on)
+        || previous_block_reasons != block_reasons
+        || previous_output_state != Some(output_state)
+        || previous_stall_reason_class != Some(stall_reason_class)
 }
 
 fn vo_block_reason(snapshot: VideoOutputQueueSnapshot) -> Option<PlaybackBlockReason> {
@@ -537,7 +684,34 @@ mod tests {
     use super::{
         AUDIO_OUTPUT_DELAY_LIMIT, AudioOutputSnapshot, DemuxReaderWatermark, PlaybackBlockReason,
         PlaybackOutputState, PlaybackPipelineSnapshot, VideoOutputQueueSnapshot, duration_to_nsecs,
+        playback_stall_reason_class, playback_stall_state_changed,
     };
+
+    #[test]
+    fn coordinator_stall_wait_suffix_does_not_create_a_new_state_class() {
+        assert_eq!(playback_stall_reason_class("decoder"), "decoder");
+        assert_eq!(playback_stall_reason_class("decoder_wait"), "decoder");
+        assert!(!playback_stall_state_changed(
+            Some(PlaybackBlockReason::DecoderInFlight),
+            &[PlaybackBlockReason::DecoderInFlight],
+            Some(PlaybackOutputState::Playing),
+            Some("decoder"),
+            PlaybackBlockReason::DecoderInFlight,
+            &[PlaybackBlockReason::DecoderInFlight],
+            PlaybackOutputState::Playing,
+            playback_stall_reason_class("decoder_wait"),
+        ));
+        assert!(playback_stall_state_changed(
+            Some(PlaybackBlockReason::DecoderInFlight),
+            &[PlaybackBlockReason::DecoderInFlight],
+            Some(PlaybackOutputState::Playing),
+            Some("decoder"),
+            PlaybackBlockReason::OutputGate,
+            &[PlaybackBlockReason::OutputGate],
+            PlaybackOutputState::Rebuffering,
+            "output_gate",
+        ));
+    }
 
     fn idle_demux_watermark() -> DemuxReaderWatermark {
         DemuxReaderWatermark {
@@ -624,6 +798,7 @@ mod tests {
                 total_pending_nsecs: duration_to_nsecs(AUDIO_OUTPUT_DELAY_LIMIT),
                 queue_frames: 0,
                 queue_generation: 0,
+                ..AudioOutputSnapshot::default()
             }),
             PlaybackOutputState::Rebuffering,
         );
@@ -797,6 +972,7 @@ mod tests {
                 total_pending_nsecs: duration_to_nsecs(AUDIO_OUTPUT_DELAY_LIMIT),
                 queue_frames: 0,
                 queue_generation: 0,
+                ..AudioOutputSnapshot::default()
             }),
             PlaybackOutputState::Playing,
         );

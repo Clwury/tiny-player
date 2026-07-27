@@ -1,3 +1,4 @@
+use super::FfmpegControl;
 use super::coordinator_gate::PlaybackCoordinatorGateService;
 use super::decode_pipeline_service::DecodePipelineService;
 use super::decoder_drain_service::DecoderDrainService;
@@ -7,8 +8,8 @@ use super::output_gate_service::OutputGateService;
 use super::output_queue_service::OutputQueueService;
 use super::playback_snapshot::PlaybackPipelineTelemetry;
 use super::playback_wait_service::PlaybackPipelineWaitService;
+use std::sync::Arc;
 
-#[derive(Default)]
 pub(super) struct PlaybackPipelineServices {
     pub(super) coordinator_gate: PlaybackCoordinatorGateService,
     pub(super) decode_pipeline: DecodePipelineService,
@@ -19,4 +20,20 @@ pub(super) struct PlaybackPipelineServices {
     pub(super) decoder_input: DecoderInputService,
     pub(super) wait: PlaybackPipelineWaitService,
     pub(super) telemetry: PlaybackPipelineTelemetry,
+}
+
+impl PlaybackPipelineServices {
+    pub(super) fn new(control: Arc<FfmpegControl>) -> Self {
+        Self {
+            coordinator_gate: PlaybackCoordinatorGateService::default(),
+            decode_pipeline: DecodePipelineService::default(),
+            output_queue: OutputQueueService,
+            output_gate: OutputGateService,
+            output_drain: OutputDrainService,
+            decoder_drain: DecoderDrainService,
+            decoder_input: DecoderInputService::default(),
+            wait: PlaybackPipelineWaitService::new(control),
+            telemetry: PlaybackPipelineTelemetry::default(),
+        }
+    }
 }

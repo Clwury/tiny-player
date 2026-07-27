@@ -25,7 +25,10 @@ impl DemuxPacketCacheShared {
         guard: &mut DemuxPacketCacheState,
         cache_pause_signal: bool,
     ) {
-        if !cache_pause_signal || !guard.cache_pause_can_enter(true) {
+        if !cache_pause_signal
+            || !self.control.output_underrun_for_cache_pause()
+            || !guard.cache_pause_can_enter(true)
+        {
             return;
         }
         if self.enter_cache_pause(guard).force_cache_state_report {
@@ -48,9 +51,14 @@ impl DemuxPacketCacheShared {
                 cached_bytes = guard.cached_bytes,
                 forward_bytes = guard.forward_bytes(),
                 forward_duration_ms = guard.forward_duration_nsecs() as f64 / 1_000_000.0,
+                effective_cache_pause_forward_ms =
+                    guard.cache_pause_forward_duration_nsecs() as f64 / 1_000_000.0,
                 reader_nsecs = guard.reader_nsecs,
+                exact_seek_target_nsecs = guard.exact_seek_target_nsecs,
+                exact_seek_target_covered = guard.cache_pause_target_covered(),
                 reader_pts_seconds = nsecs_to_seconds(guard.reader_nsecs),
                 cached_until_nsecs = ?guard.cached_until_nsecs(),
+                per_stream = ?guard.packet_queue_snapshot().streams,
                 cache_end_seconds = ?guard.cached_until_nsecs().map(nsecs_to_seconds),
                 raw_input_rate_bytes_per_sec = ?guard.raw_input_rate(),
                 should_pause_demux = guard.should_pause_demux(),
@@ -112,9 +120,14 @@ impl DemuxPacketCacheShared {
                     cached_bytes = guard.cached_bytes,
                     forward_bytes = guard.forward_bytes(),
                     forward_duration_ms = guard.forward_duration_nsecs() as f64 / 1_000_000.0,
+                    effective_cache_pause_forward_ms =
+                        guard.cache_pause_forward_duration_nsecs() as f64 / 1_000_000.0,
                     reader_nsecs = guard.reader_nsecs,
+                    exact_seek_target_nsecs = guard.exact_seek_target_nsecs,
+                    exact_seek_target_covered = guard.cache_pause_target_covered(),
                     reader_pts_seconds = nsecs_to_seconds(guard.reader_nsecs),
                     cached_until_nsecs = ?guard.cached_until_nsecs(),
+                    per_stream = ?guard.packet_queue_snapshot().streams,
                     cache_end_seconds = ?guard.cached_until_nsecs().map(nsecs_to_seconds),
                     raw_input_rate_bytes_per_sec = ?guard.raw_input_rate(),
                     should_pause_demux = guard.should_pause_demux(),

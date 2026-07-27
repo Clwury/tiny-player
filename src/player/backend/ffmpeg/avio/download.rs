@@ -1,4 +1,4 @@
-use std::{io::Read, sync::Arc, time::Duration};
+use std::{error::Error as StdError, io::Read, sync::Arc, time::Duration};
 
 use super::{
     cache::{
@@ -16,6 +16,7 @@ const HTTP_CACHE_MAX_RETRIES: u32 = 5;
 const HTTP_CACHE_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const HTTP_CACHE_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
+#[derive(Debug)]
 enum HttpDownloadOutcome {
     Eof,
     Restart(u64),
@@ -302,7 +303,11 @@ fn download_http_cache_range(
 
     let mut response = request.send().map_err(|error| {
         let retryable = http_cache_request_should_retry(&error);
-        HttpDownloadError::new(offset, format!("HTTP 视频缓存请求失败：{error}"), retryable)
+        HttpDownloadError::new(
+            offset,
+            format!("HTTP 视频缓存请求失败：{}", error.without_url()),
+            retryable,
+        )
     })?;
     let status = response.status();
     if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
@@ -326,7 +331,7 @@ fn download_http_cache_range(
             http_cache_status_should_retry(status),
         ));
     }
-    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+    let response_end_exclusive = if status == reqwest::StatusCode::PARTIAL_CONTENT {
         let content_range = content_range_from_headers(response.headers()).ok_or_else(|| {
             HttpDownloadError::new(
                 offset,
@@ -344,7 +349,12 @@ fn download_http_cache_range(
                 false,
             ));
         }
-    }
+        Some(content_range.end.saturating_add(1))
+    } else {
+        response
+            .content_length()
+            .map(|len| offset.saturating_add(len))
+    };
     let content_len = content_len_from_response(&response, offset);
     shared.set_content_len(content_len);
 
@@ -352,6 +362,11 @@ fn download_http_cache_range(
     loop {
         if shared.should_stop() {
             return Ok(HttpDownloadOutcome::Stopped);
+        }
+        if status == reqwest::StatusCode::PARTIAL_CONTENT
+            && response_end_exclusive.is_some_and(|response_end| offset >= response_end)
+        {
+            return Ok(HttpDownloadOutcome::Restart(offset));
         }
         let capacity = match shared.append_capacity_now(offset) {
             CacheAppendPermit::Ready(capacity) => capacity,
@@ -361,7 +376,16 @@ fn download_http_cache_range(
             }
             CacheAppendPermit::Stopped => return Ok(HttpDownloadOutcome::Stopped),
         };
-        let read_capacity = chunk.len().min(capacity);
+        let response_remaining = response_end_exclusive
+            .map(|response_end| response_end.saturating_sub(offset))
+            .unwrap_or(u64::MAX);
+        let read_capacity = chunk
+            .len()
+            .min(capacity)
+            .min(usize::try_from(response_remaining).unwrap_or(usize::MAX));
+        if read_capacity == 0 {
+            return Ok(HttpDownloadOutcome::Restart(offset));
+        }
         let read = match response.read(&mut chunk[..read_capacity]) {
             Ok(read) => read,
             Err(error) => {
@@ -384,12 +408,15 @@ fn download_http_cache_range(
             }
         };
         if read == 0 {
-            if content_len.is_some_and(|content_len| offset < content_len) {
+            if response_end_exclusive.is_some_and(|response_end| offset < response_end) {
                 return Err(HttpDownloadError::new(
                     offset,
-                    "HTTP 视频缓存响应在预期内容结束前提前关闭".to_string(),
+                    "HTTP 视频缓存响应在预期 range 结束前提前关闭".to_string(),
                     true,
                 ));
+            }
+            if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                return Ok(HttpDownloadOutcome::Restart(offset));
             }
             return Ok(HttpDownloadOutcome::Eof);
         }
@@ -451,7 +478,7 @@ fn download_http_side_cache_range(
         let retryable = http_cache_request_should_retry(&error);
         HttpDownloadError::new(
             offset,
-            format!("HTTP 视频缓存辅助请求失败：{error}"),
+            format!("HTTP 视频缓存辅助请求失败：{}", error.without_url()),
             retryable,
         )
     })?;
@@ -590,7 +617,18 @@ fn http_cache_read_should_restart(error: &std::io::Error) -> bool {
                 | std::io::ErrorKind::ConnectionAborted
                 | std::io::ErrorKind::BrokenPipe
         )
-        || transient_http_error_message(&error.to_string())
+        || transient_error_chain(error)
+}
+
+fn transient_error_chain(error: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if transient_http_error_message(&error.to_string()) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 fn transient_http_error_message(message: &str) -> bool {
@@ -606,11 +644,146 @@ fn transient_http_error_message(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cache::{CacheRestartRequest, HttpCacheRangeKind};
-    use super::{
-        HTTP_CACHE_MAX_RETRIES, HttpRetryState, http_cache_status_should_retry,
-        side_request_remaining_bytes, transient_http_error_message,
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::{Shutdown, TcpListener},
+        thread,
+        time::Duration,
     };
+
+    use reqwest::blocking::Client;
+
+    use super::super::super::HTTP_CACHE_RANGE_REQUEST_BYTES;
+    use super::super::cache::{CacheRestartRequest, HttpCacheRangeKind};
+    use super::super::{HttpRingCache, HttpRingCacheState};
+    use super::{
+        HTTP_CACHE_MAX_RETRIES, HttpDownloadOutcome, HttpRetryState, download_http_cache_range,
+        http_cache_status_should_retry, side_request_remaining_bytes, transient_http_error_message,
+    };
+
+    fn spawn_partial_content_server(
+        response_start: u64,
+        response_range_len: u64,
+        body_len: u64,
+        total_len: u64,
+    ) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test HTTP listener binds");
+        let address = listener.local_addr().expect("test HTTP address resolves");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("test HTTP request connects");
+            let mut reader =
+                BufReader::new(stream.try_clone().expect("test HTTP request stream clones"));
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                let read = reader
+                    .read_line(&mut line)
+                    .expect("test HTTP request header reads");
+                if read == 0 || line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+
+            let response_end = response_start
+                .saturating_add(response_range_len)
+                .saturating_sub(1);
+            write!(
+                stream,
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {response_range_len}\r\nContent-Range: bytes {response_start}-{response_end}/{total_len}\r\nConnection: close\r\n\r\n"
+            )
+            .expect("test HTTP response header writes");
+            let chunk = [0x5a; 64 * 1024];
+            let mut remaining = body_len;
+            while remaining > 0 {
+                let write_len = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(chunk.len());
+                stream
+                    .write_all(&chunk[..write_len])
+                    .expect("test HTTP response body writes");
+                remaining = remaining.saturating_sub(write_len as u64);
+            }
+            stream.flush().expect("test HTTP response flushes");
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("test HTTP response closes");
+            request
+        });
+        (format!("http://{address}/video"), handle)
+    }
+
+    fn test_download_cache(total_len: u64) -> HttpRingCache {
+        let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(total_len));
+        assert!(state.append_at(0, &[0x5a]));
+        HttpRingCache::from_state_for_test(state)
+    }
+
+    #[test]
+    fn exact_sixteen_mib_partial_response_advances_without_retry_backoff() {
+        let range_len = HTTP_CACHE_RANGE_REQUEST_BYTES;
+        let total_len = range_len * 4;
+        let range_start = 1;
+        let (url, server) =
+            spawn_partial_content_server(range_start, range_len, range_len, total_len);
+        let cache = test_download_cache(total_len);
+        let client = Client::builder().build().expect("test HTTP client builds");
+
+        let outcome = download_http_cache_range(
+            &client,
+            &url,
+            &[],
+            cache.shared_for_download_test(),
+            range_start,
+        )
+        .expect("an exact 206 subrange is not a transient failure");
+
+        let range_end = range_start + range_len;
+        assert!(matches!(outcome, HttpDownloadOutcome::Restart(offset) if offset == range_end));
+        assert_eq!(cache.next_offset_for_test(), range_end);
+        let request = server.join().expect("test HTTP server joins");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("range: bytes={range_start}-{}", range_end - 1))
+        );
+    }
+
+    #[test]
+    fn truncated_sixteen_mib_partial_response_enters_bounded_retry() {
+        let range_len = HTTP_CACHE_RANGE_REQUEST_BYTES;
+        let total_len = range_len * 4;
+        let range_start = 1;
+        let truncated_len = range_len - 1024;
+        let (url, server) =
+            spawn_partial_content_server(range_start, range_len, truncated_len, total_len);
+        let cache = test_download_cache(total_len);
+        let client = Client::builder().build().expect("test HTTP client builds");
+
+        let error = download_http_cache_range(
+            &client,
+            &url,
+            &[],
+            cache.shared_for_download_test(),
+            range_start,
+        )
+        .expect_err("a truncated 206 subrange is retryable");
+
+        assert!(error.retryable, "error={error:?}");
+        assert!(error.offset < range_start + range_len);
+        assert!(error.offset > range_start);
+        let mut retry = HttpRetryState::default();
+        let (attempt, delay) = retry
+            .next_delay(error.offset)
+            .expect("the truncated response receives a bounded retry");
+        assert_eq!(attempt, 1);
+        assert_eq!(delay, Duration::from_millis(200));
+        for _ in 1..HTTP_CACHE_MAX_RETRIES {
+            assert!(retry.next_delay(error.offset).is_some());
+        }
+        assert!(retry.next_delay(error.offset).is_none());
+        server.join().expect("test HTTP server joins");
+    }
 
     #[test]
     fn http_cache_retries_transient_gateway_statuses() {

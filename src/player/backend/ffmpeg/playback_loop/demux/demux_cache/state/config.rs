@@ -85,6 +85,7 @@ impl DemuxPacketCacheState {
             append_trim_pending: false,
             read_trim_pressure_packets: 0,
             reader_nsecs,
+            exact_seek_target_nsecs: reader_nsecs,
             session_id,
             seek_request: None,
             demux_position_detached: false,
@@ -110,6 +111,8 @@ impl DemuxPacketCacheState {
             last_emitted_seekability_revision: None,
             cache_state_emit_dirty: false,
             generation: 0,
+            producer_recovery_error: None,
+            producer_recovery_consecutive_errors: 0,
             error: None,
             shutdown: false,
         }

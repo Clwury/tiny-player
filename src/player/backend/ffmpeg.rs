@@ -26,11 +26,14 @@ mod worker;
 pub use backend::FfmpegBackend;
 
 #[cfg(test)]
+use audio::AudioOutputUnstableSnapshot;
+#[cfg(test)]
 use audio::audio_sample_len;
 use audio::{
-    AudioClockMode, AudioOutput, AudioOutputDrainStatus, AudioOutputPushResult,
-    AudioOutputSnapshot, align_audio_elements_to_frame_boundary, audio_elements_for_duration_floor,
-    audio_elements_for_frames, audio_frames_for_duration_round,
+    AudioClockHandle, AudioClockMode, AudioOutput, AudioOutputActivitySnapshot,
+    AudioOutputDrainStatus, AudioOutputPushResult, AudioOutputServiceStage, AudioOutputSnapshot,
+    AudioOutputStableSnapshot, AudioStagedFrame, align_audio_elements_to_frame_boundary,
+    audio_elements_for_duration_floor, audio_elements_for_frames, audio_frames_for_duration_round,
 };
 #[cfg(test)]
 use avio::{
@@ -44,14 +47,15 @@ use bsf::PgsFrameMergeBitstreamFilter;
 #[cfg(test)]
 use clock::queued_video_target_reached;
 #[cfg(test)]
-use clock::{MappedTimestamp, WaitStatus};
+use clock::{MappedTimestamp, WaitStatus, queued_video_coverage_duration};
 use clock::{
     PlaybackScheduler, QueuedVideoFrame, TimestampMapper, duration_nsecs,
     frame_best_effort_timestamp, frame_decode_error_flags, frame_is_corrupt, max_optional_seconds,
     nsecs_to_seconds, nsecs_to_timestamp, optional_buffered_value_changed, pts_distance,
     queued_video_duration, queued_video_frames_have_vulkan, queued_video_limit_duration,
-    queued_video_limit_frames, queued_video_limit_reached, queued_video_target_duration,
-    queued_video_target_frames, seconds_to_nsecs, stream_frame_duration_nsecs, timestamp_to_nsecs,
+    queued_video_limit_frames, queued_video_limit_reached, queued_video_range_span,
+    queued_video_target_duration, queued_video_target_frames, seconds_to_nsecs,
+    stream_frame_duration_nsecs, timestamp_to_nsecs,
 };
 use codec::{
     AudioResampler, AvFrame, AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, DecodedAudio,
@@ -76,8 +80,8 @@ use util::ffmpeg_error;
 use video::ffmpeg_raw_video_format;
 use video::{VideoFrameConvertContext, VideoFrameConverter, frame_size, video_frame_len};
 use worker::{
-    FfmpegCommand, FfmpegControl, FfmpegPlaybackInput, FfmpegWorker,
-    coalesce_playback_seek_commands, drain_playback_commands, ffmpeg_interrupt_callback,
+    AudioOutputDecision, AudioOutputLifecycle, FfmpegCommand, FfmpegControl, FfmpegPlaybackInput,
+    FfmpegWorker, drain_playback_commands, ffmpeg_interrupt_callback,
 };
 
 fn normalize_playback_volume(volume: f32) -> f32 {

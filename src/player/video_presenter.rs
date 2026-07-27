@@ -20,8 +20,8 @@ use super::{
     render_host::{
         DecodedFrame, FramePixels, FramePts, PlaybackSessionId, PooledBytes, RawVideoFormat,
         RawVideoFrame, RawVideoPlane, RawVideoPlanes, RenderBackpressure, RenderSize,
-        VideoOutputQueue, VideoOutputQueueSnapshot, VulkanDecodeDevice, VulkanVideoFrame,
-        render_image_from_bgra,
+        VideoOutputQueue, VideoOutputQueueSnapshot, VulkanDecodeDevice, VulkanPrewarmTicket,
+        VulkanVideoFrame, render_image_from_bgra,
     },
 };
 
@@ -48,17 +48,21 @@ pub struct VideoPresenter {
     vo_queue: VideoOutputQueue,
     render_worker: VideoRenderWorker,
     last_seen_session_id: PlaybackSessionId,
+    last_seen_presentation_generation: u64,
     next_generation: u64,
     latest_generation: u64,
 }
 
 impl VideoPresenter {
     pub fn new(vo_queue: VideoOutputQueue) -> Result<Self> {
-        let last_seen_session_id = vo_queue.snapshot().active_session_id;
+        let (last_seen_session_id, last_seen_presentation_generation) =
+            vo_queue.presentation_identity();
+        let render_worker = VideoRenderWorker::spawn(vo_queue.clone());
         Ok(Self {
             vo_queue,
-            render_worker: VideoRenderWorker::spawn(),
+            render_worker,
             last_seen_session_id,
+            last_seen_presentation_generation,
             next_generation: 0,
             latest_generation: 0,
         })
@@ -66,8 +70,8 @@ impl VideoPresenter {
 
     pub fn prewarm_if_needed(&mut self) {
         self.sync_vo_queue_session();
-        while let Some((_session_id, device)) = self.vo_queue.take_vulkan_prewarm() {
-            self.render_worker.prewarm_vulkan(device);
+        while let Some((ticket, device)) = self.vo_queue.take_vulkan_prewarm() {
+            self.render_worker.prewarm_vulkan(ticket, device);
         }
     }
 
@@ -121,11 +125,14 @@ impl VideoPresenter {
     }
 
     fn sync_vo_queue_session(&mut self) {
-        let active_session_id = self.vo_queue.snapshot().active_session_id;
-        if active_session_id == self.last_seen_session_id {
+        let (active_session_id, presentation_generation) = self.vo_queue.presentation_identity();
+        if active_session_id == self.last_seen_session_id
+            && presentation_generation == self.last_seen_presentation_generation
+        {
             return;
         }
         self.last_seen_session_id = active_session_id;
+        self.last_seen_presentation_generation = presentation_generation;
         self.discard_pending_frames();
     }
 
@@ -148,7 +155,7 @@ struct VideoRenderState {
 #[derive(Default)]
 struct VideoRenderSlot {
     requests: VecDeque<VideoRenderRequest>,
-    prewarm_device: Option<Arc<VulkanDecodeDevice>>,
+    prewarm_request: Option<(VulkanPrewarmTicket, Arc<VulkanDecodeDevice>)>,
     rendering: bool,
     shutdown: bool,
     ready_results: usize,
@@ -186,7 +193,10 @@ struct VideoRenderWorkerSnapshot {
 
 enum VideoRenderWork {
     Render(VideoRenderRequest),
-    Prewarm(Arc<VulkanDecodeDevice>),
+    Prewarm {
+        ticket: VulkanPrewarmTicket,
+        device: Arc<VulkanDecodeDevice>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -205,7 +215,7 @@ impl VulkanDirectFallbackKey {
 }
 
 impl VideoRenderWorker {
-    fn spawn() -> Self {
+    fn spawn(vo_queue: VideoOutputQueue) -> Self {
         let (result_tx, result_rx) = mpsc::channel();
         let state = Arc::new(VideoRenderState {
             slot: Mutex::new(VideoRenderSlot::default()),
@@ -244,16 +254,26 @@ impl VideoRenderWorker {
                                 break;
                             }
                         }
-                        VideoRenderWork::Prewarm(device) => {
+                        VideoRenderWork::Prewarm { ticket, device } => {
                             let started = Instant::now();
-                            if let Err(error) = prewarm_vulkan_tone_mapper(&mut tone_mapper, device)
-                            {
+                            let result = prewarm_vulkan_tone_mapper(&mut tone_mapper, device)
+                                .map_err(|error| error.to_string());
+                            if let Err(error) = &result {
                                 tracing::warn!(
                                     %error,
+                                    session_id = ?ticket.session_id(),
+                                    device = ticket.device_key(),
                                     "failed to prewarm Vulkan video renderer"
                                 );
                             }
                             worker_state.finish_prewarm(started.elapsed());
+                            let accepted = vo_queue.complete_vulkan_prewarm(ticket, result);
+                            tracing::debug!(
+                                session_id = ?ticket.session_id(),
+                                device = ticket.device_key(),
+                                accepted,
+                                "completed Vulkan video renderer prewarm request"
+                            );
                         }
                     }
                 }
@@ -295,17 +315,17 @@ impl VideoRenderWorker {
         self.state.can_accept_render()
     }
 
-    fn prewarm_vulkan(&self, device: Arc<VulkanDecodeDevice>) {
+    fn prewarm_vulkan(&self, ticket: VulkanPrewarmTicket, device: Arc<VulkanDecodeDevice>) {
         let mut slot = self
             .state
             .slot
             .lock()
             .expect("video render worker poisoned");
-        if slot.shutdown || !slot.requests.is_empty() {
+        if slot.shutdown {
             return;
         }
-        let should_notify = !slot.rendering && slot.prewarm_device.is_none();
-        slot.prewarm_device = Some(device);
+        let should_notify = !slot.rendering && slot.prewarm_request.is_none();
+        slot.prewarm_request = Some((ticket, device));
         if should_notify {
             self.state.ready.notify_one();
         }
@@ -318,7 +338,7 @@ impl VideoRenderWorker {
             .lock()
             .expect("video render worker poisoned");
         slot.requests.clear();
-        slot.prewarm_device = None;
+        slot.prewarm_request = None;
     }
 
     fn backpressure(&self) -> RenderBackpressure {
@@ -399,9 +419,9 @@ impl VideoRenderState {
                 slot.rendering = true;
                 return Some(VideoRenderWork::Render(request));
             }
-            if let Some(device) = slot.prewarm_device.take() {
+            if let Some((ticket, device)) = slot.prewarm_request.take() {
                 slot.rendering = true;
-                return Some(VideoRenderWork::Prewarm(device));
+                return Some(VideoRenderWork::Prewarm { ticket, device });
             }
             slot.rendering = false;
             slot = self.ready.wait(slot).expect("video render worker poisoned");
@@ -742,14 +762,15 @@ mod tests {
     fn take_render_generation(state: &VideoRenderState) -> u64 {
         match state.take_work() {
             Some(VideoRenderWork::Render(request)) => request.generation,
-            Some(VideoRenderWork::Prewarm(_)) => panic!("unexpected prewarm work"),
+            Some(VideoRenderWork::Prewarm { .. }) => panic!("unexpected prewarm work"),
             None => panic!("expected render work"),
         }
     }
 
     fn presenter_with_manual_render_worker(vo_queue: VideoOutputQueue) -> VideoPresenter {
         let (_result_tx, result_rx) = mpsc::channel();
-        let last_seen_session_id = vo_queue.snapshot().active_session_id;
+        let (last_seen_session_id, last_seen_presentation_generation) =
+            vo_queue.presentation_identity();
         VideoPresenter {
             vo_queue,
             render_worker: VideoRenderWorker {
@@ -760,6 +781,7 @@ mod tests {
                 results: result_rx,
             },
             last_seen_session_id,
+            last_seen_presentation_generation,
             next_generation: 0,
             latest_generation: 0,
         }
@@ -840,6 +862,79 @@ mod tests {
         assert_eq!(presenter.last_seen_session_id, PlaybackSessionId(2));
         assert_eq!(presenter.latest_generation, 1);
         assert_eq!(presenter.render_worker.snapshot().pending_requests, 0);
+    }
+
+    #[test]
+    fn video_presenter_invalidates_in_flight_generation_after_recovery_discard() {
+        let vo_queue = VideoOutputQueue::default();
+        let session_id = PlaybackSessionId(3);
+        vo_queue.begin_session(session_id);
+        let mut presenter = presenter_with_manual_render_worker(vo_queue.clone());
+
+        assert_eq!(
+            presenter
+                .render_worker
+                .enqueue_render(test_render_request(presenter.latest_generation)),
+            VideoRenderEnqueueResult::Queued
+        );
+        assert_eq!(presenter.render_worker.snapshot().pending_requests, 1);
+
+        let (_, previous_presentation_generation) = vo_queue.presentation_identity();
+        assert_eq!(vo_queue.discard_pending_frames(session_id), 0);
+        presenter.sync_vo_queue_session();
+
+        assert_eq!(presenter.last_seen_session_id, session_id);
+        assert_eq!(
+            presenter.last_seen_presentation_generation,
+            previous_presentation_generation.wrapping_add(1)
+        );
+        assert_eq!(presenter.latest_generation, 1);
+        assert_eq!(presenter.render_worker.snapshot().pending_requests, 0);
+    }
+
+    #[test]
+    fn recovery_discard_rejects_completed_old_render_result() {
+        let vo_queue = VideoOutputQueue::default();
+        let session_id = PlaybackSessionId(4);
+        vo_queue.begin_session(session_id);
+        let (result_tx, result_rx) = mpsc::channel();
+        let (last_seen_session_id, last_seen_presentation_generation) =
+            vo_queue.presentation_identity();
+        let render_state = Arc::new(VideoRenderState {
+            slot: Mutex::new(VideoRenderSlot::default()),
+            ready: Condvar::new(),
+        });
+        let mut presenter = VideoPresenter {
+            vo_queue: vo_queue.clone(),
+            render_worker: VideoRenderWorker {
+                state: render_state.clone(),
+                results: result_rx,
+            },
+            last_seen_session_id,
+            last_seen_presentation_generation,
+            next_generation: 0,
+            latest_generation: 0,
+        };
+
+        assert_eq!(vo_queue.discard_pending_frames(session_id), 0);
+        presenter.sync_vo_queue_session();
+        render_state.record_ready_result();
+        result_tx
+            .send(VideoRenderResult {
+                generation: 0,
+                pts: None,
+                frame: Err("stale hardware render must be ignored".to_string()),
+            })
+            .expect("test result receiver");
+
+        assert!(
+            presenter
+                .render_worker
+                .take_ready_frame(presenter.latest_generation)
+                .expect("stale result is ignored")
+                .is_none()
+        );
+        assert_eq!(render_state.snapshot().ready_results, 0);
     }
 
     #[test]

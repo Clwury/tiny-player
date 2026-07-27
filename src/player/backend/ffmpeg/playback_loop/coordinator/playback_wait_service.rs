@@ -2,6 +2,8 @@ use super::playback_snapshot::{
     PlaybackPipelineSnapshot, PlaybackPipelineSnapshotContext, PlaybackPipelineTelemetry,
 };
 use std::{
+    os::raw::c_int,
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -9,15 +11,17 @@ use std::{
 use crate::player::render_host::{PlaybackSessionId, VideoOutputQueue};
 
 use super::{
-    AudioDecodePipeline, AudioOutput, DemuxPacketCache, PlaybackOutputScheduler, PlaybackScheduler,
-    SCHEDULER_POLL_INTERVAL, SubtitlePipeline, VideoDecodePipeline, VideoFramePrepareWorker,
+    AudioDecodePipeline, AudioOutput, DemuxPacketCache, FfmpegControl, PlaybackOutputScheduler,
+    PlaybackScheduler, SCHEDULER_POLL_INTERVAL, SubtitlePipeline, VideoDecodePipeline,
+    VideoFramePrepareWorker,
 };
 
-const EXPIRED_HEVC_WATCHDOG_MIN_WAIT: Duration = Duration::from_millis(2);
+const EXPIRED_WATCHDOG_MIN_WAIT: Duration = Duration::from_millis(2);
 const MISSING_RECOVERY_REQUEST_MIN_WAIT: Duration = Duration::from_millis(2);
 
-#[derive(Default)]
-pub(super) struct PlaybackPipelineWaitService;
+pub(super) struct PlaybackPipelineWaitService {
+    control: Arc<FfmpegControl>,
+}
 
 pub(super) struct PlaybackPipelineWaitContext<'a> {
     pub(super) session_id: PlaybackSessionId,
@@ -40,6 +44,7 @@ pub(super) struct PlaybackLoopDeadline {
     hevc_startup_stall_watchdog_deadline: Option<Instant>,
     audio_decode_recovery_watchdog_deadline: Option<Instant>,
     rebuffer_empty_audio_output_watchdog_deadline: Option<Instant>,
+    output_housekeeping_deadline: Option<Instant>,
 }
 
 impl PlaybackLoopDeadline {
@@ -49,6 +54,7 @@ impl PlaybackLoopDeadline {
             hevc_startup_stall_watchdog_deadline: None,
             audio_decode_recovery_watchdog_deadline: None,
             rebuffer_empty_audio_output_watchdog_deadline: None,
+            output_housekeeping_deadline: None,
         }
     }
 
@@ -77,9 +83,17 @@ impl PlaybackLoopDeadline {
         self
     }
 
+    pub(super) fn with_output_housekeeping_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.output_housekeeping_deadline = deadline;
+        self
+    }
+
     pub(super) fn cached_seek_recovery_watchdog_remaining(self) -> Option<Duration> {
-        self.cached_seek_recovery_watchdog_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        self.cached_seek_recovery_watchdog_deadline.map(|deadline| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(EXPIRED_WATCHDOG_MIN_WAIT)
+        })
     }
 
     pub(super) fn rebuffer_empty_audio_output_watchdog_remaining(self) -> Option<Duration> {
@@ -91,12 +105,17 @@ impl PlaybackLoopDeadline {
         self.hevc_startup_stall_watchdog_deadline.map(|deadline| {
             deadline
                 .checked_duration_since(Instant::now())
-                .unwrap_or(EXPIRED_HEVC_WATCHDOG_MIN_WAIT)
+                .unwrap_or(EXPIRED_WATCHDOG_MIN_WAIT)
         })
     }
 
     pub(super) fn audio_decode_recovery_watchdog_remaining(self) -> Option<Duration> {
         self.audio_decode_recovery_watchdog_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    pub(super) fn output_housekeeping_remaining(self) -> Option<Duration> {
+        self.output_housekeeping_deadline
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 
@@ -113,16 +132,24 @@ impl PlaybackLoopDeadline {
             .audio_decode_recovery_watchdog_remaining()
             .map(|remaining| duration.min(remaining))
             .unwrap_or(duration);
-        self.rebuffer_empty_audio_output_watchdog_remaining()
+        let duration = self
+            .rebuffer_empty_audio_output_watchdog_remaining()
+            .map(|remaining| duration.min(remaining))
+            .unwrap_or(duration);
+        self.output_housekeeping_remaining()
             .map(|remaining| duration.min(remaining))
             .unwrap_or(duration)
     }
 }
 
 impl PlaybackPipelineWaitService {
+    pub(super) fn new(control: Arc<FfmpegControl>) -> Self {
+        Self { control }
+    }
+
     pub(super) fn wait_after_missing_recovery_request(&self, scheduler: &mut PlaybackScheduler) {
         let waited_at = Instant::now();
-        wait_for_stall_duration(MISSING_RECOVERY_REQUEST_MIN_WAIT);
+        self.wait_for_stall_duration(MISSING_RECOVERY_REQUEST_MIN_WAIT);
         scheduler.delay_by(waited_at.elapsed());
     }
 
@@ -132,8 +159,47 @@ impl PlaybackPipelineWaitService {
         playback_loop_deadline: PlaybackLoopDeadline,
     ) {
         let waited_at = Instant::now();
-        wait_for_stall_duration(playback_loop_deadline.cap_wait_duration(SCHEDULER_POLL_INTERVAL));
+        self.wait_for_stall_duration(
+            playback_loop_deadline.cap_wait_duration(SCHEDULER_POLL_INTERVAL),
+        );
         scheduler.delay_by(waited_at.elapsed());
+    }
+
+    pub(super) fn wait_for_cached_input_and_delay_scheduler_until(
+        &self,
+        scheduler: &mut PlaybackScheduler,
+        demux_cache: &DemuxPacketCache,
+        stream_indices: &[c_int],
+        playback_loop_deadline: PlaybackLoopDeadline,
+    ) {
+        let waited_at = Instant::now();
+        let timeout = playback_loop_deadline.cap_wait_duration(SCHEDULER_POLL_INTERVAL);
+        let _ = (demux_cache, stream_indices);
+        self.wait_for_stall_duration(timeout);
+        scheduler.delay_by(waited_at.elapsed());
+    }
+
+    pub(super) fn wait_for_cache_generation_change_and_delay_scheduler_until(
+        &self,
+        scheduler: &mut PlaybackScheduler,
+        demux_cache: &DemuxPacketCache,
+        observed_generation: u64,
+        playback_loop_deadline: PlaybackLoopDeadline,
+    ) {
+        let waited_at = Instant::now();
+        let timeout = playback_loop_deadline.cap_wait_duration(SCHEDULER_POLL_INTERVAL);
+        self.wait_for_stall_duration(timeout);
+        let generation_changed =
+            demux_cache.packet_queue_snapshot().cache_generation != observed_generation;
+        let actual_wait = waited_at.elapsed();
+        scheduler.delay_by(actual_wait);
+        tracing::trace!(
+            cache_generation = observed_generation,
+            generation_changed,
+            planned_wait_ms = timeout.as_secs_f64() * 1000.0,
+            actual_wait_ms = actual_wait.as_secs_f64() * 1000.0,
+            "waited for FFmpeg cache or output state generation change"
+        );
     }
 
     pub(super) fn yield_once(&self) {
@@ -165,10 +231,12 @@ impl PlaybackPipelineWaitService {
         &self,
         mut context: PlaybackPipelineWaitContext<'_>,
         stall_reason: &'static str,
-    ) {
+    ) -> Duration {
         let wait_duration = self.wait_duration_after_stall(&context);
         self.observe_stall_with_wait(&mut context, stall_reason, wait_duration);
-        wait_for_stall_duration(wait_duration);
+        let waited_at = Instant::now();
+        self.wait_for_stall_duration(wait_duration);
+        waited_at.elapsed()
     }
 
     fn observe_stall_with_wait(
@@ -223,20 +291,30 @@ impl PlaybackPipelineWaitService {
             )
             .cap_wait_duration(wait_duration)
     }
-}
 
-fn wait_for_stall_duration(duration: Duration) {
-    if duration.is_zero() {
-        thread::yield_now();
-    } else {
-        thread::sleep(duration);
+    fn wait_for_stall_duration(&self, duration: Duration) {
+        if self.control.should_interrupt() {
+            thread::yield_now();
+            return;
+        }
+        let observed_generation = self.control.wake_generation();
+        if self.control.should_interrupt() {
+            thread::yield_now();
+            return;
+        }
+        if duration.is_zero() {
+            thread::yield_now();
+        } else {
+            self.control
+                .wait_for_wake_change(observed_generation, duration);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPIRED_HEVC_WATCHDOG_MIN_WAIT, MISSING_RECOVERY_REQUEST_MIN_WAIT, PlaybackLoopDeadline,
+        EXPIRED_WATCHDOG_MIN_WAIT, MISSING_RECOVERY_REQUEST_MIN_WAIT, PlaybackLoopDeadline,
     };
     use std::time::{Duration, Instant};
 
@@ -253,13 +331,13 @@ mod tests {
     }
 
     #[test]
-    fn expired_cached_seek_watchdog_yields_next_loop() {
+    fn expired_cached_seek_watchdog_keeps_a_bounded_non_zero_wait() {
         let deadline = PlaybackLoopDeadline::from_cached_seek_recovery_watchdog(Some(
             Instant::now() - Duration::from_millis(1),
         ));
         assert_eq!(
             deadline.cap_wait_duration(Duration::from_millis(5)),
-            Duration::ZERO
+            EXPIRED_WATCHDOG_MIN_WAIT
         );
     }
 
@@ -312,7 +390,7 @@ mod tests {
 
         assert_eq!(
             deadline.cap_wait_duration(Duration::from_secs(5)),
-            EXPIRED_HEVC_WATCHDOG_MIN_WAIT
+            EXPIRED_WATCHDOG_MIN_WAIT
         );
     }
 }

@@ -1,6 +1,6 @@
 use std::{
     sync::{atomic::AtomicBool, mpsc::Sender},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::player::{
@@ -19,6 +19,9 @@ use super::{
     audio_elements_for_frames, audio_frames_for_duration_round, duration_nsecs,
 };
 
+const AUDIO_STAGE_SERVICE_BUDGET: Duration = Duration::from_millis(2);
+const AUDIO_STAGE_SERVICE_MAX_FRAMES: usize = 16;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) struct PendingAudioUnderrunRecoveryPlan {
     pub(in crate::player::backend::ffmpeg) audio_start_timeline_nsecs: u64,
@@ -29,7 +32,10 @@ pub(in crate::player::backend::ffmpeg) struct PendingAudioUnderrunRecoveryPlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DelayedAudioStartSilenceStatus {
     NotNeeded,
-    Queued,
+    Queued {
+        end_timeline_nsecs: u64,
+        samples: usize,
+    },
     Blocked,
 }
 
@@ -37,6 +43,39 @@ enum DelayedAudioStartSilenceStatus {
 pub(in crate::player::backend::ffmpeg) enum DelayedAudioStartSilencePolicy {
     Allow,
     Skip,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) struct AudioStageResult {
+    pub(in crate::player::backend::ffmpeg) made_progress: bool,
+    pub(in crate::player::backend::ffmpeg) staged_frames: usize,
+    pub(in crate::player::backend::ffmpeg) staged_samples: usize,
+    pub(in crate::player::backend::ffmpeg) staged_range_nsecs: Option<(u64, u64)>,
+    pub(in crate::player::backend::ffmpeg) interrupted: bool,
+    pub(in crate::player::backend::ffmpeg) would_block: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) enum AudioStageCheckpoint {
+    PendingPopped(usize),
+    FirstEnqueued,
+}
+
+impl AudioStageResult {
+    fn observe_staged_frame(
+        &mut self,
+        samples: usize,
+        start_timeline_nsecs: u64,
+        end_timeline_nsecs: u64,
+    ) {
+        self.made_progress = true;
+        self.staged_frames = self.staged_frames.saturating_add(1);
+        self.staged_samples = self.staged_samples.saturating_add(samples);
+        self.staged_range_nsecs = Some(match self.staged_range_nsecs {
+            Some((start, end)) => (start.min(start_timeline_nsecs), end.max(end_timeline_nsecs)),
+            None => (start_timeline_nsecs, end_timeline_nsecs),
+        });
+    }
 }
 
 pub(in crate::player::backend::ffmpeg) fn pending_audio_underrun_recovery_plan(
@@ -146,6 +185,93 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
     subtitle_pipeline: &mut SubtitlePipeline,
     buffered_reporter: &mut BufferedReporter,
 ) -> std::result::Result<bool, String> {
+    let expected_audio_epoch = output.audio_epoch();
+    let result = stage_pending_audio(
+        pending_audio,
+        output,
+        expected_audio_epoch,
+        audio_start_timeline_nsecs,
+        audio_flush_until_timeline_nsecs,
+        clock_mode,
+        delayed_audio_start_silence,
+        control,
+        queued_video_frames,
+        session_id,
+        vo_queue,
+        frame_presented,
+        position_reporter,
+        event_tx,
+        subtitle_pipeline,
+        buffered_reporter,
+    )?;
+    if result.staged_frames > 0 {
+        output.activate_audio_output(expected_audio_epoch, control.seek_generation(), control);
+    }
+    Ok(result.made_progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::player::backend::ffmpeg) fn stage_pending_audio(
+    pending_audio: &mut PendingStartAudio,
+    output: &AudioOutput,
+    expected_audio_epoch: u64,
+    audio_start_timeline_nsecs: u64,
+    audio_flush_until_timeline_nsecs: u64,
+    clock_mode: AudioClockMode,
+    delayed_audio_start_silence: DelayedAudioStartSilencePolicy,
+    control: &FfmpegControl,
+    queued_video_frames: &mut ScheduledVideoQueue,
+    session_id: PlaybackSessionId,
+    vo_queue: &VideoOutputQueue,
+    frame_presented: &AtomicBool,
+    position_reporter: &mut PositionReporter,
+    event_tx: &Sender<BackendEvent>,
+    subtitle_pipeline: &mut SubtitlePipeline,
+    buffered_reporter: &mut BufferedReporter,
+) -> std::result::Result<AudioStageResult, String> {
+    stage_pending_audio_with_checkpoint(
+        pending_audio,
+        output,
+        expected_audio_epoch,
+        audio_start_timeline_nsecs,
+        audio_flush_until_timeline_nsecs,
+        clock_mode,
+        delayed_audio_start_silence,
+        control,
+        queued_video_frames,
+        session_id,
+        vo_queue,
+        frame_presented,
+        position_reporter,
+        event_tx,
+        subtitle_pipeline,
+        buffered_reporter,
+        |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::player::backend::ffmpeg) fn stage_pending_audio_with_checkpoint(
+    pending_audio: &mut PendingStartAudio,
+    output: &AudioOutput,
+    expected_audio_epoch: u64,
+    audio_start_timeline_nsecs: u64,
+    audio_flush_until_timeline_nsecs: u64,
+    clock_mode: AudioClockMode,
+    delayed_audio_start_silence: DelayedAudioStartSilencePolicy,
+    control: &FfmpegControl,
+    queued_video_frames: &mut ScheduledVideoQueue,
+    session_id: PlaybackSessionId,
+    vo_queue: &VideoOutputQueue,
+    frame_presented: &AtomicBool,
+    position_reporter: &mut PositionReporter,
+    event_tx: &Sender<BackendEvent>,
+    subtitle_pipeline: &mut SubtitlePipeline,
+    buffered_reporter: &mut BufferedReporter,
+    mut observe_checkpoint: impl FnMut(AudioStageCheckpoint),
+) -> std::result::Result<AudioStageResult, String> {
+    let stage_started_at = Instant::now();
+    let mut result = AudioStageResult::default();
     let dropped_before_start = pending_audio.discard_before(audio_start_timeline_nsecs);
     if dropped_before_start > 0 {
         tracing::trace!(
@@ -157,10 +283,11 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
     }
 
     if audio_flush_until_timeline_nsecs <= audio_start_timeline_nsecs {
-        return Ok(false);
+        return Ok(result);
     }
 
-    let mut made_progress = false;
+    let mut queued_audio_frames = 0usize;
+    let mut queued_audio_until_nsecs = audio_start_timeline_nsecs;
     if delayed_audio_start_silence == DelayedAudioStartSilencePolicy::Allow {
         match queue_delayed_audio_start_silence(
             pending_audio,
@@ -168,18 +295,49 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
             audio_start_timeline_nsecs,
             audio_flush_until_timeline_nsecs,
             clock_mode,
+            expected_audio_epoch,
             control,
             session_id,
         )? {
             DelayedAudioStartSilenceStatus::NotNeeded => {}
-            DelayedAudioStartSilenceStatus::Queued => made_progress = true,
-            DelayedAudioStartSilenceStatus::Blocked => return Ok(made_progress),
+            DelayedAudioStartSilenceStatus::Queued {
+                end_timeline_nsecs,
+                samples,
+            } => {
+                queued_audio_frames = queued_audio_frames.saturating_add(1);
+                queued_audio_until_nsecs = end_timeline_nsecs;
+                result.observe_staged_frame(
+                    samples,
+                    audio_start_timeline_nsecs,
+                    end_timeline_nsecs,
+                );
+                observe_checkpoint(AudioStageCheckpoint::FirstEnqueued);
+            }
+            DelayedAudioStartSilenceStatus::Blocked => {
+                result.would_block = true;
+                return Ok(result);
+            }
         }
     }
 
-    let mut queued_audio_frames = 0usize;
-    let mut queued_audio_until_nsecs = audio_start_timeline_nsecs;
+    let mut popped_audio_frames = 0usize;
     while let Some(mut frame) = pending_audio.pop_front_until(audio_flush_until_timeline_nsecs) {
+        if popped_audio_frames >= AUDIO_STAGE_SERVICE_MAX_FRAMES
+            || stage_started_at.elapsed() >= AUDIO_STAGE_SERVICE_BUDGET
+        {
+            pending_audio.push_front_frame(frame);
+            result.would_block = true;
+            break;
+        }
+        observe_checkpoint(AudioStageCheckpoint::PendingPopped(popped_audio_frames));
+        popped_audio_frames = popped_audio_frames.saturating_add(1);
+        if frame.start_timeline_nsecs
+            > queued_audio_until_nsecs
+                .saturating_add(duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE))
+        {
+            pending_audio.push_front_frame(frame);
+            break;
+        }
         let trim_before_timeline_nsecs = audio_start_timeline_nsecs.max(queued_audio_until_nsecs);
         if !frame.trim_before(
             trim_before_timeline_nsecs,
@@ -189,17 +347,35 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
             continue;
         }
         merge_small_pending_audio_gap(&mut frame, queued_audio_until_nsecs, clock_mode, session_id);
+        let staged_start_timeline_nsecs = frame.start_timeline_nsecs;
         let buffered_until_nsecs = frame.end_timeline_nsecs;
-        match output.try_push_timed(
+        let staged_samples = frame.samples.len();
+        let push_result = match output.try_push_timed_for_epoch(
             frame.samples,
             frame.start_timeline_nsecs,
             frame.end_timeline_nsecs,
+            expected_audio_epoch,
             control,
-        )? {
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                frame.samples = error.samples;
+                pending_audio.push_front_frame(frame);
+                return Err(error.message);
+            }
+        };
+        match push_result {
             AudioOutputPushResult::Queued => {
                 queued_audio_frames = queued_audio_frames.saturating_add(1);
                 queued_audio_until_nsecs = buffered_until_nsecs;
-                made_progress = true;
+                result.observe_staged_frame(
+                    staged_samples,
+                    staged_start_timeline_nsecs,
+                    buffered_until_nsecs,
+                );
+                if queued_audio_frames == 1 {
+                    observe_checkpoint(AudioStageCheckpoint::FirstEnqueued);
+                }
             }
             AudioOutputPushResult::WouldBlock {
                 samples,
@@ -208,21 +384,22 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
             } => {
                 frame.samples = samples;
                 pending_audio.push_front_frame(frame);
-                let audio_snapshot = output.snapshot()?;
-                made_progress |= present_due_audio_clocked_frames_to_vo(
-                    queued_video_frames,
-                    audio_snapshot.played_timeline_nsecs,
-                    session_id,
-                    vo_queue,
-                    frame_presented,
-                    position_reporter,
-                    event_tx,
-                );
-                subtitle_pipeline.update_overlay(
-                    audio_snapshot.played_timeline_nsecs,
-                    session_id,
-                    event_tx,
-                );
+                if let Some(audio_snapshot) = output.try_snapshot()? {
+                    result.made_progress |= present_due_audio_clocked_frames_to_vo(
+                        queued_video_frames,
+                        audio_snapshot.played_timeline_nsecs,
+                        session_id,
+                        vo_queue,
+                        frame_presented,
+                        position_reporter,
+                        event_tx,
+                    );
+                    subtitle_pipeline.update_overlay(
+                        audio_snapshot.played_timeline_nsecs,
+                        session_id,
+                        event_tx,
+                    );
+                }
                 tracing::debug!(
                     session_id = ?session_id,
                     blocked_on = PlaybackBlockReason::AudioOutput.as_str(),
@@ -235,12 +412,14 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
                     audio_flush_until_timeline_nsecs,
                     "audio output queue full while flushing pending FFmpeg audio"
                 );
-                return Ok(made_progress);
+                result.would_block = true;
+                return Ok(result);
             }
             AudioOutputPushResult::Interrupted { samples } => {
                 frame.samples = samples;
                 pending_audio.push_front_frame(frame);
-                return Ok(made_progress);
+                result.interrupted = true;
+                return Ok(result);
             }
         }
         buffered_reporter.report_audio_timeline_nsecs(buffered_until_nsecs, session_id, event_tx);
@@ -257,7 +436,7 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
             "queued buffered FFmpeg audio covered by decoded video"
         );
     }
-    Ok(made_progress)
+    Ok(result)
 }
 
 fn merge_small_pending_audio_gap(
@@ -289,12 +468,14 @@ fn merge_small_pending_audio_gap(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn queue_delayed_audio_start_silence(
     pending_audio: &PendingStartAudio,
     output: &AudioOutput,
     audio_start_timeline_nsecs: u64,
     audio_flush_until_timeline_nsecs: u64,
     clock_mode: AudioClockMode,
+    expected_audio_epoch: u64,
     control: &FfmpegControl,
     session_id: PlaybackSessionId,
 ) -> std::result::Result<DelayedAudioStartSilenceStatus, String> {
@@ -333,12 +514,16 @@ fn queue_delayed_audio_start_silence(
         return Ok(DelayedAudioStartSilenceStatus::NotNeeded);
     }
 
-    match output.try_push_timed(
-        vec![0.0; silence_samples],
-        audio_start_timeline_nsecs,
-        first_audio_start_nsecs,
-        control,
-    )? {
+    let push_result = output
+        .try_push_timed_for_epoch(
+            vec![0.0; silence_samples],
+            audio_start_timeline_nsecs,
+            first_audio_start_nsecs,
+            expected_audio_epoch,
+            control,
+        )
+        .map_err(|error| error.message)?;
+    match push_result {
         AudioOutputPushResult::Queued => {
             tracing::debug!(
                 session_id = ?session_id,
@@ -352,7 +537,10 @@ fn queue_delayed_audio_start_silence(
                 misaligned_audio_buffer_count = output.misaligned_audio_buffer_count(),
                 "queued silence before delayed FFmpeg audio start"
             );
-            Ok(DelayedAudioStartSilenceStatus::Queued)
+            Ok(DelayedAudioStartSilenceStatus::Queued {
+                end_timeline_nsecs: first_audio_start_nsecs,
+                samples: silence_samples,
+            })
         }
         AudioOutputPushResult::WouldBlock {
             queued_frames,
@@ -505,13 +693,34 @@ pub(in crate::player::backend::ffmpeg) fn push_decoded_audio_to_output(
         return Ok(false);
     }
     let buffered_until_nsecs = end_timeline_nsecs;
-    match output.try_push_timed(
+    let has_consumable_audio =
+        !audio.samples.is_empty() && end_timeline_nsecs > start_timeline_nsecs;
+    let audio_duration_nsecs = audio.duration_nsecs;
+    let push_result = match output.try_push_timed(
         audio.samples,
         start_timeline_nsecs,
         end_timeline_nsecs,
         control,
-    )? {
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            pending_audio.push(
+                DecodedAudio {
+                    samples: error.samples,
+                    duration_nsecs: audio_duration_nsecs,
+                },
+                start_timeline_nsecs,
+                end_timeline_nsecs,
+            );
+            return Err(error.message);
+        }
+    };
+    match push_result {
         AudioOutputPushResult::Queued => {
+            if !has_consumable_audio {
+                return Ok(false);
+            }
+            output.activate_current_audio_output(control);
             buffered_reporter.report_audio_timeline_nsecs(
                 buffered_until_nsecs,
                 session_id,
@@ -527,26 +736,30 @@ pub(in crate::player::backend::ffmpeg) fn push_decoded_audio_to_output(
             pending_audio.push(
                 DecodedAudio {
                     samples,
-                    duration_nsecs: audio.duration_nsecs,
+                    duration_nsecs: audio_duration_nsecs,
                 },
                 start_timeline_nsecs,
                 end_timeline_nsecs,
             );
-            let audio_snapshot = output.snapshot()?;
-            let made_progress = present_due_audio_clocked_frames_to_vo(
-                queued_video_frames,
-                audio_snapshot.played_timeline_nsecs,
-                session_id,
-                vo_queue,
-                frame_presented,
-                position_reporter,
-                event_tx,
-            );
-            subtitle_pipeline.update_overlay(
-                audio_snapshot.played_timeline_nsecs,
-                session_id,
-                event_tx,
-            );
+            let made_progress = if let Some(audio_snapshot) = output.try_snapshot()? {
+                let made_progress = present_due_audio_clocked_frames_to_vo(
+                    queued_video_frames,
+                    audio_snapshot.played_timeline_nsecs,
+                    session_id,
+                    vo_queue,
+                    frame_presented,
+                    position_reporter,
+                    event_tx,
+                );
+                subtitle_pipeline.update_overlay(
+                    audio_snapshot.played_timeline_nsecs,
+                    session_id,
+                    event_tx,
+                );
+                made_progress
+            } else {
+                false
+            };
             tracing::debug!(
                 session_id = ?session_id,
                 blocked_on = PlaybackBlockReason::AudioOutput.as_str(),
@@ -584,6 +797,9 @@ fn present_due_audio_clocked_frames_to_vo(
     position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
 ) -> bool {
+    if queued_video_frames.deadline_service_owns_presentation() {
+        return false;
+    }
     let pop_result = queued_video_frames.pop_audio_clocked_frame(played_until_nsecs);
     let mut made_progress = pop_result.dropped_frames > 0;
     if pop_result.dropped_frames > 0 {
@@ -652,34 +868,39 @@ pub(in crate::player::backend::ffmpeg) fn service_audio_clocked_video_queue(
         } else {
             PlaybackBlockReason::AudioOutput
         };
-        tracing::debug!(
-            session_id = ?session_id,
-            blocked_on = blocked_on.as_str(),
-            queued_frames = queued_video_frames.len(),
-            queue_duration_ms = queued_video_frames.duration().as_secs_f64() * 1000.0,
-            limit_frames = queued_video_frames.limit_frames(needs_prefetch),
-            target_frames = queued_video_frames.target_frames(needs_prefetch),
-            limit_duration_ms = queued_video_frames
-                .limit_duration(needs_prefetch)
-                .as_secs_f64()
-                * 1000.0,
-            target_duration_ms = queued_video_frames
-                .target_duration(needs_prefetch)
-                .as_secs_f64()
-                * 1000.0,
-            vo_queued_frames = vo_snapshot.queued_frames,
-            vo_queue_capacity = vo_snapshot.queue_capacity,
-            vo_dropped_frames = vo_snapshot.dropped_frames,
-            render_backlogged = vo_snapshot.render_backlogged(),
-            pending_render_requests = backpressure.pending_requests,
-            render_last_ms = backpressure.last_render_nsecs as f64 / 1_000_000.0,
-            render_avg_ms = backpressure.average_render_nsecs as f64 / 1_000_000.0,
-            pending_audio_ms = audio_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
-            audio_output_shared_ms = audio_snapshot.shared_pending_nsecs as f64 / 1_000_000.0,
-            audio_output_queue_ms = audio_snapshot.queue_pending_nsecs as f64 / 1_000_000.0,
-            audio_output_queue_frames = audio_snapshot.queue_frames,
-            "decoded FFmpeg video queue reached prebuffer limit; leaving backpressure to decoder/VO"
-        );
+        if let Some(suppressed_repeats) =
+            queued_video_frames.prebuffer_limit_log_summary(Instant::now())
+        {
+            tracing::debug!(
+                session_id = ?session_id,
+                blocked_on = blocked_on.as_str(),
+                suppressed_repeats,
+                queued_frames = queued_video_frames.len(),
+                queue_duration_ms = queued_video_frames.duration().as_secs_f64() * 1000.0,
+                limit_frames = queued_video_frames.limit_frames(needs_prefetch),
+                target_frames = queued_video_frames.target_frames(needs_prefetch),
+                limit_duration_ms = queued_video_frames
+                    .limit_duration(needs_prefetch)
+                    .as_secs_f64()
+                    * 1000.0,
+                target_duration_ms = queued_video_frames
+                    .target_duration(needs_prefetch)
+                    .as_secs_f64()
+                    * 1000.0,
+                vo_queued_frames = vo_snapshot.queued_frames,
+                vo_queue_capacity = vo_snapshot.queue_capacity,
+                vo_dropped_frames = vo_snapshot.dropped_frames,
+                render_backlogged = vo_snapshot.render_backlogged(),
+                pending_render_requests = backpressure.pending_requests,
+                render_last_ms = backpressure.last_render_nsecs as f64 / 1_000_000.0,
+                render_avg_ms = backpressure.average_render_nsecs as f64 / 1_000_000.0,
+                pending_audio_ms = audio_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
+                audio_output_shared_ms = audio_snapshot.shared_pending_nsecs as f64 / 1_000_000.0,
+                audio_output_queue_ms = audio_snapshot.queue_pending_nsecs as f64 / 1_000_000.0,
+                audio_output_queue_frames = audio_snapshot.queue_frames,
+                "decoded FFmpeg video queue reached prebuffer limit; leaving backpressure to decoder/VO"
+            );
+        }
     }
 
     Ok(made_progress)

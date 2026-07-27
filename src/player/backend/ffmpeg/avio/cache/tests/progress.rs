@@ -1,4 +1,8 @@
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicU64},
+    mpsc,
+};
 
 use crate::player::{
     backend::{BackendEventKind, ByteCacheState, PlaybackCacheState},
@@ -61,6 +65,10 @@ fn http_cache_probe_read_reports_queued_side_download_activity() {
         shared: Arc::new(HttpRingCacheShared {
             state: Mutex::new(state),
             ready: Condvar::new(),
+            output_backpressure_paused: AtomicBool::new(false),
+            demux_high_water_paused: AtomicBool::new(false),
+            cache_config_generation: AtomicU64::new(0),
+            input_progress_generation: AtomicU64::new(0),
             control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
             event_tx,
         }),

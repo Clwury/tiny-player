@@ -17,6 +17,7 @@ use super::{
 enum DecoderInputServiceStatus {
     Progress,
     Backpressured,
+    OutputLeadThrottled,
     Eof,
     WouldBlock,
     Interrupted,
@@ -27,6 +28,7 @@ enum DecoderInputServiceStatus {
 pub(super) enum DecoderInputServiceOutcome {
     Ready,
     Backpressured,
+    OutputLeadThrottled,
     WouldBlock,
     Continue,
     Eof,
@@ -43,10 +45,43 @@ impl DecoderInputService {
         &mut self,
         mut context: DecoderInputServiceContext<'_>,
     ) -> std::result::Result<DecoderInputServiceOutcome, String> {
-        match service_decoder_input_once(self, &mut context) {
+        match service_decoder_input_once(self, &mut context, false) {
             DecoderInputServiceStatus::Progress => Ok(DecoderInputServiceOutcome::Ready),
             DecoderInputServiceStatus::Backpressured => {
                 Ok(DecoderInputServiceOutcome::Backpressured)
+            }
+            DecoderInputServiceStatus::OutputLeadThrottled => {
+                Ok(DecoderInputServiceOutcome::OutputLeadThrottled)
+            }
+            DecoderInputServiceStatus::Eof => Ok(DecoderInputServiceOutcome::Eof),
+            DecoderInputServiceStatus::WouldBlock => Ok(DecoderInputServiceOutcome::WouldBlock),
+            DecoderInputServiceStatus::Interrupted if context.control.should_stop() => {
+                Ok(DecoderInputServiceOutcome::Stopped)
+            }
+            DecoderInputServiceStatus::Interrupted => Ok(DecoderInputServiceOutcome::Continue),
+            DecoderInputServiceStatus::Error(error) => {
+                if context.control.has_pending_seek() {
+                    Ok(DecoderInputServiceOutcome::Continue)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub(super) fn service_cached_input(
+        &mut self,
+        mut context: DecoderInputServiceContext<'_>,
+    ) -> std::result::Result<DecoderInputServiceOutcome, String> {
+        context.should_wait_for_demux = false;
+        context.video_output_waiting_for_demux = false;
+        match service_decoder_input_once(self, &mut context, true) {
+            DecoderInputServiceStatus::Progress => Ok(DecoderInputServiceOutcome::Ready),
+            DecoderInputServiceStatus::Backpressured => {
+                Ok(DecoderInputServiceOutcome::Backpressured)
+            }
+            DecoderInputServiceStatus::OutputLeadThrottled => {
+                Ok(DecoderInputServiceOutcome::OutputLeadThrottled)
             }
             DecoderInputServiceStatus::Eof => Ok(DecoderInputServiceOutcome::Eof),
             DecoderInputServiceStatus::WouldBlock => Ok(DecoderInputServiceOutcome::WouldBlock),
@@ -78,6 +113,7 @@ pub(super) struct DecoderInputServiceContext<'a> {
 fn service_decoder_input_once(
     service: &mut DecoderInputService,
     context: &mut DecoderInputServiceContext<'_>,
+    cached_only: bool,
 ) -> DecoderInputServiceStatus {
     let service_started_at = Instant::now();
     let retry_started_at = Instant::now();
@@ -99,6 +135,7 @@ fn service_decoder_input_once(
             retry_status,
             "skipped_after_retry_progress",
             &status,
+            cached_only,
         );
         return status;
     }
@@ -113,6 +150,7 @@ fn service_decoder_input_once(
             video_admission_pressure: context.video_admission_pressure,
             should_wait_for_demux: context.should_wait_for_demux,
             video_output_waiting_for_demux: context.video_output_waiting_for_demux,
+            cached_only,
         });
     let pump_elapsed = pump_started_at.elapsed();
     let pump_result = demux_packet_pump_result_name(&result);
@@ -125,6 +163,7 @@ fn service_decoder_input_once(
         retry_status,
         pump_result,
         &status,
+        cached_only,
     );
     log_decoder_input_empty_output_diagnostic(
         context,
@@ -134,6 +173,7 @@ fn service_decoder_input_once(
         retry_status,
         pump_result,
         &status,
+        cached_only,
     );
     status
 }
@@ -150,14 +190,18 @@ fn decoder_input_status_after_retry(
     if retry_status.made_progress()
         && matches!(
             status,
-            DecoderInputServiceStatus::WouldBlock | DecoderInputServiceStatus::Eof
+            DecoderInputServiceStatus::WouldBlock
+                | DecoderInputServiceStatus::OutputLeadThrottled
+                | DecoderInputServiceStatus::Eof
         )
     {
         DecoderInputServiceStatus::Progress
     } else if retry_status.backpressured()
         && matches!(
             status,
-            DecoderInputServiceStatus::WouldBlock | DecoderInputServiceStatus::Eof
+            DecoderInputServiceStatus::WouldBlock
+                | DecoderInputServiceStatus::OutputLeadThrottled
+                | DecoderInputServiceStatus::Eof
         )
     {
         DecoderInputServiceStatus::Backpressured
@@ -170,6 +214,9 @@ fn decoder_input_status_from_pump(result: DemuxPacketPumpResult) -> DecoderInput
     match result {
         DemuxPacketPumpResult::Progress => DecoderInputServiceStatus::Progress,
         DemuxPacketPumpResult::Backpressured => DecoderInputServiceStatus::Backpressured,
+        DemuxPacketPumpResult::OutputLeadThrottled => {
+            DecoderInputServiceStatus::OutputLeadThrottled
+        }
         DemuxPacketPumpResult::Eof => DecoderInputServiceStatus::Eof,
         DemuxPacketPumpResult::WouldBlock => DecoderInputServiceStatus::WouldBlock,
         DemuxPacketPumpResult::Interrupted => DecoderInputServiceStatus::Interrupted,
@@ -181,6 +228,7 @@ fn demux_packet_pump_result_name(result: &DemuxPacketPumpResult) -> &'static str
     match result {
         DemuxPacketPumpResult::Progress => "progress",
         DemuxPacketPumpResult::Backpressured => "backpressured",
+        DemuxPacketPumpResult::OutputLeadThrottled => "output_lead_throttled",
         DemuxPacketPumpResult::Eof => "eof",
         DemuxPacketPumpResult::WouldBlock => "would_block",
         DemuxPacketPumpResult::Interrupted => "interrupted",
@@ -188,6 +236,7 @@ fn demux_packet_pump_result_name(result: &DemuxPacketPumpResult) -> &'static str
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_decoder_input_timing(
     session_id: PlaybackSessionId,
     total: Duration,
@@ -196,6 +245,7 @@ fn log_decoder_input_timing(
     retry_status: DecodeInputRetryStatus,
     pump_result: &'static str,
     status: &DecoderInputServiceStatus,
+    cached_only: bool,
 ) {
     tracing::trace!(
         session_id = ?session_id,
@@ -205,6 +255,7 @@ fn log_decoder_input_timing(
         retry_status = ?retry_status,
         pump_result,
         status = ?status,
+        cached_only,
         "FFmpeg decoder input service timing"
     );
     if total < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER
@@ -221,10 +272,12 @@ fn log_decoder_input_timing(
         retry_status = ?retry_status,
         pump_result,
         status = ?status,
+        cached_only,
         "FFmpeg decoder input service completed slowly"
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_decoder_input_empty_output_diagnostic(
     context: &DecoderInputServiceContext<'_>,
     total: Duration,
@@ -233,6 +286,7 @@ fn log_decoder_input_empty_output_diagnostic(
     retry_status: DecodeInputRetryStatus,
     pump_result: &'static str,
     status: &DecoderInputServiceStatus,
+    cached_only: bool,
 ) {
     let output_snapshot = context.pipeline.output_scheduler.snapshot();
     if output_snapshot.queued_video_frames > 0
@@ -244,6 +298,7 @@ fn log_decoder_input_empty_output_diagnostic(
         status,
         DecoderInputServiceStatus::Progress
             | DecoderInputServiceStatus::WouldBlock
+            | DecoderInputServiceStatus::OutputLeadThrottled
             | DecoderInputServiceStatus::Backpressured
     ) {
         return;
@@ -265,6 +320,7 @@ fn log_decoder_input_empty_output_diagnostic(
         status = ?status,
         should_wait_for_demux = context.should_wait_for_demux,
         video_output_waiting_for_demux = context.video_output_waiting_for_demux,
+        cached_only,
         output_state = ?output_snapshot.state,
         first_video_frame_pending = output_snapshot.first_video_frame_pending,
         output_rebuffering = output_snapshot.rebuffering,
@@ -295,7 +351,7 @@ fn log_decoder_input_empty_output_diagnostic(
         video_decode_pending_input_packets = video_decode_snapshot.pending_input_packets,
         video_decode_pending_input_capacity = video_decode_snapshot.pending_input_capacity,
         video_decode_pending_input_full = video_decode_snapshot.pending_input_full(),
-        video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+        video_decode_submitted_not_consumed_packets = video_decode_snapshot.submitted_not_consumed_packets,
         video_decode_completed_packets = video_decode_snapshot.completed_packets,
         "FFmpeg decoder input completed while output still has no video frame"
     );
@@ -318,6 +374,10 @@ mod tests {
         assert_eq!(
             decoder_input_status_from_pump(DemuxPacketPumpResult::Backpressured),
             DecoderInputServiceStatus::Backpressured
+        );
+        assert_eq!(
+            decoder_input_status_from_pump(DemuxPacketPumpResult::OutputLeadThrottled),
+            DecoderInputServiceStatus::OutputLeadThrottled
         );
         assert_eq!(
             decoder_input_status_from_pump(DemuxPacketPumpResult::WouldBlock),
@@ -400,6 +460,10 @@ mod tests {
         );
         assert_ne!(
             DecoderInputServiceOutcome::Backpressured,
+            DecoderInputServiceOutcome::WouldBlock
+        );
+        assert_ne!(
+            DecoderInputServiceOutcome::OutputLeadThrottled,
             DecoderInputServiceOutcome::WouldBlock
         );
     }

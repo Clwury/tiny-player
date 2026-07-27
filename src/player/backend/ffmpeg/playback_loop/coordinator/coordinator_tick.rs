@@ -22,7 +22,7 @@ use super::{
     DemuxPacketCache, DemuxReaderWatermark, FfmpegControl, HttpRingCache,
     PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER, PLAYBACK_COORDINATOR_TICK_TIMING_LOG_AFTER,
     PlaybackBlockReason, PlaybackOutputScheduler, PlaybackPipelineState,
-    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, duration_nsecs,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, duration_nsecs, expire_initial_av_start_hard_deadline,
 };
 use ffmpeg_sys_next as ffi;
 
@@ -76,6 +76,7 @@ struct PlaybackTickTiming {
     output_gate: Duration,
     decoder_input: Duration,
     output_queue_after: Duration,
+    planned_wait: Duration,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -84,6 +85,15 @@ pub(super) fn service_playback_tick(
 ) -> std::result::Result<PlaybackTickStatus, String> {
     let tick_started_at = Instant::now();
     let mut timing = PlaybackTickTiming::default();
+
+    context.pipeline.service_audio_output_state_machine(
+        context.control,
+        context.session_id,
+        context.vo_queue,
+        context.frame_presented,
+        context.event_tx,
+        tick_started_at,
+    )?;
 
     log_cached_seek_watchdog_tick_stage(
         context.session_id,
@@ -223,6 +233,7 @@ pub(super) fn service_playback_tick(
                 playback_telemetry: &mut context.services.telemetry,
             })?;
     timing.output_queue_before = stage_started_at.elapsed();
+    timing.planned_wait += output_queue_before_status.planned_wait;
     log_cached_seek_watchdog_tick_stage(
         context.session_id,
         context.pipeline,
@@ -270,6 +281,29 @@ pub(super) fn service_playback_tick(
         return Ok(status);
     }
     let stage_started_at = Instant::now();
+    let output_service_demand = context
+        .pipeline
+        .output_scheduler
+        .output_service_demand(Instant::now());
+    if output_service_demand.hard_deadline_due()
+        && expire_initial_av_start_hard_deadline(
+            &mut context.pipeline.output_scheduler,
+            context.pipeline.audio_output.as_ref(),
+            Instant::now(),
+            context.control,
+            context.session_id,
+        )
+    {
+        return Ok(finish_playback_tick(
+            context.session_id,
+            &mut context.pipeline.output_scheduler,
+            tick_started_at,
+            timing,
+            PlaybackTickStatus::Continue,
+            "initial_av_start_hard_deadline_before_output_gate",
+            None,
+        ));
+    }
     let output_gate_status =
         context
             .services
@@ -285,6 +319,7 @@ pub(super) fn service_playback_tick(
                 frame_presented: context.frame_presented,
                 playback_wait: &context.services.wait,
                 playback_telemetry: &mut context.services.telemetry,
+                output_service_demand,
             })?;
     timing.output_gate = stage_started_at.elapsed();
     log_cached_seek_watchdog_tick_stage(
@@ -434,7 +469,7 @@ pub(super) fn service_playback_tick(
                 return Ok(status);
             }
             let stage_started_at = Instant::now();
-            context
+            let output_queue_result = context
                 .services
                 .output_queue
                 .after_decoder_input_backpressure_or_wait(OutputQueueServiceContext {
@@ -448,6 +483,7 @@ pub(super) fn service_playback_tick(
                     playback_wait: &context.services.wait,
                     playback_telemetry: &mut context.services.telemetry,
                 })?;
+            timing.planned_wait += output_queue_result.planned_wait;
             timing.output_queue_after = stage_started_at.elapsed();
             log_cached_seek_watchdog_tick_stage(
                 context.session_id,
@@ -476,7 +512,10 @@ pub(super) fn service_playback_tick(
                 Some(decoder_input_outcome),
             ));
         }
-        DecoderInputServiceOutcome::WouldBlock => {
+        DecoderInputServiceOutcome::WouldBlock
+        | DecoderInputServiceOutcome::OutputLeadThrottled => {
+            let output_lead_throttled =
+                decoder_input_outcome == DecoderInputServiceOutcome::OutputLeadThrottled;
             log_cached_seek_watchdog_tick_stage(
                 context.session_id,
                 context.pipeline,
@@ -495,7 +534,7 @@ pub(super) fn service_playback_tick(
                 return Ok(status);
             }
             let stage_started_at = Instant::now();
-            context
+            let output_queue_result = context
                 .services
                 .output_queue
                 .after_demux_would_block_or_wait(OutputQueueServiceContext {
@@ -509,6 +548,7 @@ pub(super) fn service_playback_tick(
                     playback_wait: &context.services.wait,
                     playback_telemetry: &mut context.services.telemetry,
                 })?;
+            timing.planned_wait += output_queue_result.planned_wait;
             timing.output_queue_after = stage_started_at.elapsed();
             log_cached_seek_watchdog_tick_stage(
                 context.session_id,
@@ -533,7 +573,11 @@ pub(super) fn service_playback_tick(
                 tick_started_at,
                 timing,
                 PlaybackTickStatus::Continue,
-                "decoder_input_would_block",
+                if output_lead_throttled {
+                    "decoder_input_output_lead_throttled"
+                } else {
+                    "decoder_input_would_block"
+                },
                 Some(decoder_input_outcome),
             ));
         }
@@ -709,6 +753,24 @@ fn service_hevc_startup_stall_watchdog(
     pipeline: &mut PlaybackPipelineState,
     demux_watermark: DemuxReaderWatermark,
 ) -> std::result::Result<Option<PlaybackTickStatus>, String> {
+    if pipeline.output_scheduler.decode_recovery_active()
+        || pipeline
+            .video_decode_pipeline
+            .hevc_same_hardware_recovery_target()
+            .is_some()
+    {
+        pipeline
+            .video_decode_pipeline
+            .suspend_hevc_playback_watchdogs_for_decode_recovery();
+        return Ok(None);
+    }
+    let prepare_snapshot = pipeline.video_frame_prepare_worker.snapshot();
+    if prepare_snapshot.pending_input_frames > 0
+        || prepare_snapshot.in_flight_frames > 0
+        || prepare_snapshot.completed_frames > 0
+    {
+        return Ok(None);
+    }
     let output_snapshot = pipeline.output_scheduler.snapshot();
     let fallback_target_nsecs = output_snapshot
         .video_output_rebuffer_anchor
@@ -756,6 +818,52 @@ pub(super) fn service_hevc_startup_stall_watchdog_if_due(
     demux_watermark: DemuxReaderWatermark,
     checkpoint: &'static str,
 ) -> std::result::Result<Option<PlaybackTickStatus>, String> {
+    if pipeline.output_scheduler.decode_recovery_active()
+        || pipeline
+            .video_decode_pipeline
+            .hevc_same_hardware_recovery_target()
+            .is_some()
+    {
+        pipeline
+            .video_decode_pipeline
+            .suspend_hevc_playback_watchdogs_for_decode_recovery();
+        return Ok(None);
+    }
+    let output_snapshot = pipeline.output_scheduler.snapshot();
+    let video_decode_snapshot = pipeline.video_decode_pipeline.snapshot();
+    let prepare_snapshot = pipeline.video_frame_prepare_worker.snapshot();
+    let video_prepare_pending = prepare_snapshot.pending_input_frames > 0
+        || prepare_snapshot.in_flight_frames > 0
+        || prepare_snapshot.completed_frames > 0;
+    if hevc_startup_watchdog_waiting_cached_input(
+        pipeline.video_stream.codec_id,
+        pipeline.video_decode_pipeline.info().hardware_accelerated,
+        output_snapshot.first_video_frame_pending,
+        output_snapshot.queued_video_frames,
+        video_decode_snapshot,
+        video_prepare_pending,
+    ) {
+        if pipeline
+            .video_decode_pipeline
+            .suspend_hevc_startup_watchdog_for_input_wait()
+        {
+            tracing::debug!(
+                session_id = ?session_id,
+                checkpoint,
+                gate_reason = "waiting_cached_input",
+                video_decode_state = ?video_decode_snapshot.state,
+                submitted_not_consumed_packets =
+                    video_decode_snapshot.submitted_not_consumed_packets,
+                result_produced_sequence = video_decode_snapshot.result_produced_sequence,
+                result_consumed_sequence = video_decode_snapshot.result_consumed_sequence,
+                completed_packets = video_decode_snapshot.completed_packets,
+                decoded_queued_frames = video_decode_snapshot.queued_frames,
+                queued_video_frames = output_snapshot.queued_video_frames,
+                "suspended HEVC startup watchdog while decoder waits for cached input"
+            );
+        }
+        return Ok(None);
+    }
     let Some(deadline) = pipeline
         .video_decode_pipeline
         .hevc_startup_stall_watchdog_deadline()
@@ -767,8 +875,6 @@ pub(super) fn service_hevc_startup_stall_watchdog_if_due(
         return Ok(None);
     }
 
-    let output_snapshot = pipeline.output_scheduler.snapshot();
-    let video_decode_snapshot = pipeline.video_decode_pipeline.snapshot();
     let fallback_pending_before = pipeline
         .video_decode_pipeline
         .hevc_decode_chain_fallback_pending();
@@ -777,14 +883,23 @@ pub(super) fn service_hevc_startup_stall_watchdog_if_due(
         pipeline.video_decode_pipeline.info().hardware_accelerated,
         output_snapshot.queued_video_frames,
         video_decode_snapshot,
+        video_prepare_pending,
     );
     tracing::trace!(
         session_id = ?session_id,
         checkpoint,
         overdue_ms = now.saturating_duration_since(deadline).as_secs_f64() * 1000.0,
         video_decode_state = ?video_decode_snapshot.state,
-        in_flight_packets = video_decode_snapshot.in_flight_packets,
+        submitted_not_consumed_packets = video_decode_snapshot.submitted_not_consumed_packets,
         completed_packets = video_decode_snapshot.completed_packets,
+        submitted_sequence = video_decode_snapshot.submitted_sequence,
+        result_produced_sequence = video_decode_snapshot.result_produced_sequence,
+        result_consumed_sequence = video_decode_snapshot.result_consumed_sequence,
+        oldest_submitted_packet_nsecs = ?video_decode_snapshot.oldest_submitted_packet_nsecs,
+        last_worker_progress_ms = ?video_decode_snapshot.last_result_produced_at.map(|at| {
+            now.saturating_duration_since(at).as_secs_f64() * 1000.0
+        }),
+        video_prepare_pending,
         decoded_queued_frames = video_decode_snapshot.queued_frames,
         queued_video_frames = output_snapshot.queued_video_frames,
         output_rebuffering = output_snapshot.rebuffering,
@@ -807,8 +922,13 @@ pub(super) fn service_hevc_startup_stall_watchdog_if_due(
                 checkpoint,
                 overdue_ms = now.saturating_duration_since(deadline).as_secs_f64() * 1000.0,
                 video_decode_state = ?video_decode_snapshot.state,
-                in_flight_packets = video_decode_snapshot.in_flight_packets,
+                submitted_not_consumed_packets = video_decode_snapshot.submitted_not_consumed_packets,
                 completed_packets = video_decode_snapshot.completed_packets,
+                submitted_sequence = video_decode_snapshot.submitted_sequence,
+                result_produced_sequence = video_decode_snapshot.result_produced_sequence,
+                result_consumed_sequence = video_decode_snapshot.result_consumed_sequence,
+                oldest_submitted_packet_nsecs = ?video_decode_snapshot.oldest_submitted_packet_nsecs,
+                video_prepare_pending,
                 decoded_queued_frames = video_decode_snapshot.queued_frames,
                 queued_video_frames = output_snapshot.queued_video_frames,
                 output_rebuffering = output_snapshot.rebuffering,
@@ -825,11 +945,34 @@ pub(super) fn service_hevc_startup_stall_watchdog_if_due(
     Ok(status)
 }
 
+fn hevc_startup_watchdog_waiting_cached_input(
+    codec_id: ffi::AVCodecID,
+    hardware_accelerated: bool,
+    first_video_frame_pending: bool,
+    queued_video_frames: usize,
+    video_decode_snapshot: VideoDecodeWorkerSnapshot,
+    video_prepare_pending: bool,
+) -> bool {
+    codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC
+        && hardware_accelerated
+        && first_video_frame_pending
+        && queued_video_frames == 0
+        && !video_prepare_pending
+        && video_decode_snapshot.state == VideoDecodeWorkerState::NeedPacket
+        && video_decode_snapshot.pending_input_packets == 0
+        && video_decode_snapshot.submitted_not_consumed_packets == 0
+        && video_decode_snapshot.result_produced_sequence
+            == video_decode_snapshot.result_consumed_sequence
+        && video_decode_snapshot.completed_packets == 0
+        && video_decode_snapshot.queued_frames == 0
+}
+
 fn hevc_startup_watchdog_reject_reason(
     codec_id: ffi::AVCodecID,
     hardware_accelerated: bool,
     queued_video_frames: usize,
     video_decode_snapshot: VideoDecodeWorkerSnapshot,
+    video_prepare_pending: bool,
 ) -> &'static str {
     if codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
         return "non_hevc";
@@ -837,14 +980,22 @@ fn hevc_startup_watchdog_reject_reason(
     if !hardware_accelerated {
         return "software_decoder";
     }
+    if video_prepare_pending {
+        return "video_prepare_pending";
+    }
     if !matches!(
         video_decode_snapshot.state,
         VideoDecodeWorkerState::Decoding
     ) {
         return "decoder_not_decoding";
     }
-    if video_decode_snapshot.in_flight_packets == 0 {
-        return "no_in_flight_packets";
+    if video_decode_snapshot.submitted_not_consumed_packets == 0 {
+        return "no_submitted_packets";
+    }
+    if video_decode_snapshot.result_produced_sequence
+        != video_decode_snapshot.result_consumed_sequence
+    {
+        return "worker_results_pending";
     }
     if video_decode_snapshot.completed_packets > 0 {
         return "completed_packets_pending";
@@ -880,7 +1031,7 @@ fn startup_first_frame_decoder_warmup_needed(
         .decoder_input_snapshot(false)
         .video_decode_blocked_on;
     snapshot.queued_frames == 0
-        && (snapshot.in_flight_packets > 0
+        && (snapshot.submitted_not_consumed_packets > 0
             || snapshot.completed_packets > 0
             || matches!(
                 blocked_on,
@@ -982,7 +1133,9 @@ fn service_startup_first_frame_decoder_warmup(
         last_decoder_input_outcome = Some(decoder_input_outcome);
         match decoder_input_outcome {
             DecoderInputServiceOutcome::Ready => made_progress = true,
-            DecoderInputServiceOutcome::Backpressured | DecoderInputServiceOutcome::WouldBlock => {}
+            DecoderInputServiceOutcome::Backpressured
+            | DecoderInputServiceOutcome::WouldBlock
+            | DecoderInputServiceOutcome::OutputLeadThrottled => {}
             DecoderInputServiceOutcome::Continue => {
                 if let Some(status) = service_hevc_startup_stall_watchdog_if_due(
                     context.session_id,
@@ -1033,7 +1186,7 @@ fn service_startup_first_frame_decoder_warmup(
             last_decoder_input_outcome = ?last_decoder_input_outcome,
             video_decode_state = ?snapshot.state,
             video_decode_queued_frames = snapshot.queued_frames,
-            video_decode_in_flight_packets = snapshot.in_flight_packets,
+            video_decode_submitted_not_consumed_packets = snapshot.submitted_not_consumed_packets,
             video_decode_completed_packets = snapshot.completed_packets,
             "serviced startup first-frame decoder warmup after decoder input backpressure"
         );
@@ -1103,7 +1256,7 @@ fn log_ready_tick_empty_output_diagnostic(
         video_decode_pending_input_packets = video_decode_snapshot.pending_input_packets,
         video_decode_pending_input_capacity = video_decode_snapshot.pending_input_capacity,
         video_decode_pending_input_full = video_decode_snapshot.pending_input_full(),
-        video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+        video_decode_submitted_not_consumed_packets = video_decode_snapshot.submitted_not_consumed_packets,
         video_decode_completed_packets = video_decode_snapshot.completed_packets,
         "FFmpeg playback coordinator ready tick exited with empty video output"
     );
@@ -1294,12 +1447,19 @@ fn log_playback_tick_timing(
     exit_reason: &'static str,
     decoder_input_outcome: Option<DecoderInputServiceOutcome>,
 ) {
+    let active_total = total.saturating_sub(timing.planned_wait);
+    let output_queue_active = timing
+        .output_queue_before
+        .saturating_add(timing.output_queue_after)
+        .saturating_sub(timing.planned_wait);
     tracing::trace!(
         session_id = ?session_id,
         status = ?status,
         exit_reason,
         decoder_input_outcome = ?decoder_input_outcome,
         total_ms = total.as_secs_f64() * 1000.0,
+        planned_wait_ms = timing.planned_wait.as_secs_f64() * 1000.0,
+        active_total_ms = active_total.as_secs_f64() * 1000.0,
         decode_pipeline_ms = timing.decode_pipeline.as_secs_f64() * 1000.0,
         output_queue_before_ms = timing.output_queue_before.as_secs_f64() * 1000.0,
         output_gate_ms = timing.output_gate.as_secs_f64() * 1000.0,
@@ -1307,12 +1467,11 @@ fn log_playback_tick_timing(
         output_queue_after_ms = timing.output_queue_after.as_secs_f64() * 1000.0,
         "FFmpeg playback coordinator tick timing"
     );
-    if total < PLAYBACK_COORDINATOR_TICK_TIMING_LOG_AFTER
+    if active_total < PLAYBACK_COORDINATOR_TICK_TIMING_LOG_AFTER
         && timing.decode_pipeline < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER
-        && timing.output_queue_before < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER
+        && output_queue_active < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER
         && timing.output_gate < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER
         && timing.decoder_input < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER
-        && timing.output_queue_after < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER
     {
         return;
     }
@@ -1322,6 +1481,9 @@ fn log_playback_tick_timing(
         exit_reason,
         decoder_input_outcome = ?decoder_input_outcome,
         total_ms = total.as_secs_f64() * 1000.0,
+        planned_wait_ms = timing.planned_wait.as_secs_f64() * 1000.0,
+        active_total_ms = active_total.as_secs_f64() * 1000.0,
+        output_queue_active_ms = output_queue_active.as_secs_f64() * 1000.0,
         decode_pipeline_ms = timing.decode_pipeline.as_secs_f64() * 1000.0,
         output_queue_before_ms = timing.output_queue_before.as_secs_f64() * 1000.0,
         output_gate_ms = timing.output_gate.as_secs_f64() * 1000.0,
@@ -1341,12 +1503,13 @@ mod tests {
         HevcDecodeChainFallback, HevcDecodeChainFallbackReason, PlaybackRecoveryRequest,
         PlaybackRecoverySource, PlaybackTickStatus, PlaybackWatchdogDeadline,
         VideoDecodeWorkerSnapshot, VideoDecodeWorkerState, hevc_decode_chain_fallback_tick_status,
-        hevc_startup_watchdog_reject_reason, playback_watchdog_deadline_due,
+        hevc_startup_watchdog_reject_reason, hevc_startup_watchdog_waiting_cached_input,
+        playback_watchdog_deadline_due,
     };
 
     fn video_decode_snapshot(
         state: VideoDecodeWorkerState,
-        in_flight_packets: usize,
+        submitted_not_consumed_packets: usize,
         completed_packets: usize,
         queued_frames: usize,
     ) -> VideoDecodeWorkerSnapshot {
@@ -1356,9 +1519,10 @@ mod tests {
             queue_capacity: 8,
             pending_input_packets: 0,
             pending_input_capacity: 8,
-            in_flight_packets,
+            submitted_not_consumed_packets,
             command_queue_capacity: 4,
             completed_packets,
+            ..VideoDecodeWorkerSnapshot::default()
         }
     }
 
@@ -1417,6 +1581,7 @@ mod tests {
                 true,
                 0,
                 video_decode_snapshot(VideoDecodeWorkerState::Decoding, 4, 0, 0),
+                false,
             ),
             "eligible"
         );
@@ -1430,6 +1595,7 @@ mod tests {
                 true,
                 0,
                 video_decode_snapshot(VideoDecodeWorkerState::Decoding, 4, 0, 0),
+                false,
             ),
             "non_hevc"
         );
@@ -1439,6 +1605,7 @@ mod tests {
                 false,
                 0,
                 video_decode_snapshot(VideoDecodeWorkerState::Decoding, 4, 0, 0),
+                false,
             ),
             "software_decoder"
         );
@@ -1448,8 +1615,31 @@ mod tests {
                 true,
                 0,
                 video_decode_snapshot(VideoDecodeWorkerState::Decoding, 4, 1, 0),
+                false,
             ),
             "completed_packets_pending"
         );
+    }
+
+    #[test]
+    fn need_packet_without_in_flight_work_waits_for_cached_input() {
+        let snapshot = video_decode_snapshot(VideoDecodeWorkerState::NeedPacket, 0, 0, 0);
+
+        assert!(hevc_startup_watchdog_waiting_cached_input(
+            ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            true,
+            true,
+            0,
+            snapshot,
+            false,
+        ));
+        assert!(!hevc_startup_watchdog_waiting_cached_input(
+            ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            true,
+            true,
+            0,
+            video_decode_snapshot(VideoDecodeWorkerState::Decoding, 1, 0, 0),
+            false,
+        ));
     }
 }

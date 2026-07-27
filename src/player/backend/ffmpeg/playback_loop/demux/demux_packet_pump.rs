@@ -26,12 +26,17 @@ const DEMUX_PACKET_CACHE_READY_LOCK_WAIT: Duration = Duration::from_millis(1);
 const DEMUX_PACKET_CACHE_READY_FORWARD_NSECS: u64 = 2_000_000_000;
 const DEMUX_PACKET_FORCE_CONSUMER_DRAIN_RETRY_WAIT: Duration = Duration::from_millis(2);
 const DEMUX_PACKET_READER_OUTPUT_LEAD_LIMIT: Duration = Duration::from_millis(2500);
+const DEMUX_OUTPUT_LEAD_THROTTLE_SUMMARY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub(super) struct DemuxPacketPump {
     stream_cursor: usize,
     rebuffer_audio_priority_without_audio_progress: usize,
     last_timing_log_at: Option<Instant>,
+    last_poll_output_lead_throttled: bool,
+    output_lead_throttle_started_at: Option<Instant>,
+    output_lead_throttle_last_summary_at: Option<Instant>,
+    output_lead_throttle_suppressed_count: u64,
 }
 
 struct DemuxPacketPumpContext<'a> {
@@ -44,6 +49,7 @@ struct DemuxPacketPumpContext<'a> {
     cached_reader_watermark: DemuxReaderWatermark,
     current_start_position_nsecs: u64,
     hard_deadline: Option<Instant>,
+    cached_only: bool,
 }
 
 pub(super) struct DemuxPacketPumpAdmissionContext<'a> {
@@ -53,6 +59,7 @@ pub(super) struct DemuxPacketPumpAdmissionContext<'a> {
     pub(super) video_admission_pressure: VideoPacketAdmissionPressure,
     pub(super) should_wait_for_demux: bool,
     pub(super) video_output_waiting_for_demux: bool,
+    pub(super) cached_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +73,7 @@ enum DemuxPacketRoute {
 pub(super) enum DemuxPacketPumpResult {
     Progress,
     Backpressured,
+    OutputLeadThrottled,
     Eof,
     WouldBlock,
     Interrupted,
@@ -74,6 +82,7 @@ pub(super) enum DemuxPacketPumpResult {
 
 impl DemuxPacketPump {
     fn poll_packet(&mut self, context: DemuxPacketPumpContext<'_>) -> DemuxReadResult {
+        self.last_poll_output_lead_throttled = false;
         let (mut demux_streams, demux_stream_rotation) = self.ordered_demux_streams_for_context(
             context.decoder_input,
             context.video_admission_pressure.output_snapshot,
@@ -83,13 +92,14 @@ impl DemuxPacketPump {
         let output_snapshot = context.video_admission_pressure.output_snapshot;
         context.demux_cache.set_playback_recovery_demand(
             demux_playback_recovery_critical(output_snapshot, context.decoder_input),
-            demux_streams.contains(&context.decoder_input.video_stream_index),
+            demux_video_recovery_required(output_snapshot, context.decoder_input, &demux_streams),
             context
                 .decoder_input
                 .audio_stream_index
                 .is_some_and(|stream_index| demux_streams.contains(&stream_index)),
         );
         if all_timed_streams_throttled {
+            self.last_poll_output_lead_throttled = true;
             return DemuxReadResult::WouldBlock;
         }
         if demux_streams.is_empty() {
@@ -126,7 +136,12 @@ impl DemuxPacketPump {
         let mut applied_lock_wait = None;
         let mut force_consumer_drain_retry_count = 0_u64;
         let (demux_read_result, demux_consumed_stream_offset, demux_cache_timing) =
-            if force_consumer_drain {
+            if context.cached_only {
+                read_path = "cached_only_poll";
+                context
+                    .demux_cache
+                    .poll_packet_round_robin_with_timing(&demux_streams)
+            } else if force_consumer_drain {
                 read_path = "force_consumer_drain";
                 tracing::trace!(
                     session_id = ?context.session_id,
@@ -273,7 +288,7 @@ impl DemuxPacketPump {
     }
 
     fn filter_demux_streams_by_output_lead(
-        &self,
+        &mut self,
         context: &DemuxPacketPumpContext<'_>,
         demux_streams: &mut Vec<c_int>,
     ) -> bool {
@@ -312,29 +327,96 @@ impl DemuxPacketPump {
             }
         });
         if throttled_streams.is_empty() {
+            self.observe_output_lead_throttle(context, &[], demux_streams, false);
             return false;
         }
         let has_unthrottled_timed_stream = demux_streams
             .iter()
             .any(|stream_index| decoder_input_timed_stream(context.decoder_input, *stream_index));
+        let all_timed_streams_throttled = !has_unthrottled_timed_stream;
+        self.observe_output_lead_throttle(
+            context,
+            &throttled_streams,
+            demux_streams,
+            all_timed_streams_throttled,
+        );
+        all_timed_streams_throttled
+    }
+
+    fn observe_output_lead_throttle(
+        &mut self,
+        context: &DemuxPacketPumpContext<'_>,
+        throttled_streams: &[(c_int, u64)],
+        remaining_streams: &[c_int],
+        active: bool,
+    ) {
+        let now = Instant::now();
+        if !active {
+            if let Some(started_at) = self.output_lead_throttle_started_at.take() {
+                tracing::debug!(
+                    session_id = ?context.session_id,
+                    throttle_elapsed_ms = now
+                        .saturating_duration_since(started_at)
+                        .as_secs_f64()
+                        * 1000.0,
+                    suppressed_count = self.output_lead_throttle_suppressed_count,
+                    "left FFmpeg demux output-lead throttle"
+                );
+            }
+            self.output_lead_throttle_last_summary_at = None;
+            self.output_lead_throttle_suppressed_count = 0;
+            return;
+        }
+        let output_snapshot = context.video_admission_pressure.output_snapshot;
+        if self.output_lead_throttle_started_at.is_none() {
+            self.output_lead_throttle_started_at = Some(now);
+            self.output_lead_throttle_last_summary_at = Some(now);
+            tracing::debug!(
+                session_id = ?context.session_id,
+                throttled_streams = ?throttled_streams,
+                remaining_streams = ?remaining_streams,
+                output_reference_nsecs = context
+                    .video_admission_pressure
+                    .played_until_nsecs
+                    .unwrap_or(context.current_start_position_nsecs),
+                max_reader_output_lead_ms =
+                    demux_reader_output_lead_limit_nsecs() as f64 / 1_000_000.0,
+                output_state = ?output_snapshot.state,
+                initial_start_phase = ?output_snapshot.state,
+                first_frame_presented = output_snapshot.first_frame_presented,
+                queued_video_frames = output_snapshot.queued_video_frames,
+                queued_video_forward_ms = ?output_snapshot
+                    .queued_video_forward_nsecs
+                    .map(|duration| duration as f64 / 1_000_000.0),
+                "entered FFmpeg demux output-lead throttle"
+            );
+            return;
+        }
+        self.output_lead_throttle_suppressed_count =
+            self.output_lead_throttle_suppressed_count.saturating_add(1);
+        if self
+            .output_lead_throttle_last_summary_at
+            .is_some_and(|last| {
+                now.saturating_duration_since(last) < DEMUX_OUTPUT_LEAD_THROTTLE_SUMMARY_INTERVAL
+            })
+        {
+            return;
+        }
+        let suppressed_count = std::mem::take(&mut self.output_lead_throttle_suppressed_count);
+        self.output_lead_throttle_last_summary_at = Some(now);
         tracing::debug!(
             session_id = ?context.session_id,
+            suppressed_count,
+            throttle_elapsed_ms = self
+                .output_lead_throttle_started_at
+                .map(|started_at| now.saturating_duration_since(started_at).as_secs_f64() * 1000.0),
             throttled_streams = ?throttled_streams,
-            remaining_streams = ?demux_streams,
-            output_reference_nsecs,
-            max_reader_output_lead_ms =
-                demux_reader_output_lead_limit_nsecs() as f64 / 1_000_000.0,
-            output_state = ?context.video_admission_pressure.output_snapshot.state,
-            queued_video_frames =
-                context.video_admission_pressure.output_snapshot.queued_video_frames,
-            queued_video_forward_ms = ?context
-                .video_admission_pressure
-                .output_snapshot
+            queued_video_frames = output_snapshot.queued_video_frames,
+            queued_video_forward_ms = ?output_snapshot
                 .queued_video_forward_nsecs
                 .map(|duration| duration as f64 / 1_000_000.0),
-            "throttling FFmpeg demux reader ahead of output clock"
+            "FFmpeg demux output-lead throttle summary"
         );
-        !has_unthrottled_timed_stream
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -388,6 +470,7 @@ impl DemuxPacketPump {
             force_consumer_drain_retry_count,
             should_wait_for_demux = context.should_wait_for_demux,
             video_output_waiting_for_demux = context.video_output_waiting_for_demux,
+            cached_only = context.cached_only,
             output_state = ?output_snapshot.state,
             output_rebuffering = output_snapshot.rebuffering,
             first_video_frame_pending = output_snapshot.first_video_frame_pending,
@@ -406,7 +489,7 @@ impl DemuxPacketPump {
             video_decode_pending_input_packets = video_decode_snapshot.pending_input_packets,
             video_decode_pending_input_capacity = video_decode_snapshot.pending_input_capacity,
             video_decode_pending_input_full = video_decode_snapshot.pending_input_full(),
-            video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+            video_decode_submitted_not_consumed_packets = video_decode_snapshot.submitted_not_consumed_packets,
             "FFmpeg demux packet pump read path returned would-block"
         );
     }
@@ -645,6 +728,22 @@ impl DemuxPacketPump {
                     );
                     return DemuxPacketPumpResult::Backpressured;
                 }
+                DemuxPacketPumpResult::OutputLeadThrottled => {
+                    let result = if made_progress {
+                        DemuxPacketPumpResult::Progress
+                    } else {
+                        DemuxPacketPumpResult::OutputLeadThrottled
+                    };
+                    self.log_pump_exit_diagnostic(
+                        &context,
+                        started_at,
+                        iteration + 1,
+                        "output_lead_throttled",
+                        made_progress,
+                        &result,
+                    );
+                    return result;
+                }
                 DemuxPacketPumpResult::Eof => {
                     let result = if made_progress {
                         DemuxPacketPumpResult::Progress
@@ -736,6 +835,7 @@ impl DemuxPacketPump {
             cached_reader_watermark: context.demux_cache.cached_reader_watermark(),
             current_start_position_nsecs: context.pipeline.current_start_position_nsecs,
             hard_deadline,
+            cached_only: context.cached_only,
         });
         let mut packet = match demux_read_result {
             DemuxReadResult::Packet(packet) => packet,
@@ -766,7 +866,11 @@ impl DemuxPacketPump {
                     false,
                     false,
                 );
-                return DemuxPacketPumpResult::WouldBlock;
+                return if self.last_poll_output_lead_throttled {
+                    DemuxPacketPumpResult::OutputLeadThrottled
+                } else {
+                    DemuxPacketPumpResult::WouldBlock
+                };
             }
             DemuxReadResult::Interrupted => {
                 self.record_rebuffer_audio_priority_result(false, false, false);
@@ -786,6 +890,7 @@ impl DemuxPacketPump {
                 &packet,
                 context.session_id,
                 context.video_admission_pressure,
+                context.demux_cache.cached_reader_watermark(),
             ),
             DemuxPacketRoute::Audio => context
                 .pipeline
@@ -964,7 +1069,7 @@ impl DemuxPacketPump {
             video_decode_pending_input_packets = video_decode_snapshot.pending_input_packets,
             video_decode_pending_input_capacity = video_decode_snapshot.pending_input_capacity,
             video_decode_pending_input_full = video_decode_snapshot.pending_input_full(),
-            video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+            video_decode_submitted_not_consumed_packets = video_decode_snapshot.submitted_not_consumed_packets,
             video_decode_completed_packets = video_decode_snapshot.completed_packets,
             "FFmpeg demux packet read wait completed"
         );
@@ -1090,7 +1195,10 @@ impl DemuxPacketPump {
         let empty_startup_or_rebuffer = output_snapshot.queued_video_frames == 0
             && (output_snapshot.first_video_frame_pending || output_snapshot.rebuffering);
         let terminal_would_block = terminal_result == "would_block"
-            || matches!(returned_result, DemuxPacketPumpResult::WouldBlock);
+            || matches!(
+                returned_result,
+                DemuxPacketPumpResult::WouldBlock | DemuxPacketPumpResult::OutputLeadThrottled
+            );
         if !empty_startup_or_rebuffer || !terminal_would_block {
             return;
         }
@@ -1146,7 +1254,7 @@ impl DemuxPacketPump {
             video_decode_pending_input_packets = video_decode_snapshot.pending_input_packets,
             video_decode_pending_input_capacity = video_decode_snapshot.pending_input_capacity,
             video_decode_pending_input_full = video_decode_snapshot.pending_input_full(),
-            video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
+            video_decode_submitted_not_consumed_packets = video_decode_snapshot.submitted_not_consumed_packets,
             video_decode_completed_packets = video_decode_snapshot.completed_packets,
             "FFmpeg demux packet pump returned after empty-output would-block"
         );
@@ -1157,10 +1265,20 @@ fn demux_playback_recovery_critical(
     output_snapshot: PlaybackOutputSnapshot,
     decoder_input: &DecoderInputSnapshot,
 ) -> bool {
-    output_snapshot.rebuffering
+    output_snapshot.initial_av_start_pending
+        || output_snapshot.rebuffering
         || output_snapshot.video_output_low_water
         || decoder_input.audio_output_low_water
-        || (!output_snapshot.first_video_frame_pending && output_snapshot.queued_video_frames == 0)
+        || (!output_snapshot.initial_av_start_pending && output_snapshot.queued_video_frames == 0)
+}
+
+fn demux_video_recovery_required(
+    output_snapshot: PlaybackOutputSnapshot,
+    decoder_input: &DecoderInputSnapshot,
+    requested_streams: &[c_int],
+) -> bool {
+    output_snapshot.first_frame_needed
+        || requested_streams.contains(&decoder_input.video_stream_index)
 }
 
 fn demux_read_result_name(result: &DemuxReadResult) -> &'static str {
@@ -1177,6 +1295,7 @@ fn demux_packet_pump_result_name(result: &DemuxPacketPumpResult) -> &'static str
     match result {
         DemuxPacketPumpResult::Progress => "progress",
         DemuxPacketPumpResult::Backpressured => "backpressured",
+        DemuxPacketPumpResult::OutputLeadThrottled => "output_lead_throttled",
         DemuxPacketPumpResult::Eof => "eof",
         DemuxPacketPumpResult::WouldBlock => "would_block",
         DemuxPacketPumpResult::Interrupted => "interrupted",
@@ -1408,6 +1527,30 @@ fn demux_reader_output_lead_limit_nsecs() -> u64 {
     duration_nsecs(DEMUX_PACKET_READER_OUTPUT_LEAD_LIMIT)
 }
 
+pub(super) fn cached_input_output_lead_throttled(
+    demux_packet_snapshot: &DemuxPacketQueueSnapshot,
+    requested_streams: &[c_int],
+    output_snapshot: PlaybackOutputSnapshot,
+    output_reference_nsecs: u64,
+) -> bool {
+    if !demux_reader_output_lead_throttle_enabled(output_snapshot, false, false) {
+        return false;
+    }
+    let mut drainable_requested = demux_packet_snapshot.streams.iter().filter(|stream| {
+        requested_streams.contains(&stream.stream_index) && stream.consumer_drainable
+    });
+    let Some(first) = drainable_requested.next() else {
+        return false;
+    };
+    first.reader_nsecs.is_some_and(|reader_nsecs| {
+        demux_reader_head_exceeds_output_lead(reader_nsecs, output_reference_nsecs)
+    }) && drainable_requested.all(|stream| {
+        stream.reader_nsecs.is_some_and(|reader_nsecs| {
+            demux_reader_head_exceeds_output_lead(reader_nsecs, output_reference_nsecs)
+        })
+    })
+}
+
 fn decoder_input_timed_stream(decoder_input: &DecoderInputSnapshot, stream_index: c_int) -> bool {
     stream_index == decoder_input.video_stream_index
         || decoder_input.audio_stream_index == Some(stream_index)
@@ -1442,7 +1585,7 @@ fn demux_cache_lock_wait_for_watermark(
 }
 
 fn output_queue_low_water_needs_decoder_input(output_snapshot: PlaybackOutputSnapshot) -> bool {
-    if output_snapshot.first_video_frame_pending {
+    if output_snapshot.first_frame_needed {
         return startup_video_low_water_needs_decoder_input(output_snapshot);
     }
     if rebuffer_video_low_water_needs_decoder_input(output_snapshot) {
@@ -1487,7 +1630,10 @@ fn decoder_input_waiting_for_packets(decoder_input: &DecoderInputSnapshot) -> bo
         )
         && decoder_input.video_decode_snapshot.queued_frames == 0
         && decoder_input.video_decode_snapshot.pending_input_packets == 0
-        && decoder_input.video_decode_snapshot.in_flight_packets == 0
+        && decoder_input
+            .video_decode_snapshot
+            .submitted_not_consumed_packets
+            == 0
         && decoder_input.video_decode_snapshot.completed_packets == 0)
         || audio_low_water_priority_active(decoder_input)
 }
@@ -1579,7 +1725,7 @@ fn video_priority_demux_streams(
 }
 
 fn startup_video_low_water_needs_decoder_input(output_snapshot: PlaybackOutputSnapshot) -> bool {
-    output_snapshot.first_video_frame_pending
+    output_snapshot.first_frame_needed
         && output_snapshot.queued_video_duration_nsecs
             < duration_nsecs(VIDEO_OUTPUT_START_PREBUFFER_DURATION)
 }
@@ -1620,7 +1766,7 @@ fn log_ordered_demux_streams_for_context(
 fn video_decoder_has_pending_work(snapshot: VideoDecodeWorkerSnapshot) -> bool {
     snapshot.queued_frames > 0
         || snapshot.pending_input_packets > 0
-        || snapshot.in_flight_packets > 0
+        || snapshot.submitted_not_consumed_packets > 0
         || snapshot.completed_packets > 0
         || matches!(
             snapshot.state,
@@ -1653,12 +1799,12 @@ mod tests {
         DEMUX_PACKET_CACHE_LOW_WATER_LOCK_WAIT, DEMUX_PACKET_CACHE_READY_LOCK_WAIT,
         DemuxPacketPump, DemuxPacketRoute, PlaybackBlockReason, PlaybackOutputSnapshot,
         VideoPacketAdmissionPressure, audio_priority_demux_streams,
-        decoder_input_output_lead_throttled_stream, decoder_input_waiting_for_packets,
-        demux_playback_recovery_critical, demux_pump_cache_lock_wait_for_test,
-        demux_pump_cache_lock_wait_with_watermark_for_test, demux_pump_should_wait_for_cache_lock,
-        demux_reader_head_exceeds_output_lead, demux_reader_output_lead_limit_nsecs,
-        demux_reader_output_lead_throttle_enabled, duration_nsecs,
-        eof_cached_backpressured_streams,
+        cached_input_output_lead_throttled, decoder_input_output_lead_throttled_stream,
+        decoder_input_waiting_for_packets, demux_playback_recovery_critical,
+        demux_pump_cache_lock_wait_for_test, demux_pump_cache_lock_wait_with_watermark_for_test,
+        demux_pump_should_wait_for_cache_lock, demux_reader_head_exceeds_output_lead,
+        demux_reader_output_lead_limit_nsecs, demux_reader_output_lead_throttle_enabled,
+        demux_video_recovery_required, duration_nsecs, eof_cached_backpressured_streams,
     };
     use std::os::raw::c_int;
     use std::time::Duration;
@@ -1679,8 +1825,28 @@ mod tests {
         assert!(decoder_input_waiting_for_packets(&decoder_input));
 
         decoder_input.video_decode_snapshot.state = VideoDecodeWorkerState::Decoding;
-        decoder_input.video_decode_snapshot.in_flight_packets = 1;
+        decoder_input
+            .video_decode_snapshot
+            .submitted_not_consumed_packets = 1;
         assert!(!decoder_input_waiting_for_packets(&decoder_input));
+    }
+
+    #[test]
+    fn first_frame_keeps_video_recovery_demand_when_current_input_is_audio_only() {
+        let decoder_input = decoder_input_snapshot(vec![1], 0, Some(1), None);
+        let output = startup_output_snapshot_for_test(0);
+
+        assert!(demux_playback_recovery_critical(output, &decoder_input));
+        assert!(demux_video_recovery_required(output, &decoder_input, &[1],));
+    }
+
+    #[test]
+    fn queued_startup_frame_closes_forced_video_input_demand() {
+        let decoder_input = decoder_input_snapshot(vec![1], 0, Some(1), None);
+        let output = startup_output_snapshot_for_test(40_000_000);
+
+        assert!(demux_playback_recovery_critical(output, &decoder_input));
+        assert!(!demux_video_recovery_required(output, &decoder_input, &[1]));
     }
 
     #[test]
@@ -1943,7 +2109,7 @@ mod tests {
     }
 
     #[test]
-    fn demux_packet_pump_prioritizes_startup_video_before_audio_low_water() {
+    fn demux_packet_pump_stops_forcing_video_after_first_startup_frame() {
         let mut pump = DemuxPacketPump::default();
         let mut decoder_input = decoder_input_snapshot(vec![1, 0, 2], 0, Some(1), Some(2));
         decoder_input.audio_resume_waterline = Some(audio_resume_waterline(false));
@@ -1954,11 +2120,11 @@ mod tests {
         );
 
         assert_eq!(rotation, 0);
-        assert_eq!(streams, vec![0, 1, 2]);
+        assert_eq!(streams, vec![1, 0, 2]);
     }
 
     #[test]
-    fn demux_packet_pump_prioritizes_startup_video_after_audio_waterline_is_ready() {
+    fn demux_packet_pump_uses_normal_rotation_after_first_startup_frame() {
         let mut pump = DemuxPacketPump::default();
         let mut decoder_input = decoder_input_snapshot(vec![1, 2, 0], 0, Some(1), Some(2));
         decoder_input.audio_resume_waterline = Some(audio_resume_waterline(true));
@@ -1969,7 +2135,7 @@ mod tests {
         );
 
         assert_eq!(rotation, 0);
-        assert_eq!(streams, vec![0, 1, 2]);
+        assert_eq!(streams, vec![1, 2, 0]);
     }
 
     #[test]
@@ -2068,7 +2234,7 @@ mod tests {
     }
 
     #[test]
-    fn demux_packet_pump_waits_for_cache_lock_during_startup_video_low_water() {
+    fn demux_packet_pump_does_not_force_cache_wait_after_first_startup_frame() {
         let decoder_input = decoder_input_snapshot(vec![0, 1], 0, Some(1), None);
         let pressure = VideoPacketAdmissionPressure {
             output_snapshot: startup_output_snapshot_for_test(40_000_000),
@@ -2079,7 +2245,7 @@ mod tests {
 
         assert_eq!(
             demux_pump_cache_lock_wait_for_test(false, false, &decoder_input, pressure),
-            Some(DEMUX_PACKET_CACHE_LOW_WATER_LOCK_WAIT)
+            None
         );
     }
 
@@ -2133,6 +2299,34 @@ mod tests {
         assert!(demux_reader_head_exceeds_output_lead(
             allowed_reader_head + 1,
             output_reference_nsecs
+        ));
+    }
+
+    #[test]
+    fn drainable_output_lead_throttled_cache_is_not_input_admissible() {
+        let output_reference_nsecs = 184_700_000_000_u64;
+        let mut packet_snapshot = demux_packet_snapshot(vec![
+            (0, StreamCacheKind::Video, 85),
+            (1, StreamCacheKind::Audio, 85),
+        ]);
+        for stream in &mut packet_snapshot.streams {
+            stream.reader_nsecs = Some(
+                output_reference_nsecs
+                    .saturating_add(demux_reader_output_lead_limit_nsecs())
+                    .saturating_add(1),
+            );
+        }
+        let output = playback_output_snapshot_for_test(
+            38,
+            duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION) + 1,
+        );
+
+        assert!(packet_snapshot.consumer_drainable_for_streams(&[0, 1]));
+        assert!(cached_input_output_lead_throttled(
+            &packet_snapshot,
+            &[0, 1],
+            output,
+            output_reference_nsecs,
         ));
     }
 
@@ -2220,9 +2414,10 @@ mod tests {
                 queue_capacity: 48,
                 pending_input_packets: 0,
                 pending_input_capacity: 8,
-                in_flight_packets: 0,
+                submitted_not_consumed_packets: 0,
                 command_queue_capacity: 8,
                 completed_packets: 0,
+                ..VideoDecodeWorkerSnapshot::default()
             },
             video_decode_blocked_on: Some(PlaybackBlockReason::DecodedVideoQueue),
         }
@@ -2256,9 +2451,22 @@ mod tests {
         PlaybackOutputSnapshot {
             state: PlaybackOutputState::Playing,
             first_video_frame_pending: false,
+            first_frame_needed: false,
+            first_frame_presented: true,
+            initial_av_start_pending: false,
+            output_clock_running: true,
+            audio_start_target_nsecs: None,
+            output_transition_deadline_ms: None,
             rebuffering: false,
             queued_video_frames,
+            recovery_staging_frames: 0,
+            recovery_staging_frame_budget: None,
+            committed_output_high_water_nsecs: None,
+            recovery_staged_high_water_nsecs: None,
+            decode_recovery_audio_ready_latched: false,
+            queued_video_coverage_nsecs: queued_video_forward_nsecs,
             queued_video_duration_nsecs: queued_video_forward_nsecs,
+            queued_video_range_span_nsecs: queued_video_forward_nsecs,
             queued_video_range_nsecs: Some((
                 1_000_000_000,
                 1_000_000_000 + queued_video_forward_nsecs,
@@ -2286,9 +2494,22 @@ mod tests {
         PlaybackOutputSnapshot {
             state: PlaybackOutputState::Syncing,
             first_video_frame_pending: true,
+            first_frame_needed: queued_video_duration_nsecs == 0,
+            first_frame_presented: false,
+            initial_av_start_pending: true,
+            output_clock_running: false,
+            audio_start_target_nsecs: None,
+            output_transition_deadline_ms: None,
             rebuffering: false,
             queued_video_frames: (queued_video_duration_nsecs > 0) as usize,
+            recovery_staging_frames: 0,
+            recovery_staging_frame_budget: None,
+            committed_output_high_water_nsecs: None,
+            recovery_staged_high_water_nsecs: None,
+            decode_recovery_audio_ready_latched: false,
+            queued_video_coverage_nsecs: queued_video_duration_nsecs,
             queued_video_duration_nsecs,
+            queued_video_range_span_nsecs: queued_video_duration_nsecs,
             queued_video_range_nsecs: (queued_video_duration_nsecs > 0)
                 .then_some((1_000_000_000, 1_000_000_000 + queued_video_duration_nsecs)),
             queued_video_forward_nsecs: None,
@@ -2324,15 +2545,20 @@ mod tests {
                     reader_head_available: queued_packets > 0,
                     consumer_drainable: queued_packets > 0,
                     queued_bytes: queued_packets,
+                    reader_nsecs: None,
+                    cached_end_nsecs: None,
+                    target_coverage_nsecs: None,
                     forward_nsecs: None,
                 },
             )
             .collect::<Vec<_>>();
         DemuxPacketQueueSnapshot {
+            cache_generation: 0,
             total_packets: streams.iter().map(|stream| stream.queued_packets).sum(),
             total_bytes: streams.iter().map(|stream| stream.queued_bytes).sum(),
             memory_limit_bytes: 1024 * 1024,
             read_index: 0,
+            exact_seek_target_nsecs: 0,
             streams,
         }
     }

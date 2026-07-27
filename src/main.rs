@@ -1,6 +1,6 @@
 mod logging;
 
 fn main() {
-    logging::init();
+    let _log_guard = logging::init();
     tiny::run();
 }

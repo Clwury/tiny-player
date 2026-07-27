@@ -9,7 +9,7 @@ use crate::player::{
     render_host::{PlaybackSessionId, VideoOutputQueue},
 };
 
-use super::{DemuxPacketCache, FfmpegControl};
+use super::{AudioOutputLifecycle, DemuxPacketCache, FfmpegControl};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PlaybackEofDrainStatus {
@@ -57,6 +57,9 @@ pub(super) fn service_playback_eof_drain(
         context.session_id,
         context.event_tx,
     );
+    context
+        .control
+        .set_audio_output_lifecycle(AudioOutputLifecycle::Draining);
     if let Some(status) = output_drain_status_to_eof(with_output_drain_context(
         &mut context,
         |service, context| service.drain_until_idle(context),

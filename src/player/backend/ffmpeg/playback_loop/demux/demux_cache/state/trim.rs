@@ -780,6 +780,12 @@ impl DemuxPacketCacheState {
             self.low_level_append_blocked_packet_generations
                 .remove(&packet_id);
             if let Some(packet) = self.packets.remove(&packet_id) {
+                range.remove_packet_from_indices(
+                    stream_index,
+                    packet_id,
+                    packet.seek_timestamp_nsecs,
+                    packet.recovery_point,
+                );
                 self.cached_bytes = self.cached_bytes.saturating_sub(packet.byte_len);
                 range.subtract_report_bytes(packet.byte_len);
             }

@@ -11,6 +11,8 @@ use super::{
     DemuxSelectedStreams, PlaybackSessionId, duration_nsecs, nsecs_to_seconds,
 };
 
+const OUTPUT_BACKPRESSURE_PREFETCH_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
 const PLAYBACK_RECOVERY_DEMAND_VIDEO: u8 = 1 << 0;
 const PLAYBACK_RECOVERY_DEMAND_AUDIO: u8 = 1 << 1;
 
@@ -75,6 +77,9 @@ impl DemuxPacketCacheShared {
         let mut logged_prefetch_pause = false;
         let mut prefetch_pause_started_at = None;
         let mut next_prefetch_pause_log_at = None;
+        let mut output_backpressure_pause_started_at = None;
+        let mut next_output_backpressure_log_at = None;
+        let mut output_backpressure_waits = 0u64;
         let mut recovery_yield_started_at = None;
         loop {
             if guard.shutdown || self.control.should_stop() {
@@ -95,7 +100,7 @@ impl DemuxPacketCacheShared {
             if !self.consumer_priority_active() && guard.seekable_summary_preparation_due(now) {
                 let emit =
                     self.prepare_cache_state_emit_for(&mut guard, "prefetch-maintenance", false);
-                self.ready.notify_all();
+                self.notify_ready();
                 drop(guard);
                 self.send_cache_state_emit(emit.into_emit());
                 guard = self
@@ -105,8 +110,37 @@ impl DemuxPacketCacheShared {
                 continue;
             }
 
-            let recovery_demand = self.playback_recovery_demand();
             let recovery_critical = self.playback_recovery_critical();
+            let output_backpressure_paused = self
+                .output_backpressure_prefetch_paused
+                .load(Ordering::Acquire);
+            if output_backpressure_paused && !recovery_critical {
+                let now = Instant::now();
+                let started_at = *output_backpressure_pause_started_at.get_or_insert(now);
+                output_backpressure_waits = output_backpressure_waits.saturating_add(1);
+                if next_output_backpressure_log_at.is_none_or(|deadline| now >= deadline) {
+                    tracing::debug!(
+                        session_id = ?guard.session_id,
+                        pause_ms = now.saturating_duration_since(started_at).as_secs_f64()
+                            * 1000.0,
+                        wait_count = output_backpressure_waits,
+                        cached_bytes = guard.cached_bytes,
+                        packet_count = guard.read_range().global_order.len(),
+                        recovery_critical,
+                        reason = "output_gate_and_decoder_queue_full",
+                        "FFmpeg demux/HTTP prefetch paused by output backpressure"
+                    );
+                    next_output_backpressure_log_at =
+                        now.checked_add(OUTPUT_BACKPRESSURE_PREFETCH_LOG_INTERVAL);
+                }
+                guard = self.wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
+                continue;
+            }
+            output_backpressure_pause_started_at = None;
+            next_output_backpressure_log_at = None;
+            output_backpressure_waits = 0;
+
+            let recovery_demand = self.playback_recovery_demand();
             let any_consumer_drainable = guard.consumer_drainable_packet_available();
             let recovery_demand_drainable = guard.consumer_drainable_for_recovery_demand(
                 recovery_demand.video_required,
@@ -121,11 +155,7 @@ impl DemuxPacketCacheShared {
                 if now.saturating_duration_since(yield_started_at)
                     < DEMUX_PACKET_RECOVERY_YIELD_MAX_WAIT
                 {
-                    let (next_guard, _) = self
-                        .ready
-                        .wait_timeout(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL)
-                        .expect("FFmpeg demux packet cache poisoned");
-                    guard = next_guard;
+                    guard = self.wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
                     continue;
                 }
                 if !guard.should_pause_demux() {
@@ -189,19 +219,11 @@ impl DemuxPacketCacheShared {
                 any_consumer_drainable
             };
             if self.consumer_priority_active() && consumer_priority_drainable {
-                let (next_guard, _) = self
-                    .ready
-                    .wait_timeout(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL)
-                    .expect("FFmpeg demux packet cache poisoned");
-                guard = next_guard;
+                guard = self.wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
                 continue;
             }
             if guard.read_range_eof() || guard.error.is_some() {
-                let (next_guard, _) = self
-                    .ready
-                    .wait_timeout(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL)
-                    .expect("FFmpeg demux packet cache poisoned");
-                guard = next_guard;
+                guard = self.wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
                 continue;
             }
             let should_pause_demux = guard.should_pause_demux();
@@ -265,11 +287,7 @@ impl DemuxPacketCacheShared {
                 next_prefetch_pause_log_at =
                     now.checked_add(DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL);
             }
-            let (next_guard, _) = self
-                .ready
-                .wait_timeout(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL)
-                .expect("FFmpeg demux packet cache poisoned");
-            guard = next_guard;
+            guard = self.wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
         }
     }
 
@@ -340,7 +358,7 @@ impl DemuxPacketCacheShared {
             .swap(demand.bits(), Ordering::AcqRel)
             != demand.bits();
         if critical_changed || demand_changed {
-            self.ready.notify_all();
+            self.notify_ready();
         }
     }
 
@@ -366,6 +384,6 @@ impl DemuxPacketCacheShared {
             .saturating_add(duration_nsecs(DEMUX_CACHE_CONSUMER_PRIORITY_HOLD));
         self.consumer_lock_pressure_until_nanos
             .fetch_max(until, Ordering::AcqRel);
-        self.ready.notify_all();
+        self.notify_ready();
     }
 }

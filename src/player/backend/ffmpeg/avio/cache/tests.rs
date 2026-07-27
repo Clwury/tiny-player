@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+#[path = "tests/buffer.rs"]
+mod buffer;
 #[path = "tests/disk.rs"]
 mod disk;
 #[path = "tests/progress.rs"]

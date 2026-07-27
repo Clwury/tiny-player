@@ -2,7 +2,8 @@ use std::{
     collections::VecDeque,
     os::raw::c_int,
     sync::{
-        Arc,
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver},
     },
     thread::{self, JoinHandle},
@@ -30,7 +31,7 @@ pub(super) struct VideoDecodeWorker {
     decoded_frames: VecDeque<QueuedVideoDecodedFrame>,
     completed_packets: VecDeque<VideoDecodePacketStatus>,
     decoded_frame_queue_capacity: usize,
-    in_flight_packets: usize,
+    submitted_not_consumed_packets: usize,
     flush_generation: Option<u64>,
     flush_command_sent: bool,
     drain_generation: Option<u64>,
@@ -41,8 +42,55 @@ pub(super) struct VideoDecodeWorker {
     draining: bool,
     recovering: bool,
     eof: bool,
+    progress: Arc<VideoDecodeWorkerProgress>,
     shutdown_on_drop: bool,
     join_on_drop: bool,
+}
+
+#[derive(Default)]
+struct VideoDecodeWorkerProgress {
+    submitted_sequence: AtomicU64,
+    result_produced_sequence: AtomicU64,
+    result_consumed_sequence: AtomicU64,
+    last_result_produced_at: Mutex<Option<Instant>>,
+}
+
+impl VideoDecodeWorkerProgress {
+    fn record_submitted(&self) {
+        self.submitted_sequence.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn record_result_produced(&self) {
+        self.result_produced_sequence.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut last_result_produced_at) = self.last_result_produced_at.lock() {
+            *last_result_produced_at = Some(Instant::now());
+        }
+    }
+
+    fn record_result_consumed(&self) {
+        self.result_consumed_sequence.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn snapshot(&self) -> VideoDecodeWorkerProgressSnapshot {
+        VideoDecodeWorkerProgressSnapshot {
+            submitted_sequence: self.submitted_sequence.load(Ordering::Acquire),
+            result_produced_sequence: self.result_produced_sequence.load(Ordering::Acquire),
+            result_consumed_sequence: self.result_consumed_sequence.load(Ordering::Acquire),
+            last_result_produced_at: self
+                .last_result_produced_at
+                .lock()
+                .ok()
+                .and_then(|last_result_produced_at| *last_result_produced_at),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VideoDecodeWorkerProgressSnapshot {
+    submitted_sequence: u64,
+    result_produced_sequence: u64,
+    result_consumed_sequence: u64,
+    last_result_produced_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -79,9 +127,34 @@ pub(super) struct VideoDecodeWorkerSnapshot {
     pub(super) queue_capacity: usize,
     pub(super) pending_input_packets: usize,
     pub(super) pending_input_capacity: usize,
-    pub(super) in_flight_packets: usize,
+    pub(super) submitted_not_consumed_packets: usize,
     pub(super) command_queue_capacity: usize,
     pub(super) completed_packets: usize,
+    pub(super) submitted_sequence: u64,
+    pub(super) result_produced_sequence: u64,
+    pub(super) result_consumed_sequence: u64,
+    pub(super) last_result_produced_at: Option<Instant>,
+    pub(super) oldest_submitted_packet_nsecs: Option<u64>,
+}
+
+impl Default for VideoDecodeWorkerSnapshot {
+    fn default() -> Self {
+        Self {
+            state: VideoDecodeWorkerState::NeedPacket,
+            queued_frames: 0,
+            queue_capacity: 0,
+            pending_input_packets: 0,
+            pending_input_capacity: 0,
+            submitted_not_consumed_packets: 0,
+            command_queue_capacity: 0,
+            completed_packets: 0,
+            submitted_sequence: 0,
+            result_produced_sequence: 0,
+            result_consumed_sequence: 0,
+            last_result_produced_at: None,
+            oldest_submitted_packet_nsecs: None,
+        }
+    }
 }
 
 impl VideoDecodeWorkerSnapshot {
@@ -181,9 +254,11 @@ impl VideoDecodeWorker {
         let result_queue_capacity =
             decoded_frame_queue_capacity.saturating_add(VIDEO_DECODE_COMMAND_QUEUE_CAPACITY);
         let (result_tx, result_rx) = mpsc::sync_channel(result_queue_capacity);
+        let progress = Arc::new(VideoDecodeWorkerProgress::default());
+        let worker_progress = Arc::clone(&progress);
         let handle = thread::Builder::new()
             .name("tiny-ffmpeg-video-decode".to_string())
-            .spawn(move || run_video_decode_worker(decoder, command_rx, result_tx))
+            .spawn(move || run_video_decode_worker(decoder, command_rx, result_tx, worker_progress))
             .map_err(|error| format!("创建 FFmpeg video decode worker 失败：{error}"))?;
 
         Ok(Self {
@@ -194,7 +269,7 @@ impl VideoDecodeWorker {
             decoded_frames: VecDeque::new(),
             completed_packets: VecDeque::new(),
             decoded_frame_queue_capacity,
-            in_flight_packets: 0,
+            submitted_not_consumed_packets: 0,
             flush_generation: None,
             flush_command_sent: false,
             drain_generation: None,
@@ -205,6 +280,7 @@ impl VideoDecodeWorker {
             draining: false,
             recovering: false,
             eof: false,
+            progress,
             shutdown_on_drop: true,
             join_on_drop: true,
         })
@@ -214,10 +290,72 @@ impl VideoDecodeWorker {
         &self.info
     }
 
-    pub(super) fn detach_without_join(&mut self) {
+    pub(super) fn shutdown_and_join(
+        &mut self,
+        timeout: Duration,
+    ) -> std::result::Result<(), String> {
+        if self.handle.is_none() {
+            self.shutdown_on_drop = false;
+            self.join_on_drop = false;
+            return Ok(());
+        }
+
+        let started_at = Instant::now();
+        loop {
+            match self.command_tx.try_send(VideoDecodeCommand::Shutdown) {
+                Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => break,
+                Err(mpsc::TrySendError::Full(_)) => {
+                    self.discard_results_for_retirement();
+                    if started_at.elapsed() >= timeout {
+                        return Err(format!(
+                            "old FFmpeg video decoder worker command queue stayed full for {:.0}ms during retirement",
+                            timeout.as_secs_f64() * 1_000.0
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+
+        // Once Shutdown is queued, keep draining the bounded result channel so
+        // the worker cannot deadlock while publishing the last frame/status in
+        // front of the shutdown command.
         self.shutdown_on_drop = false;
-        self.join_on_drop = false;
-        self.handle.take();
+        loop {
+            self.discard_results_for_retirement();
+            if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+                let joined = self
+                    .handle
+                    .take()
+                    .expect("finished video decoder worker handle exists")
+                    .join()
+                    .is_ok();
+                self.join_on_drop = false;
+                self.discard_results_for_retirement();
+                return joined.then_some(()).ok_or_else(|| {
+                    "old FFmpeg video decoder worker panicked during retirement".to_string()
+                });
+            }
+            if started_at.elapsed() >= timeout {
+                // Retain the handle so a subsequent bounded fallback can retry
+                // and must not mistake a detached worker for completed teardown.
+                self.join_on_drop = false;
+                return Err(format!(
+                    "old FFmpeg video decoder worker did not retire within {:.0}ms",
+                    timeout.as_secs_f64() * 1_000.0
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn discard_results_for_retirement(&mut self) {
+        while self.result_rx.try_recv().is_ok() {}
+        self.decoded_frames.clear();
+        self.completed_packets.clear();
+        self.drain_frames.clear();
+        self.completed_drains.clear();
+        self.submitted_not_consumed_packets = 0;
     }
 
     pub(super) fn set_skip_nonref_frames(
@@ -229,15 +367,21 @@ impl VideoDecodeWorker {
     }
 
     pub(super) fn snapshot(&self) -> VideoDecodeWorkerSnapshot {
+        let progress = self.progress.snapshot();
         VideoDecodeWorkerSnapshot {
             state: self.state(),
             queued_frames: self.decoded_frames.len(),
             queue_capacity: self.decoded_frame_queue_capacity,
             pending_input_packets: 0,
             pending_input_capacity: 0,
-            in_flight_packets: self.in_flight_packets,
+            submitted_not_consumed_packets: self.submitted_not_consumed_packets,
             command_queue_capacity: VIDEO_DECODE_COMMAND_QUEUE_CAPACITY,
             completed_packets: self.completed_packets.len(),
+            submitted_sequence: progress.submitted_sequence,
+            result_produced_sequence: progress.result_produced_sequence,
+            result_consumed_sequence: progress.result_consumed_sequence,
+            last_result_produced_at: progress.last_result_produced_at,
+            oldest_submitted_packet_nsecs: None,
         }
     }
 
@@ -265,7 +409,9 @@ impl VideoDecodeWorker {
             .try_send(VideoDecodeCommand::Decode { generation, packet })
         {
             Ok(()) => {
-                self.in_flight_packets = self.in_flight_packets.saturating_add(1);
+                self.submitted_not_consumed_packets =
+                    self.submitted_not_consumed_packets.saturating_add(1);
+                self.progress.record_submitted();
                 self.eof = false;
                 Ok(VideoDecodeEnqueueResult::Queued)
             }
@@ -409,7 +555,8 @@ impl VideoDecodeWorker {
             {
                 Ok(()) => {
                     self.drain_command_sent = true;
-                    self.in_flight_packets = self.in_flight_packets.saturating_add(1);
+                    self.submitted_not_consumed_packets =
+                        self.submitted_not_consumed_packets.saturating_add(1);
                 }
                 Err(mpsc::TrySendError::Full(_)) => {}
                 Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -435,12 +582,13 @@ impl VideoDecodeWorker {
     }
 
     fn record_result(&mut self, result: VideoDecodeResult) {
+        self.progress.record_result_consumed();
         if self.recovering {
             match result {
                 VideoDecodeResult::Flushed { generation }
                     if self.flush_generation == Some(generation) =>
                 {
-                    self.in_flight_packets = 0;
+                    self.submitted_not_consumed_packets = 0;
                     self.recovering = false;
                     self.draining = false;
                     self.flush_generation = None;
@@ -453,7 +601,8 @@ impl VideoDecodeWorker {
                     self.completed_drains.clear();
                 }
                 VideoDecodeResult::PacketDone { .. } | VideoDecodeResult::Drained { .. } => {
-                    self.in_flight_packets = self.in_flight_packets.saturating_sub(1);
+                    self.submitted_not_consumed_packets =
+                        self.submitted_not_consumed_packets.saturating_sub(1);
                 }
                 VideoDecodeResult::Frame { .. } | VideoDecodeResult::Flushed { .. } => {}
             }
@@ -474,7 +623,8 @@ impl VideoDecodeWorker {
                 decoded_frames,
                 elapsed,
             } => {
-                self.in_flight_packets = self.in_flight_packets.saturating_sub(1);
+                self.submitted_not_consumed_packets =
+                    self.submitted_not_consumed_packets.saturating_sub(1);
                 self.completed_packets.push_back(VideoDecodePacketStatus {
                     generation,
                     result,
@@ -484,7 +634,8 @@ impl VideoDecodeWorker {
                 });
             }
             VideoDecodeResult::Drained { generation, result } => {
-                self.in_flight_packets = self.in_flight_packets.saturating_sub(1);
+                self.submitted_not_consumed_packets =
+                    self.submitted_not_consumed_packets.saturating_sub(1);
                 self.draining = false;
                 self.drain_generation = None;
                 self.drain_command_sent = false;
@@ -499,7 +650,7 @@ impl VideoDecodeWorker {
                     });
             }
             VideoDecodeResult::Flushed { .. } => {
-                self.in_flight_packets = 0;
+                self.submitted_not_consumed_packets = 0;
                 self.recovering = false;
                 self.draining = false;
                 self.eof = false;
@@ -528,13 +679,16 @@ impl VideoDecodeWorker {
             VideoDecodeWorkerState::Recovering
         } else if self.draining {
             VideoDecodeWorkerState::Draining
-        } else if self.eof && self.decoded_frames.is_empty() && self.in_flight_packets == 0 {
+        } else if self.eof
+            && self.decoded_frames.is_empty()
+            && self.submitted_not_consumed_packets == 0
+        {
             VideoDecodeWorkerState::Eof
         } else if self.decoded_frames.len() >= self.decoded_frame_queue_capacity {
             VideoDecodeWorkerState::OutputFull
         } else if !self.decoded_frames.is_empty() {
             VideoDecodeWorkerState::HaveFrame
-        } else if self.in_flight_packets > 0 {
+        } else if self.submitted_not_consumed_packets > 0 {
             VideoDecodeWorkerState::Decoding
         } else {
             VideoDecodeWorkerState::NeedPacket
@@ -565,6 +719,7 @@ fn run_video_decode_worker(
     decoder: Decoder,
     command_rx: mpsc::Receiver<VideoDecodeCommand>,
     result_tx: mpsc::SyncSender<VideoDecodeResult>,
+    progress: Arc<VideoDecodeWorkerProgress>,
 ) {
     let mut frame = match AvFrame::new() {
         Ok(frame) => frame,
@@ -595,6 +750,7 @@ fn run_video_decode_worker(
                     let frame =
                         FfmpegFrameRef::new_ref(frame).map_err(|error| error.to_string())?;
                     let send_started_at = Instant::now();
+                    progress.record_result_produced();
                     let send_result = result_tx.send(VideoDecodeResult::Frame {
                         generation,
                         frame: VideoDecodedFrame { frame },
@@ -607,6 +763,7 @@ fn run_video_decode_worker(
                 let decode_elapsed = total_elapsed.saturating_sub(frame_send_elapsed);
                 let result_ok = result.is_ok();
                 let packet_done_send_started_at = Instant::now();
+                progress.record_result_produced();
                 let packet_done_send_result = result_tx.send(VideoDecodeResult::PacketDone {
                     generation,
                     result,
@@ -636,6 +793,7 @@ fn run_video_decode_worker(
                 let flush_elapsed = started.elapsed();
                 frame.unref();
                 let send_started_at = Instant::now();
+                progress.record_result_produced();
                 let send_result = result_tx.send(VideoDecodeResult::Flushed { generation });
                 let send_elapsed = send_started_at.elapsed();
                 log_video_decode_worker_control_timing(
@@ -656,6 +814,7 @@ fn run_video_decode_worker(
                     let frame =
                         FfmpegFrameRef::new_ref(frame).map_err(|error| error.to_string())?;
                     let send_started_at = Instant::now();
+                    progress.record_result_produced();
                     let send_result = result_tx.send(VideoDecodeResult::Frame {
                         generation,
                         frame: VideoDecodedFrame { frame },
@@ -667,6 +826,7 @@ fn run_video_decode_worker(
                 let total_elapsed = started.elapsed();
                 let flush_elapsed = total_elapsed.saturating_sub(frame_send_elapsed);
                 let send_started_at = Instant::now();
+                progress.record_result_produced();
                 let send_result = result_tx.send(VideoDecodeResult::Drained { generation, result });
                 let send_elapsed = send_started_at.elapsed();
                 log_video_decode_worker_drain_timing(
@@ -852,7 +1012,7 @@ fn log_video_decode_worker_drain_timing(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, os::raw::c_int, sync::mpsc, time::Duration};
+    use std::{collections::VecDeque, os::raw::c_int, sync::mpsc, thread, time::Duration};
 
     use ffmpeg_sys_next as ffi;
 
@@ -898,7 +1058,7 @@ mod tests {
                 decoded_frames: VecDeque::new(),
                 completed_packets: VecDeque::new(),
                 decoded_frame_queue_capacity: SOFTWARE_DECODED_VIDEO_QUEUE_CAPACITY,
-                in_flight_packets: 0,
+                submitted_not_consumed_packets: 0,
                 flush_generation: None,
                 flush_command_sent: false,
                 drain_generation: None,
@@ -909,6 +1069,7 @@ mod tests {
                 draining: false,
                 recovering: false,
                 eof: false,
+                progress: Default::default(),
                 shutdown_on_drop: true,
                 join_on_drop: true,
             },
@@ -960,7 +1121,7 @@ mod tests {
     fn service_pumps_recovery_after_tracked_packets_are_cleared() {
         let (mut worker, result_tx, _command_rx) = test_worker_with_command_rx();
         let generation = 9;
-        worker.in_flight_packets = 1;
+        worker.submitted_not_consumed_packets = 1;
         worker.flush_buffers(generation).unwrap();
 
         assert_eq!(worker.snapshot().state, VideoDecodeWorkerState::Recovering);
@@ -977,7 +1138,7 @@ mod tests {
 
         let snapshot = worker.snapshot();
         assert_eq!(snapshot.state, VideoDecodeWorkerState::Recovering);
-        assert_eq!(snapshot.in_flight_packets, 0);
+        assert_eq!(snapshot.submitted_not_consumed_packets, 0);
 
         result_tx
             .send(VideoDecodeResult::Flushed { generation })
@@ -986,7 +1147,7 @@ mod tests {
 
         let snapshot = worker.snapshot();
         assert_eq!(snapshot.state, VideoDecodeWorkerState::NeedPacket);
-        assert_eq!(snapshot.in_flight_packets, 0);
+        assert_eq!(snapshot.submitted_not_consumed_packets, 0);
     }
 
     #[test]
@@ -1000,5 +1161,50 @@ mod tests {
             VideoDecodeCommand::SetSkipNonref(false)
         ));
         assert_eq!(worker.pending_skip_nonref, None);
+    }
+
+    #[test]
+    fn retirement_waits_for_command_capacity_and_joins_worker() {
+        let (mut worker, _result_tx, command_rx) = test_worker_with_command_rx();
+        worker
+            .command_tx
+            .try_send(VideoDecodeCommand::SetSkipNonref(true))
+            .expect("fill command queue");
+        worker.handle = Some(thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            assert!(matches!(
+                command_rx.recv().expect("queued control command"),
+                VideoDecodeCommand::SetSkipNonref(true)
+            ));
+            assert!(matches!(
+                command_rx.recv().expect("shutdown command"),
+                VideoDecodeCommand::Shutdown
+            ));
+        }));
+
+        worker
+            .shutdown_and_join(Duration::from_millis(200))
+            .expect("bounded retirement succeeds after queue drains");
+        assert!(worker.handle.is_none());
+    }
+
+    #[test]
+    fn retirement_timeout_keeps_handle_for_verified_retry() {
+        let (mut worker, _result_tx, command_rx) = test_worker_with_command_rx();
+        worker.handle = Some(thread::spawn(move || {
+            assert!(matches!(
+                command_rx.recv().expect("shutdown command"),
+                VideoDecodeCommand::Shutdown
+            ));
+            thread::sleep(Duration::from_millis(30));
+        }));
+
+        assert!(worker.shutdown_and_join(Duration::from_millis(1)).is_err());
+        assert!(worker.handle.is_some());
+        thread::sleep(Duration::from_millis(40));
+        worker
+            .shutdown_and_join(Duration::from_millis(100))
+            .expect("second retirement call verifies worker exit");
+        assert!(worker.handle.is_none());
     }
 }

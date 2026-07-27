@@ -52,9 +52,9 @@ pub(super) unsafe extern "C" fn cached_avio_read_packet(
             tracing::debug!(
                 read_pos = reader.read_pos,
                 requested = output.len(),
-                "cached FFmpeg AVIO read interrupted"
+                "cached FFmpeg AVIO read interrupted during shutdown"
             );
-            ffi::AVERROR(ffi::EIO)
+            ffi::AVERROR_EXIT
         }
         CacheReadResult::Error(error) => {
             tracing::warn!(%error, "cached FFmpeg AVIO read failed");
@@ -120,4 +120,88 @@ pub(super) unsafe extern "C" fn cached_avio_seek(
     );
     reader.cache.note_reader_offset(next, range_kind);
     i64::try_from(next).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::{c_int, c_void},
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
+    use ffmpeg_sys_next as ffi;
+
+    use super::super::{HttpRingCache, HttpRingCacheState};
+    use super::{CachedAvioReader, cached_avio_read_packet};
+
+    #[test]
+    fn pending_cached_seek_does_not_inject_eio_from_avio_callback() {
+        let cache = HttpRingCache::from_state_for_test(
+            HttpRingCacheState::new(0).with_content_len_hint(Some(1_000)),
+        );
+        let control = cache.control_for_test();
+        let reader = Box::into_raw(Box::new(CachedAvioReader {
+            cache: cache.clone(),
+            read_pos: 0,
+        }));
+        let reader_address = reader as usize;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let callback = thread::spawn(move || {
+            let mut output = [0_u8; 1];
+            started_tx
+                .send(())
+                .expect("AVIO callback start signal sends");
+            let result = unsafe {
+                cached_avio_read_packet(
+                    reader_address as *mut c_void,
+                    output.as_mut_ptr(),
+                    output.len() as i32,
+                )
+            };
+            result_tx
+                .send((result, output))
+                .expect("AVIO callback result signal sends");
+        });
+        started_rx.recv().expect("AVIO callback starts");
+
+        let seek_generation = control.request_seek();
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "pending cached seek must leave the FFmpeg AVIO callback blocked"
+        );
+
+        control.finish_seek(seek_generation);
+        let _ = cache.shared_for_download_test().append_or_restart(0, b"x");
+        let (result, output) = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cached byte wakes the FFmpeg AVIO callback");
+        assert_eq!(result, 1);
+        assert_ne!(result, ffi::AVERROR(ffi::EIO));
+        assert_eq!(output, *b"x");
+
+        callback.join().expect("AVIO callback thread joins");
+        unsafe { drop(Box::from_raw(reader)) };
+    }
+
+    #[test]
+    fn shutdown_interrupt_returns_ffmpeg_exit_instead_of_io_error() {
+        let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new(0));
+        cache.control_for_test().shutdown();
+        let mut reader = Box::new(CachedAvioReader { cache, read_pos: 0 });
+        let mut output = [0_u8; 1];
+
+        let result = unsafe {
+            cached_avio_read_packet(
+                (&mut *reader as *mut CachedAvioReader).cast::<c_void>(),
+                output.as_mut_ptr(),
+                output.len() as c_int,
+            )
+        };
+
+        assert_eq!(result, ffi::AVERROR_EXIT);
+        assert_ne!(result, ffi::AVERROR(ffi::EIO));
+    }
 }

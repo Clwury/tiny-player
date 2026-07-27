@@ -45,6 +45,19 @@ pub(super) struct SubtitleDecodeContext {
 }
 
 impl SubtitlePipeline {
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn empty_for_test() -> Self {
+        Self {
+            stream: None,
+            worker: None,
+            packets: SubtitleDecodePacketQueues::default(),
+            external_cues: Vec::new(),
+            cues: VecDeque::new(),
+            active: None,
+            needs_prefetch: false,
+        }
+    }
+
     pub(super) fn new(
         stream: Option<StreamInfo>,
         decoder: Option<Decoder>,

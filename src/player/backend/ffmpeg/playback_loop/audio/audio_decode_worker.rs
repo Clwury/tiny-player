@@ -49,6 +49,7 @@ pub(super) struct AudioDecodeWorkerInfo {
 }
 
 pub(super) struct AudioDecodePacketResult {
+    pub(super) generation: u64,
     pub(super) frames: Vec<AudioDecodedFrame>,
     pub(super) result: std::result::Result<(), String>,
     pub(super) decoded_frames: u64,
@@ -299,6 +300,14 @@ impl AudioDecodeWorker {
         Ok(Some(queued.frame))
     }
 
+    pub(super) fn take_decoded_frames_for_realign(&mut self) -> Vec<(u64, AudioDecodedFrame)> {
+        self.decoded_duration_nsecs = 0;
+        std::mem::take(&mut self.decoded_frames)
+            .into_iter()
+            .map(|queued| (queued.generation, queued.frame))
+            .collect()
+    }
+
     pub(super) fn decoded_frame_timings(
         &mut self,
     ) -> std::result::Result<Vec<AudioDecodedFrameTiming>, String> {
@@ -507,6 +516,7 @@ impl AudioDecodeWorker {
                     .push_back(QueuedAudioDecodeDrainResult {
                         generation,
                         result: AudioDecodePacketResult {
+                            generation,
                             frames,
                             result,
                             decoded_frames,
@@ -535,9 +545,10 @@ impl AudioDecodeWorker {
     }
 
     fn queue_decoded_frame(&mut self, generation: u64, frame: AudioDecodedFrame) {
-        if self.output_full() {
-            return;
-        }
+        // The duration limit is an input throttle, not a lossy queue capacity.
+        // Commands already in flight can legitimately produce frames after the
+        // limit is crossed; retain those frames and let `OutputFull` stop new
+        // packet admission instead of discarding decoded audio.
         self.decoded_duration_nsecs = self
             .decoded_duration_nsecs
             .saturating_add(frame.audio.duration_nsecs);
@@ -692,7 +703,7 @@ mod tests {
     use super::{
         AUDIO_DECODE_QUEUE_LIMIT_DURATION, AudioDecodeCommand, AudioDecodeEnqueueResult,
         AudioDecodeResult, AudioDecodeWorker, AudioDecodeWorkerInfo, AudioDecodeWorkerState,
-        AvPacket, duration_nsecs,
+        AudioDecodedFrame, AvPacket, DecodedAudio, duration_nsecs,
     };
 
     fn worker_for_test() -> AudioDecodeWorker {
@@ -846,5 +857,57 @@ mod tests {
 
         assert!(worker.output_full());
         assert_eq!(worker.state(), AudioDecodeWorkerState::OutputFull);
+    }
+
+    #[test]
+    fn decoded_frames_already_in_flight_are_retained_past_soft_limit() {
+        let mut worker = worker_for_test();
+        worker.decoded_duration_nsecs = duration_nsecs(AUDIO_DECODE_QUEUE_LIMIT_DURATION);
+
+        worker.queue_decoded_frame(
+            7,
+            AudioDecodedFrame {
+                raw_timestamp: 2_905,
+                audio: DecodedAudio {
+                    samples: vec![0.0; 4],
+                    duration_nsecs: 21_333_333,
+                },
+            },
+        );
+
+        assert_eq!(worker.decoded_frames.len(), 1);
+        assert_eq!(worker.decoded_frames.front().unwrap().generation, 7);
+        assert_eq!(
+            worker.decoded_frames.front().unwrap().frame.raw_timestamp,
+            2_905
+        );
+        assert_eq!(worker.state(), AudioDecodeWorkerState::OutputFull);
+    }
+
+    #[test]
+    fn realign_moves_all_queued_audio_frames_into_transactional_retention() {
+        let mut worker = worker_for_test();
+        for (generation, raw_timestamp) in [(7, 2_905), (8, 2_926)] {
+            worker.queue_decoded_frame(
+                generation,
+                AudioDecodedFrame {
+                    raw_timestamp,
+                    audio: DecodedAudio {
+                        samples: vec![0.0; 4],
+                        duration_nsecs: 21_333_333,
+                    },
+                },
+            );
+        }
+
+        let retained = worker.take_decoded_frames_for_realign();
+
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].0, 7);
+        assert_eq!(retained[0].1.raw_timestamp, 2_905);
+        assert_eq!(retained[1].0, 8);
+        assert_eq!(retained[1].1.raw_timestamp, 2_926);
+        assert!(worker.decoded_frames.is_empty());
+        assert_eq!(worker.decoded_duration_nsecs, 0);
     }
 }

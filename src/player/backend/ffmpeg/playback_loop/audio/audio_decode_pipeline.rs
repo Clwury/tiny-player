@@ -5,7 +5,10 @@ use super::audio_decode_worker::{
 use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
 use super::decoder_packet_queue::DecoderPacketQueues;
 use super::pending_audio_queue::matching_audio_timeline_gap;
-use std::os::raw::c_int;
+use std::{
+    os::raw::c_int,
+    time::{Duration, Instant},
+};
 
 use crate::player::render_host::PlaybackSessionId;
 
@@ -15,6 +18,112 @@ use super::{
 };
 
 const AUDIO_DECODE_PENDING_INPUT_QUEUE_CAPACITY: usize = 16;
+const AUDIO_DECODE_BACKPRESSURE_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AudioDecodeBackpressureObservation {
+    enqueue_result: AudioDecodeEnqueueResult,
+    blocked_on: PlaybackBlockReason,
+    worker_state: AudioDecodeWorkerState,
+    pending_input_full: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AudioDecodeBackpressureLogState {
+    observation: AudioDecodeBackpressureObservation,
+    started_at: Instant,
+    last_logged_at: Instant,
+    total_observations: u64,
+    suppressed_repeats: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioDecodeBackpressureLogDecision {
+    Changed {
+        suppressed_repeats: u64,
+        total_observations: u64,
+    },
+    Summary {
+        suppressed_repeats: u64,
+        total_observations: u64,
+    },
+    Suppressed,
+}
+
+fn observe_audio_decode_backpressure_log(
+    state: &mut Option<AudioDecodeBackpressureLogState>,
+    observation: AudioDecodeBackpressureObservation,
+    now: Instant,
+) -> AudioDecodeBackpressureLogDecision {
+    let Some(current) = state.as_mut() else {
+        *state = Some(AudioDecodeBackpressureLogState {
+            observation,
+            started_at: now,
+            last_logged_at: now,
+            total_observations: 1,
+            suppressed_repeats: 0,
+        });
+        return AudioDecodeBackpressureLogDecision::Changed {
+            suppressed_repeats: 0,
+            total_observations: 1,
+        };
+    };
+
+    if current.observation != observation {
+        let suppressed_repeats = current.suppressed_repeats;
+        *current = AudioDecodeBackpressureLogState {
+            observation,
+            started_at: now,
+            last_logged_at: now,
+            total_observations: 1,
+            suppressed_repeats: 0,
+        };
+        return AudioDecodeBackpressureLogDecision::Changed {
+            suppressed_repeats,
+            total_observations: 1,
+        };
+    }
+
+    current.total_observations = current.total_observations.saturating_add(1);
+    current.suppressed_repeats = current.suppressed_repeats.saturating_add(1);
+    if now.saturating_duration_since(current.last_logged_at)
+        >= AUDIO_DECODE_BACKPRESSURE_LOG_INTERVAL
+    {
+        let suppressed_repeats = current.suppressed_repeats;
+        current.suppressed_repeats = 0;
+        current.last_logged_at = now;
+        AudioDecodeBackpressureLogDecision::Summary {
+            suppressed_repeats,
+            total_observations: current.total_observations,
+        }
+    } else {
+        AudioDecodeBackpressureLogDecision::Suppressed
+    }
+}
+
+fn take_deferred_output_frame(
+    slot: &mut Option<(u64, AudioDecodedFrame)>,
+    generation: u64,
+) -> Option<AudioDecodedFrame> {
+    slot.as_ref()
+        .is_some_and(|(deferred_generation, _)| *deferred_generation == generation)
+        .then(|| slot.take().map(|(_, frame)| frame))
+        .flatten()
+}
+
+fn retain_deferred_output_frame(
+    slot: &mut Option<(u64, AudioDecodedFrame)>,
+    generation: u64,
+    frame: AudioDecodedFrame,
+) -> std::result::Result<(), String> {
+    if slot.is_some() {
+        return Err(
+            "FFmpeg audio decode pipeline already retains a deferred output frame".to_string(),
+        );
+    }
+    *slot = Some((generation, frame));
+    Ok(())
+}
 
 pub(super) struct PendingAudioDecodePacket {
     pub(super) generation: u64,
@@ -24,6 +133,8 @@ pub(super) struct PendingAudioDecodePacket {
 pub(super) struct AudioDecodePipeline {
     worker: AudioDecodeWorker,
     packets: AudioDecodePacketQueues,
+    deferred_output_frame: Option<(u64, AudioDecodedFrame)>,
+    backpressure_log_state: Option<AudioDecodeBackpressureLogState>,
 }
 
 impl AudioDecodePipeline {
@@ -35,6 +146,8 @@ impl AudioDecodePipeline {
         Ok(Self {
             worker: AudioDecodeWorker::spawn(decoder, output_rate, output_channels)?,
             packets: AudioDecodePacketQueues::default(),
+            deferred_output_frame: None,
+            backpressure_log_state: None,
         })
     }
 
@@ -46,6 +159,13 @@ impl AudioDecodePipeline {
         let mut snapshot = self.worker.snapshot();
         snapshot.pending_input_packets = self.packets.pending_input_count();
         snapshot.pending_input_capacity = self.packets.pending_input_capacity();
+        if let Some((_, frame)) = self.deferred_output_frame.as_ref() {
+            snapshot.state = AudioDecodeWorkerState::OutputFull;
+            snapshot.queued_frames = snapshot.queued_frames.saturating_add(1);
+            snapshot.queued_duration_nsecs = snapshot
+                .queued_duration_nsecs
+                .saturating_add(frame.audio.duration_nsecs);
+        }
         snapshot
     }
 
@@ -72,7 +192,7 @@ impl AudioDecodePipeline {
         pending_packet: PendingAudioDecodePacket,
         session_id: PlaybackSessionId,
     ) -> std::result::Result<DecodePacketAdmissionStatus, String> {
-        if self.packets.has_pending_input() {
+        if self.deferred_output_frame.is_some() || self.packets.has_pending_input() {
             return Ok(self.buffer_pending_input_or_backpressure(pending_packet, session_id));
         }
         let enqueue_result = self
@@ -81,6 +201,7 @@ impl AudioDecodePipeline {
         match enqueue_result {
             AudioDecodeEnqueueResult::Queued => {
                 self.push_in_flight(pending_packet);
+                self.clear_backpressure_log_if_recovered(session_id);
                 Ok(DecodePacketAdmissionStatus::Queued)
             }
             AudioDecodeEnqueueResult::InputFull | AudioDecodeEnqueueResult::OutputFull => {
@@ -94,6 +215,9 @@ impl AudioDecodePipeline {
         session_id: PlaybackSessionId,
     ) -> std::result::Result<DecodeInputRetryStatus, String> {
         self.worker.service()?;
+        if self.deferred_output_frame.is_some() {
+            return Ok(DecodeInputRetryStatus::Backpressured);
+        }
         let Some(pending_packet) = self.take_pending_input() else {
             return Ok(DecodeInputRetryStatus::Idle);
         };
@@ -103,6 +227,7 @@ impl AudioDecodePipeline {
         match enqueue_result {
             AudioDecodeEnqueueResult::Queued => {
                 self.push_in_flight(pending_packet);
+                self.clear_backpressure_log_if_recovered(session_id);
                 Ok(DecodeInputRetryStatus::Queued)
             }
             AudioDecodeEnqueueResult::InputFull | AudioDecodeEnqueueResult::OutputFull => {
@@ -145,7 +270,7 @@ impl AudioDecodePipeline {
     }
 
     fn log_pending_input_backpressured(
-        &self,
+        &mut self,
         session_id: PlaybackSessionId,
         enqueue_result: AudioDecodeEnqueueResult,
     ) {
@@ -155,8 +280,32 @@ impl AudioDecodePipeline {
             AudioDecodeEnqueueResult::OutputFull => PlaybackBlockReason::DecodedQueueFull,
             AudioDecodeEnqueueResult::Queued => PlaybackBlockReason::OutputGate,
         });
+        let decision = observe_audio_decode_backpressure_log(
+            &mut self.backpressure_log_state,
+            AudioDecodeBackpressureObservation {
+                enqueue_result,
+                blocked_on,
+                worker_state: snapshot.state,
+                pending_input_full: snapshot.pending_input_full(),
+            },
+            Instant::now(),
+        );
+        let (state_changed, suppressed_repeats, total_backpressure_observations) = match decision {
+            AudioDecodeBackpressureLogDecision::Changed {
+                suppressed_repeats,
+                total_observations,
+            } => (true, suppressed_repeats, total_observations),
+            AudioDecodeBackpressureLogDecision::Summary {
+                suppressed_repeats,
+                total_observations,
+            } => (false, suppressed_repeats, total_observations),
+            AudioDecodeBackpressureLogDecision::Suppressed => return,
+        };
         tracing::debug!(
             session_id = ?session_id,
+            state_changed,
+            suppressed_repeats,
+            total_backpressure_observations,
             blocked_on = blocked_on.as_str(),
             output_rate = self.info().output_rate,
             output_channels = self.info().output_channels,
@@ -182,6 +331,31 @@ impl AudioDecodePipeline {
         );
     }
 
+    fn clear_backpressure_log_if_recovered(&mut self, session_id: PlaybackSessionId) {
+        let snapshot = self.snapshot();
+        let pressure_cleared = snapshot.pending_input_packets == 0
+            && !snapshot.pending_input_full()
+            && snapshot.state != AudioDecodeWorkerState::OutputFull
+            && snapshot.in_flight_packets < snapshot.command_queue_capacity;
+        if !pressure_cleared {
+            return;
+        }
+        let Some(state) = self.backpressure_log_state.take() else {
+            return;
+        };
+        tracing::debug!(
+            session_id = ?session_id,
+            state_changed = true,
+            backpressure_elapsed_ms = state.started_at.elapsed().as_secs_f64() * 1000.0,
+            total_backpressure_observations = state.total_observations,
+            suppressed_repeats = state.suppressed_repeats,
+            audio_decode_state = ?snapshot.state,
+            audio_decode_pending_input_packets = snapshot.pending_input_packets,
+            audio_decode_in_flight_packets = snapshot.in_flight_packets,
+            "FFmpeg audio decoder wrapper input queue backpressure cleared"
+        );
+    }
+
     pub(super) fn admit_demux_packet(
         &mut self,
         packet: &AvPacket,
@@ -200,7 +374,32 @@ impl AudioDecodePipeline {
         &mut self,
         generation: u64,
     ) -> std::result::Result<Option<AudioDecodedFrame>, String> {
+        if let Some(frame) = take_deferred_output_frame(&mut self.deferred_output_frame, generation)
+        {
+            return Ok(Some(frame));
+        }
         self.worker.poll_frame(generation)
+    }
+
+    pub(super) fn defer_output_frame(
+        &mut self,
+        generation: u64,
+        frame: AudioDecodedFrame,
+    ) -> std::result::Result<(), String> {
+        retain_deferred_output_frame(&mut self.deferred_output_frame, generation, frame)
+    }
+
+    pub(super) fn has_deferred_output_frame(&self) -> bool {
+        self.deferred_output_frame.is_some()
+    }
+
+    pub(super) fn take_output_frames_for_realign(&mut self) -> Vec<(u64, AudioDecodedFrame)> {
+        let mut frames = Vec::new();
+        if let Some(frame) = self.deferred_output_frame.take() {
+            frames.push(frame);
+        }
+        frames.extend(self.worker.take_decoded_frames_for_realign());
+        frames
     }
 
     pub(super) fn decoded_timeline_gap_near(
@@ -214,7 +413,14 @@ impl AudioDecodePipeline {
         let mut preview_clock = audio_clock.clone();
         let initial_previous_end_nsecs = preview_clock.last_contiguous_end_nsecs();
         let audio_time_base = self.info().time_base;
-        let timings = self.worker.decoded_frame_timings()?;
+        let mut timings = Vec::new();
+        if let Some((_, deferred)) = self.deferred_output_frame.as_ref() {
+            timings.push(super::audio_decode_worker::AudioDecodedFrameTiming {
+                raw_timestamp: deferred.raw_timestamp,
+                duration_nsecs: deferred.audio.duration_nsecs,
+            });
+        }
+        timings.extend(self.worker.decoded_frame_timings()?);
         let mapped_frames = timings.into_iter().map(|timing| {
             let timestamp = preview_clock.map_contiguous(
                 timing.raw_timestamp,
@@ -248,6 +454,7 @@ impl AudioDecodePipeline {
 
     pub(super) fn flush_buffers(&mut self, generation: u64) -> std::result::Result<(), String> {
         self.worker.flush_buffers(generation)?;
+        self.deferred_output_frame = None;
         self.clear_packets();
         Ok(())
     }
@@ -269,10 +476,11 @@ impl AudioDecodePipeline {
 
     pub(super) fn clear_packets(&mut self) {
         self.packets.clear();
+        self.backpressure_log_state = None;
     }
 
     pub(super) fn has_pending_or_in_flight(&self) -> bool {
-        self.packets.has_pending_or_in_flight()
+        self.deferred_output_frame.is_some() || self.packets.has_pending_or_in_flight()
     }
 
     pub(super) fn take_pending_input(&mut self) -> Option<PendingAudioDecodePacket> {
@@ -284,7 +492,10 @@ impl AudioDecodePipeline {
     }
 
     pub(super) fn front_generation(&self) -> Option<u64> {
-        self.packets.front_generation()
+        self.deferred_output_frame
+            .as_ref()
+            .map(|(generation, _)| *generation)
+            .or_else(|| self.packets.front_generation())
     }
 
     pub(super) fn pop_completed_packet(&mut self) -> Option<PendingAudioDecodePacket> {
@@ -303,9 +514,15 @@ impl AudioDecodePacketQueues {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::super::DecodedAudio;
     use super::{
-        AUDIO_DECODE_PENDING_INPUT_QUEUE_CAPACITY, AudioDecodePipeline, AudioDecodeWorkerSnapshot,
-        AudioDecodeWorkerState, PlaybackBlockReason,
+        AUDIO_DECODE_PENDING_INPUT_QUEUE_CAPACITY, AudioDecodeBackpressureLogDecision,
+        AudioDecodeBackpressureObservation, AudioDecodeEnqueueResult, AudioDecodePipeline,
+        AudioDecodeWorkerSnapshot, AudioDecodeWorkerState, AudioDecodedFrame, PlaybackBlockReason,
+        observe_audio_decode_backpressure_log, retain_deferred_output_frame,
+        take_deferred_output_frame,
     };
 
     fn snapshot(
@@ -356,5 +573,99 @@ mod tests {
         ));
 
         assert_eq!(reason, Some(PlaybackBlockReason::DecoderRecovery));
+    }
+
+    #[test]
+    fn far_ahead_audio_retains_exactly_one_frame_until_realign_or_retry() {
+        let mut slot = None;
+        retain_deferred_output_frame(
+            &mut slot,
+            7,
+            AudioDecodedFrame {
+                raw_timestamp: 42,
+                audio: DecodedAudio {
+                    samples: vec![0.0; 4],
+                    duration_nsecs: 21_333_333,
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(
+            retain_deferred_output_frame(
+                &mut slot,
+                8,
+                AudioDecodedFrame {
+                    raw_timestamp: 43,
+                    audio: DecodedAudio {
+                        samples: vec![0.0; 4],
+                        duration_nsecs: 21_333_333,
+                    },
+                },
+            )
+            .is_err()
+        );
+        assert!(take_deferred_output_frame(&mut slot, 8).is_none());
+        let retained = take_deferred_output_frame(&mut slot, 7).expect("first frame is retained");
+        assert_eq!(retained.raw_timestamp, 42);
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn repeated_audio_decode_backpressure_logs_only_changes_and_one_second_summaries() {
+        let mut state = None;
+        let now = Instant::now();
+        let observation = AudioDecodeBackpressureObservation {
+            enqueue_result: AudioDecodeEnqueueResult::InputFull,
+            blocked_on: PlaybackBlockReason::PacketQueueFull,
+            worker_state: AudioDecodeWorkerState::NeedPacket,
+            pending_input_full: true,
+        };
+        assert_eq!(
+            observe_audio_decode_backpressure_log(&mut state, observation, now),
+            AudioDecodeBackpressureLogDecision::Changed {
+                suppressed_repeats: 0,
+                total_observations: 1,
+            }
+        );
+        for millisecond in 1..1000_u64 {
+            assert_eq!(
+                observe_audio_decode_backpressure_log(
+                    &mut state,
+                    observation,
+                    now + Duration::from_millis(millisecond),
+                ),
+                AudioDecodeBackpressureLogDecision::Suppressed
+            );
+        }
+        assert_eq!(
+            observe_audio_decode_backpressure_log(
+                &mut state,
+                observation,
+                now + Duration::from_secs(1),
+            ),
+            AudioDecodeBackpressureLogDecision::Summary {
+                suppressed_repeats: 1000,
+                total_observations: 1001,
+            }
+        );
+
+        let changed = AudioDecodeBackpressureObservation {
+            enqueue_result: AudioDecodeEnqueueResult::OutputFull,
+            blocked_on: PlaybackBlockReason::DecodedQueueFull,
+            worker_state: AudioDecodeWorkerState::OutputFull,
+            pending_input_full: true,
+        };
+        assert_eq!(
+            observe_audio_decode_backpressure_log(
+                &mut state,
+                changed,
+                now + Duration::from_secs(1) + Duration::from_millis(1),
+            ),
+            AudioDecodeBackpressureLogDecision::Changed {
+                suppressed_repeats: 0,
+                total_observations: 1,
+            }
+        );
     }
 }

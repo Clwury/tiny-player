@@ -1,8 +1,77 @@
+use std::time::Instant;
+
 use super::{
-    ByteRingBuffer, HttpCacheRangeKind, HttpCacheReadError, HttpRingCacheState, RetainedCacheRange,
+    ByteRingBuffer, HTTP_CACHE_STALL_LOG_INTERVAL, HttpCacheRangeKind, HttpCacheReadError,
+    HttpReadWaitLogDecision, HttpReadWaitLogState, HttpReadWaitObservation, HttpReadWaitPosition,
+    HttpRingCacheState, RetainedCacheRange,
 };
 
 impl HttpRingCacheState {
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn read_wait_observation(
+        &self,
+        current_offset: u64,
+        output_backpressure_paused: bool,
+    ) -> HttpReadWaitObservation {
+        let position = if current_offset < self.base_offset {
+            HttpReadWaitPosition::BeforeActiveRange
+        } else if current_offset < self.next_offset {
+            HttpReadWaitPosition::WithinActiveRange
+        } else if current_offset == self.next_offset {
+            HttpReadWaitPosition::AtAppendEdge
+        } else {
+            HttpReadWaitPosition::AheadOfActiveRange
+        };
+        HttpReadWaitObservation {
+            position,
+            active_range_kind: self.active_range_kind,
+            prefetch_paused: self.prefetch_paused,
+            output_backpressure_paused,
+            restart_pending: self.restart_request.is_some(),
+            side_download_pending: self.side_download_may_produce(current_offset),
+            eof: self.eof,
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn observe_read_wait_log(
+        &mut self,
+        observation: HttpReadWaitObservation,
+        now: Instant,
+    ) -> HttpReadWaitLogDecision {
+        let Some(state) = self.read_wait_log_state.as_mut() else {
+            self.read_wait_log_state = Some(HttpReadWaitLogState {
+                observation,
+                started_at: now,
+                last_logged_at: now,
+                suppressed_repeats: 0,
+            });
+            return HttpReadWaitLogDecision::Changed {
+                suppressed_repeats: 0,
+            };
+        };
+        if state.observation != observation {
+            let suppressed_repeats = state.suppressed_repeats;
+            *state = HttpReadWaitLogState {
+                observation,
+                started_at: now,
+                last_logged_at: now,
+                suppressed_repeats: 0,
+            };
+            return HttpReadWaitLogDecision::Changed { suppressed_repeats };
+        }
+
+        state.suppressed_repeats = state.suppressed_repeats.saturating_add(1);
+        if now.saturating_duration_since(state.last_logged_at) >= HTTP_CACHE_STALL_LOG_INTERVAL {
+            let repeated_observations = std::mem::take(&mut state.suppressed_repeats);
+            state.last_logged_at = now;
+            HttpReadWaitLogDecision::Summary {
+                repeated_observations,
+                blocked_for: now.saturating_duration_since(state.started_at),
+            }
+        } else {
+            HttpReadWaitLogDecision::Suppressed
+        }
+    }
+
     pub(in crate::player::backend::ffmpeg::avio::cache) fn set_read_error(
         &mut self,
         offset: u64,
@@ -145,4 +214,43 @@ pub(in crate::player::backend::ffmpeg::avio::cache) fn copy_available_from_range
     }
     let read = buffer.copy_at(start, output);
     (read > 0).then_some(read)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{HttpReadWaitLogDecision, HttpRingCacheState};
+
+    #[test]
+    fn identical_http_read_waits_log_immediately_then_once_per_second() {
+        let mut state = HttpRingCacheState::new(0);
+        let now = Instant::now();
+        let observation = state.read_wait_observation(0, false);
+
+        assert_eq!(
+            state.observe_read_wait_log(observation, now),
+            HttpReadWaitLogDecision::Changed {
+                suppressed_repeats: 0,
+            }
+        );
+        assert_eq!(
+            state.observe_read_wait_log(observation, now + Duration::from_millis(10)),
+            HttpReadWaitLogDecision::Suppressed
+        );
+        assert_eq!(
+            state.observe_read_wait_log(observation, now + Duration::from_secs(1)),
+            HttpReadWaitLogDecision::Summary {
+                repeated_observations: 2,
+                blocked_for: Duration::from_secs(1),
+            }
+        );
+
+        state.prefetch_paused = true;
+        let changed = state.read_wait_observation(0, false);
+        assert!(matches!(
+            state.observe_read_wait_log(changed, now + Duration::from_millis(1_010)),
+            HttpReadWaitLogDecision::Changed { .. }
+        ));
+    }
 }

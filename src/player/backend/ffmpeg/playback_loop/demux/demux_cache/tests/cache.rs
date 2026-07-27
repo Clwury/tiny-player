@@ -13,6 +13,7 @@ use std::{
 
 use ffmpeg_sys_next as ffi;
 
+use crate::player::backend::ffmpeg::AudioOutputLifecycle;
 use crate::player::{
     backend::{
         BackendEvent, BackendEventKind, CacheUnlinkPolicy, DemuxCacheState, PlaybackCacheConfig,
@@ -50,6 +51,21 @@ fn cached_seek_closer(at_nsecs: u64) -> CachedDemuxPacket {
 
 fn close_seek_range(state: &mut DemuxPacketCacheState, at_nsecs: u64) {
     state.append_packet(cached_seek_closer(at_nsecs));
+}
+
+fn finish_bounded_read_trim(state: &mut DemuxPacketCacheState) {
+    let maximum_steps = state.packets.len().saturating_add(1);
+    for _ in 0..maximum_steps {
+        if !state.backbuffer_pressure() {
+            return;
+        }
+        let outcome = state.trim_to_limit_for_read_with_outcome();
+        assert!(
+            outcome.performed,
+            "bounded read trim must make progress while backbuffer pressure remains"
+        );
+    }
+    panic!("bounded read trim did not converge within one step per cached packet");
 }
 
 fn set_reader_head_for_stream_time(
@@ -251,6 +267,7 @@ fn shared_with_codec_and_config_for_test(
         consumer_lock_pressure_until_nanos: AtomicU64::new(0),
         playback_recovery_critical: AtomicBool::new(false),
         playback_recovery_demand: AtomicU8::new(0),
+        output_backpressure_prefetch_paused: AtomicBool::new(false),
     };
     (shared, event_rx)
 }
@@ -2577,6 +2594,43 @@ fn demux_packet_cache_polls_per_stream_queues_independently() {
 }
 
 #[test]
+fn post_seek_producer_error_keeps_drainable_packet_cache_readable() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let seek_generation = control.request_seek();
+    control.finish_seek(seek_generation);
+    let mut config = cache_config_for_test();
+    config.cache_pause = false;
+    let (shared, _) = shared_with_config_for_test(Arc::clone(&control), config);
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        guard.append_packet(cached_anchor(0, 1_000_000_000));
+    }
+
+    let (consumer_drainable, forward_duration_nsecs) = shared
+        .note_producer_recovering("FFmpeg 读取媒体包失败：Input/output error".to_string(), 10);
+    assert!(consumer_drainable);
+    assert_eq!(forward_duration_nsecs, 1_000_000_000);
+    {
+        let guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        assert!(guard.error.is_none());
+        assert_eq!(guard.producer_recovery_consecutive_errors, 10);
+        assert!(guard.producer_recovery_error.is_some());
+    }
+
+    let cache = DemuxPacketCache {
+        shared: Arc::new(shared),
+        handle: None,
+    };
+    assert!(matches!(cache.poll_packet(0), DemuxReadResult::Packet(_)));
+}
+
+#[test]
 fn demux_packet_cache_round_robin_polls_selected_stream_queues_only() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let mut config = cache_config_for_test();
@@ -3150,7 +3204,7 @@ fn demux_packet_cache_discards_inflight_result_after_control_seek_request() {
 }
 
 #[test]
-fn low_level_seek_interrupts_cache_pause_and_avio_wait() {
+fn pending_seek_wakes_cache_pause_wait_and_fences_inflight_demux_result() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let mut config = cache_config_for_test();
     config.cache_pause = true;
@@ -3193,6 +3247,7 @@ fn demux_packet_cache_skips_stale_low_level_seek_request() {
 #[test]
 fn demux_packet_cache_pause_enters_on_underrun_and_resumes_after_wait_target() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    control.set_output_underrun_for_cache_pause(true);
     let mut config = cache_config_for_test();
     config.cache_pause = true;
     config.cache_pause_wait = 2.0;
@@ -3267,8 +3322,68 @@ fn demux_packet_cache_pause_enters_on_underrun_and_resumes_after_wait_target() {
 }
 
 #[test]
+fn steady_playback_cache_pause_requires_demux_and_actual_output_underrun() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing);
+    let mut config = cache_config_for_test();
+    config.cache_pause = true;
+    config.cache_pause_wait = 2.0;
+    let (shared, _event_rx) = shared_with_config_for_test(Arc::clone(&control), config);
+
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        assert!(guard.has_demux_underrun());
+        shared.enter_cache_pause_if_needed(&mut guard, true);
+    }
+    assert!(!control.is_cache_paused());
+
+    control.set_output_underrun_for_cache_pause(true);
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        shared.enter_cache_pause_if_needed(&mut guard, true);
+    }
+    assert!(control.is_cache_paused());
+}
+
+#[test]
+fn demux_packet_cache_does_not_pause_with_twenty_two_seconds_forward() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let mut config = cache_config_for_test();
+    config.cache_pause = true;
+    config.cache_pause_wait = 30.0;
+    config.demuxer_readahead_secs = 60.0;
+    let (shared, _event_rx) = shared_with_config_for_test(Arc::clone(&control), config);
+
+    shared.append_packet(cached_anchor(0, 22_000_000_000));
+    {
+        let mut guard = shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        let watermark = guard.reader_watermark();
+        assert_eq!(watermark.video_forward_nsecs, Some(22_000_000_000));
+        assert!(!watermark.video_underrun);
+        assert!(!watermark.underrun);
+
+        // The true output-underrun signal alone is insufficient: like mpv,
+        // cache pause also requires an actual demux underrun.
+        shared.enter_cache_pause_if_needed(&mut guard, true);
+    }
+
+    assert!(!control.is_cache_paused());
+    assert!(!control.is_paused());
+}
+
+#[test]
 fn demux_packet_cache_pause_waits_for_three_seconds_forward_before_resume() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    control.set_output_underrun_for_cache_pause(true);
     let mut config = cache_config_for_test();
     config.cache_pause = true;
     config.cache_pause_wait = 3.0;
@@ -3292,6 +3407,74 @@ fn demux_packet_cache_pause_waits_for_three_seconds_forward_before_resume() {
 
     assert!(!control.is_cache_paused());
     assert!(!control.is_paused());
+}
+
+#[test]
+fn demux_packet_cache_pause_uses_exact_seek_target_not_idr_anchor() {
+    let target_nsecs = 184_692_319_900;
+    let mut config = cache_config_for_test();
+    config.cache_pause = true;
+    config.cache_pause_wait = 3.0;
+    let mut state = DemuxPacketCacheState::new(
+        target_nsecs,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        config,
+    );
+
+    state.append_packet(cached_anchor(179_900_000_000, 183_133_333_333));
+
+    assert_eq!(state.exact_seek_target_nsecs, target_nsecs);
+    assert!(!state.cache_pause_target_covered());
+    assert_eq!(state.cache_pause_forward_duration_nsecs(), 0);
+    assert!(!state.cache_pause_recovered());
+
+    state.append_packet(cached_anchor(183_133_333_333, 187_692_319_900));
+
+    assert!(state.cache_pause_target_covered());
+    assert_eq!(state.cache_pause_forward_duration_nsecs(), 3_000_000_000);
+    assert!(state.cache_pause_recovered());
+}
+
+#[test]
+fn demux_packet_cache_pause_requires_audio_to_cover_exact_seek_target() {
+    let target_nsecs = 184_692_319_900;
+    let mut config = cache_config_for_test();
+    config.cache_pause = true;
+    config.cache_pause_wait = 1.0;
+    let mut state = DemuxPacketCacheState::new(
+        target_nsecs,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        config,
+    );
+    state.set_selected_streams(DemuxSelectedStreams {
+        audio_stream: Some(stream_info_for_test(1, ffi::AVCodecID::AV_CODEC_ID_AAC)),
+        subtitle_stream: None,
+    });
+    state.append_packet(cached_anchor(179_900_000_000, 186_000_000_000));
+    state.append_packet(cached_packet(
+        1,
+        false,
+        Some(179_900_000_000),
+        Some(183_133_333_333),
+    ));
+
+    assert!(!state.cache_pause_target_covered());
+    assert_eq!(state.cache_pause_forward_duration_nsecs(), 0);
+
+    state.append_packet(cached_packet(
+        1,
+        false,
+        Some(183_133_333_333),
+        Some(185_692_319_900),
+    ));
+
+    assert!(state.cache_pause_target_covered());
+    assert_eq!(state.cache_pause_forward_duration_nsecs(), 1_000_000_000);
+    assert!(state.cache_pause_recovered());
 }
 
 #[test]
@@ -3332,6 +3515,7 @@ fn demux_packet_cache_read_activates_detached_append_range_before_cache_pause_wa
 #[test]
 fn demux_packet_cache_pause_resume_keeps_user_pause_active() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    control.set_output_underrun_for_cache_pause(true);
     control.set_user_paused(true);
     let mut config = cache_config_for_test();
     config.cache_pause = true;
@@ -3366,6 +3550,7 @@ fn demux_packet_cache_pause_resume_keeps_user_pause_active() {
 #[test]
 fn demux_packet_cache_clear_pause_for_decoded_resume_clears_buffering_state() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    control.set_output_underrun_for_cache_pause(true);
     let mut config = cache_config_for_test();
     config.cache_pause = true;
     config.cache_pause_wait = 1.0;
@@ -3412,6 +3597,7 @@ fn demux_packet_cache_clear_pause_for_decoded_resume_clears_buffering_state() {
 #[test]
 fn demux_packet_cache_apply_config_disables_cache_pause_and_clears_buffering() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    control.set_output_underrun_for_cache_pause(true);
     let mut config = cache_config_for_test();
     config.cache_pause = true;
     config.cache_pause_wait = 2.0;
@@ -3586,6 +3772,7 @@ fn demux_packet_cache_coalesces_underrun_state_after_read_without_cache_pause() 
 #[test]
 fn demux_packet_cache_pause_resumes_on_eof_before_wait_target() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    control.set_output_underrun_for_cache_pause(true);
     let mut config = cache_config_for_test();
     config.cache_pause = true;
     config.cache_pause_wait = 10.0;
@@ -3626,6 +3813,7 @@ fn demux_packet_cache_pause_resumes_on_eof_before_wait_target() {
 #[test]
 fn demux_packet_cache_pause_resumes_when_demux_becomes_idle_before_wait_target() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    control.set_output_underrun_for_cache_pause(true);
     let mut config = cache_config_for_test();
     config.cache_pause = true;
     config.cache_pause_wait = 10.0;
@@ -3761,6 +3949,104 @@ fn demux_packet_cache_available_read_serves_cached_packet_while_cache_paused() {
     assert!(matches!(result, DemuxReadResult::Packet(_)));
     assert_eq!(stream_offset, Some(0));
     assert!(control.is_cache_paused());
+}
+
+#[test]
+fn demux_packet_cache_wait_for_cached_input_wakes_on_producer_append() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let mut config = cache_config_for_test();
+    config.cache_pause = true;
+    config.cache_pause_wait = 10.0;
+    let (shared, _event_rx) = shared_with_config_for_test(Arc::clone(&control), config);
+    let cache = Arc::new(DemuxPacketCache {
+        shared: Arc::new(shared),
+        handle: None,
+    });
+    control.set_cache_paused(true);
+    let (started_tx, started_rx) = mpsc::channel();
+    let waiting_cache = Arc::clone(&cache);
+    let waiter = thread::spawn(move || {
+        started_tx.send(()).expect("waiter start signal sends");
+        let started_at = Instant::now();
+        waiting_cache.wait_for_consumer_drainable(&[0], Duration::from_secs(1));
+        started_at.elapsed()
+    });
+    started_rx.recv().expect("waiter starts");
+    thread::sleep(Duration::from_millis(20));
+
+    cache.shared.append_packet(cached_anchor(0, 1_000_000_000));
+
+    let waited = waiter.join().expect("cached-input waiter joins");
+    assert!(waited < Duration::from_millis(500));
+    assert!(
+        cache
+            .packet_queue_snapshot()
+            .consumer_drainable_for_streams(&[0])
+    );
+    assert!(control.is_cache_paused());
+}
+
+#[test]
+fn demux_packet_cache_wait_for_cached_input_wakes_on_seek_generation() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let mut config = cache_config_for_test();
+    config.cache_pause = true;
+    config.cache_pause_wait = 10.0;
+    let (shared, _event_rx) = shared_with_config_for_test(Arc::clone(&control), config);
+    let cache = Arc::new(DemuxPacketCache {
+        shared: Arc::new(shared),
+        handle: None,
+    });
+    control.set_cache_paused(true);
+    let (started_tx, started_rx) = mpsc::channel();
+    let waiting_cache = Arc::clone(&cache);
+    let waiter = thread::spawn(move || {
+        started_tx.send(()).expect("waiter start signal sends");
+        let started_at = Instant::now();
+        waiting_cache.wait_for_consumer_drainable(&[0], Duration::from_secs(1));
+        started_at.elapsed()
+    });
+    started_rx.recv().expect("waiter starts");
+
+    control.request_seek();
+
+    let waited = waiter.join().expect("seek-interrupted waiter joins");
+    assert!(waited < Duration::from_millis(100), "waited={waited:?}");
+    assert!(control.has_pending_seek());
+}
+
+#[test]
+fn demux_packet_cache_generation_wait_does_not_return_for_existing_drainable_input() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let mut config = cache_config_for_test();
+    config.cache_pause = true;
+    config.cache_pause_wait = 10.0;
+    let (shared, _event_rx) = shared_with_config_for_test(Arc::clone(&control), config);
+    let cache = Arc::new(DemuxPacketCache {
+        shared: Arc::new(shared),
+        handle: None,
+    });
+    control.set_cache_paused(true);
+    cache.shared.append_packet(cached_anchor(0, 1_000_000_000));
+    let observed_generation = cache.packet_queue_snapshot().cache_generation;
+    let (started_tx, started_rx) = mpsc::channel();
+    let waiting_cache = Arc::clone(&cache);
+    let waiter = thread::spawn(move || {
+        started_tx.send(()).expect("waiter start signal sends");
+        let started_at = Instant::now();
+        let changed = waiting_cache
+            .wait_for_cache_generation_change(observed_generation, Duration::from_secs(1));
+        (changed, started_at.elapsed())
+    });
+    started_rx.recv().expect("waiter starts");
+    thread::sleep(Duration::from_millis(20));
+
+    cache.shared.append_packet(cached_anchor(0, 1_040_000_000));
+
+    let (changed, waited) = waiter.join().expect("generation waiter joins");
+    assert!(changed);
+    assert!(waited >= Duration::from_millis(15));
+    assert!(waited < Duration::from_millis(500));
 }
 
 #[test]
@@ -4929,6 +5215,7 @@ fn demux_packet_cache_state_trims_active_backbuffer_after_fast_seek() {
         state.seek_cached_fast(4_500_000_000, PlaybackSessionId(2)),
         Some(6.0)
     );
+    finish_bounded_read_trim(&mut state);
 
     assert_eq!(state.backward_bytes(), 1024);
     assert_eq!(state.forward_bytes(), 2 * 1024);
@@ -5327,6 +5614,7 @@ fn demux_packet_cache_state_active_trim_never_crosses_per_stream_reader_heads() 
         state.seek_cached_fast(2_500_000_000, PlaybackSessionId(2)),
         Some(3.0)
     );
+    finish_bounded_read_trim(&mut state);
 
     assert_eq!(state.forward_bytes(), 2 * 1024);
     assert_eq!(state.backward_bytes(), 0);
@@ -6570,6 +6858,156 @@ fn demux_packet_cache_forced_low_level_seek_bypasses_cached_hit() {
 }
 
 #[test]
+fn cached_seek_plan_resolve_does_not_move_readers_before_atomic_commit() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.append_packet(cached_anchor(0, 1_000_000_000));
+    state.append_packet(cached_packet(
+        0,
+        true,
+        Some(1_000_000_000),
+        Some(2_000_000_000),
+    ));
+    close_seek_range(&mut state, 3_000_000_000);
+    let generation_before = state.generation;
+    let reader_heads_before = state.reader_heads.clone();
+    let read_range_before = state.read_range_id;
+
+    let plan = state
+        .resolve_cached_seek_plan_attempt(1_500_000_000, PlaybackSeekMode::Precise)
+        .expect("closed cached range resolves");
+
+    assert_eq!(state.generation, generation_before);
+    assert_eq!(state.reader_heads, reader_heads_before);
+    assert_eq!(state.read_range_id, read_range_before);
+    assert_eq!(state.cached_seeks, 0);
+
+    let hit = state
+        .commit_cached_seek_plan(plan, PlaybackSessionId(2), 1)
+        .expect("unchanged plan commits atomically");
+    assert_eq!(hit.target_nsecs, 1_500_000_000);
+    assert_eq!(state.generation, generation_before + 1);
+    assert_eq!(state.exact_seek_target_nsecs, 1_500_000_000);
+    assert_eq!(state.cached_seeks, 1);
+}
+
+#[test]
+fn cached_seek_plan_rejects_stale_seekability_revision_without_moving_readers() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.append_packet(cached_anchor(0, 1_000_000_000));
+    close_seek_range(&mut state, 3_000_000_000);
+    let plan = state
+        .resolve_cached_seek_plan_attempt(500_000_000, PlaybackSeekMode::Precise)
+        .expect("closed cached range resolves");
+    let generation_before = state.generation;
+    let reader_heads_before = state.reader_heads.clone();
+
+    state.bump_seekability_revision();
+    let miss = state
+        .commit_cached_seek_plan(plan, PlaybackSessionId(2), 1)
+        .expect_err("revision change invalidates the plan");
+
+    assert_eq!(miss.reason, CachedSeekMissReason::GenerationBlocked);
+    assert_eq!(state.generation, generation_before);
+    assert_eq!(state.reader_heads, reader_heads_before);
+    assert_eq!(state.cached_seeks, 0);
+}
+
+#[test]
+fn cached_range_pts_index_orders_reordered_packets_by_presentation_time() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.append_packet(cached_runtime_packet_with_keyframe(
+        0,
+        true,
+        true,
+        Some(10_000_000_000),
+        Some(10_040_000_000),
+        Some(10_000_000_000),
+    ));
+    state.append_packet(cached_runtime_packet_with_keyframe(
+        0,
+        true,
+        false,
+        Some(10_040_000_000),
+        Some(10_080_000_000),
+        Some(9_970_000_000),
+    ));
+
+    let indexed_pts = state
+        .read_range()
+        .stream_pts_index
+        .get(&0)
+        .expect("video PTS index exists")
+        .keys()
+        .map(|(pts, _)| *pts)
+        .collect::<Vec<_>>();
+    assert_eq!(indexed_pts, vec![9_970_000_000, 10_000_000_000]);
+}
+
+#[test]
+fn blocked_cache_lookup_keeps_seek_audio_in_explicit_silence_state() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let generation = control.request_seek();
+    let (shared, _event_rx) =
+        shared_with_config_for_test(Arc::clone(&control), cache_config_for_test());
+    let shared = Arc::new(shared);
+    {
+        let mut guard = shared.state.lock().expect("cache state");
+        guard.append_packet(cached_anchor(0, 1_000_000_000));
+        close_seek_range(&mut guard, 3_000_000_000);
+    }
+    let cache = DemuxPacketCache {
+        shared: Arc::clone(&shared),
+        handle: None,
+    };
+    let barrier = Arc::new(Barrier::new(2));
+    let holder_shared = Arc::clone(&shared);
+    let holder_barrier = Arc::clone(&barrier);
+    let holder = thread::spawn(move || {
+        let _guard = holder_shared.state.lock().expect("cache state");
+        holder_barrier.wait();
+        thread::sleep(Duration::from_millis(150));
+    });
+    barrier.wait();
+
+    let started_at = Instant::now();
+    let result = cache.seek(
+        0.5,
+        PlaybackSeekMode::Precise,
+        PlaybackSessionId(9),
+        generation,
+    );
+
+    holder.join().expect("lock holder exits");
+    assert!(started_at.elapsed() >= Duration::from_millis(140));
+    assert!(matches!(result, DemuxSeekResult::Cached(_)));
+    assert!(control.is_seek_audio_paused());
+    assert_eq!(
+        control.audio_output_control_snapshot().decision(),
+        crate::player::backend::ffmpeg::AudioOutputDecision::Silence
+    );
+    control.finish_seek(generation);
+    assert!(control.finish_seek_audio_pause());
+}
+
+#[test]
 fn demux_packet_cache_cache_only_seek_never_falls_through_to_low_level() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let (shared, _event_rx) = shared_with_config_for_test(control, cache_config_for_test());
@@ -6633,6 +7071,50 @@ fn demux_packet_cache_cache_only_seek_uses_closed_cra_interval() {
     let guard = shared.state.lock().expect("cache state");
     assert_eq!(guard.cached_seeks, 1);
     assert_eq!(guard.low_level_seeks, 0);
+}
+
+#[test]
+fn demux_packet_cache_safe_only_seek_rejects_cra_without_low_level_fallback() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let (shared, _event_rx) = shared_with_config_for_test(control, cache_config_for_test());
+    let shared = Arc::new(shared);
+    {
+        let mut guard = shared.state.lock().expect("cache state");
+        guard.cached_seek_preroll_nsecs = 500_000_000;
+        guard.append_packet(cached_video_recovery_packet(
+            VideoRecoveryPointKind::Cra,
+            false,
+            59_768_000_000,
+            60_768_000_000,
+        ));
+        guard.append_packet(cached_packet(
+            0,
+            true,
+            Some(60_768_000_000),
+            Some(64_400_000_000),
+        ));
+        guard.append_packet(cached_video_recovery_packet(
+            VideoRecoveryPointKind::Cra,
+            false,
+            64_439_000_000,
+            65_439_000_000,
+        ));
+    }
+    let cache = DemuxPacketCache {
+        shared: Arc::clone(&shared),
+        handle: None,
+    };
+
+    assert_eq!(
+        cache.seek_cached_safe_only(62.521, PlaybackSeekMode::Precise, PlaybackSessionId(9), 12,),
+        DemuxSeekResult::Unavailable
+    );
+
+    let guard = shared.state.lock().expect("cache state");
+    assert_eq!(guard.cached_seeks, 0);
+    assert_eq!(guard.low_level_seeks, 0);
+    assert!(guard.seek_request.is_none());
+    assert!(guard.rejected_cached_seek_ranges.is_empty());
 }
 
 #[test]
@@ -7587,6 +8069,7 @@ fn demux_packet_cache_state_prunes_archived_range_at_recovery_boundaries() {
     close_seek_range(&mut state, 4_000_000_000);
 
     state.request_seek(10.0, PlaybackSessionId(2), 1, 10_000_000_000);
+    finish_bounded_read_trim(&mut state);
 
     assert_eq!(state.ranges.len(), 2);
     assert_eq!(state.archived_bytes(), 2 * 1024);
@@ -7633,6 +8116,7 @@ fn demux_packet_cache_state_prunes_truehd_audio_at_major_sync_boundary() {
     close_seek_range(&mut state, 7_000_000_000);
 
     state.request_seek(10.0, PlaybackSessionId(2), 1, 10_000_000_000);
+    finish_bounded_read_trim(&mut state);
 
     let archived_range = state
         .ranges
@@ -7752,6 +8236,7 @@ fn demux_packet_cache_state_prunes_non_anchor_packets_with_archived_prefix() {
     close_seek_range(&mut state, 3_000_000_000);
 
     state.request_seek(10.0, PlaybackSessionId(2), 1, 10_000_000_000);
+    finish_bounded_read_trim(&mut state);
 
     let range = state
         .ranges

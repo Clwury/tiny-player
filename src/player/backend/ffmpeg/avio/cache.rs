@@ -22,8 +22,7 @@ pub(in crate::player::backend::ffmpeg::avio::cache) use super::super::{
     HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR, HTTP_CACHE_PARTIAL_READ_MIN_BYTES,
     HTTP_CACHE_PREFETCH_PAUSE_LOG_AFTER, HTTP_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
     HTTP_CACHE_PROGRESS_REPORT_THRESHOLD, HTTP_CACHE_SIDE_DOWNLOAD_WORKERS,
-    HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES, HTTP_CACHE_STALL_LOG_AFTER,
-    HTTP_CACHE_STALL_LOG_INTERVAL, HTTP_CACHE_WAIT_INTERVAL,
+    HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES, HTTP_CACHE_STALL_LOG_INTERVAL, HTTP_CACHE_WAIT_INTERVAL,
 };
 #[cfg(test)]
 pub(in crate::player::backend::ffmpeg::avio::cache) use super::super::{
@@ -34,7 +33,9 @@ pub(in crate::player::backend::ffmpeg::avio::cache) use super::{
     download::{http_ring_cache_download_loop, http_ring_cache_side_download_loop},
     http::reqwest_header_pairs,
 };
-pub(in crate::player::backend::ffmpeg::avio::cache) use buffer::ByteRingBuffer;
+pub(in crate::player::backend::ffmpeg::avio::cache) use buffer::{
+    ByteRingBuffer, PreparedByteAppend,
+};
 pub(in crate::player::backend::ffmpeg::avio::cache) use events::{
     http_stream_cache_status_changed, playback_cache_state_from_http_status,
 };
@@ -46,5 +47,7 @@ pub(in crate::player::backend::ffmpeg) use model::{
 };
 pub(in crate::player::backend::ffmpeg::avio::cache) use model::{
     HttpCacheConfig, HttpCacheReadError, HttpCachedByteRange, HttpDiskCache,
-    HttpPlaybackBufferRange, InputRateSample, RetainedCacheRange, RetainedPlaybackSpliceSource,
+    HttpPlaybackBufferRange, HttpReadWaitLogDecision, HttpReadWaitLogState,
+    HttpReadWaitObservation, HttpReadWaitPosition, InputRateSample, PendingHttpDiskCacheWrite,
+    RetainedCacheRange, RetainedPlaybackSpliceSource,
 };

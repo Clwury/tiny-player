@@ -23,6 +23,32 @@ pub struct VideoOutputQueueSnapshot {
     pub render_backpressure: RenderBackpressure,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VulkanPrewarmTicket {
+    session_id: PlaybackSessionId,
+    presentation_generation: u64,
+    request_id: u64,
+    device_key: usize,
+}
+
+impl VulkanPrewarmTicket {
+    pub fn session_id(self) -> PlaybackSessionId {
+        self.session_id
+    }
+
+    pub fn device_key(self) -> usize {
+        self.device_key
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VulkanPrewarmStatus {
+    Pending,
+    Ready,
+    Failed(String),
+    Stale,
+}
+
 impl VideoOutputQueueSnapshot {
     pub fn render_backlogged(self) -> bool {
         self.queued_frames > 0 && self.render_backpressure.is_backlogged()
@@ -128,13 +154,21 @@ impl RenderBackpressure {
 #[derive(Default)]
 struct VideoOutputQueueState {
     active_session_id: PlaybackSessionId,
+    presentation_generation: u64,
     frames: VecDeque<DecodedFrame>,
     current_size: Option<RenderSize>,
     pending_size_change: Option<RenderSize>,
-    pending_vulkan_prewarm: Option<Arc<VulkanDecodeDevice>>,
+    vulkan_prewarm: Option<VulkanPrewarmState>,
+    next_vulkan_prewarm_request_id: u64,
     buffer_pool: FrameBufferPool,
     render_backpressure: RenderBackpressure,
     dropped_frames: u64,
+}
+
+struct VulkanPrewarmState {
+    ticket: VulkanPrewarmTicket,
+    pending_device: Option<Arc<VulkanDecodeDevice>>,
+    result: Option<std::result::Result<(), String>>,
 }
 
 impl VideoOutputQueue {
@@ -150,16 +184,39 @@ impl VideoOutputQueue {
         let mut state = self.inner.lock().expect("video output queue poisoned");
         let buffer_pool = state.buffer_pool.clone();
         let render_backpressure = state.render_backpressure;
+        let presentation_generation = state.presentation_generation.wrapping_add(1);
         *state = VideoOutputQueueState {
             active_session_id: session_id,
+            presentation_generation,
             frames: VecDeque::new(),
             current_size: None,
             pending_size_change: None,
-            pending_vulkan_prewarm: None,
+            vulkan_prewarm: None,
+            next_vulkan_prewarm_request_id: 0,
             buffer_pool,
             render_backpressure,
             dropped_frames: 0,
         };
+    }
+
+    /// Drops frames waiting to be rendered while leaving the renderer's currently
+    /// visible image untouched.
+    pub fn discard_pending_frames(&self, session_id: PlaybackSessionId) -> usize {
+        let mut state = self.inner.lock().expect("video output queue poisoned");
+        if state.active_session_id != session_id {
+            return 0;
+        }
+        let discarded = state.frames.len();
+        state.frames.clear();
+        state.pending_size_change = None;
+        state.vulkan_prewarm = None;
+        state.presentation_generation = state.presentation_generation.wrapping_add(1);
+        discarded
+    }
+
+    pub fn presentation_identity(&self) -> (PlaybackSessionId, u64) {
+        let state = self.inner.lock().expect("video output queue poisoned");
+        (state.active_session_id, state.presentation_generation)
     }
 
     #[allow(dead_code)]
@@ -355,17 +412,69 @@ impl VideoOutputQueue {
         &self,
         session_id: PlaybackSessionId,
         device: Arc<VulkanDecodeDevice>,
-    ) {
+    ) -> Option<VulkanPrewarmTicket> {
         let mut state = self.inner.lock().expect("video output queue poisoned");
-        if state.active_session_id == session_id {
-            state.pending_vulkan_prewarm = Some(device);
+        if state.active_session_id != session_id {
+            return None;
         }
+        state.next_vulkan_prewarm_request_id = state.next_vulkan_prewarm_request_id.wrapping_add(1);
+        let ticket = VulkanPrewarmTicket {
+            session_id,
+            presentation_generation: state.presentation_generation,
+            request_id: state.next_vulkan_prewarm_request_id,
+            device_key: device.key(),
+        };
+        state.vulkan_prewarm = Some(VulkanPrewarmState {
+            ticket,
+            pending_device: Some(device),
+            result: None,
+        });
+        Some(ticket)
     }
 
-    pub fn take_vulkan_prewarm(&self) -> Option<(PlaybackSessionId, Arc<VulkanDecodeDevice>)> {
+    pub fn take_vulkan_prewarm(&self) -> Option<(VulkanPrewarmTicket, Arc<VulkanDecodeDevice>)> {
         let mut state = self.inner.lock().expect("video output queue poisoned");
-        let device = state.pending_vulkan_prewarm.take()?;
-        Some((state.active_session_id, device))
+        let prewarm = state.vulkan_prewarm.as_mut()?;
+        let device = prewarm.pending_device.take()?;
+        Some((prewarm.ticket, device))
+    }
+
+    pub fn complete_vulkan_prewarm(
+        &self,
+        ticket: VulkanPrewarmTicket,
+        result: std::result::Result<(), String>,
+    ) -> bool {
+        let mut state = self.inner.lock().expect("video output queue poisoned");
+        let active_identity_matches = state.active_session_id == ticket.session_id
+            && state.presentation_generation == ticket.presentation_generation;
+        let Some(prewarm) = state.vulkan_prewarm.as_mut() else {
+            return false;
+        };
+        if !active_identity_matches || prewarm.ticket != ticket {
+            return false;
+        }
+        prewarm.result = Some(result);
+        true
+    }
+
+    pub fn vulkan_prewarm_status(&self, ticket: VulkanPrewarmTicket) -> VulkanPrewarmStatus {
+        let state = self.inner.lock().expect("video output queue poisoned");
+        if state.active_session_id != ticket.session_id
+            || state.presentation_generation != ticket.presentation_generation
+        {
+            return VulkanPrewarmStatus::Stale;
+        }
+        let Some(prewarm) = state.vulkan_prewarm.as_ref() else {
+            return VulkanPrewarmStatus::Stale;
+        };
+        if prewarm.ticket != ticket {
+            return VulkanPrewarmStatus::Stale;
+        }
+        match prewarm.result.as_ref() {
+            None => VulkanPrewarmStatus::Pending,
+            Some(Ok(())) => VulkanPrewarmStatus::Ready,
+            Some(Err(error)) => VulkanPrewarmStatus::Failed(error.clone()),
+        }
     }
 
     pub fn update_render_backpressure(&self, backpressure: RenderBackpressure) {
@@ -515,7 +624,7 @@ fn log_video_output_queue_snapshot_timing(
 mod tests {
     use super::{
         RenderBackpressure, VideoOutputQueue, VideoOutputQueuePushPolicy,
-        VideoOutputQueuePushResult,
+        VideoOutputQueuePushResult, VulkanPrewarmStatus,
     };
     use crate::player::render_host::{
         DecodedFrame, FfmpegAvBufferRef, FramePixels, PlaybackSessionId, RenderSize,
@@ -867,16 +976,74 @@ mod tests {
         let current = PlaybackSessionId(2);
         let stale = PlaybackSessionId(1);
         slot.begin_session(current);
-        slot.request_vulkan_prewarm(stale, dummy_vulkan_device(1));
+        assert!(
+            slot.request_vulkan_prewarm(stale, dummy_vulkan_device(1))
+                .is_none()
+        );
         assert!(slot.take_vulkan_prewarm().is_none());
 
         let device = dummy_vulkan_device(2);
-        slot.request_vulkan_prewarm(current, device.clone());
+        let ticket = slot
+            .request_vulkan_prewarm(current, device.clone())
+            .expect("active prewarm ticket");
 
-        let (session_id, requested) = slot.take_vulkan_prewarm().unwrap();
-        assert_eq!(session_id, current);
+        let (requested_ticket, requested) = slot.take_vulkan_prewarm().unwrap();
+        assert_eq!(requested_ticket, ticket);
+        assert_eq!(requested_ticket.session_id(), current);
         assert_eq!(requested.key(), device.key());
         assert!(slot.take_vulkan_prewarm().is_none());
+        assert_eq!(
+            slot.vulkan_prewarm_status(ticket),
+            VulkanPrewarmStatus::Pending
+        );
+        assert!(slot.complete_vulkan_prewarm(ticket, Ok(())));
+        assert_eq!(
+            slot.vulkan_prewarm_status(ticket),
+            VulkanPrewarmStatus::Ready
+        );
+
+        slot.discard_pending_frames(current);
+        assert_eq!(
+            slot.vulkan_prewarm_status(ticket),
+            VulkanPrewarmStatus::Stale
+        );
+    }
+
+    #[test]
+    fn video_output_queue_discards_only_active_session_pending_frames_for_recovery() {
+        let slot = VideoOutputQueue::default();
+        let session_id = PlaybackSessionId(8);
+        let stale_session_id = PlaybackSessionId(7);
+        let size = RenderSize {
+            width: 2,
+            height: 1,
+        };
+        slot.begin_session(session_id);
+        for value in [1_u8, 2_u8] {
+            assert!(slot.push(
+                session_id,
+                DecodedFrame {
+                    size,
+                    pts: None,
+                    key_frame: false,
+                    pixels: FramePixels::Bgra8(vec![value; 8].into()),
+                },
+            ));
+        }
+        let (_, generation_before_discard) = slot.presentation_identity();
+
+        assert_eq!(slot.discard_pending_frames(stale_session_id), 0);
+        assert_eq!(
+            slot.presentation_identity(),
+            (session_id, generation_before_discard)
+        );
+        assert_eq!(slot.snapshot().queued_frames, 2);
+        assert_eq!(slot.discard_pending_frames(session_id), 2);
+        assert_eq!(slot.snapshot().queued_frames, 0);
+        assert_eq!(
+            slot.presentation_identity(),
+            (session_id, generation_before_discard.wrapping_add(1))
+        );
     }
 
     #[test]

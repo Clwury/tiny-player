@@ -204,7 +204,10 @@ impl FfmpegBackend {
         let position_seconds = position_seconds.max(0.0);
 
         let session_id = self.advance_session();
-        self.video_output_queue.begin_session(session_id);
+        // Keep the renderer's current session/frame alive while the playback
+        // thread resolves and atomically commits a cached seek. The worker
+        // advances the VO session only after the demux reader heads (or the
+        // low-level seek request) have committed successfully.
         self.loaded = false;
         self.paused = true;
         FFMPEG_FRAME_COUNT.store(0, Ordering::Relaxed);

@@ -27,7 +27,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use packet::{
 };
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use range::{
     ArchivedStreamPruneCandidate, CachedSeekMiss, CachedSeekMissReason, DemuxCachedRange,
-    DemuxCachedSeekHit, DemuxPacketRangeView, InternalPacketTimestampHole,
+    DemuxCachedSeekHit, DemuxCachedSeekPlan, DemuxPacketRangeView, InternalPacketTimestampHole,
     PreparedSeekableRangeReport, SeekableRangeValidationStats, SeekableTimelineSummary,
     StreamRangeBoundary,
 };

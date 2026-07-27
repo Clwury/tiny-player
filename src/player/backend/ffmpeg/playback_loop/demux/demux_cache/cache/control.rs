@@ -1,13 +1,49 @@
-use std::time::Instant;
+use std::{sync::atomic::Ordering, time::Instant};
 
 use super::{
-    BackendEvent, BackendEventKind, DEMUX_PACKET_CACHE_STALL_LOG_AFTER,
-    DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL, DEMUX_PACKET_CACHE_WAIT_INTERVAL, DemuxCachedSeekInfo,
-    DemuxPacketCache, DemuxSeekResult, PlaybackCacheConfig, PlaybackSeekMode, PlaybackSessionId,
-    nsecs_to_seconds, seconds_to_nsecs,
+    BackendEvent, BackendEventKind, CachedSeekMiss, CachedSeekMissReason,
+    DEMUX_PACKET_CACHE_STALL_LOG_AFTER, DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL,
+    DEMUX_PACKET_CACHE_WAIT_INTERVAL, DemuxCachedSeekInfo, DemuxCachedSeekPlan, DemuxPacketCache,
+    DemuxSeekResult, PlaybackCacheConfig, PlaybackSeekMode, PlaybackSessionId, nsecs_to_seconds,
+    seconds_to_nsecs,
 };
 
+fn require_safe_cached_seek_anchor(
+    resolved: Result<DemuxCachedSeekPlan, CachedSeekMiss>,
+    safe_anchor_only: bool,
+) -> Result<DemuxCachedSeekPlan, CachedSeekMiss> {
+    let plan = resolved?;
+    if safe_anchor_only && !plan.hit.anchor_is_safe_seek_point {
+        return Err(CachedSeekMiss {
+            range_id: Some(plan.hit.range_id),
+            target_nsecs: plan.hit.target_nsecs,
+            reason: CachedSeekMissReason::SafeAnchorRequired,
+        });
+    }
+    Ok(plan)
+}
+
 impl DemuxPacketCache {
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn set_output_backpressure_prefetch_paused(
+        &self,
+        paused: bool,
+    ) -> bool {
+        let changed = self
+            .shared
+            .output_backpressure_prefetch_paused
+            .swap(paused, Ordering::AcqRel)
+            != paused;
+        if changed {
+            self.shared.notify_ready();
+            tracing::debug!(
+                paused,
+                reason = "output_gate_and_decoder_queue_full",
+                "updated FFmpeg demux/HTTP prefetch pause for output backpressure"
+            );
+        }
+        changed
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop) fn set_playback_recovery_demand(
         &self,
         critical: bool,
@@ -25,7 +61,14 @@ impl DemuxPacketCache {
         session_id: PlaybackSessionId,
         seek_generation: u64,
     ) -> DemuxSeekResult {
-        self.seek_with_policy(position_seconds, mode, session_id, seek_generation, true)
+        self.seek_with_policy(
+            position_seconds,
+            mode,
+            session_id,
+            seek_generation,
+            true,
+            false,
+        )
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop) fn seek_cached_only(
@@ -35,7 +78,31 @@ impl DemuxPacketCache {
         session_id: PlaybackSessionId,
         seek_generation: u64,
     ) -> DemuxSeekResult {
-        self.seek_with_policy(position_seconds, mode, session_id, seek_generation, false)
+        self.seek_with_policy(
+            position_seconds,
+            mode,
+            session_id,
+            seek_generation,
+            false,
+            false,
+        )
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn seek_cached_safe_only(
+        &self,
+        position_seconds: f64,
+        mode: PlaybackSeekMode,
+        session_id: PlaybackSessionId,
+        seek_generation: u64,
+    ) -> DemuxSeekResult {
+        self.seek_with_policy(
+            position_seconds,
+            mode,
+            session_id,
+            seek_generation,
+            false,
+            true,
+        )
     }
 
     fn seek_with_policy(
@@ -45,22 +112,106 @@ impl DemuxPacketCache {
         session_id: PlaybackSessionId,
         seek_generation: u64,
         low_level_on_miss: bool,
+        safe_anchor_only: bool,
     ) -> DemuxSeekResult {
+        let seek_started_at = Instant::now();
         let position_seconds = position_seconds.max(0.0);
         let target_nsecs = seconds_to_nsecs(position_seconds);
+        let resolve_lock_started_at = Instant::now();
+        let guard = self
+            .shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        let mut cache_lock_wait = resolve_lock_started_at.elapsed();
+        let resolved_seekability_revision = guard.seekability_revision();
+        let resolved_cache_generation = guard.generation;
+        let lookup_started_at = Instant::now();
+        let resolved = require_safe_cached_seek_anchor(
+            guard.resolve_cached_seek_plan_attempt(target_nsecs, mode),
+            safe_anchor_only,
+        );
+        let mut lookup = lookup_started_at.elapsed();
+        drop(guard);
+
+        // A later target may arrive while a deliberately slow cache lookup is
+        // in progress. Never commit or flush output for the stale target.
+        if self.shared.control.has_pending_seek()
+            && self.shared.control.seek_generation() != seek_generation
+        {
+            tracing::debug!(
+                ?session_id,
+                position_seconds,
+                ?mode,
+                seek_generation,
+                latest_seek_generation = self.shared.control.seek_generation(),
+                cache_lock_wait_ms = cache_lock_wait.as_secs_f64() * 1_000.0,
+                lookup_ms = lookup.as_secs_f64() * 1_000.0,
+                "discarded superseded cached seek plan before commit"
+            );
+            return DemuxSeekResult::Superseded;
+        }
+
+        let commit_lock_started_at = Instant::now();
         let (result, should_enter_initial_cache_pause, cache_snapshot, buffered_changed) = {
             let mut guard = self
                 .shared
                 .state
                 .lock()
                 .expect("FFmpeg demux packet cache poisoned");
+            cache_lock_wait += commit_lock_started_at.elapsed();
             guard.error = None;
-            match guard.seek_cached_with_generation_attempt(
-                target_nsecs,
-                mode,
-                session_id,
-                seek_generation,
-            ) {
+            if self.shared.control.has_pending_seek()
+                && self.shared.control.seek_generation() != seek_generation
+            {
+                tracing::debug!(
+                    ?session_id,
+                    position_seconds,
+                    ?mode,
+                    seek_generation,
+                    latest_seek_generation = self.shared.control.seek_generation(),
+                    cache_lock_wait_ms = cache_lock_wait.as_secs_f64() * 1_000.0,
+                    lookup_ms = lookup.as_secs_f64() * 1_000.0,
+                    "discarded superseded cached seek plan at commit barrier"
+                );
+                return DemuxSeekResult::Superseded;
+            }
+
+            let commit_started_at = Instant::now();
+            let state_changed = guard.seekability_revision() != resolved_seekability_revision
+                || guard.generation != resolved_cache_generation;
+            let resolved = if state_changed {
+                let retry_lookup_started_at = Instant::now();
+                let resolved = require_safe_cached_seek_anchor(
+                    guard.resolve_cached_seek_plan_attempt(target_nsecs, mode),
+                    safe_anchor_only,
+                );
+                lookup += retry_lookup_started_at.elapsed();
+                resolved
+            } else {
+                resolved
+            };
+            let committed = match resolved {
+                Ok(plan) => {
+                    match guard.commit_cached_seek_plan(plan, session_id, seek_generation) {
+                        Ok(hit) => Ok(hit),
+                        Err(_) => {
+                            let retry_lookup_started_at = Instant::now();
+                            let retry = require_safe_cached_seek_anchor(
+                                guard.resolve_cached_seek_plan_attempt(target_nsecs, mode),
+                                safe_anchor_only,
+                            );
+                            lookup += retry_lookup_started_at.elapsed();
+                            retry.and_then(|plan| {
+                                guard.commit_cached_seek_plan(plan, session_id, seek_generation)
+                            })
+                        }
+                    }
+                }
+                Err(miss) => Err(miss),
+            };
+            let commit = commit_started_at.elapsed();
+            match committed {
                 Ok(hit) => {
                     let cached_seek_info = DemuxCachedSeekInfo {
                         range_id: hit.range_id,
@@ -107,6 +258,9 @@ impl DemuxPacketCache {
                         buffered_until,
                         read_index = guard.read_index,
                         generation = guard.generation,
+                        cache_lock_wait_ms = cache_lock_wait.as_secs_f64() * 1_000.0,
+                        lookup_ms = lookup.as_secs_f64() * 1_000.0,
+                        commit_ms = commit.as_secs_f64() * 1_000.0,
                         "FFmpeg demux packet cache seek hit"
                     );
                     let cache_snapshot =
@@ -124,7 +278,11 @@ impl DemuxPacketCache {
                     )
                 }
                 Err(miss) => {
-                    if let Some(range_id) = miss.range_id {
+                    let policy_rejection = miss.reason == CachedSeekMissReason::SafeAnchorRequired;
+                    if !policy_rejection {
+                        guard.record_cached_seek_rejection(miss);
+                    }
+                    if let Some(range_id) = miss.range_id.filter(|_| !policy_rejection) {
                         tracing::warn!(
                             ?session_id,
                             position_seconds,
@@ -134,6 +292,17 @@ impl DemuxPacketCache {
                             rejection_reason = miss.reason.as_str(),
                             seek_generation,
                             "cached seek target inside advertised range was rejected; retracting range"
+                        );
+                    } else if let Some(range_id) = miss.range_id {
+                        tracing::debug!(
+                            ?session_id,
+                            position_seconds,
+                            ?mode,
+                            target_nsecs,
+                            range_id,
+                            rejection_reason = miss.reason.as_str(),
+                            seek_generation,
+                            "cached seek range remained valid but did not contain a safe IDR/BLA anchor"
                         );
                     }
                     if low_level_on_miss {
@@ -152,6 +321,9 @@ impl DemuxPacketCache {
                             cached_seek_rejection_reason = miss.reason.as_str(),
                             seek_generation,
                             generation = guard.generation,
+                            cache_lock_wait_ms = cache_lock_wait.as_secs_f64() * 1_000.0,
+                            lookup_ms = lookup.as_secs_f64() * 1_000.0,
+                            commit_ms = commit.as_secs_f64() * 1_000.0,
                             "FFmpeg demux packet cache seek miss; requested low-level seek"
                         );
                     } else {
@@ -164,6 +336,9 @@ impl DemuxPacketCache {
                             cached_seek_rejection_reason = miss.reason.as_str(),
                             seek_generation,
                             generation = guard.generation,
+                            cache_lock_wait_ms = cache_lock_wait.as_secs_f64() * 1_000.0,
+                            lookup_ms = lookup.as_secs_f64() * 1_000.0,
+                            commit_ms = commit.as_secs_f64() * 1_000.0,
                             "FFmpeg demux packet cache-only seek unavailable; low-level seek suppressed"
                         );
                     }
@@ -188,12 +363,23 @@ impl DemuxPacketCache {
             }
         };
         let cache_state = cache_snapshot.into_cache_state();
-        self.shared.ready.notify_all();
+        self.shared.notify_ready();
         self.shared
             .send_cache_state_events(session_id, cache_state, buffered_changed);
         if should_enter_initial_cache_pause {
             self.shared.enter_initial_cache_pause_if_needed();
         }
+        tracing::debug!(
+            ?session_id,
+            position_seconds,
+            ?mode,
+            seek_generation,
+            ?result,
+            cache_lock_wait_ms = cache_lock_wait.as_secs_f64() * 1_000.0,
+            lookup_ms = lookup.as_secs_f64() * 1_000.0,
+            total_ms = seek_started_at.elapsed().as_secs_f64() * 1_000.0,
+            "completed two-phase FFmpeg demux seek transaction"
+        );
         result
     }
 
@@ -206,6 +392,20 @@ impl DemuxPacketCache {
     ) -> DemuxSeekResult {
         let position_seconds = position_seconds.max(0.0);
         let target_nsecs = seconds_to_nsecs(position_seconds);
+        if self.shared.control.has_pending_seek()
+            && self.shared.control.seek_generation() != seek_generation
+        {
+            tracing::debug!(
+                ?session_id,
+                position_seconds,
+                target_nsecs,
+                seek_generation,
+                latest_seek_generation = self.shared.control.seek_generation(),
+                reason,
+                "suppressed superseded forced low-level seek"
+            );
+            return DemuxSeekResult::Superseded;
+        }
         let (cache_snapshot, buffered_changed, should_enter_initial_cache_pause) = {
             let mut guard = self
                 .shared
@@ -232,7 +432,7 @@ impl DemuxPacketCache {
             (cache_snapshot, buffered_changed, guard.cache_pause_initial)
         };
         let cache_state = cache_snapshot.into_cache_state();
-        self.shared.ready.notify_all();
+        self.shared.notify_ready();
         self.shared
             .send_cache_state_events(session_id, cache_state, buffered_changed);
         if should_enter_initial_cache_pause {
@@ -302,7 +502,7 @@ impl DemuxPacketCache {
             .lock()
             .expect("FFmpeg demux packet cache poisoned");
         guard.shutdown = true;
-        self.shared.ready.notify_all();
+        self.shared.notify_ready();
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop) fn apply_cache_config(
@@ -339,7 +539,7 @@ impl DemuxPacketCache {
             }
             self.shared.refresh_cache_pause(&mut guard);
             let emit = self.shared.prepare_cache_state_emit(&mut guard);
-            self.shared.ready.notify_all();
+            self.shared.notify_ready();
             emit
         };
         self.shared.send_cache_state_emit(emit.into_emit());
@@ -379,9 +579,14 @@ impl DemuxPacketCache {
                     cached_bytes = guard.cached_bytes,
                     forward_bytes = guard.forward_bytes(),
                     forward_duration_ms = guard.forward_duration_nsecs() as f64 / 1_000_000.0,
+                    effective_cache_pause_forward_ms =
+                        guard.cache_pause_forward_duration_nsecs() as f64 / 1_000_000.0,
                     reader_nsecs = guard.reader_nsecs,
+                    exact_seek_target_nsecs = guard.exact_seek_target_nsecs,
+                    exact_seek_target_covered = guard.cache_pause_target_covered(),
                     reader_pts_seconds = nsecs_to_seconds(guard.reader_nsecs),
                     cached_until_nsecs = ?guard.cached_until_nsecs(),
+                    per_stream = ?guard.packet_queue_snapshot().streams,
                     cache_end_seconds = ?guard.cached_until_nsecs().map(nsecs_to_seconds),
                     raw_input_rate_bytes_per_sec = ?guard.raw_input_rate(),
                     cache_pause_percent = ?guard.cache_pause_percent(),
@@ -393,12 +598,9 @@ impl DemuxPacketCache {
                 );
                 next_initial_wait_log_at = now.checked_add(DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL);
             }
-            let (next_guard, _) = self
+            guard = self
                 .shared
-                .ready
-                .wait_timeout(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL)
-                .expect("FFmpeg demux packet cache poisoned");
-            guard = next_guard;
+                .wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
         }
     }
 }

@@ -93,11 +93,18 @@ impl DemuxPacketCacheState {
                 self.stream_requires_recovery_point(stream_index),
             )
         });
+        let (seek_timestamp_nsecs, recovery_point) = self
+            .packets
+            .get(&packet_id)
+            .map(|packet| (packet.seek_timestamp_nsecs, packet.recovery_point))
+            .unwrap_or_default();
         let packet_position = self.append_packet_id_to_append_range(
             packet_id,
             stream_index,
             packet_byte_len,
             packet_is_seek_boundary,
+            seek_timestamp_nsecs,
+            recovery_point,
         );
         self.record_internal_packet_timestamp_gap(
             self.append_range_id,
@@ -233,6 +240,8 @@ impl DemuxPacketCacheState {
         stream_index: c_int,
         byte_len: usize,
         packet_is_seek_boundary: bool,
+        seek_timestamp_nsecs: Option<u64>,
+        recovery_point: bool,
     ) -> usize {
         let range = self.append_range_mut();
         range.ensure_stream_boundary(stream_index);
@@ -250,6 +259,12 @@ impl DemuxPacketCacheState {
                 .or_default()
                 .push_back(packet_id);
         }
+        range.index_packet(
+            stream_index,
+            packet_id,
+            seek_timestamp_nsecs,
+            recovery_point,
+        );
         range.add_report_bytes(byte_len);
         packet_position
     }

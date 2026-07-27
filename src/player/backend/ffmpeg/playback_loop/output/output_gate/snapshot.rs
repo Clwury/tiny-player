@@ -13,11 +13,15 @@ impl PlaybackOutputScheduler {
         played_until_nsecs: Option<u64>,
     ) -> PlaybackOutputSnapshot {
         let queued_video_duration_nsecs = self.scheduled_video_queue.duration_nsecs();
+        let queued_video_range_span_nsecs = self.scheduled_video_queue.range_span_nsecs();
         let queued_video_range_nsecs = self.scheduled_video_queue.range_nsecs();
-        let first_video_frame_pending = self.playback_output_state.first_video_frame_pending();
+        let restart_pending = self.restart_pending();
         let rebuffering = self.playback_output_state.rebuffering();
-        let forward_measure_nsecs = if first_video_frame_pending {
-            None
+        let forward_measure_nsecs = if restart_pending {
+            // Startup snapshots have no running media clock yet. Measure from the
+            // first queued frame so internal holes are still excluded from the
+            // bootstrap waterline.
+            queued_video_range_nsecs.map(|(start, _)| start)
         } else if rebuffering {
             self.video_output_rebuffer_anchor
                 .map(|anchor| anchor.timeline_nsecs)
@@ -29,9 +33,7 @@ impl PlaybackOutputScheduler {
             .and_then(|played_until| self.scheduled_video_queue.forward_nsecs_from(played_until));
         let queued_video_largest_gap_nsecs = self.scheduled_video_queue.largest_gap_nsecs();
         let video_output_low_water = played_until_nsecs.is_some_and(|played_until| {
-            !first_video_frame_pending
-                && !rebuffering
-                && self.scheduled_video_queue.low_water(played_until)
+            !restart_pending && !rebuffering && self.scheduled_video_queue.low_water(played_until)
         });
         let recent_coordinator_stall = self
             .scheduled_video_queue
@@ -39,10 +41,31 @@ impl PlaybackOutputScheduler {
 
         PlaybackOutputSnapshot {
             state: self.playback_output_state,
-            first_video_frame_pending: self.first_video_frame_pending,
+            first_video_frame_pending: restart_pending,
+            first_frame_needed: self.first_frame_needed && self.scheduled_video_queue.is_empty(),
+            first_frame_presented: self.first_frame_presented,
+            initial_av_start_pending: restart_pending,
+            output_clock_running: self.output_clock_running,
+            audio_start_target_nsecs: self
+                .initial_av_start_transaction
+                .map(|transaction| transaction.audio_start_target_nsecs),
+            output_transition_deadline_ms: self.initial_av_start_transaction.map(|transaction| {
+                transaction
+                    .hard_deadline_at
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64
+            }),
             rebuffering,
             queued_video_frames: self.scheduled_video_queue.len(),
+            recovery_staging_frames: self.recovery_staging_frames(),
+            recovery_staging_frame_budget: self.recovery_staging_frame_budget(),
+            committed_output_high_water_nsecs: self.committed_video_queue_end_nsecs(),
+            recovery_staged_high_water_nsecs: self.recovery_staged_high_water_nsecs(),
+            decode_recovery_audio_ready_latched: self.decode_recovery_audio_ready_latched(),
+            queued_video_coverage_nsecs: queued_video_duration_nsecs,
             queued_video_duration_nsecs,
+            queued_video_range_span_nsecs,
             queued_video_range_nsecs,
             queued_video_forward_nsecs: queued_video_contiguous_forward_nsecs,
             queued_video_contiguous_forward_nsecs,

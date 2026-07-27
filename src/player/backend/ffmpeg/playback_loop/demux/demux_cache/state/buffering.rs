@@ -179,9 +179,58 @@ impl DemuxPacketCacheState {
         if self.cache_pause_wait_nsecs == 0 {
             return None;
         }
-        let percent =
-            self.forward_duration_nsecs().saturating_mul(100) / self.cache_pause_wait_nsecs;
+        let percent = self
+            .cache_pause_forward_duration_nsecs()
+            .saturating_mul(100)
+            / self.cache_pause_wait_nsecs;
         Some(u8::try_from(percent.min(99)).unwrap_or(99))
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cache_pause_forward_duration_nsecs(
+        &self,
+    ) -> u64 {
+        let windows = self.active_stream_forward_windows();
+        let has_non_subtitle = windows
+            .iter()
+            .any(|window| !matches!(window.kind, StreamCacheKind::Subtitle));
+        windows
+            .into_iter()
+            .filter(|window| {
+                !(has_non_subtitle
+                    && matches!(window.kind, StreamCacheKind::Subtitle)
+                    && window.duration_nsecs() == 0)
+            })
+            .map(|window| {
+                window
+                    .end_nsecs
+                    .saturating_sub(window.reader_nsecs.max(self.exact_seek_target_nsecs))
+            })
+            .min()
+            .unwrap_or_else(|| {
+                self.cached_until_nsecs()
+                    .map(|cached_until| {
+                        cached_until
+                            .saturating_sub(self.reader_nsecs.max(self.exact_seek_target_nsecs))
+                    })
+                    .unwrap_or_default()
+            })
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cache_pause_target_covered(
+        &self,
+    ) -> bool {
+        let mut timed_stream_seen = false;
+        for window in self
+            .active_stream_forward_windows()
+            .into_iter()
+            .filter(|window| matches!(window.kind, StreamCacheKind::Video | StreamCacheKind::Audio))
+        {
+            timed_stream_seen = true;
+            if !window.has_forward_packet || window.end_nsecs < self.exact_seek_target_nsecs {
+                return false;
+            }
+        }
+        timed_stream_seen
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cache_pause_can_enter(
@@ -199,8 +248,8 @@ impl DemuxPacketCacheState {
         &self,
     ) -> bool {
         self.effective_eof()
-            || self.forward_duration_nsecs() >= self.cache_pause_wait_nsecs
-            || self.should_pause_demux()
+            || self.cache_pause_forward_duration_nsecs() >= self.cache_pause_wait_nsecs
+            || (self.cache_pause_target_covered() && self.should_pause_demux())
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn mark_eof(&mut self) {

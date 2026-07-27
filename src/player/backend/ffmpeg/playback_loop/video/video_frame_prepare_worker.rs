@@ -20,8 +20,10 @@ use super::{
 const VIDEO_FRAME_PREPARE_COMMAND_QUEUE_CAPACITY: usize = 3;
 const VIDEO_FRAME_PREPARE_PENDING_INPUT_QUEUE_CAPACITY: usize = 3;
 const VIDEO_FRAME_PREPARE_RESULT_QUEUE_CAPACITY: usize = 3;
+const VIDEO_FRAME_PREPARE_WORKER_RETIRE_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub(super) struct VideoFramePrepareWorker {
+    buffer_pool: FrameBufferPool,
     command_tx: mpsc::SyncSender<VideoFramePrepareCommand>,
     result_rx: Receiver<VideoFramePrepareResult>,
     handle: Option<JoinHandle<()>>,
@@ -171,6 +173,9 @@ impl VideoFramePrepareWorkerSnapshot {
     }
 }
 
+// Keeping the frame input inline avoids one heap allocation for every decoded
+// video frame; the bounded sync channel owns these commands only transiently.
+#[allow(clippy::large_enum_variant)]
 enum VideoFramePrepareCommand {
     Prepare(VideoFramePrepareInput),
     Shutdown,
@@ -181,12 +186,16 @@ impl VideoFramePrepareWorker {
         let (command_tx, command_rx) =
             mpsc::sync_channel(VIDEO_FRAME_PREPARE_COMMAND_QUEUE_CAPACITY);
         let (result_tx, result_rx) = mpsc::sync_channel(VIDEO_FRAME_PREPARE_RESULT_QUEUE_CAPACITY);
+        let worker_buffer_pool = buffer_pool.clone();
         let handle = thread::Builder::new()
             .name("tiny-ffmpeg-video-frame-prepare".to_string())
-            .spawn(move || run_video_frame_prepare_worker(buffer_pool, command_rx, result_tx))
+            .spawn(move || {
+                run_video_frame_prepare_worker(worker_buffer_pool, command_rx, result_tx)
+            })
             .map_err(|error| format!("创建 FFmpeg video frame prepare worker 失败：{error}"))?;
 
         Ok(Self {
+            buffer_pool,
             command_tx,
             result_rx,
             handle: Some(handle),
@@ -319,6 +328,69 @@ impl VideoFramePrepareWorker {
         while let Ok(_result) = self.result_rx.try_recv() {}
     }
 
+    pub(super) fn restart_after_resource_pressure(
+        &mut self,
+        generation: u64,
+    ) -> std::result::Result<(), String> {
+        let buffer_pool = self.buffer_pool.clone();
+        self.flush_generation(generation);
+        self.shutdown_and_join(VIDEO_FRAME_PREPARE_WORKER_RETIRE_TIMEOUT)?;
+        let mut replacement = Self::spawn(buffer_pool)?;
+        replacement.flush_generation(generation);
+        *self = replacement;
+        Ok(())
+    }
+
+    fn shutdown_and_join(&mut self, timeout: Duration) -> std::result::Result<(), String> {
+        if self.handle.is_none() {
+            return Ok(());
+        }
+        let started_at = Instant::now();
+        let mut shutdown_sent = false;
+        while !shutdown_sent {
+            while let Ok(_result) = self.result_rx.try_recv() {}
+            match self.command_tx.try_send(VideoFramePrepareCommand::Shutdown) {
+                Ok(()) => shutdown_sent = true,
+                Err(mpsc::TrySendError::Full(VideoFramePrepareCommand::Shutdown)) => {}
+                Err(mpsc::TrySendError::Full(VideoFramePrepareCommand::Prepare(_))) => {
+                    unreachable!("prepare command was not used for worker shutdown")
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => shutdown_sent = true,
+            }
+            if !shutdown_sent && started_at.elapsed() >= timeout {
+                return Err(format!(
+                    "FFmpeg video frame prepare worker shutdown queue timed out after {:.3}ms",
+                    started_at.elapsed().as_secs_f64() * 1_000.0
+                ));
+            }
+            if !shutdown_sent {
+                thread::yield_now();
+            }
+        }
+
+        while self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            while let Ok(_result) = self.result_rx.try_recv() {}
+            if started_at.elapsed() >= timeout {
+                return Err(format!(
+                    "FFmpeg video frame prepare worker retirement timed out after {:.3}ms",
+                    started_at.elapsed().as_secs_f64() * 1_000.0
+                ));
+            }
+            thread::yield_now();
+        }
+        while let Ok(_result) = self.result_rx.try_recv() {}
+        if let Some(handle) = self.handle.take() {
+            handle.join().map_err(|_| {
+                "FFmpeg video frame prepare worker panicked during retirement".to_string()
+            })?;
+        }
+        Ok(())
+    }
+
     fn try_send_or_buffer(
         &mut self,
         input: VideoFramePrepareInput,
@@ -410,6 +482,9 @@ impl VideoFramePrepareWorker {
     }
 }
 
+// This result immediately returns ownership to the caller on backpressure, so
+// boxing the uncommon variant would add allocation churn to the hot frame path.
+#[allow(clippy::large_enum_variant)]
 enum VideoFramePrepareDirectEnqueueResult {
     Queued,
     InputFull(VideoFramePrepareInput),
@@ -417,12 +492,7 @@ enum VideoFramePrepareDirectEnqueueResult {
 
 impl Drop for VideoFramePrepareWorker {
     fn drop(&mut self) {
-        while let Ok(_result) = self.result_rx.try_recv() {}
-        let _ = self.command_tx.send(VideoFramePrepareCommand::Shutdown);
-        while let Ok(_result) = self.result_rx.try_recv() {}
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        let _ = self.shutdown_and_join(Duration::from_secs(2));
     }
 }
 
@@ -626,7 +696,9 @@ mod tests {
 
     use ffmpeg_sys_next as ffi;
 
-    use crate::player::render_host::{FfmpegFrameRef, FramePts, PlaybackSessionId, RenderSize};
+    use crate::player::render_host::{
+        FfmpegFrameRef, FrameBufferPool, FramePts, PlaybackSessionId, RenderSize,
+    };
 
     use super::super::{
         AvFrame, DEFAULT_VIDEO_FRAME_DURATION_NSECS, PlaybackOutputState, VideoFrameConvertContext,
@@ -637,6 +709,7 @@ mod tests {
         let (command_tx, _command_rx) = mpsc::sync_channel(1);
         let (_result_tx, result_rx) = mpsc::sync_channel(1);
         VideoFramePrepareWorker {
+            buffer_pool: FrameBufferPool::default(),
             command_tx,
             result_rx,
             handle: None,
@@ -767,5 +840,42 @@ mod tests {
         assert!(!worker.has_pending_input());
         assert!(!worker.pending_input_full());
         assert_eq!(worker.generation_floor, 5);
+    }
+
+    #[test]
+    fn resource_pressure_restart_joins_old_prepare_worker_before_replacement() {
+        let mut worker = VideoFramePrepareWorker::spawn(FrameBufferPool::default())
+            .expect("prepare worker starts");
+        assert_eq!(
+            worker.try_enqueue(test_input(1)).expect("frame queues"),
+            VideoFramePrepareEnqueueResult::Queued
+        );
+
+        worker
+            .restart_after_resource_pressure(5)
+            .expect("old prepare worker retires before replacement");
+
+        let snapshot = worker.snapshot();
+        assert_eq!(worker.generation_floor, 5);
+        assert_eq!(snapshot.pending_input_frames, 0);
+        assert_eq!(snapshot.in_flight_frames, 0);
+        assert_eq!(snapshot.completed_frames, 0);
+        assert!(worker.handle.is_some());
+    }
+
+    #[test]
+    fn video_frame_prepare_rejects_old_hw_generation_after_recovery_flush() {
+        let mut worker = test_worker();
+        worker.flush_generation(9);
+
+        assert_eq!(
+            worker
+                .try_enqueue(test_input(8))
+                .expect("stale input is handled"),
+            VideoFramePrepareEnqueueResult::Queued
+        );
+        assert!(!worker.has_pending_input());
+        assert_eq!(worker.in_flight_frames(), 0);
+        assert_eq!(worker.snapshot().completed_frames, 0);
     }
 }

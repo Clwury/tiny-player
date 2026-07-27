@@ -137,7 +137,21 @@ pub(in crate::player::backend::ffmpeg) fn http_cache_request_headers_for_log(
         format!("range: {range}"),
     ];
     output.extend(headers.iter().map(|(name, value)| {
-        let value = value.to_str().unwrap_or("<non-utf8>");
+        let sensitive = matches!(
+            name.as_str().to_ascii_lowercase().as_str(),
+            "authorization"
+                | "proxy-authorization"
+                | "cookie"
+                | "set-cookie"
+                | "x-emby-token"
+                | "x-emby-authorization"
+                | "x-api-key"
+        );
+        let value = if sensitive {
+            "<redacted>"
+        } else {
+            value.to_str().unwrap_or("<non-utf8>")
+        };
         format!("{name}: {value}")
     }));
     output

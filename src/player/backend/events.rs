@@ -4,8 +4,6 @@ use gpui::RenderImage;
 
 use crate::player::render_host::{PlaybackSessionId, RenderSize};
 
-const NETWORK_CACHE_PAUSE_WAIT_SECONDS: f64 = 3.0;
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackVideoInfo {
     pub codec: String,
@@ -163,9 +161,9 @@ impl Default for PlaybackCacheConfig {
             demuxer_max_bytes: 150 * 1024 * 1024,
             demuxer_max_back_bytes: 50 * 1024 * 1024,
             demuxer_donate_buffer: true,
-            http_cache_max_bytes: 500 * 1024 * 1024,
+            http_cache_max_bytes: 32 * 1024 * 1024,
             http_cache_chunk_bytes: 1024 * 1024,
-            http_cache_range_request_bytes: 64 * 1024 * 1024,
+            http_cache_range_request_bytes: 16 * 1024 * 1024,
             cache_pause: true,
             cache_pause_initial: false,
             cache_pause_wait: 1.0,
@@ -211,12 +209,6 @@ impl PlaybackCacheConfig {
             } else {
                 PlaybackCacheMode::Disabled
             };
-        }
-        if input_cacheable && self.cache_pause_wait == Self::default().cache_pause_wait {
-            self.cache_pause_wait = NETWORK_CACHE_PAUSE_WAIT_SECONDS;
-        }
-        if input_cacheable && self.cache_pause {
-            self.cache_pause_initial = true;
         }
         self
     }
@@ -330,6 +322,12 @@ pub struct BackendEvent {
     pub kind: BackendEventKind,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendDiagnostic {
+    pub code: &'static str,
+    pub message: String,
+}
+
 impl BackendEvent {
     pub fn new(session_id: PlaybackSessionId, kind: BackendEventKind) -> Self {
         Self { session_id, kind }
@@ -339,6 +337,7 @@ impl BackendEvent {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum BackendEventKind {
+    Diagnostic(BackendDiagnostic),
     Pause(bool),
     PlaybackEnded,
     PlaybackRestart,
@@ -384,7 +383,8 @@ impl std::error::Error for BackendError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendError, NETWORK_CACHE_PAUSE_WAIT_SECONDS, PlaybackCacheConfig, PlaybackCacheMode,
+        BackendError, CacheUnlinkPolicy, PlaybackCacheConfig, PlaybackCacheMode,
+        PlaybackSeekableCacheMode,
     };
 
     #[test]
@@ -450,6 +450,27 @@ mod tests {
     }
 
     #[test]
+    fn cache_config_defaults_match_mpv() {
+        let config = PlaybackCacheConfig::default();
+
+        assert_eq!(config.mode, PlaybackCacheMode::Auto);
+        assert_eq!(config.seekable_cache, PlaybackSeekableCacheMode::Auto);
+        assert!(!config.disk_cache);
+        assert_eq!(config.cache_secs, 1000.0 * 60.0 * 60.0);
+        assert_eq!(config.demuxer_readahead_secs, 1.0);
+        assert_eq!(config.demuxer_hysteresis_secs, 0.0);
+        assert_eq!(config.demuxer_max_bytes, 150 * 1024 * 1024);
+        assert_eq!(config.demuxer_max_back_bytes, 50 * 1024 * 1024);
+        assert!(config.demuxer_donate_buffer);
+        assert!(config.cache_pause);
+        assert!(!config.cache_pause_initial);
+        assert_eq!(config.cache_pause_wait, 1.0);
+        assert!(!config.demuxer_cache_wait);
+        assert_eq!(config.cache_dir, None);
+        assert_eq!(config.unlink_files, CacheUnlinkPolicy::Immediate);
+    }
+
+    #[test]
     fn cache_config_resolves_auto_mode_from_input_cacheability() {
         let network = PlaybackCacheConfig::default().resolved_for_cacheable_input(true);
         let local = PlaybackCacheConfig::default().resolved_for_cacheable_input(false);
@@ -466,19 +487,23 @@ mod tests {
     }
 
     #[test]
-    fn cache_config_resolves_network_demux_prebuffer_defaults() {
+    fn cache_config_keeps_mpv_prebuffer_defaults_for_network_inputs() {
         let network = PlaybackCacheConfig::default().resolved_for_cacheable_input(true);
         let local = PlaybackCacheConfig::default().resolved_for_cacheable_input(false);
 
         assert!(!network.demuxer_cache_wait);
-        assert!(network.cache_pause_initial);
-        assert_eq!(network.cache_pause_wait, NETWORK_CACHE_PAUSE_WAIT_SECONDS);
+        assert!(!network.cache_pause_initial);
+        assert_eq!(network.cache_pause_wait, 1.0);
         assert_eq!(network.demuxer_readahead_secs, 1.0);
         assert_eq!(network.demuxer_packet_max_readahead_secs, 0.0);
         assert_eq!(network.demuxer_hysteresis_secs, 0.0);
         assert_eq!(network.demuxer_max_bytes, 150 * 1024 * 1024);
         assert_eq!(network.demuxer_max_back_bytes, 50 * 1024 * 1024);
         assert!(network.demuxer_donate_buffer);
+        assert_eq!(network.http_cache_max_bytes, 32 * 1024 * 1024);
+        assert_eq!(network.http_cache_range_request_bytes, 16 * 1024 * 1024);
+        assert!(!network.disk_cache);
+        assert_eq!(network.disk_cache_max_bytes, 4 * 1024 * 1024 * 1024);
         assert_eq!(network.effective_readahead_secs(true), 1000.0 * 60.0 * 60.0);
 
         assert!(!local.demuxer_cache_wait);

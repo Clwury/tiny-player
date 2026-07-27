@@ -2,9 +2,7 @@ use std::sync::{
     Arc,
     mpsc::{Receiver, Sender},
 };
-use std::time::Duration;
-
-use ffmpeg_sys_next as ffi;
+use std::time::Instant;
 
 use crate::player::{
     PlaybackTrackSelection,
@@ -21,14 +19,13 @@ use super::playback_reset_service::{
 };
 use super::track_switch::{TrackSwitchPipelineState, service_track_switch_pipelines};
 use super::{
-    DemuxPacketCache, FfmpegCommand, FfmpegControl, FfmpegPlaybackInput, HttpRingCache,
-    PlaybackSession, StreamCatalog, coalesce_playback_seek_commands, drain_playback_commands,
+    AudioOutput, DemuxPacketCache, FfmpegCommand, FfmpegControl, FfmpegPlaybackInput,
+    HttpRingCache, PlaybackSession, StreamCatalog, drain_playback_commands,
     playback_audio_info_from_stream, select_audio_stream_for_selection_from_catalog,
     select_subtitle_stream_for_selection_from_catalog, should_cache_http_url,
 };
 use crate::player::backend::ffmpeg::worker::{PendingSeek, PendingTrackSelection};
 
-const HEVC_CONTINUOUS_SEEK_COALESCE_QUIET_PERIOD: Duration = Duration::from_millis(180);
 const SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON: &str = "internal_subtitle_track_change";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,30 +72,10 @@ fn log_superseded_seek(
 pub(super) fn service_playback_commands(
     mut context: PlaybackCommandContext<'_>,
 ) -> std::result::Result<PlaybackCommandServiceStatus, String> {
-    let mut drained_commands = drain_playback_commands(context.command_rx, context.control);
-    if context.pipeline.video_stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC
-        && drained_commands.pending_seek.is_some()
-    {
-        let initial_seek_generation = drained_commands
-            .pending_seek
-            .map(|pending| pending.generation);
-        drained_commands = coalesce_playback_seek_commands(
-            context.command_rx,
-            context.control,
-            drained_commands,
-            HEVC_CONTINUOUS_SEEK_COALESCE_QUIET_PERIOD,
-        );
-        let final_seek = drained_commands.pending_seek;
-        if final_seek.map(|pending| pending.generation) != initial_seek_generation {
-            tracing::debug!(
-                initial_seek_generation,
-                final_seek_generation = final_seek.map(|pending| pending.generation),
-                final_position_seconds = final_seek.map(|pending| pending.position_seconds),
-                quiet_period_ms = HEVC_CONTINUOUS_SEEK_COALESCE_QUIET_PERIOD.as_secs_f64() * 1000.0,
-                "coalesced continuous HEVC seek commands before playback reset"
-            );
-        }
-    }
+    // Drain only commands that have already arrived. A single seek therefore
+    // executes in this coordinator tick, while a burst naturally collapses to
+    // its final target without ever blocking playback/VO for a quiet period.
+    let drained_commands = drain_playback_commands(context.command_rx, context.control);
     if context.control.should_stop() {
         return Ok(PlaybackCommandServiceStatus::Stopped);
     }
@@ -146,6 +123,17 @@ pub(super) fn service_playback_commands(
         let position_seconds = begin_seek(context.session, context.control, &pending_seek);
         context.pipeline.current_start_position_nsecs = context.session.start_position_nsecs();
         context.pipeline.clear_audio_realign_transaction();
+        tracing::debug!(
+            session_id = ?pending_seek.session_id,
+            position_seconds = pending_seek.position_seconds,
+            seek_mode = ?pending_seek.mode,
+            seek_generation = pending_seek.generation,
+            command_wait_ms = Instant::now()
+                .saturating_duration_since(pending_seek.queued_at)
+                .as_secs_f64()
+                * 1_000.0,
+            "servicing queued FFmpeg seek without a blocking coalesce window"
+        );
         if !pending_seek_is_latest_generation(&pending_seek, context.control) {
             log_superseded_seek(&pending_seek, context.control, "before_seek_reset");
             return Ok(PlaybackCommandServiceStatus::Continue);
@@ -156,6 +144,8 @@ pub(super) fn service_playback_commands(
             seek_generation: pending_seek.generation,
             force_low_level_seek: false,
             cache_only: false,
+            require_safe_cached_anchor: false,
+            preserve_hevc_same_hardware_recovery: false,
             recovery_transaction_id: None,
             low_level_seek_reason: None,
             session_id: context.session.id(),
@@ -210,13 +200,15 @@ fn service_track_selection_command(
         .set_selected_streams(demux_audio_stream, demux_subtitle_stream);
 
     context.pipeline.current_start_position_nsecs = context.session.start_position_nsecs();
-    service_playback_generation_seek(PlaybackGenerationFlushContext {
+    let flush_result = service_playback_generation_seek(PlaybackGenerationFlushContext {
         kind: PlaybackPositionResetKind::TrackSelection,
         position_seconds,
         seek_mode: PlaybackSeekMode::Precise,
         seek_generation: pending_track_selection.generation,
         force_low_level_seek: low_level_seek_reason.is_some(),
         cache_only: false,
+        require_safe_cached_anchor: false,
+        preserve_hevc_same_hardware_recovery: false,
         low_level_seek_reason,
         session_id: context.session.id(),
         vo_queue: context.vo_queue,
@@ -225,6 +217,9 @@ fn service_track_selection_command(
         selected_tracks: Some(&selected_tracks),
         control: context.control,
     })?;
+    if !flush_result.flushed {
+        return Ok(());
+    }
     context.pipeline.clear_cached_seek_recovery_watchdog();
 
     context.pipeline.audio_decode_pipeline = None;
@@ -246,6 +241,19 @@ fn service_track_selection_command(
     context.pipeline.audio_stream = next_audio_stream;
     context.pipeline.audio_output = next_audio_output;
     context.pipeline.audio_decode_pipeline = next_audio_decode_pipeline;
+    context
+        .pipeline
+        .output_scheduler
+        .update_video_deadline_audio_clock(
+            context
+                .pipeline
+                .audio_output
+                .as_ref()
+                .map(AudioOutput::clock_handle),
+        );
+    if context.pipeline.audio_output.is_none() {
+        context.control.finish_seek_audio_pause();
+    }
     let playback_audio_info = playback_audio_info_from_stream(
         context.pipeline.audio_stream,
         context.pipeline.audio_output.as_ref(),
@@ -318,9 +326,8 @@ mod tests {
     };
 
     use super::{
-        FfmpegControl, HEVC_CONTINUOUS_SEEK_COALESCE_QUIET_PERIOD, PendingSeek,
-        SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON, pending_seek_is_latest_generation,
-        track_selection_low_level_seek_reason,
+        FfmpegControl, PendingSeek, SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON,
+        pending_seek_is_latest_generation, track_selection_low_level_seek_reason,
     };
 
     fn pending_seek(generation: u64, position_seconds: f64) -> PendingSeek {
@@ -329,6 +336,7 @@ mod tests {
             position_seconds,
             mode: PlaybackSeekMode::Fast,
             generation,
+            queued_at: std::time::Instant::now(),
         }
     }
 
@@ -345,13 +353,6 @@ mod tests {
         assert!(!pending_seek_is_latest_generation(&second, &control));
         assert!(pending_seek_is_latest_generation(&latest, &control));
         assert_eq!(latest.position_seconds, 79.0);
-    }
-
-    #[test]
-    fn hevc_seek_coalesce_window_covers_keyboard_repeat_interval() {
-        assert!(
-            HEVC_CONTINUOUS_SEEK_COALESCE_QUIET_PERIOD >= std::time::Duration::from_millis(180)
-        );
     }
 
     #[test]

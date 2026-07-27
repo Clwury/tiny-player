@@ -1,20 +1,112 @@
+use std::{collections::VecDeque, sync::Arc};
+
 use super::HTTP_CACHE_CHUNK_SIZE;
 
+struct BytePage {
+    data: Arc<[u8]>,
+    start: usize,
+    end: usize,
+}
+
+impl BytePage {
+    fn remaining(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+}
+
+/// An append payload split into independently allocated pages before the HTTP
+/// cache state lock is acquired.
+pub(in crate::player::backend::ffmpeg::avio::cache) struct PreparedByteAppend {
+    pages: VecDeque<BytePage>,
+    len: usize,
+}
+
+impl PreparedByteAppend {
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn from_bytes(data: &[u8]) -> Self {
+        Self::from_bytes_with_page_size(data, HTTP_CACHE_CHUNK_SIZE)
+    }
+
+    fn from_bytes_with_page_size(data: &[u8], page_size: usize) -> Self {
+        let page_size = page_size.max(1);
+        let pages = data
+            .chunks(page_size)
+            .map(|chunk| BytePage {
+                data: Arc::<[u8]>::from(chunk),
+                start: 0,
+                end: chunk.len(),
+            })
+            .collect();
+        Self {
+            pages,
+            len: data.len(),
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn discard_front(&mut self, len: usize) {
+        let mut remaining = len.min(self.len);
+        self.len -= remaining;
+        while remaining > 0 {
+            let Some(front) = self.pages.front_mut() else {
+                break;
+            };
+            let available = front.remaining();
+            if remaining < available {
+                front.start += remaining;
+                remaining = 0;
+            } else {
+                remaining -= available;
+                self.pages.pop_front();
+            }
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn from_buffer(
+        buffer: ByteRingBuffer,
+    ) -> Self {
+        Self {
+            pages: buffer.pages,
+            len: buffer.len,
+        }
+    }
+}
+
+/// A segmented byte FIFO. Unlike a contiguous `Vec<u8>` ring, growing this
+/// buffer never reallocates, zero-fills, or copies the bytes already cached.
 pub(in crate::player::backend::ffmpeg::avio::cache) struct ByteRingBuffer {
-    pub(in crate::player::backend::ffmpeg::avio::cache) storage: Vec<u8>,
-    pub(in crate::player::backend::ffmpeg::avio::cache) head: usize,
-    pub(in crate::player::backend::ffmpeg::avio::cache) len: usize,
-    pub(in crate::player::backend::ffmpeg::avio::cache) max_capacity: usize,
+    pages: VecDeque<BytePage>,
+    len: usize,
+    max_capacity: usize,
+    page_size: usize,
 }
 
 impl ByteRingBuffer {
     pub(in crate::player::backend::ffmpeg::avio::cache) fn new(max_capacity: usize) -> Self {
+        Self::new_with_page_size(max_capacity, HTTP_CACHE_CHUNK_SIZE)
+    }
+
+    fn new_with_page_size(max_capacity: usize, page_size: usize) -> Self {
         Self {
-            storage: Vec::new(),
-            head: 0,
+            pages: VecDeque::new(),
             len: 0,
-            max_capacity,
+            max_capacity: max_capacity.max(1),
+            page_size: page_size.max(1),
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg) fn new_with_page_size_for_test(
+        max_capacity: usize,
+        page_size: usize,
+    ) -> Self {
+        Self::new_with_page_size(max_capacity, page_size)
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn len(&self) -> usize {
@@ -26,39 +118,63 @@ impl ByteRingBuffer {
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn clear(&mut self) {
-        self.head = 0;
+        self.pages.clear();
         self.len = 0;
     }
 
+    /// Convenience path for state-only tests and small internal moves. Network
+    /// append paths must call `PreparedByteAppend::from_bytes` before locking
+    /// and then use `append_prepared`.
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::avio::cache) fn append(&mut self, data: &[u8]) {
-        if data.is_empty() {
+        let prepared = PreparedByteAppend::from_bytes_with_page_size(data, self.page_size);
+        self.append_prepared(prepared);
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn append_prepared(
+        &mut self,
+        mut prepared: PreparedByteAppend,
+    ) {
+        if prepared.is_empty() {
             return;
         }
-
         let required_len = self
             .len
-            .checked_add(data.len())
+            .checked_add(prepared.len())
             .expect("HTTP stream cache buffer length overflowed");
-        debug_assert!(required_len <= self.max_capacity);
-        self.ensure_storage_len(required_len);
-
-        let write_offset = (self.head + self.len) % self.storage.len();
-        copy_into_wrapped(&mut self.storage, write_offset, data);
+        assert!(
+            required_len <= self.max_capacity,
+            "HTTP stream cache append exceeds configured capacity"
+        );
+        while let Some(page) = prepared.pages.pop_front() {
+            self.pages.push_back(page);
+        }
         self.len = required_len;
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn discard_front(&mut self, len: usize) {
-        let len = len.min(self.len);
-        if len == 0 {
+        let mut remaining = len.min(self.len);
+        if remaining == 0 {
             return;
         }
-        if len == self.len {
-            self.clear();
-            return;
+        self.len -= remaining;
+        while remaining > 0 {
+            let Some(front) = self.pages.front_mut() else {
+                debug_assert_eq!(self.len, 0);
+                break;
+            };
+            let available = front.remaining();
+            if remaining < available {
+                front.start += remaining;
+                remaining = 0;
+            } else {
+                remaining -= available;
+                self.pages.pop_front();
+            }
         }
-
-        self.head = (self.head + len) % self.storage.len();
-        self.len -= len;
+        if self.len == 0 {
+            self.pages.clear();
+        }
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn copy_at(
@@ -66,55 +182,77 @@ impl ByteRingBuffer {
         offset: usize,
         output: &mut [u8],
     ) -> usize {
-        if output.is_empty() || offset >= self.len || self.storage.is_empty() {
+        if output.is_empty() || offset >= self.len {
             return 0;
         }
 
         let read = (self.len - offset).min(output.len());
-        let read_offset = (self.head + offset) % self.storage.len();
-        copy_from_wrapped(&self.storage, read_offset, &mut output[..read]);
-        read
-    }
-
-    pub(in crate::player::backend::ffmpeg::avio::cache) fn ensure_storage_len(
-        &mut self,
-        required_len: usize,
-    ) {
-        if required_len <= self.storage.len() {
-            return;
-        }
-
-        let new_len = self.grown_storage_len(required_len);
-        if self.head == 0 {
-            self.storage.resize(new_len, 0);
-            return;
-        }
-
-        let mut storage = vec![0; new_len];
-        self.copy_at(0, &mut storage[..self.len]);
-        self.storage = storage;
-        self.head = 0;
-    }
-
-    pub(in crate::player::backend::ffmpeg::avio::cache) fn grown_storage_len(
-        &self,
-        required_len: usize,
-    ) -> usize {
-        let mut len = if self.storage.is_empty() {
-            HTTP_CACHE_CHUNK_SIZE
-                .min(self.max_capacity)
-                .max(required_len)
-        } else {
-            self.storage.len()
-        };
-        while len < required_len {
-            let next = len.saturating_mul(2).min(self.max_capacity);
-            if next == len {
+        let mut skip = offset;
+        let mut written = 0usize;
+        for page in &self.pages {
+            let available = page.remaining();
+            if skip >= available {
+                skip -= available;
+                continue;
+            }
+            let source_start = page.start + skip;
+            let copy_len = (available - skip).min(read - written);
+            output[written..written + copy_len]
+                .copy_from_slice(&page.data[source_start..source_start + copy_len]);
+            written += copy_len;
+            skip = 0;
+            if written == read {
                 break;
             }
-            len = next;
         }
-        len.max(required_len).min(self.max_capacity)
+        debug_assert_eq!(written, read);
+        written
+    }
+
+    /// Detaches the suffix at `offset` without copying cached bytes. A page
+    /// crossing the boundary is represented by two Arc-backed slices of the
+    /// same slab.
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn split_off(
+        &mut self,
+        offset: usize,
+    ) -> Self {
+        let offset = offset.min(self.len);
+        let original_len = self.len;
+        let mut prefix = VecDeque::new();
+        let mut suffix = VecDeque::new();
+        let mut cursor = 0usize;
+        while let Some(mut page) = self.pages.pop_front() {
+            let page_len = page.remaining();
+            let page_end = cursor.saturating_add(page_len);
+            if page_end <= offset {
+                prefix.push_back(page);
+            } else if cursor >= offset {
+                suffix.push_back(page);
+            } else {
+                let split = page.start.saturating_add(offset.saturating_sub(cursor));
+                let suffix_page = BytePage {
+                    data: Arc::clone(&page.data),
+                    start: split,
+                    end: page.end,
+                };
+                page.end = split;
+                if page.remaining() > 0 {
+                    prefix.push_back(page);
+                }
+                if suffix_page.remaining() > 0 {
+                    suffix.push_back(suffix_page);
+                }
+            }
+            cursor = page_end;
+        }
+        self.pages = prefix;
+        self.len = offset;
+        Self {
+            pages: suffix,
+            len: original_len.saturating_sub(offset),
+            max_capacity: self.max_capacity,
+            page_size: self.page_size,
+        }
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn resize_capacity(
@@ -125,37 +263,19 @@ impl ByteRingBuffer {
         if self.len > max_capacity {
             self.discard_front(self.len - max_capacity);
         }
-        if self.storage.len() > max_capacity {
-            let mut storage = vec![0; self.len];
-            self.copy_at(0, &mut storage);
-            self.storage = storage;
-            self.head = 0;
-        }
         self.max_capacity = max_capacity;
     }
-}
 
-pub(in crate::player::backend::ffmpeg::avio::cache) fn copy_into_wrapped(
-    storage: &mut [u8],
-    offset: usize,
-    data: &[u8],
-) {
-    let front_len = data.len().min(storage.len() - offset);
-    storage[offset..offset + front_len].copy_from_slice(&data[..front_len]);
-    if front_len < data.len() {
-        storage[..data.len() - front_len].copy_from_slice(&data[front_len..]);
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg) fn page_count_for_test(&self) -> usize {
+        self.pages.len()
     }
-}
 
-pub(in crate::player::backend::ffmpeg::avio::cache) fn copy_from_wrapped(
-    storage: &[u8],
-    offset: usize,
-    output: &mut [u8],
-) {
-    let output_len = output.len();
-    let front_len = output_len.min(storage.len() - offset);
-    output[..front_len].copy_from_slice(&storage[offset..offset + front_len]);
-    if front_len < output_len {
-        output[front_len..].copy_from_slice(&storage[..output_len - front_len]);
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg) fn page_data_ptrs_for_test(&self) -> Vec<usize> {
+        self.pages
+            .iter()
+            .map(|page| page.data.as_ptr() as usize)
+            .collect()
     }
 }

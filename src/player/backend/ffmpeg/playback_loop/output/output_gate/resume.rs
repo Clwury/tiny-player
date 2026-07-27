@@ -2,28 +2,27 @@ use super::{
     AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION, AtomicBool, AudioClockMode,
     AudioClockResumeDecision, AudioOutput, AudioOutputSnapshot, BackendEvent, BufferedReporter,
     DelayedAudioStartSilencePolicy, DemuxPacketCache, DemuxReaderWatermark, Duration,
-    FfmpegControl, HevcDecodeChainStats, InitialOutputSyncDecision, Instant,
-    OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PENDING_AUDIO_CONTINUITY_TOLERANCE,
+    FfmpegControl, HevcDecodeChainStats, InitialOutputSyncDecision, InitialStartAdmission,
+    InitialStartAdmissionInput, InitialStartBlockReason, InitialSyncLogDecision,
+    InitialSyncLogObservation, Instant, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER,
+    OutputServiceDemand, PENDING_AUDIO_CONTINUITY_TOLERANCE,
     PLAYING_PENDING_AUDIO_HARD_RESET_DURATION, PendingAudioPressureContext,
     PlaybackOutputScheduler, PlaybackOutputState, PlaybackResumeWaterline, PlaybackScheduler,
     PlaybackSessionId, PositionReporter, Sender, SubtitlePipeline,
-    VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
-    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE,
-    VIDEO_OUTPUT_START_FAST_READY_DURATION, VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER,
-    VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, VideoDecodeWorkerSnapshot, VideoOutputQueue,
+    VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER,
+    VideoDecodeWorkerSnapshot, VideoDecodeWorkerState, VideoOutputQueue,
     audio_output_buffered_until_for_resume, audio_output_contiguous_start_timeline_nsecs,
     discard_decoded_video_before_output_gate_resume_if_ready, duration_nsecs,
-    flush_pending_start_audio, initial_delayed_audio_start_timeline_nsecs,
-    initial_first_frame_resume_waterline_after_cached_seek_wait,
-    initial_playback_resume_waterline_after_stale_audio_preroll_wait, nsecs_to_seconds,
-    present_first_queued_video_frame, rebuffer_playback_resume_waterline_after_cache_pause,
+    flush_pending_start_audio, initial_start_admission, playback_resume_waterline_blocked_on,
+    rebuffer_playback_resume_waterline_after_cache_pause,
     rebuffer_playback_resume_waterline_after_prolonged_wait,
     service_initial_video_clock_until_audio_start, timed_output_gate_demux_watermark,
 };
+use crate::player::render_host::FramePixels;
 
 pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) const
     MAX_REBUFFER_AUDIO_LEAD_NSECS: u64 = 2_000_000_000;
-const HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) enum StaleRebufferPendingAudio {
@@ -40,6 +39,9 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) enum StaleReb
 pub(in crate::player::backend::ffmpeg) enum OutputGateResumeStatus {
     Idle,
     Waiting,
+    Rebuffering,
+    WaitingForDecodedVideo,
+    WaitingForDecodedAudio,
     WaitingForDemux,
     Resumed,
 }
@@ -76,78 +78,91 @@ struct RebufferAudioPrefillStatus {
     delayed_audio_start: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebufferSchedulerResumePlan {
+    DelayBy(Duration),
+    ResetTo(u64),
+}
+
+fn rebuffer_scheduler_resume_plan(
+    reset_video_clock_anchor: bool,
+    first_video_timeline_nsecs: u64,
+    resume_timeline_nsecs: u64,
+    rebuffer_elapsed: Duration,
+) -> RebufferSchedulerResumePlan {
+    if reset_video_clock_anchor {
+        RebufferSchedulerResumePlan::ResetTo(first_video_timeline_nsecs.max(resume_timeline_nsecs))
+    } else {
+        RebufferSchedulerResumePlan::DelayBy(rebuffer_elapsed)
+    }
+}
+
+fn apply_rebuffer_scheduler_resume_plan(
+    scheduler: &mut PlaybackScheduler,
+    plan: RebufferSchedulerResumePlan,
+) {
+    match plan {
+        RebufferSchedulerResumePlan::DelayBy(elapsed) => scheduler.delay_by(elapsed),
+        RebufferSchedulerResumePlan::ResetTo(timeline_nsecs) => scheduler.reset(timeline_nsecs),
+    }
+}
+
 impl RebufferAudioPrefillStatus {
     fn ready(self) -> bool {
         self.pending_audio_forward_nsecs >= self.target_nsecs
     }
 }
 
-fn hevc_startup_recent_zero_output_or_recovery(stats: HevcDecodeChainStats) -> bool {
-    stats.recent_zero_output_packets > 0
-        || stats.recent_soft_recovery_attempted
-        || stats.pending_fallback_reason.is_some()
-}
-
-fn hevc_startup_active_recovery(stats: HevcDecodeChainStats) -> bool {
-    stats.zero_output_packets > 0
-        || stats.soft_recovery_attempted
-        || stats.pending_fallback_reason.is_some()
-}
-
-fn hevc_startup_hard_bounded_start_ready(
-    after: PlaybackResumeWaterline,
-    queued_video_frames: usize,
-    hevc_decode_chain_stats: HevcDecodeChainStats,
-    startup_sync_elapsed: Option<Duration>,
-) -> bool {
-    // Historical recovery evidence must not keep a healthy, decoded startup in
-    // Syncing forever. Active recovery and pending fallback still take priority.
-    queued_video_frames >= 2
-        && after
-            .decoded_video_forward_nsecs
-            .is_some_and(|forward_nsecs| forward_nsecs > 0)
-        && startup_sync_elapsed
-            .is_some_and(|elapsed| elapsed >= HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER)
-        && !hevc_startup_active_recovery(hevc_decode_chain_stats)
-}
-
-fn hevc_startup_gate_defer_reason(
-    video_is_hevc: bool,
-    before: PlaybackResumeWaterline,
-    after: PlaybackResumeWaterline,
-    queued_video_frames: usize,
-    hevc_decode_chain_stats: HevcDecodeChainStats,
-    startup_sync_elapsed: Option<Duration>,
-) -> Option<&'static str> {
-    if !video_is_hevc || before.decoded_video_ready || !after.decoded_video_ready {
-        return None;
+fn initial_start_wait_status(admission: InitialStartAdmission) -> OutputGateResumeStatus {
+    let InitialStartAdmission::Waiting(reason) = admission else {
+        return OutputGateResumeStatus::Waiting;
+    };
+    match reason {
+        super::InitialStartBlockReason::NoAudioFrame
+        | super::InitialStartBlockReason::NoAudioCoverage
+        | super::InitialStartBlockReason::AudioVideoOffset => {
+            OutputGateResumeStatus::WaitingForDecodedAudio
+        }
+        super::InitialStartBlockReason::NoVideoFrame
+        | super::InitialStartBlockReason::ActiveRecovery
+        | super::InitialStartBlockReason::InsufficientLookahead
+        | super::InitialStartBlockReason::SingleFrameNotVulkan
+        | super::InitialStartBlockReason::TargetFrameNotConfirmed
+        | super::InitialStartBlockReason::FrameNotConfirmedClean => {
+            OutputGateResumeStatus::WaitingForDecodedVideo
+        }
     }
-    let hard_bounded_start_ready = hevc_startup_hard_bounded_start_ready(
-        after,
-        queued_video_frames,
-        hevc_decode_chain_stats,
-        startup_sync_elapsed,
+}
+
+fn log_initial_sync_observation(
+    output_scheduler: &mut PlaybackOutputScheduler,
+    session_id: PlaybackSessionId,
+    observation: InitialSyncLogObservation,
+    now: Instant,
+) {
+    let decision = output_scheduler.observe_initial_sync_log(observation, now);
+    let (log_kind, repeated_observations) = match decision {
+        InitialSyncLogDecision::Changed { suppressed_repeats } => ("changed", suppressed_repeats),
+        InitialSyncLogDecision::Summary {
+            repeated_observations,
+        } => ("summary", repeated_observations),
+        InitialSyncLogDecision::Suppressed => return,
+    };
+    tracing::debug!(
+        session_id = ?session_id,
+        target = observation.target_nsecs,
+        first_video = ?observation.first_video_nsecs,
+        first_audio = ?observation.first_audio_nsecs,
+        decoded_video = ?observation.decoded_video_nsecs,
+        decoded_audio = ?observation.decoded_audio_nsecs,
+        demux_min = ?observation.demux_min_nsecs,
+        blocked_on = observation.blocked_on,
+        due_kind = observation.due_kind.as_str(),
+        output_generation = output_scheduler.output_housekeeping_generation,
+        log_kind,
+        repeated_observations,
+        "FFmpeg output gate initial-sync decision"
     );
-    if hevc_startup_recent_zero_output_or_recovery(hevc_decode_chain_stats)
-        && !hard_bounded_start_ready
-    {
-        return Some("recent_zero_output_or_recovery");
-    }
-    if queued_video_frames < 2 {
-        return Some("insufficient_lookahead_frames");
-    }
-    let decoded_video_forward_nsecs = after.decoded_video_forward_nsecs.unwrap_or_default();
-    let bounded_startup_fallback_ready = decoded_video_forward_nsecs
-        >= duration_nsecs(VIDEO_OUTPUT_START_FAST_READY_DURATION)
-        && startup_sync_elapsed
-            .is_some_and(|elapsed| elapsed >= VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER);
-    if decoded_video_forward_nsecs < duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
-        && !bounded_startup_fallback_ready
-        && !hard_bounded_start_ready
-    {
-        return Some("decoded_video_below_hevc_startup_waterline");
-    }
-    None
 }
 
 fn output_gate_resume_log_context(
@@ -190,15 +205,15 @@ fn finish_output_gate_resume_timing(context: OutputGateResumeLogContext) -> Outp
         decoded_ready = ?context.waterline.map(PlaybackResumeWaterline::decoded_ready),
         target_ms = ?context.waterline.map(|waterline| waterline.target_nsecs as f64 / 1_000_000.0),
         decoded_video_ms = ?context.waterline
-            .and_then(|waterline| waterline.decoded_video_forward_nsecs)
+            .and_then(|waterline| waterline.decoded_output.video_forward_nsecs)
             .map(|duration| duration as f64 / 1_000_000.0),
         decoded_audio_ms = ?context.waterline
-            .and_then(|waterline| waterline.decoded_audio_forward_nsecs)
+            .and_then(|waterline| waterline.decoded_output.audio_forward_nsecs)
             .map(|duration| duration as f64 / 1_000_000.0),
         resume_anchor_source = ?context.waterline
             .map(|waterline| waterline.resume_anchor_source.as_str()),
         audio_start_gap_ms = ?context.waterline
-            .and_then(|waterline| waterline.delayed_audio_start_gap_nsecs)
+            .and_then(|waterline| waterline.decoded_output.delayed_audio_start_gap_nsecs)
             .map(|gap| gap as f64 / 1_000_000.0),
         allow_audio_gap_at_video_resume = ?context.waterline
             .map(|waterline| waterline.allow_audio_gap_at_video_resume),
@@ -216,7 +231,7 @@ fn finish_output_gate_resume_timing(context: OutputGateResumeLogContext) -> Outp
             .and_then(|waterline| waterline.audio_resume_waterline)
             .and_then(|audio| audio.demux_audio_cached_packets),
         demux_min_ms = ?context.waterline
-            .and_then(|waterline| waterline.demux_min_forward_nsecs)
+            .and_then(|waterline| waterline.prefetch.min_forward_nsecs)
             .map(|duration| duration as f64 / 1_000_000.0),
         "FFmpeg output gate resume timing"
     );
@@ -249,15 +264,15 @@ fn finish_output_gate_resume_timing(context: OutputGateResumeLogContext) -> Outp
         decoded_ready = ?context.waterline.map(PlaybackResumeWaterline::decoded_ready),
         target_ms = ?context.waterline.map(|waterline| waterline.target_nsecs as f64 / 1_000_000.0),
         decoded_video_ms = ?context.waterline
-            .and_then(|waterline| waterline.decoded_video_forward_nsecs)
+            .and_then(|waterline| waterline.decoded_output.video_forward_nsecs)
             .map(|duration| duration as f64 / 1_000_000.0),
         decoded_audio_ms = ?context.waterline
-            .and_then(|waterline| waterline.decoded_audio_forward_nsecs)
+            .and_then(|waterline| waterline.decoded_output.audio_forward_nsecs)
             .map(|duration| duration as f64 / 1_000_000.0),
         resume_anchor_source = ?context.waterline
             .map(|waterline| waterline.resume_anchor_source.as_str()),
         audio_start_gap_ms = ?context.waterline
-            .and_then(|waterline| waterline.delayed_audio_start_gap_nsecs)
+            .and_then(|waterline| waterline.decoded_output.delayed_audio_start_gap_nsecs)
             .map(|gap| gap as f64 / 1_000_000.0),
         allow_audio_gap_at_video_resume = ?context.waterline
             .map(|waterline| waterline.allow_audio_gap_at_video_resume),
@@ -275,7 +290,7 @@ fn finish_output_gate_resume_timing(context: OutputGateResumeLogContext) -> Outp
             .and_then(|waterline| waterline.audio_resume_waterline)
             .and_then(|audio| audio.demux_audio_cached_packets),
         demux_min_ms = ?context.waterline
-            .and_then(|waterline| waterline.demux_min_forward_nsecs)
+            .and_then(|waterline| waterline.prefetch.min_forward_nsecs)
             .map(|duration| duration as f64 / 1_000_000.0),
         "FFmpeg output gate resume completed slowly"
     );
@@ -378,7 +393,7 @@ fn enforce_rebuffer_audio_prefill_waterline(
         return waterline;
     }
 
-    waterline.decoded_audio_ready = false;
+    waterline.decoded_output.audio_ready = false;
     if let Some(mut audio_waterline) = waterline.audio_resume_waterline {
         audio_waterline.target_nsecs = prefill.target_nsecs;
         audio_waterline.pending_audio_forward_nsecs = Some(prefill.pending_audio_forward_nsecs);
@@ -493,7 +508,7 @@ fn clear_stale_rebuffer_pending_audio_if_needed(
             output_scheduler.pending_start_audio.clear();
             output_scheduler.set_rebuffer_empty_audio_output_blocked(false);
             output.reset_clock(resume_timeline_nsecs);
-            tracing::debug!(
+            tracing::warn!(
                 session_id = ?session_id,
                 resume_timeline_nsecs,
                 pending_audio_start_nsecs = pending_start_nsecs,
@@ -502,6 +517,9 @@ fn clear_stale_rebuffer_pending_audio_if_needed(
                     / 1_000_000.0,
                 cleared_pending_audio_frames,
                 cleared_pending_audio_ms,
+                skipped_content_ms = pending_start_nsecs
+                    .saturating_sub(resume_timeline_nsecs) as f64
+                    / 1_000_000.0,
                 "discarded stale rebuffer pending audio ahead of video resume"
             );
         }
@@ -529,6 +547,14 @@ fn clear_stale_rebuffer_pending_audio_if_needed(
                 output_scheduler.pending_start_audio.clear();
                 remaining_frames
             };
+            let pending_audio_ms_after = output_scheduler
+                .pending_start_audio
+                .buffered_duration()
+                .as_secs_f64()
+                * 1000.0;
+            let dropped_audio_frames = discarded_before_resume_frames
+                .saturating_add(cleared_discontinuous_pending_audio_frames);
+            let dropped_audio_ms = (pending_audio_ms_before - pending_audio_ms_after).max(0.0);
             output_scheduler.set_audio_sync_drop_before_timeline_nsecs(
                 resume_timeline_nsecs,
                 session_id,
@@ -541,7 +567,7 @@ fn clear_stale_rebuffer_pending_audio_if_needed(
             );
             output_scheduler.set_rebuffer_empty_audio_output_blocked(false);
             output.reset_clock(resume_timeline_nsecs);
-            tracing::debug!(
+            tracing::warn!(
                 session_id = ?session_id,
                 resume_timeline_nsecs,
                 pending_audio_start_nsecs = pending_start_nsecs,
@@ -551,6 +577,11 @@ fn clear_stale_rebuffer_pending_audio_if_needed(
                     / 1_000_000.0,
                 pending_audio_frames_before,
                 pending_audio_ms_before,
+                dropped_audio_frames,
+                dropped_audio_ms,
+                skipped_content_ms = resume_timeline_nsecs
+                    .saturating_sub(pending_start_nsecs) as f64
+                    / 1_000_000.0,
                 discarded_before_resume_frames,
                 cleared_discontinuous_pending_audio_frames,
                 pending_audio_frames_after = output_scheduler.pending_start_audio.len(),
@@ -610,21 +641,26 @@ pub(in crate::player::backend::ffmpeg) fn service_output_gate_resume_if_ready<F>
     current_start_position_nsecs: &mut u64,
     scheduler: &mut PlaybackScheduler,
     output_resource_pressure: bool,
-    audio_decode_queued_nsecs: u64,
+    audio_decode_queued_nsecs_snapshot: Option<u64>,
     audio_decode_in_flight_packets: usize,
     demux_audio_cached_packets: Option<usize>,
     demux_read_index: Option<usize>,
     video_decoder_pending_packets: usize,
     video_decode_snapshot: VideoDecodeWorkerSnapshot,
     video_is_hevc: bool,
+    hevc_cached_exact_seek: bool,
+    hevc_cached_exact_landing_nsecs: Option<u64>,
     hevc_decode_chain_stats: HevcDecodeChainStats,
+    output_service_demand: OutputServiceDemand,
     mut demux_watermark: F,
 ) -> std::result::Result<OutputGateResumeStatus, String>
 where
     F: FnMut() -> DemuxReaderWatermark,
 {
     let started_at = Instant::now();
+    let audio_decode_queued_nsecs = audio_decode_queued_nsecs_snapshot.unwrap_or_default();
     let mut timing = OutputGateResumeTiming::default();
+    output_scheduler.mark_output_housekeeping_serviced();
     output_scheduler.set_rebuffer_empty_audio_output_blocked(false);
     let Some(output) = output else {
         return Ok(finish_output_gate_resume_timing(
@@ -638,10 +674,50 @@ where
             ),
         ));
     };
-    if !output_scheduler
-        .playback_output_state
-        .first_video_frame_pending()
-        && !output_scheduler.playback_output_state.rebuffering()
+    if let Some(transaction) = output_scheduler.initial_av_start_transaction() {
+        if !output_service_demand.audio_start_due() && !output_service_demand.hard_deadline_due() {
+            return Ok(finish_output_gate_resume_timing(
+                output_gate_resume_log_context(
+                    output_scheduler,
+                    session_id,
+                    started_at,
+                    timing,
+                    OutputGateResumeStatus::Waiting,
+                    None,
+                ),
+            ));
+        }
+        let stage_started_at = Instant::now();
+        let status = service_initial_video_clock_until_audio_start(
+            output_scheduler,
+            output,
+            demux_cache,
+            transaction.audio_start_target_nsecs,
+            audio_decode_queued_nsecs_snapshot,
+            control,
+            session_id,
+            vo_queue,
+            frame_presented,
+            position_reporter,
+            event_tx,
+            subtitle_pipeline,
+            buffered_reporter,
+            current_start_position_nsecs,
+            scheduler,
+        )?;
+        timing.resume_action += stage_started_at.elapsed();
+        return Ok(finish_output_gate_resume_timing(
+            output_gate_resume_log_context(
+                output_scheduler,
+                session_id,
+                started_at,
+                timing,
+                status,
+                None,
+            ),
+        ));
+    }
+    if !output_scheduler.restart_pending() && !output_scheduler.playback_output_state.rebuffering()
     {
         return Ok(finish_output_gate_resume_timing(
             output_gate_resume_log_context(
@@ -655,10 +731,7 @@ where
         ));
     }
     if output_scheduler.scheduled_video_queue.is_empty() {
-        if output_scheduler
-            .playback_output_state
-            .first_video_frame_pending()
-        {
+        if output_scheduler.playback_output_state.restart_pending() {
             let stage_started_at = Instant::now();
             let audio_snapshot = output.snapshot()?;
             timing.audio_snapshot = stage_started_at.elapsed();
@@ -675,78 +748,33 @@ where
                 demux_audio_cached_packets,
             );
             timing.waterline = stage_started_at.elapsed();
-            tracing::debug!(
-                session_id = ?session_id,
-                playback_output_state = ?output_scheduler.playback_output_state,
-                queued_video_frames = 0,
-                first_video_frame_pending = true,
-                current_start_position_nsecs = *current_start_position_nsecs,
-                audio_played_timeline_nsecs = audio_snapshot.played_timeline_nsecs,
-                pending_audio_frames = output_scheduler.pending_start_audio.len(),
-                pending_audio_ms = output_scheduler
+            let observation = InitialSyncLogObservation {
+                target_nsecs: fallback_timeline_nsecs,
+                first_video_nsecs: None,
+                first_audio_nsecs: output_scheduler
                     .pending_start_audio
-                    .buffered_duration()
-                    .as_secs_f64()
-                    * 1000.0,
-                audio_output_pending_ms =
-                    audio_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
-                audio_decode_queued_ms = audio_decode_queued_nsecs as f64 / 1_000_000.0,
-                audio_decode_in_flight_packets,
-                demux_video_forward_ms = ?waterline_demux_watermark
-                    .video_forward_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                demux_audio_forward_ms = ?waterline_demux_watermark
-                    .audio_forward_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                demux_min_forward_ms = ?waterline_demux_watermark
-                    .selected_min_forward_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                demux_audio_cached_packets,
-                audio_waterline_ready = ?audio_waterline.map(|waterline| waterline.ready),
-                audio_waterline_resume_timeline_nsecs =
-                    ?audio_waterline.map(|waterline| waterline.resume_timeline_nsecs),
-                audio_waterline_decoded_ms = ?audio_waterline
-                    .and_then(|waterline| waterline.decoded_audio_forward_nsecs)
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                audio_waterline_pending_ms = ?audio_waterline
-                    .and_then(|waterline| waterline.pending_audio_forward_nsecs)
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                pending_audio_pressure_context =
-                    output_scheduler.pending_audio_pressure_context().as_str(),
-                video_decode_state = ?video_decode_snapshot.state,
-                video_decode_queued_frames = video_decode_snapshot.queued_frames,
-                video_decode_in_flight_packets = video_decode_snapshot.in_flight_packets,
-                video_decode_completed_packets = video_decode_snapshot.completed_packets,
-                video_decode_pending_input_packets =
-                    video_decode_snapshot.pending_input_packets,
-                video_decode_pending_input_full =
-                    video_decode_snapshot.pending_input_full(),
-                video_decoder_pending_packets,
-                hevc_zero_output_packets = hevc_decode_chain_stats.zero_output_packets,
-                recent_hevc_zero_output_packets =
-                    hevc_decode_chain_stats.recent_zero_output_packets,
-                hevc_soft_recovery_attempted =
-                    hevc_decode_chain_stats.soft_recovery_attempted,
-                recent_hevc_soft_recovery_attempted =
-                    hevc_decode_chain_stats.recent_soft_recovery_attempted,
-                hevc_first_zero_output_packet_nsecs =
-                    ?hevc_decode_chain_stats.first_zero_output_packet_nsecs,
-                hevc_last_video_packet_nsecs =
-                    ?hevc_decode_chain_stats.last_video_packet_nsecs,
-                hevc_last_decoded_video_end_nsecs =
-                    ?hevc_decode_chain_stats.last_decoded_video_end_nsecs,
-                hevc_pending_fallback =
-                    ?hevc_decode_chain_stats.pending_fallback_reason.map(|reason| reason.as_str()),
-                "FFmpeg output gate waiting for first decoded video frame before startup resume"
-            );
+                    .first_start_timeline_nsecs(),
+                decoded_video_nsecs: None,
+                decoded_audio_nsecs: audio_waterline
+                    .and_then(|waterline| waterline.decoded_audio_forward_nsecs),
+                demux_min_nsecs: waterline_demux_watermark.selected_min_forward_nsecs,
+                blocked_on: "no_video_frame",
+                due_kind: output_service_demand,
+            };
+            log_initial_sync_observation(output_scheduler, session_id, observation, Instant::now());
         }
+        let empty_queue_status = if output_scheduler.playback_output_state.restart_pending() {
+            OutputGateResumeStatus::WaitingForDecodedVideo
+        } else {
+            OutputGateResumeStatus::Idle
+        };
         return Ok(finish_output_gate_resume_timing(
             output_gate_resume_log_context(
                 output_scheduler,
                 session_id,
                 started_at,
                 timing,
-                OutputGateResumeStatus::Idle,
+                empty_queue_status,
                 None,
             ),
         ));
@@ -773,9 +801,7 @@ where
     } else {
         None
     };
-    let first_video_frame_pending = output_scheduler
-        .playback_output_state
-        .first_video_frame_pending();
+    let first_video_frame_pending = output_scheduler.restart_pending();
     let mut initial_sync_decision = None;
     let mut resume_decision = if first_video_frame_pending {
         let sync_decision = output_scheduler
@@ -832,53 +858,6 @@ where
     let resume_audio_output_buffered_until_nsecs =
         audio_output_buffered_until_for_resume(resume_decision, audio_output_buffered_until_nsecs);
     if let Some(sync_decision) = initial_sync_decision {
-        let first_video_timeline_nsecs = output_scheduler
-            .scheduled_video_queue
-            .range_nsecs()
-            .map(|(start, _)| start);
-        let pending_audio_buffered_until_nsecs =
-            sync_decision
-                .audio_start_timeline_nsecs
-                .and_then(|audio_start| {
-                    output_scheduler
-                        .pending_start_audio
-                        .buffered_until_from(audio_start)
-                });
-        let audio_minus_video_ms = first_video_timeline_nsecs
-            .zip(sync_decision.audio_start_timeline_nsecs)
-            .map(|(video_start, audio_start)| {
-                (audio_start as i128 - video_start as i128) as f64 / 1_000_000.0
-            });
-        let sync_reason = if sync_decision.delayed_audio_start_timeline_nsecs.is_some() {
-            "initial_video_clock_until_delayed_audio"
-        } else if sync_decision.allow_initial_audio_gap_at_video_start {
-            "initial_skip_audio_preroll_before_video"
-        } else if sync_decision.stale_audio_preroll_gap_nsecs.is_some() {
-            "initial_wait_after_audio_preroll_gap"
-        } else {
-            "initial_audio_video_start"
-        };
-        tracing::debug!(
-            session_id = ?session_id,
-            first_video_timeline_nsecs = ?first_video_timeline_nsecs,
-            first_audio_timeline_nsecs = ?sync_decision.audio_start_timeline_nsecs,
-            pending_audio_buffered_until_nsecs = ?pending_audio_buffered_until_nsecs,
-            video_resume_timeline_nsecs = sync_decision.video_resume_timeline_nsecs,
-            delayed_audio_start_timeline_nsecs =
-                ?sync_decision.delayed_audio_start_timeline_nsecs,
-            audio_minus_video_ms = ?audio_minus_video_ms,
-            stale_audio_preroll_until_nsecs = ?sync_decision.stale_audio_preroll_until_nsecs,
-            stale_audio_preroll_gap_ms = ?sync_decision
-                .stale_audio_preroll_gap_nsecs
-                .map(|gap| gap as f64 / 1_000_000.0),
-            drop_audio_before_timeline_nsecs =
-                ?sync_decision.drop_audio_before_timeline_nsecs,
-            allow_initial_audio_gap_at_video_start =
-                sync_decision.allow_initial_audio_gap_at_video_start,
-            waterline_timeline_nsecs = sync_decision.video_resume_timeline_nsecs,
-            sync_reason,
-            "FFmpeg output gate initial sync decision"
-        );
         if sync_decision.allow_initial_audio_gap_at_video_start {
             output_scheduler.initial_audio_gap_at_video_start_timeline_nsecs =
                 Some(sync_decision.video_resume_timeline_nsecs);
@@ -949,155 +928,151 @@ where
         waterline.audio_resume_waterline = Some(audio_resume_waterline);
     }
     timing.waterline = stage_started_at.elapsed();
-    let stage_started_at = Instant::now();
-    if first_video_frame_pending && !waterline.ready() {
-        let stale_preroll_waterline =
-            initial_playback_resume_waterline_after_stale_audio_preroll_wait(
-                waterline,
-                initial_sync_decision,
-                output_scheduler.startup_sync_elapsed(),
-            );
-        if !waterline.decoded_audio_ready && stale_preroll_waterline.decoded_audio_ready {
-            tracing::debug!(
-                session_id = ?session_id,
-                startup_wait_ms = output_scheduler
-                    .startup_sync_elapsed()
-                    .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
-                target_ms = waterline.target_nsecs as f64 / 1_000_000.0,
-                decoded_video_ms = ?waterline
-                    .decoded_video_forward_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                decoded_audio_ms = ?waterline
-                    .decoded_audio_forward_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                demux_ready = waterline.demux_ready,
-                stale_audio_preroll_gap_ms = ?initial_sync_decision
-                    .and_then(|decision| decision.stale_audio_preroll_gap_nsecs)
-                    .map(|gap| gap as f64 / 1_000_000.0),
-                "startup output gate stale audio preroll timed out; allowing video-clocked start"
-            );
+    let mut initial_admission = None;
+    if first_video_frame_pending {
+        let sync_decision = initial_sync_decision.expect("initial sync decision exists");
+        let (
+            first_video_nsecs,
+            first_video_duration_nsecs,
+            first_following_video_gap_nsecs,
+            first_frame_is_vulkan,
+            first_frame_confirmed_clean,
+        ) = output_scheduler
+            .scheduled_video_queue
+            .with_frames(|frames| {
+                let first = frames.front();
+                (
+                    first.map(|frame| frame.timeline_nsecs),
+                    first.map(|frame| frame.duration_nsecs),
+                    first.and_then(|first| {
+                        frames.get(1).map(|following| {
+                            following.timeline_nsecs.saturating_sub(
+                                first.timeline_nsecs.saturating_add(first.duration_nsecs),
+                            )
+                        })
+                    }),
+                    first.is_some_and(|frame| {
+                        matches!(&frame.frame.pixels, FramePixels::VulkanVideo(_))
+                    }),
+                    first.is_some(),
+                )
+            });
+        // Corrupt/decode-error frames are rejected before they can enter the
+        // scheduled output queue, so reaching this queue confirms a clean frame.
+        let contiguous_video_frames = first_video_nsecs
+            .map(|timeline_nsecs| {
+                output_scheduler
+                    .scheduled_video_queue
+                    .contiguous_frame_count_from(timeline_nsecs)
+            })
+            .unwrap_or_default();
+        let strict_video_forward_nsecs = first_video_nsecs.and_then(|timeline_nsecs| {
+            output_scheduler
+                .scheduled_video_queue
+                .strict_forward_nsecs_from(timeline_nsecs)
+        });
+        let active_recovery = output_scheduler.decode_recovery_active()
+            || video_decode_snapshot.state == VideoDecodeWorkerState::Recovering
+            || (video_is_hevc && hevc_decode_chain_stats.pending_fallback_reason.is_some());
+        let evaluation = initial_start_admission(InitialStartAdmissionInput {
+            expected_target_nsecs: fallback_timeline_nsecs,
+            first_video_nsecs,
+            first_audio_nsecs: sync_decision.audio_start_timeline_nsecs,
+            decoded_video_forward_nsecs: waterline.decoded_output.video_forward_nsecs,
+            strict_video_forward_nsecs,
+            decoded_audio_forward_nsecs: waterline.decoded_output.audio_forward_nsecs,
+            contiguous_video_frames,
+            first_video_duration_nsecs,
+            first_following_video_gap_nsecs,
+            first_frame_is_vulkan,
+            first_frame_confirmed_clean,
+            active_recovery,
+            require_strict_fast_lookahead: video_is_hevc && hevc_cached_exact_seek,
+            cached_exact_landing_nsecs: (video_is_hevc && hevc_cached_exact_seek)
+                .then_some(hevc_cached_exact_landing_nsecs)
+                .flatten(),
+            startup_sync_elapsed: output_scheduler.startup_sync_elapsed(),
+        });
+        let now = Instant::now();
+        if evaluation.pair.is_some() {
+            output_scheduler.note_initial_av_pair(now);
         }
-        waterline = stale_preroll_waterline;
-    }
-    timing.fallback += stage_started_at.elapsed();
-    let stage_started_at = Instant::now();
-    if output_scheduler
-        .playback_output_state
-        .first_video_frame_pending()
-        && !waterline.ready()
-        && waterline.decoded_ready()
-        && output_scheduler
-            .startup_sync_elapsed()
-            .is_some_and(|elapsed| elapsed >= VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER)
-    {
-        tracing::debug!(
-            session_id = ?session_id,
-            startup_wait_ms = output_scheduler
-                .startup_sync_elapsed()
-                .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
-            target_ms = waterline.target_nsecs as f64 / 1_000_000.0,
-            decoded_video_ms = ?waterline
-                .decoded_video_forward_nsecs
-                .map(|duration| duration as f64 / 1_000_000.0),
-            decoded_audio_ms = ?waterline
-                .decoded_audio_forward_nsecs
-                .map(|duration| duration as f64 / 1_000_000.0),
-            demux_min_ms = ?waterline
-                .demux_min_forward_nsecs
-                .map(|duration| duration as f64 / 1_000_000.0),
-            demux_video_ms = ?waterline
-                .demux_video_forward_nsecs
-                .map(|duration| duration as f64 / 1_000_000.0),
-            demux_audio_ms = ?waterline
-                .demux_audio_forward_nsecs
-                .map(|duration| duration as f64 / 1_000_000.0),
-            "startup output gate demux waterline timed out; allowing decoded queues to start"
+        log_initial_sync_observation(
+            output_scheduler,
+            session_id,
+            InitialSyncLogObservation {
+                target_nsecs: fallback_timeline_nsecs,
+                first_video_nsecs,
+                first_audio_nsecs: sync_decision.audio_start_timeline_nsecs,
+                decoded_video_nsecs: waterline.decoded_output.video_forward_nsecs,
+                decoded_audio_nsecs: waterline.decoded_output.audio_forward_nsecs,
+                demux_min_nsecs: waterline.prefetch.min_forward_nsecs,
+                blocked_on: evaluation
+                    .admission
+                    .blocked_on()
+                    .map(InitialStartBlockReason::as_str)
+                    .unwrap_or("none"),
+                due_kind: output_service_demand,
+            },
+            now,
         );
-        waterline.demux_ready = true;
-    }
-    timing.fallback += stage_started_at.elapsed();
-    let stage_started_at = Instant::now();
-    if output_scheduler
-        .playback_output_state
-        .first_video_frame_pending()
-        && !waterline.ready()
-    {
-        let mut first_frame_waterline = initial_first_frame_resume_waterline_after_cached_seek_wait(
-            waterline,
-            output_scheduler.scheduled_video_queue.frames(),
-            initial_sync_decision,
-            output_scheduler.startup_sync_elapsed(),
-        );
-        let hevc_hard_bounded_start_ready = video_is_hevc
-            && hevc_startup_hard_bounded_start_ready(
-                first_frame_waterline,
-                output_scheduler.scheduled_video_queue.len(),
-                hevc_decode_chain_stats,
-                output_scheduler.startup_sync_elapsed(),
-            );
-        if let Some(reason) = hevc_startup_gate_defer_reason(
-            video_is_hevc,
-            waterline,
-            first_frame_waterline,
-            output_scheduler.scheduled_video_queue.len(),
-            hevc_decode_chain_stats,
-            output_scheduler.startup_sync_elapsed(),
-        ) {
-            first_frame_waterline.decoded_video_ready = false;
-            tracing::debug!(
-                session_id = ?session_id,
-                decoded_video_ms = ?waterline
-                    .decoded_video_forward_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                queued_frames = output_scheduler.scheduled_video_queue.len(),
-                target_ms = waterline.target_nsecs as f64 / 1_000_000.0,
-                recent_zero_output = hevc_startup_recent_zero_output_or_recovery(
-                    hevc_decode_chain_stats,
-                ),
-                hard_bounded_start_ready = hevc_hard_bounded_start_ready,
-                reason,
-                startup_wait_ms = output_scheduler
-                    .startup_sync_elapsed()
-                    .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
-                "hevc_startup_gate_defer"
-            );
+        match evaluation.admission {
+            InitialStartAdmission::Prime { pair, mode } => {
+                tracing::debug!(
+                    session_id = ?session_id,
+                    target = fallback_timeline_nsecs,
+                    decoded_video = ?waterline.decoded_output.video_forward_nsecs,
+                    decoded_audio = ?waterline.decoded_output.audio_forward_nsecs,
+                    demux_min = ?waterline.prefetch.min_forward_nsecs,
+                    blocked_on = "none",
+                    due_kind = output_service_demand.as_str(),
+                    admission_mode = mode.as_str(),
+                    video_anchor_nsecs = pair.video_anchor_nsecs,
+                    audio_start_target_nsecs = pair.audio_start_target_nsecs,
+                    "admitted bounded FFmpeg initial A/V output transaction"
+                );
+                let stage_started_at = Instant::now();
+                let status = service_initial_video_clock_until_audio_start(
+                    output_scheduler,
+                    output,
+                    demux_cache,
+                    pair.audio_start_target_nsecs,
+                    audio_decode_queued_nsecs_snapshot,
+                    control,
+                    session_id,
+                    vo_queue,
+                    frame_presented,
+                    position_reporter,
+                    event_tx,
+                    subtitle_pipeline,
+                    buffered_reporter,
+                    current_start_position_nsecs,
+                    scheduler,
+                )?;
+                timing.resume_action += stage_started_at.elapsed();
+                return Ok(finish_output_gate_resume_timing(
+                    output_gate_resume_log_context(
+                        output_scheduler,
+                        session_id,
+                        started_at,
+                        timing,
+                        status,
+                        Some(waterline),
+                    ),
+                ));
+            }
+            InitialStartAdmission::Waiting(reason) => {
+                if output_scheduler.initial_av_pair_watchdog_expired(now) {
+                    output_scheduler.fail_initial_av_start_transaction(
+                        control,
+                        session_id,
+                        "initial_av_pair_watchdog_expired",
+                    );
+                }
+                initial_admission = Some(InitialStartAdmission::Waiting(reason));
+            }
         }
-        if !waterline.decoded_video_ready && first_frame_waterline.decoded_video_ready {
-            tracing::debug!(
-                session_id = ?session_id,
-                startup_wait_ms = output_scheduler
-                    .startup_sync_elapsed()
-                    .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
-                queued_video_frames = output_scheduler.scheduled_video_queue.len(),
-                queued_video_ms =
-                    output_scheduler.scheduled_video_queue.duration().as_secs_f64() * 1000.0,
-                decoded_video_range =
-                    ?output_scheduler.scheduled_video_queue.range_nsecs(),
-                target_ms = waterline.target_nsecs as f64 / 1_000_000.0,
-                decoded_video_ms = ?waterline
-                    .decoded_video_forward_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                decoded_audio_ms = ?waterline
-                    .decoded_audio_forward_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                demux_min_ms = ?waterline
-                    .demux_min_forward_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                demux_video_ms = ?waterline
-                    .demux_video_forward_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                demux_audio_ms = ?waterline
-                    .demux_audio_forward_nsecs
-                    .map(|duration| duration as f64 / 1_000_000.0),
-                demux_read_index,
-                video_decoder_pending_packets,
-                hevc_hard_bounded_start_ready,
-                "startup output gate first video frame fallback; presenting first frame with cached demux ready"
-            );
-        }
-        waterline = first_frame_waterline;
     }
-    timing.fallback += stage_started_at.elapsed();
     let stage_started_at = Instant::now();
     if output_scheduler.playback_output_state.rebuffering() && !waterline.ready() {
         let demux_consumer_drainable = !waterline_demux_watermark.underrun
@@ -1105,7 +1080,8 @@ where
             && !waterline_demux_watermark.audio_underrun
             && waterline_demux_watermark.forward_bytes > 0
             && waterline
-                .demux_min_forward_nsecs
+                .prefetch
+                .min_forward_nsecs
                 .is_some_and(|duration| duration > 0);
         let cache_pause_waterline = rebuffer_playback_resume_waterline_after_cache_pause(
             waterline,
@@ -1124,24 +1100,24 @@ where
                     .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
                 target_ms = cache_pause_waterline.target_nsecs as f64 / 1_000_000.0,
                 decoded_video_ms = ?cache_pause_waterline
-                    .decoded_video_forward_nsecs
+                    .decoded_output.video_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 decoded_audio_ms = ?cache_pause_waterline
-                    .decoded_audio_forward_nsecs
+                    .decoded_output.audio_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 demux_min_ms = ?cache_pause_waterline
-                    .demux_min_forward_nsecs
+                    .prefetch.min_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 demux_target_shortfall_ms = ?cache_pause_waterline
-                    .demux_min_forward_nsecs
+                    .prefetch.min_forward_nsecs
                     .map(|duration| cache_pause_waterline.target_nsecs.saturating_sub(duration)
                         as f64
                         / 1_000_000.0),
                 demux_video_ms = ?cache_pause_waterline
-                    .demux_video_forward_nsecs
+                    .prefetch.video_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 demux_audio_ms = ?cache_pause_waterline
-                    .demux_audio_forward_nsecs
+                    .prefetch.audio_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 demux_forward_bytes = waterline_demux_watermark.forward_bytes,
                 demux_consumer_drainable,
@@ -1158,7 +1134,7 @@ where
             waterline,
             output_scheduler.rebuffer_wait_elapsed(),
         );
-        if !waterline.decoded_audio_ready
+        if !waterline.decoded_output.audio_ready
             && stalled_waterline.ready()
             && output_scheduler
                 .rebuffer_wait_elapsed()
@@ -1181,13 +1157,13 @@ where
                 allow_audio_gap_at_video_resume =
                     resume_decision.allow_audio_gap_at_video_resume,
                 decoded_video_ms = ?stalled_waterline
-                    .decoded_video_forward_nsecs
+                    .decoded_output.video_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 decoded_audio_ms = ?waterline
-                    .decoded_audio_forward_nsecs
+                    .decoded_output.audio_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 demux_min_ms = ?stalled_waterline
-                    .demux_min_forward_nsecs
+                    .prefetch.min_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 resume_reason = "forced_video_clock_resume_after_audio_gap",
                 "forced_video_clock_resume_after_audio_gap"
@@ -1202,13 +1178,13 @@ where
                 original_target_ms = waterline.target_nsecs as f64 / 1_000_000.0,
                 target_ms = stalled_waterline.target_nsecs as f64 / 1_000_000.0,
                 decoded_video_ms = ?stalled_waterline
-                    .decoded_video_forward_nsecs
+                    .decoded_output.video_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 decoded_audio_ms = ?stalled_waterline
-                    .decoded_audio_forward_nsecs
+                    .decoded_output.audio_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 demux_min_ms = ?stalled_waterline
-                    .demux_min_forward_nsecs
+                    .prefetch.min_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 "rebuffer output gate waited for stable decoded video target; resuming with available queues"
             );
@@ -1224,135 +1200,11 @@ where
     );
     waterline =
         enforce_rebuffer_audio_prefill_waterline(waterline, rebuffer_audio_prefill, session_id);
-    if waterline.ready()
-        && first_video_frame_pending
-        && let Some(sync_decision) = initial_sync_decision
-        && let Some(delayed_audio_start_timeline_nsecs) =
-            initial_delayed_audio_start_timeline_nsecs(output_scheduler, sync_decision)
-    {
-        let stage_started_at = Instant::now();
-        let status = service_initial_video_clock_until_audio_start(
-            output_scheduler,
-            output,
-            delayed_audio_start_timeline_nsecs,
-            control,
-            session_id,
-            vo_queue,
-            frame_presented,
-            position_reporter,
-            event_tx,
-            subtitle_pipeline,
-            buffered_reporter,
-            current_start_position_nsecs,
-            scheduler,
-        )?;
-        timing.resume_action += stage_started_at.elapsed();
-        return Ok(finish_output_gate_resume_timing(
-            output_gate_resume_log_context(
-                output_scheduler,
-                session_id,
-                started_at,
-                timing,
-                status,
-                Some(waterline),
-            ),
-        ));
-    }
-    if waterline.ready() && first_video_frame_pending {
-        let stage_started_at = Instant::now();
-        output_scheduler.set_state(PlaybackOutputState::Ready);
-        let Some(first_video) = present_first_queued_video_frame(
-            output_scheduler,
-            session_id,
-            vo_queue,
-            frame_presented,
-            position_reporter,
-            event_tx,
-            |first_video, output_scheduler| {
-                if first_video.timeline_nsecs > *current_start_position_nsecs {
-                    *current_start_position_nsecs = first_video.timeline_nsecs;
-                    scheduler.reset(first_video.timeline_nsecs);
-                    subtitle_pipeline.realign_cues_for_position(first_video.timeline_nsecs);
-                    buffered_reporter.reset_to(
-                        nsecs_to_seconds(first_video.timeline_nsecs),
-                        session_id,
-                        event_tx,
-                    );
-                }
-                output.reset_clock(first_video.timeline_nsecs);
-                tracing::debug!(
-                    session_id = ?session_id,
-                    pts = first_video.timeline_nsecs,
-                    output_scheduler.scheduled_video_queue =
-                        output_scheduler.scheduled_video_queue.len(),
-                    decoded_video_range =
-                        ?output_scheduler.scheduled_video_queue.range_nsecs(),
-                    queued_video_ms =
-                        output_scheduler.scheduled_video_queue.duration().as_secs_f64() * 1000.0,
-                    target_ms = waterline.target_nsecs as f64 / 1_000_000.0,
-                    demux_min_ms = ?waterline
-                        .demux_min_forward_nsecs
-                        .map(|duration| duration as f64 / 1_000_000.0),
-                    reset_audio_to_video = resume_decision.reset_audio_to_video,
-                    "presenting first FFmpeg video frame from output gate"
-                );
-            },
-        ) else {
-            timing.resume_action += stage_started_at.elapsed();
-            return Ok(finish_output_gate_resume_timing(
-                output_gate_resume_log_context(
-                    output_scheduler,
-                    session_id,
-                    started_at,
-                    timing,
-                    OutputGateResumeStatus::Waiting,
-                    Some(waterline),
-                ),
-            ));
-        };
-        let audio_start_timeline_nsecs = first_video.timeline_nsecs;
-        let audio_flush_until_timeline_nsecs = output_scheduler
-            .scheduled_video_queue
-            .buffered_until_from_nsecs(audio_start_timeline_nsecs)
-            .unwrap_or_else(|| {
-                first_video
-                    .timeline_nsecs
-                    .saturating_add(first_video.duration_nsecs)
-            });
-        flush_pending_start_audio(
-            &mut output_scheduler.pending_start_audio,
-            output,
-            audio_start_timeline_nsecs,
-            audio_flush_until_timeline_nsecs,
-            AudioClockMode::SyncingVideo,
-            DelayedAudioStartSilencePolicy::Skip,
-            control,
-            &mut output_scheduler.scheduled_video_queue,
-            session_id,
-            vo_queue,
-            frame_presented,
-            position_reporter,
-            event_tx,
-            subtitle_pipeline,
-            buffered_reporter,
-        )?;
-        output_scheduler.defer_next_pending_start_audio_flush_after_initial_start();
-        timing.resume_action += stage_started_at.elapsed();
-        return Ok(finish_output_gate_resume_timing(
-            output_gate_resume_log_context(
-                output_scheduler,
-                session_id,
-                started_at,
-                timing,
-                OutputGateResumeStatus::Resumed,
-                Some(waterline),
-            ),
-        ));
-    }
-    if waterline.ready()
-        && output_scheduler.playback_output_state.rebuffering()
-        && output_scheduler.finish_rebuffer_if_ready(waterline, session_id)
-    {
+    let rebuffer_ready = waterline.ready() && output_scheduler.playback_output_state.rebuffering();
+    let rebuffer_elapsed = rebuffer_ready
+        .then(|| output_scheduler.rebuffer_pause_elapsed())
+        .flatten();
+    if rebuffer_ready && output_scheduler.finish_rebuffer_if_ready(waterline, session_id) {
         let stage_started_at = Instant::now();
         // Keep pre-resume video while the restart waterline is still filling;
         // dropping it early can prevent the decoded window from ever catching up.
@@ -1370,6 +1222,41 @@ where
             .flatten();
         let (audio_start_timeline_nsecs, delayed_audio_start_silence_policy) =
             rebuffer_audio_flush_start(resume_decision, audio_snapshot);
+        let first_video_timeline_nsecs = output_scheduler
+            .scheduled_video_queue
+            .range_nsecs()
+            .map(|(start_nsecs, _)| start_nsecs)
+            .unwrap_or(resume_decision.timeline_nsecs);
+        let reset_video_clock_anchor = audio_snapshot.total_pending_nsecs == 0
+            || delayed_audio_start_timeline_nsecs.is_some()
+            || resume_decision.reset_audio_to_video
+            || output_scheduler.audio_gap_recovery_active();
+        let scheduler_resume_plan = rebuffer_scheduler_resume_plan(
+            reset_video_clock_anchor,
+            first_video_timeline_nsecs,
+            resume_decision.timeline_nsecs,
+            rebuffer_elapsed.unwrap_or_default(),
+        );
+        apply_rebuffer_scheduler_resume_plan(scheduler, scheduler_resume_plan);
+        output_scheduler.mark_video_clock_anchor_valid();
+        let scheduler_timeline_nsecs = scheduler.current_timeline_nsecs();
+        let scheduler_lateness_ms = (i128::from(scheduler_timeline_nsecs)
+            - i128::from(resume_decision.timeline_nsecs))
+            as f64
+            / 1_000_000.0;
+        tracing::debug!(
+            session_id = ?session_id,
+            scheduler_timeline_nsecs,
+            resume_timeline_nsecs = resume_decision.timeline_nsecs,
+            scheduler_lateness_ms,
+            rebuffer_elapsed_ms = ?rebuffer_elapsed
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0),
+            video_clock_anchor_valid = output_scheduler.video_clock_anchor_valid(),
+            first_video_timeline_nsecs,
+            reset_video_clock_anchor,
+            scheduler_resume_plan = ?scheduler_resume_plan,
+            "synchronized FFmpeg video scheduler after rebuffer"
+        );
         if delayed_audio_start_timeline_nsecs.is_some() || resume_decision.reset_audio_to_video {
             output.reset_clock(resume_decision.timeline_nsecs);
         }
@@ -1460,14 +1347,19 @@ where
             ),
         ));
     }
+    if waterline.ready() {
+        output_scheduler.clear_output_gate_block_log();
+    }
     if !waterline.ready() {
         if first_video_frame_pending
             && !output_scheduler.scheduled_video_queue.is_empty()
             && waterline
-                .demux_min_forward_nsecs
+                .prefetch
+                .min_forward_nsecs
                 .is_some_and(|duration| duration >= waterline.target_nsecs)
             && waterline
-                .decoded_video_forward_nsecs
+                .decoded_output
+                .video_forward_nsecs
                 .is_some_and(|duration| duration < waterline.target_nsecs)
             && output_scheduler
                 .startup_sync_elapsed()
@@ -1486,19 +1378,19 @@ where
                     ?output_scheduler.scheduled_video_queue.range_nsecs(),
                 target_ms = waterline.target_nsecs as f64 / 1_000_000.0,
                 decoded_video_ms = ?waterline
-                    .decoded_video_forward_nsecs
+                    .decoded_output.video_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 decoded_audio_ms = ?waterline
-                    .decoded_audio_forward_nsecs
+                    .decoded_output.audio_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 demux_min_ms = ?waterline
-                    .demux_min_forward_nsecs
+                    .prefetch.min_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 demux_video_ms = ?waterline
-                    .demux_video_forward_nsecs
+                    .prefetch.video_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 demux_audio_ms = ?waterline
-                    .demux_audio_forward_nsecs
+                    .prefetch.audio_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 demux_read_index,
                 video_decoder_pending_packets,
@@ -1522,30 +1414,44 @@ where
                 && (rebuffer_audio_prefill_blocked
                     || (audio_snapshot.total_pending_nsecs == 0
                         && !output_scheduler.pending_start_audio.is_empty()))
-                && !waterline.decoded_audio_ready;
+                && !waterline.decoded_output.audio_ready;
+        let blocked_on = playback_resume_waterline_blocked_on(waterline);
+        let block_detail = if rebuffer_empty_audio_output_blocked {
+            if rebuffer_audio_prefill_blocked {
+                "rebuffer_audio_prefill"
+            } else {
+                "rebuffer_empty_audio_output"
+            }
+        } else {
+            blocked_on.as_str()
+        };
+        let block_log_emission = output_scheduler.observe_output_gate_block_log(
+            blocked_on,
+            block_detail,
+            Instant::now(),
+        );
         output_scheduler
             .set_rebuffer_empty_audio_output_blocked(rebuffer_empty_audio_output_blocked);
-        if rebuffer_empty_audio_output_blocked {
+        if rebuffer_empty_audio_output_blocked && let Some(emission) = block_log_emission {
             let decoded_video_range = output_scheduler.scheduled_video_queue.range_nsecs();
             tracing::debug!(
                 session_id = ?session_id,
-                blocked_on = if rebuffer_audio_prefill_blocked {
-                    "rebuffer_audio_prefill"
-                } else {
-                    "rebuffer_empty_audio_output"
-                },
+                blocked_on = block_detail,
+                log_kind = emission.log_kind,
+                suppressed_repeats = emission.suppressed_repeats,
+                blocked_ms = emission.blocked_for.as_secs_f64() * 1000.0,
                 rebuffer_anchor_timeline_nsecs =
                     ?rebuffer_anchor.map(|anchor| anchor.timeline_nsecs),
                 first_video_timeline_nsecs = ?decoded_video_range.map(|(start, _)| start),
                 pending_audio_start_nsecs =
                     ?output_scheduler.pending_start_audio.first_start_timeline_nsecs(),
                 decoded_video_ms = ?waterline
-                    .decoded_video_forward_nsecs
+                    .decoded_output.video_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
                 decoded_audio_ms = ?waterline
-                    .decoded_audio_forward_nsecs
+                    .decoded_output.audio_forward_nsecs
                     .map(|duration| duration as f64 / 1_000_000.0),
-                decoded_audio_ready = waterline.decoded_audio_ready,
+                decoded_audio_ready = waterline.decoded_output.audio_ready,
                 allow_audio_gap_at_video_resume =
                     resume_decision.allow_audio_gap_at_video_resume,
                 reset_audio_to_video = resume_decision.reset_audio_to_video,
@@ -1564,22 +1470,39 @@ where
                 "FFmpeg output gate rebuffer waiting for audio output prefill"
             );
         }
-        output_scheduler
-            .scheduled_video_queue
-            .log_resume_waterline_wait(
-                session_id,
-                "output_gate",
-                output_scheduler.playback_output_state,
-                resume_decision.timeline_nsecs,
-                &output_scheduler.pending_start_audio,
-                waterline,
-                demux_watermark,
-                pending_audio_pressure_context.as_str(),
-                startup_pending_pressure_suppressed_hard_reset,
-            );
+        if !rebuffer_empty_audio_output_blocked && let Some(emission) = block_log_emission {
+            output_scheduler
+                .scheduled_video_queue
+                .log_resume_waterline_wait(
+                    session_id,
+                    "output_gate",
+                    output_scheduler.playback_output_state,
+                    resume_decision.timeline_nsecs,
+                    &output_scheduler.pending_start_audio,
+                    waterline,
+                    demux_watermark,
+                    pending_audio_pressure_context.as_str(),
+                    startup_pending_pressure_suppressed_hard_reset,
+                    emission.log_kind,
+                    emission.suppressed_repeats,
+                    emission.blocked_for,
+                );
+        }
         timing.wait_log += stage_started_at.elapsed();
     }
-    if waterline.decoded_ready() && !waterline.demux_ready {
+    if first_video_frame_pending && let Some(admission) = initial_admission {
+        return Ok(finish_output_gate_resume_timing(
+            output_gate_resume_log_context(
+                output_scheduler,
+                session_id,
+                started_at,
+                timing,
+                initial_start_wait_status(admission),
+                Some(waterline),
+            ),
+        ));
+    }
+    if waterline.decoded_ready() && !waterline.prefetch.ready {
         return Ok(finish_output_gate_resume_timing(
             output_gate_resume_log_context(
                 output_scheduler,
@@ -1607,8 +1530,10 @@ where
 mod tests {
     use crate::player::render_host::{DecodedFrame, FramePixels, FramePts, RenderSize};
 
-    use super::super::super::video_decode_pipeline::HevcDecodeChainFallbackReason;
-    use super::super::{DecodedAudio, QueuedVideoFrame, RebufferResumeAnchor};
+    use super::super::{
+        DecodedAudio, DecodedOutputReadiness, PrefetchReadiness, QueuedVideoFrame,
+        RebufferResumeAnchor,
+    };
     use super::*;
 
     fn test_audio_snapshot(played_timeline_nsecs: u64) -> AudioOutputSnapshot {
@@ -1620,6 +1545,7 @@ mod tests {
             total_pending_nsecs: 0,
             queue_frames: 0,
             queue_generation: 0,
+            ..AudioOutputSnapshot::default()
         }
     }
 
@@ -1645,39 +1571,63 @@ mod tests {
         PlaybackResumeWaterline {
             target_nsecs: 1_000_000_000,
             audio_resume_waterline: None,
-            decoded_video_forward_nsecs: Some(1_000_000_000),
-            decoded_audio_forward_nsecs: Some(1_000_000_000),
-            delayed_audio_start_gap_nsecs: None,
+            decoded_output: DecodedOutputReadiness {
+                video_forward_nsecs: Some(1_000_000_000),
+                audio_forward_nsecs: Some(1_000_000_000),
+                delayed_audio_start_gap_nsecs: None,
+                video_ready: true,
+                audio_ready: true,
+            },
+            prefetch: PrefetchReadiness {
+                video_forward_nsecs: Some(1_000_000_000),
+                audio_forward_nsecs: Some(1_000_000_000),
+                min_forward_nsecs: Some(1_000_000_000),
+                ready: true,
+            },
             allow_audio_gap_at_video_resume: true,
             resume_anchor_source: Default::default(),
-            demux_video_forward_nsecs: Some(1_000_000_000),
-            demux_audio_forward_nsecs: Some(1_000_000_000),
-            demux_min_forward_nsecs: Some(1_000_000_000),
-            decoded_video_ready: true,
-            decoded_audio_ready: true,
-            demux_ready: true,
         }
     }
 
-    fn startup_gate_waterline(
-        decoded_video_forward_nsecs: u64,
-        decoded_video_ready: bool,
-    ) -> PlaybackResumeWaterline {
-        PlaybackResumeWaterline {
-            target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
-            audio_resume_waterline: None,
-            decoded_video_forward_nsecs: Some(decoded_video_forward_nsecs),
-            decoded_audio_forward_nsecs: Some(250_000_000),
-            delayed_audio_start_gap_nsecs: None,
-            allow_audio_gap_at_video_resume: false,
-            resume_anchor_source: Default::default(),
-            demux_video_forward_nsecs: Some(1_000_000_000),
-            demux_audio_forward_nsecs: Some(1_000_000_000),
-            demux_min_forward_nsecs: Some(1_000_000_000),
-            decoded_video_ready,
-            decoded_audio_ready: true,
-            demux_ready: true,
-        }
+    #[test]
+    fn ordinary_rebuffer_resume_applies_pause_delay_to_scheduler() {
+        let mut scheduler = PlaybackScheduler::new(5_000_000_000);
+        scheduler.set_elapsed_for_test(Duration::from_millis(1_200));
+        let before_resume = scheduler.current_timeline_nsecs();
+        let plan = rebuffer_scheduler_resume_plan(
+            false,
+            5_000_000_000,
+            5_000_000_000,
+            Duration::from_secs(1),
+        );
+
+        apply_rebuffer_scheduler_resume_plan(&mut scheduler, plan);
+
+        assert_eq!(
+            plan,
+            RebufferSchedulerResumePlan::DelayBy(Duration::from_secs(1))
+        );
+        assert!(before_resume >= 6_190_000_000);
+        assert!(scheduler.current_timeline_nsecs() < 5_300_000_000);
+    }
+
+    #[test]
+    fn audio_gap_resume_reanchors_before_draining_one_point_six_seconds() {
+        let mut scheduler = PlaybackScheduler::new(0);
+        scheduler.set_elapsed_for_test(Duration::from_secs(4));
+        let plan = rebuffer_scheduler_resume_plan(
+            true,
+            10_000_000_000,
+            10_100_000_000,
+            Duration::from_secs(1),
+        );
+
+        apply_rebuffer_scheduler_resume_plan(&mut scheduler, plan);
+
+        assert_eq!(plan, RebufferSchedulerResumePlan::ResetTo(10_100_000_000));
+        assert!(!scheduler.ready_for(11_700_000_000));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(!scheduler.ready_for(11_700_000_000));
     }
 
     #[test]
@@ -1734,169 +1684,6 @@ mod tests {
                     .expect("long delayed start"),
                 DelayedAudioStartSilencePolicy::Skip,
             )
-        );
-    }
-
-    #[test]
-    fn hevc_startup_gate_defers_single_frame_after_recent_zero_output() {
-        let before = startup_gate_waterline(40_000_000, false);
-        let after = startup_gate_waterline(40_000_000, true);
-
-        assert_eq!(
-            hevc_startup_gate_defer_reason(
-                true,
-                before,
-                after,
-                1,
-                HevcDecodeChainStats {
-                    recent_zero_output_packets: 1,
-                    ..Default::default()
-                },
-                None,
-            ),
-            Some("recent_zero_output_or_recovery")
-        );
-    }
-
-    #[test]
-    fn hevc_startup_gate_requires_minimum_decoded_waterline() {
-        let before = startup_gate_waterline(80_000_000, false);
-        let after = startup_gate_waterline(80_000_000, true);
-
-        assert_eq!(
-            hevc_startup_gate_defer_reason(
-                true,
-                before,
-                after,
-                2,
-                HevcDecodeChainStats::default(),
-                None,
-            ),
-            Some("decoded_video_below_hevc_startup_waterline")
-        );
-    }
-
-    #[test]
-    fn hevc_startup_gate_allows_bounded_start_with_short_contiguous_head() {
-        let before = startup_gate_waterline(120_000_000, false);
-        let after = startup_gate_waterline(120_000_000, true);
-
-        assert_eq!(
-            hevc_startup_gate_defer_reason(
-                true,
-                before,
-                after,
-                56,
-                HevcDecodeChainStats::default(),
-                Some(VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER - Duration::from_millis(1)),
-            ),
-            Some("decoded_video_below_hevc_startup_waterline")
-        );
-        assert_eq!(
-            hevc_startup_gate_defer_reason(
-                true,
-                before,
-                after,
-                56,
-                HevcDecodeChainStats::default(),
-                Some(VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn hevc_startup_gate_keeps_pts_gap_fallback_ahead_of_bounded_start() {
-        let before = startup_gate_waterline(120_000_000, false);
-        let after = startup_gate_waterline(120_000_000, true);
-
-        assert_eq!(
-            hevc_startup_gate_defer_reason(
-                true,
-                before,
-                after,
-                56,
-                HevcDecodeChainStats {
-                    pending_fallback_reason: Some(
-                        HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
-                    ),
-                    ..Default::default()
-                },
-                Some(VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER),
-            ),
-            Some("recent_zero_output_or_recovery")
-        );
-    }
-
-    #[test]
-    fn hevc_startup_gate_hard_fallback_ignores_stale_recovery_evidence() {
-        let before = startup_gate_waterline(49_999_999, false);
-        let after = startup_gate_waterline(49_999_999, true);
-        let stats = HevcDecodeChainStats {
-            recent_zero_output_packets: 12,
-            ..Default::default()
-        };
-
-        assert_eq!(
-            hevc_startup_gate_defer_reason(
-                true,
-                before,
-                after,
-                51,
-                stats,
-                Some(HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER - Duration::from_millis(1),),
-            ),
-            Some("recent_zero_output_or_recovery")
-        );
-        assert_eq!(
-            hevc_startup_gate_defer_reason(
-                true,
-                before,
-                after,
-                51,
-                stats,
-                Some(HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn hevc_startup_gate_hard_fallback_does_not_bypass_active_recovery() {
-        let before = startup_gate_waterline(49_999_999, false);
-        let after = startup_gate_waterline(49_999_999, true);
-
-        assert_eq!(
-            hevc_startup_gate_defer_reason(
-                true,
-                before,
-                after,
-                51,
-                HevcDecodeChainStats {
-                    zero_output_packets: 1,
-                    recent_zero_output_packets: 12,
-                    ..Default::default()
-                },
-                Some(HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER),
-            ),
-            Some("recent_zero_output_or_recovery")
-        );
-        assert_eq!(
-            hevc_startup_gate_defer_reason(
-                true,
-                before,
-                after,
-                51,
-                HevcDecodeChainStats {
-                    recent_zero_output_packets: 12,
-                    pending_fallback_reason: Some(
-                        HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,
-                    ),
-                    ..Default::default()
-                },
-                Some(HEVC_STARTUP_STALE_RECOVERY_HARD_FALLBACK_AFTER),
-            ),
-            Some("recent_zero_output_or_recovery")
         );
     }
 

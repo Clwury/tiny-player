@@ -1,8 +1,12 @@
-use super::output_gate::{OutputGateResumeStatus, service_output_gate_resume_if_ready};
+use super::output_gate::{
+    InitialAudioTransientRetry, OutputGateResumeStatus, service_output_gate_resume_if_ready,
+};
 use super::output_rebuffer::demux_reader_ready_for_output;
 use super::playback_snapshot::PlaybackPipelineTelemetry;
 use super::playback_wait_service::{PlaybackPipelineWaitContext, PlaybackPipelineWaitService};
-use super::video_decode_pipeline::HevcPostFallbackRebufferObservation;
+use super::video_decode_pipeline::{
+    HevcAdmittedVideoProgressObservation, HevcPostFallbackRebufferObservation,
+};
 use std::{
     os::raw::c_int,
     sync::{atomic::AtomicBool, mpsc::Sender},
@@ -18,10 +22,10 @@ use crate::player::{
 
 use super::{
     AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AudioOutput, AudioOutputSnapshot, DemuxPacketCache,
-    FfmpegControl, HttpRingCache, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER,
+    FfmpegControl, HttpRingCache, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, OutputServiceDemand,
     PlaybackOutputSnapshot, PlaybackOutputState, PlaybackPipelineState,
     VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-    duration_nsecs,
+    VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, duration_nsecs, expire_initial_av_start_hard_deadline,
 };
 
 const HEVC_POST_FALLBACK_AUDIO_READY_NSECS: u64 = 250_000_000;
@@ -71,15 +75,53 @@ pub(super) struct OutputGateServiceContext<'a> {
     pub(super) frame_presented: &'a AtomicBool,
     pub(super) playback_wait: &'a PlaybackPipelineWaitService,
     pub(super) playback_telemetry: &'a mut PlaybackPipelineTelemetry,
+    pub(super) output_service_demand: OutputServiceDemand,
 }
 
 fn service_output_gate_or_wait(
     mut context: OutputGateServiceContext<'_>,
 ) -> std::result::Result<OutputGateServiceStatus, String> {
+    if context.output_service_demand.hard_deadline_due()
+        && expire_initial_av_start_hard_deadline(
+            &mut context.pipeline.output_scheduler,
+            context.pipeline.audio_output.as_ref(),
+            Instant::now(),
+            context.control,
+            context.session_id,
+        )
+    {
+        return Ok(OutputGateServiceStatus {
+            outcome: OutputGateServiceOutcome::Continue,
+            should_wait_for_demux: false,
+            video_output_waiting_for_demux: false,
+            played_until_nsecs: None,
+            has_audio_output: context.pipeline.audio_output.is_some(),
+            output_resource_pressure: false,
+        });
+    }
     let started_at = Instant::now();
     let mut timing = OutputGateServiceTiming::default();
     let stage_started_at = Instant::now();
-    let status = output_gate_service_status(&mut context)?;
+    let Some(status) = output_gate_service_status(&mut context)? else {
+        if context.output_service_demand.audio_start_due() {
+            context
+                .pipeline
+                .output_scheduler
+                .defer_initial_audio_start_retry(
+                    Instant::now(),
+                    InitialAudioTransientRetry::OutputSnapshotBusy,
+                );
+        }
+        let output_snapshot = context.pipeline.output_scheduler.snapshot();
+        return Ok(OutputGateServiceStatus {
+            outcome: OutputGateServiceOutcome::Continue,
+            should_wait_for_demux: output_snapshot.should_wait_for_demux(),
+            video_output_waiting_for_demux: output_snapshot.waiting_for_demux(),
+            played_until_nsecs: None,
+            has_audio_output: context.pipeline.audio_output.is_some(),
+            output_resource_pressure: false,
+        });
+    };
     timing.status = stage_started_at.elapsed();
     let current_start_position_nsecs = context.pipeline.current_start_position_nsecs;
     let stage_started_at = Instant::now();
@@ -91,12 +133,54 @@ fn service_output_gate_or_wait(
         .audio_decode_pipeline
         .as_ref()
         .map(|pipeline| pipeline.snapshot());
+    let resume_downstream_audio_coverage_nsecs = downstream_audio_coverage_nsecs(
+        context
+            .pipeline
+            .audio_output
+            .as_ref()
+            .and_then(|output| output.try_snapshot().ok().flatten())
+            .map(|snapshot| snapshot.total_pending_nsecs),
+        context
+            .pipeline
+            .output_scheduler
+            .pending_audio_contiguous_range_nsecs(),
+        audio_decode_snapshot
+            .map(|snapshot| snapshot.queued_duration_nsecs)
+            .unwrap_or_default(),
+    );
+    let resume_has_audio_output = context.pipeline.audio_output.is_some();
     let video_decode_snapshot = context.pipeline.video_decode_pipeline.snapshot();
     let (demux_packet_snapshot, _, _) = context.demux_cache.monitor_snapshot();
     let demux_audio_cached_packets = demux_audio_cached_packets_for_stream(
         &demux_packet_snapshot,
         context.pipeline.audio_stream.map(|stream| stream.index),
     );
+    let initial_start_target_nsecs = demux_packet_snapshot.exact_seek_target_nsecs;
+    let initial_decoded_video_until_nsecs = context
+        .pipeline
+        .output_scheduler
+        .scheduled_video_queue
+        .buffered_until_from_nsecs(initial_start_target_nsecs);
+    let initial_video_reader_nsecs = demux_packet_snapshot
+        .streams
+        .iter()
+        .find(|stream| stream.stream_index == context.pipeline.video_stream.index)
+        .and_then(|stream| stream.reader_nsecs);
+    let initial_audio_contiguous_range_nsecs = context
+        .pipeline
+        .output_scheduler
+        .pending_audio_contiguous_range_nsecs();
+    let initial_audio_reader_nsecs = context
+        .pipeline
+        .audio_stream
+        .and_then(|stream| {
+            demux_packet_snapshot
+                .streams
+                .iter()
+                .find(|snapshot| snapshot.stream_index == stream.index)
+        })
+        .and_then(|stream| stream.reader_nsecs);
+    let initial_av_start_pending = context.pipeline.output_scheduler.restart_pending();
     let resume_status = service_output_gate_resume_if_ready(
         &mut context.pipeline.output_scheduler,
         context.pipeline.audio_output.as_ref(),
@@ -113,9 +197,11 @@ fn service_output_gate_or_wait(
         &mut context.pipeline.current_start_position_nsecs,
         &mut context.pipeline.scheduler,
         output_resource_pressure,
-        audio_decode_snapshot
-            .map(|snapshot| snapshot.queued_duration_nsecs)
-            .unwrap_or_default(),
+        Some(
+            audio_decode_snapshot
+                .map(|snapshot| snapshot.queued_duration_nsecs)
+                .unwrap_or_default(),
+        ),
         audio_decode_snapshot
             .map(|snapshot| snapshot.in_flight_packets)
             .unwrap_or_default(),
@@ -124,21 +210,59 @@ fn service_output_gate_or_wait(
         video_decode_snapshot.pending_input_packets,
         video_decode_snapshot,
         context.pipeline.video_stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        context.pipeline.initial_hevc_cached_exact_seek,
+        context
+            .pipeline
+            .initial_hevc_cached_exact_seek
+            .then(|| {
+                context
+                    .pipeline
+                    .video_decode_pipeline
+                    .hevc_exact_seek_landing_nsecs()
+            })
+            .flatten(),
         context
             .pipeline
             .video_decode_pipeline
             .hevc_decode_chain_stats(),
-        || context.demux_cache.cached_reader_watermark(),
+        context.output_service_demand,
+        || {
+            demux_watermark_with_initial_combined_coverage(
+                context.demux_cache.cached_reader_watermark(),
+                initial_av_start_pending,
+                initial_start_target_nsecs,
+                initial_decoded_video_until_nsecs,
+                initial_video_reader_nsecs,
+                initial_audio_contiguous_range_nsecs,
+                initial_audio_reader_nsecs,
+                resume_has_audio_output,
+                resume_downstream_audio_coverage_nsecs,
+            )
+        },
     )?;
     timing.resume = stage_started_at.elapsed();
     let service_status = match resume_status {
-        OutputGateResumeStatus::Resumed => OutputGateServiceStatus {
-            outcome: OutputGateServiceOutcome::Continue,
-            ..status
-        },
+        OutputGateResumeStatus::Resumed | OutputGateResumeStatus::Rebuffering => {
+            OutputGateServiceStatus {
+                outcome: OutputGateServiceOutcome::Continue,
+                ..status
+            }
+        }
         OutputGateResumeStatus::WaitingForDemux => {
             let stage_started_at = Instant::now();
             observe_output_gate_stall(&mut context, "output_gate_demux_wait");
+            timing.wait = stage_started_at.elapsed();
+            output_gate_service_status_after_resume(status, resume_status)
+        }
+        OutputGateResumeStatus::WaitingForDecodedVideo => {
+            let stage_started_at = Instant::now();
+            observe_output_gate_stall(&mut context, "output_gate_decoded_video_wait");
+            timing.wait = stage_started_at.elapsed();
+            output_gate_service_status_after_resume(status, resume_status)
+        }
+        OutputGateResumeStatus::WaitingForDecodedAudio => {
+            let stage_started_at = Instant::now();
+            observe_output_gate_stall(&mut context, "output_gate_decoded_audio_wait");
             timing.wait = stage_started_at.elapsed();
             output_gate_service_status_after_resume(status, resume_status)
         }
@@ -173,28 +297,39 @@ fn output_gate_service_status_after_resume(
     resume_status: OutputGateResumeStatus,
 ) -> OutputGateServiceStatus {
     match resume_status {
-        OutputGateResumeStatus::Resumed => OutputGateServiceStatus {
-            outcome: OutputGateServiceOutcome::Continue,
-            ..status
-        },
+        OutputGateResumeStatus::Resumed | OutputGateResumeStatus::Rebuffering => {
+            OutputGateServiceStatus {
+                outcome: OutputGateServiceOutcome::Continue,
+                ..status
+            }
+        }
         OutputGateResumeStatus::Idle
         | OutputGateResumeStatus::Waiting
+        | OutputGateResumeStatus::WaitingForDecodedVideo
+        | OutputGateResumeStatus::WaitingForDecodedAudio
         | OutputGateResumeStatus::WaitingForDemux => status,
     }
 }
 
 fn output_gate_service_status(
     context: &mut OutputGateServiceContext<'_>,
-) -> std::result::Result<OutputGateServiceStatus, String> {
+) -> std::result::Result<Option<OutputGateServiceStatus>, String> {
+    context
+        .pipeline
+        .output_scheduler
+        .check_decode_recovery_deadline(Instant::now(), context.control, context.session_id)?;
     let vo_snapshot = context.vo_queue.snapshot();
     let render_backlogged = vo_snapshot.render_backlogged();
     let has_audio_output = context.pipeline.audio_output.is_some();
-    let audio_output_snapshot = context
-        .pipeline
-        .audio_output
-        .as_ref()
-        .map(AudioOutput::snapshot)
-        .transpose()?;
+    let audio_output_snapshot = match context.pipeline.audio_output.as_ref() {
+        Some(output) => {
+            let Some(snapshot) = output.try_snapshot()? else {
+                return Ok(None);
+            };
+            Some(snapshot)
+        }
+        None => None,
+    };
     let output_underrun = context
         .pipeline
         .audio_output
@@ -216,6 +351,28 @@ fn output_gate_service_status(
         );
     let output_underflowing = output_snapshot.underflowing()
         || audio_output_starving(output_snapshot, audio_output_snapshot);
+    let actual_output_underrun = !output_snapshot.initial_av_start_pending
+        && (output_underrun || output_snapshot.waiting_for_demux());
+    context
+        .control
+        .set_output_underrun_for_cache_pause(actual_output_underrun);
+    let pending_audio_contiguous_range_nsecs = context
+        .pipeline
+        .output_scheduler
+        .pending_audio_contiguous_range_nsecs();
+    let audio_decode_queued_nsecs = context
+        .pipeline
+        .audio_decode_pipeline
+        .as_ref()
+        .map(|pipeline| pipeline.snapshot().queued_duration_nsecs)
+        .unwrap_or_default();
+    let downstream_audio_coverage_nsecs = downstream_audio_coverage_nsecs(
+        audio_output_snapshot.map(|snapshot| snapshot.total_pending_nsecs),
+        pending_audio_contiguous_range_nsecs,
+        audio_decode_queued_nsecs,
+    );
+    let downstream_audio_recoverable =
+        downstream_audio_can_recover_output(downstream_audio_coverage_nsecs);
     let pending_audio_recoverable = context
         .pipeline
         .output_scheduler
@@ -224,40 +381,119 @@ fn output_gate_service_status(
             output_underrun,
             output_snapshot,
             audio_output_snapshot,
-        );
+        )
+        || downstream_audio_recoverable;
     let demux_watermark = context.demux_cache.cached_reader_watermark();
+    let effective_demux_watermark = demux_watermark_with_downstream_audio_coverage(
+        demux_watermark,
+        has_audio_output,
+        downstream_audio_coverage_nsecs,
+    );
     let demux_cache_insufficient =
-        !demux_reader_ready_for_output(demux_watermark, has_audio_output);
+        !demux_reader_ready_for_output(effective_demux_watermark, has_audio_output);
     let byte_cache_low_water = context
         .http_cache
         .and_then(HttpRingCache::try_playback_byte_cache_status)
         .is_some_and(byte_cache_active_forward_low_water);
     let (forward_cache_insufficient, forward_cache_min_nsecs) = output_forward_cache_gate(
         demux_cache_insufficient,
-        demux_watermark.selected_min_forward_nsecs,
+        effective_demux_watermark.selected_min_forward_nsecs,
         byte_cache_low_water,
     );
-    let entered_rebuffer = context
+    let decode_recovery_media_clock_nsecs =
+        played_until_nsecs.unwrap_or_else(|| context.pipeline.scheduler.current_timeline_nsecs());
+    let entered_decode_recovery_barrier = context
         .pipeline
         .output_scheduler
-        .maybe_enter_video_output_rebuffer(
+        .maybe_enter_decode_recovery_barrier(
             Instant::now(),
-            output_underflowing,
-            output_snapshot.queued_video_forward_nsecs,
-            output_underrun,
-            forward_cache_insufficient,
-            forward_cache_min_nsecs,
-            render_backlogged,
-            vo_snapshot.queued_frames,
-            has_audio_output,
-            pending_audio_recoverable,
+            decode_recovery_media_clock_nsecs,
             context.control,
-            context.pipeline.audio_output.as_ref(),
-            audio_output_snapshot.map(|snapshot| snapshot.total_pending_nsecs),
             context.session_id,
-            output_snapshot.queued_video_forward_nsecs,
         );
-    if entered_rebuffer {
+    let recovery_audio_ready = context
+        .pipeline
+        .output_scheduler
+        .update_decode_recovery_audio_ready(
+            has_audio_output,
+            audio_output_snapshot,
+            audio_decode_queued_nsecs,
+        );
+    let committed_before_nsecs = context
+        .pipeline
+        .output_scheduler
+        .committed_video_queue_end_nsecs();
+    let staged_range_before_commit = context
+        .pipeline
+        .output_scheduler
+        .recovery_staging_range_nsecs();
+    let committed_decode_recovery = {
+        let pipeline = &mut *context.pipeline;
+        pipeline
+            .output_scheduler
+            .commit_decode_recovery_if_buffered(
+                context.control,
+                &mut pipeline.scheduler,
+                pipeline.audio_output.as_ref(),
+                &mut pipeline.current_start_position_nsecs,
+                recovery_audio_ready,
+                context.session_id,
+            )
+    };
+    if committed_decode_recovery {
+        if context
+            .pipeline
+            .output_scheduler
+            .decode_recovery_output_committed()
+        {
+            context
+                .pipeline
+                .video_decode_pipeline
+                .mark_hevc_same_hardware_output_committed(context.session_id);
+        }
+        let committed_after_nsecs = context
+            .pipeline
+            .output_scheduler
+            .committed_video_queue_end_nsecs();
+        if let Some((first_staged_nsecs, _)) = staged_range_before_commit {
+            context
+                .pipeline
+                .video_decode_pipeline
+                .observe_hevc_admitted_video_progress(HevcAdmittedVideoProgressObservation {
+                    session_id: context.session_id,
+                    codec_id: context.pipeline.video_stream.codec_id,
+                    generation: context.pipeline.playback_generation.current(),
+                    frame_timeline_nsecs: first_staged_nsecs,
+                    frame_duration_nsecs: context.pipeline.video_frame_duration_nsecs,
+                    current_start_position_nsecs: context.pipeline.current_start_position_nsecs,
+                    before_queue_end_nsecs: committed_before_nsecs,
+                    after_queue_end_nsecs: committed_after_nsecs,
+                });
+        }
+    }
+    let decode_recovery_active = context.pipeline.output_scheduler.decode_recovery_active();
+    let entered_rebuffer = !decode_recovery_active
+        && context
+            .pipeline
+            .output_scheduler
+            .maybe_enter_video_output_rebuffer(
+                Instant::now(),
+                output_underflowing,
+                output_snapshot.queued_video_forward_nsecs,
+                output_underrun,
+                forward_cache_insufficient,
+                forward_cache_min_nsecs,
+                render_backlogged,
+                vo_snapshot.queued_frames,
+                has_audio_output,
+                pending_audio_recoverable,
+                context.control,
+                context.pipeline.audio_output.as_ref(),
+                audio_output_snapshot.map(|snapshot| snapshot.total_pending_nsecs),
+                context.session_id,
+                output_snapshot.queued_video_forward_nsecs,
+            );
+    if entered_rebuffer || entered_decode_recovery_barrier {
         if audio_output_snapshot.is_some_and(|snapshot| snapshot.total_pending_nsecs == 0) {
             context
                 .pipeline
@@ -293,26 +529,31 @@ fn output_gate_service_status(
             demux_watermark,
             audio_ready: decoded_audio_ready_nsecs >= HEVC_POST_FALLBACK_AUDIO_READY_NSECS,
             fallback_target_nsecs: post_fallback_target_nsecs,
+            decode_recovery_active: context.pipeline.output_scheduler.decode_recovery_active(),
         });
     let should_wait_for_demux = context
         .pipeline
         .output_scheduler
         .snapshot()
         .should_wait_for_demux();
+    let current_output_snapshot = context
+        .pipeline
+        .output_scheduler
+        .snapshot_for_played_until(played_until_nsecs);
     let output_resource_pressure = context.pipeline.video_output_resource_pressure_for(
-        output_snapshot,
+        current_output_snapshot,
         vo_snapshot,
         audio_output_snapshot.map(|snapshot| snapshot.total_pending_nsecs),
     );
 
-    Ok(OutputGateServiceStatus {
+    Ok(Some(OutputGateServiceStatus {
         outcome: OutputGateServiceOutcome::Ready,
         should_wait_for_demux,
-        video_output_waiting_for_demux: output_snapshot.waiting_for_demux(),
+        video_output_waiting_for_demux: current_output_snapshot.waiting_for_demux(),
         played_until_nsecs,
         has_audio_output,
         output_resource_pressure,
-    })
+    }))
 }
 
 fn byte_cache_active_forward_low_water(status: ByteCacheState) -> bool {
@@ -340,6 +581,150 @@ fn output_forward_cache_gate(
         } else {
             demux_min_forward_nsecs
         },
+    )
+}
+
+fn downstream_audio_coverage_nsecs(
+    audio_output_pending_nsecs: Option<u64>,
+    pending_audio_contiguous_range_nsecs: Option<(u64, u64)>,
+    audio_decode_queued_nsecs: u64,
+) -> u64 {
+    let pending_audio_contiguous_nsecs = pending_audio_contiguous_range_nsecs
+        .map(|(start_nsecs, end_nsecs)| end_nsecs.saturating_sub(start_nsecs))
+        .unwrap_or_default();
+    audio_output_pending_nsecs
+        .unwrap_or_default()
+        .saturating_add(pending_audio_contiguous_nsecs)
+        .saturating_add(audio_decode_queued_nsecs)
+}
+
+fn downstream_audio_can_recover_output(downstream_audio_coverage_nsecs: u64) -> bool {
+    downstream_audio_coverage_nsecs >= duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION)
+}
+
+fn demux_watermark_with_downstream_audio_coverage(
+    mut demux_watermark: super::DemuxReaderWatermark,
+    has_audio_output: bool,
+    downstream_audio_coverage_nsecs: u64,
+) -> super::DemuxReaderWatermark {
+    if !has_audio_output
+        || downstream_audio_coverage_nsecs < duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+    {
+        return demux_watermark;
+    }
+
+    let effective_audio_forward_nsecs = demux_watermark
+        .audio_forward_nsecs
+        .unwrap_or_default()
+        .saturating_add(downstream_audio_coverage_nsecs);
+    demux_watermark.audio_forward_nsecs = Some(effective_audio_forward_nsecs);
+    demux_watermark.audio_underrun = false;
+    // The aggregate underrun bit represents selected timed streams. Once audio
+    // is covered downstream, only the video reader can keep that gate low.
+    demux_watermark.underrun = demux_watermark.video_underrun;
+    demux_watermark.selected_min_forward_nsecs = demux_watermark
+        .video_forward_nsecs
+        .zip(demux_watermark.audio_forward_nsecs)
+        .map(|(video, audio)| video.min(audio))
+        .or(demux_watermark.video_forward_nsecs)
+        .or(demux_watermark.audio_forward_nsecs);
+    demux_watermark
+}
+
+#[allow(clippy::too_many_arguments)]
+fn demux_watermark_with_initial_combined_coverage(
+    mut demux_watermark: super::DemuxReaderWatermark,
+    initial_av_start_pending: bool,
+    exact_target_nsecs: u64,
+    decoded_video_until_nsecs: Option<u64>,
+    video_reader_nsecs: Option<u64>,
+    pending_audio_range_nsecs: Option<(u64, u64)>,
+    audio_reader_nsecs: Option<u64>,
+    has_audio_output: bool,
+    downstream_audio_coverage_nsecs: u64,
+) -> super::DemuxReaderWatermark {
+    if !initial_av_start_pending {
+        return demux_watermark_with_downstream_audio_coverage(
+            demux_watermark,
+            has_audio_output,
+            downstream_audio_coverage_nsecs,
+        );
+    }
+    let continuity_tolerance_nsecs = duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE);
+    let combined_video_forward_nsecs = decoded_video_until_nsecs.and_then(|until_nsecs| {
+        contiguous_downstream_and_demux_forward_nsecs(
+            exact_target_nsecs,
+            (exact_target_nsecs, until_nsecs),
+            video_reader_nsecs,
+            demux_watermark.video_forward_nsecs,
+            continuity_tolerance_nsecs,
+        )
+    });
+    if let Some(combined_video_forward_nsecs) = combined_video_forward_nsecs {
+        demux_watermark.video_forward_nsecs = Some(combined_video_forward_nsecs);
+        demux_watermark.video_underrun = false;
+    }
+    let combined_audio_forward_nsecs = has_audio_output
+        .then(|| {
+            pending_audio_range_nsecs.and_then(|range| {
+                contiguous_downstream_and_demux_forward_nsecs(
+                    exact_target_nsecs,
+                    range,
+                    audio_reader_nsecs,
+                    demux_watermark.audio_forward_nsecs,
+                    continuity_tolerance_nsecs,
+                )
+            })
+        })
+        .flatten();
+    if let Some(combined_audio_forward_nsecs) = combined_audio_forward_nsecs {
+        demux_watermark.audio_forward_nsecs = Some(combined_audio_forward_nsecs);
+        demux_watermark.audio_underrun = false;
+    }
+    demux_watermark.underrun =
+        demux_watermark.video_underrun || (has_audio_output && demux_watermark.audio_underrun);
+    demux_watermark.selected_min_forward_nsecs = if has_audio_output {
+        demux_watermark
+            .video_forward_nsecs
+            .zip(demux_watermark.audio_forward_nsecs)
+            .map(|(video, audio)| video.min(audio))
+            .or(demux_watermark.video_forward_nsecs)
+            .or(demux_watermark.audio_forward_nsecs)
+    } else {
+        demux_watermark.video_forward_nsecs
+    };
+    demux_watermark
+}
+
+fn contiguous_downstream_and_demux_forward_nsecs(
+    exact_target_nsecs: u64,
+    downstream_range_nsecs: (u64, u64),
+    demux_reader_nsecs: Option<u64>,
+    demux_forward_nsecs: Option<u64>,
+    continuity_tolerance_nsecs: u64,
+) -> Option<u64> {
+    let (downstream_start_nsecs, downstream_end_nsecs) = downstream_range_nsecs;
+    if downstream_end_nsecs <= exact_target_nsecs
+        || downstream_start_nsecs > exact_target_nsecs.saturating_add(continuity_tolerance_nsecs)
+    {
+        return None;
+    }
+    let downstream_forward_nsecs = downstream_end_nsecs.saturating_sub(exact_target_nsecs);
+    let combined_end_nsecs = demux_reader_nsecs
+        .zip(demux_forward_nsecs)
+        .filter(|(reader_nsecs, demux_forward_nsecs)| {
+            *reader_nsecs <= downstream_end_nsecs.saturating_add(continuity_tolerance_nsecs)
+                && reader_nsecs
+                    .saturating_add(*demux_forward_nsecs)
+                    .saturating_add(continuity_tolerance_nsecs)
+                    >= downstream_end_nsecs
+        })
+        .map(|(reader_nsecs, demux_forward_nsecs)| reader_nsecs.saturating_add(demux_forward_nsecs))
+        .unwrap_or(downstream_end_nsecs);
+    Some(
+        combined_end_nsecs
+            .saturating_sub(exact_target_nsecs)
+            .max(downstream_forward_nsecs),
     )
 }
 
@@ -448,14 +833,20 @@ fn log_output_gate_service_timing(
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AudioOutputSnapshot, OutputGateResumeStatus,
-        OutputGateServiceOutcome, OutputGateServiceStatus, PlaybackOutputSnapshot,
-        PlaybackOutputState, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
+        AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AudioOutputSnapshot, Duration, Instant,
+        OutputGateResumeStatus, OutputGateServiceOutcome, OutputGateServiceStatus,
+        PlaybackOutputSnapshot, PlaybackOutputState, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
         VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, audio_output_starving,
-        audio_output_underrun_can_recover, byte_cache_active_forward_low_water, duration_nsecs,
-        output_forward_cache_gate, output_gate_service_status_after_resume,
+        audio_output_underrun_can_recover, byte_cache_active_forward_low_water,
+        demux_watermark_with_downstream_audio_coverage,
+        demux_watermark_with_initial_combined_coverage, downstream_audio_can_recover_output,
+        downstream_audio_coverage_nsecs, duration_nsecs, output_forward_cache_gate,
+        output_gate_service_status_after_resume,
     };
     use crate::player::backend::ByteCacheState;
+    use crate::player::backend::ffmpeg::playback_loop::{
+        DemuxReaderWatermark, video_output_rebuffer_should_enter,
+    };
 
     #[test]
     fn output_gate_service_status_reports_continue() {
@@ -497,6 +888,124 @@ mod tests {
         assert_eq!(status.outcome, OutputGateServiceOutcome::Ready);
         assert!(status.should_wait_for_demux);
         assert!(!status.should_continue());
+    }
+
+    #[test]
+    fn startup_waterline_joins_exact_decoded_and_demux_coverage() {
+        let target_nsecs = 184_700_000_000;
+        let decoded_until_nsecs = 186_300_000_000;
+        let raw = DemuxReaderWatermark {
+            video_forward_nsecs: Some(900_000_000),
+            audio_forward_nsecs: Some(2_500_000_000),
+            selected_min_forward_nsecs: Some(900_000_000),
+            video_underrun: true,
+            underrun: true,
+            ..DemuxReaderWatermark::default()
+        };
+
+        let combined = demux_watermark_with_initial_combined_coverage(
+            raw,
+            true,
+            target_nsecs,
+            Some(decoded_until_nsecs),
+            Some(decoded_until_nsecs),
+            None,
+            None,
+            true,
+            0,
+        );
+
+        assert_eq!(combined.video_forward_nsecs, Some(2_500_000_000));
+        assert_eq!(combined.selected_min_forward_nsecs, Some(2_500_000_000));
+        assert!(!combined.video_underrun);
+        assert!(!combined.underrun);
+    }
+
+    #[test]
+    fn startup_waterline_does_not_replace_missing_exact_target_coverage() {
+        let raw = DemuxReaderWatermark {
+            video_forward_nsecs: Some(900_000_000),
+            video_underrun: true,
+            underrun: true,
+            ..DemuxReaderWatermark::default()
+        };
+
+        let combined = demux_watermark_with_initial_combined_coverage(
+            raw,
+            true,
+            184_700_000_000,
+            None,
+            Some(186_300_000_000),
+            None,
+            None,
+            false,
+            0,
+        );
+
+        assert_eq!(combined.video_forward_nsecs, Some(900_000_000));
+        assert!(combined.video_underrun);
+        assert!(combined.underrun);
+    }
+
+    #[test]
+    fn startup_waterline_joins_delayed_pending_audio_with_adjacent_demux() {
+        let target_nsecs = 184_700_000_000;
+        let pending_audio_end_nsecs = 185_573_739_000;
+        let raw = DemuxReaderWatermark {
+            video_forward_nsecs: Some(2_500_000_000),
+            audio_forward_nsecs: Some(1_700_000_000),
+            selected_min_forward_nsecs: Some(1_700_000_000),
+            audio_underrun: true,
+            underrun: true,
+            ..DemuxReaderWatermark::default()
+        };
+
+        let combined = demux_watermark_with_initial_combined_coverage(
+            raw,
+            true,
+            target_nsecs,
+            Some(187_200_000_000),
+            Some(187_200_000_000),
+            Some((184_714_739_000, pending_audio_end_nsecs)),
+            Some(pending_audio_end_nsecs),
+            true,
+            0,
+        );
+
+        assert_eq!(combined.audio_forward_nsecs, Some(2_573_739_000));
+        assert_eq!(combined.selected_min_forward_nsecs, Some(2_573_739_000));
+        assert!(!combined.audio_underrun);
+        assert!(!combined.underrun);
+    }
+
+    #[test]
+    fn startup_waterline_does_not_sum_disconnected_audio_ranges() {
+        let target_nsecs = 184_700_000_000;
+        let pending_audio_end_nsecs = 185_573_739_000;
+        let raw = DemuxReaderWatermark {
+            video_forward_nsecs: Some(2_500_000_000),
+            audio_forward_nsecs: Some(2_500_000_000),
+            audio_underrun: true,
+            underrun: true,
+            ..DemuxReaderWatermark::default()
+        };
+
+        let combined = demux_watermark_with_initial_combined_coverage(
+            raw,
+            true,
+            target_nsecs,
+            Some(187_200_000_000),
+            Some(187_200_000_000),
+            Some((184_714_739_000, pending_audio_end_nsecs)),
+            Some(190_000_000_000),
+            true,
+            0,
+        );
+
+        assert_eq!(combined.audio_forward_nsecs, Some(873_739_000));
+        assert_eq!(combined.selected_min_forward_nsecs, Some(873_739_000));
+        assert!(!combined.audio_underrun);
+        assert!(!combined.underrun);
     }
 
     #[test]
@@ -554,13 +1063,71 @@ mod tests {
     }
 
     #[test]
+    fn downstream_audio_coverage_masks_transient_demux_audio_reader_zero() {
+        let downstream_audio_nsecs = downstream_audio_coverage_nsecs(
+            Some(580_000_000),
+            Some((10_000_000_000, 10_859_000_000)),
+            1_500_000_000,
+        );
+        let raw = DemuxReaderWatermark {
+            video_forward_nsecs: Some(29_400_000_000),
+            audio_forward_nsecs: Some(0),
+            selected_min_forward_nsecs: Some(0),
+            audio_underrun: true,
+            underrun: true,
+            forward_bytes: 1,
+            ..DemuxReaderWatermark::default()
+        };
+
+        let effective =
+            demux_watermark_with_downstream_audio_coverage(raw, true, downstream_audio_nsecs);
+
+        assert_eq!(downstream_audio_nsecs, 2_939_000_000);
+        assert!(downstream_audio_can_recover_output(downstream_audio_nsecs));
+        let now = Instant::now();
+        let mut underrun_started_at = now.checked_sub(Duration::from_secs(10));
+        assert!(!video_output_rebuffer_should_enter(
+            &mut underrun_started_at,
+            now,
+            true,
+            Some(300_000_000),
+            true,
+            true,
+            Some(0),
+            false,
+            true,
+            downstream_audio_can_recover_output(downstream_audio_nsecs),
+            PlaybackOutputState::Playing,
+        ));
+        assert_eq!(underrun_started_at, None);
+        assert!(!effective.audio_underrun);
+        assert!(!effective.underrun);
+        assert_eq!(effective.audio_forward_nsecs, Some(2_939_000_000));
+        assert_eq!(effective.selected_min_forward_nsecs, Some(2_939_000_000));
+        assert!(super::demux_reader_ready_for_output(effective, true));
+    }
+
+    #[test]
     fn audio_output_starving_tracks_audio_clock_output_underrun() {
         let playing_with_video = PlaybackOutputSnapshot {
             state: PlaybackOutputState::Playing,
             first_video_frame_pending: false,
+            first_frame_needed: false,
+            first_frame_presented: true,
+            initial_av_start_pending: false,
+            output_clock_running: true,
+            audio_start_target_nsecs: None,
+            output_transition_deadline_ms: None,
             rebuffering: false,
             queued_video_frames: 20,
+            recovery_staging_frames: 0,
+            recovery_staging_frame_budget: None,
+            committed_output_high_water_nsecs: None,
+            recovery_staged_high_water_nsecs: None,
+            decode_recovery_audio_ready_latched: false,
+            queued_video_coverage_nsecs: 800_000_000,
             queued_video_duration_nsecs: 800_000_000,
+            queued_video_range_span_nsecs: 800_000_000,
             queued_video_range_nsecs: Some((1_000_000_000, 1_800_000_000)),
             queued_video_forward_nsecs: Some(800_000_000),
             queued_video_contiguous_forward_nsecs: Some(800_000_000),
@@ -584,6 +1151,7 @@ mod tests {
             total_pending_nsecs: 0,
             queue_frames: 0,
             queue_generation: 7,
+            ..AudioOutputSnapshot::default()
         };
         let buffered_audio = AudioOutputSnapshot {
             total_pending_nsecs: 100_000_000,
@@ -621,9 +1189,22 @@ mod tests {
         let playing_with_video = PlaybackOutputSnapshot {
             state: PlaybackOutputState::Playing,
             first_video_frame_pending: false,
+            first_frame_needed: false,
+            first_frame_presented: true,
+            initial_av_start_pending: false,
+            output_clock_running: true,
+            audio_start_target_nsecs: None,
+            output_transition_deadline_ms: None,
             rebuffering: false,
             queued_video_frames: 50,
+            recovery_staging_frames: 0,
+            recovery_staging_frame_budget: None,
+            committed_output_high_water_nsecs: None,
+            recovery_staged_high_water_nsecs: None,
+            decode_recovery_audio_ready_latched: false,
+            queued_video_coverage_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
             queued_video_duration_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            queued_video_range_span_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
             queued_video_range_nsecs: Some((
                 0,
                 duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
@@ -652,6 +1233,7 @@ mod tests {
             total_pending_nsecs: duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION),
             queue_frames: 0,
             queue_generation: 1,
+            ..AudioOutputSnapshot::default()
         };
 
         assert!(audio_output_underrun_can_recover(

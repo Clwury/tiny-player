@@ -53,9 +53,9 @@ pub(super) fn load_external_subtitle_cues(
             "text/x-ass,text/ass,text/ssa,application/x-ass,text/vtt,application/x-subrip,text/plain,*/*;q=0.7",
         )
         .send()
-        .map_err(|error| format!("下载外挂字幕失败：{error}"))?
+        .map_err(|error| format!("下载外挂字幕失败：{}", error.without_url()))?
         .error_for_status()
-        .map_err(|error| format!("下载外挂字幕返回错误状态：{error}"))?;
+        .map_err(|error| format!("下载外挂字幕返回错误状态：{}", error.without_url()))?;
     if response
         .content_length()
         .is_some_and(|length| length > EXTERNAL_SUBTITLE_MAX_BYTES)

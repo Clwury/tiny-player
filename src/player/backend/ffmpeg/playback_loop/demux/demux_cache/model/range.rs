@@ -18,6 +18,15 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxC
         BTreeMap<c_int, VecDeque<PacketId>>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_seek_boundaries:
         BTreeMap<c_int, VecDeque<PacketId>>,
+    /// Presentation-time ordered packet lookup used by cached seek. Packet
+    /// order cannot be used here because HEVC B-frames legitimately make PTS
+    /// non-monotonic in demux/decode order.
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_pts_index:
+        BTreeMap<c_int, BTreeMap<(u64, PacketId), PacketId>>,
+    /// Presentation-time ordered recovery points (IDR/BLA/CRA for video and
+    /// major-sync packets for codecs that require an audio recovery point).
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_recovery_point_index:
+        BTreeMap<c_int, BTreeMap<(u64, PacketId), PacketId>>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_boundaries:
         BTreeMap<c_int, StreamRangeBoundary>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) report_stats:
@@ -38,11 +47,63 @@ impl DemuxCachedRange {
             global_order: VecDeque::new(),
             stream_queues: BTreeMap::new(),
             stream_seek_boundaries: BTreeMap::new(),
+            stream_pts_index: BTreeMap::new(),
+            stream_recovery_point_index: BTreeMap::new(),
             stream_boundaries: BTreeMap::new(),
             report_stats: RefCell::new(RangeReportStats::default()),
             is_bof,
             is_eof: false,
             last_used_generation,
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn index_packet(
+        &mut self,
+        stream_index: c_int,
+        packet_id: PacketId,
+        seek_timestamp_nsecs: Option<u64>,
+        recovery_point: bool,
+    ) {
+        let Some(seek_timestamp_nsecs) = seek_timestamp_nsecs else {
+            return;
+        };
+        let key = (seek_timestamp_nsecs, packet_id);
+        self.stream_pts_index
+            .entry(stream_index)
+            .or_default()
+            .insert(key, packet_id);
+        if recovery_point {
+            self.stream_recovery_point_index
+                .entry(stream_index)
+                .or_default()
+                .insert(key, packet_id);
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn remove_packet_from_indices(
+        &mut self,
+        stream_index: c_int,
+        packet_id: PacketId,
+        seek_timestamp_nsecs: Option<u64>,
+        recovery_point: bool,
+    ) {
+        let Some(seek_timestamp_nsecs) = seek_timestamp_nsecs else {
+            return;
+        };
+        let key = (seek_timestamp_nsecs, packet_id);
+        if let Some(index) = self.stream_pts_index.get_mut(&stream_index) {
+            index.remove(&key);
+            if index.is_empty() {
+                self.stream_pts_index.remove(&stream_index);
+            }
+        }
+        if recovery_point
+            && let Some(index) = self.stream_recovery_point_index.get_mut(&stream_index)
+        {
+            index.remove(&key);
+            if index.is_empty() {
+                self.stream_recovery_point_index.remove(&stream_index);
+            }
         }
     }
 
@@ -279,8 +340,6 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxP
         &'a BTreeMap<c_int, VecDeque<PacketId>>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) subtitle_stream_index:
         Option<c_int>,
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) is_bof: bool,
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) is_eof: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,6 +372,15 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxC
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) requires_precise_trim: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxCachedSeekPlan {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) hit: DemuxCachedSeekHit,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) seekability_revision: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) cache_generation: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) read_range_id: RangeId,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) append_range_id: RangeId,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) enum CachedSeekMissReason {
     TargetOutsideRange,
@@ -320,6 +388,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) enum CachedSe
     MissingStreamReaderHead,
     GenerationBlocked,
     AnchorTrimmed,
+    SafeAnchorRequired,
 }
 
 impl CachedSeekMissReason {
@@ -332,6 +401,7 @@ impl CachedSeekMissReason {
             Self::MissingStreamReaderHead => "missing_stream_reader_head",
             Self::GenerationBlocked => "generation_blocked",
             Self::AnchorTrimmed => "anchor_trimmed",
+            Self::SafeAnchorRequired => "safe_anchor_required",
         }
     }
 }

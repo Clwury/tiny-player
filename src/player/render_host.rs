@@ -20,7 +20,7 @@ pub use slot::{FrameBufferPool, PooledBytes};
 #[allow(unused_imports)]
 pub use video_output_queue::{
     RenderBackpressure, VideoOutputQueue, VideoOutputQueueAdmission, VideoOutputQueuePushResult,
-    VideoOutputQueueSnapshot,
+    VideoOutputQueueSnapshot, VulkanPrewarmStatus, VulkanPrewarmTicket,
 };
 pub use vulkan::{
     FfmpegAvBufferRef, FfmpegFrameRef, VulkanDecodeDevice, VulkanDecodeQueue, VulkanDecodeQueues,

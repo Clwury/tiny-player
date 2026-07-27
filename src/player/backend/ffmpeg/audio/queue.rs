@@ -1,18 +1,28 @@
 use super::{
-    AUDIO_OUTPUT_QUEUE_LIMIT_DURATION, AUDIO_QUEUE_WAIT_LOG_AFTER, Arc, AtomicBool, AtomicU64,
-    AudioBuffer, AudioQueueItem, AudioQueueShared, AudioQueueSnapshot, AudioQueueState,
-    AudioQueueWriteError, AudioQueueWriteProgress, AudioShared, Condvar, Duration, FfmpegControl,
-    Instant, JoinHandle, Mutex, Ordering, SCHEDULER_POLL_INTERVAL, VecDeque, duration_nsecs,
-    interpolated_audio_timeline_nsecs, log_audio_queue_snapshot_timing, thread,
+    AUDIO_OUTPUT_QUEUE_LIMIT_DURATION, AUDIO_QUEUE_WAIT_LOG_AFTER, Arc, AtomicBool, AudioBuffer,
+    AudioQueueInFlight, AudioQueueItem, AudioQueueShared, AudioQueueSnapshot, AudioQueueState,
+    AudioQueueWriteError, AudioQueueWriteProgress, AudioShared, AudioTimelineState, Condvar,
+    Duration, FfmpegControl, Instant, JoinHandle, Mutex, Ordering, SCHEDULER_POLL_INTERVAL,
+    TryLockError, VecDeque, duration_nsecs, interpolated_audio_timeline_nsecs,
+    log_audio_queue_snapshot_timing, thread,
 };
 
 impl AudioBuffer {
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg) fn with_capacity(max_samples: usize) -> Self {
+        Self::with_capacity_and_epoch(max_samples, 0)
+    }
+
+    pub(in crate::player::backend::ffmpeg::audio) fn with_capacity_and_epoch(
+        max_samples: usize,
+        epoch: u64,
+    ) -> Self {
         Self {
             samples: vec![0.0; max_samples],
             read_pos: 0,
             write_pos: 0,
             len: 0,
+            epoch,
         }
     }
 
@@ -73,12 +83,17 @@ impl AudioQueueState {
             items: VecDeque::new(),
             queued_samples: 0,
             queued_duration_nsecs: 0,
+            in_flight: None,
         }
     }
 
-    pub(in crate::player::backend::ffmpeg::audio) fn can_accept(&self) -> bool {
-        self.queued_duration_nsecs == 0
-            || self.queued_duration_nsecs < duration_nsecs(AUDIO_OUTPUT_QUEUE_LIMIT_DURATION)
+    pub(in crate::player::backend::ffmpeg::audio) fn can_accept(
+        &self,
+        additional_duration_nsecs: u64,
+    ) -> bool {
+        self.queued_duration_nsecs
+            .saturating_add(additional_duration_nsecs)
+            <= duration_nsecs(AUDIO_OUTPUT_QUEUE_LIMIT_DURATION)
     }
 
     pub(in crate::player::backend::ffmpeg::audio) fn push(&mut self, item: AudioQueueItem) {
@@ -102,6 +117,7 @@ impl AudioQueueState {
         self.items.clear();
         self.queued_samples = 0;
         self.queued_duration_nsecs = 0;
+        self.in_flight = None;
     }
 
     pub(in crate::player::backend::ffmpeg::audio) fn pending_duration(&self) -> Duration {
@@ -110,18 +126,26 @@ impl AudioQueueState {
 }
 
 impl AudioQueueShared {
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::audio) fn new(control: Arc<FfmpegControl>) -> Self {
+        Self::with_timeline(control, Arc::new(AudioTimelineState::new(true)))
+    }
+
+    pub(in crate::player::backend::ffmpeg::audio) fn with_timeline(
+        control: Arc<FfmpegControl>,
+        timeline: Arc<AudioTimelineState>,
+    ) -> Self {
         Self {
             state: Mutex::new(AudioQueueState::new()),
             ready: Condvar::new(),
-            generation: AtomicU64::new(0),
+            timeline,
             shutdown: AtomicBool::new(false),
             control,
         }
     }
 
     pub(in crate::player::backend::ffmpeg::audio) fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.timeline.epoch()
     }
 
     pub(in crate::player::backend::ffmpeg::audio) fn is_current_generation(
@@ -141,19 +165,53 @@ impl AudioQueueShared {
             .lock()
             .map_err(|_| "系统音频解码队列已损坏".to_string())?;
         let lock_wait = lock_started_at.elapsed();
-        let snapshot = AudioQueueSnapshot {
-            pending_nsecs: state.queued_duration_nsecs,
-            frames: state.items.len(),
-            generation: self.generation(),
-        };
+        let snapshot = self.snapshot_for_locked_state(&state);
         drop(state);
         log_audio_queue_snapshot_timing(started_at.elapsed(), lock_wait, snapshot);
         Ok(snapshot)
     }
 
-    pub(in crate::player::backend::ffmpeg::audio) fn clear(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
+    pub(in crate::player::backend::ffmpeg::audio) fn try_snapshot(
+        &self,
+    ) -> std::result::Result<Option<AudioQueueSnapshot>, String> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("系统音频解码队列已损坏".to_string());
+            }
+        };
+        Ok(Some(self.snapshot_for_locked_state(&state)))
+    }
+
+    fn snapshot_for_locked_state(&self, state: &AudioQueueState) -> AudioQueueSnapshot {
+        AudioQueueSnapshot {
+            pending_nsecs: state.queued_duration_nsecs,
+            queued_nsecs: state.queued_duration_nsecs.saturating_sub(
+                state
+                    .in_flight
+                    .map(|in_flight| in_flight.remaining_duration_nsecs)
+                    .unwrap_or_default(),
+            ),
+            in_flight_nsecs: state
+                .in_flight
+                .map(|in_flight| in_flight.remaining_duration_nsecs)
+                .unwrap_or_default(),
+            frames: state.items.len(),
+            in_flight_frames: usize::from(state.in_flight.is_some()),
+            generation: self.generation(),
+            payload_range_nsecs: queue_payload_range(state),
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::audio) fn clear_current_epoch(&self) {
         if let Ok(mut state) = self.state.lock() {
+            let stale_items = state
+                .items
+                .len()
+                .saturating_add(usize::from(state.in_flight.is_some()));
+            self.timeline
+                .record_stale_queue_items(u64::try_from(stale_items).unwrap_or(u64::MAX));
             state.clear();
         }
         self.ready.notify_all();
@@ -171,10 +229,10 @@ impl AudioQueueShared {
             .state
             .lock()
             .map_err(|_| "系统音频解码队列已损坏".to_string())?;
-        while state.items.is_empty()
-            && !self.shutdown.load(Ordering::Acquire)
-            && !self.control.should_stop()
-        {
+        while state.items.is_empty() || !self.timeline.active() {
+            if self.shutdown.load(Ordering::Acquire) || self.control.should_stop() {
+                return Ok(None);
+            }
             state = self
                 .ready
                 .wait(state)
@@ -183,7 +241,19 @@ impl AudioQueueShared {
         if self.shutdown.load(Ordering::Acquire) || self.control.should_stop() {
             Ok(None)
         } else {
-            Ok(state.items.pop_front())
+            let mutation = self.timeline.begin_mutation();
+            let item = state.items.pop_front();
+            if let Some(item) = item.as_ref() {
+                state.in_flight = Some(AudioQueueInFlight {
+                    generation: item.generation,
+                    start_timeline_nsecs: item.start_timeline_nsecs,
+                    end_timeline_nsecs: item.end_timeline_nsecs,
+                    remaining_samples: item.samples.len(),
+                    remaining_duration_nsecs: item.duration_nsecs,
+                });
+            }
+            drop(mutation);
+            Ok(item)
         }
     }
 
@@ -193,12 +263,84 @@ impl AudioQueueShared {
         samples: usize,
         duration_nsecs: u64,
     ) {
-        if self.generation() == generation
-            && let Ok(mut state) = self.state.lock()
-        {
-            state.finish_item(samples, duration_nsecs);
+        self.finish_item_with_lock_checkpoint(generation, samples, duration_nsecs, || {});
+    }
+
+    fn finish_item_with_lock_checkpoint(
+        &self,
+        generation: u64,
+        samples: usize,
+        duration_nsecs: u64,
+        after_queue_lock: impl FnOnce(),
+    ) {
+        // Take the queue lock before validating the epoch. Reset publishes the
+        // new epoch before taking this same lock; this ordering prevents a
+        // stale worker that passed a lock-free check from subtracting its old
+        // completion from counters already rebuilt for the new generation.
+        if let Ok(mut state) = self.state.lock() {
+            after_queue_lock();
+            if self.generation() == generation {
+                let _mutation = self.timeline.begin_mutation();
+                state.finish_item(samples, duration_nsecs);
+                if let Some(in_flight) = state.in_flight.as_mut()
+                    && in_flight.generation == generation
+                {
+                    in_flight.remaining_samples =
+                        in_flight.remaining_samples.saturating_sub(samples);
+                    in_flight.remaining_duration_nsecs = in_flight
+                        .remaining_duration_nsecs
+                        .saturating_sub(duration_nsecs);
+                    if in_flight.remaining_samples == 0 || in_flight.remaining_duration_nsecs == 0 {
+                        state.in_flight = None;
+                    }
+                }
+            }
         }
         self.ready.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::audio) fn finish_item_with_lock_checkpoint_for_test(
+        &self,
+        generation: u64,
+        samples: usize,
+        duration_nsecs: u64,
+        after_queue_lock: impl FnOnce(),
+    ) {
+        self.finish_item_with_lock_checkpoint(
+            generation,
+            samples,
+            duration_nsecs,
+            after_queue_lock,
+        );
+    }
+}
+
+fn queue_payload_range(state: &AudioQueueState) -> Option<(u64, u64)> {
+    let queued = state
+        .items
+        .front()
+        .zip(state.items.back())
+        .map(|(first, last)| (first.start_timeline_nsecs, last.end_timeline_nsecs));
+    let in_flight = state.in_flight.map(|in_flight| {
+        let consumed_nsecs = in_flight
+            .end_timeline_nsecs
+            .saturating_sub(in_flight.start_timeline_nsecs)
+            .saturating_sub(in_flight.remaining_duration_nsecs);
+        (
+            in_flight
+                .start_timeline_nsecs
+                .saturating_add(consumed_nsecs),
+            in_flight.end_timeline_nsecs,
+        )
+    });
+    match (queued, in_flight) {
+        (Some((queued_start, queued_end)), Some((in_flight_start, in_flight_end))) => Some((
+            queued_start.min(in_flight_start),
+            queued_end.max(in_flight_end),
+        )),
+        (Some(range), None) | (None, Some(range)) => Some(range),
+        (None, None) => None,
     }
 }
 
@@ -236,6 +378,9 @@ fn run_audio_queue_worker(shared: Arc<AudioShared>, queue: Arc<AudioQueueShared>
         let remaining_samples = samples.saturating_sub(progress.samples);
         let remaining_duration_nsecs = duration_nsecs.saturating_sub(progress.duration_nsecs);
         if remaining_samples > 0 || remaining_duration_nsecs > 0 {
+            if !queue.is_current_generation(generation) {
+                queue.timeline.record_stale_queue_item();
+            }
             queue.finish_item(generation, remaining_samples, remaining_duration_nsecs);
         }
     }
@@ -253,7 +398,12 @@ pub(in crate::player::backend::ffmpeg::audio) fn write_audio_queue_item(
     let mut next_wait_log_at = None;
 
     while offset < item.samples.len() {
-        if shared.control.should_interrupt() || !queue.is_current_generation(item.generation) {
+        if shared.control.should_interrupt()
+            || !queue.timeline.active()
+            || !queue.is_current_generation(item.generation)
+            || !shared.timeline.is_current_epoch(item.generation)
+        {
+            queue.timeline.record_stale_queue_item();
             return Ok(progress);
         }
 
@@ -263,7 +413,9 @@ pub(in crate::player::backend::ffmpeg::audio) fn write_audio_queue_item(
             .map_err(|_| AudioQueueWriteError::new("系统音频缓冲区已损坏", progress))?;
         while guard.available_capacity() == 0
             && !shared.control.should_interrupt()
+            && queue.timeline.active()
             && queue.is_current_generation(item.generation)
+            && shared.timeline.is_current_epoch(item.generation)
         {
             let (next_guard, _) = shared
                 .ready
@@ -287,7 +439,12 @@ pub(in crate::player::backend::ffmpeg::audio) fn write_audio_queue_item(
             }
         }
 
-        if shared.control.should_interrupt() || !queue.is_current_generation(item.generation) {
+        if shared.control.should_interrupt()
+            || !queue.timeline.active()
+            || !queue.is_current_generation(item.generation)
+            || !shared.timeline.is_current_epoch(item.generation)
+        {
+            queue.timeline.record_stale_queue_item();
             return Ok(progress);
         }
 
@@ -295,11 +452,15 @@ pub(in crate::player::backend::ffmpeg::audio) fn write_audio_queue_item(
         if capacity == 0 {
             continue;
         }
+        if guard.epoch != item.generation {
+            queue.timeline.record_stale_queue_item();
+            return Ok(progress);
+        }
         let previous_offset = offset;
         let end = (offset + capacity).min(item.samples.len());
+        let mutation = queue.timeline.begin_mutation();
         let written = guard.push_slice(&item.samples[offset..end]);
         offset += written;
-        drop(guard);
 
         if total_samples > 0 && written > 0 {
             let previous_timeline_nsecs = interpolated_audio_timeline_nsecs(
@@ -314,15 +475,21 @@ pub(in crate::player::backend::ffmpeg::audio) fn write_audio_queue_item(
                 offset,
                 total_samples,
             );
+            // The buffer lock serializes this timeline publication with reset.
+            // A stale worker can therefore never overwrite the new epoch's end.
             shared.set_queued_end_timeline_nsecs(current_timeline_nsecs);
             let written_duration_nsecs =
                 current_timeline_nsecs.saturating_sub(previous_timeline_nsecs);
+            drop(guard);
             queue.finish_item(item.generation, written, written_duration_nsecs);
             progress.samples = progress.samples.saturating_add(written);
             progress.duration_nsecs = progress
                 .duration_nsecs
                 .saturating_add(written_duration_nsecs);
+        } else {
+            drop(guard);
         }
+        drop(mutation);
         shared.ready.notify_all();
     }
 

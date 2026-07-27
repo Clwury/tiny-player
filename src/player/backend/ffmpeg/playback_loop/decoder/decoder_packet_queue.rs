@@ -52,6 +52,10 @@ impl<P, const PENDING_CAPACITY: usize> DecoderPacketQueues<P, PENDING_CAPACITY> 
         self.pending_input.push_front(packet);
     }
 
+    pub(super) fn push_pending_input_back(&mut self, packet: P) {
+        self.pending_input.push_back(packet);
+    }
+
     pub(super) fn take_pending_input(&mut self) -> Option<P> {
         self.pending_input.pop_front()
     }
@@ -98,6 +102,19 @@ mod tests {
         queue.push_pending_input(2).unwrap();
         queue.push_pending_input(3).unwrap();
         queue.push_pending_input_front(1);
+
+        assert_eq!(queue.take_pending_input(), Some(1));
+        assert_eq!(queue.take_pending_input(), Some(2));
+        assert_eq!(queue.take_pending_input(), Some(3));
+    }
+
+    #[test]
+    fn decoder_packet_queues_can_preserve_rejected_newest_packet_at_back() {
+        let mut queue = DecoderPacketQueues::<u32, 2>::default();
+
+        queue.push_pending_input(1).unwrap();
+        queue.push_pending_input(2).unwrap();
+        queue.push_pending_input_back(3);
 
         assert_eq!(queue.take_pending_input(), Some(1));
         assert_eq!(queue.take_pending_input(), Some(2));

@@ -12,8 +12,7 @@ use crate::player::{
 };
 
 use super::audio_output_gate::{
-    DelayedAudioStartSilencePolicy, drain_audio_clocked_decoded_video_step,
-    flush_pending_start_audio, service_audio_clocked_video_queue,
+    drain_audio_clocked_decoded_video_step, service_audio_clocked_video_queue,
 };
 use super::output_gate::{
     OutputGateResumeStatus, PlaybackOutputScheduler, service_output_gate_resume_if_ready,
@@ -23,9 +22,9 @@ use super::playback_block::PlaybackBlockReason;
 use super::video_decode_pipeline::HevcDecodeChainStats;
 use super::video_decode_worker::{VideoDecodeWorkerSnapshot, VideoDecodeWorkerState};
 use super::{
-    AudioClockMode, AudioOutput, AudioOutputSnapshot, BufferedReporter, DemuxReaderWatermark,
-    FFMPEG_FRAME_COUNT, FfmpegControl, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER,
-    PlaybackScheduler, PositionReporter, QueuedVideoFrame, SubtitlePipeline, nsecs_to_seconds,
+    AudioOutput, AudioOutputSnapshot, BufferedReporter, DemuxReaderWatermark, FFMPEG_FRAME_COUNT,
+    FfmpegControl, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PlaybackScheduler,
+    PositionReporter, QueuedVideoFrame, SubtitlePipeline, nsecs_to_seconds,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +34,7 @@ pub(in crate::player::backend::ffmpeg) enum AudioClockedVideoDrainStatus {
     Interrupted,
 }
 
-fn report_first_video_frame_presented(
+pub(in crate::player::backend::ffmpeg) fn report_first_video_frame_presented(
     session_id: PlaybackSessionId,
     event_tx: &Sender<BackendEvent>,
 ) {
@@ -63,10 +62,12 @@ pub(in crate::player::backend::ffmpeg) struct AudioClockAvailability {
     pub(in crate::player::backend::ffmpeg) pending_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg) buffered_until_timeline_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg) underrun_active: bool,
+    pub(in crate::player::backend::ffmpeg) watchdog_stalled: bool,
 }
 
 pub(in crate::player::backend::ffmpeg) fn audio_clock_availability(
     output: Option<&AudioOutput>,
+    watchdog_stalled: bool,
 ) -> std::result::Result<AudioClockAvailability, String> {
     let Some(output) = output else {
         return Ok(AudioClockAvailability {
@@ -75,6 +76,7 @@ pub(in crate::player::backend::ffmpeg) fn audio_clock_availability(
             pending_nsecs: None,
             buffered_until_timeline_nsecs: None,
             underrun_active: false,
+            watchdog_stalled: false,
         });
     };
     let snapshot = output.snapshot()?;
@@ -82,10 +84,11 @@ pub(in crate::player::backend::ffmpeg) fn audio_clock_availability(
     let pending_nsecs = snapshot.total_pending_nsecs;
     Ok(AudioClockAvailability {
         has_audio_output: true,
-        available: pending_nsecs > 0 && !underrun_active,
+        available: pending_nsecs > 0 && !underrun_active && !watchdog_stalled,
         pending_nsecs: Some(pending_nsecs),
         buffered_until_timeline_nsecs: Some(snapshot.buffered_until_timeline_nsecs),
         underrun_active,
+        watchdog_stalled,
     })
 }
 
@@ -209,9 +212,7 @@ pub(in crate::player::backend::ffmpeg) fn service_audio_clocked_video_queue_if_p
     let Some(output) = output else {
         return Ok(false);
     };
-    if output_scheduler
-        .playback_output_state
-        .first_video_frame_pending()
+    if output_scheduler.playback_output_state.restart_pending()
         || output_scheduler.playback_output_state.rebuffering()
     {
         return Ok(false);
@@ -367,10 +368,17 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_video_queue_if_a
     subtitle_pipeline: &mut SubtitlePipeline,
     buffered_reporter: &mut BufferedReporter,
 ) -> bool {
-    if output_scheduler
-        .playback_output_state
-        .first_video_frame_pending()
-    {
+    output_scheduler.set_video_deadline_audio_clock_available(audio_clock.available);
+    if output_scheduler.playback_output_state.restart_pending() {
+        return false;
+    }
+    if !output_scheduler.video_clock_anchor_valid() {
+        tracing::trace!(
+            session_id = ?session_id,
+            queued_video_frames = output_scheduler.scheduled_video_queue.len(),
+            queued_video_range = ?output_scheduler.scheduled_video_queue.range_nsecs(),
+            "holding FFmpeg video-clock drain until scheduler anchor is valid"
+        );
         return false;
     }
     // Draining on the video clock while rebuffering advances the resume point
@@ -404,6 +412,7 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_video_queue_if_a
             audio_output_buffered_until_timeline_nsecs =
                 ?audio_clock.buffered_until_timeline_nsecs,
             audio_output_underrun = audio_clock.underrun_active,
+            audio_output_watchdog_stalled = audio_clock.watchdog_stalled,
             queued_video_frames = output_scheduler.scheduled_video_queue.len(),
             queued_video_ms =
                 output_scheduler.scheduled_video_queue.duration_nsecs() as f64 / 1_000_000.0,
@@ -426,7 +435,7 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_video_queue_if_a
 }
 
 fn video_clock_drain_allowed_while_audio_unavailable(audio_clock: AudioClockAvailability) -> bool {
-    !audio_clock.has_audio_output || !audio_clock.underrun_active
+    audio_clock.watchdog_stalled || !audio_clock.has_audio_output || !audio_clock.underrun_active
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -440,8 +449,8 @@ pub(in crate::player::backend::ffmpeg) fn present_video_frame_to_vo(
     position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
     buffered_reporter: &mut BufferedReporter,
-) {
-    admit_decoded_video_frame_to_vo(
+) -> bool {
+    let admitted = admit_decoded_video_frame_to_vo(
         frame,
         session_id,
         timeline_nsecs,
@@ -453,53 +462,13 @@ pub(in crate::player::backend::ffmpeg) fn present_video_frame_to_vo(
     if let Some(buffered_until_nsecs) = buffered_until_nsecs {
         buffered_reporter.report_video_timeline_nsecs(buffered_until_nsecs, session_id, event_tx);
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::player::backend::ffmpeg) struct PresentedQueuedVideoFrame {
-    pub(in crate::player::backend::ffmpeg) timeline_nsecs: u64,
-    pub(in crate::player::backend::ffmpeg) duration_nsecs: u64,
+    admitted
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) enum DecodedVideoAdmissionStatus {
     Continue,
     Stop,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(in crate::player::backend::ffmpeg) fn present_first_queued_video_frame<F>(
-    output_scheduler: &mut PlaybackOutputScheduler,
-    session_id: PlaybackSessionId,
-    vo_queue: &VideoOutputQueue,
-    frame_presented: &AtomicBool,
-    position_reporter: &mut PositionReporter,
-    event_tx: &Sender<BackendEvent>,
-    before_present: F,
-) -> Option<PresentedQueuedVideoFrame>
-where
-    F: FnOnce(PresentedQueuedVideoFrame, &PlaybackOutputScheduler),
-{
-    let frame = output_scheduler.scheduled_video_queue.pop_front()?;
-    let timing = PresentedQueuedVideoFrame {
-        timeline_nsecs: frame.timeline_nsecs,
-        duration_nsecs: frame.duration_nsecs,
-    };
-    before_present(timing, output_scheduler);
-    let admitted = admit_decoded_video_frame_to_vo(
-        frame.frame,
-        session_id,
-        timing.timeline_nsecs,
-        vo_queue,
-        frame_presented,
-        position_reporter,
-        event_tx,
-    );
-    if admitted {
-        report_first_video_frame_presented(session_id, event_tx);
-    }
-    output_scheduler.set_state(PlaybackOutputState::Playing);
-    Some(timing)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -525,7 +494,7 @@ pub(in crate::player::backend::ffmpeg) fn queue_decoded_video_frame(
         .map(|expected| i128::from(timeline_nsecs).saturating_sub(i128::from(expected)));
     let inserted_after_tail = previous_frame_timing.is_none_or(|(pts, _)| pts <= timeline_nsecs);
     let output_state = output_scheduler.playback_output_state;
-    let first_video_frame_pending = output_scheduler.first_video_frame_pending;
+    let first_video_frame_pending = output_scheduler.restart_pending();
 
     output_scheduler
         .scheduled_video_queue
@@ -534,6 +503,7 @@ pub(in crate::player::backend::ffmpeg) fn queue_decoded_video_frame(
             timeline_nsecs,
             duration_nsecs,
         });
+    output_scheduler.mark_first_frame_queued();
     log_decoded_video_frame_queue_admission(
         session_id,
         timeline_nsecs,
@@ -664,7 +634,7 @@ where
 {
     subtitle_pipeline.update_overlay_from_audio_clock(output, session_id, event_tx)?;
 
-    let first_video_frame_pending_before_queue = output_scheduler.first_video_frame_pending;
+    let first_video_frame_pending_before_queue = output_scheduler.restart_pending();
     if first_video_frame_pending_before_queue
         && output_scheduler.scheduled_video_queue.is_empty()
         && timeline_nsecs > *current_start_position_nsecs
@@ -702,7 +672,7 @@ where
         current_start_position_nsecs,
         scheduler,
         false,
-        0,
+        None,
         0,
         None,
         None,
@@ -713,16 +683,24 @@ where
             queue_capacity: 0,
             pending_input_packets: 0,
             pending_input_capacity: 0,
-            in_flight_packets: 0,
+            submitted_not_consumed_packets: 0,
             command_queue_capacity: 0,
             completed_packets: 0,
+            ..VideoDecodeWorkerSnapshot::default()
         },
         video_is_hevc,
+        video_is_hevc,
+        None,
         HevcDecodeChainStats::default(),
+        super::OutputServiceDemand::OutputStateChanged,
         demux_watermark,
     )? {
         OutputGateResumeStatus::Resumed => return Ok(DecodedVideoAdmissionStatus::Stop),
-        OutputGateResumeStatus::Waiting | OutputGateResumeStatus::WaitingForDemux => {
+        OutputGateResumeStatus::Waiting
+        | OutputGateResumeStatus::Rebuffering
+        | OutputGateResumeStatus::WaitingForDecodedVideo
+        | OutputGateResumeStatus::WaitingForDecodedAudio
+        | OutputGateResumeStatus::WaitingForDemux => {
             return Ok(DecodedVideoAdmissionStatus::Stop);
         }
         OutputGateResumeStatus::Idle => {}
@@ -757,6 +735,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(in crate::player::backend::ffmpeg) fn service_audio_clocked_drain_decoded_video_frame(
     output_scheduler: &mut PlaybackOutputScheduler,
+    _scheduler: &mut PlaybackScheduler,
     output: &AudioOutput,
     control: &FfmpegControl,
     session_id: PlaybackSessionId,
@@ -772,37 +751,21 @@ pub(in crate::player::backend::ffmpeg) fn service_audio_clocked_drain_decoded_vi
 ) -> std::result::Result<DecodedVideoAdmissionStatus, String> {
     subtitle_pipeline.update_overlay_from_audio_clock(output, session_id, event_tx)?;
 
-    if output_scheduler.first_video_frame_pending {
-        present_video_frame_to_vo(
+    if output_scheduler.restart_pending() {
+        // Decoder drain is not a second start path.  Retain the video side as
+        // READY and let the one restart transaction commit video + AO after
+        // both sides are ready.
+        queue_decoded_video_frame(
+            output_scheduler,
             frame,
             timeline_nsecs,
-            Some(timeline_nsecs.saturating_add(duration_nsecs)),
+            duration_nsecs,
+            true,
+            output.snapshot().ok(),
             session_id,
-            vo_queue,
-            frame_presented,
-            position_reporter,
             event_tx,
             buffered_reporter,
         );
-        output_scheduler.set_state(PlaybackOutputState::Playing);
-        let audio_flush_until_timeline_nsecs = timeline_nsecs.saturating_add(duration_nsecs);
-        flush_pending_start_audio(
-            &mut output_scheduler.pending_start_audio,
-            output,
-            timeline_nsecs,
-            audio_flush_until_timeline_nsecs,
-            AudioClockMode::SyncingVideo,
-            DelayedAudioStartSilencePolicy::Skip,
-            control,
-            &mut output_scheduler.scheduled_video_queue,
-            session_id,
-            vo_queue,
-            frame_presented,
-            position_reporter,
-            event_tx,
-            subtitle_pipeline,
-            buffered_reporter,
-        )?;
         return Ok(DecodedVideoAdmissionStatus::Stop);
     }
 
@@ -864,7 +827,9 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
 ) -> DecodedVideoAdmissionStatus {
     subtitle_pipeline.update_overlay(timeline_nsecs, session_id, event_tx);
 
-    if output_scheduler.first_video_frame_pending {
+    if output_scheduler.restart_pending() {
+        scheduler.reset(timeline_nsecs);
+        output_scheduler.mark_video_clock_anchor_valid();
         if timeline_nsecs > *current_start_position_nsecs {
             tracing::debug!(
                 previous_start_position_nsecs = *current_start_position_nsecs,
@@ -872,7 +837,6 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
                 "realigning FFmpeg playback start to first decoded video frame"
             );
             *current_start_position_nsecs = timeline_nsecs;
-            scheduler.reset(timeline_nsecs);
             subtitle_pipeline.realign_cues_for_position(timeline_nsecs);
             buffered_reporter.reset_to(nsecs_to_seconds(timeline_nsecs), session_id, event_tx);
         }
@@ -882,7 +846,7 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
             current_start_position_nsecs = *current_start_position_nsecs,
             "presenting first FFmpeg video frame after start gate"
         );
-        present_video_frame_to_vo(
+        let admitted = present_video_frame_to_vo(
             frame,
             timeline_nsecs,
             Some(timeline_nsecs.saturating_add(duration_nsecs)),
@@ -892,6 +856,18 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
             position_reporter,
             event_tx,
             buffered_reporter,
+        );
+        if !admitted {
+            output_scheduler.mark_first_frame_presentation_failed();
+            return DecodedVideoAdmissionStatus::Stop;
+        }
+        let first_present_elapsed = output_scheduler.mark_first_frame_presented();
+        tracing::debug!(
+            session_id = ?session_id,
+            first_present_ms = ?first_present_elapsed
+                .map(|elapsed| elapsed.as_secs_f64() * 1_000.0),
+            first_video_timeline_nsecs = timeline_nsecs,
+            "presented first video frame for FFmpeg output generation"
         );
         output_scheduler.set_state(PlaybackOutputState::Playing);
         return DecodedVideoAdmissionStatus::Stop;
@@ -973,6 +949,7 @@ mod tests {
                 pending_nsecs: Some(0),
                 buffered_until_timeline_nsecs: Some(24_716_997_309),
                 underrun_active: true,
+                watchdog_stalled: false,
             }
         ));
         assert!(video_clock_drain_allowed_while_audio_unavailable(
@@ -982,6 +959,17 @@ mod tests {
                 pending_nsecs: None,
                 buffered_until_timeline_nsecs: None,
                 underrun_active: false,
+                watchdog_stalled: false,
+            }
+        ));
+        assert!(video_clock_drain_allowed_while_audio_unavailable(
+            AudioClockAvailability {
+                has_audio_output: true,
+                available: false,
+                pending_nsecs: Some(92_879_818),
+                buffered_until_timeline_nsecs: Some(846_325_879_818),
+                underrun_active: false,
+                watchdog_stalled: true,
             }
         ));
     }

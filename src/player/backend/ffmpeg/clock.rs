@@ -34,13 +34,46 @@ pub(super) struct QueuedVideoFrame {
     pub(super) duration_nsecs: u64,
 }
 
-pub(super) fn queued_video_duration(queued_video_frames: &VecDeque<QueuedVideoFrame>) -> Duration {
-    match (queued_video_frames.front(), queued_video_frames.back()) {
-        (Some(first), Some(last)) => {
-            Duration::from_nanos(last.timeline_nsecs.saturating_sub(first.timeline_nsecs))
+pub(super) fn queued_video_coverage_duration(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+) -> Duration {
+    let Some(first) = queued_video_frames.front() else {
+        return Duration::ZERO;
+    };
+
+    let mut coverage_nsecs = 0_u64;
+    let mut run_start_nsecs = first.timeline_nsecs;
+    let mut run_end_nsecs = first.timeline_nsecs.saturating_add(first.duration_nsecs);
+    for frame in queued_video_frames.iter().skip(1) {
+        let frame_end_nsecs = frame.timeline_nsecs.saturating_add(frame.duration_nsecs);
+        if frame.timeline_nsecs > run_end_nsecs {
+            coverage_nsecs =
+                coverage_nsecs.saturating_add(run_end_nsecs.saturating_sub(run_start_nsecs));
+            run_start_nsecs = frame.timeline_nsecs;
+            run_end_nsecs = frame_end_nsecs;
+        } else {
+            run_end_nsecs = run_end_nsecs.max(frame_end_nsecs);
         }
+    }
+    coverage_nsecs = coverage_nsecs.saturating_add(run_end_nsecs.saturating_sub(run_start_nsecs));
+    Duration::from_nanos(coverage_nsecs)
+}
+
+pub(super) fn queued_video_range_span(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+) -> Duration {
+    match (queued_video_frames.front(), queued_video_frames.back()) {
+        (Some(first), Some(last)) => Duration::from_nanos(
+            last.timeline_nsecs
+                .saturating_add(last.duration_nsecs)
+                .saturating_sub(first.timeline_nsecs),
+        ),
         _ => Duration::ZERO,
     }
+}
+
+pub(super) fn queued_video_duration(queued_video_frames: &VecDeque<QueuedVideoFrame>) -> Duration {
+    queued_video_coverage_duration(queued_video_frames)
 }
 
 pub(super) fn queued_video_limit_duration(
@@ -170,6 +203,19 @@ impl PlaybackScheduler {
             .checked_add(Duration::from_nanos(target_offset))
             .unwrap_or(self.start_instant);
         Instant::now() >= target
+    }
+
+    pub(super) fn current_timeline_nsecs(&self) -> u64 {
+        self.start_position_nsecs.saturating_add(
+            u64::try_from(self.start_instant.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_elapsed_for_test(&mut self, elapsed: Duration) {
+        self.start_instant = Instant::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(Instant::now);
     }
 
     #[cfg(test)]

@@ -3,8 +3,9 @@ use std::{collections::BTreeMap, os::raw::c_int};
 use super::seek_algorithm::CachedSeekPacketRangeContext;
 use super::{
     CachedSeekMiss, CachedSeekMissReason, DemuxCachedRange, DemuxCachedSeekHit,
-    DemuxCachedSeekInfo, DemuxPacketCacheState, DemuxPacketRangeView, DemuxSeekRequest, PacketId,
-    PlaybackSeekMode, PlaybackSessionId, RangeId, StreamCacheKind, nsecs_to_seconds,
+    DemuxCachedSeekInfo, DemuxCachedSeekPlan, DemuxPacketCacheState, DemuxPacketRangeView,
+    DemuxSeekRequest, PacketId, PlaybackSeekMode, PlaybackSessionId, RangeId, StreamCacheKind,
+    nsecs_to_seconds,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +58,7 @@ impl DemuxPacketCacheState {
             .ok()
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seek_cached_with_generation_attempt(
         &mut self,
         target_nsecs: u64,
@@ -64,6 +66,21 @@ impl DemuxPacketCacheState {
         session_id: PlaybackSessionId,
         seek_generation: u64,
     ) -> Result<DemuxCachedSeekHit, CachedSeekMiss> {
+        let plan = match self.resolve_cached_seek_plan_attempt(target_nsecs, mode) {
+            Ok(plan) => plan,
+            Err(miss) => {
+                self.record_cached_seek_rejection(miss);
+                return Err(miss);
+            }
+        };
+        self.commit_cached_seek_plan(plan, session_id, seek_generation)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn resolve_cached_seek_plan_attempt(
+        &self,
+        target_nsecs: u64,
+        mode: PlaybackSeekMode,
+    ) -> Result<DemuxCachedSeekPlan, CachedSeekMiss> {
         let detached_append_range_id = self.detached_append_range_id();
         let mut ordered_ranges = vec![(self.read_range_id, CachedSeekRangeLocation::Current)];
         if let Some(range_id) = detached_append_range_id {
@@ -78,7 +95,7 @@ impl DemuxPacketCacheState {
                 .map(|range_id| (range_id, CachedSeekRangeLocation::Archived)),
         );
 
-        let mut rejections = Vec::new();
+        let mut first_rejection = None;
         for (range_id, location) in ordered_ranges {
             if self.failed_cached_seek_ranges.contains_key(&range_id)
                 || self.rejected_cached_seek_ranges.contains_key(&range_id)
@@ -93,34 +110,32 @@ impl DemuxPacketCacheState {
             }
             match self.seek_cached_in_range_diagnostic(range, target_nsecs, mode) {
                 Ok(hit) => {
-                    for miss in rejections {
-                        self.record_cached_seek_rejection(miss);
-                    }
-                    return Ok(self.commit_cached_seek_hit(
+                    let _ = location;
+                    return Ok(DemuxCachedSeekPlan {
                         hit,
-                        location,
-                        session_id,
-                        seek_generation,
-                    ));
+                        seekability_revision: self.seekability_revision(),
+                        cache_generation: self.generation,
+                        read_range_id: self.read_range_id,
+                        append_range_id: self.append_range_id,
+                    });
                 }
                 Err(miss) => {
-                    rejections.push(miss);
+                    first_rejection.get_or_insert(miss);
                 }
             }
         }
 
-        let miss = rejections.first().copied().unwrap_or(CachedSeekMiss {
+        Err(first_rejection.unwrap_or(CachedSeekMiss {
             range_id: None,
             target_nsecs,
             reason: CachedSeekMissReason::TargetOutsideRange,
-        });
-        for rejection in rejections {
-            self.record_cached_seek_rejection(rejection);
-        }
-        Err(miss)
+        }))
     }
 
-    fn record_cached_seek_rejection(&mut self, miss: CachedSeekMiss) {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn record_cached_seek_rejection(
+        &mut self,
+        miss: CachedSeekMiss,
+    ) {
         let Some(range_id) = miss.range_id else {
             return;
         };
@@ -136,6 +151,64 @@ impl DemuxPacketCacheState {
             rejection_reason = miss.reason.as_str(),
             "invalidated advertised FFmpeg cached seek range after exact seek rejection"
         );
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn commit_cached_seek_plan(
+        &mut self,
+        plan: DemuxCachedSeekPlan,
+        session_id: PlaybackSessionId,
+        seek_generation: u64,
+    ) -> Result<DemuxCachedSeekHit, CachedSeekMiss> {
+        if !self.cached_seek_plan_is_current(&plan) {
+            return Err(CachedSeekMiss {
+                range_id: Some(plan.hit.range_id),
+                target_nsecs: plan.hit.target_nsecs,
+                reason: CachedSeekMissReason::GenerationBlocked,
+            });
+        }
+        let location = if plan.hit.range_id == self.read_range_id {
+            CachedSeekRangeLocation::Current
+        } else if Some(plan.hit.range_id) == self.detached_append_range_id() {
+            CachedSeekRangeLocation::Detached
+        } else {
+            CachedSeekRangeLocation::Archived
+        };
+        Ok(self.commit_cached_seek_hit(plan.hit, location, session_id, seek_generation))
+    }
+
+    fn cached_seek_plan_is_current(&self, plan: &DemuxCachedSeekPlan) -> bool {
+        if plan.seekability_revision != self.seekability_revision()
+            || plan.cache_generation != self.generation
+            || plan.read_range_id != self.read_range_id
+            || plan.append_range_id != self.append_range_id
+            || self
+                .failed_cached_seek_ranges
+                .contains_key(&plan.hit.range_id)
+            || self
+                .rejected_cached_seek_ranges
+                .contains_key(&plan.hit.range_id)
+        {
+            return false;
+        }
+        let Some(range) = self.ranges.get(&plan.hit.range_id) else {
+            return false;
+        };
+        if self
+            .range_cached_seek_target(range, plan.hit.target_nsecs)
+            .is_none()
+        {
+            return false;
+        }
+        plan.hit
+            .reader_heads
+            .iter()
+            .all(|(stream_index, packet_id)| {
+                self.packets.contains_key(packet_id)
+                    && range
+                        .stream_queues
+                        .get(stream_index)
+                        .is_some_and(|queue| queue.contains(packet_id))
+            })
     }
 
     fn commit_cached_seek_hit(
@@ -159,6 +232,7 @@ impl DemuxPacketCacheState {
             self.activate_range_for_read_with_heads(hit.range_id, hit.reader_heads);
         }
         self.reader_nsecs = hit.anchor_nsecs;
+        self.exact_seek_target_nsecs = hit.target_nsecs;
         self.session_id = session_id;
         self.seek_request = None;
         self.seeking = false;
@@ -167,7 +241,10 @@ impl DemuxPacketCacheState {
         if location == CachedSeekRangeLocation::Archived && !self.read_range_eof() {
             self.queue_resume_seek_after_cached_range(buffered_until_nsecs, seek_generation);
         }
-        self.trim_to_limit();
+        // A seek commit is latency-sensitive. Do at most one bounded trim
+        // step here; normal read/append maintenance finishes any remaining
+        // backbuffer work without delaying the first target frame.
+        let _ = self.trim_to_limit_for_read_with_outcome();
         self.cached_seeks = self.cached_seeks.saturating_add(1);
         self.refresh_readahead_hysteresis();
         result
@@ -250,14 +327,15 @@ impl DemuxPacketCacheState {
                 cached_seek_preroll_nsecs,
                 recovery_point_stream_index: self.recovery_point_stream_index(),
                 required_stream_indices: &required_stream_indices,
+                stream_pts_index: &range.stream_pts_index,
+                stream_recovery_point_index: &range.stream_recovery_point_index,
+                buffered_until_nsecs: seek_target.seekable_until_nsecs,
                 range: DemuxPacketRangeView {
                     stream_queues: &stream_queues,
                     subtitle_stream_index: self
                         .selected_streams
                         .subtitle_stream
                         .map(|stream| stream.index),
-                    is_bof: seek_target.is_bof,
-                    is_eof: seek_target.is_eof,
                 },
             },
             seek_target.target_nsecs,
@@ -308,14 +386,18 @@ impl DemuxPacketCacheState {
                     cached_seek_preroll_nsecs,
                     recovery_point_stream_index: self.recovery_point_stream_index(),
                     required_stream_indices,
+                    stream_pts_index: &range.stream_pts_index,
+                    stream_recovery_point_index: &range.stream_recovery_point_index,
+                    buffered_until_nsecs: self
+                        .range_cached_seek_target(range, target_nsecs)
+                        .map(|target| target.seekable_until_nsecs)
+                        .unwrap_or(target_nsecs),
                     range: DemuxPacketRangeView {
                         stream_queues: &range.stream_queues,
                         subtitle_stream_index: self
                             .selected_streams
                             .subtitle_stream
                             .map(|stream| stream.index),
-                        is_bof: range.is_bof,
-                        is_eof: range.is_eof,
                     },
                 },
                 target_nsecs,
@@ -350,16 +432,12 @@ impl DemuxPacketCacheState {
             return summary.is_bof.then_some(RangeCachedSeekTarget {
                 target_nsecs: first.0,
                 seekable_until_nsecs: first.1,
-                is_bof: summary.is_bof,
-                is_eof: summary.is_eof,
             });
         }
         if target_nsecs > last.1 {
             return summary.is_eof.then_some(RangeCachedSeekTarget {
                 target_nsecs: last.1,
                 seekable_until_nsecs: last.1,
-                is_bof: summary.is_bof,
-                is_eof: summary.is_eof,
             });
         }
         summary
@@ -369,8 +447,6 @@ impl DemuxPacketCacheState {
             .map(|(_, end)| RangeCachedSeekTarget {
                 target_nsecs,
                 seekable_until_nsecs: end,
-                is_bof: summary.is_bof,
-                is_eof: summary.is_eof,
             })
     }
 
@@ -450,6 +526,7 @@ impl DemuxPacketCacheState {
         self.clear_reader_tracking();
         self.cache_buffering_percent = None;
         self.reader_nsecs = target_nsecs;
+        self.exact_seek_target_nsecs = target_nsecs;
         self.session_id = session_id;
         self.seek_request = Some(DemuxSeekRequest {
             position_seconds,
@@ -466,7 +543,7 @@ impl DemuxPacketCacheState {
         self.low_level_seeks = self.low_level_seeks.saturating_add(1);
         self.demux_ts_nsecs = None;
         self.hysteresis_active = false;
-        self.trim_to_limit();
+        let _ = self.trim_to_limit_for_read_with_outcome();
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn request_continuation_seek(
@@ -479,6 +556,7 @@ impl DemuxPacketCacheState {
         self.preserve_detached_append_range();
         self.clear_reader_tracking();
         self.cache_buffering_percent = None;
+        self.exact_seek_target_nsecs = self.reader_nsecs;
         self.seek_request = Some(DemuxSeekRequest {
             position_seconds,
             session_id,
@@ -494,7 +572,7 @@ impl DemuxPacketCacheState {
         self.low_level_seeks = self.low_level_seeks.saturating_add(1);
         self.demux_ts_nsecs = None;
         self.hysteresis_active = false;
-        self.trim_to_limit();
+        let _ = self.trim_to_limit_for_read_with_outcome();
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn take_seek_request(
@@ -507,6 +585,4 @@ impl DemuxPacketCacheState {
 struct RangeCachedSeekTarget {
     target_nsecs: u64,
     seekable_until_nsecs: u64,
-    is_bof: bool,
-    is_eof: bool,
 }

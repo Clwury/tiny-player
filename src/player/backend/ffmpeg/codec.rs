@@ -1,4 +1,5 @@
 use std::{
+    env,
     ffi::CStr,
     mem,
     os::raw::{c_int, c_uint},
@@ -18,12 +19,15 @@ use super::{
 };
 
 const VULKAN_THREAD_SAFE_LIBAVCODEC_VERSION: c_uint = av_version_int(62, 11, 100);
+const TINY_VULKAN_DECODE_THREADS_ENV: &str = "TINY_VULKAN_DECODE_THREADS";
+const DEFAULT_VULKAN_DECODE_THREADS: c_int = 4;
 
 pub(super) struct Decoder {
     ptr: *mut ffi::AVCodecContext,
     pub(super) stream_index: c_int,
     pub(super) time_base: ffi::AVRational,
     video_hw: Option<VideoHwDecodeContext>,
+    hardware_decode_mode: HardwareDecodeMode,
     hw_format_selection: Option<Box<VideoHwFormatSelection>>,
 }
 
@@ -33,7 +37,7 @@ unsafe impl Send for Decoder {}
 impl Decoder {
     pub(super) fn open(stream: StreamInfo) -> std::result::Result<Self, String> {
         let decoder = find_decoder(stream)?;
-        Self::open_with_decoder(stream, decoder, None, None)
+        Self::open_with_decoder(stream, decoder, None, HardwareDecodeMode::Off, None)
     }
 
     pub(super) fn open_audio(stream: StreamInfo) -> std::result::Result<Self, String> {
@@ -45,7 +49,7 @@ impl Decoder {
         canvas_size: Option<RenderSize>,
     ) -> std::result::Result<Self, String> {
         let decoder = find_decoder(stream)?;
-        Self::open_with_decoder(stream, decoder, None, canvas_size)
+        Self::open_with_decoder(stream, decoder, None, HardwareDecodeMode::Off, canvas_size)
     }
 
     pub(super) fn open_video(
@@ -53,45 +57,69 @@ impl Decoder {
         hw_mode: HardwareDecodeMode,
     ) -> std::result::Result<Self, String> {
         let decoder = find_decoder(stream)?;
-        if !hw_mode.should_try_vulkan() {
-            return Self::open_with_decoder(stream, decoder, None, None);
-        }
-
-        match VideoHwDecodeContext::try_create(decoder) {
-            Ok(video_hw) => match Self::open_with_decoder(stream, decoder, Some(video_hw), None) {
-                Ok(decoder_context) => {
-                    tracing::info!(
-                        decoder = %decoder_name(decoder),
-                        "enabled FFmpeg Vulkan hardware video decoder"
-                    );
-                    Ok(decoder_context)
+        let decoder_context = if !hw_mode.should_try_vulkan() {
+            Self::open_with_decoder(stream, decoder, None, hw_mode, None)
+        } else {
+            match VideoHwDecodeContext::try_create(decoder) {
+                Ok(video_hw) => {
+                    match Self::open_with_decoder(stream, decoder, Some(video_hw), hw_mode, None) {
+                        Ok(decoder_context) => {
+                            tracing::info!(
+                                decoder = %decoder_name(decoder),
+                                requested_hw_mode = ?hw_mode,
+                                active_hwaccel = true,
+                                hw_pixel_format = ?decoder_context
+                                    .video_hw
+                                    .as_ref()
+                                    .map(|hw| hw.pixel_format()),
+                                "enabled FFmpeg Vulkan hardware video decoder"
+                            );
+                            Ok(decoder_context)
+                        }
+                        Err(error) if hw_mode.allows_fallback() => {
+                            tracing::warn!(
+                                %error,
+                                decoder = %decoder_name(decoder),
+                                "FFmpeg Vulkan decoder open failed; falling back to software"
+                            );
+                            Self::open_with_decoder(stream, decoder, None, hw_mode, None)
+                        }
+                        Err(error) => Err(format!("FFmpeg Vulkan 硬解打开失败：{error}")),
+                    }
                 }
                 Err(error) if hw_mode.allows_fallback() => {
                     tracing::warn!(
                         %error,
                         decoder = %decoder_name(decoder),
-                        "FFmpeg Vulkan decoder open failed; falling back to software"
+                        "FFmpeg Vulkan hardware decode unavailable; falling back to software"
                     );
-                    Self::open_with_decoder(stream, decoder, None, None)
+                    Self::open_with_decoder(stream, decoder, None, hw_mode, None)
                 }
-                Err(error) => Err(format!("FFmpeg Vulkan 硬解打开失败：{error}")),
-            },
-            Err(error) if hw_mode.allows_fallback() => {
-                tracing::warn!(
-                    %error,
-                    decoder = %decoder_name(decoder),
-                    "FFmpeg Vulkan hardware decode unavailable; falling back to software"
-                );
-                Self::open_with_decoder(stream, decoder, None, None)
+                Err(error) => Err(format!("FFmpeg Vulkan 硬解不可用：{error}")),
             }
-            Err(error) => Err(format!("FFmpeg Vulkan 硬解不可用：{error}")),
+        }?;
+        let active_hwaccel = decoder_context.is_hardware_accelerated();
+        if hw_mode == HardwareDecodeMode::ForceVulkan && !active_hwaccel {
+            return Err("TINY_HWDEC=force-vulkan 但 FFmpeg 未激活 Vulkan 硬解".to_string());
         }
+        tracing::info!(
+            decoder = %decoder_name(decoder),
+            requested_hw_mode = ?hw_mode,
+            active_hwaccel,
+            hw_pixel_format = ?decoder_context
+                .video_hw
+                .as_ref()
+                .map(|hw| hw.pixel_format()),
+            "resolved FFmpeg video decode mode"
+        );
+        Ok(decoder_context)
     }
 
     fn open_with_decoder(
         stream: StreamInfo,
         decoder: *const ffi::AVCodec,
         video_hw: Option<VideoHwDecodeContext>,
+        hardware_decode_mode: HardwareDecodeMode,
         subtitle_canvas_size: Option<RenderSize>,
     ) -> std::result::Result<Self, String> {
         let codecpar = unsafe { (*stream.stream).codecpar };
@@ -108,6 +136,7 @@ impl Decoder {
             ptr: context,
             stream_index: stream.index,
             time_base: stream.time_base,
+            hardware_decode_mode,
             hw_format_selection: video_hw.as_ref().map(|hw| {
                 Box::new(VideoHwFormatSelection {
                     pixel_format: hw.pixel_format(),
@@ -122,16 +151,20 @@ impl Decoder {
                 ffmpeg_error(result)
             ));
         }
+        let libavcodec_version = unsafe { ffi::avcodec_version() };
+        let requested_thread_count = if decoder_context.video_hw.is_none() {
+            0
+        } else if vulkan_decode_needs_single_thread(
+            stream.codec_id,
+            decoder_context.video_hw.as_ref(),
+        ) {
+            1
+        } else {
+            configured_vulkan_decode_thread_count()
+        };
         unsafe {
             (*context).pkt_timebase = stream.time_base;
-            (*context).thread_count = if vulkan_decode_needs_single_thread(
-                stream.codec_id,
-                decoder_context.video_hw.as_ref(),
-            ) {
-                1
-            } else {
-                0
-            };
+            (*context).thread_count = requested_thread_count;
             (*context).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
             if (*context).codec_type == ffi::AVMediaType::AVMEDIA_TYPE_VIDEO
                 && let Some(error_recognition) = video_error_recognition(stream.codec_id)
@@ -168,10 +201,17 @@ impl Decoder {
         }
         let result = unsafe { ffi::avcodec_open2(context, decoder, ptr::null_mut()) };
         if result < 0 {
-            return Err(format!("FFmpeg 打开解码器失败：{}", ffmpeg_error(result)));
+            return Err(format!(
+                "FFmpeg 打开解码器失败：code={result}, error={}",
+                ffmpeg_error(result)
+            ));
         }
         tracing::debug!(
             decoder = %decoder_name(decoder),
+            requested_hw_mode = ?decoder_context.hardware_decode_mode,
+            active_hwaccel = decoder_context.video_hw.is_some(),
+            libavcodec_version,
+            requested_thread_count,
             thread_count = unsafe { (*context).thread_count },
             active_thread_type = unsafe { (*context).active_thread_type },
             err_recognition = unsafe { (*context).err_recognition },
@@ -213,14 +253,23 @@ impl Decoder {
     where
         F: FnMut(*mut ffi::AVFrame) -> std::result::Result<(), String>,
     {
+        // Match libavcodec's receive-first state machine: exhaust output left by
+        // earlier packets before offering more input. EAGAIN from receive is a
+        // normal request for the packet below, not decode-failure evidence.
+        self.receive_frames(frame, &mut on_frame)?;
         loop {
             let result = unsafe { ffi::avcodec_send_packet(self.ptr, packet) };
             if result == ffi::AVERROR(ffi::EAGAIN) {
+                // A send-side EAGAIN means output must be drained before the
+                // exact same packet is retried; the packet is never discarded.
                 self.receive_frames(frame, &mut on_frame)?;
                 continue;
             }
             if result < 0 {
-                return Err(format!("FFmpeg 发送解码包失败：{}", ffmpeg_error(result)));
+                return Err(format!(
+                    "FFmpeg 发送解码包失败：code={result}, error={}",
+                    ffmpeg_error(result)
+                ));
             }
             return self.receive_frames(frame, &mut on_frame);
         }
@@ -237,7 +286,10 @@ impl Decoder {
         let mut on_frame = on_frame;
         let result = unsafe { ffi::avcodec_send_packet(self.ptr, ptr::null()) };
         if result < 0 && result != ffi::AVERROR_EOF {
-            return Err(format!("FFmpeg 刷新解码器失败：{}", ffmpeg_error(result)));
+            return Err(format!(
+                "FFmpeg 刷新解码器失败：code={result}, error={}",
+                ffmpeg_error(result)
+            ));
         }
         self.receive_frames(frame, &mut on_frame)
     }
@@ -295,6 +347,10 @@ impl Decoder {
         self.video_hw.is_some()
     }
 
+    pub(super) fn hardware_decode_mode(&self) -> HardwareDecodeMode {
+        self.hardware_decode_mode
+    }
+
     fn receive_frames<F>(
         &self,
         frame: &mut AvFrame,
@@ -309,7 +365,10 @@ impl Decoder {
                 return Ok(());
             }
             if result < 0 {
-                return Err(format!("FFmpeg 接收解码帧失败：{}", ffmpeg_error(result)));
+                return Err(format!(
+                    "FFmpeg 接收解码帧失败：code={result}, error={}",
+                    ffmpeg_error(result)
+                ));
             }
 
             let frame_result = on_frame(frame.as_mut_ptr());
@@ -332,11 +391,33 @@ fn vulkan_decode_needs_single_thread(
 }
 
 fn vulkan_decode_codec_needs_single_thread(
-    codec_id: ffi::AVCodecID,
+    _codec_id: ffi::AVCodecID,
     avcodec_version: c_uint,
 ) -> bool {
-    codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC
-        || avcodec_version < VULKAN_THREAD_SAFE_LIBAVCODEC_VERSION
+    avcodec_version < VULKAN_THREAD_SAFE_LIBAVCODEC_VERSION
+}
+
+fn parse_vulkan_decode_thread_count(value: &str) -> Option<c_int> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" => Some(1),
+        "4" => Some(4),
+        "" | "0" | "auto" => Some(0),
+        _ => None,
+    }
+}
+
+fn configured_vulkan_decode_thread_count() -> c_int {
+    let Ok(value) = env::var(TINY_VULKAN_DECODE_THREADS_ENV) else {
+        return DEFAULT_VULKAN_DECODE_THREADS;
+    };
+    parse_vulkan_decode_thread_count(&value).unwrap_or_else(|| {
+        tracing::warn!(
+            value,
+            default_threads = DEFAULT_VULKAN_DECODE_THREADS,
+            "ignored invalid TINY_VULKAN_DECODE_THREADS; expected 1, 4, or auto"
+        );
+        DEFAULT_VULKAN_DECODE_THREADS
+    })
 }
 
 fn video_error_recognition(codec_id: ffi::AVCodecID) -> Option<c_int> {
@@ -1240,8 +1321,8 @@ mod tests {
         AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, VideoRecoveryPointKind,
         audio_codec_requires_recovery_point, packet_is_audio_recovery_point,
         packet_is_video_recovery_point, packet_is_video_seek_point,
-        packet_video_recovery_point_kind, video_error_recognition,
-        vulkan_decode_codec_needs_single_thread,
+        packet_video_recovery_point_kind, parse_vulkan_decode_thread_count,
+        video_error_recognition, vulkan_decode_codec_needs_single_thread,
     };
 
     fn packet_from_data(data: &[u8]) -> AvPacket {
@@ -1400,10 +1481,15 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_hevc_decode_always_uses_single_thread() {
+    fn vulkan_decode_uses_single_thread_only_before_ffmpeg_thread_safety_fix() {
+        let older_unsafe_version = super::av_version_int(62, 11, 99);
         let newer_thread_safe_version = super::av_version_int(62, 28, 102);
 
         assert!(vulkan_decode_codec_needs_single_thread(
+            ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            older_unsafe_version,
+        ));
+        assert!(!vulkan_decode_codec_needs_single_thread(
             ffi::AVCodecID::AV_CODEC_ID_HEVC,
             newer_thread_safe_version,
         ));
@@ -1411,6 +1497,15 @@ mod tests {
             ffi::AVCodecID::AV_CODEC_ID_H264,
             newer_thread_safe_version,
         ));
+    }
+
+    #[test]
+    fn vulkan_decode_thread_ab_values_parse_as_one_four_or_auto() {
+        assert_eq!(parse_vulkan_decode_thread_count("1"), Some(1));
+        assert_eq!(parse_vulkan_decode_thread_count("4"), Some(4));
+        assert_eq!(parse_vulkan_decode_thread_count("auto"), Some(0));
+        assert_eq!(parse_vulkan_decode_thread_count("0"), Some(0));
+        assert_eq!(parse_vulkan_decode_thread_count("16"), None);
     }
 
     #[test]

@@ -163,7 +163,7 @@ impl DemuxPacketCache {
                 "repaired FFmpeg demux packet cache reader heads"
             );
             self.shared.refresh_monitor_snapshot(&guard);
-            self.shared.ready.notify_all();
+            self.shared.notify_ready();
         }
         repaired
     }
@@ -195,7 +195,7 @@ impl DemuxPacketCache {
             guard.realign_stream_reader_to_timeline(stream_index, target_timeline_nsecs, reason);
         if result.is_some() {
             self.shared.refresh_monitor_snapshot(&guard);
-            self.shared.ready.notify_all();
+            self.shared.notify_ready();
         }
         result
     }
@@ -216,6 +216,70 @@ impl DemuxPacketCache {
         let snapshot = DemuxPacketCacheMonitorSnapshot::from_state(&guard);
         self.shared.store_monitor_snapshot(snapshot.clone());
         (snapshot.packet_queue, snapshot.reader_watermark, false)
+    }
+
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn wait_for_consumer_drainable(
+        &self,
+        stream_indices: &[c_int],
+        timeout: Duration,
+    ) {
+        if stream_indices.is_empty() || timeout.is_zero() {
+            return;
+        }
+        let deadline = Instant::now().checked_add(timeout);
+        let mut guard = self
+            .shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        while !guard.shutdown
+            && self.shared.control.is_cache_paused()
+            && !self.shared.control.should_interrupt()
+            && !guard
+                .drainable_streams()
+                .iter()
+                .any(|stream_index| stream_indices.contains(stream_index))
+        {
+            let remaining = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                break;
+            }
+            guard = self.shared.wait_for_ready_change(guard, remaining);
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn wait_for_cache_generation_change(
+        &self,
+        observed_generation: u64,
+        timeout: Duration,
+    ) -> bool {
+        if timeout.is_zero() {
+            return false;
+        }
+        let deadline = Instant::now().checked_add(timeout);
+        let mut guard = self
+            .shared
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        while !guard.shutdown
+            && self.shared.control.is_cache_paused()
+            && !self.shared.control.should_interrupt()
+            && guard.next_packet_id == observed_generation
+        {
+            let remaining = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                break;
+            }
+            guard = self.shared.wait_for_ready_change(guard, remaining);
+        }
+        guard.next_packet_id != observed_generation
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop) fn demux_read_blocked_for(
@@ -245,7 +309,7 @@ impl DemuxPacketCache {
             subtitle_stream,
         });
         self.shared.refresh_monitor_snapshot(&guard);
-        self.shared.ready.notify_all();
+        self.shared.notify_ready();
     }
 
     fn read_packet_round_robin_inner(
@@ -300,7 +364,7 @@ impl DemuxPacketCache {
                 // pruning update the internal range immediately, while OSC
                 // observes the coalesced result on the 250 ms cache tick.
                 self.shared.emit_cache_state_after_read(&mut guard, false);
-                self.shared.ready.notify_all();
+                self.shared.notify_ready();
                 drop(guard);
                 let (packet, stream_offset) = match packet_source.packet_ref(&mut timing) {
                     Ok(packet) => packet,
@@ -311,7 +375,7 @@ impl DemuxPacketCache {
             let activate_started_at = Instant::now();
             if guard.activate_detached_append_range() {
                 timing.refresh_reader_tracking += activate_started_at.elapsed();
-                self.shared.ready.notify_all();
+                self.shared.notify_ready();
                 continue;
             }
             if self.shared.control.is_cache_paused() && !guard.cache_pause_recovered() {
@@ -319,11 +383,9 @@ impl DemuxPacketCache {
                     return (DemuxReadResult::WouldBlock, None, timing);
                 }
                 let wait_started_at = Instant::now();
-                let (next_guard, _) = self
+                let next_guard = self
                     .shared
-                    .ready
-                    .wait_timeout(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL)
-                    .expect("FFmpeg demux packet cache poisoned");
+                    .wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
                 timing.data_wait += wait_started_at.elapsed();
                 timing.data_waits = timing.data_waits.saturating_add(1);
                 guard = next_guard;
@@ -345,7 +407,7 @@ impl DemuxPacketCache {
                     "FFmpeg demux packet cache exhausted selected stream queues; requested low-level continuation seek"
                 );
                 let emit = self.shared.prepare_cache_state_emit(&mut guard);
-                self.shared.ready.notify_all();
+                self.shared.notify_ready();
                 drop(guard);
                 self.shared.send_cache_state_emit(emit.into_emit());
                 let Some(next_guard) =
@@ -426,11 +488,9 @@ impl DemuxPacketCache {
                 next_stall_log_at = now.checked_add(DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL);
             }
             let wait_started_at = Instant::now();
-            let (next_guard, _) = self
+            let next_guard = self
                 .shared
-                .ready
-                .wait_timeout(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL)
-                .expect("FFmpeg demux packet cache poisoned");
+                .wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
             timing.data_wait += wait_started_at.elapsed();
             timing.data_waits = timing.data_waits.saturating_add(1);
             guard = next_guard;

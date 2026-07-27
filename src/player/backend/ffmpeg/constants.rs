@@ -36,7 +36,6 @@ pub(super) const PLAYING_PENDING_AUDIO_HARD_RESET_DURATION: Duration = Duration:
 pub(super) const PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION: Duration = Duration::from_secs(4);
 pub(super) const PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION: Duration = Duration::from_secs(3);
 pub(super) const VIDEO_OUTPUT_REBUFFER_ENTER_AFTER: Duration = Duration::from_millis(250);
-pub(super) const VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER: Duration = Duration::from_millis(150);
 pub(super) const VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION: Duration = Duration::from_millis(250);
 pub(super) const VIDEO_OUTPUT_REBUFFER_RESUME_DURATION: Duration = Duration::from_millis(1000);
 pub(super) const VIDEO_OUTPUT_REBUFFER_MIN_STABLE_RESUME_DURATION: Duration =
@@ -47,8 +46,6 @@ pub(super) const VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER: Duration =
     Duration::from_millis(2000);
 pub(super) const VIDEO_OUTPUT_START_PREBUFFER_DURATION: Duration = Duration::from_millis(250);
 pub(super) const VIDEO_OUTPUT_START_FAST_READY_DURATION: Duration = Duration::from_millis(80);
-pub(super) const VIDEO_OUTPUT_START_FIRST_FRAME_FALLBACK_AFTER: Duration =
-    Duration::from_millis(300);
 pub(super) const VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER: Duration =
     Duration::from_millis(500);
 pub(super) const VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE: Duration = Duration::from_millis(80);
@@ -85,15 +82,14 @@ pub(super) const LATE_VIDEO_DROP_TOLERANCE: Duration = Duration::from_millis(75)
 pub(super) const DEFAULT_PLAYBACK_VOLUME: f32 = 1.0;
 pub(super) const PLAYBACK_VOLUME_SCALE: u32 = 10_000;
 #[cfg(test)]
-pub(super) const HTTP_RING_CACHE_CAPACITY: usize = 500 * 1024 * 1024;
+pub(super) const HTTP_RING_CACHE_CAPACITY: usize = 32 * 1024 * 1024;
 pub(super) const HTTP_CACHE_CHUNK_SIZE: usize = 1024 * 1024;
 #[cfg(test)]
-pub(super) const HTTP_CACHE_RANGE_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const HTTP_CACHE_RANGE_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const HTTP_CACHE_SIDE_DOWNLOAD_WORKERS: usize = 2;
 pub(super) const HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR: u64 = 1;
 pub(super) const HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR: u64 = 2;
 pub(super) const HTTP_CACHE_WAIT_INTERVAL: Duration = Duration::from_millis(50);
-pub(super) const HTTP_CACHE_STALL_LOG_AFTER: Duration = Duration::from_millis(500);
 pub(super) const HTTP_CACHE_STALL_LOG_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const HTTP_CACHE_PREFETCH_PAUSE_LOG_AFTER: Duration = Duration::from_millis(500);
 pub(super) const HTTP_CACHE_PREFETCH_PAUSE_LOG_INTERVAL: Duration = Duration::from_secs(5);

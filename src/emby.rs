@@ -120,26 +120,17 @@ impl EmbyClient {
         T: DeserializeOwned,
     {
         let url = api_url(endpoint, path_segments)?;
-        debug!(method = %method, url = %url, "sending Emby public request");
+        debug!(method = %method, url = %redacted_url_for_log(&url), "sending Emby public request");
         let response = self
             .http
             .request(method, url)
             .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
             .send()
-            .context("连接 Emby 服务器失败")?;
+            .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;
 
         let status = response.status();
-        let response_headers = format!("{:?}", response.headers());
         let response_body = response.text().context("读取 Emby API 响应失败")?;
         debug!(status = %status, "received Emby public response");
-        if log_secrets() {
-            debug!(
-                status = %status,
-                headers = %response_headers,
-                body = %response_body,
-                "full Emby public response"
-            );
-        }
 
         if !status.is_success() {
             bail!("{http_error_prefix}：HTTP {status} {response_body}");
@@ -164,16 +155,7 @@ impl EmbyClient {
             .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
         let authorization = self.authenticated_authorization_header(access_token, user_id);
 
-        debug!(method = %method, url = %url, "sending authenticated Emby request");
-        if log_secrets() {
-            debug!(
-                method = %method,
-                url = %url,
-                x_emby_authorization = %authorization,
-                x_emby_token = %access_token,
-                "full authenticated Emby request headers"
-            );
-        }
+        debug!(method = %method, url = %redacted_url_for_log(&url), "sending authenticated Emby request");
 
         let response = self
             .http
@@ -184,20 +166,11 @@ impl EmbyClient {
             .header("X-Emby-Token", access_token)
             .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
             .send()
-            .context("连接 Emby 服务器失败")?;
+            .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;
 
         let status = response.status();
-        let response_headers = format!("{:?}", response.headers());
         let response_body = response.text().context("读取 Emby API 响应失败")?;
         debug!(status = %status, "received authenticated Emby response");
-        if log_secrets() {
-            debug!(
-                status = %status,
-                headers = %response_headers,
-                body = %response_body,
-                "full authenticated Emby response"
-            );
-        }
 
         if !status.is_success() {
             bail!("Emby API 请求失败：HTTP {status} {response_body}");
@@ -227,17 +200,7 @@ impl EmbyClient {
         let authorization = self.authenticated_authorization_header(access_token, user_id);
         let request_body = serde_json::to_string(body).context("序列化 Emby API 请求失败")?;
 
-        debug!(method = %method, url = %url, "sending authenticated Emby request with body");
-        if log_secrets() {
-            debug!(
-                method = %method,
-                url = %url,
-                x_emby_authorization = %authorization,
-                x_emby_token = %access_token,
-                body = %request_body,
-                "full authenticated Emby request with body"
-            );
-        }
+        debug!(method = %method, url = %redacted_url_for_log(&url), "sending authenticated Emby request with body");
 
         let response = self
             .http
@@ -249,20 +212,11 @@ impl EmbyClient {
             .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
             .body(request_body)
             .send()
-            .context("连接 Emby 服务器失败")?;
+            .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;
 
         let status = response.status();
-        let response_headers = format!("{:?}", response.headers());
         let response_body = response.text().context("读取 Emby API 响应失败")?;
         debug!(status = %status, "received authenticated Emby response");
-        if log_secrets() {
-            debug!(
-                status = %status,
-                headers = %response_headers,
-                body = %response_body,
-                "full authenticated Emby response"
-            );
-        }
 
         if !status.is_success() {
             bail!("Emby API 请求失败：HTTP {status} {response_body}");
@@ -287,16 +241,7 @@ impl EmbyClient {
             .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
         let authorization = self.authenticated_authorization_header(access_token, user_id);
 
-        debug!(method = %method, url = %url, "sending authenticated Emby image request");
-        if log_secrets() {
-            debug!(
-                method = %method,
-                url = %url,
-                x_emby_authorization = %authorization,
-                x_emby_token = %access_token,
-                "full authenticated Emby image request headers"
-            );
-        }
+        debug!(method = %method, url = %redacted_url_for_log(&url), "sending authenticated Emby image request");
 
         let response = self
             .http
@@ -306,21 +251,12 @@ impl EmbyClient {
             .header("X-Emby-Token", access_token)
             .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
             .send()
-            .context("连接 Emby 服务器失败")?;
+            .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;
 
         let status = response.status();
         let content_type = content_type_header(response.headers());
-        let response_headers = format!("{:?}", response.headers());
         let response_bytes = response.bytes().context("读取 Emby 图片响应失败")?;
         debug!(status = %status, bytes = response_bytes.len(), "received authenticated Emby image response");
-        if log_secrets() {
-            debug!(
-                status = %status,
-                headers = %response_headers,
-                bytes = response_bytes.len(),
-                "full authenticated Emby image response metadata"
-            );
-        }
 
         if !status.is_success() {
             let body_preview = String::from_utf8_lossy(&response_bytes);
@@ -386,8 +322,30 @@ fn content_type_header(headers: &HeaderMap) -> Option<String> {
         })
 }
 
-fn log_secrets() -> bool {
-    std::env::var_os("TINY_LOG_SECRETS").is_some_and(|value| value == "1")
+fn redacted_url_for_log(url: &url::Url) -> String {
+    let mut redacted = url.clone();
+    if redacted.query().is_some() {
+        let query = redacted
+            .query_pairs()
+            .map(|(name, value)| {
+                let sensitive = matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "api_key" | "apikey" | "access_token" | "token"
+                );
+                (
+                    name.into_owned(),
+                    if sensitive {
+                        "<redacted>".to_string()
+                    } else {
+                        value.into_owned()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        redacted.set_query(None);
+        redacted.query_pairs_mut().extend_pairs(query);
+    }
+    redacted.to_string()
 }
 
 fn api_url(endpoint: &ServerEndpoint, path_segments: &[&str]) -> Result<url::Url> {
@@ -398,4 +356,21 @@ fn api_url(endpoint: &ServerEndpoint, path_segments: &[&str]) -> Result<url::Url
         .extend(path_segments);
 
     Ok(url)
+}
+
+#[cfg(test)]
+mod log_safety_tests {
+    use super::redacted_url_for_log;
+
+    #[test]
+    fn authenticated_url_log_never_contains_query_credentials() {
+        let url = url::Url::parse("https://example.test/video.mkv?api_key=secret-token&quality=90")
+            .unwrap();
+
+        let logged = redacted_url_for_log(&url);
+
+        assert!(!logged.contains("secret-token"));
+        assert!(logged.contains("quality=90"));
+        assert!(logged.contains("api_key="));
+    }
 }

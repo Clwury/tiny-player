@@ -1,3 +1,5 @@
+use std::{sync::MutexGuard, time::Duration};
+
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::{
     BackendEvent, BackendEventKind, CachePauseRefresh, CacheStateEmit, CachedDemuxPacket,
     DEMUX_CACHE_CONSUMER_LOCK_PRESSURE_AFTER, DEMUX_CACHE_CONSUMER_PRIORITY_HOLD,
@@ -20,3 +22,31 @@ mod mutation;
 mod snapshot;
 #[path = "shared/worker_control.rs"]
 mod worker_control;
+
+impl DemuxPacketCacheShared {
+    /// Publish cache/output availability through both the legacy cache
+    /// condition variable and the playback-wide generation. New waits use the
+    /// latter; the former remains for focused cache tests and compatibility.
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn notify_ready(&self) {
+        self.control.wake();
+        self.ready.notify_all();
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn wait_for_ready_change<
+        'a,
+    >(
+        &'a self,
+        guard: MutexGuard<'a, DemuxPacketCacheState>,
+        timeout: Duration,
+    ) -> MutexGuard<'a, DemuxPacketCacheState> {
+        let observed_generation = self.control.wake_generation();
+        drop(guard);
+        if !self.control.should_interrupt() {
+            self.control
+                .wait_for_wake_change(observed_generation, timeout);
+        }
+        self.state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned")
+    }
+}

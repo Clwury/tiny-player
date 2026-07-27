@@ -62,6 +62,7 @@ mod tests {
             position_seconds: 12.0,
             mode: PlaybackSeekMode::Fast,
             generation: 1,
+            queued_at: std::time::Instant::now(),
         };
         control.set_user_paused(true);
         assert!(control.set_cache_paused(true));

@@ -12,12 +12,18 @@ use ffmpeg_sys_next as ffi;
 
 use crate::player::{
     backend::{BackendEvent, BackendEventKind},
-    render_host::{PlaybackSessionId, VideoOutputQueue},
+    render_host::{PlaybackSessionId, VideoOutputQueue, VulkanPrewarmStatus},
 };
 
+use super::decode_pipeline_service::{DecodePipelineService, DecodePipelineServiceContext};
+use super::decoder_input_service::{DecoderInputServiceContext, DecoderInputServiceOutcome};
+use super::demux_cache::DemuxSeekResult;
+use super::demux_packet_pump::cached_input_output_lead_throttled;
+use super::output_gate::DecodeRecoverySource;
+use super::output_gate_service::OutputGateServiceContext;
 use super::playback_pipeline_state::{
     AudioRealignRequestAction, AudioRecoveryWatchdogAction, CachedSeekRecoveryFallback,
-    CachedSeekRecoveryFallbackAction,
+    CachedSeekRecoveryFallbackAction, CachedSeekRecoveryFallbackReason,
 };
 use super::playback_reset_service::{
     PlaybackSeekBufferingPolicy, PlaybackSeekResetContext, service_playback_seek_reset,
@@ -25,25 +31,26 @@ use super::playback_reset_service::{
 use super::playback_wait_service::PlaybackPipelineWaitService;
 use super::video_decode_pipeline::{
     HevcDecodeChainFallback, HevcDecodeChainFallbackLoopAction, HevcDecodeChainFallbackReason,
+    HevcDecodeRecoveryAction, hevc_drain_video_result_progressed,
 };
 use super::{
     AudioDecodePipeline, AudioOutput, AudioRealignCoverage, BufferedReporter,
     DEFAULT_VIDEO_FRAME_DURATION_NSECS, DemuxPacketCache, DemuxPacketCacheInput,
     DemuxReaderWatermark, DoviPipeline, END_OF_PLAYBACK_READ_ERROR_TOLERANCE_SECONDS,
     FfmpegCommand, FfmpegControl, FfmpegPlaybackInput, OpenedPlaybackInput, PlaybackCommandContext,
-    PlaybackCommandServiceStatus, PlaybackCoordinatorGateContext, PlaybackEofDrainContext,
-    PlaybackEofDrainStatus, PlaybackGeneration, PlaybackOutputScheduler, PlaybackOutputSnapshot,
-    PlaybackPipelineServices, PlaybackPipelineState, PlaybackRecoveryRequest,
-    PlaybackRecoverySource, PlaybackScheduler, PlaybackSession, PlaybackTickContext,
-    PlaybackTickStatus, PositionReporter, RebufferAudioRealignRequest, SubtitlePipeline,
-    TimestampMapper, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE,
-    VideoDecodePipeline, VideoDecodeRecovery, VideoFramePrepareWorker,
-    audio_codec_requires_recovery_point, duration_nsecs, nsecs_to_seconds,
-    open_playback_input_with_fallback, playback_audio_info_from_stream,
-    playback_video_info_from_worker, preroll_seek_position_seconds, seconds_to_nsecs,
-    service_hevc_startup_stall_watchdog_if_due, service_playback_commands,
-    service_playback_eof_drain, service_playback_tick, should_cache_http_url,
-    video_seek_preroll_nsecs,
+    PlaybackCommandServiceStatus, PlaybackCoordinatorGateContext, PlaybackCoordinatorGateStatus,
+    PlaybackEofDrainContext, PlaybackEofDrainStatus, PlaybackGeneration, PlaybackOutputScheduler,
+    PlaybackOutputSnapshot, PlaybackPipelineServices, PlaybackPipelineState,
+    PlaybackRecoveryRequest, PlaybackRecoverySource, PlaybackScheduler, PlaybackSession,
+    PlaybackTickContext, PlaybackTickStatus, PositionReporter, RebufferAudioRealignRequest,
+    SubtitlePipeline, TimestampMapper, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, VideoDecodePipeline, VideoDecodeRecovery,
+    VideoFramePrepareWorker, audio_codec_requires_recovery_point, duration_nsecs,
+    expire_initial_av_start_hard_deadline, nsecs_to_seconds, open_playback_input_with_fallback,
+    playback_audio_info_from_stream, playback_video_info_from_worker,
+    preroll_seek_position_seconds, seconds_to_nsecs, service_hevc_startup_stall_watchdog_if_due,
+    service_playback_commands, service_playback_eof_drain, service_playback_tick,
+    should_cache_http_url, video_seek_preroll_nsecs,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +73,25 @@ trait RecoveryFallbackSource {
         session_id: PlaybackSessionId,
     ) -> Option<Self::CachedFallback>;
     fn take_hevc_decode_chain_fallback(&mut self) -> Option<Self::HevcFallback>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CachedInputAdmission {
+    input_admissible: bool,
+    output_transaction_blocked: bool,
+}
+
+fn cached_input_admission(
+    requested_input_drainable: bool,
+    output_lead_throttled: bool,
+    _output_snapshot: PlaybackOutputSnapshot,
+) -> CachedInputAdmission {
+    CachedInputAdmission {
+        input_admissible: requested_input_drainable && !output_lead_throttled,
+        // Primed transactions are bounded by the decoded A/V queue limits.
+        // AudioStartDue is a retry hint, not exclusive ownership of input.
+        output_transaction_blocked: false,
+    }
 }
 
 impl RecoveryFallbackSource for PlaybackPipelineState {
@@ -348,11 +374,18 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
     let emit_playback_buffered_events = false;
     let buffered_reporter =
         BufferedReporter::new_with_events(audio_output.is_some(), emit_playback_buffered_events);
-    let output_scheduler = PlaybackOutputScheduler::new();
+    let mut output_scheduler = PlaybackOutputScheduler::new();
+    output_scheduler.start_video_deadline_service(
+        audio_output.as_ref().map(AudioOutput::clock_handle),
+        session.id(),
+        video_output_queue.clone(),
+        Arc::clone(&frame_presented),
+        event_tx.clone(),
+    )?;
     let mut video_decode_recovery = VideoDecodeRecovery::default();
     video_decode_recovery
         .reset_for_timeline_start(video_stream.codec_id, current_start_position_nsecs);
-    let mut pipeline_services = PlaybackPipelineServices::default();
+    let mut pipeline_services = PlaybackPipelineServices::new(Arc::clone(&control));
     let mut pipeline = PlaybackPipelineState {
         video_stream,
         video_frame_duration_nsecs,
@@ -378,9 +411,12 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
         current_start_position_nsecs,
         video_packet_count: 0,
         video_decode_skip_nonref_active: false,
+        initial_hevc_cached_exact_seek: false,
         cached_seek_recovery_watchdog: None,
         cached_seek_recovery_attempt: None,
         audio_realign_transaction: None,
+        audio_realign_retained_pending: None,
+        audio_realign_retained_decoded_frames: Vec::new(),
         next_recovery_transaction_id: 2,
         active_recovery_transaction_id: 1,
     };
@@ -417,6 +453,38 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
                 PlaybackCommandServiceStatus::Idle => {}
                 PlaybackCommandServiceStatus::Continue => continue,
                 PlaybackCommandServiceStatus::Stopped => break,
+            }
+
+            // This is the first post-command coordinator action: no AO status
+            // probe or recovery service is allowed to hide a terminal expiry.
+            let output_demand_before_snapshots = pipeline
+                .output_scheduler
+                .output_service_demand(Instant::now());
+            if output_demand_before_snapshots.hard_deadline_due()
+                && expire_initial_av_start_hard_deadline(
+                    &mut pipeline.output_scheduler,
+                    pipeline.audio_output.as_ref(),
+                    Instant::now(),
+                    &control,
+                    session.id(),
+                )
+            {
+                continue;
+            }
+
+            if service_hevc_same_hardware_recovery_if_needed(
+                &mut session,
+                &control,
+                &demux_cache,
+                &mut pipeline,
+                &video_output_queue,
+                &event_tx,
+                emit_playback_buffered_events,
+                &pipeline_services.wait,
+                &mut pipeline_services.decode_pipeline,
+                &frame_presented,
+            )? {
+                continue;
             }
 
             if service_cached_seek_recovery_fallback_if_needed(
@@ -457,6 +525,8 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
                 &event_tx,
                 emit_playback_buffered_events,
                 &pipeline_services.wait,
+                &mut pipeline_services.decode_pipeline,
+                &frame_presented,
                 &mut missing_recovery_request_tracker,
                 "coordinator_gate_enter",
             )? {
@@ -464,17 +534,176 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
             }
 
             let playback_loop_deadline = pipeline.playback_loop_deadline();
-            if pipeline_services
-                .coordinator_gate
-                .service(PlaybackCoordinatorGateContext {
-                    control: &control,
-                    output_scheduler: &pipeline.output_scheduler,
-                    scheduler: &mut pipeline.scheduler,
-                    playback_wait: &pipeline_services.wait,
-                    playback_loop_deadline,
-                })
-                .should_continue()
-            {
+            let cache_pause_work = pipeline.cache_pause_work_snapshot();
+            let (demux_packet_snapshot, demux_reader_watermark, _) = demux_cache.monitor_snapshot();
+            let cached_input_drainable = demux_packet_snapshot
+                .consumer_drainable_for_streams(&cache_pause_work.selected_streams);
+            let requested_input_drainable = demux_packet_snapshot
+                .consumer_drainable_for_streams(&cache_pause_work.requested_streams);
+            let output_snapshot = pipeline.output_scheduler.snapshot();
+            let output_backpressure_prefetch_paused =
+                pipeline.output_backpressure_prefetch_should_pause();
+            demux_cache
+                .set_output_backpressure_prefetch_paused(output_backpressure_prefetch_paused);
+            if let Some(http_cache) = http_cache.as_ref() {
+                http_cache
+                    .set_output_backpressure_prefetch_paused(output_backpressure_prefetch_paused);
+                http_cache.update_demux_high_water_prefetch_paused(
+                    demux_packet_snapshot.total_bytes,
+                    demux_packet_snapshot.memory_limit_bytes,
+                    demux_packet_snapshot.prefetch_queue_full(),
+                    demux_reader_watermark.underrun,
+                );
+            }
+            let output_reference_nsecs = pipeline
+                .audio_output
+                .as_ref()
+                .and_then(|output| output.try_snapshot().ok().flatten())
+                .map(|snapshot| snapshot.played_timeline_nsecs)
+                .unwrap_or(pipeline.current_start_position_nsecs);
+            let output_lead_throttled = cached_input_output_lead_throttled(
+                &demux_packet_snapshot,
+                &cache_pause_work.requested_streams,
+                output_snapshot,
+                output_reference_nsecs,
+            );
+            let cached_input_admission = cached_input_admission(
+                requested_input_drainable,
+                output_lead_throttled,
+                output_snapshot,
+            );
+            let cached_video = demux_packet_snapshot
+                .streams
+                .iter()
+                .find(|stream| stream.stream_index == cache_pause_work.video_stream_index);
+            let actual_anchor_nsecs = pipeline.exact_seek_actual_anchor_nsecs();
+            let exact_seek_target_nsecs = demux_packet_snapshot.exact_seek_target_nsecs;
+            let preroll_debt_nsecs = actual_anchor_nsecs
+                .map(|anchor_nsecs| exact_seek_target_nsecs.saturating_sub(anchor_nsecs));
+            let output_service_demand = pipeline
+                .output_scheduler
+                .output_service_demand(Instant::now());
+            let coordinator_gate_status =
+                pipeline_services
+                    .coordinator_gate
+                    .service(PlaybackCoordinatorGateContext {
+                        control: &control,
+                        output_scheduler: &pipeline.output_scheduler,
+                        scheduler: &mut pipeline.scheduler,
+                        playback_wait: &pipeline_services.wait,
+                        playback_loop_deadline,
+                        actual_decode_work: cache_pause_work.actual_decode_work,
+                        output_service_demand,
+                        first_frame_input_demand: cache_pause_work.first_frame_input_demand,
+                        cached_input_drainable,
+                        cached_input_admissible: cached_input_admission.input_admissible,
+                        output_lead_throttled,
+                        output_transaction_blocked: cached_input_admission
+                            .output_transaction_blocked,
+                        cache_generation: demux_packet_snapshot.cache_generation,
+                        selected_streams: &cache_pause_work.selected_streams,
+                        requested_streams: &cache_pause_work.requested_streams,
+                        cached_streams: &demux_packet_snapshot.streams,
+                        exact_seek_target_nsecs,
+                        actual_anchor_nsecs,
+                        preroll_debt_nsecs,
+                        cached_video_end_nsecs: cached_video
+                            .and_then(|stream| stream.cached_end_nsecs),
+                        cached_video_drainable_packets: cached_video
+                            .filter(|stream| stream.consumer_drainable)
+                            .map(|stream| stream.readable_packets_for_stream)
+                            .unwrap_or_default(),
+                    });
+            if coordinator_gate_status != PlaybackCoordinatorGateStatus::Ready {
+                let drain_made_progress = match coordinator_gate_status {
+                    PlaybackCoordinatorGateStatus::ServiceOutput => {
+                        let _status = pipeline_services.output_gate.service_or_wait(
+                            OutputGateServiceContext {
+                                session_id: session.id(),
+                                demux_cache: &demux_cache,
+                                http_cache: http_cache.as_ref(),
+                                pipeline: &mut pipeline,
+                                control: &control,
+                                event_tx: &event_tx,
+                                vo_queue: &video_output_queue,
+                                frame_presented: &frame_presented,
+                                playback_wait: &pipeline_services.wait,
+                                playback_telemetry: &mut pipeline_services.telemetry,
+                                output_service_demand,
+                            },
+                        )?;
+                        // Consuming a service demand changes its generation/deadline state.
+                        // Re-evaluate immediately so decoded work or cached input can run;
+                        // sleeping for the same interval as the probe recreated the demand
+                        // and starved both paths indefinitely.
+                        Some(true)
+                    }
+                    PlaybackCoordinatorGateStatus::DrainDecodeOnly => {
+                        let drain_status = pipeline_services.decode_pipeline.service_once(
+                            DecodePipelineServiceContext {
+                                pipeline: &mut pipeline,
+                                control: &control,
+                                session_id: session.id(),
+                                event_tx: &event_tx,
+                                vo_queue: &video_output_queue,
+                                frame_presented: &frame_presented,
+                                demux_reader_watermark: || demux_cache.cached_reader_watermark(),
+                            },
+                        )?;
+                        let retry_status = pipeline.retry_pending_decoder_inputs(session.id())?;
+                        let made_progress =
+                            drain_status.made_progress() || retry_status.made_progress();
+                        if made_progress {
+                            pipeline
+                                .video_decode_pipeline
+                                .observe_hevc_decode_pipeline_progress(Instant::now());
+                        }
+                        Some(made_progress)
+                    }
+                    PlaybackCoordinatorGateStatus::DrainCachedInput => {
+                        let video_admission_pressure = pipeline.video_packet_admission_pressure(
+                            Some(pipeline.current_start_position_nsecs),
+                            pipeline.audio_output.is_some(),
+                            video_output_queue.snapshot(),
+                        );
+                        let outcome = pipeline_services.decoder_input.service_cached_input(
+                            DecoderInputServiceContext {
+                                session_id: session.id(),
+                                demux_cache: &demux_cache,
+                                pipeline: &mut pipeline,
+                                video_admission_pressure,
+                                control: &control,
+                                should_wait_for_demux: false,
+                                video_output_waiting_for_demux: false,
+                            },
+                        )?;
+                        if outcome == DecoderInputServiceOutcome::OutputLeadThrottled {
+                            let playback_loop_deadline = pipeline.playback_loop_deadline();
+                            pipeline_services
+                                .wait
+                                .wait_for_cache_generation_change_and_delay_scheduler_until(
+                                    &mut pipeline.scheduler,
+                                    &demux_cache,
+                                    demux_packet_snapshot.cache_generation,
+                                    playback_loop_deadline,
+                                );
+                            Some(true)
+                        } else {
+                            let made_progress =
+                                matches!(outcome, DecoderInputServiceOutcome::Ready);
+                            if made_progress {
+                                pipeline
+                                    .video_decode_pipeline
+                                    .observe_hevc_decode_pipeline_progress(Instant::now());
+                            }
+                            Some(made_progress)
+                        }
+                    }
+                    PlaybackCoordinatorGateStatus::Ready
+                    | PlaybackCoordinatorGateStatus::WaitForStateChange
+                    | PlaybackCoordinatorGateStatus::WaitForCache
+                    | PlaybackCoordinatorGateStatus::Wait => None,
+                };
                 if service_hevc_startup_stall_watchdog_due_if_needed(
                     &mut session,
                     &control,
@@ -484,6 +713,8 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
                     &event_tx,
                     emit_playback_buffered_events,
                     &pipeline_services.wait,
+                    &mut pipeline_services.decode_pipeline,
+                    &frame_presented,
                     &mut missing_recovery_request_tracker,
                     "coordinator_gate_continue",
                 )? {
@@ -504,6 +735,40 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
                         session.id(),
                     );
                     continue;
+                }
+                if coordinator_gate_status == PlaybackCoordinatorGateStatus::WaitForCache
+                    || (coordinator_gate_status == PlaybackCoordinatorGateStatus::DrainCachedInput
+                        && drain_made_progress == Some(false))
+                {
+                    let playback_loop_deadline = pipeline.playback_loop_deadline();
+                    pipeline_services
+                        .wait
+                        .wait_for_cached_input_and_delay_scheduler_until(
+                            &mut pipeline.scheduler,
+                            &demux_cache,
+                            &cache_pause_work.selected_streams,
+                            playback_loop_deadline,
+                        );
+                } else if coordinator_gate_status
+                    == PlaybackCoordinatorGateStatus::WaitForStateChange
+                {
+                    let playback_loop_deadline = pipeline.playback_loop_deadline();
+                    pipeline_services
+                        .wait
+                        .wait_for_cache_generation_change_and_delay_scheduler_until(
+                            &mut pipeline.scheduler,
+                            &demux_cache,
+                            demux_packet_snapshot.cache_generation,
+                            playback_loop_deadline,
+                        );
+                } else if drain_made_progress == Some(false) {
+                    let playback_loop_deadline = pipeline.playback_loop_deadline();
+                    pipeline_services
+                        .wait
+                        .wait_poll_interval_and_delay_scheduler_until(
+                            &mut pipeline.scheduler,
+                            playback_loop_deadline,
+                        );
                 }
                 continue;
             }
@@ -721,19 +986,33 @@ fn service_rebuffer_audio_realign_seek_if_needed(
         .audio_decode_pipeline
         .as_ref()
         .map(AudioDecodePipeline::snapshot);
-    let (execution_decision, audio_output_coverage_nsecs) = audio_realign_execution_decision(
-        request.target_timeline_nsecs,
-        pending_coverage,
-        audio_output_snapshot.map(|snapshot| {
-            (
-                snapshot.played_timeline_nsecs,
-                snapshot.buffered_until_timeline_nsecs,
-            )
-        }),
-        audio_decode_snapshot
-            .map(|snapshot| snapshot.in_flight_packets)
-            .unwrap_or_default(),
-    );
+    let retained_far_ahead_frame = pipeline
+        .audio_decode_pipeline
+        .as_ref()
+        .is_some_and(AudioDecodePipeline::has_deferred_output_frame);
+    let (arbitrated_execution_decision, audio_output_coverage_nsecs) =
+        audio_realign_execution_decision(
+            request.target_timeline_nsecs,
+            pending_coverage,
+            audio_output_snapshot.map(|snapshot| {
+                (
+                    snapshot.played_timeline_nsecs,
+                    snapshot.buffered_until_timeline_nsecs,
+                )
+            }),
+            if retained_far_ahead_frame {
+                0
+            } else {
+                audio_decode_snapshot
+                    .map(|snapshot| snapshot.in_flight_packets)
+                    .unwrap_or_default()
+            },
+        );
+    let execution_decision = if retained_far_ahead_frame {
+        AudioRealignExecutionDecision::Execute
+    } else {
+        arbitrated_execution_decision
+    };
     if execution_decision != AudioRealignExecutionDecision::Execute {
         if execution_decision == AudioRealignExecutionDecision::InputPending {
             pipeline
@@ -763,6 +1042,7 @@ fn service_rebuffer_audio_realign_seek_if_needed(
                 .map(|snapshot| snapshot.pending_input_packets),
             audio_decode_in_flight_packets = ?audio_decode_snapshot
                 .map(|snapshot| snapshot.in_flight_packets),
+            retained_far_ahead_frame,
             "discarded queued FFmpeg audio realign after live-state recheck"
         );
         return Ok(true);
@@ -872,7 +1152,7 @@ fn service_rebuffer_audio_realign_request(
         first_video_after_anchor_gap_ms,
         far_ahead_audio_timeline_nsecs = request.far_ahead_audio_timeline_nsecs,
         far_ahead_audio_delta_ms,
-        far_ahead_drop_count = request.far_ahead_drop_count,
+        far_ahead_observation_count = request.far_ahead_observation_count,
         attempts,
         force_low_level_seek,
         force_low_level_fallback,
@@ -902,6 +1182,8 @@ fn service_rebuffer_audio_realign_request(
         pending_start_audio_ms = output_snapshot.pending_start_audio_nsecs as f64 / 1_000_000.0,
         "evaluating FFmpeg rebuffer audio realign recovery path"
     );
+
+    pipeline.retain_audio_for_realign(session.id(), request.reason);
 
     if can_preserve_video_queue && let Some(audio_stream_index) = audio_stream_index {
         let audio_realign_requires_recovery_point = pipeline
@@ -942,7 +1224,7 @@ fn service_rebuffer_audio_realign_request(
             }
             pipeline
                 .output_scheduler
-                .reset_audio_after_rebuffer_realign(
+                .prepare_audio_after_rebuffer_realign(
                     request.target_timeline_nsecs,
                     session.id(),
                     request.reason,
@@ -966,7 +1248,7 @@ fn service_rebuffer_audio_realign_request(
                 first_video_after_anchor_gap_ms,
                 far_ahead_audio_timeline_nsecs = request.far_ahead_audio_timeline_nsecs,
                 far_ahead_audio_delta_ms,
-                far_ahead_drop_count = request.far_ahead_drop_count,
+                far_ahead_observation_count = request.far_ahead_observation_count,
                 attempts,
                 queued_video_frames = output_snapshot.queued_video_frames,
                 queued_video_ms = output_snapshot.queued_video_duration_nsecs as f64 / 1_000_000.0,
@@ -1002,7 +1284,7 @@ fn service_rebuffer_audio_realign_request(
         first_video_after_anchor_gap_ms,
         far_ahead_audio_timeline_nsecs = request.far_ahead_audio_timeline_nsecs,
         far_ahead_audio_delta_ms,
-        far_ahead_drop_count = request.far_ahead_drop_count,
+        far_ahead_observation_count = request.far_ahead_observation_count,
         attempts,
         force_low_level_seek,
         can_preserve_video_queue,
@@ -1022,6 +1304,8 @@ fn service_rebuffer_audio_realign_request(
         seek_generation,
         force_low_level_seek,
         cache_only: false,
+        require_safe_cached_anchor: false,
+        preserve_hevc_same_hardware_recovery: false,
         recovery_transaction_id: audio_recovery_transaction_id,
         low_level_seek_reason: force_low_level_seek.then_some(request.reason),
         session_id: session.id(),
@@ -1078,7 +1362,7 @@ fn service_audio_realign_recovery_watchdog_if_needed(
     if let Some(audio_decode_pipeline) = pipeline.audio_decode_pipeline.as_mut() {
         audio_decode_pipeline.service_worker()?;
     }
-    if let Some(transaction) = pipeline.clear_audio_realign_transaction_after_resume() {
+    if let Some(transaction) = pipeline.clear_audio_realign_transaction_after_resume(session.id()) {
         tracing::debug!(
             session_id = ?session.id(),
             transaction_id = transaction.transaction_id,
@@ -1201,9 +1485,812 @@ fn service_audio_realign_recovery_watchdog_if_needed(
                 fallback_suppressed = true,
                 "FFmpeg audio decoder recovery remained stalled after bounded fallback"
             );
-            Ok(false)
+            let Some((terminal_transaction, resume_timeline_nsecs)) =
+                pipeline.finish_audio_realign_as_confirmed_media_gap(control, session.id())
+            else {
+                return Err(
+                    "FFmpeg audio realign fallback exhausted without an active transaction"
+                        .to_string(),
+                );
+            };
+            tracing::warn!(
+                session_id = ?session.id(),
+                transaction_id = terminal_transaction.transaction_id,
+                recovery_scope = "audio_realign",
+                target_timeline_nsecs = terminal_transaction.target_timeline_nsecs,
+                resume_timeline_nsecs,
+                far_ahead_audio_timeline_nsecs =
+                    terminal_transaction.request.far_ahead_audio_timeline_nsecs,
+                transaction_elapsed_ms =
+                    terminal_transaction.started_at.elapsed().as_secs_f64() * 1000.0,
+                attempts = terminal_transaction.attempts,
+                transaction_phase = terminal_transaction.phase.as_str(),
+                "committed bounded FFmpeg audio realign as a confirmed media gap"
+            );
+            Ok(true)
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn service_hevc_same_hardware_recovery_if_needed(
+    session: &mut PlaybackSession,
+    control: &FfmpegControl,
+    demux_cache: &DemuxPacketCache,
+    pipeline: &mut PlaybackPipelineState,
+    vo_queue: &VideoOutputQueue,
+    event_tx: &Sender<BackendEvent>,
+    emit_playback_buffered_events: bool,
+    playback_wait: &PlaybackPipelineWaitService,
+    decode_pipeline: &mut DecodePipelineService,
+    frame_presented: &AtomicBool,
+) -> std::result::Result<bool, String> {
+    let now = Instant::now();
+    if let Some(drop) = pipeline
+        .output_scheduler
+        .take_decode_recovery_drop_for_fallback()
+    {
+        if pipeline
+            .video_decode_pipeline
+            .hevc_same_hardware_recovery_target()
+            .is_none()
+        {
+            return Err(format!(
+                "{} recovery produced an unbridged continuous decode gap of {:.3}s at {:.3}s (first frame {:.3}s) after bounded decoder fallback was exhausted",
+                drop.source.as_str(),
+                drop.gap_nsecs as f64 / 1_000_000_000.0,
+                drop.target_nsecs as f64 / 1_000_000_000.0,
+                drop.first_frame_nsecs as f64 / 1_000_000_000.0,
+            ));
+        }
+        pipeline
+            .video_decode_pipeline
+            .mark_hevc_same_hardware_unbridged_continuous_gap();
+        tracing::warn!(
+            session_id = ?session.id(),
+            transaction_id = drop.transaction_id,
+            attempt_id = ?pipeline
+                .video_decode_pipeline
+                .hevc_same_hardware_recovery_attempt_id(),
+            decoder_epoch = ?pipeline
+                .video_decode_pipeline
+                .hevc_same_hardware_recovery_decoder_epoch(),
+            recovery_source = drop.source.as_str(),
+            target_nsecs = drop.target_nsecs,
+            first_frame_nsecs = drop.first_frame_nsecs,
+            gap_ms = drop.gap_nsecs as f64 / 1_000_000.0,
+            "routed unbridged continuous decode gap back into bounded decoder fallback"
+        );
+    }
+    let action = pipeline
+        .video_decode_pipeline
+        .pending_hevc_same_hardware_recovery_action(now);
+
+    if action == HevcDecodeRecoveryAction::None {
+        let Some(ticket) = pipeline
+            .video_decode_pipeline
+            .hevc_same_hardware_prewarm_ticket()
+        else {
+            return Ok(false);
+        };
+        match vo_queue.vulkan_prewarm_status(ticket) {
+            VulkanPrewarmStatus::Pending => {
+                let deadline = pipeline.playback_loop_deadline();
+                playback_wait.wait_poll_interval_and_delay_scheduler_until(
+                    &mut pipeline.scheduler,
+                    deadline,
+                );
+                return Ok(true);
+            }
+            VulkanPrewarmStatus::Ready => {
+                let target_nsecs = pipeline
+                    .video_decode_pipeline
+                    .hevc_same_hardware_recovery_target()
+                    .ok_or_else(|| {
+                        "Vulkan prewarm completed without a same-hardware target".to_string()
+                    })?;
+                if !pipeline
+                    .video_decode_pipeline
+                    .mark_hevc_same_hardware_prewarm_ready(now)
+                {
+                    return Err(
+                        "Vulkan prewarm completed outside same-hardware recovery".to_string()
+                    );
+                }
+                let replay_packets = pipeline
+                    .video_decode_pipeline
+                    .requeue_hevc_hw_replay_journal(
+                        &mut pipeline.playback_generation,
+                        target_nsecs,
+                        session.id(),
+                    )?;
+                pipeline
+                    .video_decode_pipeline
+                    .record_hevc_same_hardware_replay(replay_packets, true, now);
+                if replay_packets > 0 {
+                    pipeline.dovi_pipeline.reset();
+                    pipeline
+                        .video_decode_recovery
+                        .begin_verified_replay_from_safe_anchor(
+                            pipeline.video_stream.codec_id,
+                            target_nsecs,
+                        );
+                    pipeline
+                        .output_scheduler
+                        .mark_decode_recovery_replaying(pipeline.active_recovery_transaction_id());
+                    pipeline.begin_cached_seek_recovery_watchdog(target_nsecs, session.id());
+                }
+                tracing::info!(
+                    session_id = ?session.id(),
+                    target_nsecs,
+                    recovery_action = HevcDecodeRecoveryAction::ReplaySameHardware.as_str(),
+                    replay_packets,
+                    vulkan_device = ticket.device_key(),
+                    same_hw_reopen_result = "prewarm_ready",
+                    "replayed safe HEVC journal after same-Vulkan renderer prewarm"
+                );
+                return Ok(true);
+            }
+            VulkanPrewarmStatus::Failed(error) => {
+                pipeline
+                    .video_decode_pipeline
+                    .fail_hevc_same_hardware_recovery(format!(
+                        "Vulkan renderer prewarm failed: {error}"
+                    ));
+                return Ok(true);
+            }
+            VulkanPrewarmStatus::Stale => {
+                pipeline
+                    .video_decode_pipeline
+                    .fail_hevc_same_hardware_recovery(
+                        "Vulkan renderer prewarm request became stale before replay",
+                    );
+                return Ok(true);
+            }
+        }
+    }
+
+    if let Some(suppressed_repeats) = pipeline
+        .video_decode_pipeline
+        .hevc_same_hardware_action_log_summary(action, now)
+    {
+        tracing::debug!(
+            session_id = ?session.id(),
+            transaction_id = pipeline.active_recovery_transaction_id(),
+            attempt_id = ?pipeline
+                .video_decode_pipeline
+                .hevc_same_hardware_recovery_attempt_id(),
+            decoder_epoch = ?pipeline
+                .video_decode_pipeline
+                .hevc_same_hardware_recovery_decoder_epoch(),
+            recovery_action = action.as_str(),
+            target_nsecs = ?pipeline
+                .video_decode_pipeline
+                .hevc_same_hardware_recovery_target(),
+            requested_hw_mode = ?pipeline.video_decode_pipeline.requested_hardware_mode(),
+            suppressed_repeats,
+            "servicing bounded HEVC same-Vulkan recovery action"
+        );
+    }
+
+    match action {
+        HevcDecodeRecoveryAction::None => Ok(false),
+        HevcDecodeRecoveryAction::DrainPendingResults => {
+            let before = pipeline.video_decode_pipeline.snapshot();
+            let max_passes = before
+                .command_queue_capacity
+                .saturating_add(before.queue_capacity)
+                .saturating_add(1)
+                .max(1);
+            let mut made_progress = false;
+            let mut passes = 0usize;
+            while passes < max_passes {
+                passes = passes.saturating_add(1);
+                let status = decode_pipeline.service_once(DecodePipelineServiceContext {
+                    pipeline,
+                    control,
+                    session_id: session.id(),
+                    event_tx,
+                    vo_queue,
+                    frame_presented,
+                    demux_reader_watermark: || demux_cache.cached_reader_watermark(),
+                })?;
+                made_progress |= status.made_progress();
+                if status.interrupted() || !status.made_progress() {
+                    break;
+                }
+            }
+            let after = pipeline.video_decode_pipeline.snapshot();
+            // mpv's lavc_process() receive-first loop only treats work from the
+            // video decoder as decoder progress. Audio/subtitle output drained
+            // by service_once must not keep a failed video decoder in grace.
+            let video_result_progress = hevc_drain_video_result_progressed(before, after);
+            made_progress |= video_result_progress;
+            let advanced = pipeline
+                .video_decode_pipeline
+                .record_hevc_same_hardware_drain_pass(video_result_progress, Instant::now());
+            let drain_now = Instant::now();
+            if let Some(suppressed_repeats) = pipeline
+                .video_decode_pipeline
+                .hevc_same_hardware_drain_log_summary(advanced, drain_now)
+            {
+                tracing::debug!(
+                    session_id = ?session.id(),
+                    transaction_id = pipeline.active_recovery_transaction_id(),
+                    attempt_id = ?pipeline
+                        .video_decode_pipeline
+                        .hevc_same_hardware_recovery_attempt_id(),
+                    decoder_epoch = ?pipeline
+                        .video_decode_pipeline
+                        .hevc_same_hardware_recovery_decoder_epoch(),
+                    passes,
+                    made_progress,
+                    video_result_progress,
+                    advanced,
+                    suppressed_repeats,
+                    submitted_sequence = after.submitted_sequence,
+                    result_produced_sequence = after.result_produced_sequence,
+                    result_consumed_sequence = after.result_consumed_sequence,
+                    submitted_not_consumed_packets = after.submitted_not_consumed_packets,
+                    last_worker_progress_ms = ?after.last_result_produced_at.map(|at| {
+                        drain_now.saturating_duration_since(at).as_secs_f64() * 1000.0
+                    }),
+                    "drained pending decode output for same-Vulkan recovery"
+                );
+            }
+            if !advanced {
+                let deadline = pipeline.playback_loop_deadline();
+                playback_wait.wait_poll_interval_and_delay_scheduler_until(
+                    &mut pipeline.scheduler,
+                    deadline,
+                );
+            }
+            Ok(true)
+        }
+        HevcDecodeRecoveryAction::FlushSameHardware => {
+            let target_nsecs = pipeline
+                .video_decode_pipeline
+                .hevc_same_hardware_recovery_target()
+                .ok_or_else(|| "same-Vulkan flush has no recovery target".to_string())?;
+            control.set_cache_paused(false);
+            let discarded_vo_frames = vo_queue.discard_pending_frames(session.id());
+            let generation = pipeline.advance_playback_generation();
+            pipeline
+                .video_frame_prepare_worker
+                .flush_generation(generation);
+            pipeline.output_scheduler.begin_decode_recovery(
+                pipeline.active_recovery_transaction_id(),
+                target_nsecs,
+                DecodeRecoverySource::FlushReplay,
+                control,
+                session.id(),
+            );
+            pipeline
+                .video_decode_recovery
+                .reset_for_timeline_start(pipeline.video_stream.codec_id, target_nsecs);
+            if let Err(error) = pipeline
+                .video_decode_pipeline
+                .begin_hevc_same_hardware_flush(generation, now)
+            {
+                tracing::warn!(
+                    session_id = ?session.id(),
+                    target_nsecs,
+                    %error,
+                    same_hw_recovery_phase = "flush_failed",
+                    "same-Vulkan decoder flush could not be scheduled"
+                );
+                return Ok(true);
+            }
+            pipeline
+                .video_decode_pipeline
+                .reset_hevc_decoder_transient_preserving_gap_evidence(now);
+            let replay_packets = pipeline
+                .video_decode_pipeline
+                .requeue_hevc_hw_replay_journal(
+                    &mut pipeline.playback_generation,
+                    target_nsecs,
+                    session.id(),
+                )?;
+            pipeline
+                .video_decode_pipeline
+                .record_hevc_same_hardware_replay(replay_packets, false, now);
+            if replay_packets > 0 {
+                pipeline.dovi_pipeline.reset();
+                pipeline
+                    .video_decode_recovery
+                    .begin_verified_replay_from_safe_anchor(
+                        pipeline.video_stream.codec_id,
+                        target_nsecs,
+                    );
+                pipeline
+                    .output_scheduler
+                    .mark_decode_recovery_replaying(pipeline.active_recovery_transaction_id());
+                pipeline.begin_cached_seek_recovery_watchdog(target_nsecs, session.id());
+            }
+            tracing::info!(
+                session_id = ?session.id(),
+                target_nsecs,
+                discarded_vo_frames,
+                replay_packets,
+                recovery_action = HevcDecodeRecoveryAction::ReplaySameHardware.as_str(),
+                same_hw_recovery_phase = "replaying_after_flush",
+                "flushed and replayed the current Vulkan decoder"
+            );
+            Ok(true)
+        }
+        HevcDecodeRecoveryAction::ReopenSameHardware => {
+            let target_nsecs = pipeline
+                .video_decode_pipeline
+                .hevc_same_hardware_recovery_target()
+                .ok_or_else(|| "same-Vulkan reopen has no recovery target".to_string())?;
+            let generation = pipeline.advance_playback_generation();
+            let release_first = pipeline
+                .video_decode_pipeline
+                .hevc_same_hardware_recovery_is_resource_pressure();
+            let mut discarded_vo_frames = 0;
+            let mut released_scheduler_frames = 0;
+            if release_first {
+                control.set_cache_paused(false);
+                released_scheduler_frames = pipeline
+                    .output_scheduler
+                    .release_vulkan_frames_for_resource_pressure(control, session.id());
+                discarded_vo_frames = vo_queue.discard_pending_frames(session.id());
+                if let Err(error) = pipeline
+                    .video_frame_prepare_worker
+                    .restart_after_resource_pressure(generation)
+                {
+                    pipeline
+                        .video_decode_pipeline
+                        .fail_hevc_same_hardware_recovery(format!(
+                            "same-Vulkan reopen could not retire frame-prepare worker: {error}"
+                        ));
+                    tracing::error!(
+                        session_id = ?session.id(),
+                        target_nsecs,
+                        generation,
+                        released_scheduler_frames,
+                        discarded_vo_frames,
+                        %error,
+                        "aborted release-first Vulkan reopen before opening a second frame pool"
+                    );
+                    return Ok(true);
+                }
+                pipeline.output_scheduler.begin_decode_recovery(
+                    pipeline.active_recovery_transaction_id(),
+                    target_nsecs,
+                    DecodeRecoverySource::VulkanReopenReplay,
+                    control,
+                    session.id(),
+                );
+                pipeline
+                    .video_decode_recovery
+                    .reset_for_timeline_start(pipeline.video_stream.codec_id, target_nsecs);
+            }
+            let device = match pipeline
+                .video_decode_pipeline
+                .begin_hevc_same_hardware_reopen(pipeline.video_stream, generation, now)
+            {
+                Ok(device) => device,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = ?session.id(),
+                        target_nsecs,
+                        %error,
+                        same_hw_reopen_result = "failed",
+                        "same-Vulkan decoder reopen failed"
+                    );
+                    return Ok(true);
+                }
+            };
+            if !release_first {
+                control.set_cache_paused(false);
+                discarded_vo_frames = vo_queue.discard_pending_frames(session.id());
+                pipeline
+                    .video_frame_prepare_worker
+                    .flush_generation(generation);
+            }
+            pipeline.dovi_pipeline.reset();
+            if !release_first {
+                pipeline.output_scheduler.begin_decode_recovery(
+                    pipeline.active_recovery_transaction_id(),
+                    target_nsecs,
+                    DecodeRecoverySource::VulkanReopenReplay,
+                    control,
+                    session.id(),
+                );
+                pipeline
+                    .video_decode_recovery
+                    .reset_for_timeline_start(pipeline.video_stream.codec_id, target_nsecs);
+            }
+            let Some(ticket) = vo_queue.request_vulkan_prewarm(session.id(), device.clone()) else {
+                pipeline
+                    .video_decode_pipeline
+                    .fail_hevc_same_hardware_recovery(
+                        "new Vulkan device prewarm was rejected for the active playback session",
+                    );
+                return Ok(true);
+            };
+            pipeline
+                .video_decode_pipeline
+                .record_hevc_same_hardware_prewarm_request(ticket)?;
+            let playback_video_info = playback_video_info_from_worker(
+                pipeline.video_stream,
+                pipeline.video_decode_pipeline.info(),
+            );
+            let _ = event_tx.send(BackendEvent::new(
+                session.id(),
+                BackendEventKind::PlaybackInfoChanged(playback_video_info),
+            ));
+            tracing::info!(
+                session_id = ?session.id(),
+                target_nsecs,
+                discarded_vo_frames,
+                released_scheduler_frames,
+                release_first,
+                vulkan_device = device.key(),
+                same_hw_reopen_attempt = 1,
+                same_hw_reopen_result = "opened_waiting_for_renderer_prewarm",
+                "atomically replaced the HEVC decoder with a new Vulkan worker"
+            );
+            Ok(true)
+        }
+        HevcDecodeRecoveryAction::ReplaySameHardware => Ok(true),
+        HevcDecodeRecoveryAction::RebuildFromCachedSeek => {
+            let target_nsecs = pipeline
+                .video_decode_pipeline
+                .hevc_same_hardware_recovery_target()
+                .ok_or_else(|| "cached safe-IDR rebuild has no recovery target".to_string())?;
+            let transaction_id = pipeline.active_recovery_transaction_id();
+            let position_seconds = nsecs_to_seconds(target_nsecs);
+            let previous_session_start_nsecs = session.start_position_nsecs();
+            let previous_pipeline_start_nsecs = pipeline.current_start_position_nsecs;
+            let seek_generation = control.request_seek();
+            session.reset_to(session.id(), position_seconds);
+            pipeline.current_start_position_nsecs = session.start_position_nsecs();
+            let demux_seek_result = service_playback_seek_reset(PlaybackSeekResetContext {
+                position_seconds,
+                seek_mode: crate::player::backend::PlaybackSeekMode::Precise,
+                seek_generation,
+                force_low_level_seek: false,
+                cache_only: true,
+                require_safe_cached_anchor: true,
+                preserve_hevc_same_hardware_recovery: true,
+                recovery_transaction_id: Some(transaction_id),
+                low_level_seek_reason: Some("same_vulkan_reopen_replay_failed"),
+                session_id: session.id(),
+                vo_queue,
+                demux_cache,
+                pipeline,
+                emit_playback_buffered_events,
+                buffering_policy: PlaybackSeekBufferingPolicy::PreserveVisibleFrame,
+                control,
+                event_tx,
+            });
+            let demux_seek_result = match demux_seek_result {
+                Ok(result) => result,
+                Err(error) => {
+                    pipeline
+                        .video_decode_pipeline
+                        .fail_hevc_same_hardware_cached_rebuild(format!(
+                            "cached safe-IDR rebuild reset failed: {error}"
+                        ));
+                    tracing::warn!(
+                        session_id = ?session.id(),
+                        transaction_id,
+                        target_nsecs,
+                        seek_generation,
+                        %error,
+                        "cached safe-IDR rebuild reset failed after Vulkan reopen"
+                    );
+                    return Ok(true);
+                }
+            };
+            match demux_seek_result {
+                DemuxSeekResult::Cached(info) => {
+                    debug_assert!(info.anchor_is_safe_seek_point);
+                    let generation = pipeline.playback_generation.current();
+                    if let Err(error) = pipeline
+                        .video_decode_pipeline
+                        .begin_hevc_same_hardware_cached_rebuild(generation, Instant::now())
+                    {
+                        pipeline
+                            .video_decode_pipeline
+                            .fail_hevc_same_hardware_cached_rebuild(format!(
+                                "cached safe-IDR rebuild could not start: {error}"
+                            ));
+                        return Ok(true);
+                    }
+                    pipeline.output_scheduler.begin_decode_recovery(
+                        transaction_id,
+                        target_nsecs,
+                        DecodeRecoverySource::CachedSafeIdrRebuild,
+                        control,
+                        session.id(),
+                    );
+                    pipeline
+                        .output_scheduler
+                        .mark_decode_recovery_replaying(transaction_id);
+                    tracing::warn!(
+                        session_id = ?session.id(),
+                        transaction_id,
+                        target_nsecs,
+                        seek_generation,
+                        playback_generation = generation,
+                        range_id = info.range_id,
+                        anchor_packet_id = info.anchor_packet_id,
+                        anchor_kind = info.anchor_kind.as_str(),
+                        anchor_nsecs = info.anchor_nsecs,
+                        preroll_nsecs = info.preroll_nsecs,
+                        "rebuilding reopened Vulkan decoder from cached safe IDR after replay failure"
+                    );
+                }
+                DemuxSeekResult::Unavailable => {
+                    session.reset_to(session.id(), nsecs_to_seconds(previous_session_start_nsecs));
+                    pipeline.current_start_position_nsecs = previous_pipeline_start_nsecs;
+                    pipeline
+                        .video_decode_pipeline
+                        .fail_hevc_same_hardware_cached_rebuild(
+                            "demux cache has no preceding safe IDR covering the recovery target",
+                        );
+                    tracing::warn!(
+                        session_id = ?session.id(),
+                        transaction_id,
+                        target_nsecs,
+                        seek_generation,
+                        "cached safe-IDR rebuild was unavailable after Vulkan reopen"
+                    );
+                }
+                DemuxSeekResult::Superseded => {
+                    session.reset_to(session.id(), nsecs_to_seconds(previous_session_start_nsecs));
+                    pipeline.current_start_position_nsecs = previous_pipeline_start_nsecs;
+                    pipeline
+                        .video_decode_pipeline
+                        .finish_hevc_same_hardware_recovery_terminal();
+                    tracing::debug!(
+                        session_id = ?session.id(),
+                        transaction_id,
+                        target_nsecs,
+                        seek_generation,
+                        "cancelled cached safe-IDR rebuild for a newer seek"
+                    );
+                }
+                DemuxSeekResult::Requested => {
+                    pipeline
+                        .video_decode_pipeline
+                        .fail_hevc_same_hardware_cached_rebuild(
+                            "cache-only safe-IDR rebuild unexpectedly requested a low-level seek",
+                        );
+                }
+            }
+            Ok(true)
+        }
+        HevcDecodeRecoveryAction::RequestSoftwareFallback => {
+            fallback_to_software_after_same_hardware_recovery(
+                session,
+                control,
+                demux_cache,
+                pipeline,
+                vo_queue,
+                event_tx,
+                emit_playback_buffered_events,
+            )
+        }
+        HevcDecodeRecoveryAction::FailExplicitly => {
+            let error = pipeline
+                .video_decode_pipeline
+                .hevc_same_hardware_recovery_terminal_error(now)
+                .unwrap_or_else(|| "ForceVulkan 同硬解恢复失败，但缺少终态诊断".to_string());
+            pipeline
+                .video_decode_pipeline
+                .finish_hevc_same_hardware_recovery_terminal();
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fallback_to_software_after_same_hardware_recovery(
+    session: &mut PlaybackSession,
+    control: &FfmpegControl,
+    demux_cache: &DemuxPacketCache,
+    pipeline: &mut PlaybackPipelineState,
+    vo_queue: &VideoOutputQueue,
+    event_tx: &Sender<BackendEvent>,
+    emit_playback_buffered_events: bool,
+) -> std::result::Result<bool, String> {
+    let now = Instant::now();
+    let target_nsecs = pipeline
+        .video_decode_pipeline
+        .hevc_same_hardware_recovery_target()
+        .ok_or_else(|| "software fallback requested without a same-hardware target".to_string())?;
+    let terminal_error = pipeline
+        .video_decode_pipeline
+        .hevc_same_hardware_recovery_terminal_error(now)
+        .unwrap_or_else(|| "bounded same-Vulkan recovery exhausted".to_string());
+    if pipeline.video_decode_pipeline.requested_hardware_mode() != super::HardwareDecodeMode::Auto {
+        return Err(format!(
+            "software fallback invariant violation for {:?}: {terminal_error}",
+            pipeline.video_decode_pipeline.requested_hardware_mode()
+        ));
+    }
+
+    let reopened = pipeline
+        .video_decode_pipeline
+        .reopen_software_decoder(pipeline.video_stream)?;
+    if !reopened {
+        return Err(format!(
+            "same-Vulkan recovery requested software fallback but decoder was already software: {terminal_error}"
+        ));
+    }
+    let discarded_vo_frames = vo_queue.discard_pending_frames(session.id());
+    let generation = pipeline.advance_playback_generation();
+    pipeline
+        .video_frame_prepare_worker
+        .flush_generation(generation);
+    pipeline.output_scheduler.begin_decode_recovery(
+        pipeline.active_recovery_transaction_id(),
+        target_nsecs,
+        DecodeRecoverySource::SoftwareFallback,
+        control,
+        session.id(),
+    );
+    pipeline
+        .video_decode_recovery
+        .reset_for_timeline_start(pipeline.video_stream.codec_id, target_nsecs);
+    pipeline.dovi_pipeline.reset();
+    let playback_video_info = playback_video_info_from_worker(
+        pipeline.video_stream,
+        pipeline.video_decode_pipeline.info(),
+    );
+    let _ = event_tx.send(BackendEvent::new(
+        session.id(),
+        BackendEventKind::PlaybackInfoChanged(playback_video_info),
+    ));
+    let replay_packets = pipeline
+        .video_decode_pipeline
+        .requeue_hevc_hw_replay_journal(
+            &mut pipeline.playback_generation,
+            target_nsecs,
+            session.id(),
+        )?;
+    pipeline
+        .video_decode_pipeline
+        .finish_hevc_same_hardware_recovery_terminal();
+    tracing::warn!(
+        session_id = ?session.id(),
+        target_nsecs,
+        discarded_vo_frames,
+        replay_packets,
+        terminal_error,
+        "Auto mode exhausted same-Vulkan recovery and opened the software decoder"
+    );
+    if replay_packets > 0 {
+        pipeline
+            .video_decode_recovery
+            .begin_verified_replay_from_safe_anchor(pipeline.video_stream.codec_id, target_nsecs);
+        pipeline
+            .output_scheduler
+            .mark_decode_recovery_replaying(pipeline.active_recovery_transaction_id());
+        pipeline.begin_cached_seek_recovery_watchdog(target_nsecs, session.id());
+        return Ok(true);
+    }
+
+    let position_seconds = nsecs_to_seconds(target_nsecs);
+    let seek_generation = control.request_seek();
+    session.reset_to(session.id(), position_seconds);
+    pipeline.current_start_position_nsecs = session.start_position_nsecs();
+    let demux_seek_result = service_playback_seek_reset(PlaybackSeekResetContext {
+        position_seconds,
+        seek_mode: crate::player::backend::PlaybackSeekMode::Precise,
+        seek_generation,
+        force_low_level_seek: true,
+        cache_only: false,
+        require_safe_cached_anchor: false,
+        preserve_hevc_same_hardware_recovery: false,
+        recovery_transaction_id: Some(pipeline.active_recovery_transaction_id()),
+        low_level_seek_reason: Some("same_vulkan_recovery_exhausted"),
+        session_id: session.id(),
+        vo_queue,
+        demux_cache,
+        pipeline,
+        emit_playback_buffered_events,
+        buffering_policy: PlaybackSeekBufferingPolicy::PreserveVisibleFrame,
+        control,
+        event_tx,
+    })?;
+    pipeline.output_scheduler.begin_decode_recovery(
+        pipeline.active_recovery_transaction_id(),
+        target_nsecs,
+        DecodeRecoverySource::LowLevelSeek,
+        control,
+        session.id(),
+    );
+    pipeline
+        .output_scheduler
+        .mark_decode_recovery_replaying(pipeline.active_recovery_transaction_id());
+    tracing::warn!(
+        session_id = ?session.id(),
+        target_nsecs,
+        seek_generation,
+        ?demux_seek_result,
+        "software fallback had no replay journal and performed one exact low-level seek"
+    );
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_video_decode_results_before_watchdog(
+    session_id: PlaybackSessionId,
+    control: &FfmpegControl,
+    demux_cache: &DemuxPacketCache,
+    pipeline: &mut PlaybackPipelineState,
+    vo_queue: &VideoOutputQueue,
+    event_tx: &Sender<BackendEvent>,
+    decode_pipeline: &mut DecodePipelineService,
+    frame_presented: &AtomicBool,
+) -> std::result::Result<bool, String> {
+    let Some(deadline) = pipeline
+        .video_decode_pipeline
+        .hevc_startup_stall_watchdog_deadline()
+    else {
+        return Ok(false);
+    };
+    if Instant::now() < deadline {
+        return Ok(false);
+    }
+
+    let before = pipeline.video_decode_pipeline.snapshot();
+    let max_passes = before
+        .command_queue_capacity
+        .saturating_add(before.queue_capacity)
+        .saturating_add(1)
+        .max(1);
+    let mut made_progress = false;
+    let mut passes = 0usize;
+    while passes < max_passes {
+        passes = passes.saturating_add(1);
+        let status = decode_pipeline.service_once(DecodePipelineServiceContext {
+            pipeline,
+            control,
+            session_id,
+            event_tx,
+            vo_queue,
+            frame_presented,
+            demux_reader_watermark: || demux_cache.cached_reader_watermark(),
+        })?;
+        made_progress |= status.made_progress();
+        if status.interrupted() || !status.made_progress() {
+            break;
+        }
+    }
+    if made_progress {
+        pipeline
+            .video_decode_pipeline
+            .observe_hevc_decode_pipeline_progress(Instant::now());
+    }
+    let after = pipeline.video_decode_pipeline.snapshot();
+    tracing::debug!(
+        session_id = ?session_id,
+        passes,
+        made_progress,
+        submitted_sequence = after.submitted_sequence,
+        result_produced_sequence_before = before.result_produced_sequence,
+        result_produced_sequence = after.result_produced_sequence,
+        result_consumed_sequence_before = before.result_consumed_sequence,
+        result_consumed_sequence = after.result_consumed_sequence,
+        submitted_not_consumed_packets_before = before.submitted_not_consumed_packets,
+        submitted_not_consumed_packets = after.submitted_not_consumed_packets,
+        completed_packets = after.completed_packets,
+        decoded_frames = after.queued_frames,
+        oldest_submitted_packet_nsecs = ?after.oldest_submitted_packet_nsecs,
+        last_worker_progress_ms = ?after.last_result_produced_at.map(|at| {
+            Instant::now().saturating_duration_since(at).as_secs_f64() * 1000.0
+        }),
+        "drained FFmpeg video worker results before HEVC startup watchdog decision"
+    );
+    Ok(made_progress
+        || before.result_consumed_sequence != after.result_consumed_sequence
+        || before.result_produced_sequence != after.result_produced_sequence)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1216,11 +2303,26 @@ fn service_hevc_startup_stall_watchdog_due_if_needed(
     event_tx: &Sender<BackendEvent>,
     emit_playback_buffered_events: bool,
     playback_wait: &PlaybackPipelineWaitService,
+    decode_pipeline: &mut DecodePipelineService,
+    frame_presented: &AtomicBool,
     missing_recovery_request_tracker: &mut MissingRecoveryRequestTracker,
     checkpoint: &'static str,
 ) -> std::result::Result<bool, String> {
     if control.is_user_paused() {
         return Ok(false);
+    }
+    let drained_progress = drain_video_decode_results_before_watchdog(
+        session.id(),
+        control,
+        demux_cache,
+        pipeline,
+        vo_queue,
+        event_tx,
+        decode_pipeline,
+        frame_presented,
+    )?;
+    if drained_progress {
+        return Ok(true);
     }
     let Some(tick_status) = service_hevc_startup_stall_watchdog_if_due(
         session.id(),
@@ -1303,10 +2405,39 @@ fn service_cached_seek_recovery_fallback_if_needed(
             fallback_cleared = cleared_landing.is_some(),
             "consumed atomic cached-seek recovery fallback request"
         );
+        if pipeline
+            .video_decode_pipeline
+            .hevc_same_hardware_recovery_target()
+            .is_some()
+        {
+            let action = pipeline
+                .video_decode_pipeline
+                .request_hevc_same_hardware_recovery(
+                    cached_seek_fallback_as_hevc(fallback),
+                    Instant::now(),
+                );
+            pipeline.video_decode_recovery.reset();
+            if action == HevcDecodeRecoveryAction::None {
+                pipeline.rearm_cached_seek_recovery_watchdog(
+                    fallback.target_nsecs,
+                    fallback.cached_seek,
+                    session.id(),
+                );
+            }
+            tracing::warn!(
+                session_id = ?session.id(),
+                position_seconds,
+                target_nsecs = fallback.target_nsecs,
+                cached_action = fallback.action.as_str(),
+                recovery_action = action.as_str(),
+                "continued active same-Vulkan transaction before cached-seek escalation"
+            );
+            return Ok(true);
+        }
         match fallback.action {
             CachedSeekRecoveryFallbackAction::RecoveryExhausted => {
                 return Err(format!(
-                    "HEVC cached seek recovery exhausted at {:.3}s after soft recovery, software fallback and low-level seek",
+                    "HEVC cached seek recovery exhausted at {:.3}s after soft recovery, bounded decoder recovery and low-level seek",
                     position_seconds
                 ));
             }
@@ -1328,69 +2459,41 @@ fn service_cached_seek_recovery_fallback_if_needed(
                 );
                 return Ok(true);
             }
-            CachedSeekRecoveryFallbackAction::ReopenSoftware => {
-                let reopened_software = pipeline
+            CachedSeekRecoveryFallbackAction::RecoverHardware => {
+                let action = pipeline
                     .video_decode_pipeline
-                    .reopen_software_decoder(pipeline.video_stream)?;
-                if reopened_software {
-                    let playback_video_info = playback_video_info_from_worker(
-                        pipeline.video_stream,
-                        pipeline.video_decode_pipeline.info(),
+                    .request_hevc_same_hardware_recovery(
+                        cached_seek_fallback_as_hevc(fallback),
+                        Instant::now(),
                     );
-                    let _ = event_tx.send(BackendEvent::new(
-                        session.id(),
-                        BackendEventKind::PlaybackInfoChanged(playback_video_info),
-                    ));
-                    let requeued_probe_packets = pipeline
+                if action == HevcDecodeRecoveryAction::None
+                    && pipeline
                         .video_decode_pipeline
-                        .requeue_hevc_startup_probe_packets(
-                            &mut pipeline.playback_generation,
-                            session.id(),
-                        )?;
-                    if requeued_probe_packets > 0 {
-                        session.reset_to(session.id(), position_seconds);
-                        pipeline.current_start_position_nsecs = session.start_position_nsecs();
-                        pipeline.output_scheduler.reset(control);
-                        pipeline.video_decode_recovery.reset();
-                        pipeline.dovi_pipeline.reset();
-                        pipeline.rearm_cached_seek_recovery_watchdog(
-                            fallback.target_nsecs,
-                            fallback.cached_seek,
-                            session.id(),
-                        );
-                        tracing::debug!(
-                            session_id = ?session.id(),
-                            position_seconds,
-                            target_nsecs = fallback.target_nsecs,
-                            reason = fallback.reason.as_str(),
-                            requeued_probe_packets,
-                            "handled HEVC cached seek recovery fallback by requeuing probe packets on software decoder"
-                        );
-                        return Ok(true);
-                    }
-                    session.reset_to(session.id(), position_seconds);
-                    pipeline.current_start_position_nsecs = session.start_position_nsecs();
-                    pipeline.output_scheduler.reset(control);
-                    pipeline.video_decode_recovery.reset_for_timeline_start(
-                        pipeline.video_stream.codec_id,
-                        pipeline.current_start_position_nsecs,
-                    );
-                    pipeline.dovi_pipeline.reset();
+                        .hevc_same_hardware_recovery_target()
+                        .is_none()
+                {
+                    return Err(format!(
+                        "cached seek requested hardware recovery at {:.3}s without an active hardware decoder",
+                        position_seconds
+                    ));
+                }
+                pipeline.video_decode_recovery.reset();
+                if action == HevcDecodeRecoveryAction::None {
                     pipeline.rearm_cached_seek_recovery_watchdog(
                         fallback.target_nsecs,
                         fallback.cached_seek,
                         session.id(),
                     );
-                    tracing::warn!(
-                        session_id = ?session.id(),
-                        position_seconds,
-                        target_nsecs = fallback.target_nsecs,
-                        reason = fallback.reason.as_str(),
-                        requeued_probe_packets,
-                        "HEVC cached seek software reopen had no probe packets; continuing without low-level seek"
-                    );
-                    return Ok(true);
                 }
+                tracing::warn!(
+                    session_id = ?session.id(),
+                    position_seconds,
+                    target_nsecs = fallback.target_nsecs,
+                    reason = fallback.reason.as_str(),
+                    recovery_action = action.as_str(),
+                    "routed cached-seek fallback into bounded same-Vulkan recovery"
+                );
+                return Ok(true);
             }
             CachedSeekRecoveryFallbackAction::LowLevelSeek => {}
         }
@@ -1469,6 +2572,8 @@ fn service_cached_seek_recovery_fallback_if_needed(
             seek_generation,
             force_low_level_seek: true,
             cache_only: false,
+            require_safe_cached_anchor: false,
+            preserve_hevc_same_hardware_recovery: false,
             recovery_transaction_id: Some(transaction_id),
             low_level_seek_reason: Some(fallback.reason.as_str()),
             session_id: session.id(),
@@ -1480,6 +2585,16 @@ fn service_cached_seek_recovery_fallback_if_needed(
             control,
             event_tx,
         })?;
+        pipeline.output_scheduler.begin_decode_recovery(
+            transaction_id,
+            fallback.target_nsecs,
+            DecodeRecoverySource::LowLevelSeek,
+            control,
+            session.id(),
+        );
+        pipeline
+            .output_scheduler
+            .mark_decode_recovery_replaying(transaction_id);
         pipeline
             .video_decode_pipeline
             .remember_hevc_recovery_low_level_seek_target(fallback.target_nsecs);
@@ -1541,6 +2656,46 @@ fn service_cached_seek_recovery_fallback_if_needed(
         "consumed atomic HEVC recovery fallback request"
     );
 
+    if fallback.reason.invalidated_by_video_progress()
+        && pipeline
+            .video_decode_pipeline
+            .hevc_recent_video_progress_grace_active(Instant::now())
+    {
+        pipeline.video_decode_recovery.reset();
+        pipeline
+            .video_decode_pipeline
+            .reset_hevc_decode_chain_transient_state();
+        tracing::debug!(
+            session_id = ?session.id(),
+            position_seconds,
+            target_nsecs = fallback.target_nsecs,
+            reason = fallback.reason.as_str(),
+            "discarded stale HEVC decode chain fallback after recent decoded video progress"
+        );
+        return Ok(true);
+    }
+
+    if pipeline.video_decode_pipeline.info().hardware_accelerated
+        && hevc_decode_chain_fallback_requests_same_hardware_recovery(fallback.reason)
+    {
+        let action = pipeline
+            .video_decode_pipeline
+            .request_hevc_same_hardware_recovery(fallback, Instant::now());
+        pipeline.video_decode_recovery.reset();
+        if action == HevcDecodeRecoveryAction::None {
+            pipeline.begin_cached_seek_recovery_watchdog(fallback.target_nsecs, session.id());
+        }
+        tracing::warn!(
+            session_id = ?session.id(),
+            position_seconds,
+            target_nsecs = fallback.target_nsecs,
+            reason = fallback.reason.as_str(),
+            recovery_action = action.as_str(),
+            "routed HEVC hardware fallback into bounded same-Vulkan recovery"
+        );
+        return Ok(true);
+    }
+
     if let Some(info) = pipeline.active_cra_cached_seek() {
         let position_seconds = nsecs_to_seconds(info.target_nsecs);
         pipeline.clear_cached_seek_recovery_watchdog();
@@ -1570,6 +2725,8 @@ fn service_cached_seek_recovery_fallback_if_needed(
             seek_generation,
             force_low_level_seek: true,
             cache_only: false,
+            require_safe_cached_anchor: false,
+            preserve_hevc_same_hardware_recovery: false,
             recovery_transaction_id: Some(transaction_id),
             low_level_seek_reason: Some(fallback.reason.as_str()),
             session_id: session.id(),
@@ -1593,25 +2750,6 @@ fn service_cached_seek_recovery_fallback_if_needed(
             seek_generation,
             ?demux_seek_result,
             "completed CRA cached seek decode-error low-level fallback transaction"
-        );
-        return Ok(true);
-    }
-
-    if fallback.reason.invalidated_by_video_progress()
-        && pipeline
-            .video_decode_pipeline
-            .hevc_recent_video_progress_grace_active(Instant::now())
-    {
-        pipeline.video_decode_recovery.reset();
-        pipeline
-            .video_decode_pipeline
-            .reset_hevc_decode_chain_transient_state();
-        tracing::debug!(
-            session_id = ?session.id(),
-            position_seconds,
-            target_nsecs = fallback.target_nsecs,
-            reason = fallback.reason.as_str(),
-            "discarded stale HEVC decode chain fallback after recent decoded video progress"
         );
         return Ok(true);
     }
@@ -1668,75 +2806,11 @@ fn service_cached_seek_recovery_fallback_if_needed(
         return Ok(true);
     }
 
-    let should_reopen_software = pipeline.video_decode_pipeline.info().hardware_accelerated
-        && (hevc_decode_chain_fallback_reopens_software(fallback.reason)
-            || loop_action == HevcDecodeChainFallbackLoopAction::ForceSoftware);
-    let mut requeued_probe_packets = 0usize;
-    if should_reopen_software {
-        let reopened_software = pipeline
-            .video_decode_pipeline
-            .reopen_software_decoder(pipeline.video_stream)?;
-        if reopened_software {
-            let playback_video_info = playback_video_info_from_worker(
-                pipeline.video_stream,
-                pipeline.video_decode_pipeline.info(),
-            );
-            let _ = event_tx.send(BackendEvent::new(
-                session.id(),
-                BackendEventKind::PlaybackInfoChanged(playback_video_info),
-            ));
-            tracing::debug!(
-                session_id = ?session.id(),
-                reason = fallback.reason.as_str(),
-                "reopened FFmpeg HEVC decoder in software mode after repeated startup recovery failure"
-            );
-            requeued_probe_packets = pipeline
-                .video_decode_pipeline
-                .requeue_hevc_startup_probe_packets(
-                    &mut pipeline.playback_generation,
-                    session.id(),
-                )?;
-            if requeued_probe_packets > 0 {
-                session.reset_to(session.id(), position_seconds);
-                pipeline.current_start_position_nsecs = session.start_position_nsecs();
-                pipeline.output_scheduler.reset(control);
-                pipeline.video_decode_recovery.reset();
-                pipeline.dovi_pipeline.reset();
-                pipeline
-                    .video_decode_pipeline
-                    .remember_hevc_decode_chain_fallback(fallback);
-                tracing::debug!(
-                    session_id = ?session.id(),
-                    position_seconds,
-                    target_nsecs = fallback.target_nsecs,
-                    reason = fallback.reason.as_str(),
-                    requeued_probe_packets,
-                    "handled HEVC decode chain fallback by requeuing startup probe packets on software decoder"
-                );
-                return Ok(true);
-            }
-            session.reset_to(session.id(), position_seconds);
-            pipeline.current_start_position_nsecs = session.start_position_nsecs();
-            pipeline.output_scheduler.reset(control);
-            pipeline.video_decode_recovery.reset_for_timeline_start(
-                pipeline.video_stream.codec_id,
-                pipeline.current_start_position_nsecs,
-            );
-            pipeline.dovi_pipeline.reset();
-            pipeline
-                .video_decode_pipeline
-                .remember_hevc_decode_chain_fallback(fallback);
-            tracing::warn!(
-                session_id = ?session.id(),
-                position_seconds,
-                target_nsecs = fallback.target_nsecs,
-                reason = fallback.reason.as_str(),
-                requeued_probe_packets,
-                "HEVC startup probe packets unavailable after software decoder reopen; continuing without low-level seek"
-            );
-            return Ok(true);
-        }
-    }
+    // Hardware decoders have already been routed through the bounded
+    // same-Vulkan transaction above. Reaching this point means the pipeline is
+    // software-decoded and only its existing low-level seek policy applies.
+    let requeued_probe_packets = 0usize;
+    let software_reopened_without_replay = false;
     let demux_watermark = demux_cache.cached_reader_watermark();
     let output_snapshot = pipeline.output_scheduler.snapshot();
     let startup_or_post_seek =
@@ -1747,6 +2821,7 @@ fn service_cached_seek_recovery_fallback_if_needed(
         requeued_probe_packets,
         demux_watermark,
         startup_or_post_seek,
+        software_reopened_without_replay,
     ) {
         pipeline.video_decode_recovery.reset();
         pipeline
@@ -1774,7 +2849,8 @@ fn service_cached_seek_recovery_fallback_if_needed(
         hevc_decode_chain_fallback_requires_boundary_reset(fallback.reason);
     let force_low_level_from_loop =
         loop_action == HevcDecodeChainFallbackLoopAction::ForceLowLevelSeek;
-    if !force_low_level_from_loop
+    if !software_reopened_without_replay
+        && !force_low_level_from_loop
         && !boundary_reset_required
         && !demux_reader_unusable_for_hevc_low_level_seek(demux_watermark)
     {
@@ -1827,6 +2903,8 @@ fn service_cached_seek_recovery_fallback_if_needed(
         seek_generation,
         force_low_level_seek,
         cache_only: false,
+        require_safe_cached_anchor: false,
+        preserve_hevc_same_hardware_recovery: false,
         recovery_transaction_id: Some(transaction_id),
         low_level_seek_reason: Some(fallback.reason.as_str()),
         session_id: session.id(),
@@ -1838,6 +2916,16 @@ fn service_cached_seek_recovery_fallback_if_needed(
         control,
         event_tx,
     })?;
+    pipeline.output_scheduler.begin_decode_recovery(
+        transaction_id,
+        fallback.target_nsecs,
+        DecodeRecoverySource::LowLevelSeek,
+        control,
+        session.id(),
+    );
+    pipeline
+        .output_scheduler
+        .mark_decode_recovery_replaying(transaction_id);
     if force_low_level_seek {
         pipeline
             .video_decode_pipeline
@@ -1861,7 +2949,9 @@ fn service_cached_seek_recovery_fallback_if_needed(
     Ok(true)
 }
 
-fn hevc_decode_chain_fallback_reopens_software(reason: HevcDecodeChainFallbackReason) -> bool {
+fn hevc_decode_chain_fallback_requests_same_hardware_recovery(
+    reason: HevcDecodeChainFallbackReason,
+) -> bool {
     matches!(
         reason,
         HevcDecodeChainFallbackReason::ZeroOutputRebuffer
@@ -1870,6 +2960,20 @@ fn hevc_decode_chain_fallback_reopens_software(reason: HevcDecodeChainFallbackRe
             | HevcDecodeChainFallbackReason::RecoveryWaitRebuffer
             | HevcDecodeChainFallbackReason::PostFallbackRebufferUnderfill
     )
+}
+
+fn cached_seek_fallback_as_hevc(fallback: CachedSeekRecoveryFallback) -> HevcDecodeChainFallback {
+    HevcDecodeChainFallback {
+        target_nsecs: fallback.target_nsecs,
+        reason: match fallback.reason {
+            CachedSeekRecoveryFallbackReason::FirstVideoFrameTimeout => {
+                HevcDecodeChainFallbackReason::StartupInFlightStall
+            }
+            CachedSeekRecoveryFallbackReason::VideoPacketLimit => {
+                HevcDecodeChainFallbackReason::ZeroOutputRebuffer
+            }
+        },
+    }
 }
 
 fn hevc_decode_chain_fallback_requires_boundary_reset(
@@ -1901,12 +3005,15 @@ fn hevc_decode_chain_fallback_should_suppress_low_level_seek(
     probe_packets: usize,
     demux_watermark: DemuxReaderWatermark,
     startup_or_post_seek: bool,
+    software_reopened_without_replay: bool,
 ) -> bool {
-    matches!(
-        reason,
-        HevcDecodeChainFallbackReason::ZeroOutputRebuffer
-            | HevcDecodeChainFallbackReason::RecoveryWaitRebuffer
-    ) && target_nsecs == 0
+    !software_reopened_without_replay
+        && matches!(
+            reason,
+            HevcDecodeChainFallbackReason::ZeroOutputRebuffer
+                | HevcDecodeChainFallbackReason::RecoveryWaitRebuffer
+        )
+        && target_nsecs == 0
         && probe_packets == 0
         && startup_or_post_seek
         && demux_reader_healthy_for_hevc_low_level_seek_suppression(demux_watermark)
@@ -1947,8 +3054,9 @@ mod tests {
         HevcDecodeChainFallback, HevcDecodeChainFallbackReason, MissingRecoveryRequestTracker,
         PlaybackOutputSnapshot, PlaybackRecoveryRequest, PlaybackRecoverySource,
         PlaybackSeekBufferingPolicy, RecoveryFallbackArbitration, RecoveryFallbackSource,
-        audio_realign_execution_decision, demux_reader_unusable_for_hevc_low_level_seek,
-        hevc_decode_chain_fallback_reopens_software,
+        audio_realign_execution_decision, cached_input_admission,
+        demux_reader_unusable_for_hevc_low_level_seek,
+        hevc_decode_chain_fallback_requests_same_hardware_recovery,
         hevc_decode_chain_fallback_requires_boundary_reset,
         hevc_decode_chain_fallback_should_suppress_low_level_seek,
         internal_recovery_seek_buffering_policy, rebuffer_audio_realign_can_preserve_video_queue,
@@ -1992,9 +3100,22 @@ mod tests {
         PlaybackOutputSnapshot {
             state,
             first_video_frame_pending: state.first_video_frame_pending(),
+            first_frame_needed: state.first_video_frame_pending(),
+            first_frame_presented: !state.first_video_frame_pending(),
+            initial_av_start_pending: state.first_video_frame_pending(),
+            output_clock_running: state == PlaybackOutputState::Playing,
+            audio_start_target_nsecs: None,
+            output_transition_deadline_ms: None,
             rebuffering,
             queued_video_frames,
+            recovery_staging_frames: 0,
+            recovery_staging_frame_budget: None,
+            committed_output_high_water_nsecs: Some(1_800_000_000),
+            recovery_staged_high_water_nsecs: None,
+            decode_recovery_audio_ready_latched: false,
+            queued_video_coverage_nsecs: 800_000_000,
             queued_video_duration_nsecs: 800_000_000,
+            queued_video_range_span_nsecs: 800_000_000,
             queued_video_range_nsecs: Some((1_000_000_000, 1_800_000_000)),
             queued_video_forward_nsecs: Some(800_000_000),
             queued_video_contiguous_forward_nsecs: Some(800_000_000),
@@ -2010,6 +3131,27 @@ mod tests {
             recent_coordinator_stall_nsecs: None,
             recent_coordinator_stall_age_nsecs: None,
         }
+    }
+
+    #[test]
+    fn primed_cached_input_remains_admissible_until_output_lead_is_throttled() {
+        let mut output = output_snapshot(PlaybackOutputState::Syncing, 38, false, false, false);
+        output.first_frame_needed = false;
+        output.initial_av_start_pending = true;
+        output.audio_start_target_nsecs = Some(184_714_739_000);
+
+        let transaction_blocked = cached_input_admission(true, false, output);
+        assert!(transaction_blocked.input_admissible);
+        assert!(!transaction_blocked.output_transaction_blocked);
+
+        output.first_frame_needed = true;
+        let first_frame_rearmed = cached_input_admission(true, false, output);
+        assert!(first_frame_rearmed.input_admissible);
+        assert!(!first_frame_rearmed.output_transaction_blocked);
+
+        let lead_throttled = cached_input_admission(true, true, output);
+        assert!(!lead_throttled.input_admissible);
+        assert!(!lead_throttled.output_transaction_blocked);
     }
 
     #[test]
@@ -2112,29 +3254,29 @@ mod tests {
     }
 
     #[test]
-    fn hevc_startup_zero_output_hard_fallbacks_to_software() {
-        assert!(hevc_decode_chain_fallback_reopens_software(
+    fn hevc_startup_zero_output_requests_same_hardware_recovery() {
+        assert!(hevc_decode_chain_fallback_requests_same_hardware_recovery(
             HevcDecodeChainFallbackReason::ZeroOutputRebuffer
         ));
     }
 
     #[test]
-    fn hevc_startup_in_flight_stall_fallbacks_to_software() {
-        assert!(hevc_decode_chain_fallback_reopens_software(
+    fn hevc_startup_in_flight_stall_requests_same_hardware_recovery() {
+        assert!(hevc_decode_chain_fallback_requests_same_hardware_recovery(
             HevcDecodeChainFallbackReason::StartupInFlightStall
         ));
     }
 
     #[test]
-    fn hevc_recovery_wait_rebuffer_reopens_software_decoder_when_hardware() {
-        assert!(hevc_decode_chain_fallback_reopens_software(
+    fn hevc_recovery_wait_rebuffer_requests_same_hardware_recovery() {
+        assert!(hevc_decode_chain_fallback_requests_same_hardware_recovery(
             HevcDecodeChainFallbackReason::RecoveryWaitRebuffer
         ));
     }
 
     #[test]
-    fn hevc_pts_gap_fallback_reopens_software_before_seek() {
-        assert!(hevc_decode_chain_fallback_reopens_software(
+    fn hevc_pts_gap_requests_same_hardware_recovery_before_seek() {
+        assert!(hevc_decode_chain_fallback_requests_same_hardware_recovery(
             HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput
         ));
     }
@@ -2299,6 +3441,7 @@ mod tests {
                 ..DemuxReaderWatermark::default()
             },
             true,
+            false,
         ));
     }
 
@@ -2315,6 +3458,23 @@ mod tests {
                 underrun: false,
                 ..DemuxReaderWatermark::default()
             },
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn empty_safe_replay_after_software_reopen_cannot_skip_seek_fallback() {
+        assert!(!hevc_decode_chain_fallback_should_suppress_low_level_seek(
+            HevcDecodeChainFallbackReason::RecoveryWaitRebuffer,
+            0,
+            0,
+            DemuxReaderWatermark {
+                video_forward_nsecs: Some(2_000_000_000),
+                selected_min_forward_nsecs: Some(2_000_000_000),
+                ..DemuxReaderWatermark::default()
+            },
+            true,
             true,
         ));
     }

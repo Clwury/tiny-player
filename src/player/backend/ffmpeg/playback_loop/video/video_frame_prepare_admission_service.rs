@@ -153,7 +153,7 @@ pub(super) fn service_decoded_video_frame_start(
             DecodedVideoFrameStartStatus::DroppedBeforeStart
         }
         DecodedVideoFrameStartAction::Use { realign } => {
-            if realign {
+            if realign && !output_scheduler.decode_recovery_active() {
                 tracing::debug!(
                     previous_start_position_nsecs = *current_start_position_nsecs,
                     pts = frame_pts.nsecs,

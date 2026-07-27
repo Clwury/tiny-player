@@ -3,39 +3,67 @@ use std::time::{Duration, Instant};
 use super::{
     ByteRingBuffer, CacheRestartRequest, HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR,
     HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
-    HttpCacheRangeKind, HttpRingCacheState, InputRateSample, RetainedCacheRange,
-    RetainedPlaybackSpliceSource,
+    HttpCacheRangeKind, HttpRingCacheState, InputRateSample, PendingHttpDiskCacheWrite,
+    PreparedByteAppend, RetainedCacheRange, RetainedPlaybackSpliceSource,
 };
 
 impl RetainedPlaybackSpliceSource {
-    pub(in crate::player::backend::ffmpeg::avio::cache) fn copy_data(&self) -> Vec<u8> {
-        let mut data = vec![0; self.copy_len];
-        let copied = self.range.buffer.copy_at(self.copy_offset, &mut data);
-        data.truncate(copied);
-        data
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn split_prepared_pages(
+        &mut self,
+    ) -> PreparedByteAppend {
+        let suffix = self.range.buffer.split_off(self.copy_offset);
+        debug_assert_eq!(suffix.len(), self.copy_len);
+        PreparedByteAppend::from_buffer(suffix)
     }
 }
 
 impl HttpRingCacheState {
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg) fn append_at(
         &mut self,
         offset: u64,
         data: &[u8],
     ) -> bool {
+        let prepared = PreparedByteAppend::from_bytes(data);
+        self.append_prepared_at(offset, data, prepared)
+    }
+
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn append_prepared_at(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        prepared: PreparedByteAppend,
+    ) -> bool {
+        self.write_disk_cache_inline(offset, data, false);
+        self.append_prepared_to_memory(offset, data, prepared)
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn append_prepared_at_after_disk_write(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        prepared: PreparedByteAppend,
+        disk_write: Option<PendingHttpDiskCacheWrite>,
+    ) -> bool {
+        self.record_external_disk_cache_write(offset, data.len(), disk_write, false);
+        self.append_prepared_to_memory(offset, data, prepared)
+    }
+
+    fn append_prepared_to_memory(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        mut prepared: PreparedByteAppend,
+    ) -> bool {
         if data.is_empty() {
             return true;
         }
+        debug_assert_eq!(data.len(), prepared.len());
         let input_len = data.len();
         let mut offset = offset;
         let mut data = data;
         self.record_input_bytes(input_len);
-        if self.disk_cache_writable
-            && let Some(disk_cache) = self.disk_cache.as_mut()
-            && let Err(error) = disk_cache.write_at(offset, data)
-        {
-            tracing::warn!(%error, "disabling HTTP disk cache after write failure");
-            self.disk_cache_writable = false;
-        }
         if offset != self.next_offset {
             self.restart_at_with_kind(offset, self.active_range_kind);
         }
@@ -45,6 +73,7 @@ impl HttpRingCacheState {
             let trim = data.len() - max_capacity;
             offset = offset.saturating_add(trim as u64);
             data = &data[trim..];
+            prepared.discard_front(trim);
             self.restart_at_with_kind(offset, self.active_range_kind);
         }
 
@@ -52,7 +81,8 @@ impl HttpRingCacheState {
         if self.buffer.len().saturating_add(data.len()) > max_capacity {
             return false;
         }
-        self.buffer.append(data);
+        debug_assert_eq!(data.len(), prepared.len());
+        self.buffer.append_prepared(prepared);
         self.next_offset = offset.saturating_add(data.len() as u64);
         self.maybe_queue_playback_continuation();
         self.trim_to_capacity(self.active_memory_capacity());
@@ -110,61 +140,9 @@ impl HttpRingCacheState {
         &mut self,
         offset: u64,
     ) -> Option<u64> {
-        if self.active_range_kind != HttpCacheRangeKind::Playback || offset != self.next_offset {
-            return None;
-        }
-        let range_index = self.retained_ranges.iter().position(|range| {
-            range.range_kind == HttpCacheRangeKind::Playback
-                && offset >= range.base_offset
-                && offset < range.next_offset
-        })?;
-        let range = self.retained_ranges.get(range_index)?;
-        let copy_offset = usize::try_from(offset.saturating_sub(range.base_offset)).ok()?;
-        let copy_len = usize::try_from(range.next_offset.saturating_sub(offset)).ok()?;
-        if copy_len == 0 {
-            return None;
-        }
-
-        let max_capacity = self.buffer.max_capacity();
-        if copy_len > max_capacity {
-            return None;
-        }
-        self.trim_to_capacity(max_capacity.saturating_sub(copy_len));
-        if self.buffer.len().saturating_add(copy_len) > max_capacity {
-            return None;
-        }
-
-        let mut data = vec![0; copy_len];
-        let copied = self
-            .retained_ranges
-            .get(range_index)?
-            .buffer
-            .copy_at(copy_offset, &mut data);
-        if copied == 0 {
-            return None;
-        }
-        data.truncate(copied);
-        let next_offset = offset.saturating_add(copied as u64);
-        self.buffer.append(&data);
-        self.next_offset = next_offset;
-        self.active_request_start_offset = offset;
-        if self
-            .retained_ranges
-            .get(range_index)
-            .is_some_and(|range| offset <= range.base_offset && next_offset >= range.next_offset)
-        {
-            self.retained_ranges.remove(range_index);
-        }
-        self.maybe_queue_playback_continuation();
-        self.trim_to_capacity(self.active_memory_capacity());
-        self.trim_retained_ranges_to_capacity(self.retained_capacity_with_side_reserve(false));
-        tracing::debug!(
-            offset,
-            next_offset,
-            copied,
-            "spliced proactive HTTP playback range into active stream cache"
-        );
-        Some(next_offset)
+        let mut source = self.take_retained_playback_splice_source(offset)?;
+        let prepared = source.split_prepared_pages();
+        self.finish_retained_playback_splice(offset, source, prepared)
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn take_retained_playback_splice_source(
@@ -215,37 +193,39 @@ impl HttpRingCacheState {
         &mut self,
         offset: u64,
         source: RetainedPlaybackSpliceSource,
-        data: Vec<u8>,
+        prepared: PreparedByteAppend,
     ) -> Option<u64> {
         let source_offset = source
             .range
             .base_offset
             .saturating_add(source.copy_offset as u64);
-        if data.len() != source.copy_len
+        if prepared.len() != source.copy_len
             || source_offset != offset
             || self.active_range_kind != HttpCacheRangeKind::Playback
             || offset != self.next_offset
         {
-            self.restore_retained_playback_splice_source(source);
+            self.restore_retained_playback_splice_source_with_pages(source, prepared);
             return None;
         }
         let max_capacity = self.buffer.max_capacity();
-        if data.len() > max_capacity {
-            self.restore_retained_playback_splice_source(source);
+        if prepared.len() > max_capacity {
+            self.restore_retained_playback_splice_source_with_pages(source, prepared);
             return None;
         }
-        self.trim_to_capacity(max_capacity.saturating_sub(data.len()));
-        if self.buffer.len().saturating_add(data.len()) > max_capacity {
-            self.restore_retained_playback_splice_source(source);
+        self.trim_to_capacity(max_capacity.saturating_sub(prepared.len()));
+        if self.buffer.len().saturating_add(prepared.len()) > max_capacity {
+            self.restore_retained_playback_splice_source_with_pages(source, prepared);
             return None;
         }
 
-        let next_offset = offset.saturating_add(data.len() as u64);
-        self.buffer.append(&data);
+        let copied = prepared.len();
+        let next_offset = offset.saturating_add(copied as u64);
+        self.buffer.append_prepared(prepared);
         self.next_offset = next_offset;
         self.active_request_start_offset = offset;
         if source.copy_offset > 0 {
             let mut range = source.range;
+            range.next_offset = offset;
             range.last_used_generation = self.next_retained_access_generation();
             self.retained_ranges.push_back(range);
         }
@@ -255,10 +235,19 @@ impl HttpRingCacheState {
         tracing::debug!(
             offset,
             next_offset,
-            copied = data.len(),
+            copied,
             "spliced proactive HTTP playback range into active stream cache"
         );
         Some(next_offset)
+    }
+
+    fn restore_retained_playback_splice_source_with_pages(
+        &mut self,
+        mut source: RetainedPlaybackSpliceSource,
+        prepared: PreparedByteAppend,
+    ) {
+        source.range.buffer.append_prepared(prepared);
+        self.restore_retained_playback_splice_source(source);
     }
 
     #[cfg(test)]
@@ -271,15 +260,54 @@ impl HttpRingCacheState {
         self.append_retained_at_preserving(offset, data, range_kind, &[])
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg) fn append_retained_at_protected(
         &mut self,
         offset: u64,
         data: &[u8],
         request: CacheRestartRequest,
     ) -> bool {
-        self.append_retained_at_preserving(offset, data, request.range_kind, &[request])
+        let prepared = PreparedByteAppend::from_bytes(data);
+        self.append_retained_prepared_at_protected(offset, data, prepared, request)
     }
 
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn append_retained_prepared_at_protected(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        prepared: PreparedByteAppend,
+        request: CacheRestartRequest,
+    ) -> bool {
+        self.write_disk_cache_inline(offset, data, true);
+        self.append_retained_prepared_at_preserving(
+            offset,
+            data,
+            prepared,
+            request.range_kind,
+            &[request],
+        )
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn append_retained_prepared_at_protected_after_disk_write(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        prepared: PreparedByteAppend,
+        request: CacheRestartRequest,
+        disk_write: Option<PendingHttpDiskCacheWrite>,
+    ) -> bool {
+        self.record_external_disk_cache_write(offset, data.len(), disk_write, true);
+        self.append_retained_prepared_at_preserving(
+            offset,
+            data,
+            prepared,
+            request.range_kind,
+            &[request],
+        )
+    }
+
+    #[cfg(test)]
     fn append_retained_at_preserving(
         &mut self,
         offset: u64,
@@ -287,20 +315,27 @@ impl HttpRingCacheState {
         range_kind: HttpCacheRangeKind,
         protected: &[CacheRestartRequest],
     ) -> bool {
+        let prepared = PreparedByteAppend::from_bytes(data);
+        self.write_disk_cache_inline(offset, data, true);
+        self.append_retained_prepared_at_preserving(offset, data, prepared, range_kind, protected)
+    }
+
+    fn append_retained_prepared_at_preserving(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        mut prepared: PreparedByteAppend,
+        range_kind: HttpCacheRangeKind,
+        protected: &[CacheRestartRequest],
+    ) -> bool {
         if data.is_empty() {
             return true;
         }
+        debug_assert_eq!(data.len(), prepared.len());
         let input_len = data.len();
         let original_offset = offset;
         self.record_input_bytes(input_len);
         self.trim_to_capacity(self.active_memory_capacity());
-        if self.disk_cache_writable
-            && let Some(disk_cache) = self.disk_cache.as_mut()
-            && let Err(error) = disk_cache.write_at(offset, data)
-        {
-            tracing::warn!(%error, "disabling HTTP disk cache after side-range write failure");
-            self.disk_cache_writable = false;
-        }
 
         let max_capacity = self.buffer.max_capacity();
         let mut offset = offset;
@@ -309,6 +344,7 @@ impl HttpRingCacheState {
             let trim = data.len() - max_capacity;
             offset = offset.saturating_add(trim as u64);
             data = &data[trim..];
+            prepared.discard_front(trim);
         }
         if data.is_empty() {
             return true;
@@ -319,7 +355,8 @@ impl HttpRingCacheState {
             Some(range_index) => range_index,
             None => {
                 let mut buffer = ByteRingBuffer::new(max_capacity);
-                buffer.append(data);
+                debug_assert_eq!(data.len(), prepared.len());
+                buffer.append_prepared(prepared);
                 let last_used_generation = self.next_retained_access_generation();
                 self.retained_ranges.push_back(RetainedCacheRange {
                     buffer,
@@ -351,6 +388,7 @@ impl HttpRingCacheState {
                     .min(data.len());
                 offset = offset.saturating_add(skip as u64);
                 data = &data[skip..];
+                prepared.discard_front(skip);
             }
             if data.is_empty() {
                 range.last_used_generation = generation;
@@ -368,7 +406,8 @@ impl HttpRingCacheState {
             if range.buffer.len().saturating_add(data.len()) > max_capacity {
                 return false;
             }
-            range.buffer.append(data);
+            debug_assert_eq!(data.len(), prepared.len());
+            range.buffer.append_prepared(prepared);
             range.next_offset = offset.saturating_add(data.len() as u64);
             range.last_used_generation = generation;
         }
@@ -377,6 +416,57 @@ impl HttpRingCacheState {
             protected,
         );
         true
+    }
+
+    #[cfg(test)]
+    fn write_disk_cache_inline(&mut self, offset: u64, data: &[u8], side_range: bool) {
+        if !self.disk_cache_writable {
+            return;
+        }
+        let Some(disk_cache) = self.disk_cache.as_mut() else {
+            return;
+        };
+        if let Err(error) = disk_cache.write_at(offset, data) {
+            if side_range {
+                tracing::warn!(%error, "disabling HTTP disk cache after side-range write failure");
+            } else {
+                tracing::warn!(%error, "disabling HTTP disk cache after write failure");
+            }
+            self.disk_cache_writable = false;
+        }
+    }
+
+    fn record_external_disk_cache_write(
+        &mut self,
+        offset: u64,
+        len: usize,
+        disk_write: Option<PendingHttpDiskCacheWrite>,
+        side_range: bool,
+    ) {
+        let Some(disk_write) = disk_write else {
+            return;
+        };
+        let Some(disk_cache) = self.disk_cache.as_mut() else {
+            return;
+        };
+        if !self.disk_cache_writable || !std::sync::Arc::ptr_eq(&disk_cache.file, &disk_write.file)
+        {
+            return;
+        }
+        match disk_write.result {
+            Ok(()) => {
+                disk_cache.add_range(offset, offset.saturating_add(len as u64));
+                disk_cache.trim_to_limit();
+            }
+            Err(error) => {
+                if side_range {
+                    tracing::warn!(%error, "disabling HTTP disk cache after side-range write failure");
+                } else {
+                    tracing::warn!(%error, "disabling HTTP disk cache after write failure");
+                }
+                self.disk_cache_writable = false;
+            }
+        }
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn retained_range_index_for_append(

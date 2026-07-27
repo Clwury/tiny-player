@@ -6,11 +6,11 @@ use crate::player::render_host::VideoOutputQueue;
 use super::tracks::{PlaybackTrack, PlaybackTrackSelection};
 #[allow(unused_imports)]
 pub use events::{
-    BackendError, BackendEvent, BackendEventKind, BackendSubtitleBitmap, BackendSubtitleCue,
-    ByteCacheState, CacheUnlinkPolicy, DemuxCacheState, PlaybackAudioInfo, PlaybackCacheByteRange,
-    PlaybackCacheConfig, PlaybackCacheMode, PlaybackCacheState, PlaybackCacheTimeRange,
-    PlaybackFileInfo, PlaybackSeekableCacheMode, PlaybackVideoInfo, Result, StreamCacheKind,
-    StreamCacheState,
+    BackendDiagnostic, BackendError, BackendEvent, BackendEventKind, BackendSubtitleBitmap,
+    BackendSubtitleCue, ByteCacheState, CacheUnlinkPolicy, DemuxCacheState, PlaybackAudioInfo,
+    PlaybackCacheByteRange, PlaybackCacheConfig, PlaybackCacheMode, PlaybackCacheState,
+    PlaybackCacheTimeRange, PlaybackFileInfo, PlaybackSeekableCacheMode, PlaybackVideoInfo, Result,
+    StreamCacheKind, StreamCacheState,
 };
 pub use ffmpeg::FfmpegBackend;
 

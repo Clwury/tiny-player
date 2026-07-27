@@ -1,27 +1,25 @@
+use super::audio::{AudioShared, fill_audio_output};
 use super::avio::{CacheRestartRequest, CachedInputSource, HttpCacheRangeKind};
-use super::worker::{
-    FfmpegCommand, PendingSeek, PendingTrackSelection, coalesce_playback_seek_commands,
-    drain_playback_commands,
-};
+use super::worker::{FfmpegCommand, PendingSeek, PendingTrackSelection, drain_playback_commands};
 use super::{
     AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
     AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN,
-    AUDIO_VIDEO_QUEUE_LIMIT_DURATION, AUDIO_VIDEO_QUEUE_TARGET_DURATION, AudioOutputSnapshot,
-    AvFrame, AvPacket, BackendEvent, BackendEventKind, BufferedReporter, ByteCacheState,
-    CacheReadResult, DECODED_VIDEO_QUEUE_LIMIT_FRAMES, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
-    DecodedAudio, FALLBACK_AUDIO_OUTPUT_CHANNELS, FfmpegBackend, FfmpegControl,
-    FfmpegPlaybackInput, HTTP_CACHE_CHUNK_SIZE, HTTP_CACHE_PARTIAL_READ_MIN_BYTES,
-    HTTP_CACHE_RANGE_REQUEST_BYTES, HTTP_CACHE_RANGE_REQUEST_TIMEOUT,
-    HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES, HTTP_CACHE_SMALL_RANGE_REQUEST_TIMEOUT,
-    HTTP_RING_CACHE_CAPACITY, HttpContentRange, HttpRingCache, HttpRingCacheState,
-    InputProbeProfile, MappedTimestamp, PENDING_AUDIO_CONTINUITY_TOLERANCE,
-    PENDING_START_AUDIO_BACKPRESSURE_DURATION, PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION,
-    PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION, PgsFrameMergeBitstreamFilter, PlaybackCacheByteRange,
-    PlaybackCacheConfig, PlaybackCacheMode, PlaybackCacheState, PlaybackScheduler,
-    PlaybackSeekMode, PositionReporter, QueuedVideoFrame, StreamInfo, TimestampMapper,
-    VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER, VIDEO_OUTPUT_REBUFFER_ENTER_AFTER,
-    VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-    VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER, VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER,
+    AUDIO_VIDEO_QUEUE_LIMIT_DURATION, AUDIO_VIDEO_QUEUE_TARGET_DURATION, AudioOutputDecision,
+    AudioOutputLifecycle, AudioOutputSnapshot, AvFrame, AvPacket, BackendEvent, BackendEventKind,
+    BufferedReporter, ByteCacheState, CacheReadResult, DECODED_VIDEO_QUEUE_LIMIT_FRAMES,
+    DEFAULT_VIDEO_FRAME_DURATION_NSECS, DecodedAudio, FALLBACK_AUDIO_OUTPUT_CHANNELS,
+    FfmpegBackend, FfmpegControl, FfmpegPlaybackInput, HTTP_CACHE_CHUNK_SIZE,
+    HTTP_CACHE_PARTIAL_READ_MIN_BYTES, HTTP_CACHE_RANGE_REQUEST_BYTES,
+    HTTP_CACHE_RANGE_REQUEST_TIMEOUT, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
+    HTTP_CACHE_SMALL_RANGE_REQUEST_TIMEOUT, HTTP_RING_CACHE_CAPACITY, HttpContentRange,
+    HttpRingCache, HttpRingCacheState, InputProbeProfile, MappedTimestamp,
+    PENDING_AUDIO_CONTINUITY_TOLERANCE, PENDING_START_AUDIO_BACKPRESSURE_DURATION,
+    PGS_SUBTITLE_VIDEO_QUEUE_LIMIT_DURATION, PGS_SUBTITLE_VIDEO_QUEUE_TARGET_DURATION,
+    PgsFrameMergeBitstreamFilter, PlaybackCacheByteRange, PlaybackCacheConfig, PlaybackCacheMode,
+    PlaybackCacheState, PlaybackScheduler, PlaybackSeekMode, PositionReporter, QueuedVideoFrame,
+    StreamInfo, TimestampMapper, VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER,
+    VIDEO_OUTPUT_REBUFFER_ENTER_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER,
     VULKAN_AUDIO_VIDEO_QUEUE_LIMIT_DURATION, VULKAN_AUDIO_VIDEO_QUEUE_TARGET_DURATION,
     VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VULKAN_DECODED_VIDEO_QUEUE_TARGET_FRAMES,
     VULKAN_VIDEO_OUTPUT_RESOURCE_PRESSURE_FRAMES, WaitStatus, audio_sample_len,
@@ -30,10 +28,10 @@ use super::{
     frame_is_corrupt, has_annex_b_start_code, http_cache_playback_range_request_bytes,
     http_cache_range_header, http_cache_range_request_len, http_cache_range_request_timeout,
     http_cache_request_headers_for_log, http_cache_response_headers_for_log,
-    optional_buffered_value_changed, queued_video_duration, queued_video_limit_duration,
-    queued_video_limit_frames, queued_video_limit_reached, queued_video_target_duration,
-    queued_video_target_frames, queued_video_target_reached, reqwest_header_pairs,
-    should_cache_http_url,
+    optional_buffered_value_changed, queued_video_coverage_duration, queued_video_duration,
+    queued_video_limit_duration, queued_video_limit_frames, queued_video_limit_reached,
+    queued_video_range_span, queued_video_target_duration, queued_video_target_frames,
+    queued_video_target_reached, reqwest_header_pairs, should_cache_http_url,
 };
 use std::{
     collections::VecDeque,
@@ -77,7 +75,10 @@ use super::playback_loop::{
     video_output_rebuffer_resume_reached, video_output_rebuffer_should_enter,
 };
 use crate::player::{
-    backend::{BackendSubtitleCue, DemuxCacheState, PlaybackCacheTimeRange},
+    backend::{
+        BackendControl, BackendLoadRequest, BackendSubtitleCue, DemuxCacheState,
+        PlaybackCacheTimeRange,
+    },
     render_host::{
         DecodedFrame, FfmpegAvBufferRef, FfmpegFrameRef, FrameColor, FramePixels, FramePts,
         PlaybackSessionId, RawVideoChromaSite, RawVideoFormat, RawVideoRange, RenderSize,
@@ -145,20 +146,38 @@ fn ffmpeg_control_splits_user_pause_from_cache_pause() {
 fn ffmpeg_control_tracks_output_rebuffer_pause_independently() {
     let control = FfmpegControl::new(PlaybackSessionId::default());
 
+    assert_eq!(
+        control.audio_output_lifecycle(),
+        AudioOutputLifecycle::Syncing
+    );
+    assert_eq!(
+        control.audio_output_control_snapshot().decision(),
+        AudioOutputDecision::Silence
+    );
+    assert!(control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing));
     assert!(!control.is_paused());
     assert!(!control.is_output_rebuffer_paused());
-    assert!(!control.should_pause_audio_output());
+    assert_eq!(
+        control.audio_output_control_snapshot().decision(),
+        AudioOutputDecision::Consume
+    );
 
     assert!(control.set_output_rebuffer_paused(true));
     assert!(!control.is_paused());
-    assert!(control.should_pause_audio_output());
+    assert_eq!(
+        control.audio_output_control_snapshot().decision(),
+        AudioOutputDecision::Silence
+    );
     assert!(control.is_output_rebuffer_paused());
     assert!(!control.is_user_paused());
     assert!(!control.is_cache_paused());
 
     assert!(control.set_output_rebuffer_paused(false));
     assert!(!control.is_paused());
-    assert!(!control.should_pause_audio_output());
+    assert_eq!(
+        control.audio_output_control_snapshot().decision(),
+        AudioOutputDecision::Consume
+    );
 }
 
 #[test]
@@ -169,7 +188,163 @@ fn ffmpeg_control_clears_output_rebuffer_pause_on_seek_generation() {
     let generation = control.request_seek();
 
     assert_eq!(generation, 1);
+    assert_eq!(
+        control.audio_output_lifecycle(),
+        AudioOutputLifecycle::Syncing
+    );
     assert!(!control.is_output_rebuffer_paused());
+    assert!(control.is_seek_audio_paused());
+    assert_eq!(
+        control.audio_output_control_snapshot().decision(),
+        AudioOutputDecision::Silence
+    );
+
+    control.finish_seek(generation);
+    assert!(control.finish_seek_audio_pause());
+    assert!(control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing));
+    assert_eq!(
+        control.audio_output_control_snapshot().decision(),
+        AudioOutputDecision::Consume
+    );
+}
+
+#[test]
+fn ffmpeg_control_does_not_release_seek_silence_for_superseded_generation() {
+    let control = FfmpegControl::new(PlaybackSessionId::default());
+    let first = control.request_seek();
+    let second = control.request_seek();
+
+    control.finish_seek(first);
+    assert!(!control.finish_seek_audio_pause());
+    assert!(control.is_seek_audio_paused());
+    assert!(!control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing));
+    assert_eq!(
+        control.audio_output_lifecycle(),
+        AudioOutputLifecycle::Syncing
+    );
+
+    control.finish_seek(second);
+    assert!(control.finish_seek_audio_pause());
+    assert!(!control.is_seek_audio_paused());
+}
+
+#[test]
+fn ffmpeg_control_uses_one_state_word_for_lifecycle_and_pause_reasons() {
+    let control = FfmpegControl::new(PlaybackSessionId::default());
+    control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing);
+    control.set_user_paused(true);
+    control.set_cache_paused(true);
+    control.set_output_rebuffer_paused(true);
+
+    let state = control.audio_output_control_snapshot();
+    assert_eq!(state.lifecycle(), AudioOutputLifecycle::Playing);
+    assert!(state.paused_by_user());
+    assert!(state.paused_by_cache());
+    assert!(state.paused_by_rebuffer());
+    assert!(!state.paused_by_seek_transition());
+    assert_eq!(state.decision(), AudioOutputDecision::Silence);
+
+    control.set_user_paused(false);
+    control.set_cache_paused(false);
+    control.set_output_rebuffer_paused(false);
+    assert_eq!(
+        control.audio_output_control_snapshot().decision(),
+        AudioOutputDecision::Consume
+    );
+}
+
+#[test]
+fn audio_output_lifecycle_derives_one_callback_decision() {
+    let control = FfmpegControl::new(PlaybackSessionId::default());
+    for (lifecycle, expected) in [
+        (AudioOutputLifecycle::Syncing, AudioOutputDecision::Silence),
+        (AudioOutputLifecycle::Ready, AudioOutputDecision::Silence),
+        (AudioOutputLifecycle::Playing, AudioOutputDecision::Consume),
+        (AudioOutputLifecycle::Draining, AudioOutputDecision::Consume),
+    ] {
+        control.set_audio_output_lifecycle(lifecycle);
+        let callback_state = control.audio_output_control_snapshot();
+        assert_eq!(callback_state.lifecycle(), lifecycle);
+        assert_eq!(callback_state.decision(), expected);
+    }
+}
+
+#[test]
+fn nine_coalesced_seeks_leave_only_the_latest_transition_to_release() {
+    let control = FfmpegControl::new(PlaybackSessionId::default());
+    let mut generations = Vec::new();
+    for _ in 0..9 {
+        generations.push(control.request_seek());
+    }
+    for generation in generations.iter().copied().take(8) {
+        control.finish_seek(generation);
+        assert!(!control.finish_seek_audio_pause());
+        assert!(control.is_seek_audio_paused());
+    }
+
+    control.finish_seek(*generations.last().expect("latest seek generation"));
+    assert!(control.finish_seek_audio_pause());
+    assert!(control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing));
+    assert_eq!(
+        control.audio_output_lifecycle(),
+        AudioOutputLifecycle::Playing
+    );
+    assert_eq!(
+        control.audio_output_control_snapshot().decision(),
+        AudioOutputDecision::Consume
+    );
+}
+
+#[test]
+fn ninth_rapid_seek_advances_audio_clock_and_video_presentations() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let shared = AudioShared::new(
+        9_600,
+        48_000,
+        FALLBACK_AUDIO_OUTPUT_CHANNELS,
+        Arc::clone(&control),
+    );
+    let mut latest_generation = None;
+    for _ in 0..9 {
+        let generation = control.request_seek();
+        control.finish_seek(generation);
+        latest_generation = Some(generation);
+    }
+    let latest_generation = latest_generation.expect("nine seek generations");
+
+    let target_nsecs = 846_233_000_000;
+    shared.reset_clock(target_nsecs);
+    shared.activate_for_test();
+    control.set_audio_output_lifecycle(AudioOutputLifecycle::Ready);
+    assert!(control.finish_seek_audio_pause());
+    assert_eq!(
+        shared
+            .buffer
+            .lock()
+            .expect("audio output buffer poisoned")
+            .push_slice(&vec![0.0; 9_600]),
+        9_600
+    );
+    shared.set_queued_end_timeline_nsecs(target_nsecs + 100_000_000);
+    assert!(control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing));
+
+    let mut queued_video_frames =
+        test_queued_video_frames_with_duration(target_nsecs, 5, 10_000_000);
+    let mut previous_played_nsecs = shared.played_timeline_nsecs();
+    let mut presented_video_frames = 0usize;
+    for _ in 0..3 {
+        let mut callback_output = vec![0.0f32; 960];
+        fill_audio_output(&mut callback_output, &shared);
+        let played_nsecs = shared.played_timeline_nsecs();
+        assert!(played_nsecs > previous_played_nsecs);
+        if pop_audio_clocked_video_frame(&mut queued_video_frames, played_nsecs).is_some() {
+            presented_video_frames = presented_video_frames.saturating_add(1);
+        }
+        previous_played_nsecs = played_nsecs;
+    }
+
+    assert_eq!(latest_generation, 9);
+    assert_eq!(presented_video_frames, 3);
 }
 
 #[test]
@@ -213,77 +388,25 @@ fn drain_playback_commands_coalesces_continuous_seeks_to_latest_generation() {
     let control = FfmpegControl::new(PlaybackSessionId(1));
     let (command_tx, command_rx) = mpsc::channel();
 
-    for position_seconds in [75.0, 77.0, 79.0] {
+    for position_seconds in 70..80 {
         let generation = control.request_seek();
         command_tx
             .send(FfmpegCommand::Seek {
                 session_id: PlaybackSessionId(1),
-                position_seconds,
+                position_seconds: f64::from(position_seconds),
                 mode: PlaybackSeekMode::Fast,
                 generation,
+                queued_at: Instant::now(),
             })
             .unwrap();
     }
 
+    let started_at = Instant::now();
     let drained = drain_playback_commands(&command_rx, &control);
     let pending_seek = drained.pending_seek.expect("latest seek is retained");
 
+    assert!(started_at.elapsed() < Duration::from_millis(20));
     assert_eq!(pending_seek.generation, control.seek_generation());
-    assert_eq!(pending_seek.position_seconds, 79.0);
-}
-
-#[test]
-fn trailing_edge_seek_coalescing_keeps_commands_arriving_after_initial_drain() {
-    let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
-    let (command_tx, command_rx) = mpsc::channel();
-    let first_generation = control.request_seek();
-    command_tx
-        .send(FfmpegCommand::Seek {
-            session_id: PlaybackSessionId(1),
-            position_seconds: 75.0,
-            mode: PlaybackSeekMode::Fast,
-            generation: first_generation,
-        })
-        .unwrap();
-    let initial = drain_playback_commands(&command_rx, &control);
-    assert_eq!(
-        initial.pending_seek.map(|pending| pending.generation),
-        Some(first_generation)
-    );
-
-    let sender_control = Arc::clone(&control);
-    let sender = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(5));
-        let second_generation = sender_control.request_seek();
-        command_tx
-            .send(FfmpegCommand::Seek {
-                session_id: PlaybackSessionId(1),
-                position_seconds: 77.0,
-                mode: PlaybackSeekMode::Fast,
-                generation: second_generation,
-            })
-            .unwrap();
-        thread::sleep(Duration::from_millis(5));
-        let latest_generation = sender_control.request_seek();
-        command_tx
-            .send(FfmpegCommand::Seek {
-                session_id: PlaybackSessionId(1),
-                position_seconds: 79.0,
-                mode: PlaybackSeekMode::Fast,
-                generation: latest_generation,
-            })
-            .unwrap();
-        latest_generation
-    });
-
-    let drained =
-        coalesce_playback_seek_commands(&command_rx, &control, initial, Duration::from_millis(20));
-    let latest_generation = sender.join().unwrap();
-    let pending_seek = drained
-        .pending_seek
-        .expect("latest trailing seek is retained");
-
-    assert_eq!(pending_seek.generation, latest_generation);
     assert_eq!(pending_seek.position_seconds, 79.0);
 }
 
@@ -317,6 +440,8 @@ fn ffmpeg_command_drain_applies_pause_resume_and_keeps_latest_seek() {
     let (tx, rx) = mpsc::channel();
     let first_generation = control.request_seek();
     let second_generation = control.request_seek();
+    let first_queued_at = Instant::now();
+    let second_queued_at = Instant::now();
 
     tx.send(FfmpegCommand::Pause {
         session_id: PlaybackSessionId(2),
@@ -327,6 +452,7 @@ fn ffmpeg_command_drain_applies_pause_resume_and_keeps_latest_seek() {
         position_seconds: 12.0,
         mode: PlaybackSeekMode::Precise,
         generation: first_generation,
+        queued_at: first_queued_at,
     })
     .unwrap();
     tx.send(FfmpegCommand::Resume {
@@ -338,6 +464,7 @@ fn ffmpeg_command_drain_applies_pause_resume_and_keeps_latest_seek() {
         position_seconds: 24.0,
         mode: PlaybackSeekMode::Fast,
         generation: second_generation,
+        queued_at: second_queued_at,
     })
     .unwrap();
 
@@ -352,6 +479,7 @@ fn ffmpeg_command_drain_applies_pause_resume_and_keeps_latest_seek() {
             position_seconds: 24.0,
             mode: PlaybackSeekMode::Fast,
             generation: second_generation,
+            queued_at: second_queued_at,
         })
     );
 }
@@ -373,6 +501,7 @@ fn ffmpeg_command_drain_keeps_latest_track_selection() {
         position_seconds: 10.0,
         mode: PlaybackSeekMode::Fast,
         generation: seek_generation,
+        queued_at: Instant::now(),
     })
     .unwrap();
     tx.send(FfmpegCommand::SetTrackSelection {
@@ -1462,17 +1591,31 @@ fn assert_buffered_event(
 }
 
 #[test]
-fn queued_video_duration_uses_first_and_last_frame_pts() {
+fn queued_video_duration_uses_frame_interval_coverage_without_counting_gaps() {
     let mut queue = VecDeque::new();
     assert_eq!(queued_video_duration(&queue), Duration::ZERO);
 
     queue.push_back(test_queued_video_frame(1_000_000_000));
-    assert_eq!(queued_video_duration(&queue), Duration::ZERO);
+    assert_eq!(
+        queued_video_duration(&queue),
+        Duration::from_nanos(DEFAULT_VIDEO_FRAME_DURATION_NSECS)
+    );
 
     queue.push_back(test_queued_video_frame(1_180_000_000));
     queue.push_back(test_queued_video_frame(1_300_000_000));
 
-    assert_eq!(queued_video_duration(&queue), Duration::from_millis(300));
+    assert_eq!(
+        queued_video_coverage_duration(&queue),
+        Duration::from_nanos(DEFAULT_VIDEO_FRAME_DURATION_NSECS * 3)
+    );
+    assert_eq!(
+        queued_video_duration(&queue),
+        Duration::from_nanos(DEFAULT_VIDEO_FRAME_DURATION_NSECS * 3)
+    );
+    assert_eq!(
+        queued_video_range_span(&queue),
+        Duration::from_nanos(300_000_000 + DEFAULT_VIDEO_FRAME_DURATION_NSECS)
+    );
 }
 
 #[test]
@@ -1543,10 +1686,15 @@ fn queued_video_limit_uses_frame_and_duration_caps() {
     assert!(queued_video_limit_reached(&frame_limited, false));
 
     let mut duration_limited = VecDeque::new();
-    duration_limited.push_back(test_queued_video_frame(1_000_000_000));
-    duration_limited.push_back(test_queued_video_frame(
-        1_000_000_000 + duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION),
-    ));
+    let duration_limit_nsecs = duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION);
+    let frames_for_duration_limit = duration_limit_nsecs
+        .saturating_add(DEFAULT_VIDEO_FRAME_DURATION_NSECS - 1)
+        / DEFAULT_VIDEO_FRAME_DURATION_NSECS;
+    for index in 0..frames_for_duration_limit {
+        duration_limited.push_back(test_queued_video_frame(
+            1_000_000_000 + index * DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+        ));
+    }
     assert!(queued_video_limit_reached(&duration_limited, false));
 
     let mut under_limit = VecDeque::new();
@@ -1729,11 +1877,11 @@ fn video_output_rebuffer_waits_for_demux_cache_insufficient() {
 }
 
 #[test]
-fn video_output_rebuffer_enters_on_output_underrun_even_when_demux_ready() {
+fn healthy_demux_decode_underfill_does_not_enter_cache_rebuffer() {
     let now = Instant::now();
     let mut underrun_started_at = None;
 
-    assert!(video_output_rebuffer_should_enter(
+    assert!(!video_output_rebuffer_should_enter(
         &mut underrun_started_at,
         now,
         true,
@@ -1746,11 +1894,11 @@ fn video_output_rebuffer_enters_on_output_underrun_even_when_demux_ready() {
         false,
         PlaybackOutputState::Playing,
     ));
-    assert_eq!(underrun_started_at, Some(now));
+    assert_eq!(underrun_started_at, None);
 }
 
 #[test]
-fn video_output_rebuffer_allows_fast_pending_audio_recovery_on_underrun() {
+fn video_output_rebuffer_stays_out_while_pending_audio_can_recover_underrun() {
     let now = Instant::now();
     let mut underrun_started_at = None;
 
@@ -1767,11 +1915,11 @@ fn video_output_rebuffer_allows_fast_pending_audio_recovery_on_underrun() {
         true,
         PlaybackOutputState::Playing,
     ));
-    assert_eq!(underrun_started_at, Some(now));
+    assert_eq!(underrun_started_at, None);
 
     assert!(!video_output_rebuffer_should_enter(
         &mut underrun_started_at,
-        now + VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER - Duration::from_millis(1),
+        now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER - Duration::from_millis(1),
         true,
         None,
         true,
@@ -1783,9 +1931,9 @@ fn video_output_rebuffer_allows_fast_pending_audio_recovery_on_underrun() {
         PlaybackOutputState::Playing,
     ));
 
-    assert!(video_output_rebuffer_should_enter(
+    assert!(!video_output_rebuffer_should_enter(
         &mut underrun_started_at,
-        now + VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER,
+        now + VIDEO_OUTPUT_REBUFFER_ENTER_AFTER + Duration::from_secs(5),
         true,
         None,
         true,
@@ -1796,6 +1944,7 @@ fn video_output_rebuffer_allows_fast_pending_audio_recovery_on_underrun() {
         true,
         PlaybackOutputState::Playing,
     ));
+    assert_eq!(underrun_started_at, None);
 }
 
 #[test]
@@ -1841,11 +1990,11 @@ fn video_output_rebuffer_enters_immediately_after_output_underrun() {
 }
 
 #[test]
-fn video_output_rebuffer_enters_immediately_when_demux_empty_and_video_near_drain() {
+fn video_output_rebuffer_ignores_demux_empty_until_output_is_actually_low() {
     let now = Instant::now();
     let mut underrun_started_at = None;
 
-    assert!(video_output_rebuffer_should_enter(
+    assert!(!video_output_rebuffer_should_enter(
         &mut underrun_started_at,
         now,
         false,
@@ -1858,18 +2007,18 @@ fn video_output_rebuffer_enters_immediately_when_demux_empty_and_video_near_drai
         false,
         PlaybackOutputState::Playing,
     ));
-    assert_eq!(underrun_started_at, Some(now));
+    assert_eq!(underrun_started_at, None);
 }
 
 #[test]
-fn output_scheduler_enters_rebuffer_before_video_queue_drains() {
+fn output_scheduler_does_not_rebuffer_on_demux_low_water_with_buffered_video() {
     let control = FfmpegControl::new(PlaybackSessionId::default());
     let mut scheduler = PlaybackOutputScheduler::new();
     scheduler.set_state(PlaybackOutputState::Playing);
     scheduler.push_decoded_video_for_test(test_queued_video_frame(1_000_000_000));
     let now = Instant::now();
 
-    assert!(scheduler.maybe_enter_video_output_rebuffer(
+    assert!(!scheduler.maybe_enter_video_output_rebuffer(
         now,
         false,
         Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) / 2),
@@ -1888,8 +2037,8 @@ fn output_scheduler_enters_rebuffer_before_video_queue_drains() {
     ));
 
     let snapshot = scheduler.snapshot();
-    assert_eq!(snapshot.state, PlaybackOutputState::Rebuffering);
-    assert!(control.is_output_rebuffer_paused());
+    assert_eq!(snapshot.state, PlaybackOutputState::Playing);
+    assert!(!control.is_output_rebuffer_paused());
 }
 
 #[test]
@@ -1991,7 +2140,15 @@ fn output_scheduler_snapshot_reports_decoded_output_watermarks() {
     assert_eq!(snapshot.queued_video_frames, 2);
     assert_eq!(
         snapshot.queued_video_duration_nsecs,
-        DEFAULT_VIDEO_FRAME_DURATION_NSECS
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS * 2
+    );
+    assert_eq!(
+        snapshot.queued_video_coverage_nsecs,
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS * 2
+    );
+    assert_eq!(
+        snapshot.queued_video_range_span_nsecs,
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS * 2
     );
     assert_eq!(
         snapshot.queued_video_range_nsecs,
@@ -2008,6 +2165,33 @@ fn output_scheduler_snapshot_reports_decoded_output_watermarks() {
     assert_eq!(snapshot.pending_start_audio_frames, 1);
     assert_eq!(snapshot.pending_start_audio_nsecs, 20_000_000);
     assert!(!snapshot.waiting_for_demux());
+}
+
+#[test]
+fn startup_snapshot_uses_contiguous_forward_instead_of_gap_coverage() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(1_000_000_000));
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(
+        1_000_000_000 + DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+    ));
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(2_000_000_000));
+
+    let snapshot = scheduler.snapshot();
+
+    assert!(snapshot.first_video_frame_pending);
+    assert_eq!(
+        snapshot.queued_video_coverage_nsecs,
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS * 3
+    );
+    assert!(snapshot.queued_video_range_span_nsecs > snapshot.queued_video_coverage_nsecs);
+    assert_eq!(
+        snapshot.queued_video_contiguous_forward_nsecs,
+        Some(DEFAULT_VIDEO_FRAME_DURATION_NSECS * 2)
+    );
+    assert_eq!(
+        snapshot.queued_video_bootstrap_forward_nsecs(),
+        DEFAULT_VIDEO_FRAME_DURATION_NSECS * 2
+    );
 }
 
 #[test]
@@ -2118,8 +2302,8 @@ fn output_scheduler_backpressures_extreme_playing_pending_audio() {
 #[test]
 fn output_scheduler_backpressures_startup_audio_at_resume_waterline_before_first_video() {
     let mut scheduler = PlaybackOutputScheduler::new();
-    let startup_limit = (VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
-        + AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)
+    let startup_limit = VIDEO_OUTPUT_REBUFFER_RESUME_DURATION
+        .saturating_sub(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)
         .min(PENDING_START_AUDIO_BACKPRESSURE_DURATION);
 
     scheduler.push_pending_start_audio_for_test(
@@ -2279,7 +2463,7 @@ fn video_output_rebuffer_resume_keeps_stable_floor_under_vulkan_resource_pressur
 
     assert_eq!(waterline.target_nsecs, target_nsecs);
     assert_eq!(
-        waterline.decoded_video_forward_nsecs,
+        waterline.decoded_output.video_forward_nsecs,
         Some(frame_duration_nsecs * u64::try_from(queued.len()).unwrap())
     );
     assert!(!waterline.ready());
@@ -2368,7 +2552,7 @@ fn video_output_rebuffer_resume_rejects_subsecond_resume_timeline_budget() {
         duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
     );
     assert_eq!(
-        waterline.decoded_video_forward_nsecs,
+        waterline.decoded_output.video_forward_nsecs,
         Some(resume_budget_nsecs)
     );
     assert!(!waterline.ready());
@@ -2425,7 +2609,7 @@ fn video_output_rebuffer_resume_keeps_stable_floor_under_resource_pressure() {
         duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
     );
     assert_eq!(
-        waterline.decoded_video_forward_nsecs,
+        waterline.decoded_output.video_forward_nsecs,
         Some(frame_duration_nsecs)
     );
     assert!(!waterline.ready());
@@ -2485,7 +2669,7 @@ fn rebuffer_resume_fallback_waits_for_stable_target_before_timeout() {
         duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
     );
     assert_eq!(
-        before_timeout.decoded_video_forward_nsecs,
+        before_timeout.decoded_output.video_forward_nsecs,
         Some(800_000_000)
     );
     assert!(!before_timeout.ready());
@@ -2519,7 +2703,10 @@ fn rebuffer_resume_fallback_rejects_subsecond_decoded_window_after_timeout() {
         after_timeout.target_nsecs,
         duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
     );
-    assert_eq!(after_timeout.decoded_video_forward_nsecs, Some(800_000_000));
+    assert_eq!(
+        after_timeout.decoded_output.video_forward_nsecs,
+        Some(800_000_000)
+    );
     assert!(!after_timeout.ready());
 }
 
@@ -2542,16 +2729,19 @@ fn rebuffer_resume_fallback_accepts_low_water_video_after_audio_stall_timeout() 
         true,
     );
     assert_eq!(
-        waterline.decoded_video_forward_nsecs,
+        waterline.decoded_output.video_forward_nsecs,
         Some(decoded_video_forward_nsecs)
     );
-    assert_eq!(waterline.decoded_audio_forward_nsecs, Some(71_995_464));
+    assert_eq!(
+        waterline.decoded_output.audio_forward_nsecs,
+        Some(71_995_464)
+    );
     assert!(!waterline.ready());
 
     // The output gate releases the demux side after the stalled timeout so the
     // decoder can keep moving; the prolonged-wait fallback must still be the
     // thing that decides when the output side can leave rebuffering.
-    waterline.demux_ready = true;
+    waterline.prefetch.ready = true;
     let at_standard_timeout = rebuffer_playback_resume_waterline_after_prolonged_wait(
         waterline,
         Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
@@ -2568,8 +2758,8 @@ fn rebuffer_resume_fallback_accepts_low_water_video_after_audio_stall_timeout() 
         decoded_video_forward_nsecs
     );
     assert!(after_audio_timeout.ready());
-    assert!(after_audio_timeout.decoded_video_ready);
-    assert!(after_audio_timeout.decoded_audio_ready);
+    assert!(after_audio_timeout.decoded_output.video_ready);
+    assert!(after_audio_timeout.decoded_output.audio_ready);
 }
 
 #[test]
@@ -2590,7 +2780,10 @@ fn rebuffer_audio_stall_fallback_wakes_and_resumes_after_timeout() {
         false,
         true,
     );
-    assert_eq!(waterline.decoded_video_forward_nsecs, Some(280_000_000));
+    assert_eq!(
+        waterline.decoded_output.video_forward_nsecs,
+        Some(280_000_000)
+    );
     assert!(!waterline.ready());
 
     let mut scheduler = PlaybackOutputScheduler::new();
@@ -2642,8 +2835,8 @@ fn rebuffer_audio_stall_fallback_wakes_and_resumes_after_timeout() {
         Some(VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER),
     );
     assert!(after_timeout.ready());
-    assert!(after_timeout.decoded_video_ready);
-    assert!(after_timeout.decoded_audio_ready);
+    assert!(after_timeout.decoded_output.video_ready);
+    assert!(after_timeout.decoded_output.audio_ready);
 }
 
 #[test]
@@ -2677,9 +2870,9 @@ fn cache_underrun_still_blocks_resume() {
         false,
     );
 
-    assert!(waterline.decoded_video_ready);
-    assert!(waterline.decoded_audio_ready);
-    assert!(!waterline.demux_ready);
+    assert!(waterline.decoded_output.video_ready);
+    assert!(waterline.decoded_output.audio_ready);
+    assert!(!waterline.prefetch.ready);
     assert!(!waterline.ready());
     assert_eq!(
         playback_resume_waterline_blocked_on(waterline),
@@ -2721,7 +2914,10 @@ fn rebuffer_resume_fallback_accepts_one_frame_short_decoded_window_when_audio_re
         Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
     );
 
-    assert_eq!(after_timeout.decoded_video_forward_nsecs, Some(960_000_000));
+    assert_eq!(
+        after_timeout.decoded_output.video_forward_nsecs,
+        Some(960_000_000)
+    );
     assert_eq!(after_timeout.target_nsecs, 960_000_000);
     assert!(after_timeout.ready());
 }
@@ -2745,7 +2941,7 @@ fn rebuffer_resume_fallback_resumes_on_video_when_audio_stalls_past_timeout() {
         false,
         true,
     );
-    assert!(!waterline.decoded_audio_ready);
+    assert!(!waterline.decoded_output.audio_ready);
 
     // At the standard stall timeout, audio is still not ready -> keep waiting for it.
     let at_standard = rebuffer_playback_resume_waterline_after_prolonged_wait(
@@ -2761,7 +2957,7 @@ fn rebuffer_resume_fallback_resumes_on_video_when_audio_stalls_past_timeout() {
         Some(VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER),
     );
     assert!(after_audio_timeout.ready());
-    assert!(after_audio_timeout.decoded_video_ready);
+    assert!(after_audio_timeout.decoded_output.video_ready);
 }
 
 #[test]
@@ -2795,7 +2991,7 @@ fn rebuffer_resume_fallback_waits_for_delayed_audio_start_safety_window_after_de
         duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
     );
     assert_eq!(
-        after_timeout.decoded_video_forward_nsecs,
+        after_timeout.decoded_output.video_forward_nsecs,
         Some(decoded_video_forward_nsecs)
     );
     assert!(!after_timeout.ready());
@@ -2833,7 +3029,10 @@ fn rebuffer_resume_fallback_rejects_short_window_that_audio_clock_would_consume(
         after_timeout.target_nsecs,
         duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
     );
-    assert_eq!(after_timeout.decoded_video_forward_nsecs, Some(280_000_000));
+    assert_eq!(
+        after_timeout.decoded_output.video_forward_nsecs,
+        Some(280_000_000)
+    );
     assert!(!after_timeout.ready());
 }
 
@@ -2862,9 +3061,12 @@ fn rebuffer_resume_fallback_waits_when_delayed_audio_start_consumes_low_water() 
         Some(VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER),
     );
 
-    assert_eq!(after_timeout.decoded_video_forward_nsecs, Some(520_000_000));
     assert_eq!(
-        after_timeout.delayed_audio_start_gap_nsecs,
+        after_timeout.decoded_output.video_forward_nsecs,
+        Some(520_000_000)
+    );
+    assert_eq!(
+        after_timeout.decoded_output.delayed_audio_start_gap_nsecs,
         Some(delayed_audio_gap_nsecs)
     );
     assert!(!after_timeout.ready());
@@ -2904,11 +3106,11 @@ fn rebuffer_resume_fallback_accepts_delayed_audio_start_with_low_water_remaining
         duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
     );
     assert_eq!(
-        after_timeout.decoded_video_forward_nsecs,
+        after_timeout.decoded_output.video_forward_nsecs,
         Some(duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION))
     );
     assert_eq!(
-        after_timeout.delayed_audio_start_gap_nsecs,
+        after_timeout.decoded_output.delayed_audio_start_gap_nsecs,
         Some(delayed_audio_gap_nsecs)
     );
     assert!(after_timeout.ready());
@@ -3398,10 +3600,10 @@ fn initial_resume_skips_small_stale_audio_preroll_gap_before_first_video() {
     );
 
     assert!(waterline.ready());
-    assert!(waterline.decoded_video_ready);
-    assert!(waterline.decoded_audio_ready);
-    assert_eq!(waterline.decoded_audio_forward_nsecs, None);
-    assert_eq!(waterline.delayed_audio_start_gap_nsecs, None);
+    assert!(waterline.decoded_output.video_ready);
+    assert!(waterline.decoded_output.audio_ready);
+    assert_eq!(waterline.decoded_output.audio_forward_nsecs, None);
+    assert_eq!(waterline.decoded_output.delayed_audio_start_gap_nsecs, None);
 }
 
 #[test]
@@ -3466,8 +3668,8 @@ fn initial_resume_drops_large_stale_audio_preroll_without_immediate_audio_ready(
         true,
     );
 
-    assert!(waterline.decoded_video_ready);
-    assert!(!waterline.decoded_audio_ready);
+    assert!(waterline.decoded_output.video_ready);
+    assert!(!waterline.decoded_output.audio_ready);
     assert!(!waterline.ready());
 }
 
@@ -3490,8 +3692,8 @@ fn rebuffer_resume_does_not_skip_stale_audio_preroll_gap() {
         true,
     );
 
-    assert!(waterline.decoded_video_ready);
-    assert!(!waterline.decoded_audio_ready);
+    assert!(waterline.decoded_output.video_ready);
+    assert!(!waterline.decoded_output.audio_ready);
     assert!(!waterline.ready());
 }
 
@@ -3533,13 +3735,16 @@ fn initial_waterline_delays_audio_without_waiting_for_video_at_audio_start() {
     );
 
     assert!(waterline.ready());
-    assert!(waterline.decoded_video_ready);
-    assert!(waterline.decoded_audio_ready);
+    assert!(waterline.decoded_output.video_ready);
+    assert!(waterline.decoded_output.audio_ready);
     assert_eq!(
-        waterline.delayed_audio_start_gap_nsecs,
+        waterline.decoded_output.delayed_audio_start_gap_nsecs,
         Some(audio_start_nsecs - video_start_nsecs)
     );
-    assert!(waterline.decoded_video_forward_nsecs.unwrap() < audio_start_nsecs - video_start_nsecs);
+    assert!(
+        waterline.decoded_output.video_forward_nsecs.unwrap()
+            < audio_start_nsecs - video_start_nsecs
+    );
 }
 
 #[test]
@@ -3723,11 +3928,11 @@ fn rebuffer_resume_waterline_allows_video_first_when_audio_gap_is_explicit() {
     );
 
     assert!(waterline.ready());
-    assert!(waterline.decoded_video_ready);
-    assert!(waterline.decoded_audio_ready);
-    assert_eq!(waterline.decoded_audio_forward_nsecs, None);
+    assert!(waterline.decoded_output.video_ready);
+    assert!(waterline.decoded_output.audio_ready);
+    assert_eq!(waterline.decoded_output.audio_forward_nsecs, None);
     assert_eq!(
-        waterline.delayed_audio_start_gap_nsecs,
+        waterline.decoded_output.delayed_audio_start_gap_nsecs,
         Some(first_audio_nsecs - video_resume_nsecs)
     );
     assert!(waterline.allow_audio_gap_at_video_resume);
@@ -3886,7 +4091,10 @@ fn rebuffer_resume_waterline_accepts_delayed_audio_start_after_video_reset() {
     );
 
     assert!(waterline.ready());
-    assert_eq!(waterline.decoded_audio_forward_nsecs, Some(1_030_000_000));
+    assert_eq!(
+        waterline.decoded_output.audio_forward_nsecs,
+        Some(1_030_000_000)
+    );
 }
 
 #[test]
@@ -4479,6 +4687,7 @@ fn test_audio_snapshot(
         total_pending_nsecs,
         queue_frames: 0,
         queue_generation: 0,
+        ..AudioOutputSnapshot::default()
     }
 }
 
@@ -5077,7 +5286,7 @@ fn cached_input_source_skips_http_cache_when_cache_mode_is_disabled() {
 }
 
 #[test]
-fn http_cache_request_header_log_includes_effective_headers() {
+fn http_cache_request_header_log_redacts_credentials() {
     let headers = reqwest_header_pairs(&[
         ("X-Emby-Token".to_string(), "token".to_string()),
         ("User-Agent".to_string(), "Lenna/1.0.13".to_string()),
@@ -5090,7 +5299,7 @@ fn http_cache_request_header_log_includes_effective_headers() {
             "accept-encoding: identity".to_string(),
             "connection: keep-alive".to_string(),
             "range: bytes=128-255".to_string(),
-            "x-emby-token: token".to_string(),
+            "x-emby-token: <redacted>".to_string(),
             "user-agent: Lenna/1.0.13".to_string(),
         ]
     );
@@ -5860,6 +6069,375 @@ fn playback_scheduler_holds_target_while_paused() {
         WaitStatus::Ready
     );
     handle.join().expect("scheduler thread should finish");
+}
+
+#[test]
+fn rebuffer_pause_delay_keeps_scheduler_from_fast_forwarding_one_second() {
+    let mut scheduler = PlaybackScheduler::new(5_000_000_000);
+    scheduler.set_elapsed_for_test(Duration::from_millis(1_200));
+    let before_pause_adjustment = scheduler.current_timeline_nsecs();
+
+    scheduler.delay_by(Duration::from_secs(1));
+    let after_pause_adjustment = scheduler.current_timeline_nsecs();
+
+    assert!(before_pause_adjustment >= 6_190_000_000);
+    assert!(after_pause_adjustment < 5_300_000_000);
+    assert!(after_pause_adjustment.saturating_add(900_000_000) < before_pause_adjustment);
+}
+
+#[test]
+fn audio_gap_scheduler_reanchor_cannot_drain_1_6_seconds_in_ten_milliseconds() {
+    let mut scheduler = PlaybackScheduler::new(0);
+    scheduler.reset(10_000_000_000);
+
+    assert!(!scheduler.ready_for(11_600_000_000));
+    thread::sleep(Duration::from_millis(10));
+    assert!(!scheduler.ready_for(11_600_000_000));
+}
+
+#[test]
+#[ignore = "requires a local HEVC+AAC fixture and working Vulkan/audio devices"]
+fn force_vulkan_playback_advances_monotonically_for_fifteen_seconds() {
+    run_force_vulkan_playback_window(0.0, 15.0, None);
+}
+
+#[test]
+#[ignore = "requires the problem HEVC+AAC fixture and working Vulkan/audio devices"]
+fn force_vulkan_resume_near_184_seconds_advances_monotonically() {
+    run_force_vulkan_playback_window(184.0, 15.0, None);
+}
+
+#[test]
+#[ignore = "requires the problem HEVC+AAC fixture and working Vulkan/audio devices"]
+fn force_vulkan_playback_180_to_190_seconds_advances_monotonically() {
+    run_force_vulkan_playback_window(180.0, 10.0, None);
+}
+
+#[test]
+#[ignore = "requires the 681.266667s problem fixture and working Vulkan/audio devices"]
+fn force_vulkan_problem_window_has_no_presented_video_gap_over_500ms() {
+    run_force_vulkan_playback_window(681.266_667, 15.0, Some(Duration::from_millis(500)));
+}
+
+#[test]
+#[ignore = "requires the 714.266667s-IDR problem fixture and working Vulkan/audio devices"]
+fn force_vulkan_cached_precise_seek_to_716_5_has_no_presented_video_gap_over_500ms() {
+    run_force_vulkan_playback_window_with_seek(
+        710.0,
+        5.0,
+        Some(Duration::from_millis(500)),
+        Some((719.0, 716.5)),
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires the 1047.733333s-IDR HEVC+AAC fixture and working Vulkan/audio devices"]
+fn force_vulkan_cached_precise_seek_to_1050_5_commits_initial_av_without_freeze() {
+    run_force_vulkan_playback_window_with_seek(
+        1_040.0,
+        10.0,
+        Some(Duration::from_millis(500)),
+        Some((1_053.0, 1_050.5)),
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires the 139.233333s HEVC + 44.1-kHz AAC fixture and working Vulkan/audio devices"]
+fn force_vulkan_resume_from_139_233_reaches_playing_without_restart_diagnostics() {
+    run_force_vulkan_playback_window_with_seek(
+        139.233_333,
+        15.0,
+        Some(Duration::from_millis(500)),
+        None,
+        Some(44_100),
+    );
+}
+
+fn run_force_vulkan_playback_window(
+    start_position_seconds: f64,
+    window_seconds: f64,
+    max_presented_video_gap: Option<Duration>,
+) {
+    run_force_vulkan_playback_window_with_seek(
+        start_position_seconds,
+        window_seconds,
+        max_presented_video_gap,
+        None,
+        None,
+    );
+}
+
+fn run_force_vulkan_playback_window_with_seek(
+    start_position_seconds: f64,
+    window_seconds: f64,
+    max_presented_video_gap: Option<Duration>,
+    precise_seek: Option<(f64, f64)>,
+    expected_audio_sample_rate: Option<u32>,
+) {
+    let media_path = std::env::var("TINY_TEST_VULKAN_MEDIA")
+        .expect("set TINY_TEST_VULKAN_MEDIA to a local HEVC+AAC media path");
+    assert_eq!(
+        std::env::var("TINY_HWDEC").as_deref(),
+        Ok("force-vulkan"),
+        "the hardware regression is invalid unless Vulkan decode is forced"
+    );
+
+    let mut backend = FfmpegBackend::new().expect("FFmpeg backend initializes");
+    backend
+        .load(BackendLoadRequest {
+            url: media_path,
+            http_headers: Vec::new(),
+            content_length: None,
+            start_position_seconds,
+            selected_tracks: Default::default(),
+            cache_config: Default::default(),
+        })
+        .expect("local Vulkan regression media starts");
+    let video_output = backend.video_output_queue();
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let target_position_seconds = precise_seek
+        .map(|(_, target)| target + window_seconds)
+        .unwrap_or(start_position_seconds + window_seconds);
+    let mut precise_seek_issued = false;
+    let mut seek_position_regression_pending = false;
+    let mut playback_started = false;
+    let mut saw_hardware_video_info = false;
+    let mut last_position = None;
+    let mut last_position_progress_at = Instant::now();
+    let mut first_vulkan_frame_at = None;
+    let mut last_vulkan_frame_at = None;
+    let mut last_vulkan_frame_pts_nsecs = None;
+    let mut max_vulkan_wall_gap = Duration::ZERO;
+    let mut max_vulkan_pts_gap_nsecs = 0_u64;
+    let mut vulkan_frames_with_pts = 0_u64;
+    let mut playback_restart_at = None;
+    let mut vulkan_frames = 0_u64;
+    let mut buffering_reentries = 0_u64;
+    let mut cache_pause_entries = 0_u64;
+    let mut expected_audio_sample_rate_seen = expected_audio_sample_rate.is_none();
+
+    while Instant::now() < deadline {
+        for event in backend.poll_events() {
+            match event.kind {
+                BackendEventKind::PlaybackRestart => {
+                    playback_started = true;
+                    let now = Instant::now();
+                    playback_restart_at.get_or_insert(now);
+                    last_position_progress_at = now;
+                }
+                BackendEventKind::PlaybackInfoChanged(Some(info)) => {
+                    assert!(
+                        info.hardware_accelerated,
+                        "force-vulkan switched to a software video decoder: {}",
+                        info.decoder
+                    );
+                    saw_hardware_video_info = true;
+                }
+                BackendEventKind::PlaybackAudioInfoChanged(Some(info)) => {
+                    if let Some(expected_audio_sample_rate) = expected_audio_sample_rate {
+                        assert_eq!(
+                            info.sample_rate,
+                            Some(expected_audio_sample_rate),
+                            "Vulkan regression fixture does not have the required AAC sample rate"
+                        );
+                        expected_audio_sample_rate_seen = true;
+                    }
+                }
+                BackendEventKind::Diagnostic(diagnostic)
+                    if matches!(
+                        diagnostic.code,
+                        "ffmpeg_initial_audio_prepare_aborted"
+                            | "ffmpeg_initial_audio_commit_recovered"
+                            | "ffmpeg_prestart_audio_ownership_recovered"
+                    ) =>
+                {
+                    panic!(
+                        "Vulkan restart emitted forbidden diagnostic {}: {}",
+                        diagnostic.code, diagnostic.message
+                    );
+                }
+                BackendEventKind::PositionChanged(position) => {
+                    if let Some(previous) = last_position {
+                        let expected_seek_regression = seek_position_regression_pending
+                            && precise_seek.is_some_and(|(_, target)| {
+                                position + 0.001 < previous
+                                    && position >= target - 0.5
+                                    && position <= target + 1.0
+                            });
+                        assert!(
+                            position + 0.001 >= previous || expected_seek_regression,
+                            "playback position regressed from {previous:.3}s to {position:.3}s"
+                        );
+                        if expected_seek_regression {
+                            seek_position_regression_pending = false;
+                        }
+                        if position > previous + 0.001 {
+                            last_position_progress_at = Instant::now();
+                        }
+                    }
+                    if seek_position_regression_pending
+                        && precise_seek.is_some_and(|(_, target)| {
+                            position >= target - 0.5 && position <= target + 1.0
+                        })
+                    {
+                        seek_position_regression_pending = false;
+                    }
+                    last_position = Some(position);
+                }
+                BackendEventKind::Buffering(true) if playback_started => {
+                    buffering_reentries = buffering_reentries.saturating_add(1);
+                }
+                BackendEventKind::PausedForCacheChanged(true) if playback_started => {
+                    cache_pause_entries = cache_pause_entries.saturating_add(1);
+                }
+                BackendEventKind::LoadFailed(error) | BackendEventKind::Fatal(error) => {
+                    panic!("Vulkan playback failed: {error}");
+                }
+                BackendEventKind::PlaybackEnded
+                    if last_position.is_none_or(|position| position < target_position_seconds) =>
+                {
+                    panic!("Vulkan playback ended before reaching {target_position_seconds:.3}s");
+                }
+                _ => {}
+            }
+        }
+
+        while let Some(frame) = video_output.take_next_frame() {
+            assert!(
+                matches!(frame.pixels, FramePixels::VulkanVideo(_)),
+                "force-vulkan produced a non-Vulkan video frame"
+            );
+            let frame_at = Instant::now();
+            first_vulkan_frame_at.get_or_insert(frame_at);
+            if let Some(previous_frame_at) = last_vulkan_frame_at {
+                let wall_gap = frame_at.saturating_duration_since(previous_frame_at);
+                max_vulkan_wall_gap = max_vulkan_wall_gap.max(wall_gap);
+                if let Some(limit) = max_presented_video_gap {
+                    assert!(
+                        wall_gap <= limit,
+                        "presented Vulkan video stopped for {:.3}ms",
+                        wall_gap.as_secs_f64() * 1000.0
+                    );
+                }
+            }
+            last_vulkan_frame_at = Some(frame_at);
+            if let Some(pts_nsecs) = frame.pts.map(|pts| pts.nsecs) {
+                vulkan_frames_with_pts = vulkan_frames_with_pts.saturating_add(1);
+                if let Some(previous_pts_nsecs) = last_vulkan_frame_pts_nsecs {
+                    let pts_gap_nsecs = pts_nsecs.saturating_sub(previous_pts_nsecs);
+                    max_vulkan_pts_gap_nsecs = max_vulkan_pts_gap_nsecs.max(pts_gap_nsecs);
+                    if let Some(limit) = max_presented_video_gap {
+                        assert!(
+                            pts_gap_nsecs <= duration_nsecs(limit),
+                            "presented Vulkan media timeline jumped by {:.3}ms",
+                            pts_gap_nsecs as f64 / 1_000_000.0
+                        );
+                    }
+                }
+                last_vulkan_frame_pts_nsecs = Some(pts_nsecs);
+            }
+            vulkan_frames = vulkan_frames.saturating_add(1);
+        }
+        while let Some((ticket, _device)) = video_output.take_vulkan_prewarm() {
+            assert!(video_output.complete_vulkan_prewarm(ticket, Ok(())));
+        }
+
+        if let Some((issue_at_seconds, seek_target_seconds)) = precise_seek
+            && !precise_seek_issued
+            && last_position.is_some_and(|position| position >= issue_at_seconds)
+        {
+            backend
+                .seek_to_with_mode(seek_target_seconds, PlaybackSeekMode::Precise)
+                .expect("cached precise-seek regression command is accepted");
+            precise_seek_issued = true;
+            seek_position_regression_pending = true;
+            last_position = None;
+            last_position_progress_at = Instant::now();
+            last_vulkan_frame_pts_nsecs = None;
+        }
+
+        if precise_seek.is_none_or(|_| precise_seek_issued)
+            && last_position.is_some_and(|position| position >= target_position_seconds)
+        {
+            break;
+        }
+        if playback_started && last_position_progress_at.elapsed() >= Duration::from_secs(2) {
+            panic!(
+                "Vulkan playback position stopped advancing for two seconds at {:.3}s",
+                last_position.unwrap_or_default()
+            );
+        }
+        if let (Some(limit), Some(last_frame_at)) = (max_presented_video_gap, last_vulkan_frame_at)
+            && last_frame_at.elapsed() > limit
+            && last_position.is_none_or(|position| position < target_position_seconds)
+        {
+            panic!(
+                "audio position is advancing but presented Vulkan video has been frozen for {:.3}ms",
+                last_frame_at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    backend.stop().expect("Vulkan regression playback stops");
+    assert!(
+        playback_started,
+        "Vulkan playback never presented its first frame"
+    );
+    assert!(
+        vulkan_frames > 0,
+        "Vulkan playback produced no video frames"
+    );
+    if let Some(max_presented_video_gap) = max_presented_video_gap {
+        assert!(
+            vulkan_frames_with_pts > 1,
+            "Vulkan continuity regression did not observe enough timestamped video frames"
+        );
+        assert!(
+            max_vulkan_wall_gap <= max_presented_video_gap,
+            "maximum presented-video wall gap was {:.3}ms",
+            max_vulkan_wall_gap.as_secs_f64() * 1000.0
+        );
+        assert!(
+            max_vulkan_pts_gap_nsecs <= duration_nsecs(max_presented_video_gap),
+            "maximum presented-video timeline gap was {:.3}ms",
+            max_vulkan_pts_gap_nsecs as f64 / 1_000_000.0
+        );
+    }
+    assert!(
+        saw_hardware_video_info,
+        "force-vulkan playback never reported an active hardware decoder"
+    );
+    assert!(
+        expected_audio_sample_rate_seen,
+        "Vulkan playback never reported the required audio format"
+    );
+    if precise_seek.is_some() {
+        assert!(
+            precise_seek_issued,
+            "playback never reached the point that triggers the cached precise seek"
+        );
+    }
+    let first_vulkan_frame_at =
+        first_vulkan_frame_at.expect("force-vulkan playback never queued its first GPU frame");
+    let playback_restart_at =
+        playback_restart_at.expect("force-vulkan playback never completed its startup transaction");
+    assert!(
+        playback_restart_at <= first_vulkan_frame_at + Duration::from_secs(3),
+        "force-vulkan startup transaction exceeded three seconds after its first GPU frame"
+    );
+    assert!(
+        last_position.is_some_and(|position| position >= target_position_seconds),
+        "Vulkan playback did not reach {target_position_seconds:.3}s before the deadline"
+    );
+    let allowed_buffering_reentries = u64::from(precise_seek.is_some());
+    assert!(
+        buffering_reentries <= allowed_buffering_reentries,
+        "playback re-entered buffering {buffering_reentries} times (allowed {allowed_buffering_reentries})"
+    );
+    assert_eq!(cache_pause_entries, 0, "local playback entered cache pause");
 }
 
 #[test]

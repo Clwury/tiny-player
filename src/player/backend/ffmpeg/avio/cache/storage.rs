@@ -1,6 +1,6 @@
 use std::{
     env,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     os::unix::fs::FileExt,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -55,7 +55,7 @@ impl HttpDiskCache {
         }
 
         Some(Self {
-            file,
+            file: std::sync::Arc::new(file),
             path,
             ranges: Vec::new(),
             max_bytes,
@@ -64,16 +64,27 @@ impl HttpDiskCache {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::avio::cache) fn write_at(
         &mut self,
         offset: u64,
         data: &[u8],
     ) -> std::io::Result<()> {
+        Self::write_file_at(&self.file, offset, data)?;
+        self.add_range(offset, offset.saturating_add(data.len() as u64));
+        self.trim_to_limit();
+        Ok(())
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn write_file_at(
+        file: &File,
+        offset: u64,
+        data: &[u8],
+    ) -> std::io::Result<()> {
         let mut written = 0;
         while written < data.len() {
-            let written_now = self
-                .file
-                .write_at(&data[written..], offset.saturating_add(written as u64))?;
+            let written_now =
+                file.write_at(&data[written..], offset.saturating_add(written as u64))?;
             if written_now == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
@@ -82,8 +93,6 @@ impl HttpDiskCache {
             }
             written += written_now;
         }
-        self.add_range(offset, offset.saturating_add(data.len() as u64));
-        self.trim_to_limit();
         Ok(())
     }
 

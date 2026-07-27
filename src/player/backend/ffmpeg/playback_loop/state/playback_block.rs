@@ -10,9 +10,12 @@ const VULKAN_IN_FLIGHT_FRAME_MARGIN: usize = 4;
 pub(in crate::player::backend::ffmpeg) struct VideoOutputResourcePressure {
     pub(in crate::player::backend::ffmpeg) scheduled_video_frames: usize,
     pub(in crate::player::backend::ffmpeg) decoded_video_frames: usize,
-    pub(in crate::player::backend::ffmpeg) in_flight_video_packets: usize,
+    pub(in crate::player::backend::ffmpeg) submitted_not_consumed_video_packets: usize,
+    pub(in crate::player::backend::ffmpeg) prepare_worker_frames: usize,
+    pub(in crate::player::backend::ffmpeg) recovery_staging_frames: usize,
     pub(in crate::player::backend::ffmpeg) hardware_accelerated: bool,
     pub(in crate::player::backend::ffmpeg) scheduled_video_queue_limit_reached: bool,
+    pub(in crate::player::backend::ffmpeg) decode_recovery_video_admission_blocked: bool,
     pub(in crate::player::backend::ffmpeg) fill_phase_for_output_start: bool,
     pub(in crate::player::backend::ffmpeg) video_frame_duration_nsecs: u64,
     pub(in crate::player::backend::ffmpeg) vo_queue_capacity: usize,
@@ -26,7 +29,10 @@ impl VideoOutputResourcePressure {
     pub(in crate::player::backend::ffmpeg) fn active_frames(self) -> usize {
         self.scheduled_video_frames
             .saturating_add(self.decoded_video_frames)
-            .saturating_add(self.in_flight_video_packets)
+            .saturating_add(self.submitted_not_consumed_video_packets)
+            .saturating_add(self.prepare_worker_frames)
+            .saturating_add(self.recovery_staging_frames)
+            .saturating_add(self.vo_queued_frames)
     }
 
     pub(in crate::player::backend::ffmpeg) fn dynamic_frame_budget(self) -> usize {
@@ -39,6 +45,11 @@ impl VideoOutputResourcePressure {
             .saturating_add(VULKAN_HW_SURFACE_RESERVE_FRAMES)
             .saturating_add(VULKAN_IN_FLIGHT_FRAME_MARGIN)
             .max(VULKAN_VIDEO_OUTPUT_RESOURCE_PRESSURE_FRAMES)
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn hard_frame_budget(self) -> usize {
+        self.dynamic_frame_budget()
+            .saturating_add(VULKAN_IN_FLIGHT_FRAME_MARGIN)
     }
 }
 
@@ -95,11 +106,20 @@ fn frames_for_duration(frame_duration_nsecs: u64, target_nsecs: u64) -> usize {
 pub(in crate::player::backend::ffmpeg) fn video_output_resource_pressure(
     pressure: VideoOutputResourcePressure,
 ) -> bool {
-    if pressure.scheduled_video_queue_limit_reached {
+    if pressure.scheduled_video_queue_limit_reached
+        || pressure.decode_recovery_video_admission_blocked
+    {
         return true;
     }
     if !pressure.hardware_accelerated {
         return false;
+    }
+
+    // The absolute ownership budget includes every place that can retain a
+    // Vulkan AVFrame. It applies even while startup/rebuffer fill is active;
+    // only the lower steady-state pressure threshold is relaxed below.
+    if pressure.active_frames() >= pressure.hard_frame_budget() {
+        return true;
     }
 
     // During the rebuffer / first-frame fill phase the soft Vulkan frame-pressure
@@ -157,14 +177,17 @@ mod tests {
     fn pressure_for_test(
         scheduled_video_frames: usize,
         decoded_video_frames: usize,
-        in_flight_video_packets: usize,
+        submitted_not_consumed_video_packets: usize,
     ) -> VideoOutputResourcePressure {
         VideoOutputResourcePressure {
             scheduled_video_frames,
             decoded_video_frames,
-            in_flight_video_packets,
+            submitted_not_consumed_video_packets,
+            prepare_worker_frames: 0,
+            recovery_staging_frames: 0,
             hardware_accelerated: true,
             scheduled_video_queue_limit_reached: false,
+            decode_recovery_video_admission_blocked: false,
             fill_phase_for_output_start: false,
             video_frame_duration_nsecs: 20_000_000,
             vo_queue_capacity: 3,
@@ -214,20 +237,38 @@ mod tests {
     }
 
     #[test]
+    fn vulkan_ownership_budget_counts_every_external_frame_holder() {
+        let mut pressure = pressure_for_test(1, 2, 3);
+        pressure.prepare_worker_frames = 4;
+        pressure.recovery_staging_frames = 5;
+        pressure.vo_queued_frames = 6;
+
+        assert_eq!(pressure.active_frames(), 1 + 2 + 3 + 4 + 5 + 6);
+    }
+
+    #[test]
     fn video_output_resource_pressure_relaxes_soft_threshold_during_output_fill() {
         // Fill phase (rebuffer/first-frame): the soft Vulkan threshold is ignored so
         // decode can reach the resume waterline instead of deadlocking against it...
-        let mut pressure = pressure_for_test(47, 0, 0);
+        let mut pressure = pressure_for_test(46, 0, 0);
         pressure.fill_phase_for_output_start = true;
         assert!(!video_output_resource_pressure(pressure));
-        // ...but the hard scheduled-queue limit still applies even while filling.
+        // ...but the all-owner hard frame budget still applies while filling.
+        pressure.scheduled_video_frames = 47;
+        assert!(video_output_resource_pressure(pressure));
+        pressure.scheduled_video_frames = 46;
+        // The explicit recovery staging/input gate is also hard.
+        pressure.decode_recovery_video_admission_blocked = true;
+        assert!(video_output_resource_pressure(pressure));
+        pressure.decode_recovery_video_admission_blocked = false;
+        // The hard scheduled-queue limit remains unconditional.
         pressure.scheduled_video_queue_limit_reached = true;
         assert!(video_output_resource_pressure(pressure));
     }
 
     #[test]
     fn video_output_resource_pressure_relaxes_soft_threshold_on_low_output_watermarks() {
-        let mut pressure = pressure_for_test(60, 0, 0);
+        let mut pressure = pressure_for_test(45, 0, 0);
         pressure.queued_video_forward_nsecs =
             Some(duration_nsecs(AUDIO_VIDEO_QUEUE_TARGET_DURATION) - 1);
         assert!(!video_output_resource_pressure(pressure));

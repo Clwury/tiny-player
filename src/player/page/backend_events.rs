@@ -28,6 +28,13 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         match event.kind {
+            BackendEventKind::Diagnostic(diagnostic) => {
+                tracing::debug!(
+                    code = diagnostic.code,
+                    message = %diagnostic.message,
+                    "playback backend diagnostic event"
+                );
+            }
             BackendEventKind::PlaybackRestart => {
                 if self.playback_reporting_closed() {
                     return;

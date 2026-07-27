@@ -29,10 +29,12 @@ pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxPacketCacheRea
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxPacketQueueSnapshot {
+    pub(in crate::player::backend::ffmpeg::playback_loop) cache_generation: u64,
     pub(in crate::player::backend::ffmpeg::playback_loop) total_packets: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) total_bytes: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) memory_limit_bytes: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) read_index: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop) exact_seek_target_nsecs: u64,
     pub(in crate::player::backend::ffmpeg::playback_loop) streams:
         Vec<DemuxStreamPacketQueueSnapshot>,
 }
@@ -49,6 +51,9 @@ pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxStreamPacketQu
     pub(in crate::player::backend::ffmpeg::playback_loop) reader_head_available: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop) consumer_drainable: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop) queued_bytes: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop) reader_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop) cached_end_nsecs: Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop) target_coverage_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop) forward_nsecs: Option<u64>,
 }
 

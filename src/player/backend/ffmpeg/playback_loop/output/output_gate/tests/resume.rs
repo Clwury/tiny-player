@@ -8,13 +8,16 @@ use super::super::{
     AUDIO_OUTPUT_DELAY_LIMIT, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
     AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AUDIO_REBUFFER_PREFILL_LOOP_TARGET,
     AUDIO_REBUFFER_PREFILL_TARGET, AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN, AudioResumeWaterline,
-    DecodedAudio, MAX_REBUFFER_AUDIO_LEAD_NSECS, PLAYING_PENDING_AUDIO_FORCE_RECOVERY_DURATION,
-    PLAYING_PENDING_AUDIO_HARD_RESET_DURATION, PendingAudioPressureContext,
-    PendingStartAudioPressureLevel, PlaybackOutputScheduler, PlaybackOutputState,
-    RebufferResumeAnchor, StaleRebufferPendingAudio, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    DecodedAudio, DecodedAudioAdmission, MAX_REBUFFER_AUDIO_LEAD_NSECS,
+    PLAYING_PENDING_AUDIO_FORCE_RECOVERY_DURATION, PLAYING_PENDING_AUDIO_HARD_RESET_DURATION,
+    PendingAudioPressureContext, PendingAudioRetentionAnchorSource, PendingAudioRetentionPlan,
+    PendingStartAudioPressureLevel, PlaybackBlockReason, PlaybackOutputScheduler,
+    PlaybackOutputState, RebufferResumeAnchor, StaleRebufferPendingAudio,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
     discard_decoded_video_before_output_gate_resume_if_ready, duration_nsecs,
     playing_pending_audio_limit_duration, playing_pending_audio_pressure_clear_duration,
-    stale_rebuffer_pending_audio, stale_rebuffer_pending_audio_ahead,
+    playing_pending_audio_warn_entry_duration, stale_rebuffer_pending_audio,
+    stale_rebuffer_pending_audio_ahead,
 };
 use super::{audio_snapshot, resume_decision, test_queued_video_frame, waterline};
 
@@ -32,6 +35,14 @@ fn playing_pending_audio_pressure_levels_follow_steady_state_thresholds() {
     );
     assert_eq!(
         PendingStartAudioPressureLevel::from_duration(playing_pending_audio_limit_duration()),
+        PendingStartAudioPressureLevel::Normal
+    );
+    assert_eq!(
+        PendingStartAudioPressureLevel::from_duration(Duration::from_millis(859)),
+        PendingStartAudioPressureLevel::Normal
+    );
+    assert_eq!(
+        PendingStartAudioPressureLevel::from_duration(playing_pending_audio_warn_entry_duration()),
         PendingStartAudioPressureLevel::Warn
     );
     assert_eq!(
@@ -57,10 +68,10 @@ fn playing_pending_audio_pressure_uses_clear_hysteresis() {
     scheduler.push_pending_start_audio_for_test(
         DecodedAudio {
             samples: vec![0.0; 4],
-            duration_nsecs: duration_nsecs(limit) + 1,
+            duration_nsecs: duration_nsecs(playing_pending_audio_warn_entry_duration()) + 1,
         },
         1_000_000_000,
-        1_000_000_000 + duration_nsecs(limit) + 1,
+        1_000_000_000 + duration_nsecs(playing_pending_audio_warn_entry_duration()) + 1,
     );
     scheduler.report_playing_pending_start_audio_pressure(PlaybackSessionId(1), "test");
     assert_eq!(
@@ -196,7 +207,7 @@ fn audio_rebuffer_prefill_target_uses_loop_recovery_after_repeated_underruns() {
 }
 
 #[test]
-fn far_ahead_rebuffer_audio_requests_video_master_realign_after_repeated_drops() {
+fn far_ahead_rebuffer_audio_requests_video_master_realign_after_bounded_observations() {
     let mut scheduler = PlaybackOutputScheduler::new();
     scheduler.set_state(PlaybackOutputState::Rebuffering);
     scheduler.set_video_output_rebuffer_anchor_for_test(RebufferResumeAnchor {
@@ -240,7 +251,7 @@ fn far_ahead_rebuffer_audio_requests_video_master_realign_after_repeated_drops()
                 "test_far_ahead",
             )
             .is_none(),
-        "repeated drops arm the continuity watchdog but cannot bypass it"
+        "repeated observations arm the continuity watchdog but cannot bypass it"
     );
     scheduler.expire_audio_reader_gap_watchdog_for_test();
 
@@ -258,7 +269,7 @@ fn far_ahead_rebuffer_audio_requests_video_master_realign_after_repeated_drops()
     assert_eq!(request.target_timeline_nsecs, 5_680_000_000);
     assert_eq!(request.anchor_timeline_nsecs, 5_640_000_000);
     assert_eq!(request.first_video_timeline_nsecs, 5_680_000_000);
-    assert_eq!(request.far_ahead_drop_count, 4);
+    assert_eq!(request.far_ahead_observation_count, 4);
     assert_eq!(
         scheduler
             .take_rebuffer_audio_realign_request()
@@ -268,7 +279,7 @@ fn far_ahead_rebuffer_audio_requests_video_master_realign_after_repeated_drops()
 }
 
 #[test]
-fn coordinator_stall_with_continuous_audio_does_not_realign() {
+fn forced_far_ahead_realign_bypasses_coordinator_stall_and_live_audio() {
     let mut scheduler = PlaybackOutputScheduler::new();
     scheduler.set_state(PlaybackOutputState::Rebuffering);
     scheduler.set_video_output_rebuffer_anchor_for_test(RebufferResumeAnchor {
@@ -288,9 +299,9 @@ fn coordinator_stall_with_continuous_audio_does_not_realign() {
                 PlaybackSessionId(1),
                 "test_coordinator_stall",
             )
-            .is_none()
+            .is_some()
     );
-    assert!(!scheduler.rebuffer_audio_realign_request_pending());
+    assert!(scheduler.rebuffer_audio_realign_request_pending());
 }
 
 #[test]
@@ -304,35 +315,20 @@ fn coordinator_stall_does_not_hide_real_audio_gap_or_duplicate_transaction() {
     scheduler.push_decoded_video_for_test(test_queued_video_frame(5_680_000_000));
     scheduler.record_coordinator_tick(Duration::from_millis(65));
 
-    assert!(
-        scheduler
-            .observe_rebuffer_far_ahead_audio_frame(
-                182_000_000_000,
-                5_640_000_000,
-                Some(0),
-                true,
-                PlaybackSessionId(1),
-                "test_real_audio_gap",
-            )
-            .is_none(),
-        "empty coverage starts the real-gap watchdog instead of seeking immediately"
-    );
-    scheduler.expire_audio_reader_gap_watchdog_for_test();
-
     let request = scheduler
         .observe_rebuffer_far_ahead_audio_frame(
-            182_020_000_000,
+            182_000_000_000,
             5_640_000_000,
             Some(0),
             true,
             PlaybackSessionId(1),
             "test_real_audio_gap",
         )
-        .expect("a real gap requests one realign after the watchdog expires");
+        .expect("forced realign bypasses the gap watchdog");
     assert!(
         scheduler
             .observe_rebuffer_far_ahead_audio_frame(
-                182_040_000_000,
+                182_020_000_000,
                 5_640_000_000,
                 Some(0),
                 true,
@@ -425,7 +421,7 @@ fn reader_head_far_ahead_rebuffer_empty_audio_waits_for_real_gap_watchdog() {
     assert_eq!(request.anchor_timeline_nsecs, 15_120_000_000);
     assert_eq!(request.first_video_timeline_nsecs, 15_120_000_000);
     assert_eq!(request.far_ahead_audio_timeline_nsecs, 16_320_000_000);
-    assert!(request.far_ahead_drop_count < 3);
+    assert!(request.far_ahead_observation_count < 3);
     assert_eq!(
         scheduler
             .take_rebuffer_audio_realign_request()
@@ -691,7 +687,7 @@ fn startup_reader_head_gap_requests_realign_before_playback_resume() {
         202_570_884_290,
         204_567_800_334,
     );
-    let mut waterline = AudioResumeWaterline {
+    let waterline = AudioResumeWaterline {
         resume_timeline_nsecs: 202_550_000_000,
         target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
         audio_output_pending_nsecs: Some(0),
@@ -713,30 +709,6 @@ fn startup_reader_head_gap_requests_realign_before_playback_resume() {
         "reader packets represented by queued/in-flight decode work are not a continuity gap"
     );
 
-    assert!(
-        scheduler
-            .request_output_wait_audio_reader_head_realign_if_needed(
-                212_021_405_896,
-                waterline,
-                202_549_751_669,
-                PlaybackSessionId(1),
-            )
-            .is_none(),
-        "in-flight decode work prevents reader-head realign regardless of producer distance"
-    );
-    waterline.audio_decode_in_flight_packets = 0;
-    waterline.audio_decode_queued_nsecs = 0;
-    assert!(
-        scheduler
-            .request_output_wait_audio_reader_head_realign_if_needed(
-                212_021_405_896,
-                waterline,
-                202_549_751_669,
-                PlaybackSessionId(1),
-            )
-            .is_none()
-    );
-    scheduler.expire_audio_reader_gap_watchdog_for_test();
     let request = scheduler
         .request_output_wait_audio_reader_head_realign_if_needed(
             212_021_405_896,
@@ -744,7 +716,7 @@ fn startup_reader_head_gap_requests_realign_before_playback_resume() {
             202_549_751_669,
             PlaybackSessionId(1),
         )
-        .expect("a stalled gap with no queued or in-flight work requests realign");
+        .expect("reader PTS span bound requests realign despite stuck in-flight work");
 
     assert_eq!(request.reason, "output_wait_audio_reader_continuity_gap");
     assert_eq!(request.target_timeline_nsecs, 202_550_000_000);
@@ -791,7 +763,7 @@ fn audio_gap_recovery_suppresses_empty_audio_rebuffer_while_video_has_low_water(
 }
 
 #[test]
-fn audio_gap_recovery_does_not_suppress_rebuffer_when_video_queue_full_and_vo_empty() {
+fn healthy_demux_prevents_cache_rebuffer_when_video_queue_full_and_vo_empty() {
     let control = FfmpegControl::new(PlaybackSessionId::default());
     let mut scheduler = PlaybackOutputScheduler::new();
     scheduler.set_state(PlaybackOutputState::Playing);
@@ -809,7 +781,7 @@ fn audio_gap_recovery_does_not_suppress_rebuffer_when_video_queue_full_and_vo_em
         "test_audio_gap",
     );
 
-    assert!(scheduler.maybe_enter_video_output_rebuffer(
+    assert!(!scheduler.maybe_enter_video_output_rebuffer(
         now + Duration::from_millis(100),
         true,
         Some(1_600_000_000),
@@ -826,7 +798,7 @@ fn audio_gap_recovery_does_not_suppress_rebuffer_when_video_queue_full_and_vo_em
         PlaybackSessionId(1),
         Some(1_600_000_000),
     ));
-    assert_eq!(scheduler.snapshot().state, PlaybackOutputState::Rebuffering);
+    assert_eq!(scheduler.snapshot().state, PlaybackOutputState::Playing);
 }
 
 #[test]
@@ -931,12 +903,12 @@ fn post_seek_video_bootstrap_blocks_rebuffer_before_first_frame() {
 }
 
 #[test]
-fn demux_healthy_output_underflow_enters_decode_underfill_rebuffer() {
+fn demux_healthy_output_underflow_stays_out_of_cache_rebuffer() {
     let control = FfmpegControl::new(PlaybackSessionId::default());
     let mut scheduler = PlaybackOutputScheduler::new();
     scheduler.set_state(PlaybackOutputState::Playing);
 
-    assert!(scheduler.maybe_enter_video_output_rebuffer(
+    assert!(!scheduler.maybe_enter_video_output_rebuffer(
         std::time::Instant::now() + Duration::from_millis(500),
         true,
         None,
@@ -954,9 +926,9 @@ fn demux_healthy_output_underflow_enters_decode_underfill_rebuffer() {
         None,
     ));
     let snapshot = scheduler.snapshot();
-    assert_eq!(snapshot.state, PlaybackOutputState::Rebuffering);
-    assert!(snapshot.rebuffering);
-    assert!(snapshot.video_decode_underfill);
+    assert_eq!(snapshot.state, PlaybackOutputState::Playing);
+    assert!(!snapshot.rebuffering);
+    assert!(!snapshot.video_decode_underfill);
 }
 
 #[test]
@@ -1011,7 +983,7 @@ fn initial_start_pending_pressure_context_suppresses_steady_hard_reset() {
 }
 
 #[test]
-fn initial_start_pending_pressure_context_ends_after_one_shot_defer() {
+fn initial_start_pending_pressure_context_survives_one_shot_defer_above_clear_water() {
     let mut scheduler = PlaybackOutputScheduler::new();
     scheduler.set_state(PlaybackOutputState::Playing);
     scheduler.defer_next_pending_start_audio_flush_after_initial_start();
@@ -1029,8 +1001,163 @@ fn initial_start_pending_pressure_context_ends_after_one_shot_defer() {
 
     assert_eq!(
         scheduler.pending_audio_pressure_context(),
-        PendingAudioPressureContext::PlayingSteady
+        PendingAudioPressureContext::StartupSync
     );
+}
+
+#[test]
+fn vulkan_fast_start_defers_next_aac_frame_when_pending_audio_is_905ms() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+    scheduler.defer_next_pending_start_audio_flush_after_initial_start();
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 905_000_000,
+        },
+        2_000_000_000,
+        2_905_000_000,
+    );
+    let retained_before = scheduler.pending_start_audio.len();
+    assert!(scheduler.pending_start_audio_backpressured());
+
+    let admission = scheduler.defer_decoded_audio_for_backpressure(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 21_333_333,
+        },
+        2_905_000_000,
+        2_926_333_333,
+        PlaybackSessionId(1),
+        "vulkan_fast_start_regression",
+    );
+
+    let DecodedAudioAdmission::Deferred(deferred) = admission else {
+        panic!("the next AAC frame must remain owned by the decode pipeline");
+    };
+    assert_eq!(deferred.duration_nsecs, 21_333_333);
+    assert_eq!(scheduler.pending_start_audio.len(), retained_before);
+    assert_eq!(
+        scheduler.pending_start_audio.contiguous_range_nsecs(),
+        Some((2_000_000_000, 2_905_000_000))
+    );
+    assert_eq!(
+        scheduler.pending_audio_pressure_context(),
+        PendingAudioPressureContext::StartupSync
+    );
+}
+
+#[test]
+fn repeated_pending_audio_backpressure_is_summarized_instead_of_logged_per_tick() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+
+    for offset in [0, 21_333_333] {
+        let admission = scheduler.defer_decoded_audio_for_backpressure(
+            DecodedAudio {
+                samples: vec![0.0; 4],
+                duration_nsecs: 21_333_333,
+            },
+            2_905_000_000 + offset,
+            2_926_333_333 + offset,
+            PlaybackSessionId(1),
+            "same_block",
+        );
+        assert!(matches!(admission, DecodedAudioAdmission::Deferred(_)));
+    }
+
+    let log_state = scheduler
+        .pending_audio_backpressure_log_state
+        .expect("backpressure series is tracked");
+    assert_eq!(log_state.reason, "same_block");
+    assert_eq!(log_state.suppressed_repeats, 1);
+}
+
+#[test]
+fn repeated_output_gate_block_logs_only_first_and_one_second_summary() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Rebuffering);
+    let now = std::time::Instant::now();
+
+    let first = scheduler
+        .observe_output_gate_block_log(
+            PlaybackBlockReason::DecodedAudioQueue,
+            "rebuffer_empty_audio_output",
+            now,
+        )
+        .expect("first block is logged");
+    assert_eq!(first.log_kind, "state_changed");
+    assert!(
+        scheduler
+            .observe_output_gate_block_log(
+                PlaybackBlockReason::DecodedAudioQueue,
+                "rebuffer_empty_audio_output",
+                now + Duration::from_millis(7),
+            )
+            .is_none()
+    );
+    let summary = scheduler
+        .observe_output_gate_block_log(
+            PlaybackBlockReason::DecodedAudioQueue,
+            "rebuffer_empty_audio_output",
+            now + Duration::from_secs(1),
+        )
+        .expect("one-second summary is logged");
+    assert_eq!(summary.log_kind, "periodic_summary");
+    assert_eq!(summary.suppressed_repeats, 1);
+}
+
+#[test]
+fn entering_rebuffer_invalidates_video_clock_anchor_until_explicit_reanchor() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    assert!(!scheduler.video_clock_anchor_valid());
+
+    scheduler.mark_video_clock_anchor_valid();
+    assert!(scheduler.video_clock_anchor_valid());
+
+    scheduler.set_state(PlaybackOutputState::Rebuffering);
+    assert!(!scheduler.video_clock_anchor_valid());
+}
+
+#[test]
+fn every_rebuffer_transition_arms_the_unified_two_second_fallback_clock() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+    assert!(scheduler.rebuffer_wait_elapsed().is_none());
+
+    scheduler.set_state(PlaybackOutputState::Rebuffering);
+    assert!(scheduler.restart_fallback_deadline_armed());
+    assert!(scheduler.rebuffer_wait_elapsed().is_some());
+
+    scheduler.set_video_output_underrun_started_at_for_test(
+        std::time::Instant::now() - Duration::from_secs(2),
+    );
+    assert!(scheduler.rebuffer_wait_elapsed().unwrap() >= Duration::from_secs(2));
+
+    scheduler.set_state(PlaybackOutputState::Playing);
+    assert!(scheduler.rebuffer_wait_elapsed().is_none());
+}
+
+#[test]
+fn repeated_observation_of_same_far_ahead_frame_counts_one_rejection() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    for _ in 0..100 {
+        scheduler.record_audio_continuity_rejection(
+            4_905_000_000,
+            2_905_000_000,
+            None,
+            PlaybackSessionId(1),
+            "test_repeated_deferred_frame",
+        );
+    }
+
+    let summary = scheduler
+        .audio_continuity_rejection_summary
+        .expect("one rejection summary is retained");
+    assert_eq!(summary.first_rejected_pts_nsecs, 4_905_000_000);
+    assert_eq!(summary.last_rejected_pts_nsecs, 4_905_000_000);
+    assert_eq!(summary.rejected_count, 1);
+    assert_eq!(summary.largest_gap_nsecs, 2_000_000_000);
 }
 
 #[test]
@@ -1057,6 +1184,10 @@ fn pending_start_audio_can_recover_playing_audio_output() {
 fn audio_resume_waterline_records_decode_and_demux_diagnostics() {
     let mut scheduler = PlaybackOutputScheduler::new();
     scheduler.set_state(PlaybackOutputState::Rebuffering);
+    scheduler.set_video_output_rebuffer_anchor_for_test(RebufferResumeAnchor {
+        timeline_nsecs: 1_000_000_000,
+        reset_to_video_when_decoded_queue_misses_anchor: false,
+    });
     scheduler.push_decoded_video_for_test(test_queued_video_frame(1_000_000_000));
     scheduler.push_pending_start_audio_for_test(
         DecodedAudio {
@@ -1124,7 +1255,7 @@ fn rebuffer_audio_resume_waterline_uses_video_anchor_when_audio_output_is_empty(
         )
         .expect("output resume waterline");
 
-    assert_eq!(waterline.resume_timeline_nsecs, first_video_nsecs);
+    assert_eq!(waterline.resume_timeline_nsecs, anchor_nsecs);
     assert_eq!(waterline.audio_output_buffered_until_nsecs, None);
     assert_eq!(waterline.audio_output_pending_nsecs, Some(0));
 }
@@ -1194,7 +1325,7 @@ fn stale_rebuffer_pending_audio_behind_detects_anchor_miss_video_resume() {
 }
 
 #[test]
-fn startup_audio_resume_waterline_reports_low_water_before_first_video_queue() {
+fn startup_audio_resume_waterline_waits_for_unpresented_video_anchor() {
     let mut scheduler = PlaybackOutputScheduler::new();
     scheduler.push_pending_start_audio_for_test(
         DecodedAudio {
@@ -1205,27 +1336,20 @@ fn startup_audio_resume_waterline_reports_low_water_before_first_video_queue() {
         1_200_000_000,
     );
 
-    let waterline = scheduler
-        .audio_resume_waterline_for_output_wait(
-            Some(audio_snapshot(1_000_000_000, 0)),
-            64_000_000,
-            2,
-            1_000_000_000,
-            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
-            Some(3_000_000_000),
-            Some(7),
-        )
-        .expect("startup audio waterline");
-
     assert!(scheduler.scheduled_video_queue.is_empty());
-    assert!(waterline.below_target());
-    assert_eq!(waterline.resume_timeline_nsecs, 1_000_000_000);
-    assert_eq!(waterline.pending_audio_forward_nsecs, Some(200_000_000));
-    assert_eq!(waterline.decoded_audio_forward_nsecs, Some(200_000_000));
-    assert_eq!(waterline.audio_decode_queued_nsecs, 64_000_000);
-    assert_eq!(waterline.audio_decode_in_flight_packets, 2);
-    assert_eq!(waterline.demux_audio_forward_nsecs, Some(3_000_000_000));
-    assert_eq!(waterline.demux_audio_cached_packets, Some(7));
+    assert!(
+        scheduler
+            .audio_resume_waterline_for_output_wait(
+                Some(audio_snapshot(1_000_000_000, 0)),
+                64_000_000,
+                2,
+                1_000_000_000,
+                duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+                Some(3_000_000_000),
+                Some(7),
+            )
+            .is_none()
+    );
 }
 
 #[test]
@@ -1233,6 +1357,7 @@ fn startup_audio_resume_waterline_waits_for_margin_before_input_suppression() {
     let mut scheduler = PlaybackOutputScheduler::new();
     let suppression_threshold = duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
         + duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN);
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(1_000_000_000));
 
     scheduler.push_pending_start_audio_for_test(
         DecodedAudio {
@@ -1243,7 +1368,7 @@ fn startup_audio_resume_waterline_waits_for_margin_before_input_suppression() {
         1_000_000_000 + suppression_threshold - 1,
     );
 
-    assert!(scheduler.scheduled_video_queue.is_empty());
+    assert!(!scheduler.scheduled_video_queue.is_empty());
     assert!(scheduler.audio_resume_waterline_below_input_suppression(
         Some(audio_snapshot(1_000_000_000, 0)),
         0,
@@ -1271,6 +1396,7 @@ fn startup_audio_resume_waterline_waits_for_margin_before_input_suppression() {
 #[test]
 fn startup_audio_resume_waterline_below_input_suppression_keeps_filling() {
     let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(1_000_000_000));
     scheduler.push_pending_start_audio_for_test(
         DecodedAudio {
             samples: vec![0.0; 4],
@@ -1280,7 +1406,7 @@ fn startup_audio_resume_waterline_below_input_suppression_keeps_filling() {
         1_200_000_000,
     );
 
-    assert!(scheduler.scheduled_video_queue.is_empty());
+    assert!(!scheduler.scheduled_video_queue.is_empty());
     assert!(scheduler.audio_resume_waterline_below_input_suppression(
         Some(audio_snapshot(1_000_000_000, 0)),
         0,
@@ -1294,8 +1420,24 @@ fn audio_far_ahead_reference_uses_start_position_before_first_video_frame() {
     let scheduler = PlaybackOutputScheduler::new();
 
     assert_eq!(
-        scheduler.audio_far_ahead_reference_timeline_nsecs(5_000_000_000),
+        scheduler.audio_far_ahead_reference_timeline_nsecs(5_000_000_000, None),
         5_000_000_000
+    );
+}
+
+#[test]
+fn audio_far_ahead_reference_uses_actual_played_and_buffered_timeline() {
+    let scheduler = PlaybackOutputScheduler::new();
+    let stale_start_anchor_nsecs = 139_233_333_333;
+    let played_timeline_nsecs = 141_432_743_662;
+    let buffered_audio_nsecs = 100_589_671;
+
+    assert_eq!(
+        scheduler.audio_far_ahead_reference_timeline_nsecs(
+            stale_start_anchor_nsecs,
+            Some(audio_snapshot(played_timeline_nsecs, buffered_audio_nsecs)),
+        ),
+        141_533_333_333
     );
 }
 
@@ -1308,11 +1450,11 @@ fn audio_far_ahead_reference_follows_first_queued_video_frame_during_initial_syn
     // the requested start position; the reference must follow the actual
     // resume point so realigned audio is not dropped again.
     assert_eq!(
-        scheduler.audio_far_ahead_reference_timeline_nsecs(0),
+        scheduler.audio_far_ahead_reference_timeline_nsecs(0, None),
         6_000_000_000
     );
     assert_eq!(
-        scheduler.audio_far_ahead_reference_timeline_nsecs(7_000_000_000),
+        scheduler.audio_far_ahead_reference_timeline_nsecs(7_000_000_000, None),
         7_000_000_000
     );
 }
@@ -1330,7 +1472,7 @@ fn audio_far_ahead_reference_follows_rebuffer_resume_target_mid_playback() {
     // Playback started at 0:00; the far-ahead reference must follow the resume
     // target, not the session start position.
     assert_eq!(
-        scheduler.audio_far_ahead_reference_timeline_nsecs(0),
+        scheduler.audio_far_ahead_reference_timeline_nsecs(0, None),
         94_200_000_000
     );
 }
@@ -1345,7 +1487,7 @@ fn audio_far_ahead_reference_falls_back_to_anchor_without_video_queue() {
     });
 
     assert_eq!(
-        scheduler.audio_far_ahead_reference_timeline_nsecs(0),
+        scheduler.audio_far_ahead_reference_timeline_nsecs(0, None),
         93_834_465_103
     );
 }
@@ -1379,6 +1521,10 @@ fn rebuffer_audio_resume_waterline_without_video_queue_stops_filling() {
 fn output_resume_discard_removes_stale_pending_audio_before_anchor() {
     let mut scheduler = PlaybackOutputScheduler::new();
     scheduler.set_state(PlaybackOutputState::Rebuffering);
+    scheduler.set_video_output_rebuffer_anchor_for_test(RebufferResumeAnchor {
+        timeline_nsecs: 1_000_000_000,
+        reset_to_video_when_decoded_queue_misses_anchor: false,
+    });
     scheduler.push_decoded_video_for_test(test_queued_video_frame(1_000_000_000));
     scheduler.push_pending_start_audio_for_test(
         DecodedAudio {
@@ -1403,6 +1549,8 @@ fn output_resume_discard_removes_stale_pending_audio_before_anchor() {
             0,
             0,
             1_000_000_000,
+            44_100,
+            2,
             PlaybackSessionId(1),
         )
         .expect("output resume waterline");
@@ -1414,6 +1562,164 @@ fn output_resume_discard_removes_stale_pending_audio_before_anchor() {
     );
     assert!(waterline.ready);
     assert_eq!(waterline.decoded_audio_forward_nsecs, Some(1_000_000_000));
+}
+
+#[test]
+fn primed_maintenance_keeps_audio_at_immutable_165_279637171_transaction_target() {
+    const VIDEO_TARGET_NSECS: u64 = 165_266_666_667;
+    const AUDIO_TARGET_NSECS: u64 = 165_279_637_171;
+    const PRESENTED_QUEUE_FRONT_NSECS: u64 = 165_333_333_333;
+    let audio_coverage_nsecs = duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
+        + duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN);
+
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(VIDEO_TARGET_NSECS));
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(PRESENTED_QUEUE_FRONT_NSECS));
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 200_000],
+            duration_nsecs: audio_coverage_nsecs,
+        },
+        AUDIO_TARGET_NSECS,
+        AUDIO_TARGET_NSECS + audio_coverage_nsecs,
+    );
+    scheduler.begin_initial_av_start_transaction(
+        VIDEO_TARGET_NSECS,
+        AUDIO_TARGET_NSECS,
+        std::time::Instant::now(),
+    );
+    scheduler.mark_first_frame_presented();
+    scheduler.scheduled_video_queue.pop_front();
+
+    assert_eq!(
+        scheduler
+            .scheduled_video_queue
+            .range_nsecs()
+            .map(|range| range.0),
+        Some(PRESENTED_QUEUE_FRONT_NSECS)
+    );
+    assert_eq!(
+        scheduler
+            .pending_audio_retention_plan()
+            .map(|plan| plan.anchor_timeline_nsecs),
+        Some(AUDIO_TARGET_NSECS)
+    );
+
+    let waterline = scheduler
+        .discard_stale_pending_audio_before_output_resume(
+            Some(audio_snapshot(VIDEO_TARGET_NSECS, 0)),
+            0,
+            0,
+            VIDEO_TARGET_NSECS,
+            48_000,
+            2,
+            PlaybackSessionId(165),
+        )
+        .expect("primed transaction waterline");
+
+    assert_eq!(
+        scheduler.pending_start_audio.first_start_timeline_nsecs(),
+        Some(AUDIO_TARGET_NSECS)
+    );
+    assert_eq!(waterline.resume_timeline_nsecs, AUDIO_TARGET_NSECS);
+    assert!(scheduler.output_wait_audio_input_backpressured());
+}
+
+#[test]
+fn primed_transaction_rejects_a_trim_to_the_advanced_video_queue_front() {
+    const AUDIO_TARGET_NSECS: u64 = 165_279_637_171;
+    const ADVANCED_VIDEO_FRONT_NSECS: u64 = 165_333_333_333;
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 9_600],
+            duration_nsecs: 100_000_000,
+        },
+        AUDIO_TARGET_NSECS,
+        AUDIO_TARGET_NSECS + 100_000_000,
+    );
+    scheduler.begin_initial_av_start_transaction(
+        165_266_666_667,
+        AUDIO_TARGET_NSECS,
+        std::time::Instant::now(),
+    );
+
+    let dropped = scheduler.trim_pending_audio_to_retention_plan(
+        PendingAudioRetentionPlan {
+            anchor_timeline_nsecs: ADVANCED_VIDEO_FRONT_NSECS,
+            source: PendingAudioRetentionAnchorSource::UnpresentedVideo,
+        },
+        48_000,
+        2,
+        PlaybackSessionId(165),
+    );
+
+    assert_eq!(dropped, 0);
+    assert_eq!(
+        scheduler.pending_start_audio.first_start_timeline_nsecs(),
+        Some(AUDIO_TARGET_NSECS)
+    );
+}
+
+#[test]
+fn rebuffer_backpressure_uses_coverage_after_exact_resume_anchor() {
+    const ANCHOR_NSECS: u64 = 141_533_333_333;
+    const AUDIO_START_NSECS: u64 = 141_432_743_662;
+    const PENDING_NSECS: u64 = 905_578_206;
+    const EFFECTIVE_COVERAGE_NSECS: u64 = 804_988_535;
+
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Rebuffering);
+    scheduler.defer_next_pending_start_audio_flush_after_initial_start();
+    scheduler.set_video_output_rebuffer_anchor_for_test(RebufferResumeAnchor {
+        timeline_nsecs: ANCHOR_NSECS,
+        reset_to_video_when_decoded_queue_misses_anchor: false,
+    });
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(ANCHOR_NSECS));
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            // Enough 44.1-kHz stereo elements for the leading-frame trim.
+            samples: vec![0.0; 100_000],
+            duration_nsecs: PENDING_NSECS,
+        },
+        AUDIO_START_NSECS,
+        AUDIO_START_NSECS + PENDING_NSECS,
+    );
+
+    assert!(scheduler.pending_start_audio_backpressured());
+    let waterline = scheduler
+        .discard_stale_pending_audio_before_output_resume(
+            Some(audio_snapshot(ANCHOR_NSECS, 0)),
+            0,
+            0,
+            ANCHOR_NSECS,
+            44_100,
+            2,
+            PlaybackSessionId(1),
+        )
+        .expect("rebuffer audio waterline");
+
+    assert_eq!(
+        scheduler.pending_start_audio.first_start_timeline_nsecs(),
+        Some(ANCHOR_NSECS)
+    );
+    assert_eq!(
+        scheduler.pending_start_audio.buffered_duration().as_nanos(),
+        u128::from(EFFECTIVE_COVERAGE_NSECS)
+    );
+    assert_eq!(
+        waterline.decoded_audio_forward_nsecs,
+        Some(EFFECTIVE_COVERAGE_NSECS)
+    );
+    assert!(!waterline.ready);
+    assert!(waterline.below_target());
+    assert!(!scheduler.output_wait_audio_input_backpressured());
+    assert!(scheduler.audio_resume_waterline_below_input_suppression(
+        Some(audio_snapshot(ANCHOR_NSECS, 0)),
+        0,
+        0,
+        ANCHOR_NSECS,
+    ));
 }
 
 #[test]

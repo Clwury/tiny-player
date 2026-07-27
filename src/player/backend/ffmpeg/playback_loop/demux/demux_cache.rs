@@ -59,13 +59,13 @@ use model::CachedDemuxPacketRecovery;
 use model::{
     ArchivedStreamPruneCandidate, CachePauseRefresh, CacheStateEmit, CachedDemuxPacket,
     CachedSeekMiss, CachedSeekMissReason, DemuxCacheLockWait, DemuxCacheReportSnapshot,
-    DemuxCachedRange, DemuxCachedSeekHit, DemuxInputRateSample, DemuxPacketAppendOutcome,
-    DemuxPacketAppendTiming, DemuxPacketCacheThreadInput, DemuxPacketRangeView,
-    DemuxPacketReadSource, DemuxPacketTimeline, DemuxPacketTrimOutcome, DemuxSeekRequest,
-    DemuxSelectedStreams, DemuxStreamReaderRealignResult, InternalPacketTimestampHole, PacketId,
-    PreparedSeekableRangeReport, RangeId, SeekableRangeValidationStats, SeekableTimelineSummary,
-    StreamCacheRangeState, StreamForwardState, StreamForwardWindow, StreamRangeBoundary,
-    ordered_duration_seconds,
+    DemuxCachedRange, DemuxCachedSeekHit, DemuxCachedSeekPlan, DemuxInputRateSample,
+    DemuxPacketAppendOutcome, DemuxPacketAppendTiming, DemuxPacketCacheThreadInput,
+    DemuxPacketRangeView, DemuxPacketReadSource, DemuxPacketTimeline, DemuxPacketTrimOutcome,
+    DemuxSeekRequest, DemuxSelectedStreams, DemuxStreamReaderRealignResult,
+    InternalPacketTimestampHole, PacketId, PreparedSeekableRangeReport, RangeId,
+    SeekableRangeValidationStats, SeekableTimelineSummary, StreamCacheRangeState,
+    StreamForwardState, StreamForwardWindow, StreamRangeBoundary, ordered_duration_seconds,
 };
 pub(super) use model::{
     DemuxCachedSeekInfo, DemuxPacketCacheInput, DemuxReadResult, DemuxSeekResult,
@@ -102,6 +102,7 @@ struct DemuxPacketCacheShared {
     consumer_lock_pressure_until_nanos: AtomicU64,
     playback_recovery_critical: AtomicBool,
     playback_recovery_demand: AtomicU8,
+    output_backpressure_prefetch_paused: AtomicBool,
 }
 
 struct DemuxPacketCacheState {
@@ -148,6 +149,7 @@ struct DemuxPacketCacheState {
     append_trim_pending: bool,
     read_trim_pressure_packets: usize,
     reader_nsecs: u64,
+    exact_seek_target_nsecs: u64,
     session_id: PlaybackSessionId,
     seek_request: Option<DemuxSeekRequest>,
     demux_position_detached: bool,
@@ -169,6 +171,8 @@ struct DemuxPacketCacheState {
     last_emitted_seekability_revision: Option<u64>,
     cache_state_emit_dirty: bool,
     generation: u64,
+    producer_recovery_error: Option<String>,
+    producer_recovery_consecutive_errors: u32,
     error: Option<String>,
     shutdown: bool,
 }

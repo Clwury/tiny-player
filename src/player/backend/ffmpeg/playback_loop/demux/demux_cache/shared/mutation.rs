@@ -6,6 +6,39 @@ use super::{
 };
 
 impl DemuxPacketCacheShared {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn note_producer_recovering(
+        &self,
+        error: String,
+        consecutive_errors: u32,
+    ) -> (bool, u64) {
+        let mut guard = self
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        guard.producer_recovery_error = Some(error);
+        guard.producer_recovery_consecutive_errors = consecutive_errors;
+        let consumer_drainable = guard.consumer_drainable_packet_available();
+        let forward_duration_nsecs = guard.forward_duration_nsecs();
+        self.notify_ready();
+        (consumer_drainable, forward_duration_nsecs)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn clear_producer_recovery(
+        &self,
+    ) {
+        let mut guard = self
+            .state
+            .lock()
+            .expect("FFmpeg demux packet cache poisoned");
+        if guard.producer_recovery_error.take().is_none()
+            && guard.producer_recovery_consecutive_errors == 0
+        {
+            return;
+        }
+        guard.producer_recovery_consecutive_errors = 0;
+        self.notify_ready();
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn append_packet(
         &self,
         packet: CachedDemuxPacket,
@@ -35,7 +68,7 @@ impl DemuxPacketCacheShared {
             guard.mark_cache_state_emit_dirty();
         }
         let notify_started_at = Instant::now();
-        self.ready.notify_all();
+        self.notify_ready();
         append_outcome.timing.notify += notify_started_at.elapsed();
         append_outcome.timing.lock_hold += append_lock_hold_started_at.elapsed();
         drop(guard);
@@ -72,7 +105,7 @@ impl DemuxPacketCacheShared {
                                 self.refresh_monitor_snapshot(&guard);
                             }
                             let notify_started_at = Instant::now();
-                            self.ready.notify_all();
+                            self.notify_ready();
                             append_outcome.timing.notify += notify_started_at.elapsed();
                             append_outcome.timing.lock_hold +=
                                 maintenance_hold_started_at.elapsed();
@@ -124,7 +157,7 @@ impl DemuxPacketCacheShared {
             guard.mark_eof();
             self.refresh_cache_pause(&mut guard);
             let emit = self.prepare_cache_state_emit(&mut guard);
-            self.ready.notify_all();
+            self.notify_ready();
             emit
         };
         self.send_cache_state_emit(emit.into_emit());
@@ -139,6 +172,8 @@ impl DemuxPacketCacheShared {
                 .state
                 .lock()
                 .expect("FFmpeg demux packet cache poisoned");
+            guard.producer_recovery_error = None;
+            guard.producer_recovery_consecutive_errors = 0;
             guard.error = Some(error);
             guard.seeking = false;
             guard.cache_buffering_percent = None;
@@ -157,7 +192,7 @@ impl DemuxPacketCacheShared {
                 ));
             }
             let emit = self.prepare_cache_state_emit(&mut guard);
-            self.ready.notify_all();
+            self.notify_ready();
             emit
         };
         self.send_cache_state_emit(emit.into_emit());
@@ -191,7 +226,7 @@ impl DemuxPacketCacheShared {
             }
             (changed || had_percent).then(|| {
                 let emit = self.prepare_cache_state_emit(&mut guard);
-                self.ready.notify_all();
+                self.notify_ready();
                 emit
             })
         };

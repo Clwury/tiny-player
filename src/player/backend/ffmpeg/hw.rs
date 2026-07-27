@@ -7,10 +7,19 @@ use crate::player::render_host::{
 };
 use ffmpeg_sys_next as ffi;
 
-use super::ffmpeg_error;
+use super::{VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, ffmpeg_error};
 
 const TINY_HWDEC_ENV: &str = "TINY_HWDEC";
-const VULKAN_EXTRA_HW_FRAMES: c_int = 24;
+const TINY_VULKAN_EXTRA_HW_FRAMES_ENV: &str = "TINY_VULKAN_EXTRA_HW_FRAMES";
+const MPV_VULKAN_EXTRA_HW_FRAMES: c_int = 6;
+// mpv's six-frame default is sufficient for its demand-driven VO pipeline.
+// tiny retains hardware frames in its asynchronous scheduled queue, decoder
+// result queue, prepare worker, recovery staging, and VO queue. In particular,
+// a healthy 30 fps trace owned 33-35 frames at steady state and 41 during a
+// bounded recovery. Size the caller reserve from the scheduled queue's hard
+// limit so it cannot silently drift below tiny's normal external ownership.
+const TINY_VULKAN_EXTRA_HW_FRAMES: c_int = VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES as c_int;
+const TINY_VULKAN_EXTRA_HW_FRAMES_MAX: c_int = 64;
 const VK_QUEUE_GRAPHICS_BIT: u32 = 0x0000_0001;
 const VK_QUEUE_COMPUTE_BIT: u32 = 0x0000_0002;
 const VK_QUEUE_TRANSFER_BIT: u32 = 0x0000_0004;
@@ -71,7 +80,7 @@ impl VideoHwDecodeContext {
         };
         if result < 0 {
             return Err(format!(
-                "FFmpeg 创建 Vulkan 硬解设备失败：{}",
+                "FFmpeg 创建 Vulkan 硬解设备失败：code={result}, error={}",
                 ffmpeg_error(result)
             ));
         }
@@ -107,11 +116,54 @@ impl VideoHwDecodeContext {
         if device_ref.is_null() {
             return Err("FFmpeg 复制 Vulkan 硬解设备引用失败".to_string());
         }
+        let decoder_threads = unsafe { (*context).thread_count };
+        let requested_extra_hw_frames =
+            configured_vulkan_extra_hw_frames().unwrap_or(TINY_VULKAN_EXTRA_HW_FRAMES);
         unsafe {
             (*context).hw_device_ctx = device_ref;
-            (*context).extra_hw_frames = (*context).extra_hw_frames.max(VULKAN_EXTRA_HW_FRAMES);
+            (*context).extra_hw_frames = (*context).extra_hw_frames.max(requested_extra_hw_frames);
         }
+        tracing::debug!(
+            decoder_threads,
+            mpv_extra_hw_frames = MPV_VULKAN_EXTRA_HW_FRAMES,
+            tiny_extra_hw_frames = TINY_VULKAN_EXTRA_HW_FRAMES,
+            requested_extra_hw_frames,
+            extra_hw_frames = unsafe { (*context).extra_hw_frames },
+            "configured Vulkan decode surface reserve for asynchronous output ownership"
+        );
         Ok(())
+    }
+}
+
+fn parse_vulkan_extra_hw_frames(value: &str) -> Option<Option<c_int>> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return Some(None);
+    }
+    value
+        .parse::<c_int>()
+        .ok()
+        .filter(|frames| {
+            (MPV_VULKAN_EXTRA_HW_FRAMES..=TINY_VULKAN_EXTRA_HW_FRAMES_MAX).contains(frames)
+        })
+        .map(Some)
+}
+
+fn configured_vulkan_extra_hw_frames() -> Option<c_int> {
+    let Ok(value) = env::var(TINY_VULKAN_EXTRA_HW_FRAMES_ENV) else {
+        return None;
+    };
+    match parse_vulkan_extra_hw_frames(&value) {
+        Some(frames) => frames,
+        None => {
+            tracing::warn!(
+                value,
+                min_frames = MPV_VULKAN_EXTRA_HW_FRAMES,
+                max_frames = TINY_VULKAN_EXTRA_HW_FRAMES_MAX,
+                "ignored invalid TINY_VULKAN_EXTRA_HW_FRAMES; using default surface reserve"
+            );
+            None
+        }
     }
 }
 
@@ -297,8 +349,9 @@ pub(super) fn vulkan_frame_planes(
 #[cfg(test)]
 mod tests {
     use super::{
-        HardwareDecodeMode, VK_QUEUE_GRAPHICS_BIT, VK_QUEUE_TRANSFER_BIT, VulkanDecodeQueue,
-        find_queue, vulkan_ffi,
+        HardwareDecodeMode, TINY_VULKAN_EXTRA_HW_FRAMES, VK_QUEUE_GRAPHICS_BIT,
+        VK_QUEUE_TRANSFER_BIT, VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VulkanDecodeQueue,
+        find_queue, parse_vulkan_extra_hw_frames, vulkan_ffi,
     };
 
     #[test]
@@ -353,6 +406,25 @@ mod tests {
         assert!(HardwareDecodeMode::Auto.allows_fallback());
         assert!(HardwareDecodeMode::ForceVulkan.should_try_vulkan());
         assert!(!HardwareDecodeMode::ForceVulkan.allows_fallback());
+    }
+
+    #[test]
+    fn vulkan_surface_reserve_covers_tiny_async_output_ownership() {
+        assert_eq!(TINY_VULKAN_EXTRA_HW_FRAMES, 48);
+        assert_eq!(
+            TINY_VULKAN_EXTRA_HW_FRAMES as usize,
+            VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES
+        );
+    }
+
+    #[test]
+    fn vulkan_surface_reserve_override_is_bounded() {
+        assert_eq!(parse_vulkan_extra_hw_frames("auto"), Some(None));
+        assert_eq!(parse_vulkan_extra_hw_frames("6"), Some(Some(6)));
+        assert_eq!(parse_vulkan_extra_hw_frames("48"), Some(Some(48)));
+        assert_eq!(parse_vulkan_extra_hw_frames("64"), Some(Some(64)));
+        assert_eq!(parse_vulkan_extra_hw_frames("5"), None);
+        assert_eq!(parse_vulkan_extra_hw_frames("65"), None);
     }
 
     #[test]

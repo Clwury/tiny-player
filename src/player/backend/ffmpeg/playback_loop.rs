@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::AudioOutputUnstableSnapshot;
 use super::{
     AUDIO_CLOCK_VIDEO_PRESENT_LEAD, AUDIO_DECODE_QUEUE_LIMIT_DURATION, AUDIO_OUTPUT_DELAY_LIMIT,
     AUDIO_OUTPUT_QUEUE_LIMIT_DURATION, AUDIO_OUTPUT_STEADY_TARGET_DURATION,
@@ -6,41 +8,42 @@ use super::{
     AUDIO_REBUFFER_LOOP_DETECTION_WINDOW, AUDIO_REBUFFER_PREFILL_LOOP_TARGET,
     AUDIO_REBUFFER_PREFILL_TARGET, AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN,
     AUDIO_VIDEO_QUEUE_LIMIT_DURATION, AUDIO_VIDEO_QUEUE_TARGET_DURATION,
-    AUDIO_VIDEO_REBUFFER_DRIFT_RESET_THRESHOLD, AudioClockMode, AudioOutput,
-    AudioOutputDrainStatus, AudioOutputPushResult, AudioOutputSnapshot, AudioResampler, AvFrame,
-    AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, BufferedReporter,
-    DECODE_PACKET_SLOW_LOG_AFTER, DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER,
-    DEFAULT_VIDEO_FRAME_DURATION_NSECS, DEMUX_CACHE_LOCK_TIMING_LOG_AFTER,
-    DEMUX_PACKET_CACHE_LOCK_WAIT, DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_AFTER,
-    DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL, DEMUX_PACKET_CACHE_STALL_LOG_AFTER,
-    DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL, DEMUX_PACKET_CACHE_WAIT_INTERVAL,
-    DEMUX_PUMP_TIMING_LOG_INTERVAL, DEMUX_READ_WAIT_LOG_AFTER, DecodedAudio, DecodedSubtitleCue,
-    Decoder, DoviPipeline, FFMPEG_FRAME_COUNT, FfmpegCommand, FfmpegControl, FfmpegPlaybackInput,
-    FormatContext, HardwareDecodeMode, HttpRingCache, InputProbeProfile, LATE_VIDEO_DROP_TOLERANCE,
-    OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, PENDING_AUDIO_CONTINUITY_TOLERANCE,
-    PENDING_START_AUDIO_BACKPRESSURE_DURATION, PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER,
-    PLAYBACK_COORDINATOR_TICK_TIMING_LOG_AFTER, PLAYING_PENDING_AUDIO_FORCE_RECOVERY_DURATION,
-    PLAYING_PENDING_AUDIO_HARD_RESET_DURATION, PgsFrameMergeBitstreamFilter, PlaybackScheduler,
-    PositionReporter, QueuedVideoFrame, SCHEDULER_POLL_INTERVAL, StreamInfo, TimestampMapper,
+    AUDIO_VIDEO_REBUFFER_DRIFT_RESET_THRESHOLD, AudioClockHandle, AudioClockMode, AudioOutput,
+    AudioOutputActivitySnapshot, AudioOutputDrainStatus, AudioOutputLifecycle,
+    AudioOutputPushResult, AudioOutputServiceStage, AudioOutputSnapshot, AudioOutputStableSnapshot,
+    AudioResampler, AudioStagedFrame, AvFrame, AvPacket, AvPacketReadDiagnostic,
+    AvPacketStorageKind, BufferedReporter, DECODE_PACKET_SLOW_LOG_AFTER,
+    DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER, DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+    DEMUX_CACHE_LOCK_TIMING_LOG_AFTER, DEMUX_PACKET_CACHE_LOCK_WAIT,
+    DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_AFTER, DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
+    DEMUX_PACKET_CACHE_STALL_LOG_AFTER, DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL,
+    DEMUX_PACKET_CACHE_WAIT_INTERVAL, DEMUX_PUMP_TIMING_LOG_INTERVAL, DEMUX_READ_WAIT_LOG_AFTER,
+    DecodedAudio, DecodedSubtitleCue, Decoder, DoviPipeline, FFMPEG_FRAME_COUNT, FfmpegCommand,
+    FfmpegControl, FfmpegPlaybackInput, FormatContext, HardwareDecodeMode, HttpRingCache,
+    InputProbeProfile, LATE_VIDEO_DROP_TOLERANCE, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER,
+    PENDING_AUDIO_CONTINUITY_TOLERANCE, PENDING_START_AUDIO_BACKPRESSURE_DURATION,
+    PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER, PLAYBACK_COORDINATOR_TICK_TIMING_LOG_AFTER,
+    PLAYING_PENDING_AUDIO_FORCE_RECOVERY_DURATION, PLAYING_PENDING_AUDIO_HARD_RESET_DURATION,
+    PgsFrameMergeBitstreamFilter, PlaybackScheduler, PositionReporter, QueuedVideoFrame,
+    SCHEDULER_POLL_INTERVAL, StreamInfo, TimestampMapper,
     VIDEO_DECODE_SKIP_NONREF_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER,
     VIDEO_OUTPUT_REBUFFER_ENTER_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
     VIDEO_OUTPUT_REBUFFER_MIN_STABLE_RESUME_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
     VIDEO_OUTPUT_REBUFFER_STALLED_FALLBACK_AFTER, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE,
-    VIDEO_OUTPUT_START_FAST_READY_DURATION, VIDEO_OUTPUT_START_FIRST_FRAME_FALLBACK_AFTER,
-    VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER, VIDEO_OUTPUT_START_PREBUFFER_DURATION,
-    VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, VIDEO_OUTPUT_UNDERRUN_FAST_RECOVERY_AFTER,
+    VIDEO_OUTPUT_START_FAST_READY_DURATION, VIDEO_OUTPUT_START_FIRST_FRAME_STALL_LOG_AFTER,
+    VIDEO_OUTPUT_START_PREBUFFER_DURATION, VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER,
     VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VULKAN_VIDEO_OUTPUT_RESOURCE_PRESSURE_FRAMES,
     VideoFrameConvertContext, VideoFrameConverter, VideoRecoveryPointKind,
     WORKER_CHANNEL_RECV_WAIT_LOG_AFTER, WORKER_CHANNEL_SEND_WAIT_LOG_AFTER,
     align_audio_elements_to_frame_boundary, audio_codec_requires_recovery_point,
     audio_elements_for_duration_floor, audio_elements_for_frames, audio_frames_for_duration_round,
-    coalesce_playback_seek_commands, decoded_subrip_packet_cue, drain_playback_commands,
-    duration_nsecs, ffmpeg_error, frame_best_effort_timestamp, frame_decode_error_flags,
-    frame_is_corrupt, load_external_subtitle_cues, nsecs_to_seconds,
-    optional_buffered_value_changed, packet_is_audio_recovery_point,
-    packet_is_video_recovery_point, packet_is_video_seek_point, packet_video_recovery_point_kind,
-    queued_video_duration, queued_video_frames_have_vulkan, queued_video_limit_duration,
-    queued_video_target_duration, seconds_to_nsecs, timestamp_to_nsecs,
+    decoded_subrip_packet_cue, drain_playback_commands, duration_nsecs, ffmpeg_error,
+    frame_best_effort_timestamp, frame_decode_error_flags, frame_is_corrupt,
+    load_external_subtitle_cues, nsecs_to_seconds, optional_buffered_value_changed,
+    packet_is_audio_recovery_point, packet_is_video_recovery_point, packet_is_video_seek_point,
+    packet_video_recovery_point_kind, queued_video_duration, queued_video_frames_have_vulkan,
+    queued_video_limit_duration, queued_video_target_duration, seconds_to_nsecs,
+    timestamp_to_nsecs,
 };
 #[cfg(test)]
 use super::{
@@ -129,6 +132,8 @@ mod subtitles;
 mod decoded_video_frame;
 #[path = "playback_loop/video/scheduled_video_queue.rs"]
 mod scheduled_video_queue;
+#[path = "playback_loop/video/video_deadline_service.rs"]
+mod video_deadline_service;
 #[path = "playback_loop/video/video_decode_drain_frame_processor.rs"]
 mod video_decode_drain_frame_processor;
 #[path = "playback_loop/video/video_decode_pipeline.rs"]
@@ -165,7 +170,7 @@ use coordinator_commands::{
 use coordinator_drain::{
     PlaybackEofDrainContext, PlaybackEofDrainStatus, service_playback_eof_drain,
 };
-use coordinator_gate::PlaybackCoordinatorGateContext;
+use coordinator_gate::{PlaybackCoordinatorGateContext, PlaybackCoordinatorGateStatus};
 use coordinator_tick::{
     PlaybackRecoveryRequest, PlaybackRecoverySource, PlaybackTickContext, PlaybackTickStatus,
     service_hevc_startup_stall_watchdog_if_due, service_playback_tick,
@@ -187,8 +192,12 @@ use input::{
 };
 use media_info::{playback_audio_info_from_stream, playback_video_info_from_worker};
 pub(super) use output_gate::{
-    AudioRealignCoverage, PlaybackOutputScheduler, PlaybackOutputSnapshot,
-    RebufferAudioRealignRequest,
+    AudioRealignCoverage, OutputServiceDemand, PlaybackOutputScheduler, PlaybackOutputSnapshot,
+    RebufferAudioRealignRequest, expire_initial_av_start_hard_deadline,
+};
+use output_gate::{
+    DecodedAudioAdmission, PrestartAudioOwnership, PrestartAudioOwnershipInput,
+    classify_prestart_audio_ownership,
 };
 #[cfg(test)]
 pub(super) use output_rebuffer::{
@@ -240,6 +249,7 @@ pub(super) use subtitle_timeline::{
 };
 use subtitles::{SubtitleDecodeContext, SubtitlePipeline};
 use timeline::reset_playback_timeline_state;
+use video_deadline_service::VideoDeadlineService;
 use video_decode_pipeline::VideoDecodePipeline;
 pub(super) use video_decode_pipeline::VideoDecodeRecovery;
 #[cfg(test)]

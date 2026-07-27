@@ -1,9 +1,14 @@
-use std::sync::{atomic::AtomicBool, mpsc::Sender};
+use std::{
+    sync::{atomic::AtomicBool, mpsc::Sender},
+    time::Instant,
+};
 
 use crate::player::{
     backend::BackendEvent,
     render_host::{PlaybackSessionId, VideoOutputQueue},
 };
+
+use crate::player::backend::ffmpeg::playback_loop::output_gate::DecodeRecoveryPhase;
 
 use super::video_frame_prepare_worker::PreparedVideoFrame;
 use super::video_output_gate::{
@@ -12,7 +17,7 @@ use super::video_output_gate::{
 };
 use super::{
     AudioOutput, BufferedReporter, DemuxReaderWatermark, FfmpegControl, PlaybackOutputScheduler,
-    PlaybackScheduler, PositionReporter, SubtitlePipeline,
+    PlaybackScheduler, PositionReporter, QueuedVideoFrame, SubtitlePipeline,
 };
 
 pub(super) fn admit_prepared_video_frame<F>(
@@ -38,6 +43,49 @@ where
         context.audio_output.is_some(),
         context.output_scheduler,
     );
+    if context
+        .output_scheduler
+        .decode_recovery_owns_video_admission()
+    {
+        let recovery_now = Instant::now();
+        context.output_scheduler.check_decode_recovery_deadline(
+            recovery_now,
+            context.control,
+            context.session_id,
+        )?;
+        let recovery_audio_snapshot = context
+            .audio_output
+            .and_then(|output| output.snapshot().ok());
+        let recovery_media_clock_nsecs = recovery_audio_snapshot
+            .map(|snapshot| snapshot.played_timeline_nsecs)
+            .unwrap_or_else(|| context.scheduler.current_timeline_nsecs());
+        let _ = context
+            .output_scheduler
+            .maybe_enter_decode_recovery_barrier(
+                recovery_now,
+                recovery_media_clock_nsecs,
+                context.control,
+                context.session_id,
+            );
+        let staged = context.output_scheduler.stage_decode_recovery_frame(
+            QueuedVideoFrame {
+                frame,
+                timeline_nsecs,
+                duration_nsecs,
+            },
+            context.vo_queue.snapshot().queue_capacity,
+            context.session_id,
+        );
+        debug_assert!(
+            staged
+                || matches!(
+                    context.output_scheduler.decode_recovery_phase(),
+                    Some(DecodeRecoveryPhase::DroppedForFallback)
+                        | Some(DecodeRecoveryPhase::Failed)
+                )
+        );
+        return Ok(());
+    }
     if let Some(output) = context.audio_output {
         if service_audio_clocked_decoded_video_frame(
             context.output_scheduler,
@@ -171,9 +219,59 @@ pub(super) fn admit_drained_prepared_video_frame(
         context.audio_output.is_some(),
         context.output_scheduler,
     );
+    let PreparedVideoFrame {
+        frame,
+        timeline_nsecs,
+        duration_nsecs,
+        ..
+    } = context.prepared_frame;
+    if context
+        .output_scheduler
+        .decode_recovery_owns_video_admission()
+    {
+        let recovery_now = Instant::now();
+        context.output_scheduler.check_decode_recovery_deadline(
+            recovery_now,
+            context.control,
+            context.session_id,
+        )?;
+        let recovery_audio_snapshot = context
+            .audio_output
+            .and_then(|output| output.snapshot().ok());
+        let recovery_media_clock_nsecs = recovery_audio_snapshot
+            .map(|snapshot| snapshot.played_timeline_nsecs)
+            .unwrap_or_else(|| context.scheduler.current_timeline_nsecs());
+        let _ = context
+            .output_scheduler
+            .maybe_enter_decode_recovery_barrier(
+                recovery_now,
+                recovery_media_clock_nsecs,
+                context.control,
+                context.session_id,
+            );
+        let staged = context.output_scheduler.stage_decode_recovery_frame(
+            QueuedVideoFrame {
+                frame,
+                timeline_nsecs,
+                duration_nsecs,
+            },
+            context.vo_queue.snapshot().queue_capacity,
+            context.session_id,
+        );
+        debug_assert!(
+            staged
+                || matches!(
+                    context.output_scheduler.decode_recovery_phase(),
+                    Some(DecodeRecoveryPhase::DroppedForFallback)
+                        | Some(DecodeRecoveryPhase::Failed)
+                )
+        );
+        return Ok(());
+    }
     if let Some(output) = context.audio_output {
         let _ = service_audio_clocked_drain_decoded_video_frame(
             context.output_scheduler,
+            context.scheduler,
             output,
             context.control,
             context.session_id,
@@ -183,7 +281,7 @@ pub(super) fn admit_drained_prepared_video_frame(
             context.event_tx,
             context.subtitle_pipeline,
             context.buffered_reporter,
-            context.prepared_frame.frame,
+            frame,
             timeline_nsecs,
             duration_nsecs,
         )?;
@@ -199,7 +297,7 @@ pub(super) fn admit_drained_prepared_video_frame(
             context.event_tx,
             context.subtitle_pipeline,
             context.buffered_reporter,
-            context.prepared_frame.frame,
+            frame,
             timeline_nsecs,
             duration_nsecs,
             context.current_start_position_nsecs,

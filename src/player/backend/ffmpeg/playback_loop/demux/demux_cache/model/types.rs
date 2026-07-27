@@ -74,6 +74,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop) enum DemuxSeekResult {
     Cached(DemuxCachedSeekInfo),
     Requested,
     Unavailable,
+    Superseded,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

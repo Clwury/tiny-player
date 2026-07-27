@@ -8,10 +8,7 @@ use super::{
     DemuxPacketRangeView, PacketId,
 };
 
-// Diagnostic-only tolerance for independently rescaled packet start/end
-// values. Packet coverage never controls authoritative OSC seekable ranges.
-pub(super) const DEMUX_PACKET_TIMESTAMP_ROUNDING_TOLERANCE_NSECS: u64 = 10;
-
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CachedSeekTimelineBounds {
     first_cached_nsecs: u64,
@@ -20,17 +17,7 @@ struct CachedSeekTimelineBounds {
     is_eof: bool,
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct CachedSeekPacketRangeContext<'a> {
-    pub(super) packets: &'a HashMap<u64, CachedDemuxPacket>,
-    pub(super) range_id: super::RangeId,
-    pub(super) timeline_anchor_stream_index: c_int,
-    pub(super) cached_seek_preroll_nsecs: u64,
-    pub(super) recovery_point_stream_index: Option<c_int>,
-    pub(super) required_stream_indices: &'a [c_int],
-    pub(super) range: DemuxPacketRangeView<'a>,
-}
-
+#[cfg(test)]
 fn cached_seek_target_in_bounds(
     bounds: CachedSeekTimelineBounds,
     target_nsecs: u64,
@@ -41,6 +28,34 @@ fn cached_seek_target_in_bounds(
         return None;
     }
     Some(target_nsecs.clamp(bounds.first_cached_nsecs, bounds.buffered_until_nsecs))
+}
+
+// Diagnostic-only tolerance for independently rescaled packet start/end
+// values. Packet coverage never controls authoritative OSC seekable ranges.
+pub(super) const DEMUX_PACKET_TIMESTAMP_ROUNDING_TOLERANCE_NSECS: u64 = 10;
+
+#[derive(Clone, Copy)]
+pub(super) struct CachedSeekPacketRangeContext<'a> {
+    pub(super) packets: &'a HashMap<u64, CachedDemuxPacket>,
+    pub(super) range_id: super::RangeId,
+    pub(super) timeline_anchor_stream_index: c_int,
+    pub(super) cached_seek_preroll_nsecs: u64,
+    pub(super) recovery_point_stream_index: Option<c_int>,
+    pub(super) required_stream_indices: &'a [c_int],
+    pub(super) stream_pts_index: &'a BTreeMap<c_int, BTreeMap<(u64, PacketId), PacketId>>,
+    pub(super) stream_recovery_point_index:
+        &'a BTreeMap<c_int, BTreeMap<(u64, PacketId), PacketId>>,
+    pub(super) buffered_until_nsecs: u64,
+    pub(super) range: DemuxPacketRangeView<'a>,
+}
+
+struct StreamSeekTargetContext<'a> {
+    packets: &'a HashMap<u64, CachedDemuxPacket>,
+    timeline_anchor_stream_index: c_int,
+    stream_index: c_int,
+    queue: &'a VecDeque<PacketId>,
+    pts_index: Option<&'a BTreeMap<(u64, PacketId), PacketId>>,
+    recovery_point_index: Option<&'a BTreeMap<(u64, PacketId), PacketId>>,
 }
 
 impl DemuxPacketCacheState {
@@ -55,48 +70,36 @@ impl DemuxPacketCacheState {
             cached_seek_preroll_nsecs,
             recovery_point_stream_index,
             required_stream_indices,
+            stream_pts_index,
+            stream_recovery_point_index,
+            buffered_until_nsecs,
             range,
             ..
         } = context;
-        let (first_cached_nsecs, buffered_until_nsecs) =
-            Self::cached_timeline_range_in_packet_range(
-                packets,
-                timeline_anchor_stream_index,
-                range.stream_queues,
-            )
-            .ok_or(CachedSeekMissReason::MissingPrerollAnchor)?;
-        let seek_target_nsecs = cached_seek_target_in_bounds(
-            CachedSeekTimelineBounds {
-                first_cached_nsecs,
-                buffered_until_nsecs,
-                is_bof: range.is_bof,
-                is_eof: range.is_eof,
-            },
-            target_nsecs,
-        )
-        .ok_or(CachedSeekMissReason::TargetOutsideRange)?;
+        let seek_target_nsecs = target_nsecs;
 
         let anchor_search_nsecs = seek_target_nsecs.saturating_sub(cached_seek_preroll_nsecs);
-        let mut recovery_anchor_packet_id = None;
-        let mut safe_anchor_packet_id = None;
-        for packet_id in Self::timeline_anchor_packet_ids_in_packet_range(
+        let anchor_queue = range
+            .stream_queues
+            .get(&timeline_anchor_stream_index)
+            .ok_or(CachedSeekMissReason::MissingPrerollAnchor)?;
+        let recovery_index = stream_recovery_point_index
+            .get(&timeline_anchor_stream_index)
+            .ok_or(CachedSeekMissReason::MissingPrerollAnchor)?;
+        let recovery_anchor_packet_id = Self::latest_indexed_packet_at_or_before(
             packets,
-            timeline_anchor_stream_index,
-            range.stream_queues,
-        ) {
-            let packet = packets
-                .get(&packet_id)
-                .ok_or(CachedSeekMissReason::AnchorTrimmed)?;
-            let Some(start_nsecs) = packet.seek_timestamp_nsecs else {
-                continue;
-            };
-            if packet.recovery_point && start_nsecs <= anchor_search_nsecs {
-                recovery_anchor_packet_id = Some(packet_id);
-                if packet.safe_seek_point {
-                    safe_anchor_packet_id = Some(packet_id);
-                }
-            }
-        }
+            recovery_index,
+            anchor_queue,
+            anchor_search_nsecs,
+            |_| true,
+        );
+        let safe_anchor_packet_id = Self::latest_indexed_packet_at_or_before(
+            packets,
+            recovery_index,
+            anchor_queue,
+            anchor_search_nsecs,
+            |packet| packet.safe_seek_point,
+        );
         // IDR/BLA are closed-GOP safe points and remain preferred. CRA is a
         // cached-seek-only fallback when the closed seekable interval proves
         // that all required preroll packets are resident.
@@ -120,10 +123,14 @@ impl DemuxPacketCacheState {
                 Some(anchor_packet_id)
             } else {
                 Self::find_stream_seek_target_in_packet_queue(
-                    packets,
-                    timeline_anchor_stream_index,
-                    *stream_index,
-                    queue,
+                    StreamSeekTargetContext {
+                        packets,
+                        timeline_anchor_stream_index,
+                        stream_index: *stream_index,
+                        queue,
+                        pts_index: stream_pts_index.get(stream_index),
+                        recovery_point_index: stream_recovery_point_index.get(stream_index),
+                    },
                     anchor_seek_target_nsecs,
                     recovery_point_stream_index == Some(*stream_index),
                     range.subtitle_stream_index == Some(*stream_index),
@@ -165,14 +172,55 @@ impl DemuxPacketCacheState {
     }
 
     fn find_stream_seek_target_in_packet_queue(
-        packets: &HashMap<u64, CachedDemuxPacket>,
-        timeline_anchor_stream_index: c_int,
-        stream_index: c_int,
-        queue: &VecDeque<u64>,
+        context: StreamSeekTargetContext<'_>,
         target_nsecs: u64,
         require_recovery_point: bool,
         prefer_first_packet_at_timestamp: bool,
     ) -> Option<PacketId> {
+        let StreamSeekTargetContext {
+            packets,
+            timeline_anchor_stream_index,
+            stream_index,
+            queue,
+            pts_index,
+            recovery_point_index,
+        } = context;
+        let index = if require_recovery_point {
+            recovery_point_index
+        } else {
+            pts_index
+        };
+        if let Some(index) = index {
+            let selected = Self::latest_indexed_packet_at_or_before(
+                packets,
+                index,
+                queue,
+                target_nsecs,
+                |packet| {
+                    Self::packet_is_stream_seek_boundary_for(
+                        timeline_anchor_stream_index,
+                        stream_index,
+                        packet,
+                        require_recovery_point,
+                    )
+                },
+            );
+            if let Some(packet_id) = selected {
+                if !prefer_first_packet_at_timestamp {
+                    return Some(packet_id);
+                }
+                let timestamp = packets.get(&packet_id)?.seek_timestamp_nsecs?;
+                return index
+                    .range((timestamp, 0)..=(timestamp, PacketId::MAX))
+                    .find_map(|(_, packet_id)| {
+                        Self::packet_id_in_stream_queue(queue, *packet_id).then_some(*packet_id)
+                    });
+            }
+        }
+
+        // Compatibility fallback for ranges restored by older cache state or
+        // deliberately hand-built tests. Runtime appends always populate the
+        // ordered indices above.
         let mut target = None;
         let mut target_start_nsecs = None;
         for packet_id in queue {
@@ -200,6 +248,43 @@ impl DemuxPacketCacheState {
             target_start_nsecs = Some(start_nsecs);
         }
         target
+    }
+
+    fn latest_indexed_packet_at_or_before(
+        packets: &HashMap<u64, CachedDemuxPacket>,
+        index: &BTreeMap<(u64, PacketId), PacketId>,
+        queue: &VecDeque<PacketId>,
+        target_nsecs: u64,
+        mut predicate: impl FnMut(&CachedDemuxPacket) -> bool,
+    ) -> Option<PacketId> {
+        index
+            .range(..=(target_nsecs, PacketId::MAX))
+            .rev()
+            .find_map(|(_, packet_id)| {
+                if !Self::packet_id_in_stream_queue(queue, *packet_id) {
+                    return None;
+                }
+                let packet = packets.get(packet_id)?;
+                predicate(packet).then_some(*packet_id)
+            })
+    }
+
+    fn packet_id_in_stream_queue(queue: &VecDeque<PacketId>, packet_id: PacketId) -> bool {
+        let mut left = 0usize;
+        let mut right = queue.len();
+        while left < right {
+            let middle = left + (right - left) / 2;
+            let current = queue
+                .get(middle)
+                .copied()
+                .expect("binary-search index stays inside stream queue");
+            match current.cmp(&packet_id) {
+                std::cmp::Ordering::Less => left = middle + 1,
+                std::cmp::Ordering::Greater => right = middle,
+                std::cmp::Ordering::Equal => return true,
+            }
+        }
+        false
     }
 
     fn timeline_anchor_packet_ids_in_packet_range<'a>(

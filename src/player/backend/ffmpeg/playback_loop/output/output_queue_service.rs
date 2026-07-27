@@ -26,16 +26,17 @@ impl OutputQueueService {
     pub(super) fn before_decoder_input(
         &mut self,
         context: OutputQueueServiceContext<'_>,
-    ) -> std::result::Result<OutputQueueServiceStatus, String> {
+    ) -> std::result::Result<OutputQueueServiceResult, String> {
         let session_id = context.session_id;
         let started_at = Instant::now();
         let result = service_output_queues_before_decoder_input(context);
-        if let Ok(status) = result.as_ref() {
+        if let Ok(result) = result.as_ref() {
             log_output_queue_service_timing(
                 session_id,
                 "before_decoder_input",
                 started_at.elapsed(),
-                Some(*status),
+                Some(result.status),
+                result.planned_wait,
             );
         }
         result
@@ -54,6 +55,7 @@ impl OutputQueueService {
                 "after_decoder_input",
                 started_at.elapsed(),
                 None,
+                Duration::ZERO,
             );
         }
         result
@@ -62,16 +64,17 @@ impl OutputQueueService {
     pub(super) fn after_decoder_input_backpressure_or_wait(
         &mut self,
         context: OutputQueueServiceContext<'_>,
-    ) -> std::result::Result<OutputQueueServiceStatus, String> {
+    ) -> std::result::Result<OutputQueueServiceResult, String> {
         let session_id = context.session_id;
         let started_at = Instant::now();
         let result = service_output_queues_after_decoder_input_backpressure_or_wait(context);
-        if let Ok(status) = result.as_ref() {
+        if let Ok(result) = result.as_ref() {
             log_output_queue_service_timing(
                 session_id,
                 "after_decoder_input_backpressure_or_wait",
                 started_at.elapsed(),
-                Some(*status),
+                Some(result.status),
+                result.planned_wait,
             );
         }
         result
@@ -80,16 +83,17 @@ impl OutputQueueService {
     pub(super) fn after_demux_would_block_or_wait(
         &mut self,
         context: OutputQueueServiceContext<'_>,
-    ) -> std::result::Result<OutputQueueServiceStatus, String> {
+    ) -> std::result::Result<OutputQueueServiceResult, String> {
         let session_id = context.session_id;
         let started_at = Instant::now();
         let result = service_output_queues_after_demux_would_block_or_wait(context);
-        if let Ok(status) = result.as_ref() {
+        if let Ok(result) = result.as_ref() {
             log_output_queue_service_timing(
                 session_id,
                 "after_demux_would_block_or_wait",
                 started_at.elapsed(),
-                Some(*status),
+                Some(result.status),
+                result.planned_wait,
             );
         }
         result
@@ -100,6 +104,18 @@ impl OutputQueueService {
 pub(super) enum OutputQueueServiceStatus {
     Idle,
     Continue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OutputQueueServiceResult {
+    pub(super) status: OutputQueueServiceStatus,
+    pub(super) planned_wait: Duration,
+}
+
+impl OutputQueueServiceResult {
+    pub(super) fn should_continue(self) -> bool {
+        self.status.should_continue()
+    }
 }
 
 impl OutputQueueServiceStatus {
@@ -131,7 +147,7 @@ pub(super) struct OutputQueueAfterDecoderInputContext<'a> {
 
 fn service_output_queues_before_decoder_input(
     mut context: OutputQueueServiceContext<'_>,
-) -> std::result::Result<OutputQueueServiceStatus, String> {
+) -> std::result::Result<OutputQueueServiceResult, String> {
     service_audio_clocked_video_queue_if_playing(
         context.pipeline.audio_output.as_ref(),
         context.control,
@@ -145,7 +161,13 @@ fn service_output_queues_before_decoder_input(
         &mut context.pipeline.buffered_reporter,
     )?;
 
-    let audio_clock = audio_clock_availability(context.pipeline.audio_output.as_ref())?;
+    let audio_clock = audio_clock_availability(
+        context.pipeline.audio_output.as_ref(),
+        context
+            .pipeline
+            .output_scheduler
+            .audio_output_clock_stall_fallback_active(),
+    )?;
     if service_video_clocked_video_queue_if_audio_clock_unavailable(
         &context.pipeline.scheduler,
         context.control,
@@ -160,7 +182,10 @@ fn service_output_queues_before_decoder_input(
         &mut context.pipeline.buffered_reporter,
     ) {
         if context.control.has_pending_seek() {
-            return Ok(OutputQueueServiceStatus::Continue);
+            return Ok(OutputQueueServiceResult {
+                status: OutputQueueServiceStatus::Continue,
+                planned_wait: Duration::ZERO,
+            });
         }
         if context
             .pipeline
@@ -169,12 +194,19 @@ fn service_output_queues_before_decoder_input(
                 context.pipeline.subtitle_pipeline.needs_prefetch(),
             )
         {
-            wait_after_output_queue_stall(&mut context, "scheduled_video_queue_limit");
-            return Ok(OutputQueueServiceStatus::Continue);
+            let planned_wait =
+                wait_after_output_queue_stall(&mut context, "scheduled_video_queue_limit");
+            return Ok(OutputQueueServiceResult {
+                status: OutputQueueServiceStatus::Continue,
+                planned_wait,
+            });
         }
     }
 
-    Ok(OutputQueueServiceStatus::Idle)
+    Ok(OutputQueueServiceResult {
+        status: OutputQueueServiceStatus::Idle,
+        planned_wait: Duration::ZERO,
+    })
 }
 
 fn service_output_queues_after_decoder_input(
@@ -197,9 +229,15 @@ fn service_output_queues_after_decoder_input(
 
 fn service_output_queues_after_decoder_input_backpressure_or_wait(
     mut context: OutputQueueServiceContext<'_>,
-) -> std::result::Result<OutputQueueServiceStatus, String> {
+) -> std::result::Result<OutputQueueServiceResult, String> {
     observe_output_queue_stall(&mut context, "demux_decoder_backpressure");
-    let audio_clock = audio_clock_availability(context.pipeline.audio_output.as_ref())?;
+    let audio_clock = audio_clock_availability(
+        context.pipeline.audio_output.as_ref(),
+        context
+            .pipeline
+            .output_scheduler
+            .audio_output_clock_stall_fallback_active(),
+    )?;
     let made_progress = service_decode_backpressure_step(
         &context.pipeline.scheduler,
         context.pipeline.audio_output.as_ref(),
@@ -214,20 +252,30 @@ fn service_output_queues_after_decoder_input_backpressure_or_wait(
         &mut context.pipeline.subtitle_pipeline,
         &mut context.pipeline.buffered_reporter,
     )?;
-    if !made_progress {
-        wait_after_output_queue_stall(&mut context, "demux_decoder_backpressure_wait");
-    }
-    Ok(OutputQueueServiceStatus::Continue)
+    let planned_wait = if made_progress {
+        Duration::ZERO
+    } else {
+        wait_after_output_queue_stall(&mut context, "demux_decoder_backpressure_wait")
+    };
+    Ok(OutputQueueServiceResult {
+        status: OutputQueueServiceStatus::Continue,
+        planned_wait,
+    })
 }
 
 fn service_output_queues_after_demux_would_block_or_wait(
     mut context: OutputQueueServiceContext<'_>,
-) -> std::result::Result<OutputQueueServiceStatus, String> {
+) -> std::result::Result<OutputQueueServiceResult, String> {
     observe_output_queue_stall(&mut context, "demux_would_block");
-    if !service_output_queues_after_demux_would_block(&mut context)? {
-        wait_after_output_queue_stall(&mut context, "demux_would_block_wait");
-    }
-    Ok(OutputQueueServiceStatus::Continue)
+    let planned_wait = if service_output_queues_after_demux_would_block(&mut context)? {
+        Duration::ZERO
+    } else {
+        wait_after_output_queue_stall(&mut context, "demux_would_block_wait")
+    };
+    Ok(OutputQueueServiceResult {
+        status: OutputQueueServiceStatus::Continue,
+        planned_wait,
+    })
 }
 
 fn service_output_queues_after_demux_would_block(
@@ -245,7 +293,13 @@ fn service_output_queues_after_demux_would_block(
         &mut context.pipeline.subtitle_pipeline,
         &mut context.pipeline.buffered_reporter,
     )?;
-    let audio_clock = audio_clock_availability(context.pipeline.audio_output.as_ref())?;
+    let audio_clock = audio_clock_availability(
+        context.pipeline.audio_output.as_ref(),
+        context
+            .pipeline
+            .output_scheduler
+            .audio_output_clock_stall_fallback_active(),
+    )?;
     let video_progressed = service_video_clocked_video_queue_if_audio_clock_unavailable(
         &context.pipeline.scheduler,
         context.control,
@@ -288,7 +342,7 @@ fn observe_output_queue_stall(
 fn wait_after_output_queue_stall(
     context: &mut OutputQueueServiceContext<'_>,
     stall_reason: &'static str,
-) {
+) -> Duration {
     context.playback_wait.wait_after_stall(
         PlaybackPipelineWaitContext {
             session_id: context.session_id,
@@ -305,7 +359,7 @@ fn wait_after_output_queue_stall(
             playback_loop_deadline: context.pipeline.playback_loop_deadline(),
         },
         stall_reason,
-    );
+    )
 }
 
 fn log_output_queue_service_timing(
@@ -313,33 +367,57 @@ fn log_output_queue_service_timing(
     phase: &'static str,
     elapsed: Duration,
     status: Option<OutputQueueServiceStatus>,
+    planned_wait: Duration,
 ) {
+    let active_elapsed = output_queue_active_elapsed(elapsed, planned_wait);
     tracing::trace!(
         session_id = ?session_id,
         phase,
         elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        planned_wait_ms = planned_wait.as_secs_f64() * 1000.0,
+        active_elapsed_ms = active_elapsed.as_secs_f64() * 1000.0,
         status = ?status,
         "FFmpeg output queue service timing"
     );
-    if elapsed < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER {
+    if active_elapsed < PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER {
         return;
     }
     tracing::debug!(
         session_id = ?session_id,
         phase,
         elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        planned_wait_ms = planned_wait.as_secs_f64() * 1000.0,
+        active_elapsed_ms = active_elapsed.as_secs_f64() * 1000.0,
         status = ?status,
         "FFmpeg output queue service completed slowly"
     );
 }
 
+fn output_queue_active_elapsed(elapsed: Duration, planned_wait: Duration) -> Duration {
+    elapsed.saturating_sub(planned_wait)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::OutputQueueServiceStatus;
+    use std::time::Duration;
+
+    use super::{OutputQueueServiceStatus, output_queue_active_elapsed};
 
     #[test]
     fn output_queue_service_status_reports_continue() {
         assert!(OutputQueueServiceStatus::Continue.should_continue());
         assert!(!OutputQueueServiceStatus::Idle.should_continue());
+    }
+
+    #[test]
+    fn planned_poll_wait_is_not_classified_as_slow_output_work() {
+        assert_eq!(
+            output_queue_active_elapsed(Duration::from_millis(5), Duration::from_millis(5),),
+            Duration::ZERO
+        );
+        assert_eq!(
+            output_queue_active_elapsed(Duration::from_millis(8), Duration::from_millis(5),),
+            Duration::from_millis(3)
+        );
     }
 }

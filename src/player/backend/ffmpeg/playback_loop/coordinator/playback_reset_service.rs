@@ -1,5 +1,6 @@
 use super::playback_pipeline_state::PlaybackPipelineState;
 use std::sync::mpsc::Sender;
+use std::time::Instant;
 
 use crate::player::{
     backend::{BackendEvent, BackendEventKind, PlaybackSeekMode},
@@ -35,6 +36,8 @@ pub(super) struct PlaybackGenerationFlushContext<'a> {
     pub(super) seek_generation: u64,
     pub(super) force_low_level_seek: bool,
     pub(super) cache_only: bool,
+    pub(super) require_safe_cached_anchor: bool,
+    pub(super) preserve_hevc_same_hardware_recovery: bool,
     pub(super) low_level_seek_reason: Option<&'static str>,
     pub(super) session_id: PlaybackSessionId,
     pub(super) vo_queue: &'a VideoOutputQueue,
@@ -71,6 +74,8 @@ pub(super) struct PlaybackSeekResetContext<'a> {
     pub(super) seek_generation: u64,
     pub(super) force_low_level_seek: bool,
     pub(super) cache_only: bool,
+    pub(super) require_safe_cached_anchor: bool,
+    pub(super) preserve_hevc_same_hardware_recovery: bool,
     pub(super) recovery_transaction_id: Option<u64>,
     pub(super) low_level_seek_reason: Option<&'static str>,
     pub(super) session_id: PlaybackSessionId,
@@ -86,18 +91,14 @@ pub(super) struct PlaybackSeekResetContext<'a> {
 pub(super) struct PlaybackGenerationFlushResult {
     pub(super) generation: u64,
     pub(super) demux_seek_result: DemuxSeekResult,
+    pub(super) flushed: bool,
 }
 
 fn flush_playback_generation_for_position_reset(
     context: PlaybackGenerationFlushContext<'_>,
 ) -> std::result::Result<PlaybackGenerationFlushResult, String> {
-    let generation = context.pipeline.advance_playback_generation();
-    context.vo_queue.begin_session(context.session_id);
-    context.pipeline.flush_playback_generation(generation)?;
-    if let Some(audio_output) = context.pipeline.audio_output.as_ref() {
-        audio_output.reset_clock(context.pipeline.current_start_position_nsecs);
-    }
-    context.pipeline.output_scheduler.reset(context.control);
+    let transaction_started_at = Instant::now();
+    let demux_started_at = Instant::now();
     let demux_seek_result = if context.force_low_level_seek {
         context.demux_cache.seek_low_level(
             context.position_seconds,
@@ -106,6 +107,13 @@ fn flush_playback_generation_for_position_reset(
             context
                 .low_level_seek_reason
                 .unwrap_or("forced_low_level_seek"),
+        )
+    } else if context.cache_only && context.require_safe_cached_anchor {
+        context.demux_cache.seek_cached_safe_only(
+            context.position_seconds,
+            context.seek_mode,
+            context.session_id,
+            context.seek_generation,
         )
     } else if context.cache_only {
         context.demux_cache.seek_cached_only(
@@ -122,6 +130,54 @@ fn flush_playback_generation_for_position_reset(
             context.seek_generation,
         )
     };
+    let demux_prepare = demux_started_at.elapsed();
+    let safe_cache_unavailable = context.cache_only
+        && context.require_safe_cached_anchor
+        && matches!(demux_seek_result, DemuxSeekResult::Unavailable);
+    let superseded = matches!(demux_seek_result, DemuxSeekResult::Superseded)
+        || (context.control.has_pending_seek()
+            && context.control.seek_generation() != context.seek_generation);
+    if safe_cache_unavailable || superseded {
+        context.control.finish_seek(context.seek_generation);
+        return Ok(PlaybackGenerationFlushResult {
+            generation: context.pipeline.playback_generation.current(),
+            demux_seek_result: if safe_cache_unavailable {
+                demux_seek_result
+            } else {
+                DemuxSeekResult::Superseded
+            },
+            flushed: false,
+        });
+    }
+
+    // Match mpv's seek transaction ordering: first prove/commit the demux
+    // target, then invalidate the currently visible decoder/output generation.
+    let generation_started_at = Instant::now();
+    let generation = context.pipeline.advance_playback_generation();
+    let generation_advance = generation_started_at.elapsed();
+    let scheduler_reset_started_at = Instant::now();
+    context
+        .pipeline
+        .output_scheduler
+        .reset_for_session(context.control, context.session_id);
+    let scheduler_reset = scheduler_reset_started_at.elapsed();
+    let vo_started_at = Instant::now();
+    context.vo_queue.begin_session(context.session_id);
+    let vo_flush = vo_started_at.elapsed();
+    let decoder_flush_started_at = Instant::now();
+    if context.preserve_hevc_same_hardware_recovery {
+        context
+            .pipeline
+            .flush_playback_generation_preserving_hevc_same_hardware_recovery(generation)?;
+    } else {
+        context.pipeline.flush_playback_generation(generation)?;
+    }
+    let decoder_flush = decoder_flush_started_at.elapsed();
+    let audio_reset_started_at = Instant::now();
+    if let Some(audio_output) = context.pipeline.audio_output.as_ref() {
+        audio_output.reset_clock(context.pipeline.current_start_position_nsecs);
+    }
+    let audio_reset = audio_reset_started_at.elapsed();
     tracing::debug!(
         session_id = ?context.session_id,
         reset_kind = context.kind.as_str(),
@@ -130,9 +186,18 @@ fn flush_playback_generation_for_position_reset(
         seek_generation = context.seek_generation,
         force_low_level_seek = context.force_low_level_seek,
         cache_only = context.cache_only,
+        require_safe_cached_anchor = context.require_safe_cached_anchor,
+        preserve_hevc_same_hardware_recovery = context.preserve_hevc_same_hardware_recovery,
         low_level_seek_reason = ?context.low_level_seek_reason,
         playback_generation = generation,
         current_start_position_nsecs = context.pipeline.current_start_position_nsecs,
+        demux_prepare_ms = demux_prepare.as_secs_f64() * 1_000.0,
+        generation_advance_ms = generation_advance.as_secs_f64() * 1_000.0,
+        vo_flush_ms = vo_flush.as_secs_f64() * 1_000.0,
+        decoder_flush_ms = decoder_flush.as_secs_f64() * 1_000.0,
+        scheduler_reset_ms = scheduler_reset.as_secs_f64() * 1_000.0,
+        audio_reset_ms = audio_reset.as_secs_f64() * 1_000.0,
+        total_ms = transaction_started_at.elapsed().as_secs_f64() * 1_000.0,
         ?demux_seek_result,
         selected_tracks = ?context.selected_tracks,
         "handling FFmpeg playback generation flush transaction"
@@ -141,6 +206,7 @@ fn flush_playback_generation_for_position_reset(
     Ok(PlaybackGenerationFlushResult {
         generation,
         demux_seek_result,
+        flushed: true,
     })
 }
 
@@ -173,6 +239,7 @@ pub(super) fn service_playback_generation_seek(
         reset_kind = kind.as_str(),
         playback_generation = flush_result.generation,
         demux_seek_result = ?flush_result.demux_seek_result,
+        flushed = flush_result.flushed,
         "completed FFmpeg playback generation seek reset"
     );
     Ok(flush_result)
@@ -236,6 +303,8 @@ pub(super) fn service_playback_seek_reset(
         seek_generation,
         force_low_level_seek: requested_force_low_level_seek,
         cache_only: requested_cache_only,
+        require_safe_cached_anchor,
+        preserve_hevc_same_hardware_recovery,
         recovery_transaction_id: requested_recovery_transaction_id,
         low_level_seek_reason,
         session_id,
@@ -280,6 +349,8 @@ pub(super) fn service_playback_seek_reset(
         seek_generation,
         force_low_level_seek,
         cache_only,
+        require_safe_cached_anchor,
+        preserve_hevc_same_hardware_recovery,
         low_level_seek_reason,
         session_id,
         vo_queue,
@@ -288,6 +359,17 @@ pub(super) fn service_playback_seek_reset(
         selected_tracks: None,
         control,
     })?;
+    if !flush_result.flushed {
+        tracing::debug!(
+            ?session_id,
+            position_seconds,
+            seek_mode = ?seek_mode,
+            seek_generation,
+            demux_seek_result = ?flush_result.demux_seek_result,
+            "skipped playback output reset because the demux seek was not committed"
+        );
+        return Ok(flush_result.demux_seek_result);
+    }
     service_playback_position_state_reset(PlaybackPositionStateResetContext {
         position_seconds,
         session_id,
@@ -296,6 +378,10 @@ pub(super) fn service_playback_seek_reset(
         control,
         event_tx,
     });
+    pipeline.initial_hevc_cached_exact_seek = pipeline.video_stream.codec_id
+        == ffi::AVCodecID::AV_CODEC_ID_HEVC
+        && matches!(flush_result.demux_seek_result, DemuxSeekResult::Cached(_))
+        && matches!(seek_mode, PlaybackSeekMode::Precise);
     if pipeline.video_stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC
         && matches!(flush_result.demux_seek_result, DemuxSeekResult::Requested)
     {
@@ -373,6 +459,9 @@ pub(super) fn service_playback_seek_reset(
             low_level_seek_reason,
             "suppressed user-visible buffering for internal playback repair"
         );
+    }
+    if pipeline.audio_output.is_none() {
+        control.finish_seek_audio_pause();
     }
     Ok(flush_result.demux_seek_result)
 }

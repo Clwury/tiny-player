@@ -1,8 +1,9 @@
 use std::{collections::VecDeque, os::raw::c_int, time::Duration};
 
 use super::{
-    DecodedAudio, PENDING_AUDIO_CONTINUITY_TOLERANCE, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-    align_audio_elements_to_frame_boundary, audio_elements_for_duration_floor, duration_nsecs,
+    AudioStagedFrame, DecodedAudio, PENDING_AUDIO_CONTINUITY_TOLERANCE,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, align_audio_elements_to_frame_boundary,
+    audio_elements_for_duration_floor, duration_nsecs,
 };
 
 #[derive(Default)]
@@ -113,6 +114,45 @@ impl PendingStartAudio {
         dropped
     }
 
+    /// Removes all samples before `timeline_nsecs`, including the leading
+    /// portion of a frame that straddles the boundary.
+    ///
+    /// Resume waterlines are measured from the video/restart anchor.  Keeping
+    /// preroll in the queue counters makes a large queue look ready even when
+    /// its useful forward coverage is still below the waterline, so trimming
+    /// and accounting must happen before that waterline is evaluated.
+    pub(in crate::player::backend::ffmpeg) fn trim_before(
+        &mut self,
+        timeline_nsecs: u64,
+        sample_rate: c_int,
+        channels: c_int,
+    ) -> usize {
+        let dropped = self.discard_before(timeline_nsecs);
+        let Some(frame) = self.frames.front_mut() else {
+            return dropped;
+        };
+        if frame.start_timeline_nsecs >= timeline_nsecs {
+            return dropped;
+        }
+
+        let old_start_timeline_nsecs = frame.start_timeline_nsecs;
+        let old_samples = frame.samples.len();
+        if !frame.trim_before(timeline_nsecs, sample_rate, channels) {
+            self.pop_front();
+            return dropped.saturating_add(1);
+        }
+
+        let trimmed_duration_nsecs = frame
+            .start_timeline_nsecs
+            .saturating_sub(old_start_timeline_nsecs);
+        let trimmed_samples = old_samples.saturating_sub(frame.samples.len());
+        self.buffered_duration_nsecs = self
+            .buffered_duration_nsecs
+            .saturating_sub(trimmed_duration_nsecs);
+        self.buffered_samples = self.buffered_samples.saturating_sub(trimmed_samples);
+        dropped.saturating_add(usize::from(trimmed_duration_nsecs > 0))
+    }
+
     pub(in crate::player::backend::ffmpeg) fn first_start_timeline_nsecs(&self) -> Option<u64> {
         self.frames.front().map(|frame| frame.start_timeline_nsecs)
     }
@@ -121,6 +161,29 @@ impl PendingStartAudio {
         let start_timeline_nsecs = self.first_start_timeline_nsecs()?;
         let end_timeline_nsecs = self.buffered_until_from(start_timeline_nsecs)?;
         Some((start_timeline_nsecs, end_timeline_nsecs))
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn range_nsecs(&self) -> Option<(u64, u64)> {
+        Some((
+            self.frames.front()?.start_timeline_nsecs,
+            self.frames.back()?.end_timeline_nsecs,
+        ))
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn first_gap_nsecs(&self) -> Option<(u64, u64)> {
+        let mut frames = self.frames.iter();
+        let first = frames.next()?;
+        let mut contiguous_until_nsecs = first.end_timeline_nsecs;
+        let gap_tolerance_nsecs = duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE);
+        for frame in frames {
+            if frame.start_timeline_nsecs
+                > contiguous_until_nsecs.saturating_add(gap_tolerance_nsecs)
+            {
+                return Some((contiguous_until_nsecs, frame.start_timeline_nsecs));
+            }
+            contiguous_until_nsecs = contiguous_until_nsecs.max(frame.end_timeline_nsecs);
+        }
+        None
     }
 
     pub(in crate::player::backend::ffmpeg) fn contiguous_duration(&self) -> Duration {
@@ -222,6 +285,19 @@ impl PendingStartAudio {
                 .saturating_sub(frame.start_timeline_nsecs),
         );
         self.frames.push_front(frame);
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn restore_staged_frames(
+        &mut self,
+        frames: Vec<AudioStagedFrame>,
+    ) {
+        for frame in frames.into_iter().rev() {
+            self.push_front_frame(PendingStartAudioFrame {
+                samples: frame.samples,
+                start_timeline_nsecs: frame.start_timeline_nsecs,
+                end_timeline_nsecs: frame.end_timeline_nsecs,
+            });
+        }
     }
 
     pub(in crate::player::backend::ffmpeg) fn len(&self) -> usize {
