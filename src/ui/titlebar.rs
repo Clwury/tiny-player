@@ -1,9 +1,9 @@
 use gpui::{
     App, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window,
-    WindowControlArea, div, prelude::FluentBuilder, px, svg,
+    WindowControlArea, div, img, prelude::FluentBuilder, px, svg,
 };
 
-use crate::theme;
+use crate::{app_metadata::APP_ICON_ASSET_PATH, theme};
 
 pub fn app_titlebar(window: &Window, cx: &App, title: SharedString) -> impl IntoElement {
     let theme = theme::get(cx);
@@ -40,6 +40,16 @@ pub fn app_titlebar(window: &Window, cx: &App, title: SharedString) -> impl Into
                 .bottom_0()
                 .right_0()
                 .window_control_area(WindowControlArea::Drag),
+        )
+        .child(
+            div()
+                .absolute()
+                .left_2()
+                .top_0()
+                .bottom_0()
+                .flex()
+                .items_center()
+                .child(img(APP_ICON_ASSET_PATH).size(px(20.0))),
         )
         .child(
             div()

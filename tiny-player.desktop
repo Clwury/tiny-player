@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Tiny Player
+GenericName=Emby Client
+Comment=Watch videos from an Emby server
+Exec=tiny-player
+Icon=tiny-player
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=Emby;Media;Video;Player;
+StartupNotify=true
+StartupWMClass=tiny-player

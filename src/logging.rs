@@ -302,11 +302,11 @@ fn write_dropped_log_summary(
         return;
     }
     let summary = format!(
-        " WARN tiny::logging: suppressed_file_log_events={dropped} summary_interval_ms={:.3} bounded_queue_capacity={queue_capacity}\n",
+        " WARN tiny_player::logging: suppressed_file_log_events={dropped} summary_interval_ms={:.3} bounded_queue_capacity={queue_capacity}\n",
         elapsed.as_secs_f64() * 1_000.0,
     );
     if let Err(error) = writer.write_all(summary.as_bytes()) {
-        eprintln!("failed to write dropped tiny log summary: {error}");
+        eprintln!("failed to write dropped tiny-player log summary: {error}");
     }
 }
 

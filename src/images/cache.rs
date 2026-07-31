@@ -4,10 +4,10 @@ use std::{
     time::SystemTime,
 };
 
-use anyhow::{Context, Result, anyhow};
-use directories::ProjectDirs;
+use anyhow::{Context, Result};
 
 use crate::{
+    app_metadata,
     emby::{EmbyImageRequest, EmbyImageType, ImageQuality},
     server::CachedServer,
 };
@@ -67,9 +67,7 @@ pub fn prune_cache(max_bytes: u64) -> Result<()> {
 }
 
 fn image_cache_dir() -> Result<PathBuf> {
-    let dirs =
-        ProjectDirs::from("dev", "tiny", "Tiny").ok_or_else(|| anyhow!("无法定位用户缓存目录"))?;
-    Ok(dirs.cache_dir().join("images"))
+    Ok(app_metadata::cache_dir()?.join("images"))
 }
 
 #[cfg(test)]

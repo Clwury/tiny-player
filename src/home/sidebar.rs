@@ -3,7 +3,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, svg,
 };
 
-use crate::{server::CachedServer, theme};
+use crate::{app_metadata::APP_NAME, server::CachedServer, theme};
 
 use super::{HomePage, carousel::HOME_SIDEBAR_WIDTH_PX, navigation::HomeRoot};
 
@@ -113,7 +113,7 @@ impl HomePage {
                     .text_sm()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.foreground)
-                    .child("Tiny"),
+                    .child(APP_NAME),
             )
     }
 }

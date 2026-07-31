@@ -1,4 +1,5 @@
 mod app;
+mod app_metadata;
 mod assets;
 pub mod emby;
 mod home;
@@ -10,6 +11,7 @@ mod theme;
 mod ui;
 
 use app::TinyApp;
+use app_metadata::{APP_ID, APP_NAME};
 use assets::ProjectAssets;
 use gpui::{
     AppContext, Application, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
@@ -54,11 +56,11 @@ pub fn run() {
                     window_decorations: Some(WindowDecorations::Client),
                     window_background: WindowBackgroundAppearance::Transparent,
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Tiny".into()),
+                        title: Some(APP_NAME.into()),
                         appears_transparent: true,
                         traffic_light_position: None,
                     }),
-                    app_id: Some("tiny".to_string()),
+                    app_id: Some(APP_ID.to_string()),
                     ..Default::default()
                 },
                 |_, cx| cx.new(|_| TinyApp::new(cache, cache_error)),

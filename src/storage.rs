@@ -1,11 +1,10 @@
 use std::{fs, path::Path};
 
-use anyhow::{Context, Result, anyhow};
-use directories::ProjectDirs;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::server::CachedServer;
+use crate::{app_metadata, server::CachedServer};
 
 const CACHE_VERSION: u32 = 1;
 
@@ -109,9 +108,7 @@ fn same_server(a: &CachedServer, b: &CachedServer) -> bool {
 }
 
 fn cache_path() -> Result<std::path::PathBuf> {
-    let dirs =
-        ProjectDirs::from("dev", "tiny", "Tiny").ok_or_else(|| anyhow!("无法定位用户配置目录"))?;
-    Ok(dirs.config_dir().join("servers.json"))
+    Ok(app_metadata::config_dir()?.join("servers.json"))
 }
 
 pub(crate) fn load_or_init_from(path: &Path) -> Result<ServerCache> {

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Tiny Player icon">
+  <defs>
+    <clipPath id="icon-clip">
+      <rect x="0" y="0" width="512" height="512" rx="104" ry="104"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#icon-clip)" shape-rendering="geometricPrecision">
+    <rect x="0" y="0" width="512" height="512" fill="#082760"/>
+
+    <path d="M0 422 C68 394 138 352 212 365 C292 384 362 438 512 438 L512 512 L0 512 Z" fill="#1E4A8C"/>
+
+    <g transform="translate(10.24 5.24) scale(0.96)">
+      <path d="M151 328 A345 235 0 0 1 438 264 C443 270 438 290 425 302 C381 336 326 378 271 394 C232 386 188 370 151 374 Z" fill="#F8DFA3"/>
+
+      <path d="M142 405 L142 105 C142 79 171 66 194 81 L425 226 C455 245 455 283 425 302 L190 442 C169 454 142 439 142 405 Z" fill="none" stroke="#031B3F" stroke-width="23" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

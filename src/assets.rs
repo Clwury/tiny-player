@@ -9,9 +9,13 @@ pub struct ProjectAssets {
 
 impl ProjectAssets {
     pub fn new() -> Self {
-        Self {
-            base: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"),
-        }
+        Self::from_roots(option_env!("TINY_ASSET_DIR"), env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn from_roots(installed_asset_dir: Option<&str>, manifest_dir: &str) -> Self {
+        let base = installed_asset_dir
+            .map_or_else(|| PathBuf::from(manifest_dir).join("assets"), PathBuf::from);
+        Self { base }
     }
 }
 
@@ -35,5 +39,25 @@ impl AssetSource for ProjectAssets {
                     .collect()
             })
             .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_build_uses_manifest_assets() {
+        let assets = ProjectAssets::from_roots(None, "/checkout/tiny-player");
+
+        assert_eq!(assets.base, PathBuf::from("/checkout/tiny-player/assets"));
+    }
+
+    #[test]
+    fn packaged_build_uses_installed_asset_directory() {
+        let assets =
+            ProjectAssets::from_roots(Some("/usr/share/tiny-player/assets"), "/build/tiny-player");
+
+        assert_eq!(assets.base, PathBuf::from("/usr/share/tiny-player/assets"));
     }
 }

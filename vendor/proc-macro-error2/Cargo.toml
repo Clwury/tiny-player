@@ -1,0 +1,27 @@
+[package]
+name = "proc-macro-error2"
+version = "2.0.1"
+edition = "2021"
+rust-version = "1.61"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GnomedDev/proc-macro-error-2"
+description = "Almost drop-in replacement to panics in proc-macros"
+
+[lib]
+name = "proc_macro_error2"
+path = "src/lib.rs"
+
+[dependencies]
+proc-macro-error-attr2 = "=2.0.0"
+proc-macro2 = "1"
+quote = "1"
+
+[dependencies.syn]
+version = "2"
+optional = true
+default-features = false
+
+[features]
+default = ["syn-error"]
+syn-error = ["dep:syn"]
+nightly = []

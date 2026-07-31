@@ -6,10 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    app_metadata,
     emby::{ResumeItems, UserItems, UserViews},
     server::CachedServer,
 };
@@ -90,16 +90,13 @@ pub(super) fn save_snapshot(server: &CachedServer, snapshot: &HomeSnapshot) -> R
 }
 
 fn snapshot_path(server: &CachedServer) -> Result<PathBuf> {
-    let dirs =
-        ProjectDirs::from("dev", "tiny", "Tiny").ok_or_else(|| anyhow!("无法定位用户缓存目录"))?;
     let account = server
         .user_id
         .as_deref()
         .filter(|user_id| !user_id.trim().is_empty())
         .unwrap_or(server.username.as_str());
 
-    Ok(dirs
-        .cache_dir()
+    Ok(app_metadata::cache_dir()?
         .join("home")
         .join(sanitize_segment(&server.id))
         .join(sanitize_segment(account))

@@ -1,5 +1,7 @@
 use gpui::{Context, SharedString, Window};
 
+use crate::app_metadata::APP_NAME;
+
 use super::{Page, TinyApp};
 
 impl TinyApp {
@@ -21,7 +23,7 @@ impl TinyApp {
 
     pub(super) fn title(&self, cx: &Context<Self>) -> SharedString {
         match &self.page {
-            Page::Servers => "Tiny".into(),
+            Page::Servers => APP_NAME.into(),
             Page::Home(page) => page.read(cx).title(cx),
             Page::Playback { page, .. } => page.read(cx).title(),
         }

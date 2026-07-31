@@ -8,6 +8,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_LIBDIR");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR");
+    println!("cargo:rerun-if-env-changed=TINY_ASSET_DIR");
 
     let libplacebo = pkg_config::Config::new()
         .atleast_version("7")

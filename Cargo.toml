@@ -1,7 +1,11 @@
 [package]
-name = "tiny"
+name = "tiny-player"
 version = "0.1.0"
 edition = "2024"
+description = "Native Emby desktop client with FFmpeg and Vulkan playback"
+license = "MIT"
+homepage = "https://github.com/Clwury/tiny-player"
+repository = "https://github.com/Clwury/tiny-player"
 
 [dependencies]
 anyhow = "1.0"
@@ -26,3 +30,9 @@ tempfile = "3.13"
 [build-dependencies]
 bindgen = "0.72"
 pkg-config = "0.3"
+
+[patch.crates-io]
+# proc-macro-error2 2.0.1 re-exports a private proc_macro crate, which is a
+# future hard error in Rust. Keep the upstream source with the compiler's
+# suggested one-line visibility fix until crates.io publishes a fixed release.
+proc-macro-error2 = { path = "vendor/proc-macro-error2" }
