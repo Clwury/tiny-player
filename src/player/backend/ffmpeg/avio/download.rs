@@ -1,6 +1,7 @@
 use std::{error::Error as StdError, io::Read, sync::Arc, time::Duration};
 
 use super::{
+    HTTP_CACHE_NETWORK_READ_TIMEOUT,
     cache::{
         CacheAppendPermit, CacheAppendResult, CacheRestartRequest, CacheRetryPermit,
         HttpRingCacheShared,
@@ -76,6 +77,10 @@ pub(super) fn http_ring_cache_download_loop(
 ) {
     let client = match reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        // The blocking client's timeout is applied afresh to send/read
+        // operations. Do not attach a RequestBuilder timeout to the active
+        // open-ended response, because that is a total body deadline.
+        .timeout(HTTP_CACHE_NETWORK_READ_TIMEOUT)
         .build()
     {
         Ok(client) => client,
@@ -97,6 +102,7 @@ pub(super) fn http_ring_cache_download_loop(
         }
         match shared.wait_for_append_capacity(offset) {
             CacheAppendPermit::Ready(_) => {}
+            #[cfg(test)]
             CacheAppendPermit::Full => continue,
             CacheAppendPermit::Restart(next_offset) => {
                 offset = next_offset;
@@ -194,6 +200,7 @@ pub(super) fn http_ring_cache_side_download_loop(
 ) {
     let client = match reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        .timeout(HTTP_CACHE_NETWORK_READ_TIMEOUT)
         .build()
     {
         Ok(client) => client,
@@ -280,23 +287,51 @@ fn download_http_cache_range(
 
     let range_request_bytes =
         http_cache_playback_range_request_bytes(shared.playback_range_request_bytes(offset));
-    let range = http_cache_range_header(offset, known_content_len, range_request_bytes);
-    let range_len = http_cache_range_request_len(offset, known_content_len, range_request_bytes);
-    let request_timeout = http_cache_range_request_timeout(range_len);
+    let continuous_request = shared.continuous_playback_requests();
+    // Some Emby proxy chains do not start a response for an omitted Range end
+    // (`bytes=0-`) even though they immediately serve bounded ranges. Preserve
+    // mpv's one-live-response behavior without that compatibility trap by
+    // spelling the known content end explicitly. If the length is not known
+    // yet, bootstrap it with one small bounded request and continue through the
+    // discovered end on the next request.
+    let continuous_content_end = continuous_request
+        .then_some(known_content_len)
+        .flatten()
+        .and_then(|content_len| content_len.checked_sub(1));
+    let range = continuous_content_end.map_or_else(
+        || http_cache_range_header(offset, known_content_len, range_request_bytes),
+        |content_end| format!("bytes={offset}-{content_end}"),
+    );
+    let range_len = continuous_content_end
+        .is_none()
+        .then(|| http_cache_range_request_len(offset, known_content_len, range_request_bytes));
+    let request_timeout = range_len.map(http_cache_range_request_timeout);
+    let request_range_mode = if continuous_content_end.is_some() {
+        "continuous_explicit_end"
+    } else if continuous_request {
+        "bootstrap_bounded"
+    } else {
+        "bounded"
+    };
     tracing::debug!(
         offset,
         range = %range,
-        range_len,
-        range_request_bytes_effective = range_request_bytes,
-        request_timeout_ms = request_timeout.as_millis(),
+        range_len = ?range_len,
+        continuous_request,
+        request_range_mode,
+        bounded_range_request_bytes = range_request_bytes,
+        request_timeout_ms = ?request_timeout.map(|timeout| timeout.as_millis()),
+        network_read_timeout_ms = HTTP_CACHE_NETWORK_READ_TIMEOUT.as_millis(),
         "requesting HTTP stream cache range"
     );
     let mut request = client
         .get(url)
-        .timeout(request_timeout)
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .header(reqwest::header::CONNECTION, "keep-alive")
         .header(reqwest::header::RANGE, range.as_str());
+    if let Some(request_timeout) = request_timeout {
+        request = request.timeout(request_timeout);
+    }
     for (name, value) in headers {
         request = request.header(name, value);
     }
@@ -368,9 +403,17 @@ fn download_http_cache_range(
         {
             return Ok(HttpDownloadOutcome::Restart(offset));
         }
-        let capacity = match shared.append_capacity_now(offset) {
+        // Keep the current validated response alive while downstream output is
+        // briefly backpressured. mpv similarly pauses demux consumption without
+        // turning every VO watermark transition into a new HTTP request. The
+        // previous non-blocking probe abandoned the response here, producing
+        // dozens of arbitrary byte-range seams during a few seconds of Vulkan
+        // playback. Apart from wasting requests, those seams make a proxy-side
+        // short/incorrect splice indistinguishable from a damaged HEVC packet.
+        let capacity = match shared.wait_for_append_capacity(offset) {
             CacheAppendPermit::Ready(capacity) => capacity,
-            CacheAppendPermit::Full => return Ok(HttpDownloadOutcome::Restart(offset)),
+            #[cfg(test)]
+            CacheAppendPermit::Full => continue,
             CacheAppendPermit::Restart(next_offset) => {
                 return Ok(HttpDownloadOutcome::Restart(next_offset));
             }
@@ -653,7 +696,9 @@ mod tests {
 
     use reqwest::blocking::Client;
 
-    use super::super::super::HTTP_CACHE_RANGE_REQUEST_BYTES;
+    use super::super::super::{
+        HTTP_CACHE_RANGE_REQUEST_BYTES, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
+    };
     use super::super::cache::{CacheRestartRequest, HttpCacheRangeKind};
     use super::super::{HttpRingCache, HttpRingCacheState};
     use super::{
@@ -720,7 +765,30 @@ mod tests {
     }
 
     #[test]
-    fn exact_sixteen_mib_partial_response_advances_without_retry_backoff() {
+    fn continuous_active_request_bootstraps_unknown_length_with_bounded_range() {
+        let range_len = HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES;
+        let total_len = HTTP_CACHE_RANGE_REQUEST_BYTES * 4;
+        let (url, server) = spawn_partial_content_server(0, range_len, range_len, total_len);
+        let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new(0));
+        let client = Client::builder().build().expect("test HTTP client builds");
+
+        let outcome =
+            download_http_cache_range(&client, &url, &[], cache.shared_for_download_test(), 0)
+                .expect("the bounded bootstrap discovers the content length");
+
+        assert!(matches!(outcome, HttpDownloadOutcome::Restart(offset) if offset == range_len));
+        assert_eq!(cache.content_len(), Some(total_len));
+        let request = server.join().expect("test HTTP server joins");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("range: bytes=0-{}\r\n", range_len - 1))
+        );
+        assert!(!request.to_ascii_lowercase().contains("range: bytes=0-\r\n"));
+    }
+
+    #[test]
+    fn continuous_active_request_uses_explicit_end_and_accepts_bounded_response() {
         let range_len = HTTP_CACHE_RANGE_REQUEST_BYTES;
         let total_len = range_len * 4;
         let range_start = 1;
@@ -745,7 +813,51 @@ mod tests {
         assert!(
             request
                 .to_ascii_lowercase()
-                .contains(&format!("range: bytes={range_start}-{}", range_end - 1))
+                .contains(&format!("range: bytes={range_start}-{}\r\n", total_len - 1))
+        );
+    }
+
+    #[test]
+    fn active_range_waits_through_output_backpressure_without_new_range_seam() {
+        let range_start = 1;
+        let range_len = 256 * 1024;
+        let total_len = 1024 * 1024;
+        let (url, server) =
+            spawn_partial_content_server(range_start, range_len, range_len, total_len);
+        let cache = test_download_cache(total_len);
+        assert!(cache.set_output_backpressure_prefetch_paused(true));
+        let resume_cache = cache.clone();
+        let resume = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            assert!(resume_cache.set_output_backpressure_prefetch_paused(false));
+        });
+        let client = Client::builder().build().expect("test HTTP client builds");
+
+        let outcome = download_http_cache_range(
+            &client,
+            &url,
+            &[],
+            cache.shared_for_download_test(),
+            range_start,
+        )
+        .expect("temporary output backpressure preserves the active response");
+
+        let range_end = range_start + range_len;
+        assert!(matches!(outcome, HttpDownloadOutcome::Restart(offset) if offset == range_end));
+        assert_eq!(cache.next_offset_for_test(), range_end);
+        resume.join().expect("backpressure resume joins");
+        let request = server.join().expect("test HTTP server joins");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("range: bytes={range_start}-{}\r\n", total_len - 1))
+        );
+        assert_eq!(
+            request
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().starts_with("range:"))
+                .count(),
+            1
         );
     }
 

@@ -68,11 +68,7 @@ where
                 context.session_id,
             );
         let staged = context.output_scheduler.stage_decode_recovery_frame(
-            QueuedVideoFrame {
-                frame,
-                timeline_nsecs,
-                duration_nsecs,
-            },
+            QueuedVideoFrame::new(frame, timeline_nsecs, duration_nsecs),
             context.vo_queue.snapshot().queue_capacity,
             context.session_id,
         );
@@ -250,11 +246,7 @@ pub(super) fn admit_drained_prepared_video_frame(
                 context.session_id,
             );
         let staged = context.output_scheduler.stage_decode_recovery_frame(
-            QueuedVideoFrame {
-                frame,
-                timeline_nsecs,
-                duration_nsecs,
-            },
+            QueuedVideoFrame::new(frame, timeline_nsecs, duration_nsecs),
             context.vo_queue.snapshot().queue_capacity,
             context.session_id,
         );

@@ -140,6 +140,7 @@ pub(in crate::player::backend::ffmpeg) struct HttpPlaybackBufferRange {
 
 pub(in crate::player::backend::ffmpeg::avio) enum CacheAppendPermit {
     Ready(usize),
+    #[cfg(test)]
     Full,
     Restart(u64),
     Stopped,
@@ -195,6 +196,7 @@ pub(in crate::player::backend::ffmpeg::avio::cache) struct HttpCacheConfig {
     pub(in crate::player::backend::ffmpeg::avio::cache) memory_capacity: usize,
     pub(in crate::player::backend::ffmpeg::avio::cache) chunk_size: usize,
     pub(in crate::player::backend::ffmpeg::avio::cache) range_request_bytes: u64,
+    pub(in crate::player::backend::ffmpeg::avio::cache) continuous_playback_requests: bool,
     pub(in crate::player::backend::ffmpeg::avio::cache) readahead_seconds: f64,
     pub(in crate::player::backend::ffmpeg::avio::cache) hysteresis_seconds: f64,
     pub(in crate::player::backend::ffmpeg::avio::cache) max_readahead_bytes: Option<u64>,

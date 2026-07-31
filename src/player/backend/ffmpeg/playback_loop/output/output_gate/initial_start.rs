@@ -591,9 +591,9 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn fail_initi
 ///
 /// This is deliberately callable by the coordinator before any status or
 /// stable snapshot. Epoch fencing makes queue/callback publications from the
-/// old prepare stale; physical queue cleanup is left to a later bounded AO
-/// service. The fallback anchor always remains the transaction's original
-/// audio target.
+/// old prepare stale; the next stable AO snapshot retries physical cleanup
+/// without blocking this deadline path. The fallback anchor always remains
+/// the transaction's original audio target.
 pub(in crate::player::backend::ffmpeg) fn expire_initial_av_start_hard_deadline(
     output_scheduler: &mut PlaybackOutputScheduler,
     output: Option<&AudioOutput>,
@@ -701,6 +701,7 @@ fn publish_initial_video_for_audio_commit(
             frame: frame.frame.clone(),
             timeline_nsecs: frame.timeline_nsecs,
             duration_nsecs: frame.duration_nsecs,
+            source_duration_nsecs: frame.source_duration_nsecs,
         };
         let timeline_nsecs = frame.timeline_nsecs;
         let duration_nsecs = frame.duration_nsecs;

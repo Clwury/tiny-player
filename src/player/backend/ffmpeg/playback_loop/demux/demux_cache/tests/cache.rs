@@ -3172,7 +3172,7 @@ fn demux_packet_cache_state_does_not_mark_seeked_range_as_bof() {
 }
 
 #[test]
-fn demux_packet_cache_state_cached_seek_invalidates_inflight_demux_read() {
+fn cached_seek_advances_reader_generation_without_moving_demux_input() {
     let mut state = DemuxPacketCacheState::new(
         0,
         0,
@@ -3183,35 +3183,37 @@ fn demux_packet_cache_state_cached_seek_invalidates_inflight_demux_read() {
     state.append_packet(cached_anchor(0, 1_000_000_000));
     close_seek_range(&mut state, 1_000_000_000);
     let generation = state.generation;
+    let demux_input_generation = state.demux_input_generation;
 
     assert_eq!(
         state.seek_cached(500_000_000, PlaybackSessionId(2)),
         Some(1.0)
     );
     assert!(state.generation > generation);
+    assert_eq!(state.demux_input_generation, demux_input_generation);
 }
 
 #[test]
-fn demux_packet_cache_discards_inflight_result_after_control_seek_request() {
+fn control_seek_request_alone_does_not_discard_linear_demux_read() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let shared = shared_for_test(Arc::clone(&control));
-    let generation = shared.generation();
+    let demux_input_generation = shared.demux_input_generation();
     let seek_generation = control.seek_generation();
 
     control.request_seek();
 
-    assert!(shared.should_discard_demux_result(generation, seek_generation));
+    assert!(!shared.should_discard_demux_read_result(demux_input_generation));
+    assert!(shared.should_discard_demux_seek_result(demux_input_generation, seek_generation));
 }
 
 #[test]
-fn pending_seek_wakes_cache_pause_wait_and_fences_inflight_demux_result() {
+fn pending_seek_wakes_cache_pause_without_dropping_linear_demux_read() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let mut config = cache_config_for_test();
     config.cache_pause = true;
     config.cache_pause_wait = 10.0;
     let (shared, _event_rx) = shared_with_config_for_test(Arc::clone(&control), config);
-    let generation = shared.generation();
-    let seek_generation = control.seek_generation();
+    let demux_input_generation = shared.demux_input_generation();
 
     {
         let mut guard = shared
@@ -3225,7 +3227,23 @@ fn pending_seek_wakes_cache_pause_wait_and_fences_inflight_demux_result() {
     control.request_seek();
 
     assert!(shared.wait_for_demux_permit().is_none());
-    assert!(shared.should_discard_demux_result(generation, seek_generation));
+    assert!(!shared.should_discard_demux_read_result(demux_input_generation));
+}
+
+#[test]
+fn low_level_seek_request_fences_inflight_demux_read() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let shared = shared_for_test(Arc::clone(&control));
+    let demux_input_generation = shared.demux_input_generation();
+    let seek_generation = control.request_seek();
+
+    shared
+        .state
+        .lock()
+        .expect("FFmpeg demux packet cache poisoned")
+        .request_seek(10.0, PlaybackSessionId(2), seek_generation, 10_000_000_000);
+
+    assert!(shared.should_discard_demux_read_result(demux_input_generation));
 }
 
 #[test]

@@ -18,6 +18,8 @@ pub(in crate::player::backend::ffmpeg) struct AudioOutput {
     pub(in crate::player::backend::ffmpeg::audio) stream_active: AtomicBool,
     pub(in crate::player::backend::ffmpeg::audio) stream_play_count: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) stream_pause_count: AtomicU64,
+    pub(in crate::player::backend::ffmpeg::audio) pending_fenced_reset_epoch: AtomicU64,
+    pub(in crate::player::backend::ffmpeg::audio) pending_fenced_reset_target_nsecs: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) sample_rate: c_int,
     pub(in crate::player::backend::ffmpeg::audio) channels: c_int,
     pub(in crate::player::backend::ffmpeg::audio) sample_format: String,

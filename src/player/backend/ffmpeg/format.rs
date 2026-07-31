@@ -39,8 +39,8 @@ impl FormatContext {
         control: Arc<FfmpegControl>,
         mut cached_io: Option<CachedAvio>,
     ) -> std::result::Result<Self, String> {
-        let url = CString::new(url).map_err(|_| "播放地址包含无效字符".to_string())?;
-        let mut options = input_format_options(http_headers, probe_profile)?;
+        let url_cstring = CString::new(url).map_err(|_| "播放地址包含无效字符".to_string())?;
+        let mut options = input_format_options(url, http_headers, probe_profile)?;
         let mut context = unsafe { ffi::avformat_alloc_context() };
         if context.is_null() {
             unsafe { ffi::av_dict_free(&mut options) };
@@ -57,7 +57,12 @@ impl FormatContext {
         }
 
         let result = unsafe {
-            ffi::avformat_open_input(&mut context, url.as_ptr(), ptr::null_mut(), &mut options)
+            ffi::avformat_open_input(
+                &mut context,
+                url_cstring.as_ptr(),
+                ptr::null_mut(),
+                &mut options,
+            )
         };
         unsafe { ffi::av_dict_free(&mut options) };
         if result < 0 {

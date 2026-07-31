@@ -74,6 +74,7 @@ fn http_cache_state_keeps_side_range_requests_small() {
 fn http_cache_state_proactively_queues_next_playback_range() {
     let config = HttpCacheConfig {
         range_request_bytes: 100,
+        continuous_playback_requests: false,
         ..HttpCacheConfig::for_test(1_000)
     };
     let mut state =
@@ -300,7 +301,7 @@ fn http_cache_state_splices_proactive_playback_range_at_active_end() {
     assert!(state.retained_ranges.is_empty());
 }
 #[test]
-fn http_cache_state_does_not_queue_stale_proactive_playback_continuation() {
+fn continuous_playback_does_not_queue_periodic_continuation() {
     let config = HttpCacheConfig {
         range_request_bytes: 6,
         ..HttpCacheConfig::for_test(64)

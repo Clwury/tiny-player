@@ -63,7 +63,12 @@ pub(super) fn service_decoded_video_frame_start(
     event_tx: &Sender<BackendEvent>,
 ) -> DecodedVideoFrameStartStatus {
     let raw_timestamp = frame_best_effort_timestamp(frame);
-    let timestamp = video_clock.map(raw_timestamp, video_time_base);
+    let verified_replay_target_nsecs = video_decode_recovery.verified_replay_target_nsecs();
+    let timestamp = if verified_replay_target_nsecs.is_some() {
+        video_clock.map_authoritative(raw_timestamp, video_time_base)
+    } else {
+        video_clock.map(raw_timestamp, video_time_base)
+    };
     subtitle_pipeline.refresh_timeline_origin(playback_timeline_origin_nsecs, video_clock);
     let frame_pts = FramePts {
         nsecs: timestamp.timeline_nsecs,
@@ -78,6 +83,8 @@ pub(super) fn service_decoded_video_frame_start(
             raw_timestamp,
             timeline_nsecs = timestamp.timeline_nsecs,
             current_start_position_nsecs = *current_start_position_nsecs,
+            verified_replay_target_nsecs,
+            authoritative_replay_timestamp = verified_replay_target_nsecs.is_some(),
             output_first_video_frame_pending = output_snapshot.first_video_frame_pending,
             recovery_waiting = video_decode_recovery.waiting_for_keyframe(),
             decode_error_flags = frame_decode_error_flags(frame),
@@ -90,9 +97,11 @@ pub(super) fn service_decoded_video_frame_start(
     }
 
     let realign_on_next_frame = video_decode_recovery.take_realign_on_next_frame();
+    let frame_start_position_nsecs =
+        video_decode_recovery.frame_start_position_nsecs(*current_start_position_nsecs);
     let start_action = decoded_video_frame_start_action(
         timestamp.timeline_nsecs,
-        *current_start_position_nsecs,
+        frame_start_position_nsecs,
         realign_on_next_frame,
         video_decode_recovery.requires_exact_seek_output(),
     );
@@ -114,6 +123,7 @@ pub(super) fn service_decoded_video_frame_start(
                         first_preroll_frame_nsecs = ?progress.first_preroll_frame_nsecs,
                         last_preroll_frame_nsecs = ?progress.last_preroll_frame_nsecs,
                         current_start_position_nsecs = *current_start_position_nsecs,
+                        frame_start_position_nsecs,
                         output_first_video_frame_pending = output_snapshot.first_video_frame_pending,
                         recovery_realign_on_next_frame = realign_on_next_frame,
                         "dropping decoded FFmpeg video frame as seek preroll before playback target"

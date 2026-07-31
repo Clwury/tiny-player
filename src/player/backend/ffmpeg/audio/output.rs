@@ -1,6 +1,6 @@
 use super::{
-    AUDIO_BUFFER_SECONDS, Arc, AudioOutput, AudioOutputActivitySnapshot, AudioOutputDrainStatus,
-    AudioOutputPushError, AudioOutputPushResult, AudioOutputServiceStage,
+    AUDIO_BUFFER_SECONDS, Arc, AtomicU64, AudioOutput, AudioOutputActivitySnapshot,
+    AudioOutputDrainStatus, AudioOutputPushError, AudioOutputPushResult, AudioOutputServiceStage,
     AudioOutputServiceStageGuard, AudioOutputServiceTelemetry, AudioOutputSnapshot,
     AudioOutputSnapshotTiming, AudioOutputStableSnapshot, AudioOutputTryPushTimedTiming,
     AudioOutputUnstableSnapshot, AudioQueueItem, AudioQueueShared, AudioQueueSnapshot, AudioShared,
@@ -147,6 +147,8 @@ impl AudioOutput {
             stream_active: std::sync::atomic::AtomicBool::new(false),
             stream_play_count: std::sync::atomic::AtomicU64::new(0),
             stream_pause_count: std::sync::atomic::AtomicU64::new(0),
+            pending_fenced_reset_epoch: AtomicU64::new(0),
+            pending_fenced_reset_target_nsecs: AtomicU64::new(0),
             sample_rate,
             channels,
             sample_format: sample_format_name,
@@ -185,6 +187,8 @@ impl AudioOutput {
             stream_active: std::sync::atomic::AtomicBool::new(false),
             stream_play_count: std::sync::atomic::AtomicU64::new(0),
             stream_pause_count: std::sync::atomic::AtomicU64::new(0),
+            pending_fenced_reset_epoch: AtomicU64::new(0),
+            pending_fenced_reset_target_nsecs: AtomicU64::new(0),
             sample_rate,
             channels,
             sample_format: "f32".to_string(),
@@ -389,6 +393,7 @@ impl AudioOutput {
         self.shared.reset_clock_at_epoch(timeline_nsecs, epoch);
         let shared_reset = shared_started_at.elapsed();
         drop(reset_mutation);
+        self.clear_pending_fenced_reset_through(epoch);
         log_audio_output_reset_clock_timing(
             timeline_nsecs,
             started_at.elapsed(),
@@ -400,7 +405,8 @@ impl AudioOutput {
     /// Immediately makes every callback/queue publication from the old clock
     /// epoch stale without waiting for either audio mutex. The regular reset
     /// path performs physical cleanup later; this fence exists so the playback
-    /// coordinator can always terminate an expired output transaction.
+    /// coordinator can always terminate an expired output transaction. A
+    /// later stable snapshot retries that cleanup without blocking here.
     pub(in crate::player::backend::ffmpeg) fn fence_clock_without_wait(
         &self,
         timeline_nsecs: u64,
@@ -409,6 +415,10 @@ impl AudioOutput {
         let mutation = self.timeline.begin_mutation();
         let epoch = self.timeline.advance_epoch();
         self.shared.set_queued_end_timeline_nsecs(timeline_nsecs);
+        self.pending_fenced_reset_target_nsecs
+            .store(timeline_nsecs, Ordering::Relaxed);
+        self.pending_fenced_reset_epoch
+            .store(epoch, Ordering::Release);
         drop(mutation);
         self.queue.ready.notify_all();
         self.shared.ready.notify_all();
@@ -545,13 +555,12 @@ impl AudioOutput {
         let mut state = match self.queue.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => {
-                let epoch = self.fence_clock_without_wait(reset_timeline_nsecs);
-                self.try_publish_fenced_reset(reset_timeline_nsecs, epoch);
+                self.fence_clock_without_wait(reset_timeline_nsecs);
+                let _ = self.try_reconcile_pending_fenced_reset();
                 return Ok(None);
             }
             Err(TryLockError::Poisoned(_)) => {
-                let epoch = self.fence_clock_without_wait(reset_timeline_nsecs);
-                self.try_publish_fenced_reset(reset_timeline_nsecs, epoch);
+                self.fence_clock_without_wait(reset_timeline_nsecs);
                 return Err("系统音频解码队列已损坏".to_string());
             }
         };
@@ -570,30 +579,109 @@ impl AudioOutput {
             .collect::<Vec<_>>();
         state.clear();
         drop(state);
-        let epoch = self.fence_clock_without_wait(reset_timeline_nsecs);
-        self.try_publish_fenced_reset(reset_timeline_nsecs, epoch);
+        self.fence_clock_without_wait(reset_timeline_nsecs);
+        self.try_reconcile_pending_fenced_reset()?;
         Ok(Some(staged))
     }
 
-    fn try_publish_fenced_reset(&self, timeline_nsecs: u64, epoch: u64) -> bool {
+    fn clear_pending_fenced_reset_through(&self, completed_epoch: u64) {
+        loop {
+            let pending_epoch = self.pending_fenced_reset_epoch.load(Ordering::Acquire);
+            if pending_epoch == 0 || pending_epoch > completed_epoch {
+                return;
+            }
+            if self
+                .pending_fenced_reset_epoch
+                .compare_exchange(pending_epoch, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Completes the physical half of a lock-free epoch fence once all AO
+    /// locks can be acquired without waiting. Without this reconciliation the
+    /// timeline and queue move to the new epoch while the ring buffer remains
+    /// on the old one, making every subsequent stable snapshot fail forever.
+    fn try_reconcile_pending_fenced_reset(&self) -> std::result::Result<bool, String> {
+        let pending_epoch = self.pending_fenced_reset_epoch.load(Ordering::Acquire);
+        if pending_epoch == 0 || self.timeline.epoch() != pending_epoch || self.timeline.active() {
+            return Ok(false);
+        }
+        let reset_timeline_nsecs = self
+            .pending_fenced_reset_target_nsecs
+            .load(Ordering::Acquire);
+        let mut queue = match self.queue.state.try_lock() {
+            Ok(queue) => queue,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("系统音频解码队列已损坏".to_string());
+            }
+        };
         let mut buffer = match self.shared.buffer.try_lock() {
             Ok(buffer) => buffer,
-            Err(_) => return false,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("系统音频缓冲区已损坏".to_string());
+            }
         };
-        let _publish = match self.shared.callback_publish_guard.try_lock() {
+        let publish = match self.shared.callback_publish_guard.try_lock() {
             Ok(publish) => publish,
-            Err(_) => return false,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
+        if self.pending_fenced_reset_epoch.load(Ordering::Acquire) != pending_epoch
+            || self.timeline.epoch() != pending_epoch
+            || self.timeline.active()
+        {
+            return Ok(false);
+        }
+
+        let stale_queue_items = queue
+            .items
+            .len()
+            .saturating_add(usize::from(queue.in_flight.is_some()));
+        let mutation = self.timeline.begin_mutation();
+        self.timeline
+            .record_stale_queue_items(u64::try_from(stale_queue_items).unwrap_or(u64::MAX));
+        queue.clear();
         buffer.clear();
-        buffer.epoch = epoch;
-        self.shared.set_queued_end_timeline_nsecs(timeline_nsecs);
+        buffer.epoch = pending_epoch;
+        self.shared
+            .set_queued_end_timeline_nsecs(reset_timeline_nsecs);
         self.shared.played_samples.store(
-            audio_elements_for_duration_floor(timeline_nsecs, self.sample_rate, self.channels),
+            audio_elements_for_duration_floor(
+                reset_timeline_nsecs,
+                self.sample_rate,
+                self.channels,
+            ),
             Ordering::Release,
         );
+        self.shared
+            .published_played_timeline_nsecs
+            .store(reset_timeline_nsecs, Ordering::Release);
         self.shared.update_output_delay_unfenced(Duration::ZERO);
         self.shared.clear_underrun();
-        true
+        let completed = self
+            .pending_fenced_reset_epoch
+            .compare_exchange(pending_epoch, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        drop(mutation);
+        drop(publish);
+        drop(buffer);
+        drop(queue);
+        self.queue.ready.notify_all();
+        self.shared.ready.notify_all();
+        if completed {
+            tracing::debug!(
+                audio_epoch = pending_epoch,
+                reset_timeline_nsecs,
+                stale_queue_items,
+                "reconciled deferred physical audio reset before stable snapshot"
+            );
+        }
+        Ok(completed)
     }
 
     pub(in crate::player::backend::ffmpeg) fn underrun_active(&self) -> bool {
@@ -732,6 +820,7 @@ impl AudioOutput {
     }
 
     fn stable_snapshot_untracked(&self) -> std::result::Result<AudioOutputStableSnapshot, String> {
+        let _ = self.try_reconcile_pending_fenced_reset()?;
         stable_audio_output_snapshot_from_parts(
             &self.shared,
             &self.queue,

@@ -133,7 +133,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
                 );
                 continue;
             }
-            let generation = shared.generation();
+            let demux_input_generation = shared.demux_input_generation();
             let seek_generation = request.seek_generation;
             tracing::debug!(
                 ?request.session_id,
@@ -143,7 +143,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
                     request.position_seconds
                 ),
                 preroll_nsecs = video_seek_preroll_nsecs(video_stream.codec_id),
-                generation,
+                demux_input_generation,
                 seek_generation,
                 "FFmpeg demux thread applying low-level seek"
             );
@@ -151,12 +151,13 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
                 video_stream,
                 preroll_seek_position_seconds(video_stream.codec_id, request.position_seconds),
             ) {
-                if shared.should_discard_demux_result(generation, seek_generation) {
+                if shared.should_discard_demux_seek_result(demux_input_generation, seek_generation)
+                {
                     tracing::debug!(
                         ?request.session_id,
                         position_seconds = request.position_seconds,
-                        generation,
-                        current_generation = shared.generation(),
+                        demux_input_generation,
+                        current_demux_input_generation = shared.demux_input_generation(),
                         seek_generation,
                         current_seek_generation = shared.control.seek_generation(),
                         %error,
@@ -167,12 +168,12 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
                 shared.set_error(error);
                 continue;
             }
-            if shared.should_discard_demux_result(generation, seek_generation) {
+            if shared.should_discard_demux_seek_result(demux_input_generation, seek_generation) {
                 tracing::debug!(
                     ?request.session_id,
                     position_seconds = request.position_seconds,
-                    generation,
-                    current_generation = shared.generation(),
+                    demux_input_generation,
+                    current_demux_input_generation = shared.demux_input_generation(),
                     seek_generation,
                     current_seek_generation = shared.control.seek_generation(),
                     "discarding FFmpeg demux seek result after newer seek"
@@ -186,7 +187,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
                     video_stream.codec_id,
                     request.position_seconds
                 ),
-                generation,
+                demux_input_generation,
                 seek_generation,
                 "FFmpeg demux thread low-level seek applied"
             );
@@ -205,7 +206,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
             );
         }
 
-        let generation = shared.generation();
+        let demux_input_generation = shared.demux_input_generation();
         let seek_generation = shared.control.seek_generation();
         if shared.control.has_pending_seek() {
             thread::yield_now();
@@ -223,14 +224,14 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
             packet.unref();
             break;
         }
-        if shared.should_discard_demux_result(generation, seek_generation) {
+        if shared.should_discard_demux_read_result(demux_input_generation) {
             tracing::debug!(
-                generation,
-                current_generation = shared.generation(),
-                seek_generation,
+                demux_input_generation,
+                current_demux_input_generation = shared.demux_input_generation(),
+                read_seek_generation = seek_generation,
                 current_seek_generation = shared.control.seek_generation(),
                 read_result = read,
-                "discarding FFmpeg demux read result after newer seek"
+                "discarding FFmpeg demux read result after demux input moved"
             );
             packet.unref();
             if read_recovery.reset(
@@ -254,20 +255,20 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
                 shared.clear_producer_recovery();
                 tracing::info!(
                     recovered_errors,
-                    generation,
+                    demux_input_generation,
                     seek_generation,
                     "FFmpeg demux producer recovered after bounded read retries"
                 );
             }
             match timeline.cache_packet(&packet, &shared.event_tx) {
                 Ok(Some(cached)) => {
-                    if shared.should_discard_demux_result(generation, seek_generation) {
+                    if shared.should_discard_demux_read_result(demux_input_generation) {
                         tracing::debug!(
-                            generation,
-                            current_generation = shared.generation(),
-                            seek_generation,
+                            demux_input_generation,
+                            current_demux_input_generation = shared.demux_input_generation(),
+                            read_seek_generation = seek_generation,
                             current_seek_generation = shared.control.seek_generation(),
-                            "discarding FFmpeg demux packet before append after newer seek"
+                            "discarding FFmpeg demux packet before append after demux input moved"
                         );
                     } else {
                         shared.append_packet(cached);
@@ -343,7 +344,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
         tracing::debug!(
             read_result = read,
             %error,
-            generation,
+            demux_input_generation,
             seek_generation,
             consecutive_errors = read_recovery.consecutive_errors,
             max_consecutive_errors = DEMUX_READ_MAX_CONSECUTIVE_ERRORS,

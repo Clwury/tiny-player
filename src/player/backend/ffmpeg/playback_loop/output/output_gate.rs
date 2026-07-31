@@ -264,6 +264,7 @@ pub(in crate::player::backend::ffmpeg) enum OutputServiceDemand {
     None,
     PeriodicProbe,
     OutputStateChanged,
+    DecodeRecovery,
     AudioStartDue,
     HardDeadline,
 }
@@ -286,6 +287,7 @@ impl OutputServiceDemand {
             Self::None => "none",
             Self::PeriodicProbe => "periodic_probe",
             Self::OutputStateChanged => "output_state_changed",
+            Self::DecodeRecovery => "decode_recovery",
             Self::AudioStartDue => "audio_start_due",
             Self::HardDeadline => "hard_deadline",
         }
@@ -301,6 +303,8 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) struct Initia
     pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) first_audio_nsecs:
         Option<u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) decoded_video_nsecs:
+        Option<u64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) strict_video_nsecs:
         Option<u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) decoded_audio_nsecs:
         Option<u64>,
@@ -538,10 +542,24 @@ pub(in crate::player::backend::ffmpeg) const DECODE_RECOVERY_AUDIO_READY_HYSTERE
 pub(in crate::player::backend::ffmpeg) const DECODE_RECOVERY_DECODER_IN_FLIGHT_ALLOWANCE: usize = 4;
 pub(in crate::player::backend::ffmpeg) const DECODE_RECOVERY_HOLD_GAP_MAX_NSECS: u64 =
     5_000_000_000;
+// mpv's calculate_frame_duration() accepts three milliseconds of mux
+// timestamp rounding plus 0.1ms of slack. Apply the same tolerance at tiny's
+// bounded recovery limit: a nominal five-second GOP can otherwise measure
+// 5,000,041,668ns after rational timestamps and integer frame durations are
+// converted to nanoseconds.
+pub(in crate::player::backend::ffmpeg) const DECODE_RECOVERY_TIMESTAMP_TOLERANCE_NSECS: u64 =
+    3_100_000;
 pub(in crate::player::backend::ffmpeg) const DECODE_RECOVERY_MAX_REPLAY_SPAN_NSECS: u64 =
     5_000_000_000;
 pub(in crate::player::backend::ffmpeg) const DECODE_RECOVERY_MAX_WALL_TIME: Duration =
     Duration::from_secs(5);
+
+pub(in crate::player::backend::ffmpeg) fn decode_recovery_gap_within_limit(
+    gap_nsecs: u64,
+    max_gap_nsecs: u64,
+) -> bool {
+    gap_nsecs <= max_gap_nsecs.saturating_add(DECODE_RECOVERY_TIMESTAMP_TOLERANCE_NSECS)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) enum DecodeRecoveryDisposition {
@@ -554,6 +572,7 @@ pub(in crate::player::backend::ffmpeg) enum DecodeRecoveryDisposition {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) enum DecodeRecoverySource {
+    DecoderError,
     FlushReplay,
     VulkanReopenReplay,
     CachedSafeIdrRebuild,
@@ -564,6 +583,7 @@ pub(in crate::player::backend::ffmpeg) enum DecodeRecoverySource {
 impl DecodeRecoverySource {
     pub(in crate::player::backend::ffmpeg) fn as_str(self) -> &'static str {
         match self {
+            Self::DecoderError => "decoder_error",
             Self::FlushReplay => "flush_replay",
             Self::VulkanReopenReplay => "vulkan_reopen_replay",
             Self::CachedSafeIdrRebuild => "cached_safe_idr_rebuild",

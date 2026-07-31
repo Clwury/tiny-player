@@ -36,6 +36,11 @@ impl HttpCacheConfig {
             memory_capacity,
             chunk_size,
             range_request_bytes,
+            // mpv keeps the active HTTP stream open and only issues a new
+            // range after an actual seek or network failure. Use one request
+            // through the known content end; bounded requests remain available
+            // to bootstrap an unknown length and to service side-cache probes.
+            continuous_playback_requests: true,
             readahead_seconds: env_f64(
                 "TINY_HTTP_CACHE_READAHEAD_SECS",
                 config.effective_readahead_secs(cache_active),
@@ -65,6 +70,7 @@ impl HttpCacheConfig {
             memory_capacity,
             chunk_size: HTTP_CACHE_CHUNK_SIZE.min(memory_capacity.max(1)),
             range_request_bytes: HTTP_CACHE_RANGE_REQUEST_BYTES,
+            continuous_playback_requests: true,
             readahead_seconds: HTTP_CACHE_DEFAULT_READAHEAD_SECONDS,
             hysteresis_seconds: HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS,
             max_readahead_bytes: None,

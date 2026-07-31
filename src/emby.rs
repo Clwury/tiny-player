@@ -120,7 +120,8 @@ impl EmbyClient {
         T: DeserializeOwned,
     {
         let url = api_url(endpoint, path_segments)?;
-        debug!(method = %method, url = %redacted_url_for_log(&url), "sending Emby public request");
+        let include_secrets = log_secrets();
+        debug!(method = %method, url = %url_for_log(&url, include_secrets), "sending Emby public request");
         let response = self
             .http
             .request(method, url)
@@ -129,8 +130,17 @@ impl EmbyClient {
             .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;
 
         let status = response.status();
+        let response_headers = include_secrets.then(|| format!("{:?}", response.headers()));
         let response_body = response.text().context("读取 Emby API 响应失败")?;
         debug!(status = %status, "received Emby public response");
+        if let Some(response_headers) = response_headers {
+            debug!(
+                status = %status,
+                headers = %response_headers,
+                body = %response_body,
+                "full Emby public response"
+            );
+        }
 
         if !status.is_success() {
             bail!("{http_error_prefix}：HTTP {status} {response_body}");
@@ -154,8 +164,18 @@ impl EmbyClient {
             .as_deref()
             .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
         let authorization = self.authenticated_authorization_header(access_token, user_id);
+        let include_secrets = log_secrets();
 
-        debug!(method = %method, url = %redacted_url_for_log(&url), "sending authenticated Emby request");
+        debug!(method = %method, url = %url_for_log(&url, include_secrets), "sending authenticated Emby request");
+        if include_secrets {
+            debug!(
+                method = %method,
+                url = %url,
+                x_emby_authorization = %authorization,
+                x_emby_token = %access_token,
+                "full authenticated Emby request headers"
+            );
+        }
 
         let response = self
             .http
@@ -169,8 +189,17 @@ impl EmbyClient {
             .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;
 
         let status = response.status();
+        let response_headers = include_secrets.then(|| format!("{:?}", response.headers()));
         let response_body = response.text().context("读取 Emby API 响应失败")?;
         debug!(status = %status, "received authenticated Emby response");
+        if let Some(response_headers) = response_headers {
+            debug!(
+                status = %status,
+                headers = %response_headers,
+                body = %response_body,
+                "full authenticated Emby response"
+            );
+        }
 
         if !status.is_success() {
             bail!("Emby API 请求失败：HTTP {status} {response_body}");
@@ -199,8 +228,19 @@ impl EmbyClient {
             .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
         let authorization = self.authenticated_authorization_header(access_token, user_id);
         let request_body = serde_json::to_string(body).context("序列化 Emby API 请求失败")?;
+        let include_secrets = log_secrets();
 
-        debug!(method = %method, url = %redacted_url_for_log(&url), "sending authenticated Emby request with body");
+        debug!(method = %method, url = %url_for_log(&url, include_secrets), "sending authenticated Emby request with body");
+        if include_secrets {
+            debug!(
+                method = %method,
+                url = %url,
+                x_emby_authorization = %authorization,
+                x_emby_token = %access_token,
+                body = %request_body,
+                "full authenticated Emby request with body"
+            );
+        }
 
         let response = self
             .http
@@ -215,8 +255,17 @@ impl EmbyClient {
             .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;
 
         let status = response.status();
+        let response_headers = include_secrets.then(|| format!("{:?}", response.headers()));
         let response_body = response.text().context("读取 Emby API 响应失败")?;
         debug!(status = %status, "received authenticated Emby response");
+        if let Some(response_headers) = response_headers {
+            debug!(
+                status = %status,
+                headers = %response_headers,
+                body = %response_body,
+                "full authenticated Emby response"
+            );
+        }
 
         if !status.is_success() {
             bail!("Emby API 请求失败：HTTP {status} {response_body}");
@@ -240,8 +289,18 @@ impl EmbyClient {
             .as_deref()
             .ok_or_else(|| anyhow!("Emby 用户 ID 缺失，请重新登录服务器"))?;
         let authorization = self.authenticated_authorization_header(access_token, user_id);
+        let include_secrets = log_secrets();
 
-        debug!(method = %method, url = %redacted_url_for_log(&url), "sending authenticated Emby image request");
+        debug!(method = %method, url = %url_for_log(&url, include_secrets), "sending authenticated Emby image request");
+        if include_secrets {
+            debug!(
+                method = %method,
+                url = %url,
+                x_emby_authorization = %authorization,
+                x_emby_token = %access_token,
+                "full authenticated Emby image request headers"
+            );
+        }
 
         let response = self
             .http
@@ -255,8 +314,17 @@ impl EmbyClient {
 
         let status = response.status();
         let content_type = content_type_header(response.headers());
+        let response_headers = include_secrets.then(|| format!("{:?}", response.headers()));
         let response_bytes = response.bytes().context("读取 Emby 图片响应失败")?;
         debug!(status = %status, bytes = response_bytes.len(), "received authenticated Emby image response");
+        if let Some(response_headers) = response_headers {
+            debug!(
+                status = %status,
+                headers = %response_headers,
+                bytes = response_bytes.len(),
+                "full authenticated Emby image response metadata"
+            );
+        }
 
         if !status.is_success() {
             let body_preview = String::from_utf8_lossy(&response_bytes);
@@ -322,6 +390,24 @@ fn content_type_header(headers: &HeaderMap) -> Option<String> {
         })
 }
 
+const LOG_SECRETS_ENV: &str = "TINY_LOG_SECRETS";
+
+fn log_secrets() -> bool {
+    log_secrets_from_value(std::env::var_os(LOG_SECRETS_ENV).as_deref())
+}
+
+fn log_secrets_from_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
+}
+
+fn url_for_log(url: &url::Url, include_secrets: bool) -> String {
+    if include_secrets {
+        url.to_string()
+    } else {
+        redacted_url_for_log(url)
+    }
+}
+
 fn redacted_url_for_log(url: &url::Url) -> String {
     let mut redacted = url.clone();
     if redacted.query().is_some() {
@@ -360,17 +446,39 @@ fn api_url(endpoint: &ServerEndpoint, path_segments: &[&str]) -> Result<url::Url
 
 #[cfg(test)]
 mod log_safety_tests {
-    use super::redacted_url_for_log;
+    use std::ffi::OsStr;
+
+    use super::{log_secrets_from_value, url_for_log};
 
     #[test]
-    fn authenticated_url_log_never_contains_query_credentials() {
+    fn authenticated_url_log_hides_credentials_by_default() {
         let url = url::Url::parse("https://example.test/video.mkv?api_key=secret-token&quality=90")
             .unwrap();
 
-        let logged = redacted_url_for_log(&url);
+        let logged = url_for_log(&url, false);
 
         assert!(!logged.contains("secret-token"));
         assert!(logged.contains("quality=90"));
         assert!(logged.contains("api_key="));
+    }
+
+    #[test]
+    fn authenticated_url_log_includes_credentials_when_explicitly_enabled() {
+        let url = url::Url::parse("https://example.test/video.mkv?api_key=secret-token&quality=90")
+            .unwrap();
+
+        let logged = url_for_log(&url, true);
+
+        assert!(logged.contains("secret-token"));
+        assert!(logged.contains("quality=90"));
+    }
+
+    #[test]
+    fn log_secrets_requires_explicit_one() {
+        assert!(!log_secrets_from_value(None));
+        assert!(!log_secrets_from_value(Some(OsStr::new(""))));
+        assert!(!log_secrets_from_value(Some(OsStr::new("0"))));
+        assert!(!log_secrets_from_value(Some(OsStr::new("true"))));
+        assert!(log_secrets_from_value(Some(OsStr::new("1"))));
     }
 }

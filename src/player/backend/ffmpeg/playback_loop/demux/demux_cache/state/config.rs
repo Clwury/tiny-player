@@ -110,6 +110,7 @@ impl DemuxPacketCacheState {
             seekability_revision: 0,
             last_emitted_seekability_revision: None,
             cache_state_emit_dirty: false,
+            demux_input_generation: 0,
             generation: 0,
             producer_recovery_error: None,
             producer_recovery_consecutive_errors: 0,

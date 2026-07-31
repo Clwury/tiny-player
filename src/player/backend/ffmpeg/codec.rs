@@ -7,9 +7,8 @@ use std::{
     sync::Arc,
 };
 
-use ffmpeg_sys_next as ffi;
-
 use crate::player::render_host::{FrameBufferPool, PooledBytes, RenderSize, VulkanDecodeDevice};
+use ffmpeg_sys_next as ffi;
 
 use super::audio::{audio_sample_len, frame_sample_format, zeroed_channel_layout};
 use super::subtitle::{DecodedSubtitleCue, decoded_subtitle_cues};
@@ -425,7 +424,13 @@ fn video_error_recognition(codec_id: ffi::AVCodecID) -> Option<c_int> {
         ffi::AVCodecID::AV_CODEC_ID_H264 => {
             Some(ffi::AV_EF_BITSTREAM | ffi::AV_EF_BUFFER | ffi::AV_EF_EXPLODE)
         }
-        ffi::AVCodecID::AV_CODEC_ID_HEVC => Some(ffi::AV_EF_BITSTREAM | ffi::AV_EF_BUFFER),
+        // FFmpeg otherwise logs a missing HEVC reference, swallows
+        // AVERROR_INVALIDDATA at the NAL boundary, and reports the packet as
+        // consumed. That hides a broken RPS from tiny until the next IDR makes
+        // the multi-second output hole observable. EXPLODE preserves FFmpeg's
+        // normal bitstream checks while surfacing this error immediately to
+        // the existing flush-and-realign recovery path.
+        ffi::AVCodecID::AV_CODEC_ID_HEVC => Some(ffi::AV_EF_EXPLODE),
         _ => None,
     }
 }
@@ -982,6 +987,7 @@ impl AvPacket {
 
     pub(super) fn unref(&mut self) {
         unsafe { ffi::av_packet_unref(self.ptr) };
+        self.read_diagnostic = None;
     }
 }
 
@@ -1465,14 +1471,14 @@ mod tests {
     }
 
     #[test]
-    fn video_error_recognition_keeps_hevc_decode_errors_non_fatal() {
+    fn video_error_recognition_surfaces_hevc_rps_failures() {
         assert_eq!(
             video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_H264),
             Some(ffi::AV_EF_BITSTREAM | ffi::AV_EF_BUFFER | ffi::AV_EF_EXPLODE)
         );
         assert_eq!(
             video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_HEVC),
-            Some(ffi::AV_EF_BITSTREAM | ffi::AV_EF_BUFFER)
+            Some(ffi::AV_EF_EXPLODE)
         );
         assert_eq!(
             video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_MPEG4),

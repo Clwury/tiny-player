@@ -531,6 +531,7 @@ fn identical_initial_sync_state_is_suppressed_and_summarized_every_500ms() {
         first_video_nsecs: Some(184_700_000_000),
         first_audio_nsecs: Some(184_714_739_000),
         decoded_video_nsecs: Some(33_333_333),
+        strict_video_nsecs: Some(33_333_333),
         decoded_audio_nsecs: Some(626_938_758),
         demux_min_nsecs: Some(33_333_333),
         blocked_on: "insufficient_lookahead",

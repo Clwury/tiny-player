@@ -4,12 +4,13 @@ use ffmpeg_sys_next as ffi;
 
 use super::super::{
     FFMPEG_FAST_ANALYZE_DURATION_US, FFMPEG_FAST_PROBE_SIZE, FFMPEG_SUBTITLE_ANALYZE_DURATION_US,
-    FFMPEG_SUBTITLE_PROBE_SIZE, HTTP_CACHE_RANGE_REQUEST_TIMEOUT,
+    FFMPEG_SUBTITLE_PROBE_SIZE, HTTP_CACHE_NETWORK_READ_TIMEOUT, HTTP_CACHE_RANGE_REQUEST_TIMEOUT,
     HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES, HTTP_CACHE_SMALL_RANGE_REQUEST_TIMEOUT,
     InputProbeProfile, ffmpeg_error,
 };
 
 pub(in crate::player::backend::ffmpeg) fn input_format_options(
+    url: &str,
     http_headers: &[(String, String)],
     probe_profile: InputProbeProfile,
 ) -> std::result::Result<*mut ffi::AVDictionary, String> {
@@ -36,6 +37,20 @@ pub(in crate::player::backend::ffmpeg) fn input_format_options(
         ) {
             unsafe { ffi::av_dict_free(&mut options) };
             return Err(error);
+        }
+    }
+
+    if should_cache_http_url(url) {
+        let network_timeout_micros = HTTP_CACHE_NETWORK_READ_TIMEOUT.as_micros().to_string();
+        for (name, value) in [
+            ("reconnect", "1"),
+            ("reconnect_delay_max", "7"),
+            ("timeout", network_timeout_micros.as_str()),
+        ] {
+            if let Err(error) = set_input_format_option(&mut options, name, value) {
+                unsafe { ffi::av_dict_free(&mut options) };
+                return Err(error);
+            }
         }
     }
 

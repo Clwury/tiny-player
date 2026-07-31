@@ -13,24 +13,25 @@ use super::{
     BackendEvent, DECODE_RECOVERY_AUDIO_READY_HYSTERESIS_NSECS,
     DECODE_RECOVERY_DECODER_IN_FLIGHT_ALLOWANCE, DECODE_RECOVERY_HOLD_GAP_MAX_NSECS,
     DECODE_RECOVERY_MAX_REPLAY_SPAN_NSECS, DECODE_RECOVERY_MAX_WALL_TIME,
-    DECODE_RECOVERY_STAGING_NSECS, DecodeRecoveryDisposition, DecodeRecoveryDropForFallback,
-    DecodeRecoveryGapProvenance, DecodeRecoveryPhase, DecodeRecoverySource,
-    DecodeRecoveryTransaction, Duration, FfmpegControl, INITIAL_AUDIO_DEFER_LOG_SUMMARY_INTERVAL,
-    INITIAL_AUDIO_START_RETRY_INTERVAL, INITIAL_AV_START_HARD_TIMEOUT,
-    INITIAL_SYNC_LOG_SUMMARY_INTERVAL, InitialAudioDeferLogState, InitialAudioDeferObservation,
-    InitialAudioPreparePhase, InitialAudioPrepareToken, InitialAudioTransientRetry,
-    InitialAvStartTransaction, InitialSyncLogDecision, InitialSyncLogObservation,
-    InitialSyncLogState, Instant, OUTPUT_GATE_PERIODIC_PROBE_INTERVAL, OutputGateBlockLogEmission,
-    OutputGateBlockLogState, OutputServiceDemand, PENDING_AUDIO_CONTINUITY_TOLERANCE,
-    PendingAudioRetentionAnchorSource, PendingAudioRetentionPlan, PendingStartAudio,
-    PendingStartAudioPressureLevel, PlaybackBlockReason, PlaybackOutputScheduler,
-    PlaybackOutputSnapshot, PlaybackOutputState, PlaybackResumeWaterline, PlaybackScheduler,
-    PlaybackSessionId, PrestartAudioOwnership, PrestartAudioOwnershipLogState, QueuedVideoFrame,
-    RebufferAudioRealignRequest, ScheduledVideoQueue, Sender,
-    VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
-    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE,
-    VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, VideoDeadlineService, VideoOutputQueue,
-    VideoOutputUnderflowClassification, clear_video_output_rebuffer, duration_nsecs,
+    DECODE_RECOVERY_STAGING_NSECS, DECODE_RECOVERY_TIMESTAMP_TOLERANCE_NSECS,
+    DecodeRecoveryDisposition, DecodeRecoveryDropForFallback, DecodeRecoveryGapProvenance,
+    DecodeRecoveryPhase, DecodeRecoverySource, DecodeRecoveryTransaction, Duration, FfmpegControl,
+    INITIAL_AUDIO_DEFER_LOG_SUMMARY_INTERVAL, INITIAL_AUDIO_START_RETRY_INTERVAL,
+    INITIAL_AV_START_HARD_TIMEOUT, INITIAL_SYNC_LOG_SUMMARY_INTERVAL, InitialAudioDeferLogState,
+    InitialAudioDeferObservation, InitialAudioPreparePhase, InitialAudioPrepareToken,
+    InitialAudioTransientRetry, InitialAvStartTransaction, InitialSyncLogDecision,
+    InitialSyncLogObservation, InitialSyncLogState, Instant, OUTPUT_GATE_PERIODIC_PROBE_INTERVAL,
+    OutputGateBlockLogEmission, OutputGateBlockLogState, OutputServiceDemand,
+    PENDING_AUDIO_CONTINUITY_TOLERANCE, PendingAudioRetentionAnchorSource,
+    PendingAudioRetentionPlan, PendingStartAudio, PendingStartAudioPressureLevel,
+    PlaybackBlockReason, PlaybackOutputScheduler, PlaybackOutputSnapshot, PlaybackOutputState,
+    PlaybackResumeWaterline, PlaybackScheduler, PlaybackSessionId, PrestartAudioOwnership,
+    PrestartAudioOwnershipLogState, QueuedVideoFrame, RebufferAudioRealignRequest,
+    ScheduledVideoQueue, Sender, VIDEO_OUTPUT_REBUFFER_AUDIO_STALL_FALLBACK_AFTER,
+    VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER,
+    VideoDeadlineService, VideoOutputQueue, VideoOutputUnderflowClassification,
+    clear_video_output_rebuffer, decode_recovery_gap_within_limit, duration_nsecs,
     enter_video_output_rebuffer, finish_video_output_rebuffer_if_ready,
     video_output_rebuffer_should_enter, video_output_underflow_classification,
 };
@@ -444,6 +445,10 @@ impl PlaybackOutputScheduler {
             last_rejected_frame_nsecs: None,
             last_rejection_log_at: None,
         });
+        // Decoder input can become blocked as soon as recovery owns frame
+        // admission. Wake the output side independently so the transaction is
+        // not waiting for another demux/decode event to make progress.
+        self.note_output_housekeeping_change();
         tracing::warn!(
             session_id = ?session_id,
             transaction_id = transaction_id.max(1),
@@ -480,6 +485,18 @@ impl PlaybackOutputScheduler {
     pub(in crate::player::backend::ffmpeg) fn decode_recovery_active(&self) -> bool {
         self.decode_recovery_phase()
             .is_some_and(|phase| !phase.terminal())
+    }
+
+    fn decode_recovery_drained_boundary_ready(&self) -> bool {
+        self.scheduled_video_queue.is_empty()
+            && self
+                .decode_recovery_transaction
+                .as_ref()
+                .is_some_and(|transaction| {
+                    transaction.phase == DecodeRecoveryPhase::Buffered
+                        && transaction.source == DecodeRecoverySource::DecoderError
+                        && transaction.disposition == DecodeRecoveryDisposition::Reanchor
+                })
     }
 
     pub(in crate::player::backend::ffmpeg) fn decode_recovery_owns_video_admission(&self) -> bool {
@@ -755,7 +772,25 @@ impl PlaybackOutputScheduler {
                 transaction.largest_confirmed_gap_nsecs = transaction
                     .largest_confirmed_gap_nsecs
                     .max(initial_gap_nsecs);
-                if initial_gap_nsecs > 0 && initial_gap_nsecs <= DECODE_RECOVERY_HOLD_GAP_MAX_NSECS
+                if transaction.source == DecodeRecoverySource::DecoderError
+                    && initial_gap_nsecs > DECODE_RECOVERY_TIMESTAMP_TOLERANCE_NSECS
+                {
+                    transaction.disposition = DecodeRecoveryDisposition::Reanchor;
+                    transaction.resume_nsecs = frame.timeline_nsecs;
+                    tracing::warn!(
+                        session_id = ?session_id,
+                        transaction_id = transaction.transaction_id,
+                        recovery_source = transaction.source.as_str(),
+                        target_nsecs = transaction.target_nsecs,
+                        resume_nsecs = transaction.resume_nsecs,
+                        decoder_output_gap_ms = initial_gap_nsecs as f64 / 1_000_000.0,
+                        "scheduled HEVC decoder-error gap for boundary reanchor"
+                    );
+                } else if initial_gap_nsecs > 0
+                    && decode_recovery_gap_within_limit(
+                        initial_gap_nsecs,
+                        DECODE_RECOVERY_HOLD_GAP_MAX_NSECS,
+                    )
                 {
                     transaction.disposition = DecodeRecoveryDisposition::HoldGap;
                     transaction.bridged_gap_count = transaction.bridged_gap_count.saturating_add(1);
@@ -767,9 +802,14 @@ impl PlaybackOutputScheduler {
                         confirmed_gap_ms = initial_gap_nsecs as f64 / 1_000_000.0,
                         hold_gap_limit_ms =
                             DECODE_RECOVERY_HOLD_GAP_MAX_NSECS as f64 / 1_000_000.0,
-                        "accepted software replay frame after confirmed media timeline gap"
+                        timestamp_tolerance_ms =
+                            DECODE_RECOVERY_TIMESTAMP_TOLERANCE_NSECS as f64 / 1_000_000.0,
+                        "accepted recovery frame after confirmed media timeline gap"
                     );
-                } else if initial_gap_nsecs > DECODE_RECOVERY_HOLD_GAP_MAX_NSECS {
+                } else if !decode_recovery_gap_within_limit(
+                    initial_gap_nsecs,
+                    DECODE_RECOVERY_HOLD_GAP_MAX_NSECS,
+                ) {
                     if transaction.gap_provenance
                         == DecodeRecoveryGapProvenance::ConfirmedSynchronizedTimelineGap
                     {
@@ -807,6 +847,7 @@ impl PlaybackOutputScheduler {
                             discontinuity_ms = initial_gap_nsecs as f64 / 1_000_000.0,
                             "withheld recovery frame at unbridged continuous decode gap"
                         );
+                        self.note_output_housekeeping_change();
                         return true;
                     }
                 }
@@ -819,7 +860,27 @@ impl PlaybackOutputScheduler {
             if gap_nsecs > 0 {
                 transaction.largest_confirmed_gap_nsecs =
                     transaction.largest_confirmed_gap_nsecs.max(gap_nsecs);
-                if gap_nsecs <= DECODE_RECOVERY_HOLD_GAP_MAX_NSECS {
+                if transaction.source == DecodeRecoverySource::DecoderError
+                    && gap_nsecs > DECODE_RECOVERY_TIMESTAMP_TOLERANCE_NSECS
+                {
+                    let discarded_staging_frames = transaction.staging_queue.len();
+                    transaction.staging_queue.clear();
+                    transaction.disposition = DecodeRecoveryDisposition::Reanchor;
+                    transaction.resume_nsecs = frame.timeline_nsecs;
+                    transaction.first_staged_frame_nsecs = None;
+                    tracing::warn!(
+                        session_id = ?session_id,
+                        transaction_id = transaction.transaction_id,
+                        target_nsecs = transaction.target_nsecs,
+                        resume_nsecs = transaction.resume_nsecs,
+                        decoder_output_gap_ms = gap_nsecs as f64 / 1_000_000.0,
+                        discarded_staging_frames,
+                        "rescheduled HEVC decoder-error recovery at later boundary gap"
+                    );
+                } else if decode_recovery_gap_within_limit(
+                    gap_nsecs,
+                    DECODE_RECOVERY_HOLD_GAP_MAX_NSECS,
+                ) {
                     if transaction
                         .staging_queue
                         .extend_back_duration_to(frame.timeline_nsecs)
@@ -871,12 +932,26 @@ impl PlaybackOutputScheduler {
                         released_staging_frames,
                         "withheld staged recovery frame at unbridged continuous decode gap"
                     );
+                    self.note_output_housekeeping_change();
                     return true;
                 }
             }
         }
 
-        let replay_span_nsecs = frame_end_nsecs.saturating_sub(transaction.target_nsecs);
+        // HoldGap and Reanchor both account for a timeline interval where the
+        // decoder returned no usable pictures; that skipped interval is not
+        // replay work. Match mpv's discontinuity handling and measure the
+        // bounded buffer built after the first usable frame/new anchor.
+        let replay_span_origin_nsecs = match transaction.disposition {
+            DecodeRecoveryDisposition::HoldGap => transaction
+                .first_staged_frame_nsecs
+                .unwrap_or(frame.timeline_nsecs),
+            DecodeRecoveryDisposition::Reanchor => transaction.resume_nsecs,
+            DecodeRecoveryDisposition::Exact | DecodeRecoveryDisposition::DropForFallback => {
+                transaction.target_nsecs
+            }
+        };
+        let replay_span_nsecs = frame_end_nsecs.saturating_sub(replay_span_origin_nsecs);
         if replay_span_nsecs >= DECODE_RECOVERY_MAX_REPLAY_SPAN_NSECS {
             let discarded_staging_frames = transaction.staging_queue.len();
             transaction.staging_queue.clear();
@@ -894,6 +969,7 @@ impl PlaybackOutputScheduler {
                     session_id = ?session_id,
                     transaction_id = transaction.transaction_id,
                     disposition = ?transaction.disposition,
+                    replay_span_origin_nsecs,
                     replay_span_ms = replay_span_nsecs as f64 / 1_000_000.0,
                     replay_span_limit_ms =
                         DECODE_RECOVERY_MAX_REPLAY_SPAN_NSECS as f64 / 1_000_000.0,
@@ -919,6 +995,7 @@ impl PlaybackOutputScheduler {
                     session_id = ?session_id,
                     transaction_id = transaction.transaction_id,
                     disposition = ?transaction.disposition,
+                    replay_span_origin_nsecs,
                     replay_span_ms = replay_span_nsecs as f64 / 1_000_000.0,
                     replay_span_limit_ms =
                         DECODE_RECOVERY_MAX_REPLAY_SPAN_NSECS as f64 / 1_000_000.0,
@@ -927,6 +1004,7 @@ impl PlaybackOutputScheduler {
                     gap_ms = gap_nsecs as f64 / 1_000_000.0,
                     "failed bounded HEVC recovery at the replay-span limit"
                 );
+                self.note_output_housekeeping_change();
             }
             return true;
         }
@@ -989,6 +1067,12 @@ impl PlaybackOutputScheduler {
                 "HEVC decode recovery staging reached its hard Vulkan-frame budget"
             );
         }
+        if entered_buffered {
+            // mpv wakes its core whenever decoder/output state changes. Do the
+            // same here because cache backpressure may otherwise prevent the
+            // coordinator from revisiting the output gate.
+            self.note_output_housekeeping_change();
+        }
         true
     }
 
@@ -998,12 +1082,19 @@ impl PlaybackOutputScheduler {
         control: &FfmpegControl,
         session_id: PlaybackSessionId,
     ) -> std::result::Result<(), String> {
+        let drained_decoder_error_boundary = self.decode_recovery_drained_boundary_ready();
         let Some(transaction) = self.decode_recovery_transaction.as_mut() else {
             return Ok(());
         };
         if transaction.phase.terminal()
             || now.saturating_duration_since(transaction.started_at) < DECODE_RECOVERY_MAX_WALL_TIME
         {
+            return Ok(());
+        }
+        if drained_decoder_error_boundary {
+            // The transaction is already commit-ready. Let the output service
+            // enter its barrier and commit below instead of turning a single
+            // scheduling race at the wall-time boundary into a fatal stall.
             return Ok(());
         }
 
@@ -1061,6 +1152,15 @@ impl PlaybackOutputScheduler {
             return false;
         };
         if transaction.phase != DecodeRecoveryPhase::Buffered {
+            return false;
+        }
+        if transaction.source == DecodeRecoverySource::DecoderError
+            && transaction.disposition == DecodeRecoveryDisposition::Reanchor
+            && transaction.barrier_started_at.is_none()
+        {
+            // Preserve already-decoded good frames until playback reaches the
+            // exact broken-chain boundary. Reanchoring earlier would trade the
+            // visible gap for an even larger, premature content skip.
             return false;
         }
         if transaction.barrier_started_at.is_some()
@@ -1186,13 +1286,18 @@ impl PlaybackOutputScheduler {
         control: &FfmpegControl,
         session_id: PlaybackSessionId,
     ) -> bool {
+        let retained_video_queue_empty = self.scheduled_video_queue.is_empty();
         let Some(transaction) = self.decode_recovery_transaction.as_mut() else {
             return false;
         };
-        if transaction.phase == DecodeRecoveryPhase::Buffered
+        let buffered_decoder_reanchor = transaction.phase == DecodeRecoveryPhase::Buffered
+            && transaction.source == DecodeRecoverySource::DecoderError
+            && transaction.disposition == DecodeRecoveryDisposition::Reanchor;
+        let retained_boundary_drained = buffered_decoder_reanchor && retained_video_queue_empty;
+        if (transaction.phase == DecodeRecoveryPhase::Buffered && !buffered_decoder_reanchor)
             || transaction.phase.terminal()
             || transaction.barrier_started_at.is_some()
-            || media_clock_nsecs < transaction.target_nsecs
+            || (media_clock_nsecs < transaction.target_nsecs && !retained_boundary_drained)
         {
             return false;
         }
@@ -1211,6 +1316,12 @@ impl PlaybackOutputScheduler {
             transaction_id,
             target_nsecs,
             media_clock_nsecs,
+            retained_video_queue_empty,
+            boundary_reason = if retained_boundary_drained {
+                "retained_video_queue_drained"
+            } else {
+                "media_clock"
+            },
             "entered dedicated decode recovery barrier at gap boundary"
         );
         true
@@ -2942,6 +3053,9 @@ impl PlaybackOutputScheduler {
         if self.output_housekeeping_generation != self.output_housekeeping_serviced_generation {
             return OutputServiceDemand::OutputStateChanged;
         }
+        if self.decode_recovery_drained_boundary_ready() {
+            return OutputServiceDemand::DecodeRecovery;
+        }
 
         let startup_probe_due = self.restart_pending()
             && self.initial_av_start_transaction.is_none()
@@ -2953,6 +3067,13 @@ impl PlaybackOutputScheduler {
                         .last_output_housekeeping_service_at
                         .is_none_or(|serviced_at| serviced_at < fallback_at)
             });
+        let decode_recovery_probe_due = self.decode_recovery_active()
+            && self
+                .last_output_housekeeping_service_at
+                .is_none_or(|serviced_at| {
+                    now.saturating_duration_since(serviced_at)
+                        >= OUTPUT_GATE_PERIODIC_PROBE_INTERVAL
+                });
         let periodic_probe_due = (self.playback_output_state.rebuffering()
             || (self.restart_pending()
                 && self.initial_av_start_transaction.is_none()
@@ -2963,7 +3084,9 @@ impl PlaybackOutputScheduler {
                     now.saturating_duration_since(serviced_at)
                         >= OUTPUT_GATE_PERIODIC_PROBE_INTERVAL
                 });
-        if startup_probe_due || periodic_probe_due {
+        if decode_recovery_probe_due {
+            OutputServiceDemand::DecodeRecovery
+        } else if startup_probe_due || periodic_probe_due {
             OutputServiceDemand::PeriodicProbe
         } else {
             OutputServiceDemand::None
@@ -3281,17 +3404,21 @@ impl PlaybackOutputScheduler {
         let periodic_probe_deadline = (self.playback_output_state.rebuffering()
             || (self.restart_pending()
                 && self.initial_av_start_transaction.is_none()
-                && self.initial_av_pair_started_at.is_some()))
+                && self.initial_av_pair_started_at.is_some())
+            || self.decode_recovery_active())
         .then(|| {
             self.last_output_housekeeping_service_at
                 .map(|serviced_at| serviced_at + OUTPUT_GATE_PERIODIC_PROBE_INTERVAL)
                 .unwrap_or(now + OUTPUT_GATE_PERIODIC_PROBE_INTERVAL)
         });
+        let decode_recovery_boundary_deadline =
+            self.decode_recovery_drained_boundary_ready().then_some(now);
         [
             transaction_deadline,
             pair_deadline,
             startup_fallback_deadline,
             periodic_probe_deadline,
+            decode_recovery_boundary_deadline,
         ]
         .into_iter()
         .flatten()
@@ -3661,8 +3788,9 @@ mod decode_recovery_tests {
     use super::{
         AudioOutputSnapshot, DECODE_RECOVERY_MAX_REPLAY_SPAN_NSECS, DECODE_RECOVERY_MAX_WALL_TIME,
         DecodeRecoveryDisposition, DecodeRecoveryPhase, DecodeRecoverySource, Duration,
-        FfmpegControl, Instant, PlaybackOutputScheduler, PlaybackOutputState, PlaybackScheduler,
-        QueuedVideoFrame, decode_recovery_staging_frame_budget,
+        FfmpegControl, Instant, OUTPUT_GATE_PERIODIC_PROBE_INTERVAL, OutputServiceDemand,
+        PlaybackOutputScheduler, PlaybackOutputState, PlaybackScheduler, QueuedVideoFrame,
+        decode_recovery_staging_frame_budget,
     };
 
     fn frame(timeline_nsecs: u64, duration_nsecs: u64, old_hardware: bool) -> QueuedVideoFrame {
@@ -3680,6 +3808,7 @@ mod decode_recovery_tests {
             },
             timeline_nsecs,
             duration_nsecs,
+            source_duration_nsecs: duration_nsecs,
         }
     }
 
@@ -4144,6 +4273,62 @@ mod decode_recovery_tests {
     }
 
     #[test]
+    fn decode_recovery_accepts_log_derived_mux_rounded_five_second_gap() {
+        let session_id = PlaybackSessionId(5);
+        let control = FfmpegControl::new(session_id);
+        let mut output = PlaybackOutputScheduler::new();
+        output.set_state(PlaybackOutputState::Playing);
+        let target_nsecs = 367_466_645_832;
+        let first_frame_nsecs = 372_466_687_500;
+        output.begin_decode_recovery(
+            5,
+            target_nsecs,
+            DecodeRecoverySource::CachedSafeIdrRebuild,
+            &control,
+            session_id,
+        );
+        output.mark_decode_recovery_replaying(5);
+
+        assert_eq!(first_frame_nsecs - target_nsecs, 5_000_041_668);
+        assert!(output.stage_decode_recovery_frame(
+            frame(first_frame_nsecs, 33_333_332, false),
+            3,
+            session_id,
+        ));
+        assert_eq!(
+            output.decode_recovery_phase(),
+            Some(DecodeRecoveryPhase::Buffered)
+        );
+        let transaction = output
+            .decode_recovery_transaction
+            .as_ref()
+            .expect("transaction");
+        assert_eq!(transaction.disposition, DecodeRecoveryDisposition::HoldGap);
+        assert_eq!(
+            transaction.first_staged_frame_nsecs,
+            Some(first_frame_nsecs)
+        );
+        assert_eq!(transaction.staging_queue.len(), 1);
+        assert!(transaction.drop_for_fallback.is_none());
+
+        let mut scheduler = PlaybackScheduler::new(target_nsecs);
+        let mut current_start_position_nsecs = target_nsecs;
+        assert!(output.commit_decode_recovery_if_buffered(
+            &control,
+            &mut scheduler,
+            None,
+            &mut current_start_position_nsecs,
+            true,
+            session_id,
+        ));
+        assert_eq!(
+            output.decode_recovery_phase(),
+            Some(DecodeRecoveryPhase::CommittedGap)
+        );
+        assert_eq!(current_start_position_nsecs, target_nsecs);
+    }
+
+    #[test]
     fn decode_recovery_reanchors_large_discontinuity_without_unbounded_replay() {
         let session_id = PlaybackSessionId(4);
         let control = FfmpegControl::new(session_id);
@@ -4161,11 +4346,13 @@ mod decode_recovery_tests {
         output.confirm_decode_recovery_synchronized_timeline_gap();
         output.mark_decode_recovery_replaying(12);
 
-        assert!(output.stage_decode_recovery_frame(
-            frame(resume_nsecs, 40_000_000, false),
-            3,
-            session_id,
-        ));
+        for index in 0..13_u64 {
+            assert!(output.stage_decode_recovery_frame(
+                frame(resume_nsecs + index * 40_000_000, 40_000_000, false),
+                3,
+                session_id,
+            ));
+        }
         assert_eq!(
             output.decode_recovery_phase(),
             Some(DecodeRecoveryPhase::Buffered)
@@ -4194,6 +4381,282 @@ mod decode_recovery_tests {
     }
 
     #[test]
+    fn decoder_error_reanchor_waits_for_last_good_frame_boundary() {
+        let session_id = PlaybackSessionId(9);
+        let control = FfmpegControl::new(session_id);
+        let mut output = PlaybackOutputScheduler::new();
+        output.set_state(PlaybackOutputState::Playing);
+        let target_nsecs = 797_366_645_832;
+        let resume_nsecs = 799_500_000_000;
+        for timeline_nsecs in [target_nsecs - 80_000_000, target_nsecs - 40_000_000] {
+            output
+                .scheduled_video_queue
+                .push_queued(frame(timeline_nsecs, 40_000_000, true));
+        }
+        output.begin_decode_recovery(
+            10_591,
+            target_nsecs,
+            DecodeRecoverySource::DecoderError,
+            &control,
+            session_id,
+        );
+        output.mark_decode_recovery_replaying(10_591);
+
+        for index in 0..13_u64 {
+            assert!(output.stage_decode_recovery_frame(
+                frame(resume_nsecs + index * 40_000_000, 40_000_000, false),
+                3,
+                session_id,
+            ));
+        }
+        assert_eq!(
+            output.decode_recovery_phase(),
+            Some(DecodeRecoveryPhase::Buffered)
+        );
+        assert_eq!(
+            output
+                .decode_recovery_transaction
+                .as_ref()
+                .expect("transaction")
+                .disposition,
+            DecodeRecoveryDisposition::Reanchor
+        );
+
+        let mut scheduler = PlaybackScheduler::new(target_nsecs - 500_000_000);
+        let mut current_start_position_nsecs = target_nsecs - 500_000_000;
+        assert!(
+            !output.commit_decode_recovery_if_buffered(
+                &control,
+                &mut scheduler,
+                None,
+                &mut current_start_position_nsecs,
+                true,
+                session_id,
+            ),
+            "the buffered IDR must not discard good queued frames early"
+        );
+        assert!(!output.maybe_enter_decode_recovery_barrier(
+            Instant::now(),
+            target_nsecs - 1,
+            &control,
+            session_id,
+        ));
+        assert!(output.maybe_enter_decode_recovery_barrier(
+            Instant::now(),
+            target_nsecs,
+            &control,
+            session_id,
+        ));
+        assert!(output.commit_decode_recovery_if_buffered(
+            &control,
+            &mut scheduler,
+            None,
+            &mut current_start_position_nsecs,
+            true,
+            session_id,
+        ));
+        assert_eq!(
+            output.decode_recovery_phase(),
+            Some(DecodeRecoveryPhase::Reanchored)
+        );
+        assert_eq!(current_start_position_nsecs, resume_nsecs);
+        assert_eq!(
+            output.scheduled_video_queue.range_nsecs(),
+            Some((resume_nsecs, resume_nsecs + 13 * 40_000_000))
+        );
+        assert_eq!(
+            output.audio_sync_drop_before_timeline_nsecs(),
+            Some(resume_nsecs)
+        );
+    }
+
+    #[test]
+    fn decoder_error_reanchor_commits_when_audio_underruns_one_frame_before_boundary() {
+        let session_id = PlaybackSessionId(9);
+        let control = FfmpegControl::new(session_id);
+        let mut output = PlaybackOutputScheduler::new();
+        output.set_state(PlaybackOutputState::Playing);
+
+        // Exact values from the 14:41 failure: the retained queue ended at
+        // 881.300s, but native audio exhausted its last real samples roughly
+        // one frame earlier and could no longer advance the master clock.
+        let target_nsecs = 881_300_020_832;
+        let underrun_clock_nsecs = 881_266_458_916;
+        let resume_nsecs = 884_500_000_000;
+        output.scheduled_video_queue.push_queued(frame(
+            target_nsecs - 33_333_332,
+            33_333_332,
+            true,
+        ));
+        let before_recovery = Instant::now();
+        output.mark_output_housekeeping_serviced_at(before_recovery);
+        output.begin_decode_recovery(
+            6_343,
+            target_nsecs,
+            DecodeRecoverySource::DecoderError,
+            &control,
+            session_id,
+        );
+        assert_eq!(
+            output.output_service_demand(before_recovery),
+            OutputServiceDemand::OutputStateChanged,
+            "starting recovery must wake output independently of decoder input"
+        );
+        output.mark_output_housekeeping_serviced_at(before_recovery);
+        output.mark_decode_recovery_replaying(6_343);
+        for index in 0..16_u64 {
+            assert!(output.stage_decode_recovery_frame(
+                frame(resume_nsecs + index * 33_333_332, 33_333_332, false,),
+                3,
+                session_id,
+            ));
+        }
+        assert_eq!(
+            output.decode_recovery_phase(),
+            Some(DecodeRecoveryPhase::Buffered)
+        );
+        assert_eq!(
+            output.output_service_demand(Instant::now()),
+            OutputServiceDemand::OutputStateChanged,
+            "buffering the recovery transaction must publish another output wakeup"
+        );
+
+        let serviced_at = Instant::now();
+        output.mark_output_housekeeping_serviced_at(serviced_at);
+        assert_eq!(
+            output.output_service_demand(
+                serviced_at + OUTPUT_GATE_PERIODIC_PROBE_INTERVAL - Duration::from_nanos(1)
+            ),
+            OutputServiceDemand::None
+        );
+        assert_eq!(
+            output.output_service_demand(serviced_at + OUTPUT_GATE_PERIODIC_PROBE_INTERVAL),
+            OutputServiceDemand::DecodeRecovery,
+            "an active recovery must keep waking output even if decoder input is blocked"
+        );
+        assert!(!output.maybe_enter_decode_recovery_barrier(
+            serviced_at,
+            underrun_clock_nsecs,
+            &control,
+            session_id,
+        ));
+
+        // Once the retained frame has been handed to VO, waiting for the audio
+        // clock to reach its end timestamp is impossible during underrun.
+        output.scheduled_video_queue.clear();
+        assert_eq!(
+            output.output_service_demand(serviced_at),
+            OutputServiceDemand::DecodeRecovery
+        );
+        assert!(
+            output
+                .output_housekeeping_deadline()
+                .is_some_and(|deadline| deadline <= Instant::now()),
+            "a drained recovery boundary must make output housekeeping immediately due"
+        );
+        output
+            .decode_recovery_transaction
+            .as_mut()
+            .expect("transaction")
+            .started_at = Instant::now()
+            .checked_sub(DECODE_RECOVERY_MAX_WALL_TIME + Duration::from_millis(1))
+            .expect("deadline start");
+        assert!(
+            output
+                .check_decode_recovery_deadline(Instant::now(), &control, session_id)
+                .is_ok(),
+            "a drained commit-ready boundary must win a race with the wall deadline"
+        );
+        assert!(output.maybe_enter_decode_recovery_barrier(
+            Instant::now(),
+            underrun_clock_nsecs,
+            &control,
+            session_id,
+        ));
+
+        let mut scheduler = PlaybackScheduler::new(underrun_clock_nsecs);
+        let mut current_start_position_nsecs = underrun_clock_nsecs;
+        assert!(output.commit_decode_recovery_if_buffered(
+            &control,
+            &mut scheduler,
+            None,
+            &mut current_start_position_nsecs,
+            true,
+            session_id,
+        ));
+        assert_eq!(
+            output.decode_recovery_phase(),
+            Some(DecodeRecoveryPhase::Reanchored)
+        );
+        assert_eq!(current_start_position_nsecs, resume_nsecs);
+    }
+
+    #[test]
+    fn decoder_error_reanchor_does_not_count_log_derived_skipped_gap_as_replay() {
+        let session_id = PlaybackSessionId(5);
+        let control = FfmpegControl::new(session_id);
+        let mut output = PlaybackOutputScheduler::new();
+        output.set_state(PlaybackOutputState::Playing);
+
+        let target_nsecs = 955_566_645_832;
+        let resume_nsecs = 961_300_000_000;
+        output.scheduled_video_queue.push_queued(frame(
+            target_nsecs - 33_333_332,
+            33_333_332,
+            true,
+        ));
+        output.begin_decode_recovery(
+            6_082,
+            target_nsecs,
+            DecodeRecoverySource::DecoderError,
+            &control,
+            session_id,
+        );
+        output.mark_decode_recovery_replaying(6_082);
+
+        assert_eq!(resume_nsecs - target_nsecs, 5_733_354_168);
+        for index in 0..16_u64 {
+            assert!(output.stage_decode_recovery_frame(
+                frame(resume_nsecs + index * 33_333_332, 33_333_332, false,),
+                3,
+                session_id,
+            ));
+        }
+        let transaction = output
+            .decode_recovery_transaction
+            .as_ref()
+            .expect("transaction");
+        assert_eq!(transaction.phase, DecodeRecoveryPhase::Buffered);
+        assert_eq!(transaction.disposition, DecodeRecoveryDisposition::Reanchor);
+        assert_eq!(transaction.resume_nsecs, resume_nsecs);
+        assert!(transaction.drop_for_fallback.is_none());
+        assert_eq!(transaction.staging_queue.len(), 16);
+
+        output.scheduled_video_queue.clear();
+        assert!(output.maybe_enter_decode_recovery_barrier(
+            Instant::now(),
+            target_nsecs - 33_333_332,
+            &control,
+            session_id,
+        ));
+        let mut scheduler = PlaybackScheduler::new(target_nsecs - 33_333_332);
+        let mut current_start_position_nsecs = target_nsecs - 33_333_332;
+        assert!(output.commit_decode_recovery_if_buffered(
+            &control,
+            &mut scheduler,
+            None,
+            &mut current_start_position_nsecs,
+            true,
+            session_id,
+        ));
+        assert_eq!(
+            output.decode_recovery_phase(),
+            Some(DecodeRecoveryPhase::Reanchored)
+        );
+        assert_eq!(current_start_position_nsecs, resume_nsecs);
+    }
+
+    #[test]
     fn decode_recovery_withholds_large_continuous_gap_for_bounded_fallback() {
         let session_id = PlaybackSessionId(6);
         let control = FfmpegControl::new(session_id);
@@ -4208,6 +4671,7 @@ mod decode_recovery_tests {
             &control,
             session_id,
         );
+        output.mark_output_housekeeping_serviced_at(Instant::now());
         output.mark_decode_recovery_replaying(14);
 
         assert!(output.stage_decode_recovery_frame(
@@ -4218,6 +4682,11 @@ mod decode_recovery_tests {
         assert_eq!(
             output.decode_recovery_phase(),
             Some(DecodeRecoveryPhase::DroppedForFallback)
+        );
+        assert_eq!(
+            output.output_service_demand(Instant::now()),
+            OutputServiceDemand::OutputStateChanged,
+            "terminal fallback must wake output while decoder admission is blocked"
         );
         assert!(!output.decode_recovery_output_committed());
         assert!(output.decode_recovery_owns_video_admission());
@@ -4311,7 +4780,7 @@ mod decode_recovery_tests {
     }
 
     #[test]
-    fn first_recovery_frame_crossing_replay_span_is_immediately_terminal() {
+    fn first_hold_gap_frame_end_does_not_count_as_unbounded_replay() {
         let session_id = PlaybackSessionId(63);
         let control = FfmpegControl::new(session_id);
         let mut output = PlaybackOutputScheduler::new();
@@ -4336,10 +4805,18 @@ mod decode_recovery_tests {
 
         assert_eq!(
             output.decode_recovery_phase(),
-            Some(DecodeRecoveryPhase::DroppedForFallback)
+            Some(DecodeRecoveryPhase::Buffered)
         );
-        assert_eq!(output.recovery_staging_frames(), 0);
-        assert!(output.take_decode_recovery_drop_for_fallback().is_some());
+        assert_eq!(output.recovery_staging_frames(), 1);
+        assert!(output.take_decode_recovery_drop_for_fallback().is_none());
+        assert_eq!(
+            output
+                .decode_recovery_transaction
+                .as_ref()
+                .expect("transaction")
+                .disposition,
+            DecodeRecoveryDisposition::HoldGap
+        );
     }
 
     #[test]

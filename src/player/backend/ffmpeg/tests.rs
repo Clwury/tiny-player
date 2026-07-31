@@ -1429,6 +1429,30 @@ fn timestamp_mapper_synthesizes_repeated_video_timestamps() {
 }
 
 #[test]
+fn timestamp_mapper_preserves_authoritative_decoder_replay_pts() {
+    let mut mapper = TimestampMapper::new(Some(0), 339_720_000_000, Some(40_000_000));
+    let time_base = ffi::AVRational { num: 1, den: 1_000 };
+
+    assert_eq!(
+        mapper.map(381_720, time_base).timeline_nsecs,
+        381_720_000_000
+    );
+    assert_eq!(
+        mapper.map_authoritative(372_840, time_base).timeline_nsecs,
+        372_840_000_000,
+        "verified replay must not synthesize an old safe-anchor PTS after the pre-flush high-water"
+    );
+    assert_eq!(
+        mapper.map_authoritative(381_760, time_base).timeline_nsecs,
+        381_760_000_000
+    );
+    assert_eq!(
+        mapper.map(381_800, time_base).timeline_nsecs,
+        381_800_000_000
+    );
+}
+
+#[test]
 fn timestamp_mapper_keeps_aac_millisecond_timestamps_sample_contiguous() {
     let mut mapper = TimestampMapper::new(Some(0), 0, None);
     let time_base = ffi::AVRational { num: 1, den: 1_000 };
@@ -4721,6 +4745,7 @@ fn test_queued_video_frame(timeline_nsecs: u64) -> QueuedVideoFrame {
         },
         timeline_nsecs,
         duration_nsecs: DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+        source_duration_nsecs: DEFAULT_VIDEO_FRAME_DURATION_NSECS,
     }
 }
 
@@ -5258,6 +5283,41 @@ fn cached_input_source_shutdowns_http_cache_when_no_reader_is_released() {
     drop(CachedInputSource::from_cache_for_test(cache.clone()));
 
     assert!(cache.is_shutdown_for_test());
+}
+
+#[test]
+fn empty_http_cache_can_fall_back_to_native_ffmpeg_input() {
+    let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new_with_cache_capacity(
+        0,
+        HTTP_CACHE_CHUNK_SIZE,
+    ));
+    let mut source = CachedInputSource::from_cache_for_test(cache.clone());
+
+    assert!(source.disable_empty_startup_cache_for_native_fallback());
+    assert!(cache.is_shutdown_for_test());
+    assert!(
+        source
+            .cached_avio()
+            .expect("native fallback cache lookup succeeds")
+            .is_none()
+    );
+}
+
+#[test]
+fn populated_http_cache_is_preserved_for_probe_fallback() {
+    let mut state = HttpRingCacheState::new_with_cache_capacity(0, HTTP_CACHE_CHUNK_SIZE);
+    assert!(state.append_at(0, b"media"));
+    let cache = HttpRingCache::from_state_for_test(state);
+    let mut source = CachedInputSource::from_cache_for_test(cache.clone());
+
+    assert!(!source.disable_empty_startup_cache_for_native_fallback());
+    assert!(!cache.is_shutdown_for_test());
+    assert!(
+        source
+            .cached_avio()
+            .expect("cached probe lookup succeeds")
+            .is_some()
+    );
 }
 
 #[test]

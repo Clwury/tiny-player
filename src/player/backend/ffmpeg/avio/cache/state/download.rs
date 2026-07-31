@@ -93,7 +93,8 @@ impl HttpRingCacheState {
     pub(in crate::player::backend::ffmpeg::avio::cache) fn maybe_queue_playback_continuation(
         &mut self,
     ) {
-        if self.active_range_kind != HttpCacheRangeKind::Playback
+        if self.config.continuous_playback_requests
+            || self.active_range_kind != HttpCacheRangeKind::Playback
             || self.config.range_request_bytes == 0
         {
             return;

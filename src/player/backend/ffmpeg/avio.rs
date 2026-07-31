@@ -7,7 +7,8 @@ use std::{
 use ffmpeg_sys_next as ffi;
 
 use super::{
-    BackendEvent, FFMPEG_AVIO_BUFFER_SIZE, FfmpegControl, PlaybackCacheConfig, PlaybackCacheMode,
+    BackendEvent, FFMPEG_AVIO_BUFFER_SIZE, FfmpegControl, HTTP_CACHE_NETWORK_READ_TIMEOUT,
+    PlaybackCacheConfig, PlaybackCacheMode,
 };
 
 mod cache;
@@ -81,6 +82,20 @@ impl CachedInputSource {
 
     pub(super) fn release(&mut self) {
         self.released = true;
+    }
+
+    pub(super) fn disable_empty_startup_cache_for_native_fallback(&mut self) -> bool {
+        let should_disable = self
+            .cache
+            .as_ref()
+            .is_some_and(|cache| !cache.has_cached_byte_at(0));
+        if !should_disable {
+            return false;
+        }
+        if let Some(cache) = self.cache.take() {
+            cache.shutdown();
+        }
+        true
     }
 
     #[cfg(test)]

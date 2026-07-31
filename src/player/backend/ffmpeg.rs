@@ -64,7 +64,7 @@ use codec::{
     packet_video_recovery_point_kind,
 };
 use constants::*;
-use dovi::{DoviPipeline, ffmpeg_dovi_metadata_from_frame};
+use dovi::{DoviPipeline, ffmpeg_dovi_metadata_from_frame, stream_has_dovi_config};
 #[cfg(test)]
 use dovi::{dovi_packet_timeline_nsecs, has_annex_b_start_code};
 use format::{FormatContext, StreamInfo};

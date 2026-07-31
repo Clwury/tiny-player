@@ -25,6 +25,7 @@ fn test_queued_video_frame(timeline_nsecs: u64) -> QueuedVideoFrame {
         },
         timeline_nsecs,
         duration_nsecs: DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+        source_duration_nsecs: DEFAULT_VIDEO_FRAME_DURATION_NSECS,
     }
 }
 fn resume_decision() -> AudioClockResumeDecision {

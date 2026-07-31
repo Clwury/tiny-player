@@ -498,11 +498,7 @@ pub(in crate::player::backend::ffmpeg) fn queue_decoded_video_frame(
 
     output_scheduler
         .scheduled_video_queue
-        .push_queued(QueuedVideoFrame {
-            frame,
-            timeline_nsecs,
-            duration_nsecs,
-        });
+        .push_queued(QueuedVideoFrame::new(frame, timeline_nsecs, duration_nsecs));
     output_scheduler.mark_first_frame_queued();
     log_decoded_video_frame_queue_admission(
         session_id,

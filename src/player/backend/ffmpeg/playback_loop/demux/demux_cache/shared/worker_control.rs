@@ -48,12 +48,20 @@ impl DemuxPacketCacheShared {
         request.seek_generation < self.control.seek_generation()
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn should_discard_demux_result(
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn should_discard_demux_seek_result(
         &self,
-        generation: u64,
+        demux_input_generation: u64,
         seek_generation: u64,
     ) -> bool {
-        self.generation() != generation || self.control.seek_generation() != seek_generation
+        self.demux_input_generation() != demux_input_generation
+            || self.control.seek_generation() != seek_generation
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn should_discard_demux_read_result(
+        &self,
+        demux_input_generation: u64,
+    ) -> bool {
+        self.demux_input_generation() != demux_input_generation
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn should_stop(
@@ -291,11 +299,13 @@ impl DemuxPacketCacheShared {
         }
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn generation(&self) -> u64 {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn demux_input_generation(
+        &self,
+    ) -> u64 {
         self.state
             .lock()
             .expect("FFmpeg demux packet cache poisoned")
-            .generation
+            .demux_input_generation
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn session_id(

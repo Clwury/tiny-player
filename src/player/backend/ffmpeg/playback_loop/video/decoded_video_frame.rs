@@ -745,6 +745,16 @@ where
                         video_is_hevc: video_stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC,
                         demux_reader_watermark: &mut demux_reader_watermark,
                     })?;
+                    if video_stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC
+                        && let Some(staged_end_nsecs) =
+                            output_scheduler.recovery_staged_high_water_nsecs()
+                    {
+                        video_decode_pipeline.observe_hevc_same_hardware_staged_output_progress(
+                            session_id,
+                            prepared_generation,
+                            staged_end_nsecs,
+                        );
+                    }
                     let after_queue_end_nsecs = output_scheduler.admitted_video_queue_end_nsecs();
                     video_decode_pipeline.observe_hevc_admitted_video_progress(
                         HevcAdmittedVideoProgressObservation {

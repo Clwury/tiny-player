@@ -31,7 +31,7 @@ use super::playback_reset_service::{
 use super::playback_wait_service::PlaybackPipelineWaitService;
 use super::video_decode_pipeline::{
     HevcDecodeChainFallback, HevcDecodeChainFallbackLoopAction, HevcDecodeChainFallbackReason,
-    HevcDecodeRecoveryAction, hevc_drain_video_result_progressed,
+    HevcDecodeRecoveryAction, hevc_decoder_drain_work_pending, hevc_drain_video_result_progressed,
 };
 use super::{
     AudioDecodePipeline, AudioOutput, AudioRealignCoverage, BufferedReporter,
@@ -1705,10 +1705,19 @@ fn service_hevc_same_hardware_recovery_if_needed(
             // video decoder as decoder progress. Audio/subtitle output drained
             // by service_once must not keep a failed video decoder in grace.
             let video_result_progress = hevc_drain_video_result_progressed(before, after);
+            let prepare_after = pipeline.video_frame_prepare_worker.snapshot();
+            let decoder_work_pending = hevc_decoder_drain_work_pending(after)
+                || prepare_after.pending_input_frames > 0
+                || prepare_after.in_flight_frames > 0
+                || prepare_after.completed_frames > 0;
             made_progress |= video_result_progress;
             let advanced = pipeline
                 .video_decode_pipeline
-                .record_hevc_same_hardware_drain_pass(video_result_progress, Instant::now());
+                .record_hevc_same_hardware_drain_pass(
+                    video_result_progress,
+                    decoder_work_pending,
+                    Instant::now(),
+                );
             let drain_now = Instant::now();
             if let Some(suppressed_repeats) = pipeline
                 .video_decode_pipeline
@@ -1726,6 +1735,7 @@ fn service_hevc_same_hardware_recovery_if_needed(
                     passes,
                     made_progress,
                     video_result_progress,
+                    decoder_work_pending,
                     advanced,
                     suppressed_repeats,
                     submitted_sequence = after.submitted_sequence,
@@ -2119,7 +2129,7 @@ fn fallback_to_software_after_same_hardware_recovery(
         .reopen_software_decoder(pipeline.video_stream)?;
     if !reopened {
         return Err(format!(
-            "same-Vulkan recovery requested software fallback but decoder was already software: {terminal_error}"
+            "HEVC hardware recovery requested software fallback but decoder was already software: {terminal_error}"
         ));
     }
     let discarded_vo_frames = vo_queue.discard_pending_frames(session.id());
@@ -2162,7 +2172,7 @@ fn fallback_to_software_after_same_hardware_recovery(
         discarded_vo_frames,
         replay_packets,
         terminal_error,
-        "Auto mode exhausted same-Vulkan recovery and opened the software decoder"
+        "Auto mode opened the software decoder after HEVC hardware recovery failure"
     );
     if replay_packets > 0 {
         pipeline
@@ -2188,7 +2198,7 @@ fn fallback_to_software_after_same_hardware_recovery(
         require_safe_cached_anchor: false,
         preserve_hevc_same_hardware_recovery: false,
         recovery_transaction_id: Some(pipeline.active_recovery_transaction_id()),
-        low_level_seek_reason: Some("same_vulkan_recovery_exhausted"),
+        low_level_seek_reason: Some("hevc_hardware_recovery_fallback"),
         session_id: session.id(),
         vo_queue,
         demux_cache,
@@ -2682,6 +2692,25 @@ fn service_cached_seek_recovery_fallback_if_needed(
             .video_decode_pipeline
             .request_hevc_same_hardware_recovery(fallback, Instant::now());
         pipeline.video_decode_recovery.reset();
+        if action == HevcDecodeRecoveryAction::RequestSoftwareFallback {
+            tracing::warn!(
+                session_id = ?session.id(),
+                position_seconds,
+                target_nsecs = fallback.target_nsecs,
+                reason = fallback.reason.as_str(),
+                recovery_action = action.as_str(),
+                "routed exhausted bounded HEVC hardware recovery to software fallback"
+            );
+            return fallback_to_software_after_same_hardware_recovery(
+                session,
+                control,
+                demux_cache,
+                pipeline,
+                vo_queue,
+                event_tx,
+                emit_playback_buffered_events,
+            );
+        }
         if action == HevcDecodeRecoveryAction::None {
             pipeline.begin_cached_seek_recovery_watchdog(fallback.target_nsecs, session.id());
         }

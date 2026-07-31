@@ -132,12 +132,23 @@ pub(super) fn open_playback_input_with_fallback(
         }
         Err(initial_error) => {
             let fallback_probe_profile = fallback_probe_profile_for_source(source);
-            tracing::debug!(
-                %initial_error,
-                initial_probe_profile = ?initial_probe_profile,
-                fallback_probe_profile = ?fallback_probe_profile,
-                "FFmpeg initial probe failed; retrying"
-            );
+            let native_http_fallback =
+                cached_source.disable_empty_startup_cache_for_native_fallback();
+            if native_http_fallback {
+                tracing::warn!(
+                    %initial_error,
+                    initial_probe_profile = ?initial_probe_profile,
+                    fallback_probe_profile = ?fallback_probe_profile,
+                    "HTTP stream cache produced no startup byte; retrying through native FFmpeg AVIO"
+                );
+            } else {
+                tracing::debug!(
+                    %initial_error,
+                    initial_probe_profile = ?initial_probe_profile,
+                    fallback_probe_profile = ?fallback_probe_profile,
+                    "FFmpeg initial probe failed; retrying"
+                );
+            }
             probe_playback_input(
                 source,
                 &cached_source,

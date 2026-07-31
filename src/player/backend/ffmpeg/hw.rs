@@ -122,6 +122,13 @@ impl VideoHwDecodeContext {
         unsafe {
             (*context).hw_device_ctx = device_ref;
             (*context).extra_hw_frames = (*context).extra_hw_frames.max(requested_extra_hw_frames);
+            // Match mpv's vd_lavc hardware setup. FFmpeg has already selected
+            // the requested Vulkan configuration, so a conservative stream
+            // level declaration must not constrain the attached decoder. tiny
+            // imports the returned VkImages directly and already budgets the
+            // externally retained AVFrames above, so avoid an extra implicit
+            // device copy just as mpv does.
+            (*context).hwaccel_flags = vulkan_hwaccel_flags((*context).hwaccel_flags);
         }
         tracing::debug!(
             decoder_threads,
@@ -129,10 +136,15 @@ impl VideoHwDecodeContext {
             tiny_extra_hw_frames = TINY_VULKAN_EXTRA_HW_FRAMES,
             requested_extra_hw_frames,
             extra_hw_frames = unsafe { (*context).extra_hw_frames },
+            hwaccel_flags = unsafe { (*context).hwaccel_flags },
             "configured Vulkan decode surface reserve for asynchronous output ownership"
         );
         Ok(())
     }
+}
+
+fn vulkan_hwaccel_flags(existing: c_int) -> c_int {
+    existing | ffi::AV_HWACCEL_FLAG_IGNORE_LEVEL | ffi::AV_HWACCEL_FLAG_UNSAFE_OUTPUT
 }
 
 fn parse_vulkan_extra_hw_frames(value: &str) -> Option<Option<c_int>> {
@@ -351,7 +363,7 @@ mod tests {
     use super::{
         HardwareDecodeMode, TINY_VULKAN_EXTRA_HW_FRAMES, VK_QUEUE_GRAPHICS_BIT,
         VK_QUEUE_TRANSFER_BIT, VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VulkanDecodeQueue,
-        find_queue, parse_vulkan_extra_hw_frames, vulkan_ffi,
+        find_queue, parse_vulkan_extra_hw_frames, vulkan_ffi, vulkan_hwaccel_flags,
     };
 
     #[test]
@@ -406,6 +418,16 @@ mod tests {
         assert!(HardwareDecodeMode::Auto.allows_fallback());
         assert!(HardwareDecodeMode::ForceVulkan.should_try_vulkan());
         assert!(!HardwareDecodeMode::ForceVulkan.allows_fallback());
+    }
+
+    #[test]
+    fn vulkan_decode_uses_mpv_direct_output_flags() {
+        let existing = 1 << 8;
+        let flags = vulkan_hwaccel_flags(existing);
+
+        assert_ne!(flags & ffmpeg_sys_next::AV_HWACCEL_FLAG_IGNORE_LEVEL, 0);
+        assert_ne!(flags & ffmpeg_sys_next::AV_HWACCEL_FLAG_UNSAFE_OUTPUT, 0);
+        assert_ne!(flags & existing, 0);
     }
 
     #[test]

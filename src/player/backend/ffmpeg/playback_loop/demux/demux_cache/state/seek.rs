@@ -486,6 +486,7 @@ impl DemuxPacketCacheState {
         buffered_until_nsecs: u64,
         seek_generation: u64,
     ) {
+        self.demux_input_generation = self.demux_input_generation.saturating_add(1);
         self.seek_request = Some(DemuxSeekRequest {
             position_seconds: nsecs_to_seconds(buffered_until_nsecs),
             session_id: self.session_id,
@@ -536,6 +537,7 @@ impl DemuxPacketCacheState {
         self.demux_position_detached = false;
         self.resume_append_skip_until_nsecs = None;
         self.low_level_append_guard_target_nsecs = Some(target_nsecs);
+        self.demux_input_generation = self.demux_input_generation.saturating_add(1);
         self.generation = self.generation.saturating_add(1);
         self.bump_seekability_revision();
         self.start_new_current_range(target_nsecs == 0);
@@ -565,6 +567,7 @@ impl DemuxPacketCacheState {
         self.demux_position_detached = false;
         self.resume_append_skip_until_nsecs = None;
         self.low_level_append_guard_target_nsecs = Some(self.reader_nsecs);
+        self.demux_input_generation = self.demux_input_generation.saturating_add(1);
         self.generation = self.generation.saturating_add(1);
         self.bump_seekability_revision();
         self.start_new_current_range(false);

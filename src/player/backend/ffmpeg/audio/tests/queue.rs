@@ -525,6 +525,58 @@ fn stable_snapshot_yields_until_a_short_timeline_mutation_finishes() {
 }
 
 #[test]
+fn stable_snapshot_reconciles_deferred_fenced_reset_after_lock_contention() {
+    const OLD_TARGET_NSECS: u64 = 1_000_000_000;
+    const NEW_TARGET_NSECS: u64 = 2_000_000_000;
+    const STALE_DURATION_NSECS: u64 = 10_000_000;
+
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
+    let output = Arc::new(AudioOutput::stopped_for_test(control, 4_800, 44_100, 2));
+    output.reset_clock(OLD_TARGET_NSECS);
+    let stale_epoch = output.audio_epoch();
+    {
+        let mut queue = output.queue.state.lock().unwrap();
+        queue.push(AudioQueueItem {
+            samples: vec![0.25; 882],
+            start_timeline_nsecs: OLD_TARGET_NSECS,
+            end_timeline_nsecs: OLD_TARGET_NSECS + STALE_DURATION_NSECS,
+            duration_nsecs: STALE_DURATION_NSECS,
+            generation: stale_epoch,
+        });
+    }
+
+    let release = Arc::new(AtomicBool::new(false));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let locked_output = Arc::clone(&output);
+    let locked_release = Arc::clone(&release);
+    let lock_holder = std::thread::spawn(move || {
+        locked_output.hold_internal_locks_until_for_test(entered_tx, &locked_release);
+    });
+    entered_rx.recv().expect("audio locks are held");
+
+    let fenced_epoch = output.fence_clock_without_wait(NEW_TARGET_NSECS);
+    assert!(fenced_epoch > stale_epoch);
+    assert!(matches!(
+        output.stable_snapshot().unwrap(),
+        AudioOutputStableSnapshot::SnapshotUnstable(_)
+    ));
+
+    release.store(true, Ordering::Release);
+    lock_holder.join().unwrap();
+
+    let AudioOutputStableSnapshot::Stable(snapshot) = output.stable_snapshot().unwrap() else {
+        panic!("the next stable snapshot must finish the deferred physical reset");
+    };
+    assert_eq!(snapshot.audio_epoch, fenced_epoch);
+    assert_eq!(snapshot.queue_generation, fenced_epoch);
+    assert_eq!(snapshot.played_timeline_nsecs, NEW_TARGET_NSECS);
+    assert_eq!(snapshot.total_pending_nsecs, 0);
+    assert_eq!(snapshot.queue_frames, 0);
+    assert_eq!(snapshot.payload_range_nsecs, None);
+    assert_eq!(output.shared.buffer.lock().unwrap().epoch, fenced_epoch);
+}
+
+#[test]
 fn stable_snapshot_does_not_reread_timeline_after_validation() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
     let timeline = Arc::new(AudioTimelineState::new(false));

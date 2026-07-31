@@ -170,6 +170,10 @@ struct DemuxPacketCacheState {
     seekability_revision: u64,
     last_emitted_seekability_revision: Option<u64>,
     cache_state_emit_dirty: bool,
+    // Advances only when AVFormatContext is scheduled to move. Cached seeks
+    // advance `generation` to fence reader heads, but must not invalidate an
+    // in-flight av_read_frame result from the still-linear demux input.
+    demux_input_generation: u64,
     generation: u64,
     producer_recovery_error: Option<String>,
     producer_recovery_consecutive_errors: u32,

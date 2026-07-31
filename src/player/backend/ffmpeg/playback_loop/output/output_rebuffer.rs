@@ -1726,6 +1726,7 @@ mod tests {
             },
             timeline_nsecs,
             duration_nsecs: DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+            source_duration_nsecs: DEFAULT_VIDEO_FRAME_DURATION_NSECS,
         }
     }
 

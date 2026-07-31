@@ -43,7 +43,7 @@ use super::{
     packet_is_audio_recovery_point, packet_is_video_recovery_point, packet_is_video_seek_point,
     packet_video_recovery_point_kind, queued_video_duration, queued_video_frames_have_vulkan,
     queued_video_limit_duration, queued_video_target_duration, seconds_to_nsecs,
-    timestamp_to_nsecs,
+    stream_has_dovi_config, timestamp_to_nsecs,
 };
 #[cfg(test)]
 use super::{

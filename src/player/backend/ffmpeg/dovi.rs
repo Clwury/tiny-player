@@ -120,6 +120,7 @@ impl DoviPipeline {
 struct DoviMetadataState {
     queue: DoviMetadataQueue,
     last_profile5: Option<DoviFrameMetadata>,
+    stream_dovi_configured: bool,
     stream_profile5: bool,
     stream_profile_checked: bool,
     reused_profile5_logged: bool,
@@ -130,6 +131,13 @@ struct DoviMetadataState {
 impl DoviMetadataState {
     pub(super) fn observe_packet(&mut self, packet: &AvPacket, stream: StreamInfo) -> bool {
         self.observe_stream_config(stream);
+        // Match mpv's lavc path: packet-level RPU parsing is only a metadata
+        // fallback for streams which the demuxer explicitly identified as
+        // Dolby Vision. Guessing across every HEVC packet can interpret normal
+        // slice payload as a different NAL length format.
+        if !self.stream_dovi_configured {
+            return false;
+        }
         let metadata = self.queue.observe_packet(packet, stream);
         if metadata
             .as_ref()
@@ -147,6 +155,7 @@ impl DoviMetadataState {
         metadata: DoviFrameMetadata,
     ) {
         self.observe_stream_config(stream);
+        self.stream_dovi_configured = true;
         if metadata.is_profile5() {
             self.stream_profile5 = true;
         }
@@ -227,20 +236,32 @@ impl DoviMetadataState {
             return;
         }
         self.stream_profile_checked = true;
-        if stream_dovi_profile5(stream) {
+        self.stream_dovi_configured = stream_has_dovi_config(stream);
+        if self.stream_dovi_configured && stream_dovi_profile5(stream) {
             self.stream_profile5 = true;
             tracing::debug!("detected Dolby Vision Profile 5 stream configuration");
         }
     }
 }
 
+pub(super) fn stream_has_dovi_config(stream: StreamInfo) -> bool {
+    stream_dovi_config_side_data(stream).is_some()
+}
+
 fn stream_dovi_profile5(stream: StreamInfo) -> bool {
-    if stream.stream.is_null() {
+    let Some((data, size)) = stream_dovi_config_side_data(stream) else {
         return false;
+    };
+    dovi_config_is_profile5(unsafe { slice::from_raw_parts(data, size) })
+}
+
+fn stream_dovi_config_side_data(stream: StreamInfo) -> Option<(*const u8, usize)> {
+    if stream.stream.is_null() {
+        return None;
     }
     let codecpar = unsafe { (*stream.stream).codecpar };
     if codecpar.is_null() {
-        return false;
+        return None;
     }
     let side_data = unsafe {
         ffi::av_packet_side_data_get(
@@ -250,13 +271,13 @@ fn stream_dovi_profile5(stream: StreamInfo) -> bool {
         )
     };
     if side_data.is_null() {
-        return false;
+        return None;
     }
     let (data, size) = unsafe { ((*side_data).data, (*side_data).size) };
     if data.is_null() || size == 0 {
-        return false;
+        return None;
     }
-    dovi_config_is_profile5(unsafe { slice::from_raw_parts(data, size) })
+    Some((data.cast_const(), size))
 }
 
 fn dovi_config_is_profile5(data: &[u8]) -> bool {
@@ -433,11 +454,13 @@ fn starts_with_annex_b_start_code(data: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use ffmpeg_sys_next as ffi;
+
     use crate::player::{dovi::DoviFrameMetadata, render_host::FramePts};
 
     use super::{
-        DoviMetadataEntry, DoviMetadataQueue, DoviMetadataState, dovi_config_is_profile5,
-        dovi_metadata_from_rpu_buffer,
+        AvPacket, DoviMetadataEntry, DoviMetadataQueue, DoviMetadataState, StreamInfo,
+        dovi_config_is_profile5, dovi_metadata_from_rpu_buffer,
     };
 
     #[test]
@@ -639,6 +662,33 @@ mod tests {
         assert!(dovi_config_is_profile5(&[1, 0, 5, 6, 1, 0, 1, 0, 0]));
         assert!(!dovi_config_is_profile5(&[1, 0, 8, 6, 1, 0, 1, 1, 0]));
         assert!(!dovi_config_is_profile5(&[1, 0]));
+    }
+
+    #[test]
+    fn hdr10_stream_does_not_probe_packets_for_dolby_vision_metadata() {
+        let payload = profile5_rpu_payload();
+        let rpu_nalu = dolby_vision::rpu::dovi_rpu::DoviRpu::parse_rpu(&payload)
+            .unwrap()
+            .write_hevc_unspec62_nalu()
+            .unwrap();
+        let mut data = Vec::with_capacity(4 + rpu_nalu.len());
+        data.extend_from_slice(&(rpu_nalu.len() as u32).to_be_bytes());
+        data.extend_from_slice(&rpu_nalu);
+        let props = AvPacket::new().expect("packet props allocate");
+        let packet = AvPacket::from_data_and_props(&data, &props).expect("packet data allocates");
+        let hdr10_stream = StreamInfo {
+            index: 0,
+            stream: std::ptr::null_mut(),
+            decoder: std::ptr::null(),
+            codec_id: ffi::AVCodecID::AV_CODEC_ID_HEVC,
+            time_base: ffi::AVRational { num: 1, den: 1_000 },
+            start_nsecs: None,
+            frame_duration_nsecs: Some(40_000_000),
+        };
+        let mut state = DoviMetadataState::default();
+
+        assert!(!state.observe_packet(&packet, hdr10_stream));
+        assert!(state.queue.entries.is_empty());
     }
 
     fn profile5_rpu_payload() -> Vec<u8> {

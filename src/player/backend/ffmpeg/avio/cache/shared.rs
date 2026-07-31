@@ -21,14 +21,30 @@ use super::{
     FfmpegControl, HTTP_CACHE_CONTENT_LEN_WAIT, HTTP_CACHE_PARTIAL_READ_MIN_BYTES,
     HTTP_CACHE_PREFETCH_PAUSE_LOG_AFTER, HTTP_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
     HTTP_CACHE_SIDE_DOWNLOAD_WORKERS, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
-    HTTP_CACHE_WAIT_INTERVAL, HttpCacheConfig, HttpCacheRangeKind, HttpDiskCache,
-    HttpReadWaitLogDecision, HttpRingCache, HttpRingCacheShared, HttpRingCacheState,
-    PendingHttpDiskCacheWrite, PreparedByteAppend, RetainedPlaybackSpliceSource,
-    http_ring_cache_download_loop, http_ring_cache_side_download_loop,
-    playback_cache_state_from_http_status, reqwest_header_pairs,
+    HTTP_CACHE_STARTUP_FIRST_BYTE_TIMEOUT, HTTP_CACHE_WAIT_INTERVAL, HttpCacheConfig,
+    HttpCacheRangeKind, HttpDiskCache, HttpReadWaitLogDecision, HttpRingCache, HttpRingCacheShared,
+    HttpRingCacheState, PendingHttpDiskCacheWrite, PreparedByteAppend,
+    RetainedPlaybackSpliceSource, http_ring_cache_download_loop,
+    http_ring_cache_side_download_loop, playback_cache_state_from_http_status,
+    reqwest_header_pairs,
 };
 
+fn startup_first_byte_wait_timed_out(
+    offset: u64,
+    total: usize,
+    read_started_at: Instant,
+    now: Instant,
+) -> bool {
+    offset == 0
+        && total == 0
+        && now.saturating_duration_since(read_started_at) >= HTTP_CACHE_STARTUP_FIRST_BYTE_TIMEOUT
+}
+
 impl HttpRingCache {
+    pub(in crate::player::backend::ffmpeg::avio) fn has_cached_byte_at(&self, offset: u64) -> bool {
+        self.shared.has_cached_byte_at(offset)
+    }
+
     pub(in crate::player::backend::ffmpeg) fn input_progress_generation(&self) -> u64 {
         self.shared
             .input_progress_generation
@@ -224,6 +240,7 @@ impl HttpRingCache {
             return CacheReadResult::Data(0);
         }
 
+        let read_started_at = Instant::now();
         let mut guard = self
             .shared
             .state
@@ -362,6 +379,21 @@ impl HttpRingCache {
             }
 
             let now = Instant::now();
+            if startup_first_byte_wait_timed_out(offset, total, read_started_at, now) {
+                tracing::warn!(
+                    offset,
+                    current_offset,
+                    requested = output.len(),
+                    waited_ms = now
+                        .saturating_duration_since(read_started_at)
+                        .as_millis(),
+                    base_offset = guard.base_offset,
+                    next_offset = guard.next_offset,
+                    content_len = ?guard.content_len,
+                    "HTTP stream cache startup produced no first byte"
+                );
+                return CacheReadResult::Error("HTTP 视频缓存启播等待首字节超时".to_string());
+            }
             let wait_observation = guard
                 .read_wait_observation(current_offset, self.shared.prefetch_paused_by_downstream());
             let wait_log_decision = guard.observe_read_wait_log(wait_observation, now);
@@ -967,6 +999,21 @@ impl HttpRingCacheShared {
             .chunk_size
     }
 
+    pub(in crate::player::backend::ffmpeg::avio) fn continuous_playback_requests(&self) -> bool {
+        self.state
+            .lock()
+            .expect("HTTP stream cache poisoned")
+            .config
+            .continuous_playback_requests
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn has_cached_byte_at(&self, offset: u64) -> bool {
+        self.state
+            .lock()
+            .expect("HTTP stream cache poisoned")
+            .cached_range_contains(offset)
+    }
+
     pub(in crate::player::backend::ffmpeg::avio) fn playback_range_request_bytes(
         &self,
         offset: u64,
@@ -1112,6 +1159,7 @@ impl HttpRingCacheShared {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::avio) fn append_capacity_now(
         &self,
         offset: u64,
@@ -1234,5 +1282,28 @@ impl HttpRingCacheShared {
         self.notify_ready();
         self.send_cache_events(status);
         CacheAppendResult::Appended
+    }
+}
+
+#[cfg(test)]
+mod startup_wait_tests {
+    use std::time::Instant;
+
+    use super::{HTTP_CACHE_STARTUP_FIRST_BYTE_TIMEOUT, startup_first_byte_wait_timed_out};
+
+    #[test]
+    fn startup_first_byte_wait_only_times_out_an_empty_read_at_stream_start() {
+        let started_at = Instant::now();
+        let deadline = started_at + HTTP_CACHE_STARTUP_FIRST_BYTE_TIMEOUT;
+
+        assert!(startup_first_byte_wait_timed_out(
+            0, 0, started_at, deadline
+        ));
+        assert!(!startup_first_byte_wait_timed_out(
+            1, 0, started_at, deadline
+        ));
+        assert!(!startup_first_byte_wait_timed_out(
+            0, 1, started_at, deadline
+        ));
     }
 }

@@ -32,10 +32,41 @@ pub(super) struct QueuedVideoFrame {
     pub(super) frame: DecodedFrame,
     pub(super) timeline_nsecs: u64,
     pub(super) duration_nsecs: u64,
+    // The scheduler may extend `duration_nsecs` to hold the last good frame
+    // across an accepted source/decode gap. Keep the duration that came from
+    // the decoded frame separate so that a multi-second hold does not pretend
+    // that the decoder has buffered multi-second future output.
+    pub(super) source_duration_nsecs: u64,
+}
+
+impl QueuedVideoFrame {
+    pub(super) fn new(frame: DecodedFrame, timeline_nsecs: u64, duration_nsecs: u64) -> Self {
+        Self {
+            frame,
+            timeline_nsecs,
+            duration_nsecs,
+            source_duration_nsecs: duration_nsecs,
+        }
+    }
 }
 
 pub(super) fn queued_video_coverage_duration(
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
+) -> Duration {
+    queued_video_interval_coverage_duration(queued_video_frames, |frame| frame.duration_nsecs)
+}
+
+fn queued_video_source_coverage_duration(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+) -> Duration {
+    queued_video_interval_coverage_duration(queued_video_frames, |frame| {
+        frame.source_duration_nsecs
+    })
+}
+
+fn queued_video_interval_coverage_duration(
+    queued_video_frames: &VecDeque<QueuedVideoFrame>,
+    frame_duration_nsecs: impl Fn(&QueuedVideoFrame) -> u64,
 ) -> Duration {
     let Some(first) = queued_video_frames.front() else {
         return Duration::ZERO;
@@ -43,9 +74,13 @@ pub(super) fn queued_video_coverage_duration(
 
     let mut coverage_nsecs = 0_u64;
     let mut run_start_nsecs = first.timeline_nsecs;
-    let mut run_end_nsecs = first.timeline_nsecs.saturating_add(first.duration_nsecs);
+    let mut run_end_nsecs = first
+        .timeline_nsecs
+        .saturating_add(frame_duration_nsecs(first));
     for frame in queued_video_frames.iter().skip(1) {
-        let frame_end_nsecs = frame.timeline_nsecs.saturating_add(frame.duration_nsecs);
+        let frame_end_nsecs = frame
+            .timeline_nsecs
+            .saturating_add(frame_duration_nsecs(frame));
         if frame.timeline_nsecs > run_end_nsecs {
             coverage_nsecs =
                 coverage_nsecs.saturating_add(run_end_nsecs.saturating_sub(run_start_nsecs));
@@ -127,7 +162,7 @@ pub(super) fn queued_video_limit_reached(
     needs_subtitle_prefetch: bool,
 ) -> bool {
     !queued_video_frames.is_empty()
-        && (queued_video_duration(queued_video_frames)
+        && (queued_video_source_coverage_duration(queued_video_frames)
             >= queued_video_limit_duration(queued_video_frames, needs_subtitle_prefetch)
             || queued_video_frames.len()
                 >= queued_video_limit_frames(queued_video_frames, needs_subtitle_prefetch))
@@ -139,7 +174,7 @@ pub(super) fn queued_video_target_reached(
     needs_subtitle_prefetch: bool,
 ) -> bool {
     !queued_video_frames.is_empty()
-        && (queued_video_duration(queued_video_frames)
+        && (queued_video_source_coverage_duration(queued_video_frames)
             >= queued_video_target_duration(queued_video_frames, needs_subtitle_prefetch)
             || queued_video_frames.len()
                 >= queued_video_target_frames(queued_video_frames, needs_subtitle_prefetch))
@@ -288,6 +323,27 @@ impl TimestampMapper {
     }
 
     pub(super) fn map(&mut self, timestamp: i64, time_base: ffi::AVRational) -> MappedTimestamp {
+        self.map_with_monotonic_fallback(timestamp, time_base, true)
+    }
+
+    /// Maps a timestamp from a verified decoder replay without carrying the
+    /// pre-flush monotonic high-water forward. Decoder replay deliberately
+    /// starts at an older safe anchor, so its original PTS must remain visible
+    /// to the recovery trim instead of being synthesized into future frames.
+    pub(super) fn map_authoritative(
+        &mut self,
+        timestamp: i64,
+        time_base: ffi::AVRational,
+    ) -> MappedTimestamp {
+        self.map_with_monotonic_fallback(timestamp, time_base, false)
+    }
+
+    fn map_with_monotonic_fallback(
+        &mut self,
+        timestamp: i64,
+        time_base: ffi::AVRational,
+        enforce_monotonicity: bool,
+    ) -> MappedTimestamp {
         let mut timeline_nsecs = timestamp_to_nsecs(timestamp, time_base)
             .map(|nsecs| self.timeline_from_timestamp(nsecs))
             .unwrap_or_else(|| self.next_synthetic_timeline());
@@ -295,7 +351,8 @@ impl TimestampMapper {
         if self.start_position_nsecs > 0 && timeline_nsecs == 0 {
             timeline_nsecs = self.next_synthetic_timeline();
         }
-        if let Some(last_timeline_nsecs) = self.last_timeline_nsecs
+        if enforce_monotonicity
+            && let Some(last_timeline_nsecs) = self.last_timeline_nsecs
             && timeline_nsecs <= last_timeline_nsecs
         {
             timeline_nsecs = last_timeline_nsecs.saturating_add(self.fallback_step_nsecs);

@@ -96,6 +96,12 @@ pub(super) const HTTP_CACHE_PREFETCH_PAUSE_LOG_INTERVAL: Duration = Duration::fr
 pub(super) const HTTP_CACHE_MAX_READ_CHUNK_BYTES: usize = 128 * 1024;
 pub(super) const HTTP_CACHE_PARTIAL_READ_MIN_BYTES: usize = 64 * 1024;
 pub(super) const HTTP_CACHE_CONTENT_LEN_WAIT: Duration = Duration::from_secs(1);
+pub(super) const HTTP_CACHE_STARTUP_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(5);
+// Match mpv's default network timeout while keeping it scoped to an
+// individual blocking read. Active playback responses are intentionally
+// continuous, so a whole-response deadline would turn normal long playback
+// into a periodic reconnect.
+pub(super) const HTTP_CACHE_NETWORK_READ_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) const HTTP_CACHE_RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
 pub(super) const HTTP_CACHE_SMALL_RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);

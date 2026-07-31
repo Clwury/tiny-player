@@ -154,6 +154,7 @@ fn log_initial_sync_observation(
         first_video = ?observation.first_video_nsecs,
         first_audio = ?observation.first_audio_nsecs,
         decoded_video = ?observation.decoded_video_nsecs,
+        strict_video = ?observation.strict_video_nsecs,
         decoded_audio = ?observation.decoded_audio_nsecs,
         demux_min = ?observation.demux_min_nsecs,
         blocked_on = observation.blocked_on,
@@ -755,6 +756,7 @@ where
                     .pending_start_audio
                     .first_start_timeline_nsecs(),
                 decoded_video_nsecs: None,
+                strict_video_nsecs: None,
                 decoded_audio_nsecs: audio_waterline
                     .and_then(|waterline| waterline.decoded_audio_forward_nsecs),
                 demux_min_nsecs: waterline_demux_watermark.selected_min_forward_nsecs,
@@ -1005,6 +1007,7 @@ where
                 first_video_nsecs,
                 first_audio_nsecs: sync_decision.audio_start_timeline_nsecs,
                 decoded_video_nsecs: waterline.decoded_output.video_forward_nsecs,
+                strict_video_nsecs: strict_video_forward_nsecs,
                 decoded_audio_nsecs: waterline.decoded_output.audio_forward_nsecs,
                 demux_min_nsecs: waterline.prefetch.min_forward_nsecs,
                 blocked_on: evaluation
@@ -1564,6 +1567,7 @@ mod tests {
             },
             timeline_nsecs,
             duration_nsecs,
+            source_duration_nsecs: duration_nsecs,
         }
     }
 

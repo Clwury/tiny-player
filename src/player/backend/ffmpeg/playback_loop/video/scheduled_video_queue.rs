@@ -106,6 +106,11 @@ const PREBUFFER_LIMIT_LOG_INTERVAL: Duration = Duration::from_millis(500);
 // Rational FFmpeg timestamps converted to integer nanoseconds can differ by a few
 // nanoseconds at an otherwise exact continuity boundary.
 pub(in crate::player::backend::ffmpeg) const VIDEO_TIMESTAMP_ROUNDING_TOLERANCE_NSECS: u64 = 1_000;
+// mpv's calculate_frame_duration() accepts 3 ms of mux timestamp rounding plus
+// 0.1 ms of slack before treating adjacent frame timing as discontinuous. Keep
+// strict startup lookahead equally tolerant: this is far below a frame period,
+// but covers coarse source time bases such as the 41.668 us jitter seen at 30 fps.
+const VIDEO_STRICT_CONTINUITY_MAX_TIMESTAMP_JITTER_NSECS: u64 = 3_100_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) struct QueuedVideoContinuity {
@@ -487,8 +492,12 @@ impl ScheduledVideoQueue {
         timeline_nsecs: u64,
     ) -> Option<u64> {
         self.with_frames(|frames| {
-            queued_video_contiguous_buffered_until_from_nsecs(frames, timeline_nsecs, 0)
-                .map(|until| until.saturating_sub(timeline_nsecs))
+            queued_video_contiguous_buffered_until_from_nsecs(
+                frames,
+                timeline_nsecs,
+                VIDEO_STRICT_CONTINUITY_MAX_TIMESTAMP_JITTER_NSECS,
+            )
+            .map(|until| until.saturating_sub(timeline_nsecs))
         })
     }
 
@@ -620,6 +629,7 @@ impl ScheduledVideoQueue {
             let frame_end_nsecs = frame.timeline_nsecs.saturating_add(frame.duration_nsecs);
             if frame.timeline_nsecs < timeline_nsecs && frame_end_nsecs > timeline_nsecs {
                 frame.duration_nsecs = timeline_nsecs.saturating_sub(frame.timeline_nsecs);
+                frame.source_duration_nsecs = frame.source_duration_nsecs.min(frame.duration_nsecs);
             }
         }
         let dropped = original_len.saturating_sub(frames.len());
@@ -1160,6 +1170,7 @@ mod tests {
             },
             timeline_nsecs,
             duration_nsecs,
+            source_duration_nsecs: duration_nsecs,
         }
     }
 
@@ -1261,6 +1272,48 @@ mod tests {
     }
 
     #[test]
+    fn strict_startup_lookahead_tolerates_mux_timestamp_quantization() {
+        let mut queue = ScheduledVideoQueue::default();
+        let first_nsecs = 535_833_312_500;
+        let frame_duration_nsecs = 33_333_332;
+        for timeline_nsecs in [
+            first_nsecs,
+            535_866_687_500,
+            535_900_000_000,
+            535_933_312_500,
+        ] {
+            queue.push_queued(queued_video_frame(timeline_nsecs, frame_duration_nsecs));
+        }
+
+        assert!(
+            queue
+                .strict_forward_nsecs_from(first_nsecs)
+                .is_some_and(|forward_nsecs| forward_nsecs >= 80_000_000)
+        );
+    }
+
+    #[test]
+    fn strict_startup_lookahead_stops_at_real_timestamp_gap() {
+        let mut queue = ScheduledVideoQueue::default();
+        let first_nsecs = 1_000_000_000;
+        let frame_duration_nsecs = 40_000_000;
+        queue.push_queued(queued_video_frame(first_nsecs, frame_duration_nsecs));
+        queue.push_queued(queued_video_frame(
+            first_nsecs
+                + frame_duration_nsecs
+                + VIDEO_STRICT_CONTINUITY_MAX_TIMESTAMP_JITTER_NSECS
+                + VIDEO_TIMESTAMP_ROUNDING_TOLERANCE_NSECS
+                + 1,
+            frame_duration_nsecs,
+        ));
+
+        assert_eq!(
+            queue.strict_forward_nsecs_from(first_nsecs),
+            Some(frame_duration_nsecs)
+        );
+    }
+
+    #[test]
     fn extending_tail_duration_bridges_confirmed_media_timeline_gap() {
         let mut queue = ScheduledVideoQueue::default();
         queue.push_queued(queued_video_frame(1_000_000_000, 40_000_000));
@@ -1276,6 +1329,29 @@ mod tests {
             Some(1_874_000_000)
         );
         assert_eq!(queue.largest_gap_nsecs(), None);
+    }
+
+    #[test]
+    fn accepted_hold_gap_does_not_fake_decoded_queue_backpressure() {
+        let mut queue = ScheduledVideoQueue::default();
+        let last_good_nsecs = 90_533_312_500;
+        let next_idr_nsecs = 95_000_000_000;
+        let frame_duration_nsecs = 33_333_333;
+        queue.push_queued(queued_video_frame(last_good_nsecs, frame_duration_nsecs));
+
+        queue
+            .extend_back_duration_to(next_idr_nsecs)
+            .expect("the accepted HEVC gap extends the last good frame");
+        queue.push_queued(queued_video_frame(next_idr_nsecs, frame_duration_nsecs));
+
+        assert!(
+            queue.duration() > queue.limit_duration(false),
+            "the display timeline must still hold the last good frame until the IDR"
+        );
+        assert!(
+            !queue.limit_reached(false),
+            "the held interval is not decoded output and must not stop lookahead"
+        );
     }
 
     #[test]
