@@ -1,12 +1,25 @@
 # Maintainer: Clwury <1931946508@qq.com>
 
+# makepkg normally uses $startdir/src as disposable build storage. In an
+# upstream Rust checkout that path contains the project sources, so redirect
+# only the default local layout before `makepkg -C` can remove it.
+if [[ -n ${startdir:-} && -n ${BUILDDIR:-} && \
+      -f $startdir/src/main.rs && $BUILDDIR -ef $startdir ]]; then
+    BUILDDIR="$startdir/.makepkg"
+    if [[ -n ${SRCDEST:-} && $SRCDEST -ef $startdir ]]; then
+        SRCDEST="$BUILDDIR/sources"
+    fi
+fi
+
 pkgname=tiny-player-git
-pkgver=0.1.0.r83.g342cfda
+pkgver=0.1.0.r85.g8df5055
 pkgrel=1
 pkgdesc='Native Emby desktop client with FFmpeg and Vulkan playback'
 arch=('x86_64')
 url='https://github.com/Clwury/tiny-player'
 license=('MIT')
+# ring builds a native GCC archive that rust-lld cannot consume as GCC LTO.
+options=('!lto')
 depends=(
     'alsa-lib'
     'ffmpeg>=8.1'

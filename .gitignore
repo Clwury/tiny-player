@@ -1,4 +1,5 @@
 /target
+/.makepkg/
 /.worktrees/
 /sample
 /.claude

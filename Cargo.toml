@@ -11,7 +11,7 @@ repository = "https://github.com/Clwury/tiny-player"
 anyhow = "1.0"
 directories = "5"
 cpal = "0.17.3"
-dolby_vision = { git = "https://github.com/quietvoid/dovi_tool", package = "dolby_vision" }
+dolby_vision = { git = "https://github.com/quietvoid/dovi_tool", tag = "libdovi-3.4.0", package = "dolby_vision" }
 gpui = "0.2.2"
 ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avformat", "swscale", "swresample"] }
 image = "0.25"
@@ -29,7 +29,7 @@ tempfile = "3.13"
 
 [build-dependencies]
 bindgen = "0.72"
-pkg-config = "0.3"
+pkg-config = "0.3.33"
 
 [patch.crates-io]
 # proc-macro-error2 2.0.1 re-exports a private proc_macro crate, which is a

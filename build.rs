@@ -3,6 +3,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const LIBPLACEBO_MIN_VERSION: &str = "7";
+const LIBPLACEBO_MAX_VERSION: &str = "8";
+const LIBAVUTIL_MIN_VERSION: &str = "60.26.100";
+const LIBAVUTIL_MAX_VERSION: &str = "61";
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
@@ -11,9 +16,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TINY_ASSET_DIR");
 
     let libplacebo = pkg_config::Config::new()
-        .atleast_version("7")
+        .range_version(LIBPLACEBO_MIN_VERSION..LIBPLACEBO_MAX_VERSION)
         .probe("libplacebo")
-        .expect("libplacebo 7 is required for HDR tone mapping");
+        .expect(
+            "supported libplacebo range is >= 7 and < 8; install libplacebo 7.x for HDR tone mapping",
+        );
     let builder = bindgen::Builder::default()
         .header_contents(
             "libplacebo_wrapper.h",
@@ -34,8 +41,11 @@ fn main() {
 
     let libavutil = pkg_config::Config::new()
         .cargo_metadata(false)
+        .range_version(LIBAVUTIL_MIN_VERSION..LIBAVUTIL_MAX_VERSION)
         .probe("libavutil")
-        .expect("libavutil pkg-config metadata is required to generate FFmpeg Vulkan bindings");
+        .expect(
+            "supported libavutil range is >= 60.26.100 and < 61 (FFmpeg >= 8.1 and < 9); install FFmpeg 8.x",
+        );
     let ffmpeg_vulkan_builder = bindgen::Builder::default()
         .header_contents(
             "ffmpeg_vulkan_wrapper.h",
