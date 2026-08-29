@@ -589,7 +589,10 @@ impl AvVulkanFrameAccess {
         }
         unsafe {
             (*self.vulkan_frame).layout[plane_index] = layout as ffmpeg_vulkan::VkImageLayout;
-            (*self.vulkan_frame).access[plane_index] = 0 as ffmpeg_vulkan::VkAccessFlagBits;
+            // FFmpeg 9 changed this field from VkAccessFlagBits (u32) to
+            // VkAccessFlagBits2 (u64). Let the generated binding determine
+            // the integer type so both header versions remain compatible.
+            (*self.vulkan_frame).access[plane_index] = 0;
             (*self.vulkan_frame).sem_value[plane_index] = semaphore_value;
         }
         Ok(())

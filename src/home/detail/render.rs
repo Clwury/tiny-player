@@ -1,7 +1,7 @@
 use gpui::{
-    Animation, AnimationExt as _, App, ClickEvent, Context, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage,
-    Window, deferred, div, ease_in_out, img, prelude::FluentBuilder, px, svg,
+    Animation, AnimationExt as _, Context, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage, Transformation,
+    Window, deferred, div, ease_in_out, img, percentage, prelude::FluentBuilder, px, svg,
 };
 
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::super::{
-    HomeContent,
+    HomeContent, LoadState,
     carousel::{
         DETAIL_EPISODE_CARD_GAP_PX, DETAIL_EPISODE_CARD_PADDING_PX, DETAIL_EPISODE_CARD_WIDTH_PX,
         DETAIL_PERSON_CARD_GAP_PX, DETAIL_PERSON_CARD_PADDING_PX, DETAIL_PERSON_CARD_WIDTH_PX,
@@ -81,88 +81,13 @@ impl HomeContent {
                                 .flex()
                                 .flex_col()
                                 .gap_5()
-                                .when_some(detail.item_failed.clone(), |this, error| {
-                                    this.child(detail_error_with_retry(
-                                        "retry-detail-item",
-                                        error,
-                                        cx.listener(|page, _, _, cx| {
-                                            page.load_series_media_item_if_needed(cx)
-                                        }),
-                                        cx,
-                                    ))
-                                })
-                                .when(
-                                    detail.effects.item.is_loading() && detail.item.is_none(),
-                                    |this| {
-                                        this.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(theme.muted_foreground)
-                                                .child("加载媒体详情中…"),
-                                        )
-                                    },
-                                )
                                 .when(detail.item.is_some(), |this| {
                                     this.child(self.render_series_detail_controls(detail, cx))
                                 })
                                 .when(detail.is_series(), |this| {
-                                    this.when_some(detail.next_up_failed.clone(), |this, error| {
-                                        this.child(detail_error_with_retry(
-                                            "retry-detail-next-up",
-                                            error,
-                                            cx.listener(|page, _, _, cx| {
-                                                page.load_series_next_up_if_needed(cx)
-                                            }),
-                                            cx,
-                                        ))
-                                    })
-                                    .when(
-                                        detail.effects.next_up.is_loading()
-                                            && detail.next_up.is_none(),
-                                        |this| {
-                                            this.child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child("加载下一剧集中…"),
-                                            )
-                                        },
-                                    )
-                                    .when_some(detail.seasons_failed.clone(), |this, error| {
-                                        this.child(detail_error_with_retry(
-                                            "retry-detail-seasons",
-                                            error,
-                                            cx.listener(|page, _, _, cx| {
-                                                page.load_series_seasons_if_needed(cx)
-                                            }),
-                                            cx,
-                                        ))
-                                    })
-                                    .when(
-                                        detail.effects.seasons.is_loading()
-                                            && detail.seasons.is_none(),
-                                        |this| {
-                                            this.child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child("加载季数中…"),
-                                            )
-                                        },
-                                    )
-                                    .when_some(detail.seasons.as_ref(), |this, seasons| {
+                                    this.when_some(detail.seasons.as_ref(), |this, seasons| {
                                         this.child(self.render_series_detail_season_selector(
                                             detail, seasons, cx,
-                                        ))
-                                    })
-                                    .when_some(detail.episodes_failed.clone(), |this, error| {
-                                        this.child(detail_error_with_retry(
-                                            "retry-detail-episodes",
-                                            error,
-                                            cx.listener(|page, _, _, cx| {
-                                                page.load_series_episodes_if_needed(cx)
-                                            }),
-                                            cx,
                                         ))
                                     })
                                     .when_some(
@@ -176,29 +101,26 @@ impl HomeContent {
                                             )
                                         },
                                     )
-                                    .when(
-                                        detail.effects.episodes.is_loading()
-                                            && detail.episodes.is_none(),
-                                        |this| {
-                                            this.child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child("加载剧集列表中…"),
-                                            )
+                                    .when_some(
+                                        detail
+                                            .episodes
+                                            .as_ref()
+                                            .filter(|episodes| !episodes.items.is_empty()),
+                                        |this, episodes| {
+                                            this.child(self.render_series_detail_episodes_row(
+                                                detail,
+                                                episodes,
+                                                main_content_width,
+                                                cx,
+                                            ))
                                         },
                                     )
-                                    .when_some(detail.episodes.as_ref(), |this, episodes| {
-                                        this.child(self.render_series_detail_episodes_row(
-                                            detail,
-                                            episodes,
-                                            main_content_width,
-                                            cx,
-                                        ))
-                                    })
                                     .when(
-                                        !detail.effects.episodes.is_loading()
-                                            && detail.episodes.is_none(),
+                                        detail.effects.episodes == LoadState::Loaded
+                                            && detail
+                                                .episodes
+                                                .as_ref()
+                                                .is_none_or(|episodes| episodes.items.is_empty()),
                                         |this| {
                                             this.child(
                                                 div()
@@ -224,14 +146,24 @@ impl HomeContent {
                                         ))
                                     },
                                 )
-                                .child(self.render_series_detail_similar_section(
-                                    detail,
-                                    main_content_width,
-                                    cx,
-                                ))
+                                .when(
+                                    detail
+                                        .similar_items
+                                        .as_ref()
+                                        .is_some_and(|items| !items.items.is_empty()),
+                                    |this| {
+                                        this.child(self.render_series_detail_similar_section(
+                                            detail,
+                                            main_content_width,
+                                            cx,
+                                        ))
+                                    },
+                                )
                                 .when_some(detail.item.as_ref(), |this, item| {
-                                    this.child(self.render_series_detail_studios_row(item, cx))
-                                        .child(self.render_series_detail_links_row(item, cx))
+                                    this.when(has_studios(item), |this| {
+                                        this.child(self.render_series_detail_studios_row(item, cx))
+                                    })
+                                    .child(self.render_series_detail_links_row(item, cx))
                                 }),
                         )
                 },
@@ -281,6 +213,10 @@ impl HomeContent {
             .item
             .as_ref()
             .and_then(|item| self.image_path_for_series_logo(item));
+        let show_title_fallback = detail
+            .item
+            .as_ref()
+            .is_some_and(|item| item.logo_image_tag().is_none());
         let display_title = detail
             .item
             .as_ref()
@@ -326,6 +262,8 @@ impl HomeContent {
                     .right_6()
                     .bottom_6()
                     .flex()
+                    .w(px(760.0))
+                    .max_w_full()
                     .flex_col()
                     .gap_3()
                     .text_color(theme.foreground)
@@ -333,15 +271,17 @@ impl HomeContent {
                         div()
                             .flex()
                             .flex_col()
+                            .w_full()
                             .gap_2()
                             .when_some(logo_path.clone(), |this, path| {
                                 this.child(img(path).w(px(200.0)))
                             })
-                            .when(logo_path.is_none(), |this| {
+                            .when(show_title_fallback, |this| {
                                 this.child(
                                     div()
-                                        .max_w(px(760.0))
-                                        .truncate()
+                                        .w_full()
+                                        .min_w_0()
+                                        .whitespace_normal()
                                         .text_lg()
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
                                         .child(display_title),
@@ -352,9 +292,11 @@ impl HomeContent {
                         div()
                             .flex()
                             .h(px(24.0))
+                            .w_full()
                             .max_w(px(760.0))
                             .items_center()
-                            .truncate()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
                             .text_base()
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .when_some(episode_line, |this, line| this.child(line)),
@@ -479,195 +421,181 @@ impl HomeContent {
                 .selected_media_source()
                 .and_then(|source| source.id.as_deref())
                 .is_some_and(|id| !id.trim().is_empty());
-        let play_label =
-            detail_play_button_label(detail.playback_loading, detail.playback_position_seconds());
+        let play_label = detail_play_button_label(detail.playback_position_seconds());
 
-        div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .w(px(150.0))
-                            .h(px(42.0))
-                            .justify_center()
-                            .items_center()
-                            .gap_2()
-                            .rounded(px(8.0))
-                            .id("series-detail-play-button")
-                            .border_1()
-                            .border_color(theme.input_border_focused)
-                            .bg(theme.foreground)
-                            .px_4()
-                            .text_base()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.background)
-                            .child(
-                                svg()
-                                    .path("icons/play.svg")
-                                    .size(px(18.0))
-                                    .text_color(theme.background),
-                            )
-                            .child(play_label)
-                            .when(can_play, |this| this.cursor_pointer().on_click(play))
-                            .when(!can_play, |this| this.cursor_default().opacity(0.62)),
-                    )
-                    .child(
-                        div()
-                            .id("series-detail-favorite-button")
-                            .flex()
-                            .size(px(32.0))
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(theme.input_border)
-                            .bg(theme.input_background)
-                            .child(
-                                svg()
-                                    .path(if favorite {
-                                        "icons/heart-filled.svg"
-                                    } else {
-                                        "icons/heart.svg"
-                                    })
-                                    .size(px(14.0))
-                                    .text_color(if favorite {
-                                        theme.error
-                                    } else {
-                                        theme.foreground
-                                    }),
-                            )
-                            .when(!favorite_pending, |this| {
-                                this.cursor_pointer()
-                                    .hover(move |style| style.bg(theme.secondary_hover))
-                                    .on_click(toggle_favorite)
-                            })
-                            .when(favorite_pending, |this| {
-                                this.cursor_default().opacity(0.55)
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w_0()
-                            .flex_wrap()
-                            .items_center()
-                            .justify_end()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .relative()
-                                    .child(
-                                        detail_select_box("视频", video_label, source_count > 0, cx)
-                                            .id("series-detail-video-select")
-                                            .on_click(toggle_video),
-                                    )
-                                    .when(media_source_select_open, |this| {
-                                        this.child(
-                                            deferred(detail_select_menu(
-                                                "series-detail-video-menu",
-                                                source_count,
-                                                DETAIL_SELECT_WIDTH_PX,
-                                                &detail.media_source_scroll_handle,
-                                                cx,
-                                                media_sources.iter().enumerate().map(
-                                                    |(index, source)| {
-                                                        let label = source.name_label(index);
-                                                        let selected =
-                                                            selected_source_index == Some(index);
-                                                        let on_click = cx.listener(
-                                                            move |page: &mut HomeContent, _, _, cx| {
-                                                                page.select_series_media_source(
-                                                                    index, cx,
-                                                                );
-                                                            },
-                                                        );
+        div().flex().flex_col().w_full().gap_2().child(
+            div()
+                .flex()
+                .flex_wrap()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .w(px(150.0))
+                        .h(px(42.0))
+                        .justify_center()
+                        .items_center()
+                        .gap_2()
+                        .rounded(px(8.0))
+                        .id("series-detail-play-button")
+                        .border_1()
+                        .border_color(theme.input_border_focused)
+                        .bg(theme.foreground)
+                        .px_4()
+                        .text_base()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.background)
+                        .child(detail_play_button_icon(detail.playback_loading, theme))
+                        .child(play_label)
+                        .when(can_play, |this| this.cursor_pointer().on_click(play))
+                        .when(!can_play, |this| this.cursor_default().opacity(0.62)),
+                )
+                .child(
+                    div()
+                        .id("series-detail-favorite-button")
+                        .flex()
+                        .size(px(32.0))
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme.input_border)
+                        .bg(theme.input_background)
+                        .child(
+                            svg()
+                                .path(if favorite {
+                                    "icons/heart-filled.svg"
+                                } else {
+                                    "icons/heart.svg"
+                                })
+                                .size(px(14.0))
+                                .text_color(if favorite {
+                                    theme.error
+                                } else {
+                                    theme.foreground
+                                }),
+                        )
+                        .when(!favorite_pending, |this| {
+                            this.cursor_pointer()
+                                .hover(move |style| style.bg(theme.secondary_hover))
+                                .on_click(toggle_favorite)
+                        })
+                        .when(favorite_pending, |this| this.cursor_default().opacity(0.55)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_end()
+                        .gap_3()
+                        .child(
+                            div()
+                                .relative()
+                                .child(
+                                    detail_select_box("视频", video_label, source_count > 0, cx)
+                                        .id("series-detail-video-select")
+                                        .on_click(toggle_video),
+                                )
+                                .when(media_source_select_open, |this| {
+                                    this.child(
+                                        deferred(detail_select_menu(
+                                            "series-detail-video-menu",
+                                            source_count,
+                                            DETAIL_SELECT_WIDTH_PX,
+                                            &detail.media_source_scroll_handle,
+                                            cx,
+                                            media_sources.iter().enumerate().map(
+                                                |(index, source)| {
+                                                    let label = source.name_label(index);
+                                                    let selected =
+                                                        selected_source_index == Some(index);
+                                                    let on_click = cx.listener(
+                                                        move |page: &mut HomeContent, _, _, cx| {
+                                                            page.select_series_media_source(
+                                                                index, cx,
+                                                            );
+                                                        },
+                                                    );
 
-                                                        detail_select_option(
-                                                            label,
-                                                            selected,
-                                                            (
-                                                                gpui::ElementId::from(
-                                                                    "series-detail-video-option",
-                                                                ),
-                                                                index.to_string(),
+                                                    detail_select_option(
+                                                        label,
+                                                        selected,
+                                                        (
+                                                            gpui::ElementId::from(
+                                                                "series-detail-video-option",
                                                             ),
-                                                            cx,
-                                                        )
-                                                        .on_click(on_click)
-                                                    },
-                                                ),
-                                            ))
-                                            .with_priority(1),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .relative()
-                                    .child(
-                                        detail_select_box("字幕", subtitle_label, subtitle_count > 0, cx)
-                                            .id("series-detail-subtitle-select")
-                                            .on_click(toggle_subtitle),
+                                                            index.to_string(),
+                                                        ),
+                                                        cx,
+                                                    )
+                                                    .on_click(on_click)
+                                                },
+                                            ),
+                                        ))
+                                        .with_priority(1),
                                     )
-                                    .when(subtitle_select_open, |this| {
-                                        this.child(
-                                            deferred(detail_select_menu(
-                                                "series-detail-subtitle-menu",
-                                                subtitle_count,
-                                                DETAIL_SELECT_WIDTH_PX,
-                                                &detail.subtitle_scroll_handle,
-                                                cx,
-                                                subtitle_streams.iter().enumerate().map(
-                                                    |(index, stream)| {
-                                                        let label = stream.display_title_label(index);
-                                                        let selected =
-                                                            selected_subtitle_index == Some(index);
-                                                        let on_click = cx.listener(
-                                                            move |page: &mut HomeContent, _, _, cx| {
-                                                                page.select_series_subtitle(index, cx);
-                                                            },
-                                                        );
+                                }),
+                        )
+                        .child(
+                            div()
+                                .relative()
+                                .child(
+                                    detail_select_box(
+                                        "字幕",
+                                        subtitle_label,
+                                        subtitle_count > 0,
+                                        cx,
+                                    )
+                                    .id("series-detail-subtitle-select")
+                                    .on_click(toggle_subtitle),
+                                )
+                                .when(subtitle_select_open, |this| {
+                                    this.child(
+                                        deferred(detail_select_menu(
+                                            "series-detail-subtitle-menu",
+                                            subtitle_count,
+                                            DETAIL_SELECT_WIDTH_PX,
+                                            &detail.subtitle_scroll_handle,
+                                            cx,
+                                            subtitle_streams.iter().enumerate().map(
+                                                |(index, stream)| {
+                                                    let label = stream.display_title_label(index);
+                                                    let selected =
+                                                        selected_subtitle_index == Some(index);
+                                                    let on_click = cx.listener(
+                                                        move |page: &mut HomeContent, _, _, cx| {
+                                                            page.select_series_subtitle(index, cx);
+                                                        },
+                                                    );
 
-                                                        detail_select_option(
-                                                            label,
-                                                            selected,
-                                                            (
-                                                                gpui::ElementId::from(
-                                                                    "series-detail-subtitle-option",
-                                                                ),
-                                                                index.to_string(),
+                                                    detail_select_option(
+                                                        label,
+                                                        selected,
+                                                        (
+                                                            gpui::ElementId::from(
+                                                                "series-detail-subtitle-option",
                                                             ),
-                                                            cx,
-                                                        )
-                                                        .on_click(on_click)
-                                                    },
-                                                ),
-                                            ))
-                                            .with_priority(1),
-                                        )
-                                    }),
-                            ),
-                    ),
-            )
-            .when_some(detail.playback_failed.clone(), |this, error| {
-                this.child(div().text_sm().text_color(theme.error).child(error))
-            })
-            .when_some(self.detail_favorite_error(), |this, error| {
-                this.child(div().text_sm().text_color(theme.error).child(error))
-            })
+                                                            index.to_string(),
+                                                        ),
+                                                        cx,
+                                                    )
+                                                    .on_click(on_click)
+                                                },
+                                            ),
+                                        ))
+                                        .with_priority(1),
+                                    )
+                                }),
+                        ),
+                ),
+        )
     }
 
     fn render_series_detail_season_selector(
@@ -1004,36 +932,13 @@ impl HomeContent {
         viewport_width: f32,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
         let items = detail.similar_items.as_ref();
-        let show_empty = !detail.effects.similar.is_loading()
-            && detail.similar_failed.is_none()
-            && items.is_none_or(|items| items.items.is_empty());
 
         div()
             .flex()
             .flex_col()
             .gap_3()
             .child(home_section_title("相似作品", cx))
-            .when_some(detail.similar_failed.clone(), |this, error| {
-                this.child(detail_error_with_retry(
-                    "retry-detail-similar",
-                    error,
-                    cx.listener(|page, _, _, cx| page.load_similar_items_if_needed(cx)),
-                    cx,
-                ))
-            })
-            .when(
-                detail.effects.similar.is_loading() && items.is_none(),
-                |this| {
-                    this.child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("加载相似作品中…"),
-                    )
-                },
-            )
             .when_some(
                 items.filter(|items| !items.items.is_empty()),
                 |this, items| {
@@ -1045,14 +950,6 @@ impl HomeContent {
                     ))
                 },
             )
-            .when(show_empty, |this| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("暂无相似作品"),
-                )
-            })
     }
 
     fn render_series_detail_similar_row(
@@ -1188,7 +1085,6 @@ impl HomeContent {
         item: &MediaItem,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
         let studios = item
             .studios
             .as_deref()
@@ -1196,31 +1092,24 @@ impl HomeContent {
             .iter()
             .filter_map(|studio| studio.name().map(ToString::to_string))
             .collect::<Vec<_>>();
-        let has_studios = !studios.is_empty();
 
         div()
             .flex()
             .flex_col()
             .gap_3()
             .child(home_section_title("工作室", cx))
-            .when(has_studios, |this| {
-                this.child(div().flex().flex_wrap().gap_2().children(
-                    studios.into_iter().enumerate().map(|(index, name)| {
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(studios.into_iter().enumerate().map(|(index, name)| {
                         detail_tag(name.clone(), false, cx).id((
                             gpui::ElementId::from("series-detail-studio-tag"),
                             format!("{name}-{index}"),
                         ))
-                    }),
-                ))
-            })
-            .when(!has_studios, |this| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("暂无工作室信息"),
-                )
-            })
+                    })),
+            )
     }
 
     fn render_series_detail_links_row(
@@ -1266,6 +1155,12 @@ impl HomeContent {
     }
 }
 
+fn has_studios(item: &MediaItem) -> bool {
+    item.studios
+        .as_deref()
+        .is_some_and(|studios| studios.iter().any(|studio| studio.name().is_some()))
+}
+
 fn detail_tag<T>(label: String, clickable: bool, cx: &Context<T>) -> gpui::Div {
     let theme = theme::get(cx);
 
@@ -1286,35 +1181,6 @@ fn detail_tag<T>(label: String, clickable: bool, cx: &Context<T>) -> gpui::Div {
                 .hover(move |style| style.bg(theme.secondary_hover))
         })
         .child(label)
-}
-
-fn detail_error_with_retry<T>(
-    id: &'static str,
-    error: gpui::SharedString,
-    retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    cx: &Context<T>,
-) -> impl IntoElement {
-    let theme = theme::get(cx);
-    div()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_2()
-        .child(div().text_sm().text_color(theme.error).child(error))
-        .child(
-            div()
-                .id(id)
-                .rounded_md()
-                .px_2()
-                .py_1()
-                .text_sm()
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.input_border_focused)
-                .hover(move |style| style.bg(theme.secondary_hover))
-                .cursor_pointer()
-                .child("重试")
-                .on_click(retry),
-        )
 }
 
 fn detail_select_box<T>(
@@ -1543,10 +1409,42 @@ fn detail_select_label_needs_tooltip(label: &str) -> bool {
     detail_select_label_width_units(label) > DETAIL_SELECT_TOOLTIP_WIDTH_UNITS
 }
 
-fn detail_play_button_label(playback_loading: bool, playback_seconds: Option<u64>) -> String {
-    if playback_loading {
-        "获取播放地址中…".to_string()
-    } else if let Some(total_seconds) = playback_seconds {
+fn detail_play_button_icon(playback_loading: bool, theme: &theme::TinyTheme) -> impl IntoElement {
+    let color = theme.background;
+
+    div()
+        .flex()
+        .size(px(18.0))
+        .items_center()
+        .justify_center()
+        .when(playback_loading, |this| {
+            this.child(
+                svg()
+                    .path("icons/loader.svg")
+                    .size(px(18.0))
+                    .overflow_hidden()
+                    .text_color(color)
+                    .with_animation(
+                        "series-detail-playback-loader",
+                        Animation::new(std::time::Duration::from_millis(1_800)).repeat(),
+                        |svg, delta| {
+                            svg.with_transformation(Transformation::rotate(percentage(delta)))
+                        },
+                    ),
+            )
+        })
+        .when(!playback_loading, |this| {
+            this.child(
+                svg()
+                    .path("icons/play.svg")
+                    .size(px(18.0))
+                    .text_color(color),
+            )
+        })
+}
+
+fn detail_play_button_label(playback_seconds: Option<u64>) -> String {
+    if let Some(total_seconds) = playback_seconds {
         let minutes = total_seconds / 60;
         let seconds = total_seconds % 60;
         format!("继续 {minutes}:{seconds:02}")
@@ -1600,10 +1498,9 @@ mod tests {
 
     #[test]
     fn play_button_label_shows_resume_time_with_two_digit_seconds() {
-        assert_eq!(detail_play_button_label(false, Some(905)), "继续 15:05");
-        assert_eq!(detail_play_button_label(false, Some(900)), "继续 15:00");
-        assert_eq!(detail_play_button_label(false, None), "播放");
-        assert_eq!(detail_play_button_label(true, Some(905)), "获取播放地址中…");
+        assert_eq!(detail_play_button_label(Some(905)), "继续 15:05");
+        assert_eq!(detail_play_button_label(Some(900)), "继续 15:00");
+        assert_eq!(detail_play_button_label(None), "播放");
     }
 
     #[test]

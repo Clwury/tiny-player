@@ -8,6 +8,10 @@ use crate::emby::{
 use super::{
     HomeContent, LoadState,
     navigation::{HomeRoot, HomeRoute},
+    notification::{
+        FAVORITES_INITIAL_NOTIFICATION_KEY, FAVORITES_LOAD_MORE_NOTIFICATION_KEY,
+        FAVORITES_REFRESH_NOTIFICATION_KEY, NotificationScope,
+    },
     paged_items::PAGED_ITEMS_LIMIT,
 };
 
@@ -19,19 +23,29 @@ pub(crate) struct FavoriteRollback {
 
 impl HomeContent {
     pub(super) fn enter_favorites_if_needed(&mut self, cx: &mut Context<Self>) {
-        if self.favorites.initial == LoadState::Idle || self.favorites.dirty {
+        if self.favorites.initial == LoadState::Idle
+            || self.favorites.initial == LoadState::Failed
+            || self.favorites.dirty
+        {
             self.load_favorites_initial(cx);
         }
     }
 
-    pub(super) fn retry_favorites(&mut self, cx: &mut Context<Self>) {
-        self.load_favorites_initial(cx);
+    pub(super) fn auto_load_more_favorites(&mut self, cx: &mut Context<Self>) {
+        if self.navigation.current() != &HomeRoute::Root(HomeRoot::Favorites) {
+            return;
+        }
+        self.load_more_favorites(cx);
     }
 
     pub(super) fn load_more_favorites(&mut self, cx: &mut Context<Self>) {
         let Some((generation, start_index)) = self.favorites.begin_load_more() else {
             return;
         };
+        self.clear_notification(
+            NotificationScope::Favorites,
+            FAVORITES_LOAD_MORE_NOTIFICATION_KEY,
+        );
         cx.notify();
         let server = self.current_server.clone();
         let identity = self.request_identity();
@@ -62,6 +76,7 @@ impl HomeContent {
         let Some(generation) = self.favorites.begin_initial(clear) else {
             return;
         };
+        self.clear_notifications_for_scope(NotificationScope::Favorites);
         cx.notify();
         let server = self.current_server.clone();
         let identity = self.request_identity();
@@ -108,12 +123,29 @@ impl HomeContent {
             });
             self.ensure_user_items_images(items, cx);
         }
-        if self.favorites.finish_initial_with_raw_count(
+        let finished = self.favorites.finish_initial_with_raw_count(
             generation,
             result,
             PAGED_ITEMS_LIMIT,
             raw_count,
-        ) {
+        );
+        if finished {
+            if self.favorites.initial == LoadState::Failed {
+                let (key, message): (&str, SharedString) =
+                    if let Some(error) = self.favorites.initial_error.clone() {
+                        (
+                            FAVORITES_INITIAL_NOTIFICATION_KEY,
+                            format!("加载收藏失败：{error}").into(),
+                        )
+                    } else if let Some(error) = self.favorites.refresh_error.clone() {
+                        (FAVORITES_REFRESH_NOTIFICATION_KEY, error)
+                    } else {
+                        (FAVORITES_INITIAL_NOTIFICATION_KEY, "加载收藏失败".into())
+                    };
+                self.push_error_notification(NotificationScope::Favorites, key, message, cx);
+            } else {
+                self.clear_notifications_for_scope(NotificationScope::Favorites);
+            }
             cx.notify();
         }
     }
@@ -148,13 +180,29 @@ impl HomeContent {
             });
             self.ensure_user_items_images(items, cx);
         }
-        if self.favorites.finish_load_more_with_raw_count(
+        let finished = self.favorites.finish_load_more_with_raw_count(
             generation,
             start_index,
             result,
             PAGED_ITEMS_LIMIT,
             raw_count,
-        ) {
+        );
+        if finished {
+            if self.favorites.load_more == LoadState::Failed {
+                if let Some(error) = self.favorites.load_more_error.clone() {
+                    self.push_error_notification(
+                        NotificationScope::Favorites,
+                        FAVORITES_LOAD_MORE_NOTIFICATION_KEY,
+                        format!("加载更多收藏失败：{error}"),
+                        cx,
+                    );
+                }
+            } else {
+                self.clear_notification(
+                    NotificationScope::Favorites,
+                    FAVORITES_LOAD_MORE_NOTIFICATION_KEY,
+                );
+            }
             cx.notify();
         }
     }
@@ -204,7 +252,10 @@ impl HomeContent {
             },
         );
         self.favorite_requests.insert(item_id.clone());
-        self.favorite_failures.remove(&item_id);
+        self.clear_notification(
+            NotificationScope::Detail,
+            &format!("detail:favorite:{item_id}"),
+        );
         cx.notify();
 
         let server = self.current_server.clone();
@@ -239,7 +290,6 @@ impl HomeContent {
         match result {
             Ok(data) => {
                 self.user_data_overrides.insert(item_id.clone(), data);
-                self.favorite_failures.remove(&item_id);
             }
             Err(error) => {
                 if let Some(rollback) = rollback {
@@ -255,8 +305,19 @@ impl HomeContent {
                         self.favorites.restore_item(index, item);
                     }
                 }
-                self.favorite_failures
-                    .insert(item_id, format!("更新收藏失败：{error}").into());
+                let message: SharedString = format!("更新收藏失败：{error}").into();
+                let is_detail = self
+                    .series_detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.series_id == item_id);
+                if is_detail {
+                    self.push_error_notification(
+                        NotificationScope::Detail,
+                        format!("detail:favorite:{item_id}"),
+                        message,
+                        cx,
+                    );
+                }
             }
         }
         self.schedule_home_snapshot_save(cx);
@@ -331,13 +392,6 @@ impl HomeContent {
 
     pub(super) fn favorite_is_pending(&self, item_id: &str) -> bool {
         self.favorite_requests.contains(item_id)
-    }
-
-    pub(super) fn detail_favorite_error(&self) -> Option<SharedString> {
-        self.series_detail
-            .as_ref()
-            .and_then(|detail| self.favorite_failures.get(&detail.series_id))
-            .cloned()
     }
 }
 

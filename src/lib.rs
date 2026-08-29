@@ -32,7 +32,7 @@ pub fn run() {
             theme::init(cx);
             TextInput::bind_keys(cx);
 
-            let (cache, cache_error) = match storage::load_or_init() {
+            let (cache, startup_error) = match storage::load_or_init() {
                 Ok(cache) => (cache, None),
                 Err(error) => (
                     ServerCache::empty(),
@@ -63,7 +63,7 @@ pub fn run() {
                     app_id: Some(APP_ID.to_string()),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|_| TinyApp::new(cache, cache_error)),
+                |_, cx| cx.new(|cx| TinyApp::new(cache, startup_error, cx)),
             )
             .unwrap();
 

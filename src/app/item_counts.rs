@@ -36,7 +36,7 @@ impl TinyApp {
         }
 
         let Some(client) = self.emby_client.clone() else {
-            self.cache_error = Some("Emby HTTP 客户端不可用".into());
+            self.push_app_error_notification("Emby HTTP 客户端不可用", cx);
             cx.notify();
             return;
         };

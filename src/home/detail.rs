@@ -2,6 +2,7 @@ mod images;
 mod render;
 mod state;
 
+use super::notification::{HOME_RESUME_DETAIL_NOTIFICATION_KEY, NotificationScope};
 pub(crate) use state::{SeriesDetailSelectKind, SeriesDetailState};
 
 use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, SharedString, Window, point, px};
@@ -21,6 +22,13 @@ use super::{
     HomeContent, HomeContentEvent, LoadState, WorkspaceIdentity,
     carousel::DETAIL_EPISODE_CARD_STEP_PX,
 };
+
+const DETAIL_ITEM_NOTIFICATION_KEY: &str = "detail:item";
+const DETAIL_SIMILAR_NOTIFICATION_KEY: &str = "detail:similar";
+const DETAIL_SEASONS_NOTIFICATION_KEY: &str = "detail:seasons";
+const DETAIL_NEXT_UP_NOTIFICATION_KEY: &str = "detail:next-up";
+const DETAIL_EPISODES_NOTIFICATION_KEY: &str = "detail:episodes";
+const DETAIL_PLAYBACK_NOTIFICATION_KEY: &str = "detail:playback";
 
 struct SelectedPlayback {
     detail_id: String,
@@ -68,8 +76,14 @@ impl HomeContent {
             }
             Some("Episode") => {
                 let Some(detail) = SeriesDetailState::from_resume_episode(item) else {
-                    self.resume_detail_failed =
-                        Some("继续观看剧集缺少 SeriesId，无法打开详情".into());
+                    if let Some(scope) = self.current_notification_scope() {
+                        self.push_error_notification(
+                            scope,
+                            HOME_RESUME_DETAIL_NOTIFICATION_KEY,
+                            "继续观看剧集缺少 SeriesId，无法打开详情",
+                            cx,
+                        );
+                    }
                     cx.notify();
                     return;
                 };
@@ -80,9 +94,8 @@ impl HomeContent {
     }
 
     fn open_detail_state(&mut self, detail: SeriesDetailState, cx: &mut Context<Self>) {
-        self.resume_detail_failed = None;
         self.resume_item_context_menu = None;
-        self.favorite_failures.remove(&detail.series_id);
+        self.clear_all_notifications();
         if let Some(current) = self.series_detail.take() {
             self.detail_history.push(current);
         }
@@ -106,6 +119,7 @@ impl HomeContent {
         if !self.navigation.pop() {
             return;
         }
+        self.clear_notifications_for_scope(NotificationScope::Detail);
         self.detail_generation = self.detail_generation.wrapping_add(1);
         self.series_detail = if matches!(
             self.navigation.current(),
@@ -149,6 +163,7 @@ impl HomeContent {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.clear_notification(NotificationScope::Detail, DETAIL_PLAYBACK_NOTIFICATION_KEY);
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -159,7 +174,14 @@ impl HomeContent {
         let selected = match selected_playback(detail, &self.current_server) {
             Ok(selected) => selected,
             Err(error) => {
-                detail.playback_failed = Some(error.into());
+                let message: SharedString = error.into();
+                detail.playback_failed = Some(message.clone());
+                self.push_error_notification(
+                    NotificationScope::Detail,
+                    DETAIL_PLAYBACK_NOTIFICATION_KEY,
+                    message,
+                    cx,
+                );
                 cx.notify();
                 return;
             }
@@ -259,7 +281,14 @@ impl HomeContent {
                 })));
             }
             Err(error) => {
-                detail.playback_failed = Some(format!("获取播放地址失败：{error}").into());
+                let message: SharedString = format!("获取播放地址失败：{error}").into();
+                detail.playback_failed = Some(message.clone());
+                self.push_error_notification(
+                    NotificationScope::Detail,
+                    DETAIL_PLAYBACK_NOTIFICATION_KEY,
+                    message,
+                    cx,
+                );
             }
         }
 
@@ -307,6 +336,7 @@ impl HomeContent {
         let identity = self.request_identity();
         let user_data_revision = self.user_data_request_revision();
         let generation = self.detail_generation;
+        self.clear_notification(NotificationScope::Detail, DETAIL_ITEM_NOTIFICATION_KEY);
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -383,14 +413,21 @@ impl HomeContent {
                 }
             }
             Err(error) => {
+                let message: SharedString = format!("加载媒体详情失败：{error}").into();
                 if let Some(detail) = self.series_detail.as_mut() {
                     if detail.series_id.as_str() != series_id.as_str() {
                         return;
                     }
 
                     detail.effects.item = LoadState::Failed;
-                    detail.item_failed = Some(format!("加载媒体详情失败：{error}").into());
+                    detail.item_failed = Some(message.clone());
                 }
+                self.push_error_notification(
+                    NotificationScope::Detail,
+                    DETAIL_ITEM_NOTIFICATION_KEY,
+                    message,
+                    cx,
+                );
             }
         }
 
@@ -401,6 +438,7 @@ impl HomeContent {
         let identity = self.request_identity();
         let user_data_revision = self.user_data_request_revision();
         let generation = self.detail_generation;
+        self.clear_notification(NotificationScope::Detail, DETAIL_SIMILAR_NOTIFICATION_KEY);
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -472,14 +510,21 @@ impl HomeContent {
                 }
             }
             Err(error) => {
+                let message: SharedString = format!("加载相似作品失败：{error}").into();
                 if let Some(detail) = self.series_detail.as_mut() {
                     if detail.series_id.as_str() != item_id.as_str() {
                         return;
                     }
 
                     detail.effects.similar = LoadState::Failed;
-                    detail.similar_failed = Some(format!("加载相似作品失败：{error}").into());
+                    detail.similar_failed = Some(message.clone());
                 }
+                self.push_error_notification(
+                    NotificationScope::Detail,
+                    DETAIL_SIMILAR_NOTIFICATION_KEY,
+                    message,
+                    cx,
+                );
             }
         }
 
@@ -489,6 +534,7 @@ impl HomeContent {
     fn load_series_seasons_if_needed(&mut self, cx: &mut Context<Self>) {
         let identity = self.request_identity();
         let generation = self.detail_generation;
+        self.clear_notification(NotificationScope::Detail, DETAIL_SEASONS_NOTIFICATION_KEY);
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -542,8 +588,15 @@ impl HomeContent {
                 self.load_series_episodes_if_needed(cx);
             }
             Err(error) => {
+                let message: SharedString = format!("加载剧集季数失败：{error}").into();
                 detail.effects.seasons = LoadState::Failed;
-                detail.seasons_failed = Some(format!("加载剧集季数失败：{error}").into());
+                detail.seasons_failed = Some(message.clone());
+                self.push_error_notification(
+                    NotificationScope::Detail,
+                    DETAIL_SEASONS_NOTIFICATION_KEY,
+                    message,
+                    cx,
+                );
             }
         }
 
@@ -553,6 +606,7 @@ impl HomeContent {
     fn load_series_next_up_if_needed(&mut self, cx: &mut Context<Self>) {
         let identity = self.request_identity();
         let generation = self.detail_generation;
+        self.clear_notification(NotificationScope::Detail, DETAIL_NEXT_UP_NOTIFICATION_KEY);
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -597,6 +651,7 @@ impl HomeContent {
             return;
         }
 
+        let mut failure = None;
         match result {
             Ok(mut next_up) => {
                 apply_media_item_user_data_overrides(&mut next_up.items, &self.user_data_overrides);
@@ -607,11 +662,22 @@ impl HomeContent {
                 self.load_series_episodes_if_needed(cx);
             }
             Err(error) => {
+                let message: SharedString = format!("加载下一剧集失败：{error}").into();
                 detail.effects.next_up = LoadState::Failed;
-                detail.next_up_failed = Some(format!("加载下一剧集失败：{error}").into());
+                detail.next_up_failed = Some(message.clone());
+                failure = Some(message);
                 detail.choose_season_if_needed();
                 self.load_series_episodes_if_needed(cx);
             }
+        }
+
+        if let Some(message) = failure {
+            self.push_error_notification(
+                NotificationScope::Detail,
+                DETAIL_NEXT_UP_NOTIFICATION_KEY,
+                message,
+                cx,
+            );
         }
 
         cx.notify();
@@ -623,6 +689,7 @@ impl HomeContent {
             detail: self.detail_generation,
             user_data: self.user_data_request_revision(),
         };
+        self.clear_notification(NotificationScope::Detail, DETAIL_EPISODES_NOTIFICATION_KEY);
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
@@ -724,6 +791,7 @@ impl HomeContent {
                 }
             }
             Err(error) => {
+                let message: SharedString = format!("加载剧集分集失败：{error}").into();
                 if let Some(detail) = self.series_detail.as_mut() {
                     if detail.series_id.as_str() != series_id.as_str()
                         || detail.selected_season_id.as_deref() != Some(season_id.as_str())
@@ -733,8 +801,14 @@ impl HomeContent {
                     }
 
                     detail.effects.episodes = LoadState::Failed;
-                    detail.episodes_failed = Some(format!("加载剧集分集失败：{error}").into());
+                    detail.episodes_failed = Some(message.clone());
                 }
+                self.push_error_notification(
+                    NotificationScope::Detail,
+                    DETAIL_EPISODES_NOTIFICATION_KEY,
+                    message,
+                    cx,
+                );
             }
         }
 

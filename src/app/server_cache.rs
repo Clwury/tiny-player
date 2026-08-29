@@ -32,10 +32,10 @@ impl TinyApp {
                 self.servers = cache.servers.clone();
                 self.cache = cache;
                 self.retain_item_count_state();
-                self.cache_error = None;
+                self.clear_app_notifications();
             }
             Err(error) => {
-                self.cache_error = Some(format!("删除服务器失败：{error}").into());
+                self.push_app_error_notification(format!("删除服务器失败：{error}"), cx);
             }
         }
         cx.notify();
@@ -52,14 +52,14 @@ impl TinyApp {
                 self.servers = cache.servers.clone();
                 self.cache = cache;
                 self.retain_item_count_state();
-                self.cache_error = None;
+                self.clear_app_notifications();
                 self.add_server_dialog = None;
                 self.page = Page::Servers;
             }
             Err(error) => {
                 dialog.update(cx, |dialog, cx| {
                     dialog.set_submitting(false, cx);
-                    dialog.set_form_error(format!("添加服务器失败：{error}"), cx);
+                    dialog.push_error_notification(format!("添加服务器失败：{error}"), cx);
                 });
             }
         }
@@ -78,13 +78,13 @@ impl TinyApp {
                 self.servers = cache.servers.clone();
                 self.cache = cache;
                 self.retain_item_count_state();
-                self.cache_error = None;
+                self.clear_app_notifications();
                 self.add_server_dialog = None;
             }
             Err(error) => {
                 dialog.update(cx, |dialog, cx| {
                     dialog.set_submitting(false, cx);
-                    dialog.set_form_error(format!("保存服务器失败：{error}"), cx);
+                    dialog.push_error_notification(format!("保存服务器失败：{error}"), cx);
                 });
             }
         }

@@ -2,7 +2,10 @@ use gpui::{AppContext as _, Context, MouseDownEvent, Pixels, Point, Window};
 
 use crate::emby::{ResumeItems, UserItemData};
 
-use super::{HomeContent, WorkspaceIdentity};
+use super::{
+    HomeContent, WorkspaceIdentity,
+    notification::{HOME_RESUME_ACTION_NOTIFICATION_KEY, NotificationScope},
+};
 
 #[derive(Clone, Debug)]
 pub(super) struct ResumeItemContextMenu {
@@ -77,7 +80,7 @@ impl HomeContent {
         }
 
         self.resume_item_context_menu = None;
-        self.resume_action_failed = None;
+        self.clear_notification(NotificationScope::Home, HOME_RESUME_ACTION_NOTIFICATION_KEY);
         self.resume_item_requests.insert(item_id.clone());
         cx.notify();
 
@@ -132,11 +135,19 @@ impl HomeContent {
                     self.user_data_overrides.insert(item_id.clone(), data);
                 }
                 remove_resume_item(&mut self.resume_items, &item_id);
-                self.resume_action_failed = None;
+                self.clear_notification(
+                    NotificationScope::Home,
+                    HOME_RESUME_ACTION_NOTIFICATION_KEY,
+                );
                 self.schedule_home_snapshot_save(cx);
             }
             Err(error) => {
-                self.resume_action_failed = Some(format!("{}失败：{error}", action.label()).into());
+                self.push_error_notification(
+                    NotificationScope::Home,
+                    HOME_RESUME_ACTION_NOTIFICATION_KEY,
+                    format!("{}失败：{error}", action.label()),
+                    cx,
+                );
             }
         }
         cx.notify();

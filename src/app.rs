@@ -2,6 +2,7 @@ mod auth;
 mod cache_save;
 mod dialogs;
 mod item_counts;
+mod notification;
 mod render;
 mod resize;
 mod server_cache;
@@ -10,7 +11,7 @@ mod window;
 
 use std::collections::{HashMap, HashSet};
 
-use gpui::{Entity, SharedString};
+use gpui::{Context, Entity, SharedString};
 
 pub(crate) use resize::WINDOW_RESIZE_EDGE_WIDTH_PX;
 
@@ -22,6 +23,7 @@ use crate::{
     storage::ServerCache,
     ui::add_server_dialog::AddServerDialogState,
 };
+use notification::AppNotificationQueue;
 
 pub struct TinyApp {
     add_server_dialog: Option<Entity<AddServerDialogState>>,
@@ -29,7 +31,7 @@ pub struct TinyApp {
     cache: ServerCache,
     emby_client: Option<EmbyClient>,
     servers: Vec<CachedServer>,
-    cache_error: Option<SharedString>,
+    app_notifications: AppNotificationQueue,
     item_counts: HashMap<String, ItemCounts>,
     item_counts_loading: HashSet<String>,
     item_counts_failed: HashSet<String>,
@@ -53,23 +55,26 @@ enum Page {
 }
 
 impl TinyApp {
-    pub fn new(cache: ServerCache, cache_error: Option<SharedString>) -> Self {
+    pub fn new(
+        cache: ServerCache,
+        startup_error: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let servers = cache.servers.clone();
-        let window_persistence_enabled = cache_error.is_none();
+        let window_persistence_enabled = startup_error.is_none();
         let item_counts = item_counts::cached_item_counts_by_server(&servers);
         let (emby_client, emby_client_error) = match EmbyClient::new(cache.device_id.clone()) {
             Ok(client) => (Some(client), None),
             Err(error) => (None, Some(format!("{error}").into())),
         };
-        let cache_error = cache_error.or(emby_client_error);
-
-        Self {
+        let initial_error = startup_error.or(emby_client_error);
+        let mut app = Self {
             add_server_dialog: None,
             open_server_menu: None,
             cache,
             emby_client,
             servers,
-            cache_error,
+            app_notifications: AppNotificationQueue::default(),
             item_counts,
             item_counts_loading: HashSet::new(),
             item_counts_failed: HashSet::new(),
@@ -80,6 +85,10 @@ impl TinyApp {
             cache_save_generation: 0,
             pending_cache_save_error_prefix: None,
             page: Page::Servers,
+        };
+        if let Some(error) = initial_error {
+            app.push_app_error_notification(error, cx);
         }
+        app
     }
 }

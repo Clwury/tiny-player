@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
-use gpui::{AppContext, Context, Timer, point, px};
+use gpui::{AppContext, Context, SharedString, Timer, point, px};
 
 use crate::{
     emby::{
@@ -16,6 +16,10 @@ use crate::{
 use super::{
     HomeContent, WorkspaceIdentity, cache as home_cache,
     library::{is_supported_view, latest_item_types},
+    notification::{
+        HOME_RESUME_ITEMS_NOTIFICATION_KEY, HOME_USER_VIEWS_NOTIFICATION_KEY, NotificationScope,
+        latest_items_notification_key,
+    },
 };
 
 const RESUME_CARD_IMAGE_MAX_WIDTH: u32 = 800;
@@ -119,7 +123,6 @@ impl HomeContent {
                 });
                 items.total_record_count = items.items.len() as u32;
                 row.items = Some(items);
-                row.failed = None;
             }
         }
     }
@@ -159,6 +162,7 @@ impl HomeContent {
 
         self.home_refresh_generation = self.home_refresh_generation.wrapping_add(1);
         self.invalidate_pending_home_snapshot_save();
+        self.clear_notifications_for_scope(NotificationScope::Home);
         self.home_effects.home_snapshot = super::LoadState::Loaded;
         self.home_effects.user_views = super::LoadState::Idle;
         self.home_effects.resume_items = super::LoadState::Idle;
@@ -167,8 +171,6 @@ impl HomeContent {
         self.user_views_carousel = Default::default();
         self.resume_items = None;
         self.resume_items_failed = None;
-        self.resume_detail_failed = None;
-        self.resume_action_failed = None;
         self.resume_item_context_menu = None;
         self.resume_items_carousel = Default::default();
         self.user_view_items_rows.clear();
@@ -204,6 +206,7 @@ impl HomeContent {
 
         self.home_effects.user_views = super::LoadState::Loading;
         self.user_views_failed = None;
+        self.clear_notification(NotificationScope::Home, HOME_USER_VIEWS_NOTIFICATION_KEY);
         cx.notify();
         let server = self.current_server.clone();
         let identity = self.request_identity();
@@ -228,6 +231,7 @@ impl HomeContent {
 
         self.home_effects.resume_items = super::LoadState::Loading;
         self.resume_items_failed = None;
+        self.clear_notification(NotificationScope::Home, HOME_RESUME_ITEMS_NOTIFICATION_KEY);
         cx.notify();
         let server = self.current_server.clone();
         let identity = self.request_identity();
@@ -262,6 +266,7 @@ impl HomeContent {
                 views.total_record_count = views.items.len() as u32;
                 self.home_effects.user_views = super::LoadState::Loaded;
                 self.user_views_failed = None;
+                self.clear_notification(NotificationScope::Home, HOME_USER_VIEWS_NOTIFICATION_KEY);
                 self.ensure_user_view_images(&views, cx);
                 self.user_views = Some(views.clone());
                 self.load_user_view_items_for_views(&views, cx);
@@ -276,6 +281,13 @@ impl HomeContent {
                         format!("加载首页失败：{error}")
                     }
                     .into(),
+                );
+                let message = self.user_views_failed.clone().expect("failure was stored");
+                self.push_error_notification(
+                    NotificationScope::Home,
+                    HOME_USER_VIEWS_NOTIFICATION_KEY,
+                    message,
+                    cx,
                 );
             }
         }
@@ -303,9 +315,10 @@ impl HomeContent {
                 self.absorb_resume_items_user_data(&items, user_data_revision);
                 self.home_effects.resume_items = super::LoadState::Loaded;
                 self.resume_items_failed = None;
-                if self.resume_item_requests.is_empty() {
-                    self.resume_action_failed = None;
-                }
+                self.clear_notification(
+                    NotificationScope::Home,
+                    HOME_RESUME_ITEMS_NOTIFICATION_KEY,
+                );
                 self.ensure_resume_item_images(&items, cx);
                 self.resume_items = Some(items);
                 self.schedule_home_snapshot_save(cx);
@@ -319,6 +332,16 @@ impl HomeContent {
                         format!("加载继续观看失败：{error}")
                     }
                     .into(),
+                );
+                let message = self
+                    .resume_items_failed
+                    .clone()
+                    .expect("failure was stored");
+                self.push_error_notification(
+                    NotificationScope::Home,
+                    HOME_RESUME_ITEMS_NOTIFICATION_KEY,
+                    message,
+                    cx,
                 );
             }
         }
@@ -346,18 +369,6 @@ impl HomeContent {
         self.pump_latest_queue(cx);
     }
 
-    pub(super) fn retry_latest_items(&mut self, view_id: &str, cx: &mut Context<Self>) {
-        if self
-            .latest_in_flight
-            .contains(&(view_id.to_string(), self.home_refresh_generation))
-            || self.latest_queue.iter().any(|id| id == view_id)
-        {
-            return;
-        }
-        self.latest_queue.push_front(view_id.to_string());
-        self.pump_latest_queue(cx);
-    }
-
     fn pump_latest_queue(&mut self, cx: &mut Context<Self>) {
         while self.latest_in_flight.len() < HOME_LATEST_CONCURRENCY {
             let Some(view_id) = self.latest_queue.pop_front() else {
@@ -381,15 +392,22 @@ impl HomeContent {
             {
                 continue;
             }
-            let row = self
+            if self
                 .user_view_items_rows
-                .entry(view_id.clone())
-                .or_default();
-            if row.loading {
+                .get(&view_id)
+                .is_some_and(|row| row.loading)
+            {
                 continue;
             }
-            row.loading = true;
-            row.failed = None;
+            let notification_key = latest_items_notification_key(&view_id);
+            self.clear_notification(NotificationScope::Home, &notification_key);
+            {
+                let row = self
+                    .user_view_items_rows
+                    .entry(view_id.clone())
+                    .or_default();
+                row.loading = true;
+            }
             self.latest_in_flight.insert((view_id.clone(), generation));
             let server = self.current_server.clone();
             let identity = self.request_identity();
@@ -460,22 +478,37 @@ impl HomeContent {
                 };
                 self.absorb_user_items_user_data(&items, user_data_revision);
                 self.ensure_feed_user_items_images(&items, cx);
-                let row = self.user_view_items_rows.entry(view_id).or_default();
+                let notification_key = latest_items_notification_key(&view_id);
+                let row = self
+                    .user_view_items_rows
+                    .entry(view_id.clone())
+                    .or_default();
                 row.loading = false;
-                row.failed = None;
                 row.items = Some(items);
+                self.clear_notification(NotificationScope::Home, &notification_key);
                 self.schedule_home_snapshot_save(cx);
             }
             Err(error) => {
-                let row = self.user_view_items_rows.entry(view_id).or_default();
-                row.loading = false;
-                row.failed = Some(
-                    if row.items.is_some() {
+                let message = {
+                    let row = self
+                        .user_view_items_rows
+                        .entry(view_id.clone())
+                        .or_default();
+                    row.loading = false;
+                    let message: SharedString = if row.items.is_some() {
                         format!("刷新失败：{error}")
                     } else {
                         format!("加载媒体库内容失败：{error}")
                     }
-                    .into(),
+                    .into();
+                    message
+                };
+                let notification_key = latest_items_notification_key(&view_id);
+                self.push_error_notification(
+                    NotificationScope::Home,
+                    notification_key,
+                    message,
+                    cx,
                 );
             }
         }

@@ -26,7 +26,8 @@ impl TinyApp {
         cx: &mut Context<Self>,
     ) {
         self.open_server_menu = None;
-        self.cache_error = None;
+        self.clear_app_notifications();
+        self.clear_server_notifications();
 
         let server_id = server.id.clone();
         if has_cached_auth(server) {
@@ -44,7 +45,7 @@ impl TinyApp {
 
         let Some(client) = self.emby_client.clone() else {
             self.selecting_server_id = None;
-            self.cache_error = Some("Emby HTTP 客户端不可用".into());
+            self.push_server_error_notification("Emby HTTP 客户端不可用", cx);
             cx.notify();
             return;
         };
@@ -86,7 +87,7 @@ impl TinyApp {
             }
             Err(error) => {
                 self.selecting_server_id = None;
-                self.cache_error = Some(format!("登录服务器失败：{error}").into());
+                self.push_server_error_notification(format!("登录服务器失败：{error}"), cx);
                 self.page = Page::Servers;
             }
         }
@@ -117,7 +118,7 @@ impl TinyApp {
 
         let Some(home_server) = home_server else {
             self.selecting_server_id = None;
-            self.cache_error = Some("登录服务器失败：服务器不存在".into());
+            self.push_server_error_notification("登录服务器失败：服务器不存在", cx);
             self.page = Page::Servers;
             return;
         };
@@ -135,7 +136,7 @@ impl TinyApp {
 
         if !updated_cache {
             self.selecting_server_id = None;
-            self.cache_error = Some("保存登录信息失败：服务器不存在".into());
+            self.push_server_error_notification("保存登录信息失败：服务器不存在", cx);
             self.page = Page::Servers;
             return;
         }
@@ -148,12 +149,13 @@ impl TinyApp {
 
         match storage::save(&self.cache) {
             Ok(()) => {
-                self.cache_error = None;
+                self.clear_app_notifications();
+                self.clear_server_notifications();
                 self.item_counts_failed.remove(&server_id);
                 self.load_item_counts_for_server_id(&server_id, cx);
             }
             Err(error) => {
-                self.cache_error = Some(format!("保存登录信息失败：{error}").into());
+                self.push_app_error_notification(format!("保存登录信息失败：{error}"), cx);
             }
         }
     }
@@ -161,12 +163,13 @@ impl TinyApp {
     fn open_home_for_server(&mut self, server: CachedServer, cx: &mut Context<Self>) {
         let Some(client) = self.emby_client.clone() else {
             self.selecting_server_id = None;
-            self.cache_error = Some("Emby HTTP 客户端不可用".into());
+            self.push_server_error_notification("Emby HTTP 客户端不可用", cx);
             self.page = Page::Servers;
             return;
         };
 
         self.selecting_server_id = None;
+        self.clear_server_notifications();
         let servers = self.servers.clone();
         let home_page = cx.new(|cx| HomePage::new(server, servers, client, cx));
         let playback_return_to = home_page.clone();

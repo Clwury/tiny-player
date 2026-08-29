@@ -6,6 +6,7 @@ mod detail;
 mod favorites;
 mod library;
 mod navigation;
+mod notification;
 mod paged_items;
 mod playback;
 mod render;
@@ -27,6 +28,7 @@ use carousel::CarouselState;
 use favorites::FavoriteRollback;
 use library::LibraryState;
 use navigation::{HomeNavigation, HomeRoot, HomeRoute};
+use notification::HomeNotificationQueue;
 use paged_items::PagedItemsState;
 use resume_actions::ResumeItemContextMenu;
 use search::SearchState;
@@ -82,7 +84,6 @@ struct HomeEffects {
 struct UserViewItemsRow {
     items: Option<UserItems>,
     loading: bool,
-    failed: Option<gpui::SharedString>,
     carousel: CarouselState,
 }
 
@@ -108,8 +109,6 @@ struct HomeContent {
     user_views_carousel: CarouselState,
     resume_items: Option<ResumeItems>,
     resume_items_failed: Option<gpui::SharedString>,
-    resume_detail_failed: Option<gpui::SharedString>,
-    resume_action_failed: Option<gpui::SharedString>,
     resume_items_carousel: CarouselState,
     resume_item_context_menu: Option<ResumeItemContextMenu>,
     resume_item_requests: HashSet<String>,
@@ -125,10 +124,10 @@ struct HomeContent {
     user_data_item_revisions: HashMap<String, u64>,
     favorite_requests: HashSet<String>,
     favorite_rollbacks: HashMap<String, FavoriteRollback>,
-    favorite_failures: HashMap<String, SharedString>,
     series_detail: Option<SeriesDetailState>,
     detail_history: Vec<SeriesDetailState>,
     detail_generation: u64,
+    notifications: HomeNotificationQueue,
     home_scroll_handle: ScrollHandle,
     image_loader: ImageLoader,
     snapshot_save_generation: u64,
@@ -188,8 +187,6 @@ impl HomeContent {
             user_views_carousel: CarouselState::default(),
             resume_items: None,
             resume_items_failed: None,
-            resume_detail_failed: None,
-            resume_action_failed: None,
             resume_items_carousel: CarouselState::default(),
             resume_item_context_menu: None,
             resume_item_requests: HashSet::new(),
@@ -205,10 +202,10 @@ impl HomeContent {
             user_data_item_revisions: HashMap::new(),
             favorite_requests: HashSet::new(),
             favorite_rollbacks: HashMap::new(),
-            favorite_failures: HashMap::new(),
             series_detail: None,
             detail_history: Vec::new(),
             detail_generation: 0,
+            notifications: HomeNotificationQueue::default(),
             home_scroll_handle: ScrollHandle::new(),
             image_loader: ImageLoader::new(),
             snapshot_save_generation: 0,
@@ -254,7 +251,7 @@ impl HomeContent {
         self.detail_generation = self.detail_generation.wrapping_add(1);
         self.series_detail = None;
         self.detail_history.clear();
-        self.favorite_failures.clear();
+        self.clear_all_notifications();
         self.resume_item_context_menu = None;
         match root {
             HomeRoot::Home => self.start_effects(cx),

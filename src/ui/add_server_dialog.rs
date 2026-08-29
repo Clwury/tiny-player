@@ -1,6 +1,7 @@
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, svg,
+    SharedString, StatefulInteractiveElement, Styled, Timer, Window, deferred, div,
+    prelude::FluentBuilder, px, svg,
 };
 
 use crate::{
@@ -8,15 +9,15 @@ use crate::{
     theme,
 };
 
-use super::text_input::{TextInput, TextInputEvent};
+use super::{
+    notification::{
+        NOTIFICATION_AUTOHIDE, NotificationQueue, error_notification, notification_layer,
+    },
+    text_input::{TextInput, TextInputEvent},
+};
 
-#[derive(Default)]
-struct AddServerErrors {
-    address: Option<SharedString>,
-    port: Option<SharedString>,
-    username: Option<SharedString>,
-    password: Option<SharedString>,
-}
+const SERVER_DIALOG_ERROR_NOTIFICATION_KEY: &str = "server-dialog:error";
+const SERVER_DIALOG_NOTIFICATION_TOP_PX: f32 = 51.0;
 
 #[derive(Clone, Debug)]
 pub enum ServerDialogMode {
@@ -34,8 +35,7 @@ pub struct AddServerDialogState {
     password: Entity<TextInput>,
     show_password: bool,
     is_submitting: bool,
-    form_error: Option<SharedString>,
-    errors: AddServerErrors,
+    notifications: NotificationQueue<&'static str>,
 }
 
 impl AddServerDialogState {
@@ -120,8 +120,7 @@ impl AddServerDialogState {
             password: password_input,
             show_password: false,
             is_submitting: false,
-            form_error: None,
-            errors: AddServerErrors::default(),
+            notifications: NotificationQueue::default(),
         }
     }
 
@@ -130,8 +129,7 @@ impl AddServerDialogState {
             return None;
         }
 
-        self.errors = AddServerErrors::default();
-        self.form_error = None;
+        self.notifications.clear();
 
         let protocol = self.protocol;
         let address = self.address.read(cx).value();
@@ -140,40 +138,13 @@ impl AddServerDialogState {
         let username = self.username.read(cx).value();
         let password = self.password.read(cx).value();
 
-        let username_trimmed = username.trim();
-        let password_trimmed = password.trim();
-
-        let endpoint = match ServerEndpoint::parse_user_input(protocol, &address, &port, &path) {
-            Ok(endpoint) => Some(endpoint),
+        match validate_server_submission(protocol, &address, &port, &path, &username, &password) {
+            Ok(submission) => Some(submission),
             Err(error) => {
-                let message = error.to_string();
-                if message.contains("端口") {
-                    self.errors.port = Some(message.into());
-                } else {
-                    self.errors.address = Some(message.into());
-                }
+                self.push_error_notification(error, cx);
                 None
             }
-        };
-
-        if username_trimmed.is_empty() {
-            self.errors.username = Some("请输入用户名".into());
         }
-
-        if password_trimmed.is_empty() {
-            self.errors.password = Some("请输入密码".into());
-        }
-
-        if self.has_errors() {
-            cx.notify();
-            return None;
-        }
-
-        Some(AddServerSubmission {
-            endpoint: endpoint.expect("endpoint was validated"),
-            username: username_trimmed.to_string(),
-            password: password_trimmed.to_string(),
-        })
     }
 
     pub fn edit_server_id(&self) -> Option<String> {
@@ -188,14 +159,27 @@ impl AddServerDialogState {
         cx.notify();
     }
 
-    pub fn set_form_error(&mut self, error: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.form_error = Some(error.into());
+    pub fn push_error_notification(
+        &mut self,
+        error: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self
+            .notifications
+            .push(SERVER_DIALOG_ERROR_NOTIFICATION_KEY, error.into());
         cx.notify();
-    }
 
-    pub fn clear_form_error(&mut self, cx: &mut Context<Self>) {
-        self.form_error = None;
-        cx.notify();
+        cx.spawn(async move |dialog, cx| {
+            Timer::after(NOTIFICATION_AUTOHIDE).await;
+            dialog
+                .update(cx, |dialog, cx| {
+                    if dialog.notifications.remove(id) {
+                        cx.notify();
+                    }
+                })
+                .ok();
+        })
+        .detach();
     }
 
     fn auto_format_full_url(&mut self, cx: &mut Context<Self>) {
@@ -205,8 +189,6 @@ impl AddServerDialogState {
         };
 
         self.protocol = endpoint.protocol;
-        self.errors.address = None;
-        self.errors.port = None;
 
         let formatted_address = endpoint.address_input_value();
         self.address.update(cx, |address, cx| {
@@ -239,22 +221,8 @@ impl AddServerDialogState {
     ) -> impl IntoElement {
         let theme = theme::get(cx);
         let (title, submit_label) = match &self.mode {
-            ServerDialogMode::Add => (
-                "添加服务器",
-                if self.is_submitting {
-                    "添加中..."
-                } else {
-                    "添加"
-                },
-            ),
-            ServerDialogMode::Edit { .. } => (
-                "编辑服务器",
-                if self.is_submitting {
-                    "保存中..."
-                } else {
-                    "保存"
-                },
-            ),
+            ServerDialogMode::Add => ("添加服务器", "添加"),
+            ServerDialogMode::Edit { .. } => ("编辑服务器", "保存"),
         };
 
         div()
@@ -289,7 +257,7 @@ impl AddServerDialogState {
                             .text_color(theme.foreground)
                             .child(title),
                     )
-                    .child(self.render_form(dialog, cx))
+                    .child(self.render_form(dialog.clone(), cx))
                     .child(
                         div()
                             .flex()
@@ -311,10 +279,12 @@ impl AddServerDialogState {
                             ),
                     ),
             )
+            .when(!self.notifications.is_empty(), |this| {
+                this.child(deferred(self.render_notification_layer(dialog, cx)).with_priority(3))
+            })
     }
 
     fn render_form(&self, dialog: Entity<Self>, cx: &App) -> impl IntoElement {
-        let theme = theme::get(cx);
         let port = self.port.read(cx).value();
         let password_icon = if self.show_password {
             "icons/eye-off.svg"
@@ -328,9 +298,6 @@ impl AddServerDialogState {
             .flex_col()
             .gap_4()
             .w_full()
-            .when_some(self.form_error.clone(), |this, error| {
-                this.child(div().text_sm().text_color(theme.error).child(error))
-            })
             .child(field(
                 "服务器地址",
                 address_input(
@@ -339,7 +306,6 @@ impl AddServerDialogState {
                     format!(":{}", port),
                     cx,
                 ),
-                self.errors.address.clone(),
                 cx,
             ))
             .child(
@@ -349,27 +315,15 @@ impl AddServerDialogState {
                     .child(div().w(px(148.0)).child(field(
                         "协议",
                         protocol_selector(dialog.clone(), self.protocol, cx),
-                        None,
                         cx,
                     )))
-                    .child(div().flex_1().child(field(
-                        "端口",
-                        self.port.clone(),
-                        self.errors.port.clone(),
-                        cx,
-                    ))),
+                    .child(div().flex_1().child(field("端口", self.port.clone(), cx))),
             )
-            .child(field("路径", self.path.clone(), None, cx))
-            .child(field(
-                "用户名",
-                self.username.clone(),
-                self.errors.username.clone(),
-                cx,
-            ))
+            .child(field("路径", self.path.clone(), cx))
+            .child(field("用户名", self.username.clone(), cx))
             .child(field(
                 "密码",
                 password_input(self.password.clone(), password_icon, toggle_dialog, cx),
-                self.errors.password.clone(),
                 cx,
             ))
     }
@@ -401,12 +355,57 @@ impl AddServerDialogState {
         cx.notify();
     }
 
-    fn has_errors(&self) -> bool {
-        self.errors.address.is_some()
-            || self.errors.port.is_some()
-            || self.errors.username.is_some()
-            || self.errors.password.is_some()
+    fn dismiss_notification(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.notifications.remove(id) {
+            cx.notify();
+        }
     }
+
+    fn render_notification_layer(&self, dialog: Entity<Self>, cx: &App) -> impl IntoElement {
+        notification_layer()
+            .top(px(SERVER_DIALOG_NOTIFICATION_TOP_PX))
+            .children(self.notifications.iter().map(|entry| {
+                let id = entry.notification.id;
+                let dismiss_dialog = dialog.clone();
+                error_notification(
+                    id,
+                    entry.notification.message.clone(),
+                    move |_, _, cx| {
+                        dismiss_dialog.update(cx, |dialog, cx| {
+                            dialog.dismiss_notification(id, cx);
+                        });
+                    },
+                    cx,
+                )
+            }))
+    }
+}
+
+fn validate_server_submission(
+    protocol: Protocol,
+    address: &str,
+    port: &str,
+    path: &str,
+    username: &str,
+    password: &str,
+) -> Result<AddServerSubmission, SharedString> {
+    let endpoint = ServerEndpoint::parse_user_input(protocol, address, port, path)
+        .map_err(|error| -> SharedString { error.to_string().into() })?;
+    let username = username.trim();
+    let password = password.trim();
+
+    if username.is_empty() {
+        return Err("请输入用户名".into());
+    }
+    if password.is_empty() {
+        return Err("请输入密码".into());
+    }
+
+    Ok(AddServerSubmission {
+        endpoint,
+        username: username.to_string(),
+        password: password.to_string(),
+    })
 }
 
 fn parsed_full_url_endpoint(address: &str) -> Option<ServerEndpoint> {
@@ -419,12 +418,7 @@ fn parsed_full_url_endpoint(address: &str) -> Option<ServerEndpoint> {
     ServerEndpoint::parse_user_input(Protocol::Https, address, "", "").ok()
 }
 
-fn field(
-    label: &'static str,
-    input: impl IntoElement,
-    error: Option<SharedString>,
-    cx: &App,
-) -> impl IntoElement {
+fn field(label: &'static str, input: impl IntoElement, cx: &App) -> impl IntoElement {
     let theme = theme::get(cx);
 
     div()
@@ -440,9 +434,6 @@ fn field(
                 .child(label),
         )
         .child(input)
-        .when_some(error, |this, error| {
-            this.child(div().text_xs().text_color(theme.error).child(error))
-        })
 }
 
 fn address_input(
@@ -645,5 +636,43 @@ mod tests {
     fn ignores_non_full_url_for_auto_formatting() {
         assert!(parsed_full_url_endpoint("example.com:8096").is_none());
         assert!(parsed_full_url_endpoint("ftp://example.com").is_none());
+    }
+
+    #[test]
+    fn validates_address_before_credentials() {
+        let error = validate_server_submission(Protocol::Https, "", "443", "", "", "")
+            .expect_err("blank address should fail validation first");
+
+        assert_eq!(error.as_ref(), "请输入服务器地址");
+    }
+
+    #[test]
+    fn validates_username_before_password() {
+        let error = validate_server_submission(Protocol::Https, "example.com", "443", "", "", "")
+            .expect_err("blank username should fail validation before password");
+
+        assert_eq!(error.as_ref(), "请输入用户名");
+
+        let error =
+            validate_server_submission(Protocol::Https, "example.com", "443", "", "user", "")
+                .expect_err("blank password should fail after username is valid");
+        assert_eq!(error.as_ref(), "请输入密码");
+    }
+
+    #[test]
+    fn valid_submission_trims_credentials() {
+        let submission = validate_server_submission(
+            Protocol::Https,
+            "example.com",
+            "443",
+            "",
+            " user ",
+            " password ",
+        )
+        .expect("valid fields should produce a submission");
+
+        assert_eq!(submission.endpoint.address, "example.com");
+        assert_eq!(submission.username, "user");
+        assert_eq!(submission.password, "password");
     }
 }

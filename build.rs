@@ -6,7 +6,10 @@ use std::{
 const LIBPLACEBO_MIN_VERSION: &str = "7";
 const LIBPLACEBO_MAX_VERSION: &str = "8";
 const LIBAVUTIL_MIN_VERSION: &str = "60.26.100";
-const LIBAVUTIL_MAX_VERSION: &str = "61";
+// FFmpeg 9 uses libavutil 61.x. Keep the upper bound at the next major
+// version so FFmpeg 8.1 and 9 installations are accepted while an ABI
+// breaking FFmpeg 10 (libavutil 62) is still rejected explicitly.
+const LIBAVUTIL_MAX_VERSION: &str = "62";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -44,7 +47,7 @@ fn main() {
         .range_version(LIBAVUTIL_MIN_VERSION..LIBAVUTIL_MAX_VERSION)
         .probe("libavutil")
         .expect(
-            "supported libavutil range is >= 60.26.100 and < 61 (FFmpeg >= 8.1 and < 9); install FFmpeg 8.x",
+            "supported libavutil range is >= 60.26.100 and < 62 (FFmpeg >= 8.1 and < 10); install FFmpeg 8.1+ or 9.x",
         );
     let ffmpeg_vulkan_builder = bindgen::Builder::default()
         .header_contents(

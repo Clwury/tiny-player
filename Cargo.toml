@@ -13,7 +13,7 @@ directories = "5"
 cpal = "0.17.3"
 dolby_vision = { git = "https://github.com/quietvoid/dovi_tool", tag = "libdovi-3.4.0", package = "dolby_vision" }
 gpui = "0.2.2"
-ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avformat", "swscale", "swresample"] }
+ffmpeg-sys-next = { version = "9.0", default-features = false, features = ["avformat", "swscale", "swresample"] }
 image = "0.25"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }

@@ -43,7 +43,7 @@ impl TinyApp {
             let result = task.await;
             app.update(cx, |app, cx| {
                 if let Err(error) = result {
-                    app.cache_error = Some(format!("{error_prefix}：{error}").into());
+                    app.push_app_error_notification(format!("{error_prefix}：{error}"), cx);
                     cx.notify();
                 }
             })

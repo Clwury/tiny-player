@@ -238,14 +238,19 @@ fn resume_item_card_image<T>(
     div()
         .relative()
         .w(px(USER_VIEW_CARD_WIDTH_PX))
+        .h(px(USER_VIEW_CARD_IMAGE_HEIGHT_PX))
         .rounded_lg()
         .overflow_hidden()
+        .bg(theme.input_background)
         .when_some(image_path, |this, path| {
-            this.child(img(path).w(px(USER_VIEW_CARD_WIDTH_PX)).rounded_lg())
+            this.child(cover_img(
+                path,
+                USER_VIEW_CARD_WIDTH_PX,
+                USER_VIEW_CARD_IMAGE_HEIGHT_PX,
+            ))
         })
         .when(!has_image, |this| {
             this.flex()
-                .h(px(USER_VIEW_CARD_IMAGE_HEIGHT_PX))
                 .items_center()
                 .justify_center()
                 .text_xs()
@@ -545,7 +550,7 @@ pub(super) fn episode_card<T>(
                         .child(episode.episode_card_label()),
                 )
                 .when_some(
-                    non_empty_string(episode.overview.as_deref()),
+                    compact_episode_overview(episode.overview.as_deref()),
                     |this, overview| {
                         this.child(
                             div()
@@ -679,11 +684,9 @@ fn person_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl In
         })
 }
 
-fn non_empty_string(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+fn compact_episode_overview(value: Option<&str>) -> Option<String> {
+    let overview = value?.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!overview.is_empty()).then_some(overview)
 }
 
 fn user_item_card_image<T>(
@@ -852,6 +855,33 @@ mod tests {
             cover_crop_bounds(160, 400, 160, 213).unwrap(),
             (0, 93, 160, 213)
         );
+    }
+
+    #[test]
+    fn crops_portrait_resume_image_to_fixed_landscape_frame() {
+        assert_eq!(
+            cover_crop_bounds(
+                160,
+                213,
+                USER_VIEW_CARD_WIDTH_PX as u32,
+                USER_VIEW_CARD_IMAGE_HEIGHT_PX as u32,
+            )
+            .unwrap(),
+            (0, 60, 160, 92)
+        );
+    }
+
+    #[test]
+    fn compacts_indented_paragraphs_before_episode_line_clamp() {
+        let overview = "　　改编自飞卢小说网同名小说。\n\n　　顾长歌穿越到玄幻世界，发现自己成了注定被“天命之子”击败的“天命大反派”顾长歌，为求自保并逆天改命，他被迫利用系统和对“爽文套路”的先知，反向算计、掠夺并打压各位“天命之子”，从而获得奖励，一步步走上巅峰。";
+
+        assert_eq!(
+            compact_episode_overview(Some(overview)).as_deref(),
+            Some(
+                "改编自飞卢小说网同名小说。 顾长歌穿越到玄幻世界，发现自己成了注定被“天命之子”击败的“天命大反派”顾长歌，为求自保并逆天改命，他被迫利用系统和对“爽文套路”的先知，反向算计、掠夺并打压各位“天命之子”，从而获得奖励，一步步走上巅峰。"
+            )
+        );
+        assert_eq!(compact_episode_overview(Some(" \n　\t")), None);
     }
 
     #[test]

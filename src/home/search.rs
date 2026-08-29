@@ -2,7 +2,12 @@ use gpui::{AppContext as _, Context, ScrollHandle, SharedString};
 
 use crate::{emby::UserItem, ui::text_input::TextInputEvent};
 
-use super::{HomeContent, LoadState};
+use super::{
+    HomeContent, LoadState,
+    notification::{
+        NotificationScope, SEARCH_INITIAL_NOTIFICATION_KEY, SEARCH_LOAD_MORE_NOTIFICATION_KEY,
+    },
+};
 
 const SEARCH_LIMIT: u32 = 30;
 
@@ -117,6 +122,7 @@ impl HomeContent {
             return;
         }
         self.search.reset_for_query(query);
+        self.clear_notifications_for_scope(NotificationScope::Search);
         cx.notify();
     }
 
@@ -125,6 +131,7 @@ impl HomeContent {
         if query.is_empty() {
             if !self.search.query.is_empty() || !self.search.items.is_empty() {
                 self.search.reset_for_query(String::new());
+                self.clear_notifications_for_scope(NotificationScope::Search);
                 cx.notify();
             }
             return;
@@ -136,18 +143,13 @@ impl HomeContent {
         self.start_search_initial(query, generation, cx);
     }
 
-    pub(super) fn retry_search(&mut self, cx: &mut Context<Self>) {
-        if self.search.query.is_empty() || self.search.initial == LoadState::Loading {
+    pub(super) fn auto_load_more_search(&mut self, cx: &mut Context<Self>) {
+        if self.navigation.current()
+            != &super::navigation::HomeRoute::Root(super::navigation::HomeRoot::Search)
+        {
             return;
         }
-        self.search.generation = self.search.generation.wrapping_add(1);
-        let generation = self.search.generation;
-        let query = self.search.query.clone();
-        self.search.items.clear();
-        self.search.total_record_count = None;
-        self.search.next_start_index = 0;
-        self.search.exhausted = false;
-        self.start_search_initial(query, generation, cx);
+        self.load_more_search(cx);
     }
 
     pub(super) fn load_more_search(&mut self, cx: &mut Context<Self>) {
@@ -159,6 +161,7 @@ impl HomeContent {
         let start_index = self.search.next_start_index;
         self.search.load_more = LoadState::Loading;
         self.search.load_more_error = None;
+        self.clear_notification(NotificationScope::Search, SEARCH_LOAD_MORE_NOTIFICATION_KEY);
         cx.notify();
         self.spawn_search_request(query, generation, start_index, false, cx);
     }
@@ -171,6 +174,7 @@ impl HomeContent {
         self.search.initial_error = None;
         self.search.load_more = LoadState::Idle;
         self.search.load_more_error = None;
+        self.clear_notifications_for_scope(NotificationScope::Search);
         cx.notify();
         self.spawn_search_request(query, generation, 0, true, cx);
     }
@@ -250,9 +254,20 @@ impl HomeContent {
                     self.search.next_start_index = 0;
                     self.search.merge_page(page);
                     self.search.initial_error = None;
+                    self.clear_notification(
+                        NotificationScope::Search,
+                        SEARCH_INITIAL_NOTIFICATION_KEY,
+                    );
                 }
                 Err(error) => {
-                    self.search.initial_error = Some(error.to_string().into());
+                    let error_message: SharedString = error.to_string().into();
+                    self.search.initial_error = Some(error_message.clone());
+                    self.push_error_notification(
+                        NotificationScope::Search,
+                        SEARCH_INITIAL_NOTIFICATION_KEY,
+                        format!("搜索失败：{error_message}"),
+                        cx,
+                    );
                 }
             }
         } else {
@@ -264,9 +279,20 @@ impl HomeContent {
                 Ok(page) => {
                     self.search.merge_page(page);
                     self.search.load_more_error = None;
+                    self.clear_notification(
+                        NotificationScope::Search,
+                        SEARCH_LOAD_MORE_NOTIFICATION_KEY,
+                    );
                 }
                 Err(error) => {
-                    self.search.load_more_error = Some(error.to_string().into());
+                    let error_message: SharedString = error.to_string().into();
+                    self.search.load_more_error = Some(error_message.clone());
+                    self.push_error_notification(
+                        NotificationScope::Search,
+                        SEARCH_LOAD_MORE_NOTIFICATION_KEY,
+                        format!("加载更多搜索结果失败：{error_message}"),
+                        cx,
+                    );
                 }
             }
         }

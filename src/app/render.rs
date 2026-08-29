@@ -1,6 +1,6 @@
 use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Styled, Window,
-    div, prelude::FluentBuilder, px,
+    deferred, div, prelude::FluentBuilder,
 };
 
 use crate::{theme, ui::titlebar::app_titlebar};
@@ -17,7 +17,6 @@ impl TinyApp {
         _rounded_window: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let error_color = theme::get(cx).error;
         let close_menu = cx.listener(Self::close_server_menu);
         let home_page = match &self.page {
             Page::Home(page) => Some(page.clone()),
@@ -38,17 +37,20 @@ impl TinyApp {
             })
             .when_some(home_page, |this, page| this.child(page))
             .when_some(playback_page, |this, page| this.child(page))
-            .when_some(self.cache_error.clone(), |this, error| {
-                this.child(
-                    div()
-                        .absolute()
-                        .top(px(52.0))
-                        .left(px(16.0))
-                        .text_sm()
-                        .text_color(error_color)
-                        .child(error),
-                )
-            })
+            .when(
+                matches!(self.page, Page::Home(_)) && self.has_app_notifications(),
+                |this| {
+                    this.child(deferred(self.render_app_notification_layer(cx)).with_priority(4))
+                },
+            )
+            .when(
+                matches!(self.page, Page::Servers) && self.has_server_page_notifications(),
+                |this| {
+                    this.child(
+                        deferred(self.render_server_page_notification_layer(cx)).with_priority(4),
+                    )
+                },
+            )
     }
 
     fn render_servers_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {

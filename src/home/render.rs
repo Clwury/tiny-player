@@ -49,6 +49,25 @@ impl HomeContent {
         let is_library = matches!(current, HomeRoute::Library { .. });
         let is_favorites = current == &HomeRoute::Root(HomeRoot::Favorites);
         let is_search = current == &HomeRoute::Root(HomeRoot::Search);
+        let home_has_content = self
+            .user_views
+            .as_ref()
+            .is_some_and(|views| !views.items.is_empty())
+            || self
+                .resume_items
+                .as_ref()
+                .is_some_and(|items| !items.items.is_empty())
+            || self.user_view_items_rows.values().any(|row| {
+                row.items
+                    .as_ref()
+                    .is_some_and(|items| !items.items.is_empty())
+            });
+        let show_main_scrollbar = main_scrollbar_is_visible(
+            current,
+            home_has_content,
+            !self.favorites.items.is_empty(),
+            !self.search.query.is_empty() && !self.search.items.is_empty(),
+        );
         let scroll_handle = self.current_scroll_handle();
         let has_authentication_error = self.authentication_error.is_some();
 
@@ -106,17 +125,23 @@ impl HomeContent {
             .when(is_detail && !has_authentication_error, |this| {
                 this.child(self.render_series_detail_back_button(cx))
             })
-            .child(
-                Scrollbar::vertical(scroll_handle)
-                    .id("home-main-scrollbar")
-                    .edge_inset(px(8.0))
-                    .right_inset(scrollbar_right_inset),
-            )
+            .when(show_main_scrollbar, |this| {
+                this.child(
+                    Scrollbar::vertical(scroll_handle)
+                        .id("home-main-scrollbar")
+                        .edge_inset(px(8.0))
+                        .right_inset(scrollbar_right_inset),
+                )
+            })
             .when_some(self.resume_item_context_menu.clone(), |this, menu| {
                 this.child(
                     deferred(self.render_resume_item_context_menu(menu, cx)).with_priority(2),
                 )
             })
+            .when(
+                !has_authentication_error && self.has_visible_notifications(),
+                |this| this.child(deferred(self.render_notification_layer(cx)).with_priority(3)),
+            )
     }
 
     fn render_resume_item_context_menu(
@@ -244,6 +269,22 @@ impl HomeContent {
     ) -> impl IntoElement {
         let theme = theme::get(cx);
         let main_content_width = home_main_content_width(window);
+        let show_user_views_section = home_data_section_is_visible(
+            self.user_views.is_some(),
+            self.user_views
+                .as_ref()
+                .is_some_and(|views| !views.items.is_empty()),
+            self.home_effects.user_views.is_loading(),
+            self.user_views_failed.is_some(),
+        );
+        let show_resume_section = home_data_section_is_visible(
+            self.resume_items.is_some(),
+            self.resume_items
+                .as_ref()
+                .is_some_and(|items| !items.items.is_empty()),
+            self.home_effects.resume_items.is_loading(),
+            self.resume_items_failed.is_some(),
+        );
 
         div()
             .absolute()
@@ -256,117 +297,87 @@ impl HomeContent {
             .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
             .track_scroll(&self.home_scroll_handle)
             .p_6()
-            .child(
-                div()
-                    .mb_3()
-                    .text_lg()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.foreground)
-                    .child("我的媒体"),
-            )
-            .when_some(self.user_views_failed.clone(), |this, error| {
-                this.child(self.render_inline_error(
-                    error,
-                    "retry-home-views",
-                    cx.listener(|page, _, _, cx| page.load_user_views_if_needed(cx)),
-                    cx,
-                ))
+            .when(show_user_views_section, |this| {
+                this.child(
+                    div()
+                        .child(
+                            div()
+                                .mb_3()
+                                .text_lg()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.foreground)
+                                .child("我的媒体"),
+                        )
+                        .when_some(self.user_views.as_ref(), |this, views| {
+                            this.child(self.render_user_views_row(views, main_content_width, cx))
+                        })
+                        .when(
+                            !self.home_effects.user_views.is_loading()
+                                && self.user_views_failed.is_none()
+                                && self
+                                    .user_views
+                                    .as_ref()
+                                    .is_none_or(|views| views.items.is_empty()),
+                            |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child("暂无可浏览的视频媒体库"),
+                                )
+                            },
+                        ),
+                )
             })
-            .when(
-                self.home_effects.user_views.is_loading() && self.user_views.is_none(),
-                |this| {
-                    this.child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("加载中…"),
-                    )
-                },
-            )
-            .when_some(self.user_views.as_ref(), |this, views| {
-                this.child(self.render_user_views_row(views, main_content_width, cx))
+            .when(show_resume_section, |this| {
+                this.child(
+                    div()
+                        .child(
+                            home_section_title("继续观看", cx)
+                                .mb_3()
+                                .when(show_user_views_section, |this| this.mt_8()),
+                        )
+                        .when_some(self.resume_items.as_ref(), |this, items| {
+                            this.child(self.render_resume_items_row(items, main_content_width, cx))
+                        })
+                        .when(
+                            self.resume_items.as_ref().is_some_and(|items| {
+                                items.items.iter().any(|item| {
+                                    item.item_type.as_deref() == Some("Episode")
+                                        && item
+                                            .series_id
+                                            .as_deref()
+                                            .is_none_or(|id| id.trim().is_empty())
+                                })
+                            }),
+                            |this| {
+                                this.child(
+                                    div()
+                                        .mt_2()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("部分单集缺少剧集信息，暂时无法打开"),
+                                )
+                            },
+                        )
+                        .when(
+                            !self.home_effects.resume_items.is_loading()
+                                && self.resume_items_failed.is_none()
+                                && self
+                                    .resume_items
+                                    .as_ref()
+                                    .is_none_or(|items| items.items.is_empty()),
+                            |this| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child("暂无继续观看内容"),
+                                )
+                            },
+                        ),
+                )
             })
-            .when(
-                !self.home_effects.user_views.is_loading()
-                    && self.user_views_failed.is_none()
-                    && self
-                        .user_views
-                        .as_ref()
-                        .is_none_or(|views| views.items.is_empty()),
-                |this| {
-                    this.child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("暂无可浏览的视频媒体库"),
-                    )
-                },
-            )
-            .child(home_section_title("继续观看", cx).mt_8().mb_3())
-            .when_some(self.resume_items_failed.clone(), |this, error| {
-                this.child(self.render_inline_error(
-                    error,
-                    "retry-home-resume",
-                    cx.listener(|page, _, _, cx| page.load_resume_items_if_needed(cx)),
-                    cx,
-                ))
-            })
-            .when_some(self.resume_detail_failed.clone(), |this, error| {
-                this.child(div().text_sm().text_color(theme.error).child(error))
-            })
-            .when_some(self.resume_action_failed.clone(), |this, error| {
-                this.child(div().text_sm().text_color(theme.error).child(error))
-            })
-            .when(
-                self.home_effects.resume_items.is_loading() && self.resume_items.is_none(),
-                |this| {
-                    this.child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("加载中…"),
-                    )
-                },
-            )
-            .when_some(self.resume_items.as_ref(), |this, items| {
-                this.child(self.render_resume_items_row(items, main_content_width, cx))
-            })
-            .when(
-                self.resume_items.as_ref().is_some_and(|items| {
-                    items.items.iter().any(|item| {
-                        item.item_type.as_deref() == Some("Episode")
-                            && item
-                                .series_id
-                                .as_deref()
-                                .is_none_or(|id| id.trim().is_empty())
-                    })
-                }),
-                |this| {
-                    this.child(
-                        div()
-                            .mt_2()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("部分单集缺少剧集信息，暂时无法打开"),
-                    )
-                },
-            )
-            .when(
-                !self.home_effects.resume_items.is_loading()
-                    && self.resume_items_failed.is_none()
-                    && self
-                        .resume_items
-                        .as_ref()
-                        .is_none_or(|items| items.items.is_empty()),
-                |this| {
-                    this.child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("暂无继续观看内容"),
-                    )
-                },
-            )
             .when_some(self.user_views.as_ref(), |this, views| {
                 this.children(
                     views.items.iter().map(|view| {
@@ -627,11 +638,8 @@ impl HomeContent {
     ) -> impl IntoElement {
         let theme = theme::get(cx);
         let row = self.user_view_items_rows.get(&view.id);
-        let failed = row.and_then(|row| row.failed.clone());
-        let has_failed = failed.is_some();
-        let loading = row.is_some_and(|row| row.loading);
         let items = row.and_then(|row| row.items.as_ref());
-        let visible = loading || has_failed || items.is_some_and(|items| !items.items.is_empty());
+        let visible = items.is_some_and(|items| !items.items.is_empty());
         let title = view.name.to_string();
         let open_view_id = view.id.clone();
         let view_all_action_id =
@@ -639,11 +647,6 @@ impl HomeContent {
         let open_library = cx.listener(move |page, _, _, cx| {
             page.open_library_by_id(&open_view_id, cx);
         });
-        let retry_view_id = view.id.clone();
-        let retry = cx.listener(move |page, _, _, cx| {
-            page.retry_latest_items(&retry_view_id, cx);
-        });
-
         div().when(visible, |this| {
             this.mt_8()
                 .child(
@@ -675,28 +678,17 @@ impl HomeContent {
                                 .on_click(open_library),
                         ),
                 )
-                .when_some(failed, |this, error| {
-                    this.child(self.render_inline_error(
-                        error,
-                        gpui::ElementId::from((
-                            gpui::ElementId::from("retry-latest"),
-                            view.id.clone(),
-                        )),
-                        retry,
-                        cx,
-                    ))
-                })
-                .when(loading && items.is_none(), |this| {
-                    this.child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("加载中…"),
-                    )
-                })
-                .when_some(items, |this, items| {
-                    this.child(self.render_user_view_items_row(&view.id, items, viewport_width, cx))
-                })
+                .when_some(
+                    items.filter(|items| !items.items.is_empty()),
+                    |this, items| {
+                        this.child(self.render_user_view_items_row(
+                            &view.id,
+                            items,
+                            viewport_width,
+                            cx,
+                        ))
+                    },
+                )
         })
     }
 
@@ -914,6 +906,29 @@ fn home_dashboard_cache_style() -> StyleRefinement {
     StyleRefinement::default().absolute().size_full()
 }
 
+fn home_data_section_is_visible(
+    has_response: bool,
+    has_items: bool,
+    loading: bool,
+    failed: bool,
+) -> bool {
+    has_items || (has_response && !loading && !failed)
+}
+
+fn main_scrollbar_is_visible(
+    route: &HomeRoute,
+    home_has_content: bool,
+    favorites_has_content: bool,
+    search_has_content: bool,
+) -> bool {
+    match route {
+        HomeRoute::Root(HomeRoot::Home) => home_has_content,
+        HomeRoute::Root(HomeRoot::Favorites) => favorites_has_content,
+        HomeRoute::Root(HomeRoot::Search) => search_has_content,
+        HomeRoute::Library { .. } | HomeRoute::Detail { .. } => true,
+    }
+}
+
 impl HomePage {
     fn render_content_area(&self, cx: &Context<Self>, rounded_window: bool) -> impl IntoElement {
         let theme = theme::get(cx);
@@ -958,5 +973,67 @@ impl Render for HomePage {
                 on_search,
             ))
             .child(self.render_content_area(cx, rounded_window))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HomeRoot, HomeRoute, home_data_section_is_visible, main_scrollbar_is_visible};
+
+    #[test]
+    fn empty_home_section_is_hidden_while_loading_or_after_failure() {
+        assert!(!home_data_section_is_visible(false, false, true, false));
+        assert!(!home_data_section_is_visible(true, false, true, false));
+        assert!(!home_data_section_is_visible(true, false, false, true));
+    }
+
+    #[test]
+    fn home_section_shows_cached_items_or_a_confirmed_empty_state() {
+        assert!(home_data_section_is_visible(true, true, true, false));
+        assert!(home_data_section_is_visible(true, false, false, false));
+    }
+
+    #[test]
+    fn empty_root_pages_hide_the_main_scrollbar() {
+        assert!(!main_scrollbar_is_visible(
+            &HomeRoute::Root(HomeRoot::Home),
+            false,
+            false,
+            false,
+        ));
+        assert!(!main_scrollbar_is_visible(
+            &HomeRoute::Root(HomeRoot::Favorites),
+            false,
+            false,
+            false,
+        ));
+        assert!(!main_scrollbar_is_visible(
+            &HomeRoute::Root(HomeRoot::Search),
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn populated_root_pages_show_the_main_scrollbar() {
+        assert!(main_scrollbar_is_visible(
+            &HomeRoute::Root(HomeRoot::Home),
+            true,
+            false,
+            false,
+        ));
+        assert!(main_scrollbar_is_visible(
+            &HomeRoute::Root(HomeRoot::Favorites),
+            false,
+            true,
+            false,
+        ));
+        assert!(main_scrollbar_is_visible(
+            &HomeRoute::Root(HomeRoot::Search),
+            false,
+            false,
+            true,
+        ));
     }
 }

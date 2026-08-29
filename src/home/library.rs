@@ -5,6 +5,10 @@ use crate::emby::{SortOrder, UserItems, UserItemsQuery, UserItemsSort, UserView,
 use super::{
     HomeContent, HomeContentEvent,
     navigation::HomeRoute,
+    notification::{
+        NotificationScope, library_initial_notification_key, library_load_more_notification_key,
+        library_refresh_notification_key,
+    },
     paged_items::{PAGED_ITEMS_LIMIT, PagedItemsState},
 };
 
@@ -93,6 +97,7 @@ impl HomeContent {
         };
         self.navigation
             .push_library(view.id.clone(), view.name.clone(), item_types);
+        self.clear_library_notifications(&view.id);
         self.detail_generation = self.detail_generation.wrapping_add(1);
         self.series_detail = None;
         self.detail_history.clear();
@@ -112,20 +117,6 @@ impl HomeContent {
         if let Some(view) = view {
             self.open_library_for_view(&view, cx);
         }
-    }
-
-    pub(super) fn retry_current_library(&mut self, cx: &mut Context<Self>) {
-        let HomeRoute::Library { view_id, .. } = self.navigation.current() else {
-            return;
-        };
-        self.load_library_initial(view_id.clone(), false, cx);
-    }
-
-    pub(super) fn load_more_current_library(&mut self, cx: &mut Context<Self>) {
-        let HomeRoute::Library { view_id, .. } = self.navigation.current() else {
-            return;
-        };
-        self.load_more_library(view_id.clone(), cx);
     }
 
     pub(super) fn toggle_current_library_sort_menu(&mut self, cx: &mut Context<Self>) {
@@ -225,6 +216,10 @@ impl HomeContent {
             return;
         };
         let query = library_items_query(&view_id, state, start_index);
+        self.clear_notification(
+            NotificationScope::Library,
+            &library_load_more_notification_key(&view_id),
+        );
         cx.notify();
 
         let server = self.current_server.clone();
@@ -260,6 +255,7 @@ impl HomeContent {
             return;
         };
         let query = library_items_query(&view_id, state, 0);
+        self.clear_library_notifications(&view_id);
         cx.notify();
 
         let server = self.current_server.clone();
@@ -326,12 +322,39 @@ impl HomeContent {
                 )
             });
         if applied {
-            let items = self.libraries.get(&request.view_id).map(|state| UserItems {
-                items: state.paged.items.clone(),
-                total_record_count: state.paged.total_record_count.unwrap_or_default(),
+            let library_result = self.libraries.get(&request.view_id).map(|state| {
+                let items = UserItems {
+                    items: state.paged.items.clone(),
+                    total_record_count: state.paged.total_record_count.unwrap_or_default(),
+                };
+                let failure = state
+                    .paged
+                    .initial_error
+                    .clone()
+                    .map(|error| {
+                        (
+                            library_initial_notification_key(&request.view_id),
+                            format!("加载媒体库失败：{error}"),
+                        )
+                    })
+                    .or_else(|| {
+                        state.paged.refresh_error.clone().map(|error| {
+                            (
+                                library_refresh_notification_key(&request.view_id),
+                                error.to_string(),
+                            )
+                        })
+                    });
+                (items, failure)
             });
-            if let Some(items) = items {
-                self.ensure_user_items_images(&items, cx);
+            let Some((items, failure)) = library_result else {
+                return;
+            };
+            self.ensure_user_items_images(&items, cx);
+            if let Some((key, message)) = failure {
+                self.push_error_notification(NotificationScope::Library, key, message, cx);
+            } else {
+                self.clear_library_notifications(&request.view_id);
             }
             cx.notify();
         }
@@ -381,6 +404,24 @@ impl HomeContent {
                 )
             });
         if applied {
+            let failure = self
+                .libraries
+                .get(&request.view_id)
+                .and_then(|state| state.paged.load_more_error.clone())
+                .map(|error| format!("加载更多媒体库内容失败：{error}"));
+            if let Some(message) = failure {
+                self.push_error_notification(
+                    NotificationScope::Library,
+                    library_load_more_notification_key(&request.view_id),
+                    message,
+                    cx,
+                );
+            } else {
+                self.clear_notification(
+                    NotificationScope::Library,
+                    &library_load_more_notification_key(&request.view_id),
+                );
+            }
             cx.notify();
         }
     }

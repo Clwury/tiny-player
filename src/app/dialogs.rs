@@ -15,6 +15,7 @@ impl TinyApp {
         cx: &mut Context<Self>,
     ) {
         self.open_server_menu = None;
+        self.clear_server_notifications();
         if self.add_server_dialog.is_none() {
             self.add_server_dialog = Some(cx.new(AddServerDialogState::new));
         }
@@ -56,15 +57,12 @@ impl TinyApp {
             return;
         };
 
-        dialog.update(cx, |dialog, cx| {
-            dialog.clear_form_error(cx);
-            dialog.set_submitting(true, cx);
-        });
+        dialog.update(cx, |dialog, cx| dialog.set_submitting(true, cx));
 
         let Some(client) = self.emby_client.clone() else {
             dialog.update(cx, |dialog, cx| {
                 dialog.set_submitting(false, cx);
-                dialog.set_form_error("Emby HTTP 客户端不可用", cx);
+                dialog.push_error_notification("Emby HTTP 客户端不可用", cx);
             });
             return;
         };
@@ -115,6 +113,7 @@ impl TinyApp {
         cx: &mut Context<Self>,
     ) {
         self.open_server_menu = None;
+        self.clear_server_notifications();
         if let Some(server) = self.servers.iter().find(|cached| cached.id == server.id) {
             let server = server.clone();
             self.add_server_dialog = Some(cx.new(|cx| AddServerDialogState::new_edit(&server, cx)));
