@@ -100,6 +100,8 @@ impl DemuxPacketCacheState {
         seekability_revision: u64,
     ) -> DemuxCacheReportSnapshot {
         let forward_window = self.selected_forward_timeline_window();
+        let effective_readahead_nsecs = self.effective_readahead_nsecs();
+        let effective_hysteresis_nsecs = self.effective_hysteresis_nsecs();
         let cached_until_nsecs = if forward_window.is_none() {
             self.cached_until_nsecs()
         } else {
@@ -140,6 +142,12 @@ impl DemuxPacketCacheState {
                 byte_level_seeks: 0,
                 seekable_ranges: seekable_report.ranges,
                 streams: self.stream_cache_states_with_forward_bytes(forward_bytes),
+                readahead_secs: nsecs_to_seconds(effective_readahead_nsecs),
+                hysteresis_secs: nsecs_to_seconds(effective_hysteresis_nsecs),
+                memory_limit_bytes: u64::try_from(self.memory_limit_bytes).unwrap_or(u64::MAX),
+                backbuffer_limit_bytes: u64::try_from(self.backbuffer_limit_bytes)
+                    .unwrap_or(u64::MAX),
+                cached_range_count: self.ranges.len(),
             },
             paused_for_cache,
             buffering_percent: self.cache_buffering_percent,
@@ -298,6 +306,49 @@ impl DemuxPacketCacheState {
             .sum()
     }
 
+    /// Readahead expressed in time after applying the currently observed
+    /// compressed input rate. The configured value remains the upper bound;
+    /// the byte budget can only shorten it. This keeps high-bitrate streams
+    /// from waiting for an impossible time target.
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn effective_readahead_nsecs(
+        &self,
+    ) -> u64 {
+        if !self.adaptive_readahead || self.memory_limit_bytes == 0 {
+            return self.configured_readahead_nsecs;
+        }
+        let Some(rate) = self.adaptive_input_rate().filter(|rate| *rate > 0) else {
+            return self.configured_readahead_nsecs;
+        };
+        let byte_limited = (self.memory_limit_bytes as u128)
+            .saturating_mul(1_000_000_000u128)
+            .checked_div(rate as u128)
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(self.configured_readahead_nsecs);
+        self.configured_readahead_nsecs.min(byte_limited.max(1))
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn effective_hysteresis_nsecs(
+        &self,
+    ) -> u64 {
+        if !self.automatic_hysteresis {
+            return self
+                .configured_hysteresis_nsecs
+                .min(self.effective_readahead_nsecs());
+        }
+        self.hysteresis_nsecs
+            .min(self.effective_readahead_nsecs() / 2)
+    }
+
+    /// Cache-pause recovery should never wait longer than the current demux
+    /// target. This keeps a large user-configured pause window from defeating
+    /// adaptive readahead on high-bitrate streams.
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn effective_cache_pause_wait_nsecs(
+        &self,
+    ) -> u64 {
+        self.cache_pause_wait_nsecs
+            .min(self.effective_readahead_nsecs().max(1))
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn range_has_current_generation_blocked_packet(
         &self,
         range: &DemuxCachedRange,
@@ -371,11 +422,13 @@ impl DemuxPacketCacheState {
             return true;
         }
         let forward_duration = window.duration_nsecs();
-        if forward_duration >= self.readahead_nsecs {
+        let readahead_nsecs = self.effective_readahead_nsecs();
+        if forward_duration >= readahead_nsecs {
             return true;
         }
-        let resume_threshold = self.readahead_nsecs.saturating_sub(self.hysteresis_nsecs);
-        self.hysteresis_active && self.hysteresis_nsecs > 0 && forward_duration > resume_threshold
+        let hysteresis_nsecs = self.effective_hysteresis_nsecs();
+        let resume_threshold = readahead_nsecs.saturating_sub(hysteresis_nsecs);
+        self.hysteresis_active && hysteresis_nsecs > 0 && forward_duration > resume_threshold
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn stream_window_underrun(

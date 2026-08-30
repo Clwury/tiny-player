@@ -461,6 +461,7 @@ impl DemuxPacketCacheState {
         self.read_range_mut().last_used_generation = self.generation;
         self.read_index = read_index.min(range_len);
         self.reset_reader_heads_for_read_index();
+        self.enforce_cached_range_limit();
     }
 
     fn activate_range_for_read_with_heads(
@@ -479,6 +480,7 @@ impl DemuxPacketCacheState {
             .map(|stream_index| (stream_index, self.generation))
             .collect();
         self.refresh_reader_tracking();
+        self.enforce_cached_range_limit();
     }
 
     fn queue_resume_seek_after_cached_range(

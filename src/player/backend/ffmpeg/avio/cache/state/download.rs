@@ -93,15 +93,16 @@ impl HttpRingCacheState {
     pub(in crate::player::backend::ffmpeg::avio::cache) fn maybe_queue_playback_continuation(
         &mut self,
     ) {
+        let range_request_bytes = self.range_request_bytes_effective();
         if self.config.continuous_playback_requests
             || self.active_range_kind != HttpCacheRangeKind::Playback
-            || self.config.range_request_bytes == 0
+            || range_request_bytes == 0
         {
             return;
         }
         let continuation_offset = self
             .active_request_start_offset
-            .saturating_add(self.config.range_request_bytes);
+            .saturating_add(range_request_bytes);
         if self
             .content_len
             .is_some_and(|content_len| continuation_offset >= content_len)
@@ -127,8 +128,7 @@ impl HttpRingCacheState {
         continuation_offset: u64,
     ) -> u64 {
         let trigger_bytes = self
-            .config
-            .range_request_bytes
+            .range_request_bytes_effective()
             .saturating_mul(HTTP_CACHE_NEXT_RANGE_PREFETCH_NUMERATOR)
             / HTTP_CACHE_NEXT_RANGE_PREFETCH_DENOMINATOR.max(1);
         self.active_request_start_offset
@@ -507,6 +507,34 @@ impl HttpRingCacheState {
         (bytes > 0).then(|| u64::try_from(bytes).unwrap_or(u64::MAX))
     }
 
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn adaptive_input_rate(
+        &self,
+    ) -> Option<u64> {
+        let now = Instant::now();
+        let first = self
+            .input_rate_samples
+            .iter()
+            .find(|sample| now.saturating_duration_since(sample.at) <= Duration::from_secs(1))?;
+        let elapsed = now.saturating_duration_since(first.at);
+        if elapsed < Duration::from_millis(250) {
+            return None;
+        }
+        let bytes: u128 = self
+            .input_rate_samples
+            .iter()
+            .filter(|sample| now.saturating_duration_since(sample.at) <= Duration::from_secs(1))
+            .map(|sample| sample.bytes as u128)
+            .sum();
+        if bytes == 0 {
+            return None;
+        }
+        let rate = bytes
+            .saturating_mul(1_000_000_000)
+            .checked_div(elapsed.as_nanos().max(1))
+            .unwrap_or(u128::from(u64::MAX));
+        Some(u64::try_from(rate.max(1)).unwrap_or(u64::MAX))
+    }
+
     pub(in crate::player::backend::ffmpeg::avio::cache) fn prune_input_rate_samples(&mut self) {
         let now = Instant::now();
         while self
@@ -623,16 +651,21 @@ impl HttpRingCacheState {
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn target_readahead_bytes(&self) -> u64 {
         let memory_capacity = self.active_memory_capacity() as u64;
-        let by_seconds = self
+        let by_media_seconds = self
             .content_len
             .zip(self.duration_seconds)
             .map(|(content_len, duration)| {
                 ((content_len as f64 / duration) * self.config.readahead_seconds).round() as u64
             })
             .filter(|bytes| *bytes > 0)
+            .or_else(|| {
+                self.adaptive_input_rate().map(|rate| {
+                    (rate as f64 * self.config.readahead_seconds.max(1.0)).round() as u64
+                })
+            })
             .unwrap_or(memory_capacity);
         let by_config = self.config.max_readahead_bytes.unwrap_or(memory_capacity);
-        by_seconds.min(by_config).min(memory_capacity).max(1)
+        by_media_seconds.min(by_config).min(memory_capacity).max(1)
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn resume_readahead_bytes(
@@ -640,14 +673,26 @@ impl HttpRingCacheState {
         target: u64,
     ) -> u64 {
         let Some((content_len, duration)) = self.content_len.zip(self.duration_seconds) else {
-            return target / 2;
+            // A zero hysteresis is an explicit opt-out when automatic
+            // hysteresis is disabled. Keep the conservative half-target only
+            // for the automatically selected fallback band.
+            return if self.config.hysteresis_seconds == 0.0 {
+                target
+            } else {
+                target / 2
+            };
         };
         let hysteresis_bytes =
             ((content_len as f64 / duration) * self.config.hysteresis_seconds).round() as u64;
         if hysteresis_bytes == 0 {
             target
         } else {
-            target.saturating_sub(hysteresis_bytes).min(target)
+            // Never let a time-based hysteresis exceed the active byte target.
+            // Without this clamp a high-bitrate stream can calculate a zero
+            // resume watermark and remain paused until the ring is completely
+            // drained.
+            let bounded_hysteresis = hysteresis_bytes.min(target / 2);
+            target.saturating_sub(bounded_hysteresis).min(target)
         }
     }
 

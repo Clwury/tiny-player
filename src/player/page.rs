@@ -103,6 +103,14 @@ impl EventEmitter<PlaybackEvent> for PlaybackPage {}
 
 impl PlaybackPage {
     pub fn new(request: PlaybackRequest, cx: &mut Context<Self>) -> Self {
+        Self::new_with_cache_config(request, Default::default(), cx)
+    }
+
+    pub fn new_with_cache_config(
+        request: PlaybackRequest,
+        cache_config: super::backend::PlaybackCacheConfig,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut error_message = None;
         let status_message = "正在加载视频…".into();
         let source_protocol = playback_protocol(&request.url);
@@ -119,7 +127,7 @@ impl PlaybackPage {
                             content_length: request.content_length,
                             start_position_seconds: request.initial_position_seconds,
                             selected_tracks: request.selected_tracks.clone(),
-                            cache_config: Default::default(),
+                            cache_config: cache_config.clone().normalized(),
                         };
                         if let Err(error) = backend.command(BackendCommand::Load(load_request)) {
                             error_message = Some(format!("加载视频失败：{error}").into());

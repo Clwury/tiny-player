@@ -49,6 +49,9 @@ pub(in crate::player::backend::ffmpeg::avio::cache) fn http_stream_cache_status_
             != next.active_forward_est_seconds.is_some()
         || previous.range_request_bytes_effective != next.range_request_bytes_effective
         || previous.byte_level_seeks != next.byte_level_seeks
+        || previous.prefetch_paused != next.prefetch_paused
+        || previous.retained_range_count != next.retained_range_count
+        || previous.memory_capacity_bytes != next.memory_capacity_bytes
     {
         return true;
     }
@@ -81,6 +84,18 @@ pub(in crate::player::backend::ffmpeg::avio::cache) fn http_stream_cache_status_
         .active_forward_est_seconds
         .zip(next.active_forward_est_seconds)
         .is_some_and(|(previous, next)| (previous - next).abs() >= 0.5)
+    {
+        return true;
+    }
+    if previous
+        .target_readahead_bytes
+        .abs_diff(next.target_readahead_bytes)
+        >= cached_bytes_threshold
+        || previous
+            .resume_readahead_bytes
+            .abs_diff(next.resume_readahead_bytes)
+            >= cached_bytes_threshold
+        || previous.retained_bytes.abs_diff(next.retained_bytes) >= cached_bytes_threshold
     {
         return true;
     }

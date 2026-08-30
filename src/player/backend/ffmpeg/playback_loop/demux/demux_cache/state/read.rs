@@ -693,7 +693,12 @@ impl DemuxPacketCacheState {
                 continue;
             }
             let packet_limit = self.stream_packet_queue_limit(stream_index);
-            let prefetch_packet_queue_full = queued_packets >= packet_limit;
+            let packet_queue_full = queued_packets >= packet_limit;
+            // Match mpv's eager/lazy split: audio/video queues can stop the
+            // producer, while subtitle queues are drained opportunistically
+            // and must never globally pause media prefetch.
+            let prefetch_packet_queue_full = packet_queue_full
+                && matches!(kind, StreamCacheKind::Video | StreamCacheKind::Audio);
             let readable_packets_for_stream = self.readable_packet_count_for_stream(stream_index);
             let reader_head_available = self.next_packet_id_for_stream(stream_index).is_some();
             let consumer_drainable = readable_packets_for_stream > 0;
@@ -719,7 +724,7 @@ impl DemuxPacketCacheState {
                 kind,
                 queued_packets,
                 packet_limit,
-                packet_queue_full: prefetch_packet_queue_full,
+                packet_queue_full,
                 prefetch_packet_queue_full,
                 readable_packets_for_stream,
                 reader_head_available,

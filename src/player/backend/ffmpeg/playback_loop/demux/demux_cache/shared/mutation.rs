@@ -1,11 +1,79 @@
 use std::{sync::TryLockError, time::Instant};
 
+use super::super::DemuxPacketDiskCache;
 use super::{
     BackendEvent, BackendEventKind, CachedDemuxPacket, DemuxPacketCacheShared,
     log_demux_packet_append_timing,
 };
 
 impl DemuxPacketCacheShared {
+    /// Spill packet payload bytes without holding the cache mutex during file
+    /// I/O. Space is reserved under the mutex, then the write happens through
+    /// the shared file handle and the packet is converted to a disk payload
+    /// before it is inserted into the queue.
+    fn spill_packet_outside_state_lock(
+        &self,
+        packet: &mut CachedDemuxPacket,
+    ) -> std::time::Duration {
+        let started_at = Instant::now();
+        let disk_enabled = {
+            let guard = self
+                .state
+                .lock()
+                .expect("FFmpeg demux packet cache poisoned");
+            guard.disk_cache_writable && guard.disk_cache.is_some()
+        };
+        if !disk_enabled {
+            return started_at.elapsed();
+        }
+
+        let spill = match packet.prepare_disk_spill() {
+            Ok(Some(spill)) => spill,
+            Ok(None) => return started_at.elapsed(),
+            Err(error) => {
+                tracing::warn!(%error, "pausing FFmpeg demux packet disk cache writes");
+                if let Ok(mut guard) = self.state.lock() {
+                    guard.disk_cache_writable = false;
+                }
+                return started_at.elapsed();
+            }
+        };
+        let reservation = {
+            let mut guard = self
+                .state
+                .lock()
+                .expect("FFmpeg demux packet cache poisoned");
+            if !guard.disk_cache_writable {
+                None
+            } else if let Some(disk_cache) = guard.disk_cache.as_mut() {
+                match disk_cache.reserve_packet(spill.data.len()) {
+                    Ok((offset, file)) => Some((offset, file)),
+                    Err(error) => {
+                        tracing::warn!(%error, "pausing FFmpeg demux packet disk cache writes");
+                        guard.disk_cache_writable = false;
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        let Some((offset, file)) = reservation else {
+            return started_at.elapsed();
+        };
+
+        if let Err(error) = DemuxPacketDiskCache::write_reserved_packet(&file, offset, &spill.data)
+        {
+            tracing::warn!(%error, "pausing FFmpeg demux packet disk cache writes");
+            if let Ok(mut guard) = self.state.lock() {
+                guard.disk_cache_writable = false;
+            }
+            return started_at.elapsed();
+        }
+        packet.finish_disk_spill(offset, spill);
+        started_at.elapsed()
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn note_producer_recovering(
         &self,
         error: String,
@@ -41,19 +109,45 @@ impl DemuxPacketCacheShared {
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn append_packet(
         &self,
-        packet: CachedDemuxPacket,
+        mut packet: CachedDemuxPacket,
     ) {
+        // Capture the input generation before the potentially slow disk
+        // preparation. A seek can replace the active range while the packet
+        // is being serialized; stale packets must not be appended to the new
+        // generation once the state lock is reacquired.
+        let expected_demux_input_generation = {
+            let guard = self
+                .state
+                .lock()
+                .expect("FFmpeg demux packet cache poisoned");
+            guard.demux_input_generation
+        };
+        let expected_seek_generation = self.control.seek_generation();
         let packet_stream_index = packet.stream_index;
         let packet_bytes = packet.byte_len;
+        let disk_write_elapsed = self.spill_packet_outside_state_lock(&mut packet);
         let lock_wait_started_at = Instant::now();
         let mut guard = self
             .state
             .lock()
             .expect("FFmpeg demux packet cache poisoned");
         let append_lock_wait = lock_wait_started_at.elapsed();
+        if guard.demux_input_generation != expected_demux_input_generation
+            || self.control.seek_generation() != expected_seek_generation
+        {
+            tracing::debug!(
+                expected_demux_input_generation,
+                current_demux_input_generation = guard.demux_input_generation,
+                expected_seek_generation,
+                current_seek_generation = self.control.seek_generation(),
+                "discarding stale FFmpeg demux packet after cache generation changed"
+            );
+            return;
+        }
         let append_lock_hold_started_at = Instant::now();
         let session_id = guard.session_id;
         let mut append_outcome = guard.append_packet_fast(packet);
+        append_outcome.timing.disk_write += disk_write_elapsed;
         append_outcome.timing.lock_wait = append_lock_wait;
         let refresh_cache_pause_started_at = Instant::now();
         let cache_pause_refresh = self.refresh_cache_pause_after_append(&mut guard);

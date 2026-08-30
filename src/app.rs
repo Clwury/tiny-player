@@ -22,11 +22,13 @@ use crate::{
     server::CachedServer,
     storage::ServerCache,
     ui::add_server_dialog::AddServerDialogState,
+    ui::playback_settings_dialog::PlaybackSettingsDialogState,
 };
 use notification::AppNotificationQueue;
 
 pub struct TinyApp {
     add_server_dialog: Option<Entity<AddServerDialogState>>,
+    playback_settings_dialog: Option<Entity<PlaybackSettingsDialogState>>,
     open_server_menu: Option<String>,
     cache: ServerCache,
     emby_client: Option<EmbyClient>,
@@ -70,6 +72,7 @@ impl TinyApp {
         let initial_error = startup_error.or(emby_client_error);
         let mut app = Self {
             add_server_dialog: None,
+            playback_settings_dialog: None,
             open_server_menu: None,
             cache,
             emby_client,

@@ -59,9 +59,10 @@ pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxStreamPacketQu
 
 impl DemuxPacketQueueSnapshot {
     pub(in crate::player::backend::ffmpeg::playback_loop) fn prefetch_queue_full(&self) -> bool {
-        self.streams
-            .iter()
-            .any(|stream| stream.prefetch_packet_queue_full)
+        self.streams.iter().any(|stream| {
+            stream.prefetch_packet_queue_full
+                && matches!(stream.kind, StreamCacheKind::Video | StreamCacheKind::Audio)
+        })
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop) fn consumer_drainable(&self) -> bool {

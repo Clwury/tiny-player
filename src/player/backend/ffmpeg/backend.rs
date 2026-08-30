@@ -475,6 +475,11 @@ fn demux_state_carries_demux_cache_data(state: &DemuxCacheState) -> bool {
         || state.ts_last.is_some()
         || !state.seekable_ranges.is_empty()
         || !state.streams.is_empty()
+        || state.readahead_secs > 0.0
+        || state.hysteresis_secs > 0.0
+        || state.memory_limit_bytes > 0
+        || state.backbuffer_limit_bytes > 0
+        || state.cached_range_count > 0
 }
 
 impl BackendControl for FfmpegBackend {

@@ -9,6 +9,9 @@ mod render_host;
 mod tracks;
 mod video_presenter;
 
+pub use backend::{
+    CacheUnlinkPolicy, PlaybackCacheConfig, PlaybackCacheMode, PlaybackSeekableCacheMode,
+};
 pub use page::{
     EmbyPlaybackContext, PlaybackEvent, PlaybackPage, PlaybackQueue, PlaybackQueueItem,
     PlaybackRequest, PlaybackStateUpdate, PlaybackStopCompletion, PlaybackStopResult,

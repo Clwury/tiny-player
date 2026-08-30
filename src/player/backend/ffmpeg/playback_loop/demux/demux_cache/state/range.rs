@@ -127,6 +127,7 @@ impl DemuxPacketCacheState {
         self.read_range_id = range_id;
         self.append_range_id = range_id;
         self.clear_reader_tracking();
+        self.enforce_cached_range_limit();
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn start_detached_append_range(
@@ -141,14 +142,54 @@ impl DemuxPacketCacheState {
             range_id,
             DemuxCachedRange::new(range_id, false, self.generation),
         );
+        self.enforce_cached_range_limit();
+    }
+
+    /// Keep archived seek ranges bounded. The active read range and a detached
+    /// append range are always protected; among the remaining ranges, evict
+    /// the least recently used one and prefer empty/short ranges on ties.
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn enforce_cached_range_limit(
+        &mut self,
+    ) -> usize {
+        let limit = self.max_cached_ranges.max(1);
+        let mut removed = 0usize;
+        while self.ranges.len() > limit {
+            let detached = self.detached_append_range_id();
+            let candidate = self
+                .ranges
+                .iter()
+                .filter(|(range_id, _)| {
+                    **range_id != self.read_range_id && Some(**range_id) != detached
+                })
+                .min_by(|(_, left), (_, right)| {
+                    left.last_used_generation
+                        .cmp(&right.last_used_generation)
+                        .then_with(|| left.global_order.len().cmp(&right.global_order.len()))
+                })
+                .map(|(range_id, _)| *range_id);
+            let Some(range_id) = candidate else {
+                // A limit of one can still temporarily require the active and
+                // detached ranges; never drop either while a seek is in flight.
+                break;
+            };
+            if let Some(range) = self.ranges.remove(&range_id) {
+                self.remove_range_packets(range);
+                removed = removed.saturating_add(1);
+                self.bump_seekability_revision();
+            }
+        }
+        removed
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn preserve_current_range(
         &mut self,
     ) {
         if self.read_range().global_order.is_empty() {
-            self.ranges.remove(&self.read_range_id);
+            if let Some(range) = self.ranges.remove(&self.read_range_id) {
+                self.remove_range_packets(range);
+            }
             self.clear_reader_tracking();
+            self.enforce_cached_range_limit();
             return;
         }
         if self.backbuffer_limit_bytes == 0 {
@@ -156,11 +197,13 @@ impl DemuxPacketCacheState {
                 self.remove_range_packets(range);
             }
             self.clear_reader_tracking();
+            self.enforce_cached_range_limit();
             return;
         }
         let generation = self.generation;
         self.read_range_mut().last_used_generation = generation;
         self.clear_reader_tracking();
+        self.enforce_cached_range_limit();
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn preserve_detached_append_range(
@@ -175,6 +218,9 @@ impl DemuxPacketCacheState {
         };
         self.append_range_id = self.read_range_id;
         if range.global_order.is_empty() {
+            self.failed_cached_seek_ranges.remove(&range_id);
+            self.rejected_cached_seek_ranges.remove(&range_id);
+            self.enforce_cached_range_limit();
             return;
         }
         if self.backbuffer_limit_bytes == 0 {
@@ -183,6 +229,7 @@ impl DemuxPacketCacheState {
             range.last_used_generation = self.generation;
             self.ranges.insert(range.id, range);
         }
+        self.enforce_cached_range_limit();
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn activate_detached_append_range(
@@ -200,6 +247,7 @@ impl DemuxPacketCacheState {
         }
         self.preserve_current_range();
         self.activate_range_for_read(range_id, 0);
+        self.enforce_cached_range_limit();
         true
     }
 
@@ -207,6 +255,7 @@ impl DemuxPacketCacheState {
         &mut self,
         range: DemuxCachedRange,
     ) {
+        let range_id = range.id;
         for packet_id in range.global_order {
             self.consumed_packet_ids.remove(&packet_id);
             self.low_level_append_blocked_packet_generations
@@ -215,6 +264,8 @@ impl DemuxPacketCacheState {
                 self.cached_bytes = self.cached_bytes.saturating_sub(packet.byte_len);
             }
         }
+        self.failed_cached_seek_ranges.remove(&range_id);
+        self.rejected_cached_seek_ranges.remove(&range_id);
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn mark_read_stream_bof(

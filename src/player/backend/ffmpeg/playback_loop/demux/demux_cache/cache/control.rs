@@ -592,8 +592,8 @@ impl DemuxPacketCache {
                     cache_pause_percent = ?guard.cache_pause_percent(),
                     cache_paused = self.shared.control.is_cache_paused(),
                     should_pause_demux = guard.should_pause_demux(),
-                    readahead_ms = guard.readahead_nsecs as f64 / 1_000_000.0,
-                    cache_pause_wait_ms = guard.cache_pause_wait_nsecs as f64 / 1_000_000.0,
+                    readahead_ms = guard.effective_readahead_nsecs() as f64 / 1_000_000.0,
+                    cache_pause_wait_ms = guard.effective_cache_pause_wait_nsecs() as f64 / 1_000_000.0,
                     "still waiting for initial FFmpeg demux cache fill"
                 );
                 next_initial_wait_log_at = now.checked_add(DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL);

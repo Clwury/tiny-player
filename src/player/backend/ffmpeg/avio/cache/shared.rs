@@ -1019,7 +1019,7 @@ impl HttpRingCacheShared {
         offset: u64,
     ) -> u64 {
         let guard = self.state.lock().expect("HTTP stream cache poisoned");
-        let configured = guard.config.range_request_bytes.max(1);
+        let configured = guard.range_request_bytes_effective();
         if guard.active_range_kind == HttpCacheRangeKind::Playback
             && offset == guard.base_offset
             && guard.base_offset == guard.next_offset

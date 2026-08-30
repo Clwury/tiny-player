@@ -259,7 +259,7 @@ impl DemuxPacketCacheShared {
                     cache_pause_percent = ?guard.cache_pause_percent(),
                     cache_paused = self.control.is_cache_paused(),
                     should_pause_demux,
-                    readahead_ms = guard.readahead_nsecs as f64 / 1_000_000.0,
+                    readahead_ms = guard.effective_readahead_nsecs() as f64 / 1_000_000.0,
                     generation = guard.generation,
                     seek_generation = self.control.seek_generation(),
                     "FFmpeg demux packet cache prefetch paused"
@@ -287,7 +287,7 @@ impl DemuxPacketCacheShared {
                     cache_pause_percent = ?guard.cache_pause_percent(),
                     cache_paused = self.control.is_cache_paused(),
                     should_pause_demux = guard.should_pause_demux(),
-                    readahead_ms = guard.readahead_nsecs as f64 / 1_000_000.0,
+                    readahead_ms = guard.effective_readahead_nsecs() as f64 / 1_000_000.0,
                     generation = guard.generation,
                     seek_generation = self.control.seek_generation(),
                     "FFmpeg demux packet cache prefetch still paused"

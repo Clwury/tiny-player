@@ -954,6 +954,7 @@ impl Render for HomePage {
         let on_home = cx.listener(Self::select_home_section);
         let on_favorites = cx.listener(Self::select_favorites_section);
         let on_search = cx.listener(Self::select_search_section);
+        let on_settings = cx.listener(Self::open_settings);
 
         div()
             .flex()
@@ -971,6 +972,7 @@ impl Render for HomePage {
                 on_home,
                 on_favorites,
                 on_search,
+                on_settings,
             ))
             .child(self.render_content_area(cx, rounded_window))
     }

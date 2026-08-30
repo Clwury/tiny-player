@@ -178,6 +178,7 @@ impl TinyApp {
             move |app: &mut TinyApp, _, event, cx| match event {
                 HomeEvent::BackToServers => app.show_servers_page_from_home(cx),
                 HomeEvent::SectionChanged | HomeEvent::TitleChanged => cx.notify(),
+                HomeEvent::OpenSettings => app.open_playback_settings_dialog(cx),
                 HomeEvent::OpenPlayback(request) => {
                     app.open_playback_page(playback_return_to.clone(), request.as_ref().clone(), cx)
                 }
@@ -193,7 +194,10 @@ impl TinyApp {
         request: PlaybackRequest,
         cx: &mut Context<Self>,
     ) {
-        let playback_page = cx.new(|cx| crate::player::PlaybackPage::new(request, cx));
+        let playback_cache_config = self.cache.playback.clone();
+        let playback_page = cx.new(|cx| {
+            crate::player::PlaybackPage::new_with_cache_config(request, playback_cache_config, cx)
+        });
         cx.subscribe(
             &playback_page,
             |app: &mut TinyApp, _, event, cx| match event {

@@ -120,8 +120,25 @@ fn demux_packet_cache_state_allows_zero_demuxer_max_bytes() {
         config,
     );
 
-    assert_eq!(state.memory_limit_bytes, 0);
+    // A finite shared budget turns the legacy "unlimited" forward setting
+    // into the remaining bounded slice. Setting the total budget to zero is
+    // the explicit way to retain independent-layer semantics.
+    assert!(state.memory_limit_bytes > 0);
     assert!(!state.should_pause_demux());
+
+    let independent = PlaybackCacheConfig {
+        demuxer_max_bytes: 0,
+        total_cache_max_bytes: 0,
+        ..PlaybackCacheConfig::default()
+    };
+    let independent_state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        independent,
+    );
+    assert_eq!(independent_state.memory_limit_bytes, 0);
 }
 
 #[test]

@@ -27,6 +27,8 @@ impl HttpRingCacheState {
             .map(|content_len| self.next_offset.min(content_len) as f64 / content_len as f64);
         let raw_input_rate = self.raw_input_rate();
         let active_forward_bytes = self.active_forward_bytes();
+        let target_readahead_bytes = self.target_readahead_bytes();
+        let resume_readahead_bytes = self.resume_readahead_bytes(target_readahead_bytes);
         ByteCacheState {
             ranges: ranges.into_iter().map(Into::into).collect(),
             reader_fraction,
@@ -40,6 +42,12 @@ impl HttpRingCacheState {
             active_forward_est_seconds: self.active_forward_est_seconds(raw_input_rate),
             range_request_bytes_effective: self.range_request_bytes_effective(),
             byte_level_seeks: self.byte_level_seeks,
+            target_readahead_bytes,
+            resume_readahead_bytes,
+            memory_capacity_bytes: self.config.memory_capacity as u64,
+            retained_bytes: self.retained_memory_bytes() as u64,
+            prefetch_paused: self.prefetch_paused,
+            retained_range_count: self.retained_ranges.len(),
         }
     }
 
@@ -72,7 +80,24 @@ impl HttpRingCacheState {
     pub(in crate::player::backend::ffmpeg::avio::cache) fn range_request_bytes_effective(
         &self,
     ) -> u64 {
-        self.config.range_request_bytes.max(1)
+        let configured = self.config.range_request_bytes.max(1);
+        if !self.config.adaptive_range_request {
+            return configured;
+        }
+        let Some(rate) = self.adaptive_input_rate().filter(|rate| *rate > 0) else {
+            return configured;
+        };
+        // Request enough bytes for a bounded lead, then cap the adaptation to
+        // four configured requests. This avoids both tiny high-latency ranges
+        // and a single bitrate spike producing an oversized allocation.
+        let lead_seconds = self.config.readahead_seconds.clamp(1.0, 30.0);
+        let target = (rate as f64 * lead_seconds).round() as u64;
+        let memory_capacity = (self.config.memory_capacity as u64).max(1);
+        target
+            .max(self.config.chunk_size as u64)
+            .min(configured.saturating_mul(4).max(configured))
+            .min(memory_capacity)
+            .clamp(1, 128 * 1024 * 1024)
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn cache_idle(&self) -> bool {
@@ -140,7 +165,7 @@ impl HttpRingCacheState {
         if !http_stream_cache_status_changed(
             self.last_reported_status.as_ref(),
             &status,
-            self.config.range_request_bytes,
+            self.range_request_bytes_effective(),
         ) {
             return None;
         }

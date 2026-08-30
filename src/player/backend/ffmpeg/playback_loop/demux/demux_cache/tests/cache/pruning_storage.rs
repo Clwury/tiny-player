@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn demux_packet_cache_bounds_archived_ranges_and_cleans_seek_tombstones() {
+    let mut config = cache_config_for_test();
+    config.total_cache_max_bytes = 0;
+    config.demuxer_max_ranges = 2;
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        config,
+    );
+    state.ranges.insert(1, DemuxCachedRange::new(1, false, 1));
+    state.ranges.insert(2, DemuxCachedRange::new(2, false, 2));
+    state.ranges.insert(3, DemuxCachedRange::new(3, false, 3));
+    state.rejected_cached_seek_ranges.insert(
+        1,
+        CachedSeekMiss {
+            range_id: Some(1),
+            target_nsecs: 1,
+            reason: CachedSeekMissReason::TargetOutsideRange,
+        },
+    );
+    assert_eq!(state.enforce_cached_range_limit(), 2);
+
+    assert_eq!(state.ranges.len(), 2);
+    assert!(state.ranges.contains_key(&0));
+    assert!(state.ranges.contains_key(&3));
+    assert!(!state.ranges.contains_key(&1));
+    assert!(!state.ranges.contains_key(&2));
+    assert!(!state.rejected_cached_seek_ranges.contains_key(&1));
+}
+
+#[test]
 fn demux_packet_cache_state_reports_per_stream_idle_and_underrun() {
     let mut config = cache_config_for_test();
     config.cache_secs = 1.0;

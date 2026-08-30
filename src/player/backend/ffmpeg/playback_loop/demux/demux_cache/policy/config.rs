@@ -55,21 +55,24 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn demux_pack
 
 /// Hysteresis band for the demux PACKET cache read-ahead.
 ///
-/// The default config sets no hysteresis (mpv parity). But unlike mpv -- whose demuxer
-/// thread does not share a mutex with the playback consumer -- tiny's demux producer and
-/// the coordinator pump contend on a single cache mutex. With zero hysteresis the
-/// producer resumes reading the instant `forward` dips below the read-ahead target, so it
-/// wakes to read+append on every consumed packet, thrashing the lock against the pump
-/// and starving the decoder. Inject a band (when none is configured) so the producer
-/// parks between refills and the pump gets long uncontended windows to feed the decoder.
-/// Cap the automatic band so larger seekable-range windows resume prefetching early.
+/// Keep an explicit hysteresis value separate from the automatic refill band.
+/// mpv can use a zero band because its demux thread does not share the packet
+/// mutex with the playback consumer; tiny's producer and coordinator do. The
+/// automatic band prevents wake/read/append churn, while the UI can disable it
+/// by setting `automatic_hysteresis` to false.
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn demux_packet_cache_hysteresis_nsecs(
     cache_config: &PlaybackCacheConfig,
     readahead_nsecs: u64,
 ) -> u64 {
     let configured = seconds_to_nsecs(cache_config.demuxer_hysteresis_secs);
+    if !cache_config.automatic_hysteresis {
+        return configured.min(readahead_nsecs);
+    }
     if configured > 0 {
-        configured
+        // Keep an explicitly requested band below the target. This mirrors
+        // mpv's recommendation and prevents a high-bitrate byte target from
+        // producing a zero-byte resume watermark in the transport cache.
+        configured.min(readahead_nsecs / 2)
     } else {
         (readahead_nsecs / 3).min(duration_nsecs(DEMUX_PACKET_CACHE_MAX_AUTO_HYSTERESIS))
     }

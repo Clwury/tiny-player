@@ -101,7 +101,10 @@ impl Render for TinyApp {
         let close_menu = cx.listener(Self::close_server_menu);
         let submit_dialog = cx.listener(Self::submit_add_server_dialog);
         let dialog = self.add_server_dialog.clone();
-        let modal_open = dialog.is_some();
+        let close_playback_settings = cx.listener(Self::close_playback_settings_dialog);
+        let submit_playback_settings = cx.listener(Self::submit_playback_settings_dialog);
+        let playback_settings_dialog = self.playback_settings_dialog.clone();
+        let modal_open = dialog.is_some() || playback_settings_dialog.is_some();
 
         div()
             .relative()
@@ -133,6 +136,15 @@ impl Render for TinyApp {
                     rounded_window,
                     close_dialog,
                     submit_dialog,
+                    cx,
+                ))
+            })
+            .when_some(playback_settings_dialog, |this, dialog| {
+                this.child(dialog.read(cx).render_layer(
+                    dialog.clone(),
+                    rounded_window,
+                    close_playback_settings,
+                    submit_playback_settings,
                     cx,
                 ))
             })

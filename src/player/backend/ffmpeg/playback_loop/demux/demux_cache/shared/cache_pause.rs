@@ -62,8 +62,8 @@ impl DemuxPacketCacheShared {
                 cache_end_seconds = ?guard.cached_until_nsecs().map(nsecs_to_seconds),
                 raw_input_rate_bytes_per_sec = ?guard.raw_input_rate(),
                 should_pause_demux = guard.should_pause_demux(),
-                readahead_ms = guard.readahead_nsecs as f64 / 1_000_000.0,
-                cache_pause_wait_ms = guard.cache_pause_wait_nsecs as f64 / 1_000_000.0,
+                readahead_ms = guard.effective_readahead_nsecs() as f64 / 1_000_000.0,
+                cache_pause_wait_ms = guard.effective_cache_pause_wait_nsecs() as f64 / 1_000_000.0,
                 "FFmpeg demux packet cache pause entered"
             );
         }
@@ -131,8 +131,8 @@ impl DemuxPacketCacheShared {
                     cache_end_seconds = ?guard.cached_until_nsecs().map(nsecs_to_seconds),
                     raw_input_rate_bytes_per_sec = ?guard.raw_input_rate(),
                     should_pause_demux = guard.should_pause_demux(),
-                    readahead_ms = guard.readahead_nsecs as f64 / 1_000_000.0,
-                    cache_pause_wait_ms = guard.cache_pause_wait_nsecs as f64 / 1_000_000.0,
+                    readahead_ms = guard.effective_readahead_nsecs() as f64 / 1_000_000.0,
+                    cache_pause_wait_ms = guard.effective_cache_pause_wait_nsecs() as f64 / 1_000_000.0,
                     "FFmpeg demux packet cache pause recovered"
                 );
             }

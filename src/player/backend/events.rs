@@ -1,8 +1,12 @@
 use std::{fmt, path::PathBuf, sync::Arc};
 
 use gpui::RenderImage;
+use serde::{Deserialize, Serialize};
 
 use crate::player::render_host::{PlaybackSessionId, RenderSize};
+
+const CACHE_CHUNK_MIN_BYTES: u64 = 64 * 1024;
+const SHARED_CACHE_LAYER_RESERVE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackVideoInfo {
@@ -100,7 +104,8 @@ impl BackendSubtitleCue {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PlaybackCacheMode {
     Auto,
     Enabled,
@@ -108,7 +113,8 @@ pub enum PlaybackCacheMode {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PlaybackSeekableCacheMode {
     Auto,
     Enabled,
@@ -116,14 +122,16 @@ pub enum PlaybackSeekableCacheMode {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CacheUnlinkPolicy {
     Immediate,
     WhenDone,
     Never,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PlaybackCacheConfig {
     pub mode: PlaybackCacheMode,
     pub seekable_cache: PlaybackSeekableCacheMode,
@@ -145,6 +153,16 @@ pub struct PlaybackCacheConfig {
     pub demuxer_cache_wait: bool,
     pub cache_dir: Option<PathBuf>,
     pub unlink_files: CacheUnlinkPolicy,
+    /// Upper bound shared by the transport and demux cache layers. A value of
+    /// zero keeps the legacy independent-layer limits; when finite, a zero
+    /// demux forward limit means "use the remaining shared budget".
+    pub total_cache_max_bytes: u64,
+    /// Maximum number of archived demux seek ranges retained in memory.
+    pub demuxer_max_ranges: usize,
+    /// Adapt the time target to the observed compressed input rate.
+    pub adaptive_readahead: bool,
+    /// Distinguish an automatic refill band from an explicitly disabled band.
+    pub automatic_hysteresis: bool,
 }
 
 impl Default for PlaybackCacheConfig {
@@ -170,6 +188,10 @@ impl Default for PlaybackCacheConfig {
             demuxer_cache_wait: false,
             cache_dir: None,
             unlink_files: CacheUnlinkPolicy::Immediate,
+            total_cache_max_bytes: 256 * 1024 * 1024,
+            demuxer_max_ranges: 10,
+            adaptive_readahead: true,
+            automatic_hysteresis: true,
         }
     }
 }
@@ -189,15 +211,32 @@ impl PlaybackCacheConfig {
         self.disk_cache_max_bytes = self.disk_cache_max_bytes.max(1);
         self.http_cache_chunk_bytes = self
             .http_cache_chunk_bytes
-            .clamp(64 * 1024, 16 * 1024 * 1024);
+            .clamp(CACHE_CHUNK_MIN_BYTES, 16 * 1024 * 1024);
         self.http_cache_range_request_bytes = self
             .http_cache_range_request_bytes
-            .clamp(64 * 1024, 128 * 1024 * 1024);
+            .clamp(CACHE_CHUNK_MIN_BYTES, 128 * 1024 * 1024);
         self.http_cache_range_request_bytes = self
             .http_cache_range_request_bytes
             .max(self.http_cache_chunk_bytes);
         self.http_cache_max_bytes = self.http_cache_max_bytes.max(self.http_cache_chunk_bytes);
         self.cache_pause_wait = valid_non_negative_or(self.cache_pause_wait, 1.0);
+        if self.total_cache_max_bytes > 0 {
+            // Keep enough room for one transport chunk and the minimum
+            // forward/backward working slices. Without this floor a finite
+            // total could resolve a layer to zero, which has a different
+            // legacy meaning (unlimited/disabled) inside the cache state.
+            let minimum_forward = shared_cache_forward_reserve(self.demuxer_max_bytes);
+            let minimum_back = shared_cache_back_reserve(self.demuxer_max_back_bytes);
+            let minimum_total = self
+                .http_cache_chunk_bytes
+                .saturating_add(minimum_forward)
+                .saturating_add(minimum_back);
+            self.total_cache_max_bytes = self.total_cache_max_bytes.max(minimum_total);
+        }
+        if self.demuxer_max_ranges == 0 {
+            self.demuxer_max_ranges = Self::default().demuxer_max_ranges;
+        }
+        self.demuxer_max_ranges = self.demuxer_max_ranges.clamp(1, 64);
         self
     }
 
@@ -221,12 +260,128 @@ impl PlaybackCacheConfig {
         }
     }
 
+    /// Return the time target after applying the byte ceiling and an observed
+    /// compressed input rate. This is intentionally a pure helper so callers
+    /// can use it without changing the cache state machine.
+    pub fn effective_readahead_secs_for_rate(
+        &self,
+        cache_active: bool,
+        input_rate_bytes_per_sec: Option<u64>,
+    ) -> f64 {
+        let target = self.effective_readahead_secs(cache_active);
+        if !self.adaptive_readahead {
+            return target;
+        }
+        let Some(rate) = input_rate_bytes_per_sec.filter(|rate| *rate > 0) else {
+            return target;
+        };
+        let byte_budget = self.effective_demuxer_max_bytes();
+        if byte_budget == 0 {
+            return target;
+        }
+        let byte_limited = byte_budget as f64 / rate as f64;
+        if byte_limited.is_finite() && byte_limited > 0.0 {
+            target.min(byte_limited)
+        } else {
+            target
+        }
+    }
+
+    /// Compute the transport window allowed by the shared cache budget.
+    /// Keep at least one configured chunk so a range request can make progress
+    /// even when a user deliberately chooses a very small total budget.
+    pub fn effective_http_cache_max_bytes(&self) -> u64 {
+        self.effective_cache_budgets().0
+    }
+
+    /// Return `(http, demux-forward, demux-back)` limits after applying the
+    /// optional shared budget. With a finite total, a zero forward demux limit
+    /// consumes the remaining shared budget (the equivalent of "unlimited"
+    /// within that budget); a zero backward limit remains disabled. A zero
+    /// total is the explicit legacy mode where each layer keeps its own cap.
+    pub fn effective_cache_budgets(&self) -> (u64, u64, u64) {
+        if self.total_cache_max_bytes == 0 {
+            return (
+                self.http_cache_max_bytes,
+                self.demuxer_max_bytes,
+                self.demuxer_max_back_bytes,
+            );
+        }
+
+        let total = self.total_cache_max_bytes;
+        let minimum_http = self
+            .http_cache_chunk_bytes
+            .max(CACHE_CHUNK_MIN_BYTES)
+            .min(total);
+        let minimum_forward = shared_cache_forward_reserve(self.demuxer_max_bytes);
+        let minimum_back = shared_cache_back_reserve(self.demuxer_max_back_bytes);
+        let http_capacity = total
+            .saturating_sub(minimum_forward)
+            .saturating_sub(minimum_back)
+            .max(minimum_http)
+            .min(total);
+        let http = self
+            .http_cache_max_bytes
+            .min(http_capacity)
+            .max(minimum_http)
+            .min(total);
+        let mut remaining = total.saturating_sub(http);
+
+        // Forward playback gets priority over the optional backward seek
+        // reserve when the shared budget is tight. A configured zero is an
+        // unlimited request, so it receives all remaining forward capacity.
+        let forward_capacity = remaining.saturating_sub(minimum_back);
+        let forward_request = if self.demuxer_max_bytes == 0 {
+            u64::MAX
+        } else {
+            self.demuxer_max_bytes
+        };
+        let forward = forward_request
+            .min(forward_capacity)
+            .max(minimum_forward)
+            .min(remaining);
+        remaining = remaining.saturating_sub(forward);
+        let back = if self.demuxer_max_back_bytes == 0 {
+            0
+        } else {
+            self.demuxer_max_back_bytes
+                .min(remaining)
+                .max(minimum_back)
+                .min(remaining)
+        };
+        (http, forward, back)
+    }
+
+    pub fn effective_demuxer_max_bytes(&self) -> u64 {
+        self.effective_cache_budgets().1
+    }
+
+    pub fn effective_demuxer_max_back_bytes(&self) -> u64 {
+        self.effective_cache_budgets().2
+    }
+
     pub fn seekable_cache_active(&self, cache_active: bool) -> bool {
         match self.seekable_cache {
             PlaybackSeekableCacheMode::Enabled => true,
             PlaybackSeekableCacheMode::Disabled => false,
             PlaybackSeekableCacheMode::Auto => cache_active,
         }
+    }
+}
+
+fn shared_cache_forward_reserve(configured: u64) -> u64 {
+    if configured == 0 {
+        SHARED_CACHE_LAYER_RESERVE_BYTES
+    } else {
+        configured.clamp(1, SHARED_CACHE_LAYER_RESERVE_BYTES)
+    }
+}
+
+fn shared_cache_back_reserve(configured: u64) -> u64 {
+    if configured == 0 {
+        0
+    } else {
+        configured.clamp(1, SHARED_CACHE_LAYER_RESERVE_BYTES)
     }
 }
 
@@ -290,6 +445,12 @@ pub struct DemuxCacheState {
     pub byte_level_seeks: u64,
     pub seekable_ranges: Vec<PlaybackCacheTimeRange>,
     pub streams: Vec<StreamCacheState>,
+    /// Effective targets after adaptive rate and byte-budget clamping.
+    pub readahead_secs: f64,
+    pub hysteresis_secs: f64,
+    pub memory_limit_bytes: u64,
+    pub backbuffer_limit_bytes: u64,
+    pub cached_range_count: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -306,6 +467,14 @@ pub struct ByteCacheState {
     pub active_forward_est_seconds: Option<f64>,
     pub range_request_bytes_effective: u64,
     pub byte_level_seeks: u64,
+    /// Transport-side watermarks and retained-range pressure, exposed for
+    /// diagnostics/UI without requiring another cache lock acquisition.
+    pub target_readahead_bytes: u64,
+    pub resume_readahead_bytes: u64,
+    pub memory_capacity_bytes: u64,
+    pub retained_bytes: u64,
+    pub prefetch_paused: bool,
+    pub retained_range_count: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -468,6 +637,10 @@ mod tests {
         assert!(!config.demuxer_cache_wait);
         assert_eq!(config.cache_dir, None);
         assert_eq!(config.unlink_files, CacheUnlinkPolicy::Immediate);
+        assert_eq!(config.total_cache_max_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.demuxer_max_ranges, 10);
+        assert!(config.adaptive_readahead);
+        assert!(config.automatic_hysteresis);
     }
 
     #[test]
@@ -527,5 +700,103 @@ mod tests {
         assert!(!network.cache_pause);
         assert!(!network.cache_pause_initial);
         assert!(!network.demuxer_cache_wait);
+    }
+
+    #[test]
+    fn finite_total_cache_budget_is_split_in_priority_order() {
+        let config = PlaybackCacheConfig {
+            total_cache_max_bytes: 96 * 1024 * 1024,
+            http_cache_max_bytes: 48 * 1024 * 1024,
+            demuxer_max_bytes: 32 * 1024 * 1024,
+            demuxer_max_back_bytes: 16 * 1024 * 1024,
+            ..PlaybackCacheConfig::default()
+        }
+        .normalized();
+        let (http, forward, back) = config.effective_cache_budgets();
+
+        assert!(http >= config.http_cache_chunk_bytes);
+        assert!(forward > 0);
+        assert!(back > 0);
+        assert!(http + forward + back <= config.total_cache_max_bytes);
+        assert_eq!(http, 48 * 1024 * 1024);
+        assert_eq!(forward, 32 * 1024 * 1024);
+        assert_eq!(back, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn finite_total_budget_bounds_an_unlimited_forward_layer() {
+        let config = PlaybackCacheConfig {
+            total_cache_max_bytes: 8 * 1024 * 1024,
+            http_cache_max_bytes: 2 * 1024 * 1024,
+            demuxer_max_bytes: 0,
+            demuxer_max_back_bytes: 0,
+            ..PlaybackCacheConfig::default()
+        }
+        .normalized();
+        let (http, forward, back) = config.effective_cache_budgets();
+
+        assert_eq!(http, 2 * 1024 * 1024);
+        assert_eq!(back, 0);
+        assert_eq!(forward, config.total_cache_max_bytes - http);
+    }
+
+    #[test]
+    fn zero_total_preserves_independent_layer_limits() {
+        let config = PlaybackCacheConfig {
+            total_cache_max_bytes: 0,
+            demuxer_max_bytes: 0,
+            demuxer_max_back_bytes: 1234,
+            ..PlaybackCacheConfig::default()
+        }
+        .normalized();
+
+        assert_eq!(
+            config.effective_cache_budgets(),
+            (config.http_cache_max_bytes, 0, 1234)
+        );
+    }
+
+    #[test]
+    fn adaptive_readahead_is_capped_by_effective_demux_budget() {
+        let config = PlaybackCacheConfig {
+            cache_secs: 60.0,
+            demuxer_readahead_secs: 2.0,
+            demuxer_max_bytes: 10 * 1024 * 1024,
+            ..PlaybackCacheConfig::default()
+        }
+        .normalized();
+
+        assert_eq!(
+            config.effective_readahead_secs_for_rate(true, Some(20 * 1024 * 1024)),
+            0.5
+        );
+        let fixed = PlaybackCacheConfig {
+            adaptive_readahead: false,
+            ..config
+        };
+        assert_eq!(
+            fixed.effective_readahead_secs_for_rate(true, Some(u64::MAX)),
+            60.0
+        );
+    }
+
+    #[test]
+    fn cache_config_deserializes_older_files_with_new_defaults() {
+        let config: PlaybackCacheConfig = serde_json::from_str(r#"{"cache_secs":2.0}"#).unwrap();
+
+        assert_eq!(config.cache_secs, 2.0);
+        assert_eq!(config.total_cache_max_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.demuxer_max_ranges, 10);
+        assert!(config.adaptive_readahead);
+    }
+
+    #[test]
+    fn cache_config_serializes_enum_values_in_snake_case() {
+        let config = PlaybackCacheConfig {
+            unlink_files: CacheUnlinkPolicy::WhenDone,
+            ..PlaybackCacheConfig::default()
+        };
+        let value = serde_json::to_value(config).unwrap();
+        assert_eq!(value["unlink_files"], "when_done");
     }
 }

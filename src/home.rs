@@ -45,6 +45,7 @@ pub enum HomeEvent {
     BackToServers,
     SectionChanged,
     TitleChanged,
+    OpenSettings,
     OpenPlayback(Box<PlaybackRequest>),
 }
 
@@ -383,6 +384,10 @@ impl HomePage {
 
     fn back_to_servers(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(HomeEvent::BackToServers);
+    }
+
+    fn open_settings(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(HomeEvent::OpenSettings);
     }
 
     pub(crate) fn apply_playback_update(

@@ -16,26 +16,38 @@ impl HttpCacheConfig {
     ) -> Self {
         let config = config.clone().normalized();
         let cache_active = !matches!(config.mode, PlaybackCacheMode::Disabled);
+        let configured_memory = usize::try_from(config.effective_http_cache_max_bytes())
+            .unwrap_or(usize::MAX)
+            .max(1);
         let configured_chunk = usize::try_from(config.http_cache_chunk_bytes)
             .unwrap_or(usize::MAX)
-            .clamp(64 * 1024, 16 * 1024 * 1024);
-        let configured_memory = usize::try_from(config.http_cache_max_bytes)
-            .unwrap_or(usize::MAX)
-            .max(configured_chunk);
-        let chunk_size = env_usize("TINY_HTTP_CACHE_CHUNK_BYTES", configured_chunk)
-            .clamp(64 * 1024, 16 * 1024 * 1024);
-        let memory_capacity =
-            env_usize("TINY_HTTP_CACHE_MEMORY_BYTES", configured_memory).max(chunk_size);
+            .clamp(64 * 1024, 16 * 1024 * 1024)
+            .min(configured_memory)
+            .max(1);
+        // Environment overrides are still useful for diagnostics, but they
+        // must not silently bypass the shared cache budget. Keep the chunk
+        // below the effective capacity so every append can make progress.
+        let minimum_chunk = (64 * 1024).min(configured_memory).max(1);
+        let chunk_size = env_usize("TINY_HTTP_CACHE_CHUNK_BYTES", configured_chunk).clamp(
+            minimum_chunk,
+            configured_memory.min(16 * 1024 * 1024).max(minimum_chunk),
+        );
+        let memory_capacity = env_usize("TINY_HTTP_CACHE_MEMORY_BYTES", configured_memory)
+            .min(configured_memory)
+            .max(chunk_size);
         let range_request_bytes = env_u64("TINY_HTTP_CACHE_RANGE_REQUEST_BYTES")
             .unwrap_or(config.http_cache_range_request_bytes)
             .clamp(64 * 1024, 128 * 1024 * 1024)
             .max(u64::try_from(chunk_size).unwrap_or(u64::MAX));
-        let configured_hysteresis_seconds =
-            http_cache_hysteresis_seconds(config.demuxer_hysteresis_secs);
+        let configured_hysteresis_seconds = http_cache_hysteresis_seconds(
+            config.demuxer_hysteresis_secs,
+            config.automatic_hysteresis,
+        );
         Self {
             memory_capacity,
             chunk_size,
             range_request_bytes,
+            adaptive_range_request: config.adaptive_readahead,
             // mpv keeps the active HTTP stream open and only issues a new
             // range after an actual seek or network failure. Use one request
             // through the known content end; bounded requests remain available
@@ -52,7 +64,9 @@ impl HttpCacheConfig {
             )
             .max(0.0),
             max_readahead_bytes: Some(
-                env_u64("TINY_HTTP_CACHE_MAX_BYTES").unwrap_or(config.http_cache_max_bytes),
+                env_u64("TINY_HTTP_CACHE_MAX_BYTES")
+                    .unwrap_or(config.effective_http_cache_max_bytes())
+                    .min(u64::try_from(memory_capacity).unwrap_or(u64::MAX)),
             ),
             disk_cache_bytes: config.disk_cache.then(|| {
                 env_u64("TINY_HTTP_CACHE_DISK_BYTES").unwrap_or(config.disk_cache_max_bytes)
@@ -70,6 +84,7 @@ impl HttpCacheConfig {
             memory_capacity,
             chunk_size: HTTP_CACHE_CHUNK_SIZE.min(memory_capacity.max(1)),
             range_request_bytes: HTTP_CACHE_RANGE_REQUEST_BYTES,
+            adaptive_range_request: false,
             continuous_playback_requests: true,
             readahead_seconds: HTTP_CACHE_DEFAULT_READAHEAD_SECONDS,
             hysteresis_seconds: HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS,
@@ -81,7 +96,14 @@ impl HttpCacheConfig {
     }
 }
 
-fn http_cache_hysteresis_seconds(configured: f64) -> f64 {
+fn http_cache_hysteresis_seconds(configured: f64, automatic: bool) -> f64 {
+    if !automatic {
+        return if configured.is_finite() && configured >= 0.0 {
+            configured
+        } else {
+            0.0
+        };
+    }
     if configured.is_finite() && configured > 0.0 {
         configured
     } else {
@@ -119,13 +141,18 @@ mod tests {
     #[test]
     fn http_cache_uses_default_hysteresis_when_demux_hysteresis_is_zero() {
         assert_eq!(
-            http_cache_hysteresis_seconds(0.0),
+            http_cache_hysteresis_seconds(0.0, true),
             HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS
         );
     }
 
     #[test]
     fn http_cache_preserves_explicit_hysteresis() {
-        assert_eq!(http_cache_hysteresis_seconds(2.5), 2.5);
+        assert_eq!(http_cache_hysteresis_seconds(2.5, true), 2.5);
+    }
+
+    #[test]
+    fn http_cache_honors_explicitly_disabled_hysteresis() {
+        assert_eq!(http_cache_hysteresis_seconds(0.0, false), 0.0);
     }
 }

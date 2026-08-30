@@ -27,15 +27,16 @@ impl DemuxPacketCacheState {
         let disk_cache = DemuxPacketDiskCache::from_config(&cache_config);
         let disk_cache_writable = disk_cache.is_some();
         let memory_limit_bytes =
-            usize::try_from(cache_config.demuxer_max_bytes).unwrap_or(usize::MAX);
+            usize::try_from(cache_config.effective_demuxer_max_bytes()).unwrap_or(usize::MAX);
         let cache_active = !matches!(cache_config.mode, PlaybackCacheMode::Disabled);
         let seekable_cache_active = cache_config.seekable_cache_active(cache_active);
         let backbuffer_limit_bytes = if seekable_cache_active {
-            usize::try_from(cache_config.demuxer_max_back_bytes).unwrap_or(usize::MAX)
+            usize::try_from(cache_config.effective_demuxer_max_back_bytes()).unwrap_or(usize::MAX)
         } else {
             0
         };
         let readahead_nsecs = demux_packet_cache_readahead_nsecs(&cache_config, cache_active);
+        let configured_hysteresis_nsecs = seconds_to_nsecs(cache_config.demuxer_hysteresis_secs);
         let hysteresis_nsecs = demux_packet_cache_hysteresis_nsecs(&cache_config, readahead_nsecs);
         let cache_pause_wait_nsecs = seconds_to_nsecs(cache_config.cache_pause_wait);
         let mut stream_kinds = BTreeMap::new();
@@ -71,8 +72,13 @@ impl DemuxPacketCacheState {
             memory_limit_bytes,
             backbuffer_limit_bytes,
             donate_backbuffer: cache_config.demuxer_donate_buffer,
+            configured_readahead_nsecs: readahead_nsecs,
             readahead_nsecs,
+            configured_hysteresis_nsecs,
+            automatic_hysteresis: cache_config.automatic_hysteresis,
             hysteresis_nsecs,
+            adaptive_readahead: cache_config.adaptive_readahead,
+            max_cached_ranges: cache_config.demuxer_max_ranges,
             hysteresis_active: false,
             cache_pause_enabled: cache_active && cache_config.cache_pause,
             cache_pause_initial: cache_config.cache_pause_initial,
@@ -182,18 +188,24 @@ impl DemuxPacketCacheState {
         let seekable_cache_active = cache_config.seekable_cache_active(cache_active);
 
         self.memory_limit_bytes =
-            usize::try_from(cache_config.demuxer_max_bytes).unwrap_or(usize::MAX);
+            usize::try_from(cache_config.effective_demuxer_max_bytes()).unwrap_or(usize::MAX);
         self.backbuffer_limit_bytes = if seekable_cache_active {
-            usize::try_from(cache_config.demuxer_max_back_bytes).unwrap_or(usize::MAX)
+            usize::try_from(cache_config.effective_demuxer_max_back_bytes()).unwrap_or(usize::MAX)
         } else {
             0
         };
         self.donate_backbuffer = cache_config.demuxer_donate_buffer;
+        self.adaptive_readahead = cache_config.adaptive_readahead;
+        self.max_cached_ranges = cache_config.demuxer_max_ranges;
         self.append_trim_pressure_packets = 0;
         self.append_trim_active = false;
         self.append_trim_pending = false;
         self.read_trim_pressure_packets = 0;
-        self.readahead_nsecs = demux_packet_cache_readahead_nsecs(&cache_config, cache_active);
+        self.configured_readahead_nsecs =
+            demux_packet_cache_readahead_nsecs(&cache_config, cache_active);
+        self.readahead_nsecs = self.configured_readahead_nsecs;
+        self.configured_hysteresis_nsecs = seconds_to_nsecs(cache_config.demuxer_hysteresis_secs);
+        self.automatic_hysteresis = cache_config.automatic_hysteresis;
         self.hysteresis_nsecs =
             demux_packet_cache_hysteresis_nsecs(&cache_config, self.readahead_nsecs);
         if self.hysteresis_nsecs == 0 {
@@ -217,6 +229,7 @@ impl DemuxPacketCacheState {
         }
 
         self.trim_to_limit();
+        self.enforce_cached_range_limit();
         self.refresh_readahead_hysteresis();
     }
 

@@ -89,12 +89,24 @@ impl DemuxPacketDiskCache {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn write_packet(
         &mut self,
         data: &[u8],
     ) -> std::result::Result<u64, String> {
-        let len = u64::try_from(data.len())
-            .map_err(|_| "FFmpeg demux packet payload 过大".to_string())?;
+        let (offset, file) = self.reserve_packet(data.len())?;
+        Self::write_reserved_packet(&file, offset, data)?;
+        Ok(offset)
+    }
+
+    /// Reserve space while the cache state mutex is held. The actual I/O is
+    /// intentionally performed by `write_reserved_packet` after that mutex is
+    /// released, so a slow filesystem cannot block packet consumers.
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn reserve_packet(
+        &mut self,
+        len: usize,
+    ) -> std::result::Result<(u64, Arc<File>), String> {
+        let len = u64::try_from(len).map_err(|_| "FFmpeg demux packet payload 过大".to_string())?;
         let offset = self.next_offset;
         let next = offset
             .checked_add(len)
@@ -102,10 +114,18 @@ impl DemuxPacketDiskCache {
         if next > self.max_bytes {
             return Err("FFmpeg demux packet disk cache 已满".to_string());
         }
+        self.next_offset = next;
+        Ok((offset, Arc::clone(&self.file)))
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn write_reserved_packet(
+        file: &File,
+        offset: u64,
+        data: &[u8],
+    ) -> std::result::Result<(), String> {
         let mut written = 0;
         while written < data.len() {
-            let written_now = self
-                .file
+            let written_now = file
                 .write_at(&data[written..], offset.saturating_add(written as u64))
                 .map_err(|error| format!("写入 FFmpeg demux packet disk cache 失败：{error}"))?;
             if written_now == 0 {
@@ -113,8 +133,7 @@ impl DemuxPacketDiskCache {
             }
             written += written_now;
         }
-        self.next_offset = next;
-        Ok(offset)
+        Ok(())
     }
 
     #[cfg(test)]

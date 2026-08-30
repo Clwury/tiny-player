@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{app_metadata, server::CachedServer};
+use crate::{app_metadata, player::PlaybackCacheConfig, server::CachedServer};
 
 const CACHE_VERSION: u32 = 1;
 
@@ -15,6 +15,10 @@ pub struct ServerCache {
     pub servers: Vec<CachedServer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window: Option<WindowState>,
+    /// Global playback tuning persisted alongside the server list. The
+    /// `default` attribute keeps older cache files backward compatible.
+    #[serde(default)]
+    pub playback: PlaybackCacheConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +34,7 @@ impl ServerCache {
             device_id: Uuid::new_v4().to_string(),
             servers: Vec::new(),
             window: None,
+            playback: PlaybackCacheConfig::default(),
         }
     }
 
@@ -124,6 +129,10 @@ pub(crate) fn load_or_init_from(path: &Path) -> Result<ServerCache> {
     if cache.device_id.is_empty() {
         cache.device_id = Uuid::new_v4().to_string();
     }
+    // Normalize both newly added and hand-edited settings before they reach
+    // the playback worker. This also makes old cache files (without a
+    // `playback` field) behave exactly like a fresh configuration.
+    cache.playback = cache.playback.clone().normalized();
 
     Ok(cache)
 }
@@ -225,6 +234,23 @@ mod tests {
     }
 
     #[test]
+    fn saves_and_loads_playback_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut cache = ServerCache::empty();
+        cache.playback.cache_secs = 42.5;
+        cache.playback.adaptive_readahead = false;
+        cache.playback.total_cache_max_bytes = 96 * 1024 * 1024;
+
+        save_to(&cache, &path).unwrap();
+        let loaded = load_or_init_from(&path).unwrap();
+
+        assert_eq!(loaded.playback.cache_secs, 42.5);
+        assert!(!loaded.playback.adaptive_readahead);
+        assert_eq!(loaded.playback.total_cache_max_bytes, 96 * 1024 * 1024);
+    }
+
+    #[test]
     fn loads_cache_without_window_state() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("servers.json");
@@ -238,6 +264,7 @@ mod tests {
 
         assert_eq!(loaded.device_id, "device-local");
         assert_eq!(loaded.window_size(), None);
+        assert_eq!(loaded.playback, PlaybackCacheConfig::default());
     }
 
     #[test]

@@ -1,6 +1,12 @@
 use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, Window};
 
-use crate::{server::CachedServer, ui::add_server_dialog::AddServerDialogState};
+use crate::{
+    server::CachedServer,
+    ui::{
+        add_server_dialog::AddServerDialogState,
+        playback_settings_dialog::PlaybackSettingsDialogState,
+    },
+};
 
 use super::{
     TinyApp,
@@ -8,6 +14,42 @@ use super::{
 };
 
 impl TinyApp {
+    pub(super) fn open_playback_settings_dialog(&mut self, cx: &mut Context<Self>) {
+        self.open_server_menu = None;
+        self.clear_app_notifications();
+        let config = self.cache.playback.clone();
+        self.playback_settings_dialog =
+            Some(cx.new(|cx| PlaybackSettingsDialogState::new(&config, cx)));
+        cx.notify();
+    }
+
+    pub(super) fn close_playback_settings_dialog(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.playback_settings_dialog = None;
+        cx.notify();
+    }
+
+    pub(super) fn submit_playback_settings_dialog(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dialog) = self.playback_settings_dialog.clone() else {
+            return;
+        };
+
+        let config = dialog.update(cx, |dialog, cx| dialog.submit(cx));
+        self.cache.playback = config;
+        self.playback_settings_dialog = None;
+        self.schedule_cache_save("保存播放设置失败", cx);
+        cx.notify();
+    }
+
     pub(super) fn open_add_server_dialog(
         &mut self,
         _: &ClickEvent,

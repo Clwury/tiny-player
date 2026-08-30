@@ -235,6 +235,9 @@ impl AddServerDialogState {
             .items_center()
             .justify_center()
             .bg(theme.overlay)
+            // Keep the modal layer from forwarding clicks or wheel events to
+            // the page underneath its transparent backdrop.
+            .occlude()
             .when(rounded_window, |this| {
                 this.rounded(theme.radius_lg).overflow_hidden()
             })

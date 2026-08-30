@@ -14,11 +14,13 @@ impl DemuxPacketCacheState {
             return true;
         }
         let forward_duration = self.forward_duration_nsecs();
-        if forward_duration >= self.readahead_nsecs {
+        let readahead_nsecs = self.effective_readahead_nsecs();
+        if forward_duration >= readahead_nsecs {
             return true;
         }
-        let resume_threshold = self.readahead_nsecs.saturating_sub(self.hysteresis_nsecs);
-        self.hysteresis_active && self.hysteresis_nsecs > 0 && forward_duration > resume_threshold
+        let hysteresis_nsecs = self.effective_hysteresis_nsecs();
+        let resume_threshold = readahead_nsecs.saturating_sub(hysteresis_nsecs);
+        self.hysteresis_active && hysteresis_nsecs > 0 && forward_duration > resume_threshold
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn reader_watermark(
@@ -109,7 +111,10 @@ impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn initial_cache_fill_complete(
         &self,
     ) -> bool {
-        if self.cache_pause_enabled && self.cache_pause_initial && self.cache_pause_wait_nsecs > 0 {
+        if self.cache_pause_enabled
+            && self.cache_pause_initial
+            && self.effective_cache_pause_wait_nsecs() > 0
+        {
             self.cache_pause_recovered()
         } else {
             self.effective_eof() || self.should_pause_demux()
@@ -119,17 +124,19 @@ impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn refresh_readahead_hysteresis(
         &mut self,
     ) {
-        if self.hysteresis_nsecs == 0 {
+        if self.effective_hysteresis_nsecs() == 0 {
             self.hysteresis_active = false;
             return;
         }
         let forward_duration = self.forward_duration_nsecs();
-        let resume_threshold = self.readahead_nsecs.saturating_sub(self.hysteresis_nsecs);
+        let readahead_nsecs = self.effective_readahead_nsecs();
+        let hysteresis_nsecs = self.effective_hysteresis_nsecs();
+        let resume_threshold = readahead_nsecs.saturating_sub(hysteresis_nsecs);
         if self.hysteresis_active {
             if forward_duration <= resume_threshold {
                 self.hysteresis_active = false;
             }
-        } else if forward_duration >= self.readahead_nsecs {
+        } else if forward_duration >= readahead_nsecs {
             self.hysteresis_active = true;
         }
     }
@@ -176,13 +183,14 @@ impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cache_pause_percent(
         &self,
     ) -> Option<u8> {
-        if self.cache_pause_wait_nsecs == 0 {
+        let wait_nsecs = self.effective_cache_pause_wait_nsecs();
+        if wait_nsecs == 0 {
             return None;
         }
         let percent = self
             .cache_pause_forward_duration_nsecs()
             .saturating_mul(100)
-            / self.cache_pause_wait_nsecs;
+            / wait_nsecs;
         Some(u8::try_from(percent.min(99)).unwrap_or(99))
     }
 
@@ -238,7 +246,7 @@ impl DemuxPacketCacheState {
         require_demux_underrun: bool,
     ) -> bool {
         self.cache_pause_enabled
-            && self.cache_pause_wait_nsecs > 0
+            && self.effective_cache_pause_wait_nsecs() > 0
             && !self.effective_eof()
             && !self.cache_pause_recovered()
             && (!require_demux_underrun || self.has_demux_underrun())
@@ -248,7 +256,7 @@ impl DemuxPacketCacheState {
         &self,
     ) -> bool {
         self.effective_eof()
-            || self.cache_pause_forward_duration_nsecs() >= self.cache_pause_wait_nsecs
+            || self.cache_pause_forward_duration_nsecs() >= self.effective_cache_pause_wait_nsecs()
             || (self.cache_pause_target_covered() && self.should_pause_demux())
     }
 

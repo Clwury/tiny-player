@@ -8,6 +8,7 @@ use crate::{app_metadata::APP_NAME, server::CachedServer, theme};
 use super::{HomePage, carousel::HOME_SIDEBAR_WIDTH_PX, navigation::HomeRoot};
 
 impl HomePage {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_sidebar(
         &self,
         cx: &Context<Self>,
@@ -16,6 +17,7 @@ impl HomePage {
         on_home: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         on_favorites: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         on_search: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        on_settings: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
         let theme = theme::get(cx);
         let username = self.current_server.username.clone();
@@ -70,7 +72,7 @@ impl HomePage {
                     )
                 }),
             ))
-            .child(user_row(username, cx))
+            .child(user_row(username, cx, on_settings))
     }
 
     fn render_title_row(
@@ -175,7 +177,11 @@ fn server_list_item(title: String, active: bool, cx: &Context<HomePage>) -> impl
         .child(title)
 }
 
-fn user_row(username: String, cx: &Context<HomePage>) -> impl IntoElement {
+fn user_row(
+    username: String,
+    cx: &Context<HomePage>,
+    on_settings: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     let theme = theme::get(cx);
 
     div()
@@ -204,10 +210,27 @@ fn user_row(username: String, cx: &Context<HomePage>) -> impl IntoElement {
                 .child(div().truncate().child(username)),
         )
         .child(
-            svg()
-                .path("icons/setting.svg")
-                .size(px(17.0))
-                .text_color(theme.muted_foreground),
+            div()
+                .id("open-playback-settings")
+                .flex()
+                .size(px(30.0))
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .hover(move |style| style.bg(theme.secondary_hover))
+                .child(
+                    svg()
+                        .path("icons/setting.svg")
+                        .size(px(17.0))
+                        .text_color(theme.muted_foreground),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_click(move |event, window, cx| {
+                    cx.stop_propagation();
+                    on_settings(event, window, cx);
+                }),
         )
 }
 

@@ -326,19 +326,15 @@ impl HttpRingCacheState {
         let Some(content_len) = self.content_len else {
             return false;
         };
-        if offset >= content_len
-            || offset < content_len.saturating_sub(self.config.range_request_bytes)
-        {
+        let range_request_bytes = self.range_request_bytes_effective();
+        if offset >= content_len || offset < content_len.saturating_sub(range_request_bytes) {
             return false;
         }
 
         let active_range_near_offset = self.active_range_kind == HttpCacheRangeKind::Playback
             && self.buffer.len() > 0
-            && offset
-                <= self
-                    .next_offset
-                    .saturating_add(self.config.range_request_bytes)
-            && self.base_offset <= offset.saturating_add(self.config.range_request_bytes);
+            && offset <= self.next_offset.saturating_add(range_request_bytes)
+            && self.base_offset <= offset.saturating_add(range_request_bytes);
         !active_range_near_offset
     }
 

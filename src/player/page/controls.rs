@@ -485,6 +485,12 @@ pub(super) fn cache_status_segments(cache_state: Option<&PlaybackCacheState>) ->
     {
         segments.push(format!("Demux {:.1}s", duration.max(0.0)));
     }
+    if cache_state.demux.readahead_secs.is_finite() && cache_state.demux.readahead_secs > 0.0 {
+        segments.push(format!("目标 {:.1}s", cache_state.demux.readahead_secs));
+    }
+    if cache_state.demux.cached_range_count > 0 {
+        segments.push(format!("Ranges {}", cache_state.demux.cached_range_count));
+    }
     for stream in &cache_state.demux.streams {
         let Some(duration) = stream
             .cache_duration
@@ -514,6 +520,22 @@ pub(super) fn cache_status_segments(cache_state: Option<&PlaybackCacheState>) ->
             "Byte {}",
             format_cache_bytes(byte_cache.cached_bytes)
         ));
+    }
+    if let Some(byte_cache) = cache_state.byte.as_ref()
+        && byte_cache.target_readahead_bytes > 0
+        && byte_cache.memory_capacity_bytes > 0
+    {
+        segments.push(format!(
+            "Byte 预读 {}/{}",
+            format_cache_bytes(byte_cache.target_readahead_bytes),
+            format_cache_bytes(byte_cache.memory_capacity_bytes)
+        ));
+        if byte_cache.prefetch_paused {
+            segments.push("Byte 暂停".to_string());
+        }
+        if byte_cache.retained_range_count > 0 {
+            segments.push(format!("Byte ranges {}", byte_cache.retained_range_count));
+        }
     }
     if let Some(file_cache_bytes) = cache_state.demux.file_cache_bytes
         && file_cache_bytes > 0
@@ -801,6 +823,36 @@ mod tests {
             ]
         );
         assert!(cache_status_segments(None).is_empty());
+    }
+
+    #[test]
+    fn cache_status_segments_expose_effective_prefetch_pressure() {
+        let state = PlaybackCacheState {
+            demux: DemuxCacheState {
+                readahead_secs: 1.25,
+                cached_range_count: 3,
+                ..DemuxCacheState::default()
+            },
+            byte: Some(ByteCacheState {
+                target_readahead_bytes: 2 * 1024 * 1024,
+                memory_capacity_bytes: 8 * 1024 * 1024,
+                prefetch_paused: true,
+                retained_range_count: 2,
+                ..ByteCacheState::default()
+            }),
+            ..PlaybackCacheState::default()
+        };
+        let segments = cache_status_segments(Some(&state));
+
+        assert!(segments.iter().any(|segment| segment == "目标 1.2s"));
+        assert!(segments.iter().any(|segment| segment == "Ranges 3"));
+        assert!(
+            segments
+                .iter()
+                .any(|segment| segment == "Byte 预读 2.0 MiB/8.0 MiB")
+        );
+        assert!(segments.iter().any(|segment| segment == "Byte 暂停"));
+        assert!(segments.iter().any(|segment| segment == "Byte ranges 2"));
     }
 
     #[test]
