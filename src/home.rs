@@ -13,16 +13,20 @@ mod render;
 mod resume_actions;
 mod search;
 mod sidebar;
+mod visible_row;
 mod workspace_render;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::Instant,
+};
 
 use crate::{
     emby::{EmbyClient, ResumeItems, UserItemData, UserItems, UserViews},
     images::loader::ImageLoader,
     player::PlaybackRequest,
     server::CachedServer,
-    ui::text_input::TextInput,
+    ui::editor::Editor,
 };
 use carousel::CarouselState;
 use favorites::FavoriteRollback;
@@ -37,7 +41,7 @@ pub(crate) use detail::SeriesDetailState;
 
 use gpui::{
     App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, ScrollHandle, SharedString,
-    WeakEntity, Window,
+    Task, WeakEntity, Window,
 };
 
 #[derive(Clone, Debug)]
@@ -95,12 +99,21 @@ pub struct HomePage {
     home_content: Entity<HomeContent>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct HomeContent {
     current_server: CachedServer,
     emby_client: EmbyClient,
     home_dashboard: Entity<HomeDashboard>,
-    defer_home_dashboard_refresh: bool,
+    reuse_home_dashboard_until_next_render: bool,
+    last_window_size: Option<(u32, u32)>,
+    resize_in_progress: bool,
+    resize_generation: u64,
+    last_resize_activity: Option<Instant>,
+    resize_settle_task_active: bool,
+    resize_settle_task: Task<()>,
+    defer_workspace_grid_contraction: bool,
+    defer_home_dashboard_warmup: bool,
+    workspace_grid_columns: usize,
     authentication_error: Option<SharedString>,
     navigation: HomeNavigation,
     home_refresh_generation: u64,
@@ -119,7 +132,7 @@ struct HomeContent {
     libraries: HashMap<String, LibraryState>,
     favorites: PagedItemsState,
     search: SearchState,
-    search_input: Entity<TextInput>,
+    search_input: Entity<Editor>,
     user_data_overrides: HashMap<String, UserItemData>,
     user_data_revision: u64,
     user_data_item_revisions: HashMap<String, u64>,
@@ -153,7 +166,7 @@ impl EventEmitter<HomeContentEvent> for HomeContent {}
 
 impl HomeContent {
     fn new(current_server: CachedServer, emby_client: EmbyClient, cx: &mut Context<Self>) -> Self {
-        let search_input = cx.new(|cx| TextInput::new("搜索电影或剧集", cx).clearable());
+        let search_input = cx.new(|cx| Editor::new("搜索电影或剧集", cx).clearable());
         cx.subscribe(&search_input, |page, _, event, cx| {
             page.on_search_input_event(event, cx);
         })
@@ -162,7 +175,13 @@ impl HomeContent {
         let home_dashboard = cx.new(move |_| HomeDashboard { home_content });
         let observed_home_dashboard = home_dashboard.clone();
         cx.observe_self(move |page, cx| {
-            if page.navigation.current() == &HomeRoute::Root(HomeRoot::Home) {
+            // The cached dashboard reads HomeContent state through a separate
+            // entity, so invalidate it whenever visible Home state changes. A
+            // route-only transition back to Home can reuse the warm dashboard
+            // cache; later data notifications invalidate it normally.
+            if page.navigation.current() == &HomeRoute::Root(HomeRoot::Home)
+                && !page.reuse_home_dashboard_until_next_render
+            {
                 observed_home_dashboard.update(cx, |_, cx| cx.notify());
             }
         })
@@ -178,7 +197,16 @@ impl HomeContent {
             current_server,
             emby_client,
             home_dashboard,
-            defer_home_dashboard_refresh: false,
+            reuse_home_dashboard_until_next_render: false,
+            last_window_size: None,
+            resize_in_progress: false,
+            resize_generation: 0,
+            last_resize_activity: None,
+            resize_settle_task_active: false,
+            resize_settle_task: Task::ready(()),
+            defer_workspace_grid_contraction: false,
+            defer_home_dashboard_warmup: false,
+            workspace_grid_columns: 0,
             authentication_error,
             navigation: HomeNavigation::default(),
             home_refresh_generation: 0,
@@ -246,12 +274,27 @@ impl HomeContent {
             return false;
         }
 
-        let entering_home = root == HomeRoot::Home;
+        // Non-Home workspaces keep the last dashboard frame cached behind their
+        // opaque overlay. Do not dirty that cache for the route-only Home update.
+        self.reuse_home_dashboard_until_next_render = root == HomeRoot::Home;
+
         self.sync_previous_offsets();
-        self.defer_home_dashboard_refresh |= entering_home;
         self.detail_generation = self.detail_generation.wrapping_add(1);
-        self.series_detail = None;
-        self.detail_history.clear();
+        // Detail responses can contain many episodes, people and media-source
+        // strings. Keep them alive through the next frame so switching a sidebar
+        // item can present the new workspace before doing all of that deallocation.
+        let detail_to_drop = self.series_detail.take();
+        let detail_history_to_drop = std::mem::take(&mut self.detail_history);
+        if detail_to_drop.is_some() || !detail_history_to_drop.is_empty() {
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |_, _| drop((detail_to_drop, detail_history_to_drop)));
+                // `on_next_frame` callbacks run outside an element's
+                // layout/prepaint/paint context, so `request_animation_frame`
+                // would try to read `current_view` and panic. `refresh` is the
+                // phase-independent way to request the follow-up frame here.
+                window.refresh();
+            });
+        }
         self.clear_all_notifications();
         self.resume_item_context_menu = None;
         match root {
@@ -262,7 +305,7 @@ impl HomeContent {
             HomeRoot::Search if self.authentication_error.is_none() => {
                 if !self.search.focused_once {
                     let focus = self.search_input.read(cx).focus_handle(cx);
-                    window.focus(&focus);
+                    window.focus(&focus, cx);
                     self.search.focused_once = true;
                 }
             }

@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, path::Path, sync::Arc};
 
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{
@@ -26,7 +26,7 @@ const IMAGE_PROGRESS_BAR_HORIZONTAL_INSET_PX: f32 = 8.0;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CoverImageSource {
-    path: PathBuf,
+    path: Arc<Path>,
     width: u32,
     height: u32,
 }
@@ -46,7 +46,7 @@ impl Asset for CoverImageAsset {
     }
 }
 
-pub(super) fn cover_img(path: PathBuf, width: f32, height: f32) -> impl IntoElement {
+pub(super) fn cover_img(path: Arc<Path>, width: f32, height: f32) -> impl IntoElement {
     let source = CoverImageSource {
         path,
         width: width as u32,
@@ -180,7 +180,7 @@ pub(super) fn carousel_button(
 
 pub(super) fn user_view_card<T>(
     name: String,
-    image_path: Option<PathBuf>,
+    image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
@@ -206,7 +206,7 @@ pub(super) fn user_view_card<T>(
         )
 }
 
-fn user_view_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl IntoElement {
+fn user_view_card_image<T>(image_path: Option<Arc<Path>>, cx: &Context<T>) -> impl IntoElement {
     let theme = theme::get(cx);
     let has_image = image_path.is_some();
 
@@ -227,7 +227,7 @@ fn user_view_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl
 }
 
 fn resume_item_card_image<T>(
-    image_path: Option<PathBuf>,
+    image_path: Option<Arc<Path>>,
     played_fraction: Option<f32>,
     is_favorite: bool,
     cx: &Context<T>,
@@ -306,7 +306,7 @@ fn image_progress_bar<T>(image_width: f32, played_fraction: f32, cx: &Context<T>
 
 pub(super) fn resume_item_card<T>(
     item: &ResumeItem,
-    image_path: Option<PathBuf>,
+    image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
@@ -359,7 +359,7 @@ pub(super) fn resume_item_card<T>(
 
 pub(super) fn user_item_card<T>(
     item: &UserItem,
-    image_path: Option<PathBuf>,
+    image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
@@ -403,7 +403,7 @@ pub(super) fn user_item_card<T>(
 
 pub(super) fn user_episode_card<T>(
     item: &UserItem,
-    image_path: Option<PathBuf>,
+    image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
@@ -496,7 +496,7 @@ pub(super) fn user_episode_card<T>(
 
 pub(super) fn episode_card<T>(
     episode: &MediaItem,
-    image_path: Option<PathBuf>,
+    image_path: Option<Arc<Path>>,
     selected: bool,
     cx: &Context<T>,
 ) -> gpui::Div {
@@ -566,7 +566,7 @@ pub(super) fn episode_card<T>(
 }
 
 fn episode_card_image<T>(
-    image_path: Option<PathBuf>,
+    image_path: Option<Arc<Path>>,
     played_fraction: Option<f32>,
     cx: &Context<T>,
 ) -> impl IntoElement {
@@ -606,7 +606,7 @@ fn episode_card_image<T>(
 
 pub(super) fn person_card<T>(
     person: &MediaPerson,
-    image_path: Option<PathBuf>,
+    image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
@@ -656,7 +656,7 @@ pub(super) fn person_card<T>(
         )
 }
 
-fn person_card_image<T>(image_path: Option<PathBuf>, cx: &Context<T>) -> impl IntoElement {
+fn person_card_image<T>(image_path: Option<Arc<Path>>, cx: &Context<T>) -> impl IntoElement {
     let theme = theme::get(cx);
     let has_image = image_path.is_some();
 
@@ -691,7 +691,7 @@ fn compact_episode_overview(value: Option<&str>) -> Option<String> {
 
 fn user_item_card_image<T>(
     item: &UserItem,
-    image_path: Option<PathBuf>,
+    image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> impl IntoElement {
     let theme = theme::get(cx);

@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, App, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Transformation, Window, div,
-    percentage, prelude::FluentBuilder, px, rgb, svg,
+    Animation, AnimationExt as _, App, Context, ElementId, Hsla, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, SharedString, StatefulInteractiveElement, Styled, Transformation,
+    Window, div, percentage, prelude::FluentBuilder, px, rgb, svg,
 };
 
 use crate::{emby::ItemCounts, server::CachedServer, theme};
@@ -86,6 +86,7 @@ where
         .to_string();
     let selected_server = server.clone();
     let menu_server = server.clone();
+    let card_id = (ElementId::from("server-card"), server.id.clone());
 
     div()
         .relative()
@@ -93,6 +94,7 @@ where
         .h(px(SERVER_CARD_HEIGHT_PX))
         .child(
             div()
+                .id(card_id)
                 .absolute()
                 .top_0()
                 .right_0()
@@ -206,6 +208,10 @@ where
     Delete: Fn(&CachedServer, &mut Window, &mut App) + 'static,
 {
     let theme = theme::get(cx);
+    let button_id = (
+        ElementId::from("server-card-menu-button"),
+        server.id.clone(),
+    );
     let toggle_server = server.clone();
     let loader_server_id = server.id.clone();
 
@@ -214,6 +220,7 @@ where
         .flex_none()
         .child(
             div()
+                .id(button_id)
                 .flex()
                 .size(px(26.0))
                 .items_center()
@@ -273,6 +280,7 @@ fn server_card_menu(
     on_delete: impl Fn(&CachedServer, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
+    let menu_id = ElementId::from(format!("server-card-menu-{}", server.id));
     let edit_server = server.clone();
     let delete_server = server;
 
@@ -294,6 +302,7 @@ fn server_card_menu(
             cx.stop_propagation();
         })
         .child(menu_item(
+            (menu_id.clone(), "edit"),
             "编辑",
             false,
             move |window, cx| {
@@ -302,6 +311,7 @@ fn server_card_menu(
             cx,
         ))
         .child(menu_item(
+            (menu_id, "delete"),
             "删除",
             true,
             move |window, cx| {
@@ -312,6 +322,7 @@ fn server_card_menu(
 }
 
 fn menu_item(
+    id: impl Into<ElementId>,
     label: &'static str,
     destructive: bool,
     action: impl Fn(&mut Window, &mut App) + 'static,
@@ -320,6 +331,7 @@ fn menu_item(
     let theme = theme::get(cx);
 
     div()
+        .id(id)
         .flex()
         .h(px(30.0))
         .items_center()

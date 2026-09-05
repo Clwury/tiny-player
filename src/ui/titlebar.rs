@@ -5,6 +5,8 @@ use gpui::{
 
 use crate::{app_metadata::APP_ICON_ASSET_PATH, theme};
 
+pub(crate) const APP_TITLEBAR_HEIGHT_PX: f32 = 35.0;
+
 pub fn app_titlebar(window: &Window, cx: &App, title: SharedString) -> impl IntoElement {
     let theme = theme::get(cx);
 
@@ -12,7 +14,7 @@ pub fn app_titlebar(window: &Window, cx: &App, title: SharedString) -> impl Into
         .id("titlebar")
         .relative()
         .flex()
-        .h(px(35.0))
+        .h(px(APP_TITLEBAR_HEIGHT_PX))
         .w_full()
         .items_center()
         .justify_center()

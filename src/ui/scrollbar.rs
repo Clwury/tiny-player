@@ -181,7 +181,7 @@ impl Element for Scrollbar {
             vertical_scrollbar_track_bounds(bounds, self.edge_inset, self.right_inset);
         let track_height = track_bounds.size.height;
         let viewport_height = self.scroll_handle.bounds().size.height;
-        let max_offset = self.scroll_handle.max_offset().height;
+        let max_offset = self.scroll_handle.max_offset().y;
         let scroll_top = (-self.scroll_handle.offset().y).clamp(px(0.0), max_offset);
         let metrics = vertical_scrollbar_metrics(
             f32::from(track_height),

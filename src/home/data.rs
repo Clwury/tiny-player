@@ -1,11 +1,11 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
-use gpui::{AppContext, Context, SharedString, Timer, point, px};
+use gpui::{AppContext, Context, SharedString, point, px};
 
 use crate::{
     emby::{
-        EmbyImageRequest, ImageQuality, ResumeItemImageSource, ResumeItems, UserItem,
-        UserItemImageSource, UserItems, UserViews,
+        EmbyImageRequest, EmbyImageType, ImageQuality, ResumeItemImageSource, ResumeItems,
+        UserItem, UserItemImageSource, UserItems, UserViews,
     },
     images::{
         cache::{self as image_cache},
@@ -129,7 +129,9 @@ impl HomeContent {
 
     fn schedule_cached_home_images_ensure(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |page, cx| {
-            Timer::after(HOME_CACHED_IMAGE_ENSURE_DELAY).await;
+            cx.background_executor()
+                .timer(HOME_CACHED_IMAGE_ENSURE_DELAY)
+                .await;
             page.update(cx, |page, cx| {
                 page.ensure_cached_home_images(cx);
                 cx.notify();
@@ -141,7 +143,9 @@ impl HomeContent {
 
     fn schedule_home_network_refresh(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |page, cx| {
-            Timer::after(HOME_CACHED_IMAGE_ENSURE_DELAY).await;
+            cx.background_executor()
+                .timer(HOME_CACHED_IMAGE_ENSURE_DELAY)
+                .await;
             page.update(cx, |page, cx| {
                 page.load_home_network_effects(cx);
             })
@@ -649,7 +653,9 @@ impl HomeContent {
         let generation = self.snapshot_save_generation;
 
         cx.spawn(async move |page, cx| {
-            Timer::after(HOME_SNAPSHOT_SAVE_DEBOUNCE).await;
+            cx.background_executor()
+                .timer(HOME_SNAPSHOT_SAVE_DEBOUNCE)
+                .await;
             page.update(cx, |page, cx| {
                 page.flush_home_snapshot_save(generation, cx);
             })
@@ -721,35 +727,56 @@ impl HomeContent {
         &self,
         item_id: &str,
         primary_tag: Option<&str>,
-    ) -> Option<PathBuf> {
-        let request = EmbyImageRequest::primary(item_id, primary_tag.map(ToString::to_string))
-            .with_max_width(640)
-            .with_quality(ImageQuality::DEFAULT);
-        self.image_path_for_request(&request)
+    ) -> Option<Arc<Path>> {
+        self.image_loader.path_for_source(
+            &self.current_server,
+            item_id,
+            EmbyImageType::Primary,
+            primary_tag,
+            Some(640),
+            ImageQuality::DEFAULT,
+        )
     }
 
     pub(super) fn image_path_for_resume_image(
         &self,
         source: ResumeItemImageSource<'_>,
-    ) -> Option<PathBuf> {
-        let request = resume_image_request(source);
-        self.image_path_for_request(&request)
+    ) -> Option<Arc<Path>> {
+        self.image_loader.path_for_source(
+            &self.current_server,
+            source.item_id,
+            source.image_type,
+            Some(source.tag),
+            Some(RESUME_CARD_IMAGE_MAX_WIDTH),
+            ImageQuality::DEFAULT,
+        )
     }
 
-    pub(super) fn image_path_for_user_item(&self, item: &UserItem) -> Option<PathBuf> {
-        let request = user_item_image_request(item.image_source());
-        self.image_path_for_request(&request)
+    pub(super) fn image_path_for_user_item(&self, item: &UserItem) -> Option<Arc<Path>> {
+        let source = item.image_source();
+        self.image_loader.path_for_source(
+            &self.current_server,
+            source.item_id,
+            source.image_type,
+            source.tag,
+            Some(HOME_ITEM_CARD_IMAGE_MAX_WIDTH),
+            ImageQuality::DEFAULT,
+        )
     }
 
-    pub(super) fn image_path_for_episode_user_item(&self, item: &UserItem) -> Option<PathBuf> {
-        let request = episode_user_item_image_request(item.episode_image_source());
-        self.image_path_for_request(&request)
+    pub(super) fn image_path_for_episode_user_item(&self, item: &UserItem) -> Option<Arc<Path>> {
+        let source = item.episode_image_source();
+        self.image_loader.path_for_source(
+            &self.current_server,
+            source.item_id,
+            source.image_type,
+            source.tag,
+            Some(RESUME_CARD_IMAGE_MAX_WIDTH),
+            ImageQuality::DEFAULT,
+        )
     }
 
-    pub(super) fn image_path_for_request(
-        &self,
-        request: &EmbyImageRequest,
-    ) -> Option<std::path::PathBuf> {
+    pub(super) fn image_path_for_request(&self, request: &EmbyImageRequest) -> Option<Arc<Path>> {
         self.image_loader
             .path_for_request(&self.current_server, request)
     }

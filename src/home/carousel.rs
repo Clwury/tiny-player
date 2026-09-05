@@ -1,6 +1,10 @@
+use std::time::{Duration, Instant};
+
 use gpui::{ClickEvent, Context, Window};
 
 use super::HomeContent;
+
+pub(super) const CAROUSEL_SCROLL_DURATION: Duration = Duration::from_millis(220);
 
 pub(super) const USER_VIEW_CARD_WIDTH_PX: f32 = 240.0;
 pub(super) const USER_VIEW_CARD_PADDING_PX: f32 = 4.0;
@@ -48,7 +52,10 @@ const DETAIL_PERSON_SCROLL_STEP_PX: f32 =
     DETAIL_PERSON_CARD_STEP_PX * DETAIL_PERSON_SCROLL_CARD_COUNT;
 
 pub(super) fn home_main_content_width(window: &Window) -> f32 {
-    let window_width = f32::from(window.bounds().size.width);
+    home_main_content_width_for_window_width(f32::from(window.viewport_size().width))
+}
+
+pub(super) fn home_main_content_width_for_window_width(window_width: f32) -> f32 {
     (window_width
         - HOME_SIDEBAR_WIDTH_PX
         - HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX
@@ -83,6 +90,7 @@ pub(crate) struct CarouselState {
     scroll_offset: f32,
     previous_scroll_offset: f32,
     animation_id: u64,
+    animation_started_at: Option<Instant>,
     hovered: bool,
     controls_hovered: bool,
 }
@@ -93,7 +101,14 @@ impl CarouselState {
     }
 
     pub(super) fn previous_scroll_offset(self, max_offset: f32) -> f32 {
-        self.previous_scroll_offset.min(max_offset)
+        if self
+            .animation_started_at
+            .is_some_and(|start| start.elapsed() < CAROUSEL_SCROLL_DURATION)
+        {
+            self.previous_scroll_offset.min(max_offset)
+        } else {
+            self.scroll_offset(max_offset)
+        }
     }
 
     pub(super) fn animation_id(self) -> u64 {
@@ -131,11 +146,13 @@ impl CarouselState {
         self.previous_scroll_offset = self.scroll_offset.min(max_offset);
         self.scroll_offset = offset;
         self.animation_id += 1;
+        self.animation_started_at = Some(Instant::now());
         true
     }
 
     pub(super) fn sync_previous_offset(&mut self) {
         self.previous_scroll_offset = self.scroll_offset;
+        self.animation_started_at = None;
     }
 }
 
@@ -741,6 +758,23 @@ impl HomeContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_scroll_does_not_replay_after_a_row_reenters_the_viewport() {
+        let mut carousel = CarouselState {
+            scroll_offset: 800.0,
+            previous_scroll_offset: 0.0,
+            animation_started_at: Some(Instant::now() - CAROUSEL_SCROLL_DURATION),
+            ..Default::default()
+        };
+        assert_eq!(carousel.previous_scroll_offset(1_000.0), 800.0);
+        assert_eq!(carousel.previous_scroll_offset(600.0), 600.0);
+
+        carousel.set_scroll_offset(400.0, 1_000.0);
+        assert_eq!(carousel.previous_scroll_offset(1_000.0), 800.0);
+        carousel.sync_previous_offset();
+        assert_eq!(carousel.previous_scroll_offset(1_000.0), 400.0);
+    }
 
     #[test]
     fn visible_range_returns_empty_for_empty_carousel() {

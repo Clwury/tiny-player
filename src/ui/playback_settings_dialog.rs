@@ -12,7 +12,7 @@ use crate::{
     theme,
 };
 
-use super::text_input::TextInput;
+use super::editor::Editor;
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const BYTES_PER_GIB: u64 = 1024 * BYTES_PER_MIB;
@@ -33,7 +33,7 @@ pub struct PlaybackSettingsDialogState {
     mode: PlaybackCacheMode,
     seekable_cache: PlaybackSeekableCacheMode,
     unlink_files: CacheUnlinkPolicy,
-    cache_dir: Entity<TextInput>,
+    cache_dir: Entity<Editor>,
     disk_cache: bool,
     cache_pause: bool,
     cache_pause_initial: bool,
@@ -41,19 +41,19 @@ pub struct PlaybackSettingsDialogState {
     adaptive_readahead: bool,
     automatic_hysteresis: bool,
     demuxer_cache_wait: bool,
-    total_cache_mib: Entity<TextInput>,
-    http_cache_mib: Entity<TextInput>,
-    http_cache_chunk_mib: Entity<TextInput>,
-    demuxer_forward_mib: Entity<TextInput>,
-    demuxer_back_mib: Entity<TextInput>,
-    range_request_mib: Entity<TextInput>,
-    cache_secs: Entity<TextInput>,
-    readahead_secs: Entity<TextInput>,
-    packet_readahead_secs: Entity<TextInput>,
-    hysteresis_secs: Entity<TextInput>,
-    cache_pause_wait_secs: Entity<TextInput>,
-    max_ranges: Entity<TextInput>,
-    disk_cache_gib: Entity<TextInput>,
+    total_cache_mib: Entity<Editor>,
+    http_cache_mib: Entity<Editor>,
+    http_cache_chunk_mib: Entity<Editor>,
+    demuxer_forward_mib: Entity<Editor>,
+    demuxer_back_mib: Entity<Editor>,
+    range_request_mib: Entity<Editor>,
+    cache_secs: Entity<Editor>,
+    readahead_secs: Entity<Editor>,
+    packet_readahead_secs: Entity<Editor>,
+    hysteresis_secs: Entity<Editor>,
+    cache_pause_wait_secs: Entity<Editor>,
+    max_ranges: Entity<Editor>,
+    disk_cache_gib: Entity<Editor>,
 }
 
 impl PlaybackSettingsDialogState {
@@ -64,7 +64,7 @@ impl PlaybackSettingsDialogState {
             mode: config.mode,
             seekable_cache: config.seekable_cache,
             unlink_files: config.unlink_files,
-            cache_dir: text_input(
+            cache_dir: editor_input(
                 "默认临时目录",
                 config
                     .cache_dir
@@ -460,22 +460,22 @@ fn number_input(
     placeholder: &'static str,
     value: u64,
     cx: &mut Context<PlaybackSettingsDialogState>,
-) -> Entity<TextInput> {
+) -> Entity<Editor> {
     cx.new(|cx| {
-        TextInput::new(placeholder, cx)
+        Editor::new(placeholder, cx)
             .default_value(value.to_string())
             .digits_only()
             .max_chars(12)
     })
 }
 
-fn text_input(
+fn editor_input(
     placeholder: &'static str,
     value: String,
     cx: &mut Context<PlaybackSettingsDialogState>,
-) -> Entity<TextInput> {
+) -> Entity<Editor> {
     cx.new(|cx| {
-        TextInput::new(placeholder, cx)
+        Editor::new(placeholder, cx)
             .default_value(value)
             .max_chars(256)
     })
@@ -485,9 +485,9 @@ fn decimal_input(
     placeholder: &'static str,
     value: f64,
     cx: &mut Context<PlaybackSettingsDialogState>,
-) -> Entity<TextInput> {
+) -> Entity<Editor> {
     cx.new(|cx| {
-        TextInput::new(placeholder, cx)
+        Editor::new(placeholder, cx)
             .default_value(format_seconds(value))
             .max_chars(16)
     })
@@ -505,15 +505,15 @@ fn parse_u64(value: &str, fallback: u64) -> u64 {
     value.trim().parse::<u64>().unwrap_or(fallback)
 }
 
-fn mib_to_bytes(input: &TextInput, fallback_mib: u64) -> u64 {
+fn mib_to_bytes(input: &Editor, fallback_mib: u64) -> u64 {
     parse_u64(input.value().as_ref(), fallback_mib).saturating_mul(BYTES_PER_MIB)
 }
 
-fn gib_to_bytes(input: &TextInput, fallback_gib: u64) -> u64 {
+fn gib_to_bytes(input: &Editor, fallback_gib: u64) -> u64 {
     parse_u64(input.value().as_ref(), fallback_gib).saturating_mul(BYTES_PER_GIB)
 }
 
-fn seconds_value(input: &TextInput, fallback: f64) -> f64 {
+fn seconds_value(input: &Editor, fallback: f64) -> f64 {
     let fallback = if fallback.is_finite() && fallback >= 0.0 {
         fallback
     } else {

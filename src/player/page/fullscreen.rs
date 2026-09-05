@@ -29,7 +29,9 @@ impl PlaybackPage {
         let generation = self.fullscreen.hide_generation;
 
         cx.spawn(async move |page, cx| {
-            Timer::after(FULLSCREEN_CONTROLS_HIDE_DELAY).await;
+            cx.background_executor()
+                .timer(FULLSCREEN_CONTROLS_HIDE_DELAY)
+                .await;
             page.update(cx, |page, cx| {
                 page.hide_idle_fullscreen_controls(generation, cx);
             })

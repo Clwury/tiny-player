@@ -10,27 +10,43 @@ mod storage;
 mod theme;
 mod ui;
 
+use std::rc::Rc;
+
 use app::TinyApp;
 use app_metadata::{APP_ID, APP_NAME};
 use assets::ProjectAssets;
 use gpui::{
-    AppContext, Application, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowOptions, px, size,
+    App, AppContext, Application, Bounds, Global, Platform, TitlebarOptions,
+    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, px, size,
 };
 use storage::ServerCache;
-use ui::text_input::TextInput;
+use ui::editor::Editor;
 
 const DEFAULT_WINDOW_WIDTH: u32 = 1100;
 const DEFAULT_WINDOW_HEIGHT: u32 = 720;
 const MIN_WINDOW_WIDTH: u32 = 900;
 const MIN_WINDOW_HEIGHT: u32 = 600;
 
+struct TinyPlatform(Rc<dyn Platform>);
+
+impl Global for TinyPlatform {}
+
+pub(crate) fn hide_cursor_until_mouse_moves(cx: &App) {
+    if cx.has_global::<TinyPlatform>() {
+        cx.global::<TinyPlatform>()
+            .0
+            .hide_cursor_until_mouse_moves();
+    }
+}
+
 pub fn run() {
-    Application::new()
+    let platform = gpui_platform::current_platform(false);
+    Application::with_platform(platform.clone())
         .with_assets(ProjectAssets::new())
-        .run(|cx| {
+        .run(move |cx| {
+            cx.set_global(TinyPlatform(platform));
             theme::init(cx);
-            TextInput::bind_keys(cx);
+            Editor::bind_keys(cx);
 
             let (cache, startup_error) = match storage::load_or_init() {
                 Ok(cache) => (cache, None),

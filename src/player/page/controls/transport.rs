@@ -108,7 +108,9 @@ impl PlaybackPage {
         self.volume.hide_generation = self.volume.hide_generation.wrapping_add(1);
         let generation = self.volume.hide_generation;
         cx.spawn(async move |page, cx| {
-            Timer::after(VOLUME_INDICATOR_HIDE_DELAY).await;
+            cx.background_executor()
+                .timer(VOLUME_INDICATOR_HIDE_DELAY)
+                .await;
             page.update(cx, |page, cx| {
                 if page.volume.hide_generation != generation {
                     return;

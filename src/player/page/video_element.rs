@@ -62,6 +62,7 @@ impl gpui::Element for VideoFrameElement {
 
         _ = window.paint_image(
             fitted_bounds,
+            fitted_bounds,
             gpui::Corners::default(),
             self.frame.clone(),
             0,

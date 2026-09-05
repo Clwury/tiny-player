@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use gpui::{AppContext as _, Context, Timer};
+use gpui::{AppContext as _, Context};
 
 use crate::storage;
 
@@ -14,25 +14,43 @@ impl TinyApp {
         error_prefix: &'static str,
         cx: &mut Context<Self>,
     ) {
-        self.cache_save_generation = self.cache_save_generation.wrapping_add(1);
         self.pending_cache_save_error_prefix = Some(error_prefix);
-        let generation = self.cache_save_generation;
+        self.last_cache_save_activity = Some(std::time::Instant::now());
 
-        cx.spawn(async move |app, cx| {
-            Timer::after(CACHE_SAVE_DEBOUNCE).await;
-            app.update(cx, |app, cx| {
-                app.flush_scheduled_cache_save(generation, cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn flush_scheduled_cache_save(&mut self, generation: u64, cx: &mut Context<Self>) {
-        if self.cache_save_generation != generation {
+        // Keep one debounce task alive for the whole burst of changes. Window
+        // resize events can arrive once per frame; creating and cancelling a
+        // timer for every pixel change still allocates work on the foreground
+        // executor even though only the final size needs to be persisted.
+        if self.cache_save_task_active {
             return;
         }
 
+        self.cache_save_task_active = true;
+        self.cache_save_task = cx.spawn(async move |app, cx| {
+            cx.background_executor().timer(CACHE_SAVE_DEBOUNCE).await;
+            loop {
+                let remaining = app
+                    .update(cx, |app, _| {
+                        app.last_cache_save_activity
+                            .map(|last| CACHE_SAVE_DEBOUNCE.saturating_sub(last.elapsed()))
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    app.update(cx, |app, cx| {
+                        app.cache_save_task_active = false;
+                        app.last_cache_save_activity = None;
+                        app.flush_scheduled_cache_save(cx);
+                    })
+                    .ok();
+                    break;
+                }
+                cx.background_executor().timer(remaining).await;
+            }
+        });
+    }
+
+    fn flush_scheduled_cache_save(&mut self, cx: &mut Context<Self>) {
         let Some(error_prefix) = self.pending_cache_save_error_prefix.take() else {
             return;
         };

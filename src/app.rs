@@ -9,9 +9,12 @@ mod server_cache;
 mod server_card;
 mod window;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
-use gpui::{Context, Entity, SharedString};
+use gpui::{Context, Entity, SharedString, Task};
 
 pub(crate) use resize::WINDOW_RESIZE_EDGE_WIDTH_PX;
 
@@ -41,8 +44,10 @@ pub struct TinyApp {
     selecting_server_id: Option<String>,
     window_bounds_observed: bool,
     window_persistence_enabled: bool,
-    cache_save_generation: u64,
     pending_cache_save_error_prefix: Option<&'static str>,
+    last_cache_save_activity: Option<Instant>,
+    cache_save_task_active: bool,
+    cache_save_task: Task<()>,
     page: Page,
 }
 
@@ -85,8 +90,10 @@ impl TinyApp {
             selecting_server_id: None,
             window_bounds_observed: false,
             window_persistence_enabled,
-            cache_save_generation: 0,
             pending_cache_save_error_prefix: None,
+            last_cache_save_activity: None,
+            cache_save_task_active: false,
+            cache_save_task: Task::ready(()),
             page: Page::Servers,
         };
         if let Some(error) = initial_error {

@@ -400,6 +400,7 @@ impl gpui::Element for SubtitleBitmapElement {
     ) {
         _ = window.paint_image(
             bounds,
+            bounds,
             gpui::Corners::default(),
             self.image.clone(),
             0,

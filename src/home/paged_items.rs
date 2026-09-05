@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{cell::Cell, collections::HashSet};
 
 use gpui::{ScrollHandle, SharedString};
 
@@ -21,12 +21,16 @@ pub(crate) struct PagedItemsState {
     pub(crate) dirty: bool,
     pub(crate) generation: u64,
     pub(crate) exhausted: bool,
+    /// Shared by the lightweight virtual grid, pagination observer and the
+    /// application scrollbar.
     pub(crate) scroll_handle: ScrollHandle,
+    pub(crate) grid_columns: Cell<usize>,
     refresh_checkpoint: Option<(Option<u32>, u32, bool)>,
 }
 
 impl Default for PagedItemsState {
     fn default() -> Self {
+        let scroll_handle = ScrollHandle::new();
         Self {
             items: Vec::new(),
             total_record_count: None,
@@ -39,7 +43,8 @@ impl Default for PagedItemsState {
             dirty: false,
             generation: 0,
             exhausted: false,
-            scroll_handle: ScrollHandle::new(),
+            scroll_handle,
+            grid_columns: Cell::new(1),
             refresh_checkpoint: None,
         }
     }

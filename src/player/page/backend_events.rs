@@ -169,7 +169,9 @@ impl PlaybackPage {
 
         self.timeline.paused_backend_poll_scheduled = true;
         cx.spawn(async move |page, cx| {
-            Timer::after(PAUSED_BACKEND_POLL_INTERVAL).await;
+            cx.background_executor()
+                .timer(PAUSED_BACKEND_POLL_INTERVAL)
+                .await;
             page.update(cx, |page, cx| {
                 page.timeline.paused_backend_poll_scheduled = false;
                 if page.should_poll_backend_while_paused() {

@@ -1,7 +1,7 @@
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Timer, Window, deferred, div,
-    prelude::FluentBuilder, px, svg,
+    SharedString, StatefulInteractiveElement, Styled, Window, deferred, div,
+    prelude::FluentBuilder, px,
 };
 
 use crate::{
@@ -10,10 +10,10 @@ use crate::{
 };
 
 use super::{
+    editor::{Editor, EditorEvent},
     notification::{
         NOTIFICATION_AUTOHIDE, NotificationQueue, error_notification, notification_layer,
     },
-    text_input::{TextInput, TextInputEvent},
 };
 
 const SERVER_DIALOG_ERROR_NOTIFICATION_KEY: &str = "server-dialog:error";
@@ -28,12 +28,11 @@ pub enum ServerDialogMode {
 pub struct AddServerDialogState {
     mode: ServerDialogMode,
     protocol: Protocol,
-    address: Entity<TextInput>,
-    port: Entity<TextInput>,
-    path: Entity<TextInput>,
-    username: Entity<TextInput>,
-    password: Entity<TextInput>,
-    show_password: bool,
+    address: Entity<Editor>,
+    port: Entity<Editor>,
+    path: Entity<Editor>,
+    username: Entity<Editor>,
+    password: Entity<Editor>,
     is_submitting: bool,
     notifications: NotificationQueue<&'static str>,
 }
@@ -83,29 +82,30 @@ impl AddServerDialogState {
         cx: &mut Context<Self>,
     ) -> Self {
         let address_input = cx.new(|cx| {
-            TextInput::new("服务器地址", cx)
+            Editor::new("服务器地址", cx)
                 .default_value(address)
                 .borderless()
         });
         let port_input = cx.new(|cx| {
-            TextInput::new("端口", cx)
+            Editor::new("端口", cx)
                 .default_value(port)
                 .digits_only()
                 .max_chars(5)
         });
-        let path_input = cx.new(|cx| TextInput::new("可空", cx).default_value(path));
-        let username_input = cx.new(|cx| TextInput::new("用户名", cx).default_value(username));
+        let path_input = cx.new(|cx| Editor::new("可空", cx).default_value(path));
+        let username_input = cx.new(|cx| Editor::new("用户名", cx).default_value(username));
         let password_input = cx.new(|cx| {
-            TextInput::new("密码", cx)
+            Editor::new("密码", cx)
                 .default_value(password)
                 .masked(true)
+                .mask_toggle()
         });
 
         cx.subscribe(
             &address_input,
             |dialog: &mut AddServerDialogState, _, event, cx| match event {
-                TextInputEvent::Changed => dialog.auto_format_full_url(cx),
-                TextInputEvent::Submitted => {}
+                EditorEvent::Changed => dialog.auto_format_full_url(cx),
+                EditorEvent::Submitted => {}
             },
         )
         .detach();
@@ -118,7 +118,6 @@ impl AddServerDialogState {
             path: path_input,
             username: username_input,
             password: password_input,
-            show_password: false,
             is_submitting: false,
             notifications: NotificationQueue::default(),
         }
@@ -170,7 +169,7 @@ impl AddServerDialogState {
         cx.notify();
 
         cx.spawn(async move |dialog, cx| {
-            Timer::after(NOTIFICATION_AUTOHIDE).await;
+            cx.background_executor().timer(NOTIFICATION_AUTOHIDE).await;
             dialog
                 .update(cx, |dialog, cx| {
                     if dialog.notifications.remove(id) {
@@ -289,12 +288,6 @@ impl AddServerDialogState {
 
     fn render_form(&self, dialog: Entity<Self>, cx: &App) -> impl IntoElement {
         let port = self.port.read(cx).value();
-        let password_icon = if self.show_password {
-            "icons/eye-off.svg"
-        } else {
-            "icons/eye.svg"
-        };
-        let toggle_dialog = dialog.clone();
 
         div()
             .flex()
@@ -324,11 +317,7 @@ impl AddServerDialogState {
             )
             .child(field("路径", self.path.clone(), cx))
             .child(field("用户名", self.username.clone(), cx))
-            .child(field(
-                "密码",
-                password_input(self.password.clone(), password_icon, toggle_dialog, cx),
-                cx,
-            ))
+            .child(field("密码", self.password.clone(), cx))
     }
 
     fn select_protocol(&mut self, protocol: Protocol, cx: &mut Context<Self>) {
@@ -345,15 +334,6 @@ impl AddServerDialogState {
             if value.is_empty() || value.as_ref() == previous_default {
                 port.set_value(next_default, cx);
             }
-        });
-        cx.notify();
-    }
-
-    fn toggle_password(&mut self, cx: &mut Context<Self>) {
-        self.show_password = !self.show_password;
-        let masked = !self.show_password;
-        self.password.update(cx, |password, cx| {
-            password.set_masked(masked, cx);
         });
         cx.notify();
     }
@@ -440,7 +420,7 @@ fn field(label: &'static str, input: impl IntoElement, cx: &App) -> impl IntoEle
 }
 
 fn address_input(
-    input: Entity<TextInput>,
+    input: Entity<Editor>,
     prefix: String,
     suffix: String,
     cx: &App,
@@ -469,41 +449,6 @@ fn address_input(
                 .text_sm()
                 .text_color(theme.muted_foreground)
                 .child(suffix),
-        )
-}
-
-fn password_input(
-    input: Entity<TextInput>,
-    icon_path: &'static str,
-    dialog: Entity<AddServerDialogState>,
-    cx: &App,
-) -> impl IntoElement {
-    let theme = theme::get(cx);
-
-    div()
-        .flex()
-        .items_center()
-        .gap_1()
-        .child(div().flex_1().child(input))
-        .child(
-            div()
-                .id("toggle-password-visibility")
-                .flex()
-                .size(px(34.0))
-                .items_center()
-                .justify_center()
-                .rounded_md()
-                .text_color(theme.foreground)
-                .hover(move |style| style.bg(theme.secondary_hover))
-                .child(
-                    svg()
-                        .path(icon_path)
-                        .size(px(16.0))
-                        .text_color(theme.foreground),
-                )
-                .on_click(move |_, _, cx| {
-                    dialog.update(cx, |dialog, cx| dialog.toggle_password(cx));
-                }),
         )
 }
 

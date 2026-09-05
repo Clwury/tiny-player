@@ -104,14 +104,14 @@ impl HomeContent {
                                 let item_id = item.id.clone();
                                 let card = user_item_card(&item, image_path, cx).id((
                                     gpui::ElementId::from("series-detail-similar-card"),
-                                    item_id,
+                                    item_id.clone(),
                                 ));
 
                                 if matches!(item.item_type.as_deref(), Some("Series" | "Movie")) {
-                                    let item = item.clone();
+                                    let open_item_id = item_id;
                                     let on_click =
                                         cx.listener(move |page: &mut HomeContent, _, _, cx| {
-                                            page.open_media_detail(&item, cx);
+                                            page.open_media_detail_by_id(open_item_id.clone(), cx);
                                         });
                                     card.cursor_pointer().on_click(on_click)
                                 } else {

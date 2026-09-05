@@ -1,4 +1,4 @@
-use gpui::{ClickEvent, Context, IntoElement, ParentElement, SharedString, Timer};
+use gpui::{ClickEvent, Context, IntoElement, ParentElement, SharedString};
 
 use crate::ui::notification::{
     NOTIFICATION_AUTOHIDE, NotificationQueue, error_notification, notification_layer,
@@ -73,7 +73,7 @@ impl HomeContent {
         cx.notify();
 
         cx.spawn(async move |page, cx| {
-            Timer::after(NOTIFICATION_AUTOHIDE).await;
+            cx.background_executor().timer(NOTIFICATION_AUTOHIDE).await;
             page.update(cx, |page, cx| {
                 if page.notifications.remove(id) {
                     cx.notify();

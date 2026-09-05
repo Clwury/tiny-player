@@ -1,6 +1,8 @@
-use gpui::{AppContext as _, Context, ScrollHandle, SharedString};
+use std::cell::Cell;
 
-use crate::{emby::UserItem, ui::text_input::TextInputEvent};
+use gpui::{AppContext as _, Context, ScrollHandle, SharedString, point, px};
+
+use crate::{emby::UserItem, ui::editor::EditorEvent};
 
 use super::{
     HomeContent, LoadState,
@@ -24,6 +26,7 @@ pub(crate) struct SearchState {
     pub(crate) generation: u64,
     pub(crate) exhausted: bool,
     pub(crate) scroll_handle: ScrollHandle,
+    pub(crate) grid_columns: Cell<usize>,
     pub(crate) focused_once: bool,
 }
 
@@ -41,6 +44,7 @@ impl Default for SearchState {
             generation: 0,
             exhausted: false,
             scroll_handle: ScrollHandle::new(),
+            grid_columns: Cell::new(1),
             focused_once: false,
         }
     }
@@ -75,6 +79,7 @@ impl SearchState {
         self.initial_error = None;
         self.load_more_error = None;
         self.exhausted = false;
+        self.scroll_handle.set_offset(point(px(0.0), px(0.0)));
         self.generation
     }
 
@@ -109,10 +114,10 @@ impl SearchState {
 }
 
 impl HomeContent {
-    pub(super) fn on_search_input_event(&mut self, event: &TextInputEvent, cx: &mut Context<Self>) {
+    pub(super) fn on_search_input_event(&mut self, event: &EditorEvent, cx: &mut Context<Self>) {
         match event {
-            TextInputEvent::Changed => self.reset_search_from_input(cx),
-            TextInputEvent::Submitted => self.submit_search_from_input(cx),
+            EditorEvent::Changed => self.reset_search_from_input(cx),
+            EditorEvent::Submitted => self.submit_search_from_input(cx),
         }
     }
 

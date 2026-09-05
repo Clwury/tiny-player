@@ -1,6 +1,19 @@
 use super::*;
 
+use crate::home::navigation::{HomeRoot, HomeRoute};
+
 impl HomeContent {
+    pub(in super::super) fn open_media_detail_by_id(
+        &mut self,
+        item_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.user_item_by_id(&item_id) else {
+            return;
+        };
+        self.open_media_detail(&item, cx);
+    }
+
     pub(in super::super) fn open_media_detail(&mut self, item: &UserItem, cx: &mut Context<Self>) {
         let Some(detail) = SeriesDetailState::from_user_item(item) else {
             return;
@@ -38,6 +51,67 @@ impl HomeContent {
             }
             _ => {}
         }
+    }
+
+    pub(in super::super) fn open_resume_item_detail_by_id(
+        &mut self,
+        item_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.resume_item_by_id(&item_id) else {
+            return;
+        };
+        self.open_resume_item_detail(&item, cx);
+    }
+
+    fn user_item_by_id(&self, item_id: &str) -> Option<UserItem> {
+        let current_route_item = match self.navigation.current() {
+            HomeRoute::Root(HomeRoot::Favorites) => {
+                self.favorites.items.iter().find(|item| item.id == item_id)
+            }
+            HomeRoute::Root(HomeRoot::Search) => {
+                self.search.items.iter().find(|item| item.id == item_id)
+            }
+            HomeRoute::Library { view_id, .. } => self
+                .libraries
+                .get(view_id)
+                .and_then(|library| library.paged.items.iter().find(|item| item.id == item_id)),
+            HomeRoute::Detail { .. } => self
+                .series_detail
+                .as_ref()
+                .and_then(|detail| detail.similar_items.as_ref())
+                .and_then(|items| items.items.iter().find(|item| item.id == item_id)),
+            HomeRoute::Root(HomeRoot::Home) => None,
+        };
+
+        let item = current_route_item
+            .or_else(|| {
+                self.user_view_items_rows
+                    .values()
+                    .filter_map(|row| row.items.as_ref())
+                    .flat_map(|items| items.items.iter())
+                    .find(|item| item.id == item_id)
+            })
+            .or_else(|| self.favorites.items.iter().find(|item| item.id == item_id))
+            .or_else(|| self.search.items.iter().find(|item| item.id == item_id))
+            .or_else(|| {
+                self.libraries
+                    .values()
+                    .flat_map(|library| library.paged.items.iter())
+                    .find(|item| item.id == item_id)
+            })?;
+
+        Some(self.effective_user_item(item).into_owned())
+    }
+
+    fn resume_item_by_id(&self, item_id: &str) -> Option<ResumeItem> {
+        let item = self
+            .resume_items
+            .as_ref()?
+            .items
+            .iter()
+            .find(|item| item.id == item_id)?;
+        Some(self.effective_resume_item(item).into_owned())
     }
 
     pub(super) fn open_detail_state(&mut self, detail: SeriesDetailState, cx: &mut Context<Self>) {

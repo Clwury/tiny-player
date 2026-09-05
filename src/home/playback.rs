@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use gpui::{Context, Timer};
+use gpui::Context;
 
 use crate::{
     emby::UserItemData,
@@ -117,7 +117,9 @@ impl HomeContent {
                 if result != PlaybackStopResult::Pending {
                     break;
                 }
-                Timer::after(PLAYBACK_REFRESH_POLL_INTERVAL).await;
+                cx.background_executor()
+                    .timer(PLAYBACK_REFRESH_POLL_INTERVAL)
+                    .await;
                 result = completion.result();
             }
             page.update(cx, |page, cx| {

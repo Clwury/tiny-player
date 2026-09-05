@@ -1,11 +1,11 @@
 use std::{fmt, sync::Arc, time::Duration};
 
 use gpui::{
-    AppContext as _, Bounds, Context, CursorStyle, DragMoveEvent, EventEmitter, FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, Timer, Window, canvas, deferred, div,
-    prelude::*, px, relative, rgb, rgba, svg,
+    AppContext as _, Bounds, Context, DragMoveEvent, EventEmitter, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, Window, canvas, deferred, div, prelude::*, px, relative,
+    rgb, rgba, svg,
 };
 
 use crate::theme;
@@ -337,7 +337,7 @@ impl PlaybackPage {
             .unwrap_or_else(|| self.status_message.clone())
     }
 
-    fn render_mouse_capture(&self, is_fullscreen: bool, cx: &Context<Self>) -> impl IntoElement {
+    fn render_mouse_capture(&self, cx: &Context<Self>) -> impl IntoElement {
         div()
             .id("playback-mouse-capture")
             .absolute()
@@ -355,9 +355,6 @@ impl PlaybackPage {
             )
             .on_mouse_move(cx.listener(Self::handle_surface_mouse_move))
             .on_scroll_wheel(cx.listener(Self::handle_surface_scroll_wheel))
-            .when(is_fullscreen && !self.fullscreen.cursor_visible, |this| {
-                this.cursor(CursorStyle::None)
-            })
     }
 }
 
@@ -389,7 +386,7 @@ impl Render for PlaybackPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.poll_backend(window, cx);
         if !self.focus_handle.is_focused(window) {
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
         }
 
         let current_frame = self.frame.current.clone();
@@ -402,6 +399,9 @@ impl Render for PlaybackPage {
         let message_text = self.message_text();
         let theme = theme::get(cx);
         let is_fullscreen = window.is_fullscreen();
+        if is_fullscreen && !self.fullscreen.cursor_visible {
+            crate::hide_cursor_until_mouse_moves(cx);
+        }
         let progress_bar_visible = self.progress_bar_visible();
         let view = cx.entity().downgrade();
         let viewport_observer = canvas(
@@ -452,9 +452,6 @@ impl Render for PlaybackPage {
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_scroll_wheel(cx.listener(Self::handle_surface_scroll_wheel))
-            .when(is_fullscreen && !self.fullscreen.cursor_visible, |this| {
-                this.cursor(CursorStyle::None)
-            })
             .when(!window.is_maximized() && !is_fullscreen, |this| {
                 this.rounded_b(theme.radius_lg).overflow_hidden()
             })
@@ -476,7 +473,7 @@ impl Render for PlaybackPage {
                 )
             })
             .child(viewport_observer)
-            .child(self.render_mouse_capture(is_fullscreen, cx))
+            .child(self.render_mouse_capture(cx))
             .when(self.playback_details_visible, |this| {
                 this.child(self.render_playback_details_overlay(window, cx))
             })

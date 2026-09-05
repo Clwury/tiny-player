@@ -1,12 +1,16 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 
-use crate::{emby::EmbyImageRequest, server::CachedServer};
+use crate::{
+    emby::{EmbyImageRequest, EmbyImageType, ImageQuality},
+    server::CachedServer,
+};
 
 use super::cache::{self as image_cache, CachedImageKey};
 
@@ -30,7 +34,14 @@ pub(crate) struct ImageLoadFailure {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ImageLoader {
-    paths: HashMap<CachedImageKey, PathBuf>,
+    // Image paths are shared with every card that references them. The nested,
+    // borrowed-friendly index both returns an `Arc<Path>` (avoiding path clones)
+    // and avoids constructing an owned lookup key on every render. Constructing a
+    // `CachedImageKey` for every visible card would clone the item id, server id
+    // and image tag on every frame (window resizing makes that especially
+    // noticeable). Queue/in-flight sets still own `CachedImageKey`s; this index
+    // is the source of truth for completed paths.
+    paths_by_server: HashMap<String, HashMap<String, Vec<ImagePathEntry>>>,
     queued: VecDeque<ImageLoadJob>,
     queued_keys: HashSet<CachedImageKey>,
     in_flight: HashSet<CachedImageKey>,
@@ -38,6 +49,24 @@ pub(crate) struct ImageLoader {
     max_concurrent: usize,
     retry_after: Duration,
     max_attempts: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ImagePathEntry {
+    image_type: EmbyImageType,
+    tag: String,
+    max_width: Option<u32>,
+    quality: ImageQuality,
+    path: Arc<Path>,
+}
+
+impl ImagePathEntry {
+    fn matches_key(&self, key: &CachedImageKey) -> bool {
+        self.image_type == key.image_type
+            && self.tag == key.tag
+            && self.max_width == key.max_width
+            && self.quality == key.quality
+    }
 }
 
 impl Default for ImageLoader {
@@ -61,7 +90,7 @@ impl ImageLoader {
         max_attempts: usize,
     ) -> Self {
         Self {
-            paths: HashMap::new(),
+            paths_by_server: HashMap::new(),
             queued: VecDeque::new(),
             queued_keys: HashSet::new(),
             in_flight: HashSet::new(),
@@ -77,7 +106,7 @@ impl ImageLoader {
             return;
         };
 
-        if self.paths.contains_key(&key)
+        if self.path_for_key(&key).is_some()
             || self.queued_keys.contains(&key)
             || self.in_flight.contains(&key)
         {
@@ -91,7 +120,7 @@ impl ImageLoader {
         match image_cache::cached_image_exists(&key) {
             Ok(Some(path)) => {
                 self.failures.remove(&key);
-                self.paths.insert(key, path);
+                self.insert_path(key, Arc::from(path));
             }
             Ok(None) => self.queue_job(key, request),
             Err(error) => self.record_failure(key, error),
@@ -120,7 +149,7 @@ impl ImageLoader {
         match result {
             Ok(path) => {
                 self.failures.remove(&key);
-                self.paths.insert(key, path);
+                self.insert_path(key, Arc::from(path));
             }
             Err(error) => self.record_failure(key, error),
         }
@@ -130,9 +159,69 @@ impl ImageLoader {
         &self,
         server: &CachedServer,
         request: &EmbyImageRequest,
-    ) -> Option<PathBuf> {
-        let key = CachedImageKey::from_request(server, request)?;
-        self.paths.get(&key).cloned()
+    ) -> Option<Arc<Path>> {
+        self.path_for_source(
+            server,
+            request.item_id.as_str(),
+            request.image_type,
+            request.tag.as_deref(),
+            request.max_width,
+            request.quality,
+        )
+    }
+
+    pub(crate) fn path_for_source(
+        &self,
+        server: &CachedServer,
+        item_id: &str,
+        image_type: EmbyImageType,
+        tag: Option<&str>,
+        max_width: Option<u32>,
+        quality: ImageQuality,
+    ) -> Option<Arc<Path>> {
+        let tag = tag?.trim();
+        if tag.is_empty() {
+            return None;
+        }
+        let server_paths = self.paths_by_server.get(server.id.as_str())?;
+        let item_paths = server_paths.get(item_id)?;
+        item_paths
+            .iter()
+            .find(|entry| {
+                entry.image_type == image_type
+                    && entry.tag == tag
+                    && entry.max_width == max_width
+                    && entry.quality == quality
+            })
+            .map(|entry| entry.path.clone())
+    }
+
+    fn insert_path(&mut self, key: CachedImageKey, path: Arc<Path>) {
+        let server_paths = self
+            .paths_by_server
+            .entry(key.server_id.clone())
+            .or_default();
+        let item_paths = server_paths.entry(key.item_id.clone()).or_default();
+        if let Some(entry) = item_paths.iter_mut().find(|entry| entry.matches_key(&key)) {
+            entry.path = path;
+        } else {
+            item_paths.push(ImagePathEntry {
+                image_type: key.image_type,
+                tag: key.tag,
+                max_width: key.max_width,
+                quality: key.quality,
+                path,
+            });
+        }
+    }
+
+    fn path_for_key(&self, key: &CachedImageKey) -> Option<&Arc<Path>> {
+        self.paths_by_server
+            .get(key.server_id.as_str())?
+            .get(key.item_id.as_str())?
+            .iter()
+            .find(|entry| entry.matches_key(key))
+            .map(|entry| &entry.path)
     }
 
     #[allow(dead_code)]
@@ -146,7 +235,7 @@ impl ImageLoader {
     }
 
     fn queue_job(&mut self, key: CachedImageKey, request: EmbyImageRequest) {
-        if self.paths.contains_key(&key)
+        if self.path_for_key(&key).is_some()
             || self.queued_keys.contains(&key)
             || self.in_flight.contains(&key)
         {
@@ -241,6 +330,27 @@ mod tests {
 
         loader.ensure_image(&server, request);
         assert!(loader.start_queued_jobs().is_empty());
+    }
+
+    #[test]
+    fn completed_path_lookup_does_not_require_rebuilding_the_owned_key() {
+        let server = server();
+        let lookup_request = request("lookup-1");
+        let mut loader = ImageLoader::with_limits(1, Duration::ZERO, 1);
+
+        loader.ensure_image(&server, lookup_request.clone());
+        let job = loader.start_queued_jobs().pop().unwrap();
+        loader.finish_job(job.key, Ok(PathBuf::from("/tmp/lookup-1.jpg")));
+
+        assert_eq!(
+            loader.path_for_request(&server, &lookup_request),
+            Some(Arc::from(Path::new("/tmp/lookup-1.jpg")))
+        );
+        assert!(
+            loader
+                .path_for_request(&server, &request("other"))
+                .is_none()
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use gpui::{ClickEvent, Context, IntoElement, ParentElement, SharedString, Timer};
+use gpui::{ClickEvent, Context, IntoElement, ParentElement, SharedString};
 
 use crate::ui::notification::{
     NOTIFICATION_AUTOHIDE, NotificationQueue, error_notification, notification_layer,
@@ -26,7 +26,7 @@ impl TinyApp {
         cx.notify();
 
         cx.spawn(async move |app, cx| {
-            Timer::after(NOTIFICATION_AUTOHIDE).await;
+            cx.background_executor().timer(NOTIFICATION_AUTOHIDE).await;
             app.update(cx, |app, cx| {
                 if app.app_notifications.remove(id) {
                     cx.notify();
@@ -80,7 +80,7 @@ impl TinyApp {
         cx.notify();
 
         cx.spawn(async move |app, cx| {
-            Timer::after(NOTIFICATION_AUTOHIDE).await;
+            cx.background_executor().timer(NOTIFICATION_AUTOHIDE).await;
             app.update(cx, |app, cx| {
                 if app.app_notifications.remove(id) {
                     cx.notify();

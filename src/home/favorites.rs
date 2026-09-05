@@ -1,3 +1,5 @@
+use std::{borrow::Cow, collections::HashMap};
+
 use gpui::{AppContext as _, ClickEvent, Context, SharedString, Window};
 
 use crate::emby::{
@@ -382,11 +384,11 @@ impl HomeContent {
         self.user_data_overrides.get(item_id).or(fallback)
     }
 
-    pub(super) fn effective_user_item(&self, item: &UserItem) -> UserItem {
+    pub(super) fn effective_user_item<'a>(&self, item: &'a UserItem) -> Cow<'a, UserItem> {
         effective_user_item(item, &self.user_data_overrides)
     }
 
-    pub(super) fn effective_resume_item(&self, item: &ResumeItem) -> ResumeItem {
+    pub(super) fn effective_resume_item<'a>(&self, item: &'a ResumeItem) -> Cow<'a, ResumeItem> {
         effective_resume_item(item, &self.user_data_overrides)
     }
 
@@ -412,26 +414,36 @@ fn is_movie_or_series(item: &UserItem) -> bool {
     !item.id.trim().is_empty() && matches!(item.item_type.as_deref(), Some("Movie" | "Series"))
 }
 
-fn effective_user_item(
-    item: &UserItem,
-    overrides: &std::collections::HashMap<String, UserItemData>,
-) -> UserItem {
-    let mut item = item.clone();
-    if let Some(data) = overrides.get(&item.id) {
-        item.user_data = Some(data.clone());
+fn effective_user_item<'a>(
+    item: &'a UserItem,
+    overrides: &HashMap<String, UserItemData>,
+) -> Cow<'a, UserItem> {
+    let Some(data) = overrides.get(&item.id) else {
+        return Cow::Borrowed(item);
+    };
+    if item.user_data.as_ref() == Some(data) {
+        return Cow::Borrowed(item);
     }
-    item
+
+    let mut item = item.clone();
+    item.user_data = Some(data.clone());
+    Cow::Owned(item)
 }
 
-fn effective_resume_item(
-    item: &ResumeItem,
-    overrides: &std::collections::HashMap<String, UserItemData>,
-) -> ResumeItem {
-    let mut item = item.clone();
-    if let Some(data) = overrides.get(&item.id) {
-        item.user_data = Some(data.clone());
+fn effective_resume_item<'a>(
+    item: &'a ResumeItem,
+    overrides: &HashMap<String, UserItemData>,
+) -> Cow<'a, ResumeItem> {
+    let Some(data) = overrides.get(&item.id) else {
+        return Cow::Borrowed(item);
+    };
+    if item.user_data.as_ref() == Some(data) {
+        return Cow::Borrowed(item);
     }
-    item
+
+    let mut item = item.clone();
+    item.user_data = Some(data.clone());
+    Cow::Owned(item)
 }
 
 fn user_data_response_is_current(
@@ -511,6 +523,47 @@ mod tests {
         let effective = effective_resume_item(&item, &overrides);
 
         assert!(effective.is_favorite());
+    }
+
+    #[test]
+    fn unchanged_user_data_reuses_the_original_item() {
+        let item: UserItem = serde_json::from_value(serde_json::json!({
+            "Id": "movie-1",
+            "Name": "电影",
+            "Type": "Movie",
+            "UserData": { "IsFavorite": false }
+        }))
+        .unwrap();
+        let overrides =
+            HashMap::from([(item.id.clone(), item.user_data.clone().unwrap_or_default())]);
+
+        assert!(matches!(
+            effective_user_item(&item, &overrides),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn changed_user_data_only_clones_the_overridden_item() {
+        let item: UserItem = serde_json::from_value(serde_json::json!({
+            "Id": "movie-1",
+            "Name": "电影",
+            "Type": "Movie",
+            "UserData": { "IsFavorite": false }
+        }))
+        .unwrap();
+        let overrides = HashMap::from([(
+            item.id.clone(),
+            UserItemData {
+                is_favorite: true,
+                ..UserItemData::default()
+            },
+        )]);
+
+        assert!(matches!(
+            effective_user_item(&item, &overrides),
+            Cow::Owned(_)
+        ));
     }
 
     #[test]

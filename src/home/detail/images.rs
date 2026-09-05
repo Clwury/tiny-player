@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::Path, sync::Arc};
 
 use gpui::Context;
 
@@ -45,22 +45,22 @@ impl HomeContent {
         }
     }
 
-    pub(crate) fn image_path_for_series_backdrop(&self, item: &MediaItem) -> Option<PathBuf> {
+    pub(crate) fn image_path_for_series_backdrop(&self, item: &MediaItem) -> Option<Arc<Path>> {
         let request = series_backdrop_image_request(item)?;
         self.image_path_for_request(&request)
     }
 
-    pub(crate) fn image_path_for_series_logo(&self, item: &MediaItem) -> Option<PathBuf> {
+    pub(crate) fn image_path_for_series_logo(&self, item: &MediaItem) -> Option<Arc<Path>> {
         let request = series_logo_image_request(item)?;
         self.image_path_for_request(&request)
     }
 
-    pub(crate) fn image_path_for_episode_primary(&self, episode: &MediaItem) -> Option<PathBuf> {
+    pub(crate) fn image_path_for_episode_primary(&self, episode: &MediaItem) -> Option<Arc<Path>> {
         let request = episode_primary_image_request(episode)?;
         self.image_path_for_request(&request)
     }
 
-    pub(crate) fn image_path_for_person_primary(&self, person: &MediaPerson) -> Option<PathBuf> {
+    pub(crate) fn image_path_for_person_primary(&self, person: &MediaPerson) -> Option<Arc<Path>> {
         let request = person_primary_image_request(person)?;
         self.image_path_for_request(&request)
     }

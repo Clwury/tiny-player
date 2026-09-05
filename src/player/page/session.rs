@@ -359,7 +359,9 @@ impl PlaybackPage {
         self.reporting.periodic_generation = self.reporting.periodic_generation.wrapping_add(1);
         let generation = self.reporting.periodic_generation;
         cx.spawn(async move |page, cx| {
-            Timer::after(PLAYBACK_PROGRESS_REPORT_INTERVAL).await;
+            cx.background_executor()
+                .timer(PLAYBACK_PROGRESS_REPORT_INTERVAL)
+                .await;
             page.update(cx, |page, cx| {
                 if page.reporting.periodic_generation != generation
                     || page.reporting.phase != PlaybackReportingPhase::Started
