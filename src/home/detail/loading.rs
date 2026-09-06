@@ -2,6 +2,7 @@ use super::*;
 
 impl HomeContent {
     pub(super) fn load_media_detail_effects(&mut self, cx: &mut Context<Self>) {
+        self.load_resume_video_sources_if_needed(cx);
         self.load_series_media_item_if_needed(cx);
         self.load_similar_items_if_needed(cx);
         if self

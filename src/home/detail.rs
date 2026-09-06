@@ -1,19 +1,20 @@
 mod images;
 mod render;
 mod state;
+mod video_sources;
 
 use super::notification::{HOME_RESUME_DETAIL_NOTIFICATION_KEY, NotificationScope};
 pub(crate) use state::{SeriesDetailSelectKind, SeriesDetailState};
 
-use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, SharedString, Window, point, px};
+use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, SharedString, Window};
 
 use crate::{
     emby::{
         MediaItem, MediaItems, ResumeItem, UserItem, UserItems, playback::resolve_direct_stream_url,
     },
     player::{
-        EmbyPlaybackContext, PlaybackQueue, PlaybackQueueItem, PlaybackRequest, PlaybackTrack,
-        PlaybackTrackSelection, playback_initial_position_seconds,
+        EmbyPlaybackContext, PlaybackLanguagePreferences, PlaybackQueue, PlaybackQueueItem,
+        PlaybackRequest, PlaybackTrack, PlaybackTrackSelection, playback_initial_position_seconds,
     },
     server::CachedServer,
 };
@@ -32,6 +33,7 @@ const DETAIL_PLAYBACK_NOTIFICATION_KEY: &str = "detail:playback";
 
 struct SelectedPlayback {
     detail_id: String,
+    list_item_id: String,
     item_id: String,
     media_source_id: String,
     title: SharedString,
@@ -44,6 +46,7 @@ struct SelectedPlayback {
 }
 
 struct ResolvedPlayback {
+    item_id: String,
     url: String,
     http_headers: Vec<(String, String)>,
     content_length: Option<u64>,
@@ -67,6 +70,7 @@ mod selection;
 fn selected_playback(
     detail: &SeriesDetailState,
     server: &CachedServer,
+    languages: PlaybackLanguagePreferences,
 ) -> Result<SelectedPlayback, String> {
     let item = detail
         .selected_playback_item()
@@ -93,17 +97,20 @@ fn selected_playback(
     };
 
     let audio_tracks = playback_audio_tracks(source);
-    let subtitle_tracks = playback_subtitle_tracks(source, server, &item.id, &media_source_id);
-    let selected_tracks = playback_track_selection(detail, source, &subtitle_tracks);
+    let item_id = source.playback_item_id(&item.id);
+    let subtitle_tracks = playback_subtitle_tracks(source, server, item_id, &media_source_id);
+    let selected_tracks = playback_track_selection(detail, source, &subtitle_tracks, languages);
     let playback_position_ticks = detail.playback_position_ticks();
     let mut queue = playback_queue(detail, item, &title);
     if let Some(current) = queue.items.get_mut(queue.current_index) {
         current.playback_position_ticks = playback_position_ticks;
+        current.media_sources = detail.selected_media_sources().unwrap_or_default().to_vec();
     }
 
     Ok(SelectedPlayback {
         detail_id: detail.series_id.clone(),
-        item_id: item.id.clone(),
+        list_item_id: item.id.clone(),
+        item_id: item_id.to_string(),
         media_source_id,
         title: title.into(),
         audio_tracks,
@@ -240,28 +247,21 @@ fn playback_track_selection(
     detail: &SeriesDetailState,
     source: &crate::emby::MediaSource,
     subtitle_tracks: &[PlaybackTrack],
+    languages: PlaybackLanguagePreferences,
 ) -> PlaybackTrackSelection {
-    let default_audio_stream_index = source.audio_streams().into_iter().find_map(|stream| {
-        stream
-            .index
-            .and_then(|index| usize::try_from(index).ok())
-            .filter(|_| stream.is_default.unwrap_or(false))
-    });
-    let audio_stream_index = default_audio_stream_index.or_else(|| {
-        source
-            .audio_streams()
-            .into_iter()
-            .find_map(|stream| stream.index.and_then(|index| usize::try_from(index).ok()))
-    });
-    let selected_subtitle = detail.selected_subtitle_index().and_then(|position| {
-        crate::player::playback_subtitle_track_at_position(source, subtitle_tracks, position)
-    });
+    let mut selection =
+        crate::player::preferred_playback_track_selection(source, subtitle_tracks, languages);
+    let selected_subtitle =
+        detail
+            .selected_subtitle_index(languages.subtitle)
+            .and_then(|position| {
+                crate::player::playback_subtitle_track_at_position(
+                    source,
+                    subtitle_tracks,
+                    position,
+                )
+            });
 
-    let mut selection = PlaybackTrackSelection {
-        audio_stream_index,
-        default_audio_stream_index,
-        ..Default::default()
-    };
     selection.set_subtitle_track(selected_subtitle);
     selection
 }
@@ -358,9 +358,54 @@ mod tests {
     }
 
     #[test]
+    fn detail_and_playback_follow_languages_without_overriding_manual_subtitles() {
+        use crate::player::TrackLanguage;
+        let movie: UserItem = serde_json::from_value(serde_json::json!({
+            "Id": "movie-1", "Name": "Movie", "Type": "Movie"
+        }))
+        .unwrap();
+        let mut detail = SeriesDetailState::from_user_item(&movie).unwrap();
+        detail.item = Some(serde_json::from_value(serde_json::json!({
+            "Id": "movie-1", "Name": "Movie", "Type": "Movie",
+            "MediaSources": [{"Id": "source-1", "MediaStreams": [
+                {"Index": 1, "Type": "Audio", "Language": "eng", "IsDefault": true},
+                {"Index": 3, "Type": "Audio", "Language": "jpn"},
+                {"Index": 4, "Type": "Subtitle", "Language": "eng", "DisplayTitle": "English", "IsDefault": true},
+                {"Index": 7, "Type": "Subtitle", "Language": "chs", "DisplayTitle": "简体中文"}
+            ]}]
+        })).unwrap());
+        detail.sync_media_source_selection();
+        assert_eq!(
+            detail.selected_subtitle_label(TrackLanguage::Default),
+            "English"
+        );
+        let languages = PlaybackLanguagePreferences {
+            audio: TrackLanguage::Japanese,
+            subtitle: TrackLanguage::ChineseSimplified,
+        };
+        assert_eq!(
+            detail.selected_subtitle_label(languages.subtitle),
+            "简体中文"
+        );
+        let selected = selected_playback(&detail, &server(), languages).unwrap();
+        assert_eq!(selected.selected_tracks.audio_stream_index, Some(3));
+        assert_eq!(selected.selected_tracks.subtitle_stream_index, Some(7));
+
+        detail.selected_subtitle_index = Some(0);
+        detail.sync_media_source_selection();
+        assert_eq!(
+            detail.selected_subtitle_label(languages.subtitle),
+            "English"
+        );
+        let selected = selected_playback(&detail, &server(), languages).unwrap();
+        assert_eq!(selected.selected_tracks.subtitle_stream_index, Some(4));
+    }
+
+    #[test]
     fn playback_subtitle_tracks_resolve_external_ass_delivery_url() {
         let source = MediaSource {
             id: Some("mediasource_1126227".to_string()),
+            item_id: None,
             name: None,
             path: None,
             source_type: None,
@@ -404,6 +449,7 @@ mod tests {
     fn playback_subtitle_tracks_build_external_ass_url_when_delivery_url_missing() {
         let source = MediaSource {
             id: Some("mediasource_1126227".to_string()),
+            item_id: None,
             name: None,
             path: None,
             source_type: None,
@@ -442,6 +488,7 @@ mod tests {
     fn playback_subtitle_tracks_keep_internal_ass_on_embedded_stream() {
         let source = MediaSource {
             id: Some("mediasource_1126227".to_string()),
+            item_id: None,
             name: None,
             path: None,
             source_type: None,
@@ -477,6 +524,7 @@ mod tests {
     fn playback_subtitle_tracks_keep_internal_subrip_on_embedded_stream() {
         let source = MediaSource {
             id: Some("mediasource_824061".to_string()),
+            item_id: None,
             name: None,
             path: None,
             source_type: None,

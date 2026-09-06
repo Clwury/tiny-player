@@ -2,7 +2,7 @@ use gpui::{ScrollHandle, point, px};
 
 use crate::emby::{MediaItem, MediaItems, MediaSource, ResumeItem, UserItem, UserItems};
 
-use super::super::LoadState;
+use super::super::{LoadState, video_version::VideoVersion};
 
 const EMBY_TICKS_PER_SECOND: u64 = 10_000_000;
 
@@ -13,6 +13,7 @@ pub(crate) struct SeriesDetailEffects {
     pub(crate) next_up: LoadState,
     pub(crate) episodes: LoadState,
     pub(crate) similar: LoadState,
+    pub(crate) resume_sources: LoadState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +49,10 @@ pub(crate) struct SeriesDetailState {
     pub(crate) next_up: Option<MediaItems>,
     pub(crate) next_up_failed: Option<gpui::SharedString>,
     resume_episode: Option<ResumeItem>,
+    // Keep the original playable item separate from its series/episode group.
+    resume_media_item_id: Option<String>,
+    pub(crate) resume_media_sources: Option<Vec<MediaSource>>,
+    pub(crate) resume_video_version: Option<VideoVersion>,
     pub(crate) episodes: Option<MediaItems>,
     pub(crate) episodes_failed: Option<gpui::SharedString>,
     pub(crate) episode_selection_warning: Option<gpui::SharedString>,
@@ -60,6 +65,8 @@ pub(crate) struct SeriesDetailState {
     pub(crate) preferred_episode_id: Option<String>,
     preferred_season_id_hint: Option<String>,
     pub(crate) selected_media_source_index: Option<usize>,
+    manual_video_version: Option<VideoVersion>,
+    /// Explicit selection only; automatic choices follow the current language preference.
     pub(crate) selected_subtitle_index: Option<usize>,
     pub(crate) open_select: Option<SeriesDetailSelectKind>,
     pub(crate) scroll_handle: ScrollHandle,
@@ -146,12 +153,14 @@ impl SeriesDetailState {
             return None;
         }
 
-        Some(Self::new_with_identity(
+        let mut detail = Self::new_with_identity(
             item.id.clone(),
             item.name.clone(),
             SeriesDetailKind::Movie,
             SeriesDetailOrigin::Resume,
-        ))
+        );
+        detail.resume_media_item_id = Some(item.id.clone());
+        Some(detail)
     }
 
     pub(crate) fn from_resume_episode(item: &ResumeItem) -> Option<Self> {
@@ -182,6 +191,7 @@ impl SeriesDetailState {
             SeriesDetailOrigin::Resume,
         );
         detail.selected_episode_id = Some(episode_id.clone());
+        detail.resume_media_item_id = Some(episode_id.clone());
         detail.preferred_episode_id = Some(episode_id);
         detail.preferred_season_id_hint = item
             .parent_id
@@ -216,6 +226,9 @@ impl SeriesDetailState {
             next_up: None,
             next_up_failed: None,
             resume_episode: None,
+            resume_media_item_id: None,
+            resume_media_sources: None,
+            resume_video_version: None,
             episodes: None,
             episodes_failed: None,
             episode_selection_warning: None,
@@ -228,6 +241,7 @@ impl SeriesDetailState {
             preferred_episode_id: None,
             preferred_season_id_hint: None,
             selected_media_source_index: None,
+            manual_video_version: None,
             selected_subtitle_index: None,
             open_select: None,
             scroll_handle: ScrollHandle::new(),
@@ -263,7 +277,9 @@ impl SeriesDetailState {
         };
 
         if self.opened_from_resume() {
-            return self.preferred_episode_id.as_deref() == Some(selected_episode_id);
+            return self
+                .preferred_episode()
+                .is_some_and(|episode| episode.id == selected_episode_id);
         }
 
         self.next_up_episode()
@@ -332,6 +348,28 @@ impl SeriesDetailState {
             .filter(|episode| episode.id == preferred_episode_id)
     }
 
+    fn preferred_episode(&self) -> Option<&MediaItem> {
+        let preferred_id = self.preferred_episode_id.as_deref()?;
+        let episodes = &self.episodes.as_ref()?.items;
+        episodes
+            .iter()
+            .find(|episode| episode.id == preferred_id)
+            .or_else(|| {
+                // Alternate versions may be grouped under another episode ID.
+                // Resolve that group only for the item opened from Continue Watching.
+                if self.resume_media_item_id.as_deref() != Some(preferred_id) {
+                    return None;
+                }
+                episodes.iter().find(|episode| {
+                    episode.media_sources.as_ref().is_some_and(|sources| {
+                        sources
+                            .iter()
+                            .any(|source| source.matches_item_id(preferred_id))
+                    })
+                })
+            })
+    }
+
     pub(crate) fn playback_position_seconds(&self) -> Option<u64> {
         Some(self.playback_position_ticks()? / EMBY_TICKS_PER_SECOND)
     }
@@ -341,7 +379,12 @@ impl SeriesDetailState {
         let selected_id = selected.id.as_str();
         self.resume_episode
             .as_ref()
-            .filter(|episode| episode.id == selected_id)
+            .filter(|episode| {
+                episode.id == selected_id
+                    || self
+                        .selected_media_source()
+                        .is_some_and(|source| source.matches_item_id(&episode.id))
+            })
             .and_then(|episode| episode.user_data.as_ref())
             .and_then(|data| data.playback_position_ticks)
             .filter(|ticks| *ticks > 0)
@@ -421,21 +464,23 @@ impl SeriesDetailState {
         update: &crate::player::PlaybackStateUpdate,
         user_data: &crate::emby::UserItemData,
     ) {
-        if let Some(item) = self.item.as_mut().filter(|item| item.id == update.item_id) {
-            item.user_data = Some(user_data.clone());
-        }
-        if let Some(items) = self.episodes.as_mut() {
-            set_media_item_user_data(&mut items.items, &update.item_id, user_data);
-        }
-        if let Some(items) = self.next_up.as_mut() {
-            set_media_item_user_data(&mut items.items, &update.item_id, user_data);
-        }
-        if let Some(item) = self
-            .resume_episode
-            .as_mut()
-            .filter(|item| item.id == update.item_id)
-        {
-            item.user_data = Some(user_data.clone());
+        for item_id in [&update.item_id, &update.list_item_id] {
+            if let Some(item) = self.item.as_mut().filter(|item| item.id == *item_id) {
+                item.user_data = Some(user_data.clone());
+            }
+            if let Some(items) = self.episodes.as_mut() {
+                set_media_item_user_data(&mut items.items, item_id, user_data);
+            }
+            if let Some(items) = self.next_up.as_mut() {
+                set_media_item_user_data(&mut items.items, item_id, user_data);
+            }
+            if let Some(item) = self
+                .resume_episode
+                .as_mut()
+                .filter(|item| item.id == *item_id)
+            {
+                item.user_data = Some(user_data.clone());
+            }
         }
 
         let Some(selected_item_id) = update.selected_item_id.as_ref() else {
@@ -482,22 +527,84 @@ impl SeriesDetailState {
     }
 
     pub(crate) fn selected_media_source(&self) -> Option<&MediaSource> {
-        let item = self.selected_playback_item()?;
-        let sources = item.media_sources.as_deref()?;
+        let sources = self.selected_media_sources()?;
         let index = self.selected_media_source_index()?;
         sources.get(index)
     }
 
     pub(crate) fn selected_media_source_index(&self) -> Option<usize> {
-        let sources = self
-            .selected_playback_item()
-            .and_then(|item| item.media_sources.as_deref())?;
-        self.selected_media_source_index
-            .filter(|index| *index < sources.len())
-            .or_else(|| preferred_media_source_index(sources))
+        let sources = self.selected_media_sources()?;
+        self.manual_video_version
+            .as_ref()
+            .and_then(|version| version.find_source(sources))
+            .or_else(|| {
+                if self.is_resume_playback_item_selected() {
+                    // Like Tsukimi, restore the version matcher or use the first
+                    // PlaybackInfo source. Resume.Id identifies an item, not its
+                    // previously selected version on servers that group versions.
+                    self.resume_video_version
+                        .as_ref()
+                        .and_then(|version| version.find_source(sources))
+                        .or_else(|| (!sources.is_empty()).then_some(0))
+                } else {
+                    preferred_media_source_index(sources)
+                }
+            })
     }
 
-    pub(crate) fn selected_subtitle_index(&self) -> Option<usize> {
+    pub(crate) fn resume_media_item_id(&self) -> Option<&str> {
+        self.resume_media_item_id.as_deref()
+    }
+
+    fn is_resume_playback_item_selected(&self) -> bool {
+        let Some(resume_id) = self.resume_media_item_id.as_deref() else {
+            return false;
+        };
+        self.selected_playback_item().is_some_and(|item| {
+            self.is_movie()
+                || item.id == resume_id
+                || item.media_sources.as_ref().is_some_and(|sources| {
+                    sources
+                        .iter()
+                        .any(|source| source.matches_item_id(resume_id))
+                })
+        })
+    }
+
+    pub(crate) fn selected_media_sources(&self) -> Option<&[MediaSource]> {
+        if self.is_resume_playback_item_selected()
+            && let Some(sources) = self.resume_media_sources.as_deref()
+        {
+            return Some(sources);
+        }
+        self.selected_playback_item()?.media_sources.as_deref()
+    }
+
+    pub(crate) fn video_sources_loading(&self) -> bool {
+        self.is_resume_playback_item_selected() && self.effects.resume_sources == LoadState::Loading
+    }
+
+    pub(crate) fn select_media_source(&mut self, index: usize) {
+        let Some(source) = self
+            .selected_media_sources()
+            .and_then(|sources| sources.get(index))
+        else {
+            return;
+        };
+        self.manual_video_version = Some(VideoVersion::from_source(source));
+        self.selected_media_source_index = Some(index);
+        self.selected_subtitle_index = None;
+        self.subtitle_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
+        self.open_select = None;
+        self.reset_playback_request();
+        self.sync_media_source_selection();
+    }
+
+    pub(crate) fn selected_subtitle_index(
+        &self,
+        language: crate::player::TrackLanguage,
+    ) -> Option<usize> {
         let source = self.selected_media_source()?;
         let subtitle_count = source.subtitle_streams().len();
         if subtitle_count == 0 {
@@ -506,14 +613,14 @@ impl SeriesDetailState {
 
         self.selected_subtitle_index
             .filter(|index| *index < subtitle_count)
-            .or_else(|| source.preferred_subtitle_stream_position())
+            .or_else(|| language.preferred_subtitle_stream_position(source))
     }
 
     pub(crate) fn selected_media_source_label(&self) -> String {
-        let Some(item) = self.selected_playback_item() else {
-            return "暂无视频源".to_string();
-        };
-        let Some(sources) = item.media_sources.as_deref() else {
+        if self.video_sources_loading() {
+            return "正在加载视频源…".to_string();
+        }
+        let Some(sources) = self.selected_media_sources() else {
             return "暂无视频源".to_string();
         };
         let Some(index) = self.selected_media_source_index() else {
@@ -525,12 +632,12 @@ impl SeriesDetailState {
             .unwrap_or_else(|| "暂无视频源".to_string())
     }
 
-    pub(crate) fn selected_subtitle_label(&self) -> String {
+    pub(crate) fn selected_subtitle_label(&self, language: crate::player::TrackLanguage) -> String {
         let Some(source) = self.selected_media_source() else {
             return "无字幕".to_string();
         };
         let subtitles = source.subtitle_streams();
-        let Some(index) = self.selected_subtitle_index() else {
+        let Some(index) = self.selected_subtitle_index(language) else {
             return "无字幕".to_string();
         };
         subtitles
@@ -580,37 +687,13 @@ impl SeriesDetailState {
     }
 
     pub(crate) fn choose_episode_from_loaded_episodes(&mut self) {
-        let episode_ids = self
-            .episodes
-            .as_ref()
-            .map(|episodes| {
-                episodes
-                    .items
-                    .iter()
-                    .map(|episode| episode.id.clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let preferred_missing = self
-            .preferred_episode_id
-            .as_ref()
-            .is_some_and(|episode_id| !episode_ids.iter().any(|id| id == episode_id));
+        let preferred = self.preferred_episode().map(|episode| episode.id.clone());
+        let preferred_missing = self.preferred_episode_id.is_some() && preferred.is_none();
         self.episode_selection_warning =
             preferred_missing.then(|| "原单集已不可用，已选择当前可播放单集".into());
 
-        let selected = self
-            .preferred_episode_id
-            .as_ref()
-            .filter(|episode_id| episode_ids.iter().any(|id| id == *episode_id))
-            .cloned()
-            .or_else(|| {
-                self.selected_episode_id
-                    .as_ref()
-                    .filter(|episode_id| episode_ids.iter().any(|id| id == *episode_id))
-                    .cloned()
-            })
-            .or_else(|| episode_ids.first().cloned());
+        let selected =
+            preferred.or_else(|| self.selected_episode().map(|episode| episode.id.clone()));
 
         self.apply_selected_episode(selected);
     }
@@ -619,6 +702,7 @@ impl SeriesDetailState {
         if self.selected_episode_id != episode_id {
             self.selected_episode_id = episode_id;
             self.selected_media_source_index = None;
+            self.manual_video_version = None;
             self.selected_subtitle_index = None;
             self.open_select = None;
             self.reset_select_scroll_offsets();
@@ -635,6 +719,7 @@ impl SeriesDetailState {
         self.episodes_request_season_id = None;
         self.selected_episode_id = None;
         self.selected_media_source_index = None;
+        self.manual_video_version = None;
         self.selected_subtitle_index = None;
         self.open_select = None;
         self.reset_select_scroll_offsets();
@@ -658,6 +743,7 @@ impl SeriesDetailState {
             &mut self.effects.next_up,
             &mut self.effects.episodes,
             &mut self.effects.similar,
+            &mut self.effects.resume_sources,
         ] {
             if *state == LoadState::Loading {
                 *state = LoadState::Idle;
@@ -683,17 +769,28 @@ impl SeriesDetailState {
             self.open_select = None;
             return;
         }
+        if self.selected_media_source_index != selected_media_source_index
+            && self.manual_video_version.is_none()
+        {
+            self.selected_subtitle_index = None;
+        }
         self.selected_media_source_index = selected_media_source_index;
+        if let Some(resume_item_id) = self.resume_media_item_id.as_deref() {
+            let source = self.selected_media_source();
+            tracing::debug!(
+                resume_item_id,
+                selected_episode_id = ?self.selected_episode_id,
+                media_source_id = ?source.and_then(|source| source.id.as_deref()),
+                media_source_item_id = ?source.and_then(|source| source.item_id.as_deref()),
+                manual = self.manual_video_version.is_some(),
+                "resolved resume detail video selection"
+            );
+        }
 
-        let (subtitle_count, preferred_subtitle_index) = self
+        let subtitle_count = self
             .selected_media_source()
-            .map(|source| {
-                (
-                    source.subtitle_streams().len(),
-                    source.preferred_subtitle_stream_position(),
-                )
-            })
-            .unwrap_or((0, None));
+            .map(|source| source.subtitle_streams().len())
+            .unwrap_or(0);
         if subtitle_count == 0 {
             self.selected_subtitle_index = None;
             if self.open_select == Some(SeriesDetailSelectKind::Subtitle) {
@@ -701,9 +798,9 @@ impl SeriesDetailState {
             }
         } else if self
             .selected_subtitle_index
-            .is_none_or(|index| index >= subtitle_count)
+            .is_some_and(|index| index >= subtitle_count)
         {
-            self.selected_subtitle_index = preferred_subtitle_index;
+            self.selected_subtitle_index = None;
         }
     }
 }
@@ -838,6 +935,9 @@ mod tests {
             }),
             next_up_failed: None,
             resume_episode: None,
+            resume_media_item_id: None,
+            resume_media_sources: None,
+            resume_video_version: None,
             episodes: Some(MediaItems {
                 items: vec![
                     media_item("episode-1", "第一集"),
@@ -856,6 +956,7 @@ mod tests {
             preferred_episode_id: Some("episode-2".to_string()),
             preferred_season_id_hint: None,
             selected_media_source_index: None,
+            manual_video_version: None,
             selected_subtitle_index: None,
             open_select: None,
             scroll_handle: ScrollHandle::new(),
@@ -900,6 +1001,7 @@ mod tests {
     fn media_source(id: &str, name: &str) -> MediaSource {
         MediaSource {
             id: Some(id.to_string()),
+            item_id: None,
             name: Some(name.to_string()),
             path: None,
             source_type: None,
@@ -920,6 +1022,7 @@ mod tests {
             serde_json::from_value(serde_json::json!([
                 {
                     "Id": "source-1",
+                    "ItemId": "movie-1",
                     "Type": "Grouping",
                     "MediaStreams": [
                         { "Index": 0, "Type": "Video", "IsDefault": false }
@@ -943,8 +1046,192 @@ mod tests {
         detail.sync_media_source_selection();
 
         assert_eq!(detail.selected_media_source_index(), Some(1));
-        assert_eq!(detail.selected_subtitle_index(), Some(1));
-        assert_eq!(detail.selected_subtitle_label(), "简体中文");
+        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(1));
+        assert_eq!(
+            detail.selected_subtitle_label(Default::default()),
+            "简体中文"
+        );
+    }
+
+    #[test]
+    fn resume_movie_restores_its_version_and_preserves_manual_selection() {
+        let movie: ResumeItem = serde_json::from_value(serde_json::json!({
+            "Id": "movie-1", "Name": "Movie", "Type": "Movie"
+        }))
+        .unwrap();
+        let mut detail = SeriesDetailState::from_resume_movie(&movie).unwrap();
+        detail.resume_video_version = Some(VideoVersion {
+            source_id: "resumed-source".into(),
+            name: Some("Resumed version".into()),
+        });
+        let mut item = media_item("movie-1", "Movie");
+        item.media_sources = Some(serde_json::from_value(serde_json::json!([
+            {"Id": "default-source", "Type": "Default"},
+            {
+                "Id": "resumed-source", "ItemId": "movie-1", "Name": "Resumed version",
+                "MediaStreams": [
+                    {"Type": "Subtitle", "Index": 3, "DisplayTitle": "简体中文", "IsDefault": true}
+                ]
+            }
+        ])).unwrap());
+        detail.item = Some(item);
+
+        detail.sync_media_source_selection();
+        assert_eq!(detail.selected_media_source_index(), Some(1));
+        assert_eq!(detail.selected_media_source_label(), "Resumed version");
+        assert_eq!(
+            detail.selected_subtitle_label(Default::default()),
+            "简体中文"
+        );
+
+        detail.select_media_source(0);
+        assert_eq!(detail.selected_media_source_index(), Some(0));
+        detail
+            .item
+            .as_mut()
+            .unwrap()
+            .media_sources
+            .as_mut()
+            .unwrap()
+            .swap(0, 1);
+        detail.sync_media_source_selection();
+        assert_eq!(detail.selected_media_source_index(), Some(1));
+        assert_eq!(
+            detail.selected_media_source().unwrap().id.as_deref(),
+            Some("default-source")
+        );
+    }
+
+    #[test]
+    fn remembered_video_overrides_an_automatic_selection_after_reload() {
+        let movie: ResumeItem = serde_json::from_value(serde_json::json!({
+            "Id": "movie-1", "Name": "Movie", "Type": "Movie"
+        }))
+        .unwrap();
+        let mut detail = SeriesDetailState::from_resume_movie(&movie).unwrap();
+        detail.resume_video_version = Some(VideoVersion {
+            source_id: "resumed-source".into(),
+            name: None,
+        });
+        let mut item = media_item("movie-1", "Movie");
+        item.media_sources = Some(vec![media_source("default-source", "Default")]);
+        detail.item = Some(item);
+        detail.sync_media_source_selection();
+        assert_eq!(detail.selected_media_source_index(), Some(0));
+
+        detail.item.as_mut().unwrap().media_sources = Some(
+            serde_json::from_value(serde_json::json!([
+                {"Id": "default-source", "ItemId": "other-item", "Type": "Default"},
+                {"Id": "resumed-source", "ItemId": "movie-1"}
+            ]))
+            .unwrap(),
+        );
+        detail.sync_media_source_selection();
+        assert_eq!(detail.selected_media_source_index(), Some(1));
+    }
+
+    #[test]
+    fn resume_uses_playback_info_order_instead_of_item_id_or_default_type() {
+        let movie: ResumeItem = serde_json::from_value(serde_json::json!({
+            "Id": "movie-1", "Name": "Movie", "Type": "Movie"
+        }))
+        .unwrap();
+        let mut detail = SeriesDetailState::from_resume_movie(&movie).unwrap();
+        let mut item = media_item("movie-1", "Movie");
+        item.media_sources = Some(vec![media_source("metadata-source", "Metadata")]);
+        detail.resume_media_sources = Some(
+            serde_json::from_value(serde_json::json!([
+                {"Id": "source-2160p", "ItemId": "other-item", "Name": "2160p", "Type": "Grouping"},
+                {"Id": "source-1080p", "ItemId": "movie-1", "Type": "Default"}
+            ]))
+            .unwrap(),
+        );
+        detail.item = Some(item);
+        detail.sync_media_source_selection();
+        assert_eq!(detail.selected_media_source_index(), Some(0));
+        assert_eq!(detail.selected_media_source_label(), "2160p");
+    }
+
+    #[test]
+    fn resume_movie_without_a_remembered_version_uses_the_first_source() {
+        let movie: ResumeItem = serde_json::from_value(serde_json::json!({
+            "Id": "movie-1", "Name": "Movie", "Type": "Movie"
+        }))
+        .unwrap();
+        let mut detail = SeriesDetailState::from_resume_movie(&movie).unwrap();
+        let mut item = media_item("movie-1", "Movie");
+        let mut default = media_source("source-default", "Default");
+        default.source_type = Some("Default".to_string());
+        item.media_sources = Some(vec![media_source("other-version", "Other"), default]);
+        detail.item = Some(item);
+        detail.sync_media_source_selection();
+        assert_eq!(detail.selected_media_source_index(), Some(0));
+    }
+
+    #[test]
+    fn only_resume_episode_entry_restores_the_remembered_version() {
+        let episode = resume_episode("episode-2", "Second", "series-1", 1);
+        let user_episode: UserItem =
+            serde_json::from_value(serde_json::to_value(&episode).unwrap()).unwrap();
+        let resume_detail = SeriesDetailState::from_resume_episode(&episode).unwrap();
+        let user_detail = SeriesDetailState::from_user_item(&user_episode).unwrap();
+        for (mut detail, expected_index) in [(resume_detail, 1), (user_detail, 0)] {
+            detail.resume_video_version = Some(VideoVersion {
+                source_id: "mediasource_episode-2".into(),
+                name: None,
+            });
+            let mut item = media_item("episode-2", "Second");
+            let mut default = media_source("default-source", "Default");
+            default.source_type = Some("Default".to_string());
+            let mut resumed_source = media_source("mediasource_episode-2", "Resumed");
+            resumed_source.item_id = Some("episode-2".to_string());
+            item.media_sources = Some(vec![default.clone(), resumed_source]);
+            let mut next = media_item("episode-3", "Third");
+            next.media_sources = Some(vec![
+                default,
+                media_source("mediasource_episode-3", "Other"),
+            ]);
+            detail.episodes = Some(MediaItems {
+                items: vec![item, next],
+                total_record_count: 2,
+            });
+            detail.choose_episode_from_loaded_episodes();
+            assert_eq!(detail.selected_episode_id.as_deref(), Some("episode-2"));
+            assert_eq!(detail.selected_media_source_index(), Some(expected_index));
+
+            detail.preferred_episode_id = Some("episode-3".to_string());
+            detail.apply_selected_episode(Some("episode-3".to_string()));
+            assert_eq!(detail.selected_media_source_index(), Some(0));
+        }
+    }
+
+    #[test]
+    fn resume_episode_version_selects_its_group_and_keeps_resume_position() {
+        let mut episode = resume_episode("version-2", "Second", "series-1", 1);
+        episode.user_data = Some(UserItemData {
+            playback_position_ticks: Some(9_050_000_000),
+            ..Default::default()
+        });
+        let mut detail = SeriesDetailState::from_resume_episode(&episode).unwrap();
+        let mut group = media_item("episode-2", "Second");
+        group.media_sources = Some(
+            serde_json::from_value(serde_json::json!([
+                {"Id": "default-source", "Type": "Default"},
+                {"Id": "resumed-source", "ItemId": "version-2"}
+            ]))
+            .unwrap(),
+        );
+        detail.resume_media_sources = Some(vec![group.media_sources.as_ref().unwrap()[1].clone()]);
+        detail.episodes = Some(MediaItems {
+            items: vec![media_item("episode-1", "First"), group],
+            total_record_count: 2,
+        });
+        detail.choose_episode_from_loaded_episodes();
+        assert_eq!(detail.selected_episode_id.as_deref(), Some("episode-2"));
+        assert_eq!(detail.selected_media_source_index(), Some(0));
+        assert!(detail.episode_selection_warning.is_none());
+        assert!(detail.should_reveal_selected_episode());
+        assert_eq!(detail.playback_position_seconds(), Some(905));
     }
 
     #[test]
@@ -978,7 +1265,7 @@ mod tests {
         detail.sync_media_source_selection();
 
         assert_eq!(detail.selected_media_source_index(), Some(1));
-        assert_eq!(detail.selected_subtitle_index(), Some(1));
+        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(1));
     }
 
     #[test]
@@ -1006,8 +1293,11 @@ mod tests {
 
         detail.sync_media_source_selection();
 
-        assert_eq!(detail.selected_subtitle_index(), Some(1));
-        assert_eq!(detail.selected_subtitle_label(), "强制字幕");
+        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(1));
+        assert_eq!(
+            detail.selected_subtitle_label(Default::default()),
+            "强制字幕"
+        );
     }
 
     #[test]
@@ -1033,12 +1323,16 @@ mod tests {
         );
         detail.item = Some(item);
 
-        assert_eq!(detail.selected_subtitle_index(), Some(0));
-        assert_eq!(detail.selected_subtitle_label(), "第一字幕");
+        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(0));
+        assert_eq!(
+            detail.selected_subtitle_label(Default::default()),
+            "第一字幕"
+        );
 
         detail.sync_media_source_selection();
 
-        assert_eq!(detail.selected_subtitle_index, Some(0));
+        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(0));
+        assert_eq!(detail.selected_subtitle_index, None);
     }
 
     #[test]
@@ -1068,8 +1362,11 @@ mod tests {
         detail.sync_media_source_selection();
 
         assert_eq!(detail.selected_media_source_index(), Some(0));
-        assert_eq!(detail.selected_subtitle_index(), Some(1));
-        assert_eq!(detail.selected_subtitle_label(), "简体中文");
+        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(1));
+        assert_eq!(
+            detail.selected_subtitle_label(Default::default()),
+            "简体中文"
+        );
     }
 
     #[test]
@@ -1269,7 +1566,10 @@ mod tests {
         });
         detail.selected_episode_id = Some("episode-1".to_string());
         let update = crate::player::PlaybackStateUpdate {
-            item_id: "episode-1".to_string(),
+            item_id: "episode-1-2160p".to_string(),
+            list_item_id: "episode-1".to_string(),
+            media_source_id: "source-2160p".to_string(),
+            media_source_name: None,
             series_id: Some("series-1".to_string()),
             season_id: Some("season-1".to_string()),
             position_ticks: 250,

@@ -16,6 +16,10 @@ const PLAYBACK_PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 pub struct PlaybackStateUpdate {
     pub item_id: String,
+    // A grouped episode can have a different ID from the version being played.
+    pub list_item_id: String,
+    pub media_source_id: String,
+    pub media_source_name: Option<String>,
     pub series_id: Option<String>,
     pub season_id: Option<String>,
     pub position_ticks: u64,
@@ -256,7 +260,7 @@ impl PlaybackPage {
             self.emby.item_id.clone(),
             self.emby.media_source_id.clone(),
             playlist_item_id,
-            self.queue.report_items(),
+            self.queue.report_items(&self.emby.item_id),
         );
         apply_snapshot_to_start_report(&snapshot, &mut report);
         report.play_session_id = self.emby.play_session_id.clone();
@@ -430,6 +434,17 @@ impl PlaybackPage {
         let queue_item = self.queue.current();
         PlaybackStateUpdate {
             item_id: self.emby.item_id.clone(),
+            list_item_id: queue_item
+                .map(|item| item.item_id.clone())
+                .unwrap_or_else(|| self.emby.item_id.clone()),
+            media_source_id: self.emby.media_source_id.clone(),
+            media_source_name: queue_item
+                .and_then(|item| {
+                    item.media_sources.iter().find(|source| {
+                        source.id.as_deref() == Some(self.emby.media_source_id.as_str())
+                    })
+                })
+                .and_then(|source| source.name.clone()),
             series_id: queue_item.and_then(|item| item.series_id.clone()),
             season_id: queue_item.and_then(|item| item.season_id.clone()),
             position_ticks: snapshot.position_ticks,

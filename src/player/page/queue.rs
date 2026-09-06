@@ -3,8 +3,8 @@ use anyhow::{Result, anyhow};
 use crate::emby::playback::resolve_direct_stream_url;
 
 use super::request::{
-    default_playback_track_selection, playback_audio_tracks_for_source,
-    playback_subtitle_tracks_for_source, preferred_playback_media_source,
+    playback_audio_tracks_for_source, playback_subtitle_tracks_for_source,
+    preferred_playback_media_source, preferred_playback_track_selection,
 };
 use super::state::effective_playback_paused;
 use super::*;
@@ -145,8 +145,9 @@ impl PlaybackPage {
         let server = self.emby.server.clone();
         let mut queue = self.queue.clone();
         queue.current_index = target_index;
+        let languages = crate::player::PlaybackLanguagePreferences::get(cx);
         let task = cx.background_spawn(async move {
-            resolve_queue_playback_request(client, server, queue, target)
+            resolve_queue_playback_request(client, server, queue, target, languages)
         });
         cx.spawn(async move |page, cx| {
             let result = task.await;
@@ -183,7 +184,7 @@ impl PlaybackPage {
                         update.position_ticks
                     });
                 }
-                update.selected_item_id = Some(request.emby.item_id.clone());
+                update.selected_item_id = request.queue.current().map(|item| item.item_id.clone());
                 cx.emit(PlaybackEvent::Replace {
                     request: Box::new(request),
                     update,
@@ -287,6 +288,7 @@ fn resolve_queue_playback_request(
     server: crate::server::CachedServer,
     queue: PlaybackQueue,
     item: PlaybackQueueItem,
+    languages: crate::player::PlaybackLanguagePreferences,
 ) -> Result<PlaybackRequest> {
     let source = preferred_playback_media_source(&item.media_sources)
         .ok_or_else(|| anyhow!("目标单集没有可用视频源"))?;
@@ -297,8 +299,13 @@ fn resolve_queue_playback_request(
         .filter(|id| !id.is_empty())
         .ok_or_else(|| anyhow!("目标单集视频源缺少 ID"))?
         .to_string();
-    let playback_info = client.playback_info(&server, &item.item_id, &selected_media_source_id)?;
+    let requested_item_id = source.playback_item_id(&item.item_id);
+    let playback_info =
+        client.playback_info(&server, requested_item_id, &selected_media_source_id)?;
     let resolved_source = playback_info.direct_stream_source_for(&selected_media_source_id)?;
+    let playback_item_id = resolved_source
+        .playback_item_id(requested_item_id)
+        .to_string();
     let direct_stream_url = resolved_source.direct_stream_url()?;
     let url = resolve_direct_stream_url(&server, direct_stream_url)?;
     let http_headers = client.playback_http_headers(&server)?;
@@ -311,8 +318,8 @@ fn resolve_queue_playback_request(
         .to_string();
     let audio_tracks = playback_audio_tracks_for_source(source);
     let subtitle_tracks =
-        playback_subtitle_tracks_for_source(source, &server, &item.item_id, &media_source_id);
-    let selected_tracks = default_playback_track_selection(source, &subtitle_tracks);
+        playback_subtitle_tracks_for_source(source, &server, &playback_item_id, &media_source_id);
+    let selected_tracks = preferred_playback_track_selection(source, &subtitle_tracks, languages);
     let initial_position_seconds =
         playback_initial_position_seconds(item.playback_position_ticks, item.run_time_ticks);
 
@@ -329,7 +336,7 @@ fn resolve_queue_playback_request(
         emby: EmbyPlaybackContext {
             client,
             server,
-            item_id: item.item_id,
+            item_id: playback_item_id,
             media_source_id,
             play_session_id: playback_info
                 .play_session_id
@@ -395,6 +402,7 @@ mod tests {
     fn media_source(id: &str, source_type: Option<&str>, default_video: bool) -> MediaSource {
         MediaSource {
             id: Some(id.to_string()),
+            item_id: None,
             name: None,
             path: None,
             source_type: source_type.map(ToString::to_string),

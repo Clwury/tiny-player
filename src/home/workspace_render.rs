@@ -17,7 +17,7 @@ use super::{
         HOME_ITEM_CARD_GAP_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
         HOME_MAIN_SCROLLBAR_WIDTH_PX, home_main_content_width_for_window_width,
     },
-    components::{user_episode_card, user_item_card},
+    components::{user_episode_card, user_item_card, user_item_card_with_favorite_badge},
     library::{LibraryState, available_library_sorts},
     navigation::HomeRoute,
     paged_items::PagedItemsState,
@@ -558,10 +558,15 @@ impl HomeContent {
                 .on_click(open)
         } else {
             let image_path = self.image_path_for_user_item(&item);
-            user_item_card(&item, image_path, cx)
-                .id(item_id)
-                .cursor_pointer()
-                .on_click(open)
+            user_item_card_with_favorite_badge(
+                &item,
+                image_path,
+                !matches!(source, UserItemGridSource::Favorites),
+                cx,
+            )
+            .id(item_id)
+            .cursor_pointer()
+            .on_click(open)
         }
     }
 
@@ -927,11 +932,11 @@ fn library_sort_option<T>(
         .child(div().min_w_0().truncate().child(label))
         .when(selected, |this| {
             this.child(
-                div()
+                svg()
+                    .path("icons/check.svg")
+                    .size(px(14.0))
                     .flex_none()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.input_border_focused)
-                    .child("✓"),
+                    .text_color(theme.input_border_focused),
             )
         })
 }

@@ -1,7 +1,8 @@
 use gpui::{
-    Animation, AnimationExt as _, Context, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage, Transformation,
-    Window, deferred, div, ease_in_out, img, percentage, prelude::FluentBuilder, px, svg,
+    Animation, AnimationExt as _, Context, InteractiveElement, InteractiveText, IntoElement,
+    MouseButton, ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage,
+    StyledText, Transformation, Window, deferred, div, ease_in_out, img, percentage,
+    prelude::FluentBuilder, px, svg,
 };
 
 use crate::{
@@ -97,6 +98,14 @@ fn detail_select_box_with_width<T>(
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
+    let text = StyledText::new(value.clone());
+    let text_layout = text.layout().clone();
+    let text = InteractiveText::new((gpui::ElementId::from("detail-select-value"), label), text)
+        .tooltip(move |_, _, cx| {
+            // Compare the rendered text (including any ellipsis) with the original
+            // so the tooltip follows the actual available width and font metrics.
+            (text_layout.text() != value).then(|| text_tooltip(value.clone(), cx))
+        });
 
     div()
         .flex()
@@ -131,6 +140,7 @@ fn detail_select_box_with_width<T>(
         .child(
             div()
                 .flex()
+                .flex_1()
                 .min_w_0()
                 .items_center()
                 .gap_2()
@@ -143,16 +153,18 @@ fn detail_select_box_with_width<T>(
                 )
                 .child(
                     div()
+                        .flex_1()
                         .min_w_0()
                         .truncate()
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(value),
+                        .child(text),
                 ),
         )
         .child(
             svg()
                 .path("icons/chevron-right.svg")
                 .size(px(14.0))
+                .flex_none()
                 .text_color(theme.muted_foreground),
         )
 }

@@ -220,9 +220,12 @@ fn user_view_card_image<T>(image_path: Option<Arc<Path>>, cx: &Context<T>) -> im
                 .h(px(USER_VIEW_CARD_IMAGE_HEIGHT_PX))
                 .items_center()
                 .justify_center()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("暂无图片")
+                .child(
+                    svg()
+                        .path("icons/clapperboard.svg")
+                        .size(px(32.0))
+                        .text_color(theme.muted_foreground),
+                )
         })
 }
 
@@ -250,12 +253,12 @@ fn resume_item_card_image<T>(
             ))
         })
         .when(!has_image, |this| {
-            this.flex()
-                .items_center()
-                .justify_center()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("暂无图片")
+            this.flex().items_center().justify_center().child(
+                svg()
+                    .path("icons/clapperboard.svg")
+                    .size(px(32.0))
+                    .text_color(theme.muted_foreground),
+            )
         })
         .when_some(played_fraction, |this, fraction| {
             this.child(image_progress_bar(USER_VIEW_CARD_WIDTH_PX, fraction, cx))
@@ -274,9 +277,9 @@ fn resume_item_card_image<T>(
                     .bg(theme.dialog_background.opacity(0.86))
                     .child(
                         svg()
-                            .path("icons/heart.svg")
+                            .path("icons/heart-filled.svg")
                             .size(px(14.0))
-                            .text_color(theme.error),
+                            .text_color(theme.foreground),
                     ),
             )
         })
@@ -362,6 +365,15 @@ pub(super) fn user_item_card<T>(
     image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> gpui::Div {
+    user_item_card_with_favorite_badge(item, image_path, true, cx)
+}
+
+pub(super) fn user_item_card_with_favorite_badge<T>(
+    item: &UserItem,
+    image_path: Option<Arc<Path>>,
+    show_favorite_badge: bool,
+    cx: &Context<T>,
+) -> gpui::Div {
     let theme = theme::get(cx);
 
     div()
@@ -372,7 +384,12 @@ pub(super) fn user_item_card<T>(
         .rounded_lg()
         .p(px(HOME_ITEM_CARD_PADDING_PX))
         .hover(move |style| style.bg(theme.secondary_hover))
-        .child(user_item_card_image(item, image_path, cx))
+        .child(user_item_card_image(
+            item,
+            image_path,
+            show_favorite_badge,
+            cx,
+        ))
         .child(
             div()
                 .w(px(HOME_ITEM_CARD_WIDTH_PX))
@@ -457,12 +474,12 @@ pub(super) fn user_episode_card<T>(
                     )
                 })
                 .when(!has_image, |this| {
-                    this.flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("暂无图片")
+                    this.flex().items_center().justify_center().child(
+                        svg()
+                            .path("icons/clapperboard.svg")
+                            .size(px(32.0))
+                            .text_color(theme.muted_foreground),
+                    )
                 })
                 .when_some(played_fraction, |this, fraction| {
                     this.child(image_progress_bar(HOME_ITEM_CARD_WIDTH_PX, fraction, cx))
@@ -588,12 +605,12 @@ fn episode_card_image<T>(
             ))
         })
         .when(!has_image, |this| {
-            this.flex()
-                .items_center()
-                .justify_center()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("暂无图片")
+            this.flex().items_center().justify_center().child(
+                svg()
+                    .path("icons/clapperboard.svg")
+                    .size(px(32.0))
+                    .text_color(theme.muted_foreground),
+            )
         })
         .when_some(played_fraction, |this, fraction| {
             this.child(image_progress_bar(
@@ -675,12 +692,12 @@ fn person_card_image<T>(image_path: Option<Arc<Path>>, cx: &Context<T>) -> impl 
             ))
         })
         .when(!has_image, |this| {
-            this.flex()
-                .items_center()
-                .justify_center()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("暂无图片")
+            this.flex().items_center().justify_center().child(
+                svg()
+                    .path("icons/circle-user-round.svg")
+                    .size(px(32.0))
+                    .text_color(theme.muted_foreground),
+            )
         })
 }
 
@@ -692,6 +709,7 @@ fn compact_episode_overview(value: Option<&str>) -> Option<String> {
 fn user_item_card_image<T>(
     item: &UserItem,
     image_path: Option<Arc<Path>>,
+    show_favorite_badge: bool,
     cx: &Context<T>,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
@@ -699,7 +717,7 @@ fn user_item_card_image<T>(
     let rating = item.community_rating.map(format_community_rating);
     let unplayed_count = item.unplayed_count();
     let has_badges = rating.is_some() || unplayed_count.is_some();
-    let is_favorite = item.is_favorite();
+    let is_favorite = show_favorite_badge && item.is_favorite();
 
     div()
         .relative()
@@ -716,12 +734,12 @@ fn user_item_card_image<T>(
             ))
         })
         .when(!has_image, |this| {
-            this.flex()
-                .items_center()
-                .justify_center()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("暂无图片")
+            this.flex().items_center().justify_center().child(
+                svg()
+                    .path("icons/clapperboard.svg")
+                    .size(px(32.0))
+                    .text_color(theme.muted_foreground),
+            )
         })
         .when(has_badges, |this| {
             this.child(
@@ -754,9 +772,9 @@ fn user_item_card_image<T>(
                     .bg(theme.dialog_background.opacity(0.86))
                     .child(
                         svg()
-                            .path("icons/heart.svg")
+                            .path("icons/heart-filled.svg")
                             .size(px(14.0))
-                            .text_color(theme.error),
+                            .text_color(theme.foreground),
                     ),
             )
         })

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Method;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::instrument;
 use url::Url;
 
@@ -16,8 +16,35 @@ impl EmbyClient {
         item_id: &str,
         media_source_id: &str,
     ) -> Result<PlaybackInfo> {
-        validate_item_id(item_id)?;
         validate_media_source_id(media_source_id)?;
+        self.request_playback_info(server, item_id, Some(media_source_id))
+    }
+
+    pub fn playback_media_sources(
+        &self,
+        server: &CachedServer,
+        item_id: &str,
+    ) -> Result<Vec<super::MediaSource>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Sources {
+            #[serde(default)]
+            media_sources: Vec<super::MediaSource>,
+        }
+        let response: Sources = self.request_playback_info(server, item_id, None)?;
+        if response.media_sources.is_empty() {
+            bail!("播放信息中没有可用视频源");
+        }
+        Ok(response.media_sources)
+    }
+
+    fn request_playback_info<T: DeserializeOwned>(
+        &self,
+        server: &CachedServer,
+        item_id: &str,
+        media_source_id: Option<&str>,
+    ) -> Result<T> {
+        validate_item_id(item_id)?;
         let user_id = authenticated_user_id(server)?;
         let mut url = api_url(&server.endpoint, &["Items", item_id, "PlaybackInfo"])?;
         add_playback_info_query(&mut url, media_source_id, user_id);
@@ -255,6 +282,7 @@ pub struct PlaybackInfo {
 #[serde(rename_all = "PascalCase")]
 pub struct PlaybackMediaSource {
     pub id: Option<String>,
+    pub item_id: Option<String>,
     #[serde(alias = "ContentLength")]
     pub size: Option<u64>,
     pub direct_stream_url: Option<String>,
@@ -291,6 +319,14 @@ impl PlaybackInfo {
 }
 
 impl PlaybackMediaSource {
+    pub(crate) fn playback_item_id<'a>(&'a self, requested_item_id: &'a str) -> &'a str {
+        self.item_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(requested_item_id)
+    }
+
     pub fn direct_stream_url(&self) -> Result<&str> {
         self.direct_stream_url
             .as_deref()
@@ -361,12 +397,15 @@ fn validate_report_ids(item_id: &str, media_source_id: &str) -> Result<()> {
     validate_media_source_id(media_source_id)
 }
 
-fn add_playback_info_query(url: &mut Url, media_source_id: &str, user_id: &str) {
-    url.query_pairs_mut()
+fn add_playback_info_query(url: &mut Url, media_source_id: Option<&str>, user_id: &str) {
+    let mut query = url.query_pairs_mut();
+    query
         .append_pair("AutoOpenLiveStream", "false")
-        .append_pair("IsPlayback", "false")
-        .append_pair("MediaSourceId", media_source_id)
-        .append_pair("UserId", user_id);
+        .append_pair("IsPlayback", "false");
+    if let Some(media_source_id) = media_source_id {
+        query.append_pair("MediaSourceId", media_source_id);
+    }
+    query.append_pair("UserId", user_id);
 }
 
 #[cfg(test)]
@@ -422,12 +461,49 @@ mod tests {
     fn builds_playback_info_url() {
         let mut url =
             crate::emby::api_url(&endpoint(), &["Items", "795341", "PlaybackInfo"]).unwrap();
-        add_playback_info_query(&mut url, "mediasource_795341", "user-1");
+        add_playback_info_query(&mut url, Some("mediasource_795341"), "user-1");
 
         assert_eq!(
             url.as_str(),
             "https://example.com/emby/Items/795341/PlaybackInfo?AutoOpenLiveStream=false&IsPlayback=false&MediaSourceId=mediasource_795341&UserId=user-1"
         );
+    }
+
+    #[test]
+    fn loads_all_playback_versions_for_original_item_without_source_filter() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let body = serde_json::json!({"MediaSources": [
+                {"Id": "source-2160", "ItemId": "1193754", "Name": "2160p", "Type": "Grouping",
+                    "MediaStreams": [{"Type": "Subtitle", "Index": 3, "DisplayTitle": "Chinese"}]},
+                {"Id": "source-1080", "ItemId": "824018", "Name": "1080p", "Type": "Default"}
+            ]})
+            .to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            request
+        });
+        let server = server_with_endpoint(ServerEndpoint {
+            protocol: Protocol::Http,
+            address: "127.0.0.1".into(),
+            port,
+            path: String::new(),
+        });
+        let sources = EmbyClient::new("test".into())
+            .unwrap()
+            .playback_media_sources(&server, "824018")
+            .unwrap();
+        let request = server_thread.join().unwrap();
+        let target = request.lines().next().unwrap();
+        assert!(target.starts_with("POST /emby/Items/824018/PlaybackInfo?"));
+        assert!(!target.contains("MediaSourceId"));
+        assert!(target.contains("IsPlayback=false"));
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].name.as_deref(), Some("2160p"));
+        assert_eq!(sources[0].item_id.as_deref(), Some("1193754"));
+        assert_eq!(sources[0].subtitle_streams()[0].index, Some(3));
     }
 
     #[test]
@@ -639,9 +715,29 @@ mod tests {
     }
 
     #[test]
+    fn playback_source_uses_its_item_id_and_keeps_compatibility_when_missing() {
+        for (item_id, expected) in [
+            (Some("version-2160p"), "version-2160p"),
+            (Some(" "), "episode-group"),
+            (None, "episode-group"),
+        ] {
+            let info: PlaybackInfo = serde_json::from_value(serde_json::json!({
+                "MediaSources": [{
+                    "Id": "opaque-source-id", "ItemId": item_id,
+                    "DirectStreamUrl": "/video.mkv"
+                }]
+            }))
+            .unwrap();
+            let source = info.direct_stream_source_for("opaque-source-id").unwrap();
+            assert_eq!(source.playback_item_id("episode-group"), expected);
+        }
+    }
+
+    #[test]
     fn rejects_missing_direct_stream_url() {
         let playback_info = PlaybackInfo {
             media_sources: vec![PlaybackMediaSource {
+                item_id: None,
                 id: Some("source-1".to_string()),
                 size: None,
                 direct_stream_url: None,

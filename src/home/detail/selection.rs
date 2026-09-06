@@ -91,12 +91,8 @@ impl HomeContent {
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
-        let source_count = detail
-            .selected_playback_item()
-            .and_then(|item| item.media_sources.as_ref())
-            .map(Vec::len)
-            .unwrap_or(0);
-        if source_count == 0 {
+        let source_count = detail.selected_media_sources().map(<[_]>::len).unwrap_or(0);
+        if source_count == 0 || detail.video_sources_loading() {
             return;
         }
 
@@ -129,9 +125,11 @@ impl HomeContent {
 
         let opening = detail.open_select != Some(SeriesDetailSelectKind::Subtitle);
         if opening {
-            detail
-                .subtitle_scroll_handle
-                .scroll_to_item(detail.selected_subtitle_index().unwrap_or(0));
+            detail.subtitle_scroll_handle.scroll_to_item(
+                detail
+                    .selected_subtitle_index(PlaybackLanguagePreferences::get(cx).subtitle)
+                    .unwrap_or(0),
+            );
         }
         detail.open_select = opening.then_some(SeriesDetailSelectKind::Subtitle);
         cx.notify();
@@ -145,23 +143,7 @@ impl HomeContent {
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
-        let source_count = detail
-            .selected_playback_item()
-            .and_then(|item| item.media_sources.as_ref())
-            .map(Vec::len)
-            .unwrap_or(0);
-        if index >= source_count {
-            return;
-        }
-
-        detail.selected_media_source_index = Some(index);
-        detail.selected_subtitle_index = None;
-        detail
-            .subtitle_scroll_handle
-            .set_offset(point(px(0.0), px(0.0)));
-        detail.open_select = None;
-        detail.reset_playback_request();
-        detail.sync_media_source_selection();
+        detail.select_media_source(index);
         cx.notify();
     }
 

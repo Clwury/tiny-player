@@ -1,4 +1,5 @@
 use super::*;
+use crate::player::PlaybackLanguagePreferences;
 
 impl HomeContent {
     pub(super) fn render_series_detail_controls(
@@ -8,7 +9,8 @@ impl HomeContent {
     ) -> impl IntoElement {
         let theme = theme::get(cx);
         let video_label = detail.selected_media_source_label();
-        let subtitle_label = detail.selected_subtitle_label();
+        let subtitle_language = PlaybackLanguagePreferences::get(cx).subtitle;
+        let subtitle_label = detail.selected_subtitle_label(subtitle_language);
         let play = cx.listener(Self::play_selected_media);
         let toggle_video = cx.listener(Self::toggle_series_media_source_select);
         let toggle_subtitle = cx.listener(Self::toggle_series_subtitle_select);
@@ -23,10 +25,7 @@ impl HomeContent {
             )
             .is_some_and(|data| data.is_favorite);
         let favorite_pending = self.favorite_is_pending(&detail.series_id);
-        let media_sources = detail
-            .selected_playback_item()
-            .and_then(|item| item.media_sources.as_deref())
-            .unwrap_or_default();
+        let media_sources = detail.selected_media_sources().unwrap_or_default();
         let source_count = media_sources.len();
         let selected_source_index = detail.selected_media_source_index();
         let subtitle_streams = detail
@@ -34,12 +33,13 @@ impl HomeContent {
             .map(|source| source.subtitle_streams())
             .unwrap_or_default();
         let subtitle_count = subtitle_streams.len();
-        let selected_subtitle_index = detail.selected_subtitle_index();
+        let selected_subtitle_index = detail.selected_subtitle_index(subtitle_language);
         let media_source_select_open =
             detail.open_select == Some(SeriesDetailSelectKind::MediaSource) && source_count > 0;
         let subtitle_select_open =
             detail.open_select == Some(SeriesDetailSelectKind::Subtitle) && subtitle_count > 0;
         let can_play = !detail.playback_loading
+            && !detail.video_sources_loading()
             && detail.selected_playback_item().is_some()
             && detail
                 .selected_media_source()
@@ -97,11 +97,7 @@ impl HomeContent {
                                     "icons/heart.svg"
                                 })
                                 .size(px(14.0))
-                                .text_color(if favorite {
-                                    theme.error
-                                } else {
-                                    theme.foreground
-                                }),
+                                .text_color(theme.foreground),
                         )
                         .when(!favorite_pending, |this| {
                             this.cursor_pointer()
@@ -123,9 +119,14 @@ impl HomeContent {
                             div()
                                 .relative()
                                 .child(
-                                    detail_select_box("视频", video_label, source_count > 0, cx)
-                                        .id("series-detail-video-select")
-                                        .on_click(toggle_video),
+                                    detail_select_box(
+                                        "视频",
+                                        video_label,
+                                        source_count > 0 && !detail.video_sources_loading(),
+                                        cx,
+                                    )
+                                    .id("series-detail-video-select")
+                                    .on_click(toggle_video),
                                 )
                                 .when(media_source_select_open, |this| {
                                     this.child(

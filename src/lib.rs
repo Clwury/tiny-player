@@ -55,6 +55,7 @@ pub fn run() {
                     Some(format!("加载服务器缓存失败：{error}").into()),
                 ),
             };
+            theme::set(cache.color_theme, cx);
             let window_size = restored_window_size(&cache);
             let bounds = Bounds::centered(
                 None,

@@ -40,7 +40,10 @@ pub use request::{
     EmbyPlaybackContext, PlaybackQueue, PlaybackQueueItem, PlaybackRequest,
     playback_initial_position_seconds,
 };
-pub(crate) use request::{playback_audio_tracks_for_source, playback_subtitle_tracks_for_source};
+pub(crate) use request::{
+    playback_audio_tracks_for_source, playback_subtitle_tracks_for_source,
+    preferred_playback_track_selection,
+};
 pub use session::{PlaybackStateUpdate, PlaybackStopCompletion, PlaybackStopResult};
 
 use progress::{

@@ -13,6 +13,7 @@ mod render;
 mod resume_actions;
 mod search;
 mod sidebar;
+mod video_version;
 mod visible_row;
 mod workspace_render;
 
@@ -134,6 +135,7 @@ struct HomeContent {
     search: SearchState,
     search_input: Entity<Editor>,
     user_data_overrides: HashMap<String, UserItemData>,
+    played_video_versions: HashMap<String, video_version::VideoVersion>,
     user_data_revision: u64,
     user_data_item_revisions: HashMap<String, u64>,
     favorite_requests: HashSet<String>,
@@ -227,6 +229,7 @@ impl HomeContent {
             search: SearchState::default(),
             search_input,
             user_data_overrides: HashMap::new(),
+            played_video_versions: HashMap::new(),
             user_data_revision: 0,
             user_data_item_revisions: HashMap::new(),
             favorite_requests: HashSet::new(),

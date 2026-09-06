@@ -64,12 +64,16 @@ impl PlaybackQueue {
         format!("playlistItem{index}")
     }
 
-    pub fn report_items(&self) -> Vec<crate::emby::PlaybackQueueReportItem> {
+    pub fn report_items(&self, playing_item_id: &str) -> Vec<crate::emby::PlaybackQueueReportItem> {
         self.items
             .iter()
             .enumerate()
             .map(|(index, item)| crate::emby::PlaybackQueueReportItem {
-                id: item.item_id.clone(),
+                id: if index == self.current_index {
+                    playing_item_id.to_string()
+                } else {
+                    item.item_id.clone()
+                },
                 playlist_item_id: Self::playlist_item_id(index),
             })
             .collect()
@@ -214,9 +218,10 @@ pub(crate) fn playback_subtitle_tracks_for_source(
         .collect()
 }
 
-pub(crate) fn default_playback_track_selection(
+pub(crate) fn preferred_playback_track_selection(
     source: &crate::emby::MediaSource,
     subtitle_tracks: &[PlaybackTrack],
+    languages: crate::player::PlaybackLanguagePreferences,
 ) -> PlaybackTrackSelection {
     let default_audio_stream_index = source.audio_streams().into_iter().find_map(|stream| {
         stream
@@ -224,14 +229,19 @@ pub(crate) fn default_playback_track_selection(
             .and_then(|index| usize::try_from(index).ok())
             .filter(|_| stream.is_default.unwrap_or(false))
     });
-    let audio_stream_index = default_audio_stream_index.or_else(|| {
-        source
-            .audio_streams()
-            .into_iter()
-            .find_map(|stream| stream.index.and_then(|index| usize::try_from(index).ok()))
-    });
-    let selected_subtitle = source
-        .preferred_subtitle_stream_position()
+    let audio_stream_index = languages
+        .audio
+        .matching_audio_stream_index(source)
+        .or(default_audio_stream_index)
+        .or_else(|| {
+            source
+                .audio_streams()
+                .into_iter()
+                .find_map(|stream| stream.index.and_then(|index| usize::try_from(index).ok()))
+        });
+    let selected_subtitle = languages
+        .subtitle
+        .preferred_subtitle_stream_position(source)
         .and_then(|position| {
             playback_subtitle_track_at_position(source, subtitle_tracks, position)
         });
@@ -340,8 +350,11 @@ mod tests {
 
         assert_eq!(queue.previous_index(), Some(0));
         assert_eq!(queue.next_index(), Some(2));
-        assert_eq!(queue.report_items()[1].id, "episode-2");
-        assert_eq!(queue.report_items()[1].playlist_item_id, "playlistItem1");
+        let reported_items = queue.report_items("episode-2-2160p");
+        assert_eq!(reported_items[0].id, "episode-1");
+        assert_eq!(reported_items[1].id, "episode-2-2160p");
+        assert_eq!(reported_items[1].playlist_item_id, "playlistItem1");
+        assert_eq!(queue.current().unwrap().item_id, "episode-2");
     }
 
     #[test]
@@ -375,6 +388,53 @@ mod tests {
             playback_initial_position_seconds(Some(120_000_000), None),
             12.0
         );
+    }
+
+    #[test]
+    fn language_preferences_select_actual_stream_indices_and_keep_external_subtitle_metadata() {
+        use crate::player::{PlaybackLanguagePreferences, TrackLanguage};
+        let source = serde_json::from_value(serde_json::json!({
+            "DefaultSubtitleStreamIndex": 5,
+            "MediaStreams": [
+                {"Index": 1, "Type": "Audio", "Language": "eng", "IsDefault": true},
+                {"Type": "Audio", "Language": "jpn", "IsDefault": true},
+                {"Index": 4, "Type": "Audio", "Language": "jpn"},
+                {"Index": 5, "Type": "Subtitle", "Language": "eng"},
+                {"Type": "Subtitle", "Language": "chs"},
+                {"Index": 9, "Type": "Subtitle", "Language": "zho", "DisplayTitle": "简体中文", "IsExternal": true, "Codec": "ass"}
+            ]
+        })).unwrap();
+        let tracks =
+            playback_subtitle_tracks_for_source(&source, &debug_server(), "episode-1", "source-1");
+        let languages = PlaybackLanguagePreferences {
+            audio: TrackLanguage::Japanese,
+            subtitle: TrackLanguage::ChineseSimplified,
+        };
+        let selection = preferred_playback_track_selection(&source, &tracks, languages);
+        assert_eq!(selection.audio_stream_index, Some(4));
+        assert_eq!(selection.default_audio_stream_index, Some(1));
+        assert_eq!(selection.subtitle_stream_index, Some(9));
+        assert_eq!(selection.subtitle_codec.as_deref(), Some("ass"));
+        assert!(
+            selection
+                .subtitle_external_url
+                .as_deref()
+                .unwrap()
+                .contains("/Subtitles/9/")
+        );
+
+        for language in [TrackLanguage::Default, TrackLanguage::Russian] {
+            let selection = preferred_playback_track_selection(
+                &source,
+                &tracks,
+                PlaybackLanguagePreferences {
+                    audio: language,
+                    subtitle: language,
+                },
+            );
+            assert_eq!(selection.audio_stream_index, Some(1));
+            assert_eq!(selection.subtitle_stream_index, Some(5));
+        }
     }
 
     #[test]
@@ -440,6 +500,7 @@ mod tests {
     fn default_subtitle_selection_skips_streams_without_indices() {
         let source = MediaSource {
             id: Some("source-1".to_string()),
+            item_id: None,
             name: None,
             path: None,
             source_type: None,
@@ -481,7 +542,7 @@ mod tests {
         let tracks =
             playback_subtitle_tracks_for_source(&source, &debug_server(), "episode-1", "source-1");
 
-        let selection = default_playback_track_selection(&source, &tracks);
+        let selection = preferred_playback_track_selection(&source, &tracks, Default::default());
 
         assert_eq!(selection.subtitle_stream_index, Some(7));
     }

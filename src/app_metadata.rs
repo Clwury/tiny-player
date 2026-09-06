@@ -18,6 +18,10 @@ pub(crate) fn cache_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.cache_dir().to_path_buf())
 }
 
+pub(crate) fn default_playback_cache_dir() -> PathBuf {
+    std::env::temp_dir().join(APP_ID)
+}
+
 fn project_dirs() -> Result<ProjectDirs> {
     ProjectDirs::from(PROJECT_QUALIFIER, PROJECT_ORGANIZATION, APP_NAME)
         .ok_or_else(|| anyhow!("无法定位 Tiny Player 用户目录"))

@@ -354,6 +354,9 @@ pub struct Editor {
     digits_only: bool,
     max_chars: Option<usize>,
     borderless: bool,
+    compact: bool,
+    centered: bool,
+    input_height: Pixels,
     clearable: bool,
     /// Render a password visibility control in the editor's suffix slot.
     mask_toggle: bool,
@@ -482,6 +485,9 @@ impl Editor {
             digits_only: false,
             max_chars: None,
             borderless: false,
+            compact: false,
+            centered: false,
+            input_height: px(34.0),
             clearable: false,
             mask_toggle: false,
             history: Vec::new(),
@@ -549,6 +555,23 @@ impl Editor {
 
     pub fn borderless(mut self) -> Self {
         self.borderless = true;
+        self
+    }
+
+    /// Match Zed's compact settings controls without changing other editors.
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self.input_height = px(28.0);
+        self
+    }
+
+    pub fn height(mut self, height: Pixels) -> Self {
+        self.input_height = height;
+        self
+    }
+
+    pub fn centered(mut self) -> Self {
+        self.centered = true;
         self
     }
 
@@ -1548,7 +1571,11 @@ impl Element for EditorElement {
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
 
-        let scroll_offset = if raw_content.is_empty() {
+        let scroll_offset = if input.centered && line.width < bounds.size.width {
+            // Keep the same offset for painting, cursor placement, selection and
+            // mouse hit testing. A negative offset centers a short numeric value.
+            (line.width - bounds.size.width) / 2.0
+        } else if raw_content.is_empty() {
             px(0.0)
         } else {
             Editor::scroll_offset_for_cursor(
@@ -1734,13 +1761,13 @@ impl Render for Editor {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .items_center()
-            .h(px(34.0))
+            .h(self.input_height)
             .w_full()
-            .rounded(px(8.0))
+            .rounded(px(if self.compact { 6.0 } else { 8.0 }))
             .border_1()
             .border_color(border_color)
             .bg(theme.input_background)
-            .px_2()
+            .px(px(if self.compact { 4.0 } else { 8.0 }))
             .gap_1()
             .text_color(theme.foreground)
             .text_sm()

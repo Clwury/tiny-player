@@ -29,6 +29,8 @@ pub(super) struct HomeSnapshot {
     pub(super) resume_items: Option<CachedSection<ResumeItems>>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(super) latest_items_by_view: HashMap<String, CachedSection<UserItems>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(super) played_video_versions: HashMap<String, super::video_version::VideoVersion>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,6 +53,7 @@ impl HomeSnapshot {
             remote_server_id: server.server_id.clone(),
             user_id: server.user_id.clone(),
             saved_at_unix,
+            played_video_versions: HashMap::new(),
             user_views: user_views.map(|data| CachedSection::new(data, saved_at_unix)),
             resume_items: resume_items.map(|data| CachedSection::new(data, saved_at_unix)),
             latest_items_by_view: latest_items_by_view

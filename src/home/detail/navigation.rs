@@ -2,6 +2,10 @@ use super::*;
 
 use crate::home::navigation::{HomeRoot, HomeRoute};
 
+#[cfg(test)]
+#[path = "navigation_tests.rs"]
+mod tests;
+
 impl HomeContent {
     pub(in super::super) fn open_media_detail_by_id(
         &mut self,
@@ -114,7 +118,15 @@ impl HomeContent {
         Some(self.effective_resume_item(item).into_owned())
     }
 
-    pub(super) fn open_detail_state(&mut self, detail: SeriesDetailState, cx: &mut Context<Self>) {
+    pub(super) fn open_detail_state(
+        &mut self,
+        mut detail: SeriesDetailState,
+        cx: &mut Context<Self>,
+    ) {
+        detail.resume_video_version = detail
+            .resume_media_item_id()
+            .and_then(|id| self.played_video_versions.get(id))
+            .cloned();
         self.resume_item_context_menu = None;
         self.clear_all_notifications();
         if let Some(current) = self.series_detail.take() {
@@ -190,11 +202,15 @@ impl HomeContent {
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
-        if detail.playback_loading {
+        if detail.playback_loading || detail.video_sources_loading() {
             return;
         }
 
-        let selected = match selected_playback(detail, &self.current_server) {
+        let selected = match selected_playback(
+            detail,
+            &self.current_server,
+            PlaybackLanguagePreferences::get(cx),
+        ) {
             Ok(selected) => selected,
             Err(error) => {
                 let message: SharedString = error.into();
@@ -237,6 +253,7 @@ impl HomeContent {
                 .unwrap_or(task_media_source_id.as_str())
                 .to_string();
             Ok::<_, anyhow::Error>(ResolvedPlayback {
+                item_id: source.playback_item_id(&task_item_id).to_string(),
                 url: playback_url.to_string(),
                 http_headers,
                 content_length: source.size,
@@ -294,7 +311,7 @@ impl HomeContent {
                     emby: EmbyPlaybackContext {
                         client: self.emby_client.clone(),
                         server: self.current_server.clone(),
-                        item_id: selected.item_id,
+                        item_id: playback.item_id,
                         media_source_id: playback.media_source_id,
                         play_session_id: playback
                             .play_session_id
@@ -325,7 +342,7 @@ impl HomeContent {
             }
             let item_matches = detail
                 .selected_playback_item()
-                .is_some_and(|item| item.id.as_str() == selected.item_id.as_str());
+                .is_some_and(|item| item.id.as_str() == selected.list_item_id.as_str());
             let source_matches = detail
                 .selected_media_source()
                 .and_then(|source| source.id.as_deref())

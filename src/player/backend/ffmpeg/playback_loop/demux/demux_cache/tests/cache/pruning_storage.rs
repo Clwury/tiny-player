@@ -948,6 +948,10 @@ fn demux_packet_disk_cache_restores_packet_payload() {
     .expect("packet caches");
     let mut disk_cache = DemuxPacketDiskCache::new(1024, None, CacheUnlinkPolicy::WhenDone)
         .expect("disk cache creates");
+    let expected_dir = std::env::var("TINY_DEMUX_PACKET_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join(crate::app_metadata::APP_ID));
+    assert_eq!(disk_cache.path.parent(), Some(expected_dir.as_path()));
 
     cached
         .spill_to_disk(&mut disk_cache)

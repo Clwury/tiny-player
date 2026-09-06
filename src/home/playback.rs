@@ -18,24 +18,44 @@ impl HomeContent {
         update: PlaybackStateUpdate,
         cx: &mut Context<Self>,
     ) {
-        let previous = self.loaded_playback_user_data(&update.item_id).cloned();
+        let previous = self
+            .loaded_playback_user_data(&update.item_id)
+            .or_else(|| self.loaded_playback_user_data(&update.list_item_id))
+            .cloned();
         let user_data = playback_user_data_after_update(previous, &update);
 
+        if !update.failed && update.position_ticks > 0 && !update.media_source_id.is_empty() {
+            let version = super::video_version::VideoVersion {
+                source_id: update.media_source_id.clone(),
+                name: update.media_source_name.clone(),
+            };
+            for item_id in [&update.item_id, &update.list_item_id] {
+                self.played_video_versions
+                    .insert(item_id.clone(), version.clone());
+            }
+        }
+
         self.user_data_revision = self.user_data_revision.wrapping_add(1);
-        self.user_data_item_revisions
-            .insert(update.item_id.clone(), self.user_data_revision);
-        self.user_data_overrides
-            .insert(update.item_id.clone(), user_data.clone());
+        for item_id in [&update.item_id, &update.list_item_id] {
+            self.user_data_item_revisions
+                .insert(item_id.clone(), self.user_data_revision);
+            self.user_data_overrides
+                .insert(item_id.clone(), user_data.clone());
+        }
 
         if let Some(items) = self.resume_items.as_mut() {
             if update.ended {
-                items.items.retain(|item| item.id != update.item_id);
-            } else if let Some(item) = items
-                .items
-                .iter_mut()
-                .find(|item| item.id == update.item_id)
-            {
-                item.user_data = Some(user_data.clone());
+                items
+                    .items
+                    .retain(|item| item.id != update.item_id && item.id != update.list_item_id);
+            } else {
+                for item in items
+                    .items
+                    .iter_mut()
+                    .filter(|item| item.id == update.item_id || item.id == update.list_item_id)
+                {
+                    item.user_data = Some(user_data.clone());
+                }
             }
         }
         if let Some(detail) = self.series_detail.as_mut() {
@@ -206,6 +226,9 @@ mod tests {
     ) -> PlaybackStateUpdate {
         PlaybackStateUpdate {
             item_id: "episode-1".to_string(),
+            list_item_id: "episode-1".to_string(),
+            media_source_id: "source-1".to_string(),
+            media_source_name: None,
             series_id: Some("series-1".to_string()),
             season_id: Some("season-1".to_string()),
             position_ticks,

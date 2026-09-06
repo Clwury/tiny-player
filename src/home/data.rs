@@ -82,7 +82,10 @@ impl HomeContent {
         cx.notify();
     }
 
-    fn hydrate_home_snapshot(&mut self, snapshot: home_cache::HomeSnapshot) {
+    pub(super) fn hydrate_home_snapshot(&mut self, snapshot: home_cache::HomeSnapshot) {
+        for (item_id, version) in snapshot.played_video_versions {
+            self.played_video_versions.entry(item_id).or_insert(version);
+        }
         if let Some(section) = snapshot.user_views
             && self.user_views.is_none()
         {
@@ -687,7 +690,7 @@ impl HomeContent {
         .detach();
     }
 
-    fn home_snapshot(&self) -> home_cache::HomeSnapshot {
+    pub(super) fn home_snapshot(&self) -> home_cache::HomeSnapshot {
         let latest_items_by_view = self
             .user_view_items_rows
             .iter()
@@ -711,12 +714,14 @@ impl HomeContent {
                 }
             }
         }
-        home_cache::HomeSnapshot::new(
+        let mut snapshot = home_cache::HomeSnapshot::new(
             &self.current_server,
             self.user_views.clone(),
             resume_items,
             latest_items_by_view,
-        )
+        );
+        snapshot.played_video_versions = self.played_video_versions.clone();
+        snapshot
     }
 
     fn apply_user_data_overrides(&self, items: &mut [UserItem]) {

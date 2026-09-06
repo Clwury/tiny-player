@@ -292,6 +292,7 @@ impl MediaPerson {
 #[serde(rename_all = "PascalCase")]
 pub struct MediaSource {
     pub id: Option<String>,
+    pub item_id: Option<String>,
     pub name: Option<String>,
     pub path: Option<String>,
     #[serde(rename = "Type")]
@@ -302,6 +303,21 @@ pub struct MediaSource {
 }
 
 impl MediaSource {
+    pub(crate) fn playback_item_id<'a>(&'a self, list_item_id: &'a str) -> &'a str {
+        non_empty_str(self.item_id.as_deref()).unwrap_or(list_item_id)
+    }
+
+    pub(crate) fn matches_item_id(&self, item_id: &str) -> bool {
+        let item_id = item_id.trim();
+        if item_id.is_empty() {
+            return false;
+        }
+        self.item_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|source_item_id| source_item_id == item_id)
+    }
+
     pub fn display_name(&self, index: usize) -> String {
         self.name
             .as_deref()
@@ -664,6 +680,48 @@ mod tests {
         assert_eq!(source.name_label(0), "1080p - 8 Mbps");
         assert_eq!(subtitles[0].display_label(0), "简体中文");
         assert_eq!(subtitles[0].display_title_label(0), "简体中文");
+    }
+
+    #[test]
+    fn media_source_uses_version_item_id_for_playback() {
+        for (item_id, expected) in [
+            (Some("version-2160p"), "version-2160p"),
+            (Some(" "), "episode-group"),
+            (None, "episode-group"),
+        ] {
+            let source: MediaSource = serde_json::from_value(serde_json::json!({
+                "Id": "opaque-source-id", "ItemId": item_id
+            }))
+            .unwrap();
+            assert_eq!(source.playback_item_id("episode-group"), expected);
+        }
+    }
+
+    #[test]
+    fn media_source_matches_item_id_without_confusing_other_versions() {
+        for (json, matches) in [
+            (
+                serde_json::json!({"Id": "opaque-source", "ItemId": "795341"}),
+                true,
+            ),
+            (serde_json::json!({"Id": "795341"}), false),
+            (serde_json::json!({"Id": "mediasource_795341"}), false),
+            (
+                serde_json::json!({"Id": "mediasource_795341", "ItemId": " "}),
+                false,
+            ),
+            (
+                serde_json::json!({"Id": "mediasource_795341", "ItemId": "another-item"}),
+                false,
+            ),
+            (serde_json::json!({"Id": "mediasource_1795341"}), false),
+            (serde_json::json!({"Id": "source-1"}), false),
+            (serde_json::json!({}), false),
+        ] {
+            let source: MediaSource = serde_json::from_value(json).unwrap();
+            assert_eq!(source.matches_item_id("795341"), matches);
+            assert!(!source.matches_item_id(" "));
+        }
     }
 
     #[test]

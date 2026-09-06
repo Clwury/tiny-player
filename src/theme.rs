@@ -2,13 +2,46 @@ use std::collections::HashMap;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use gpui::{App, Global, Hsla, Pixels, hsla, px};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-const DEFAULT_THEME_NAME: &str = "Catppuccin Mocha";
 const DEFAULT_THEME_JSON: &str = include_str!("../themes/catppuccin.json");
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorTheme {
+    Latte,
+    Frappe,
+    Macchiato,
+    #[default]
+    #[serde(other)]
+    Mocha,
+}
+
+impl ColorTheme {
+    pub const ALL: [Self; 4] = [Self::Latte, Self::Frappe, Self::Macchiato, Self::Mocha];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Latte => "Catppuccin Latte",
+            Self::Frappe => "Catppuccin Frappe",
+            Self::Macchiato => "Catppuccin Macchiato",
+            Self::Mocha => "Catppuccin Mocha",
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Latte => "theme-latte",
+            Self::Frappe => "theme-frappe",
+            Self::Macchiato => "theme-macchiato",
+            Self::Mocha => "theme-mocha",
+        }
+    }
+}
+
 pub struct TinyTheme {
+    pub selection: ColorTheme,
     pub background: Hsla,
     pub foreground: Hsla,
     pub title_bar: Hsla,
@@ -28,12 +61,25 @@ pub struct TinyTheme {
 impl Global for TinyTheme {}
 
 pub fn init(cx: &mut App) {
-    let theme = TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, DEFAULT_THEME_NAME)
-        .unwrap_or_else(|error| {
+    set(ColorTheme::default(), cx);
+}
+
+pub fn set(selection: ColorTheme, cx: &mut App) {
+    if cx
+        .try_global::<TinyTheme>()
+        .is_some_and(|theme| theme.selection == selection)
+    {
+        return;
+    }
+    let theme =
+        TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, selection).unwrap_or_else(|error| {
             debug!(%error, "failed to load bundled theme, falling back to built-in Mocha colors");
             TinyTheme::catppuccin_mocha_fallback()
         });
     cx.set_global(theme);
+    // Refresh every window, including cached child views, rather than only
+    // invalidating the settings dialog that initiated the change.
+    cx.refresh_windows();
 }
 
 pub fn get(cx: &App) -> &TinyTheme {
@@ -56,22 +102,22 @@ struct ThemeConfig {
 }
 
 impl TinyTheme {
-    fn from_theme_set_json(json: &str, preferred_name: &str) -> Result<Self> {
+    fn from_theme_set_json(json: &str, selection: ColorTheme) -> Result<Self> {
         let theme_set: ThemeSet = serde_json::from_str(json).context("解析主题 JSON 失败")?;
         let config = theme_set
             .themes
             .iter()
-            .find(|theme| theme.name == preferred_name)
-            .or_else(|| theme_set.themes.first())
-            .ok_or_else(|| anyhow!("主题 JSON 中没有可用主题"))?;
+            .find(|theme| theme.name == selection.name())
+            .ok_or_else(|| anyhow!("主题 JSON 中没有 {}", selection.name()))?;
 
-        Self::from_theme_config(config)
+        Self::from_theme_config(config, selection)
     }
 
-    fn from_theme_config(config: &ThemeConfig) -> Result<Self> {
+    fn from_theme_config(config: &ThemeConfig, selection: ColorTheme) -> Result<Self> {
         let fallback = Self::catppuccin_mocha_fallback();
 
         Ok(Self {
+            selection,
             background: color_or_any(config, &["background"], fallback.background)?,
             foreground: color_or_any(config, &["foreground"], fallback.foreground)?,
             title_bar: color_or_any(
@@ -128,6 +174,7 @@ impl TinyTheme {
 
     fn catppuccin_mocha_fallback() -> Self {
         Self {
+            selection: ColorTheme::Mocha,
             background: hex(0x1e1e2e),
             foreground: hex(0xcdd6f4),
             title_bar: hex(0x181825),
@@ -225,10 +272,79 @@ fn rgb_to_hsla(r: u8, g: u8, b: u8, alpha: f32) -> Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{
+        AppContext as _, Context, Entity, IntoElement, Render, StyleRefinement, Styled,
+        TestAppContext, Window, div,
+    };
+
+    #[test]
+    fn all_bundled_color_themes_load_their_own_palette() {
+        for (selection, background) in [
+            (ColorTheme::Latte, "#E5E9EF"),
+            (ColorTheme::Frappe, "#232634"),
+            (ColorTheme::Macchiato, "#1E2030"),
+            (ColorTheme::Mocha, "#181825"),
+        ] {
+            let theme = TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, selection).unwrap();
+            assert_eq!(theme.selection, selection);
+            assert_eq!(theme.background, parse_hex_color(background).unwrap());
+            assert_ne!(theme.foreground, theme.background);
+        }
+    }
+
+    struct ThemeSurface {
+        rendered_background: Option<Hsla>,
+    }
+
+    impl Render for ThemeSurface {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let background = get(cx).background;
+            self.rendered_background = Some(background);
+            div().size_full().bg(background)
+        }
+    }
+
+    struct ThemeWindow(Entity<ThemeSurface>);
+
+    impl Render for ThemeWindow {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+        }
+    }
+
+    #[gpui::test]
+    fn theme_changes_refresh_cached_views_in_every_open_window(cx: &mut TestAppContext) {
+        cx.update(init);
+        let windows: Vec<_> = (0..2)
+            .map(|_| {
+                cx.add_window(|_, cx| {
+                    ThemeWindow(cx.new(|_| ThemeSurface {
+                        rendered_background: None,
+                    }))
+                })
+            })
+            .collect();
+        cx.run_until_parked();
+        for selection in ColorTheme::ALL {
+            cx.update(|cx| set(selection, cx));
+            cx.run_until_parked();
+            let expected = cx.update(|cx| get(cx).background);
+            for window in &windows {
+                assert_eq!(
+                    window
+                        .read_with(cx, |root, cx| root.0.read(cx).rendered_background)
+                        .unwrap(),
+                    Some(expected)
+                );
+            }
+        }
+    }
 
     #[test]
     fn loads_mocha_from_theme_json() {
-        let theme = TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, DEFAULT_THEME_NAME).unwrap();
+        let theme = TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, ColorTheme::Mocha).unwrap();
 
         assert_eq!(theme.background, parse_hex_color("#181825").unwrap());
         assert_eq!(theme.title_bar, parse_hex_color("#11111B").unwrap());

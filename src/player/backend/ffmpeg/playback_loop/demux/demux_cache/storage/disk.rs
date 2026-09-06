@@ -10,6 +10,7 @@ use std::{
 #[cfg(test)]
 use super::AvPacket;
 use super::{CacheUnlinkPolicy, PlaybackCacheConfig};
+use crate::app_metadata::default_playback_cache_dir;
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxPacketDiskCache {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) file: Arc<File>,
@@ -45,7 +46,7 @@ impl DemuxPacketDiskCache {
                     .ok()
                     .map(PathBuf::from)
             })
-            .unwrap_or_else(env::temp_dir);
+            .unwrap_or_else(default_playback_cache_dir);
         if let Err(error) = std::fs::create_dir_all(&dir) {
             tracing::warn!(%error, path = %dir.display(), "failed to create demux packet cache directory");
             return None;

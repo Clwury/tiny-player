@@ -4,7 +4,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{app_metadata, player::PlaybackCacheConfig, server::CachedServer};
+use crate::{
+    app_metadata,
+    player::{PlaybackCacheConfig, PlaybackLanguagePreferences},
+    server::CachedServer,
+    theme::ColorTheme,
+};
 
 const CACHE_VERSION: u32 = 1;
 
@@ -19,6 +24,10 @@ pub struct ServerCache {
     /// `default` attribute keeps older cache files backward compatible.
     #[serde(default)]
     pub playback: PlaybackCacheConfig,
+    #[serde(default)]
+    pub color_theme: ColorTheme,
+    #[serde(default)]
+    pub track_languages: PlaybackLanguagePreferences,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +44,8 @@ impl ServerCache {
             servers: Vec::new(),
             window: None,
             playback: PlaybackCacheConfig::default(),
+            color_theme: ColorTheme::default(),
+            track_languages: PlaybackLanguagePreferences::default(),
         }
     }
 
@@ -251,6 +262,57 @@ mod tests {
     }
 
     #[test]
+    fn saves_and_restores_color_theme() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut cache = ServerCache::empty();
+        for selection in ColorTheme::ALL {
+            cache.color_theme = selection;
+            save_to(&cache, &path).unwrap();
+            assert_eq!(load_or_init_from(&path).unwrap().color_theme, selection);
+        }
+    }
+
+    #[test]
+    fn saves_and_restores_track_languages() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut cache = ServerCache::empty();
+        for language in crate::player::TrackLanguage::ALL {
+            cache.track_languages.audio = language;
+            cache.track_languages.subtitle = language;
+            save_to(&cache, &path).unwrap();
+            assert_eq!(
+                load_or_init_from(&path).unwrap().track_languages,
+                cache.track_languages
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_unknown_track_languages_preserve_other_settings() {
+        let mut json = serde_json::to_value(ServerCache::empty()).unwrap();
+        json["device_id"] = "existing-device".into();
+        json["track_languages"] = serde_json::json!({"audio": "unknown-language"});
+        let cache: ServerCache = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            cache.track_languages,
+            PlaybackLanguagePreferences::default()
+        );
+        assert_eq!(cache.device_id, "existing-device");
+    }
+
+    #[test]
+    fn unknown_color_theme_falls_back_without_discarding_server_settings() {
+        let mut json = serde_json::to_value(ServerCache::empty()).unwrap();
+        json["color_theme"] = "removed-theme".into();
+        json["device_id"] = "existing-device".into();
+        let cache: ServerCache = serde_json::from_value(json).unwrap();
+        assert_eq!(cache.color_theme, ColorTheme::Mocha);
+        assert_eq!(cache.device_id, "existing-device");
+    }
+
+    #[test]
     fn loads_cache_without_window_state() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("servers.json");
@@ -265,6 +327,11 @@ mod tests {
         assert_eq!(loaded.device_id, "device-local");
         assert_eq!(loaded.window_size(), None);
         assert_eq!(loaded.playback, PlaybackCacheConfig::default());
+        assert_eq!(loaded.color_theme, ColorTheme::Mocha);
+        assert_eq!(
+            loaded.track_languages,
+            PlaybackLanguagePreferences::default()
+        );
     }
 
     #[test]

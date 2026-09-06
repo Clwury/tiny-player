@@ -4,7 +4,7 @@ use crate::{
     server::CachedServer,
     ui::{
         add_server_dialog::AddServerDialogState,
-        playback_settings_dialog::PlaybackSettingsDialogState,
+        playback_settings_dialog::{PlaybackSettingsDialogState, SettingsChanged},
     },
 };
 
@@ -18,35 +18,30 @@ impl TinyApp {
         self.open_server_menu = None;
         self.clear_app_notifications();
         let config = self.cache.playback.clone();
-        self.playback_settings_dialog =
-            Some(cx.new(|cx| PlaybackSettingsDialogState::new(&config, cx)));
+        let dialog = cx.new(|cx| PlaybackSettingsDialogState::new(&config, cx));
+        cx.subscribe(&dialog, |app, dialog, _: &SettingsChanged, cx| {
+            app.cache.playback = dialog.read(cx).playback_config();
+            app.cache.color_theme = dialog.read(cx).color_theme();
+            app.cache.track_languages = dialog.read(cx).track_languages();
+            app.schedule_cache_save("自动保存设置失败", cx);
+        })
+        .detach();
+        if let Some(error_prefix) = self.pending_cache_save_error_prefix {
+            self.schedule_cache_save(error_prefix, cx);
+        }
+        self.playback_settings_dialog = Some(dialog);
         cx.notify();
     }
 
     pub(super) fn close_playback_settings_dialog(
         &mut self,
         _: &gpui::ClickEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        window.blur(cx);
+        self.flush_scheduled_cache_save(cx);
         self.playback_settings_dialog = None;
-        cx.notify();
-    }
-
-    pub(super) fn submit_playback_settings_dialog(
-        &mut self,
-        _: &gpui::ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(dialog) = self.playback_settings_dialog.clone() else {
-            return;
-        };
-
-        let config = dialog.update(cx, |dialog, cx| dialog.submit(cx));
-        self.cache.playback = config;
-        self.playback_settings_dialog = None;
-        self.schedule_cache_save("保存播放设置失败", cx);
         cx.notify();
     }
 

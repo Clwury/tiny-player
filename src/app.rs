@@ -48,6 +48,8 @@ pub struct TinyApp {
     last_cache_save_activity: Option<Instant>,
     cache_save_task_active: bool,
     cache_save_task: Task<()>,
+    #[cfg(test)]
+    cache_save_path: Option<std::path::PathBuf>,
     page: Page,
 }
 
@@ -67,6 +69,7 @@ impl TinyApp {
         startup_error: Option<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
+        cache.track_languages.apply(cx);
         let servers = cache.servers.clone();
         let window_persistence_enabled = startup_error.is_none();
         let item_counts = item_counts::cached_item_counts_by_server(&servers);
@@ -75,6 +78,13 @@ impl TinyApp {
             Err(error) => (None, Some(format!("{error}").into())),
         };
         let initial_error = startup_error.or(emby_client_error);
+        cx.on_release(|app, _| app.save_pending_cache_on_release())
+            .detach();
+        cx.on_app_quit(|app, cx| {
+            app.flush_scheduled_cache_save(cx);
+            async {}
+        })
+        .detach();
         let mut app = Self {
             add_server_dialog: None,
             playback_settings_dialog: None,
@@ -94,6 +104,8 @@ impl TinyApp {
             last_cache_save_activity: None,
             cache_save_task_active: false,
             cache_save_task: Task::ready(()),
+            #[cfg(test)]
+            cache_save_path: None,
             page: Page::Servers,
         };
         if let Some(error) = initial_error {

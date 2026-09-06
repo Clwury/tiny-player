@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::player::backend::CacheUnlinkPolicy;
+use crate::{app_metadata::default_playback_cache_dir, player::backend::CacheUnlinkPolicy};
 
 use super::{HttpCachedByteRange, HttpDiskCache};
 
@@ -18,7 +18,7 @@ impl HttpDiskCache {
     ) -> Option<Self> {
         let dir = configured_dir
             .or_else(|| env::var("TINY_HTTP_CACHE_DIR").ok().map(PathBuf::from))
-            .unwrap_or_else(env::temp_dir);
+            .unwrap_or_else(default_playback_cache_dir);
         if let Err(error) = std::fs::create_dir_all(&dir) {
             tracing::warn!(%error, path = %dir.display(), "failed to create HTTP disk cache directory");
             return None;
