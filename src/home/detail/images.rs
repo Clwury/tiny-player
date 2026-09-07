@@ -6,10 +6,9 @@ use crate::emby::{
     EmbyImageRequest, EmbyImageType, ImageQuality, MediaItem, MediaItems, MediaPerson,
 };
 
-use super::super::HomeContent;
+use super::super::{HomeContent, data::EPISODE_CARD_IMAGE_MAX_WIDTH};
 
 const SERIES_BACKDROP_IMAGE_MAX_WIDTH: u32 = 3000;
-const SERIES_EPISODE_IMAGE_MAX_WIDTH: u32 = 640;
 const SERIES_PERSON_IMAGE_MAX_WIDTH: u32 = 320;
 
 impl HomeContent {
@@ -87,7 +86,7 @@ fn episode_primary_image_request(episode: &MediaItem) -> Option<EmbyImageRequest
     Some(
         EmbyImageRequest::new(episode.id.clone(), EmbyImageType::Primary)
             .with_tag(Some(episode.primary_image_tag()?.to_string()))
-            .with_max_width(SERIES_EPISODE_IMAGE_MAX_WIDTH)
+            .with_max_width(EPISODE_CARD_IMAGE_MAX_WIDTH)
             .with_quality(ImageQuality::DEFAULT),
     )
 }

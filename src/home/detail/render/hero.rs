@@ -172,10 +172,11 @@ impl HomeContent {
             .item
             .as_ref()
             .and_then(|item| self.image_path_for_series_logo(item));
-        let show_title_fallback = detail
-            .item
-            .as_ref()
-            .is_some_and(|item| item.logo_image_tag().is_none());
+        let show_title_fallback = !detail.is_movie()
+            && detail
+                .item
+                .as_ref()
+                .is_some_and(|item| item.logo_image_tag().is_none());
         let display_title = detail
             .item
             .as_ref()
@@ -226,40 +227,52 @@ impl HomeContent {
                     .flex_col()
                     .gap_3()
                     .text_color(theme.foreground)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .w_full()
-                            .gap_2()
-                            .when_some(logo_path.clone(), |this, path| {
-                                this.child(img(path).w(px(200.0)))
-                            })
-                            .when(show_title_fallback, |this| {
-                                this.child(
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .whitespace_normal()
-                                        .text_lg()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child(display_title),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .h(px(24.0))
-                            .w_full()
-                            .max_w(px(760.0))
-                            .items_center()
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_base()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .when_some(episode_line, |this, line| this.child(line)),
-                    )
+                    .when(logo_path.is_some() || show_title_fallback, |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .w_full()
+                                .gap_2()
+                                .when_some(logo_path.clone(), |this, path| {
+                                    this.child(
+                                        img(path)
+                                            .debug_selector(|| "series-detail-logo".to_string())
+                                            .w(px(200.0)),
+                                    )
+                                })
+                                .when(show_title_fallback, |this| {
+                                    this.child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .whitespace_normal()
+                                            .text_lg()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .child(display_title),
+                                    )
+                                }),
+                        )
+                    })
+                    // Reserve the episode line before asynchronous episode data arrives.
+                    // This bottom-aligned stack must keep the logo at the same height.
+                    .when(detail.is_series(), |this| {
+                        this.child(
+                            div()
+                                .debug_selector(|| "series-detail-episode-line".to_string())
+                                .flex()
+                                .flex_none()
+                                .h(px(24.0))
+                                .w_full()
+                                .max_w(px(760.0))
+                                .items_center()
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_base()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .when_some(episode_line, |this, line| this.child(line)),
+                        )
+                    })
                     .when_some(detail.item.as_ref(), |this, item| {
                         this.child(self.render_series_detail_metadata_row(item, cx))
                     }),

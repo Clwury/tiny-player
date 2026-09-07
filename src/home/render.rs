@@ -124,6 +124,7 @@ impl HomeContent {
         let is_detail = matches!(current, HomeRoute::Detail { .. });
         let is_library = matches!(current, HomeRoute::Library { .. });
         let is_favorites = current == &HomeRoute::Root(HomeRoot::Favorites);
+        let is_favorite_items = matches!(current, HomeRoute::FavoriteItems { .. });
         let is_search = current == &HomeRoute::Root(HomeRoot::Search);
         // Keep the cached dashboard layer mounted behind opaque workspaces so a
         // route transition back to Home can reuse its last layout and paint scene.
@@ -146,7 +147,7 @@ impl HomeContent {
         let show_main_scrollbar = main_scrollbar_is_visible(
             current,
             home_has_content,
-            !self.favorites.items.is_empty(),
+            self.favorites.has_items(),
             !self.search.query.is_empty() && !self.search.items.is_empty(),
         );
         let scroll_handle = self.current_scroll_handle();
@@ -201,6 +202,13 @@ impl HomeContent {
             .when(is_favorites && !has_authentication_error, |this| {
                 this.child(self.render_workspace_layer(
                     self.render_favorites_scrollable_content(window, cx),
+                    rounded_window,
+                    cx,
+                ))
+            })
+            .when(is_favorite_items && !has_authentication_error, |this| {
+                this.child(self.render_workspace_layer(
+                    self.render_favorite_items_content(window, cx),
                     rounded_window,
                     cx,
                 ))
@@ -325,6 +333,9 @@ impl HomeContent {
         match self.navigation.current() {
             HomeRoute::Root(HomeRoot::Home) => &self.home_scroll_handle,
             HomeRoute::Root(HomeRoot::Favorites) => &self.favorites.scroll_handle,
+            HomeRoute::FavoriteItems { item_type } => {
+                &self.favorites[*item_type].paged.scroll_handle
+            }
             HomeRoute::Root(HomeRoot::Search) => &self.search.scroll_handle,
             HomeRoute::Library { view_id, .. } => self
                 .libraries
@@ -373,14 +384,10 @@ impl HomeContent {
             self.home_effects.user_views.is_loading(),
             self.user_views_failed.is_some(),
         );
-        let show_resume_section = home_data_section_is_visible(
-            self.resume_items.is_some(),
-            self.resume_items
-                .as_ref()
-                .is_some_and(|items| !items.items.is_empty()),
-            self.home_effects.resume_items.is_loading(),
-            self.resume_items_failed.is_some(),
-        );
+        let show_resume_section = self
+            .resume_items
+            .as_ref()
+            .is_some_and(|items| !items.items.is_empty());
 
         div()
             .absolute()
@@ -453,22 +460,6 @@ impl HomeContent {
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
                                         .child("部分单集缺少剧集信息，暂时无法打开"),
-                                )
-                            },
-                        )
-                        .when(
-                            !self.home_effects.resume_items.is_loading()
-                                && self.resume_items_failed.is_none()
-                                && self
-                                    .resume_items
-                                    .as_ref()
-                                    .is_none_or(|items| items.items.is_empty()),
-                            |this| {
-                                this.child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme.muted_foreground)
-                                        .child("暂无继续观看内容"),
                                 )
                             },
                         ),
@@ -1035,18 +1026,19 @@ impl Render for HomeContent {
         let previous_window_size = self.last_window_size.replace(window_size_key);
         let window_size_changed = previous_window_size.is_some_and(|size| size != window_size_key);
         let measured_grid_columns = super::workspace_render::responsive_user_item_grid_columns(
-            super::workspace_render::user_item_grid_columns(window),
+            super::workspace_render::user_item_grid_columns(window, self.navigation.current()),
         );
         let current_route = self.navigation.current();
         let virtual_workspace_visible = matches!(
             current_route,
-            HomeRoute::Root(HomeRoot::Favorites | HomeRoot::Search)
+            HomeRoute::FavoriteItems { .. } | HomeRoute::Root(HomeRoot::Search)
         );
 
         // Bounds updates bypass cached view frames. Track the drag as one burst so
         // hidden dashboard work and automatic pagination stay out of the interactive
         // resize path until the window has been still for a short interval.
         if window_size_changed {
+            self.favorites.sync_previous_offsets();
             // Finish Home carousel motion before changing its viewport. Keeping
             // the previous animation range would also build cards that are no
             // longer visible for every subsequent resize frame.
@@ -1155,7 +1147,7 @@ fn home_carousel_overscan(resize_in_progress: bool) -> (usize, usize) {
     }
 }
 
-fn home_carousel_track(
+pub(super) fn home_carousel_track(
     track: gpui::Div,
     animation_id: impl Into<gpui::ElementId>,
     previous_offset: f32,
@@ -1206,7 +1198,9 @@ fn main_scrollbar_is_visible(
         HomeRoute::Root(HomeRoot::Home) => home_has_content,
         HomeRoute::Root(HomeRoot::Favorites) => favorites_has_content,
         HomeRoute::Root(HomeRoot::Search) => search_has_content,
-        HomeRoute::Library { .. } | HomeRoute::Detail { .. } => true,
+        HomeRoute::FavoriteItems { .. } | HomeRoute::Library { .. } | HomeRoute::Detail { .. } => {
+            true
+        }
     }
 }
 

@@ -108,8 +108,7 @@ impl HomeContent {
             }
         }
         self.favorites
-            .items
-            .iter()
+            .items()
             .find(|item| item.id == item_id)
             .and_then(|item| item.user_data.as_ref())
             .or_else(|| {

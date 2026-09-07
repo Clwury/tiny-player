@@ -297,11 +297,7 @@ fn detail_select_option<T>(
         } else {
             gpui::FontWeight::NORMAL
         })
-        .text_color(if selected {
-            theme.foreground
-        } else {
-            theme.muted_foreground
-        })
+        .text_color(theme.foreground)
         .bg(if selected {
             theme.secondary_hover
         } else {

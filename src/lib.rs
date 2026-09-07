@@ -13,12 +13,9 @@ mod ui;
 use std::rc::Rc;
 
 use app::TinyApp;
-use app_metadata::{APP_ID, APP_NAME};
+use app_metadata::APP_NAME;
 use assets::ProjectAssets;
-use gpui::{
-    App, AppContext, Application, Bounds, Global, Platform, TitlebarOptions,
-    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, px, size,
-};
+use gpui::{App, AppContext, Application, Bounds, Global, Platform, px, size};
 use storage::ServerCache;
 use ui::editor::Editor;
 
@@ -64,22 +61,11 @@ pub fn run() {
             );
 
             cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(
-                        px(MIN_WINDOW_WIDTH as f32),
-                        px(MIN_WINDOW_HEIGHT as f32),
-                    )),
-                    window_decorations: Some(WindowDecorations::Client),
-                    window_background: WindowBackgroundAppearance::Transparent,
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(APP_NAME.into()),
-                        appears_transparent: true,
-                        traffic_light_position: None,
-                    }),
-                    app_id: Some(APP_ID.to_string()),
-                    ..Default::default()
-                },
+                app::app_window_options(
+                    APP_NAME.into(),
+                    bounds,
+                    size(px(MIN_WINDOW_WIDTH as f32), px(MIN_WINDOW_HEIGHT as f32)),
+                ),
                 |_, cx| cx.new(|cx| TinyApp::new(cache, startup_error, cx)),
             )
             .unwrap();

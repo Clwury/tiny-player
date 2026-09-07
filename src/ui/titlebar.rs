@@ -126,6 +126,7 @@ fn button_base(id: &'static str, icon_path: SharedString, cx: &App) -> gpui::Sta
 
     div()
         .id(id)
+        .debug_selector(move || format!("window-control-{id}"))
         .flex()
         .size(px(24.0))
         .items_center()

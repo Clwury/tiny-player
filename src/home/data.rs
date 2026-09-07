@@ -24,6 +24,7 @@ use super::{
 
 const RESUME_CARD_IMAGE_MAX_WIDTH: u32 = 800;
 const HOME_ITEM_CARD_IMAGE_MAX_WIDTH: u32 = 400;
+pub(super) const EPISODE_CARD_IMAGE_MAX_WIDTH: u32 = 640;
 const HOME_ITEM_PAGE_LIMIT: u32 = 30;
 const HOME_LATEST_CONCURRENCY: usize = 4;
 const HOME_SNAPSHOT_SAVE_DEBOUNCE: Duration = Duration::from_millis(450);
@@ -548,6 +549,20 @@ impl HomeContent {
         }
     }
 
+    pub(super) fn ensure_favorite_items_images(
+        &mut self,
+        items: &UserItems,
+        cx: &mut Context<Self>,
+    ) {
+        for item in &items.items {
+            if item.item_type.as_deref() == Some("Episode") {
+                self.ensure_image(favorite_episode_image_request(item), cx);
+            } else {
+                self.ensure_user_item_image(item.image_source(), cx);
+            }
+        }
+    }
+
     pub(super) fn ensure_feed_user_items_images(
         &mut self,
         items: &UserItems,
@@ -781,6 +796,10 @@ impl HomeContent {
         )
     }
 
+    pub(super) fn image_path_for_favorite_episode(&self, item: &UserItem) -> Option<Arc<Path>> {
+        self.image_path_for_request(&favorite_episode_image_request(item))
+    }
+
     pub(super) fn image_path_for_request(&self, request: &EmbyImageRequest) -> Option<Arc<Path>> {
         self.image_loader
             .path_for_request(&self.current_server, request)
@@ -799,6 +818,15 @@ fn episode_user_item_image_request(source: UserItemImageSource<'_>) -> EmbyImage
         .with_tag(source.tag.map(ToString::to_string))
         .with_max_width(RESUME_CARD_IMAGE_MAX_WIDTH)
         .with_quality(ImageQuality::DEFAULT)
+}
+
+fn favorite_episode_image_request(item: &UserItem) -> EmbyImageRequest {
+    EmbyImageRequest::primary(
+        item.id.clone(),
+        item.primary_image_tag().map(str::to_string),
+    )
+    .with_max_width(EPISODE_CARD_IMAGE_MAX_WIDTH)
+    .with_quality(ImageQuality::DEFAULT)
 }
 
 fn resume_image_request(source: ResumeItemImageSource<'_>) -> EmbyImageRequest {
@@ -823,6 +851,21 @@ fn apply_user_data_overrides(
 mod tests {
     use super::*;
     use crate::emby::UserItemData;
+
+    #[test]
+    fn favorite_episodes_request_the_same_primary_cover_size_as_detail_cards() {
+        let item: UserItem = serde_json::from_value(serde_json::json!({
+            "Id": "episode-1", "Name": "Episode", "Type": "Episode",
+            "ImageTags": { "Primary": "primary-tag", "Thumb": "thumb-tag" },
+            "BackdropImageTags": ["backdrop-tag"]
+        }))
+        .unwrap();
+        let request = favorite_episode_image_request(&item);
+        assert_eq!(request.item_id, "episode-1");
+        assert_eq!(request.image_type, EmbyImageType::Primary);
+        assert_eq!(request.tag.as_deref(), Some("primary-tag"));
+        assert_eq!(request.max_width, Some(640));
+    }
 
     #[test]
     fn snapshot_items_receive_latest_user_data_overrides() {

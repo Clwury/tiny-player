@@ -46,6 +46,7 @@ pub struct TinyTheme {
     pub foreground: Hsla,
     pub title_bar: Hsla,
     pub title_bar_border: Hsla,
+    pub window_border: Hsla,
     pub secondary_hover: Hsla,
     pub input_background: Hsla,
     pub input_border: Hsla,
@@ -130,6 +131,7 @@ impl TinyTheme {
                 &["title_bar.border", "border"],
                 fallback.title_bar_border,
             )?,
+            window_border: color_or_any(config, &["border"], fallback.window_border)?,
             secondary_hover: color_or_any(
                 config,
                 &["secondary.hover.background", "secondary.active.background"],
@@ -179,6 +181,7 @@ impl TinyTheme {
             foreground: hex(0xcdd6f4),
             title_bar: hex(0x181825),
             title_bar_border: hex(0x313244),
+            window_border: hex(0x313244),
             secondary_hover: hsla(0.647, 0.20, 0.36, 0.55),
             input_background: hex(0x11111b),
             input_border: hex(0x45475a),
@@ -279,15 +282,16 @@ mod tests {
 
     #[test]
     fn all_bundled_color_themes_load_their_own_palette() {
-        for (selection, background) in [
-            (ColorTheme::Latte, "#E5E9EF"),
-            (ColorTheme::Frappe, "#232634"),
-            (ColorTheme::Macchiato, "#1E2030"),
-            (ColorTheme::Mocha, "#181825"),
+        for (selection, background, border) in [
+            (ColorTheme::Latte, "#E5E9EF", "#CCD0DA"),
+            (ColorTheme::Frappe, "#232634", "#3e4255"),
+            (ColorTheme::Macchiato, "#1E2030", "#494d64"),
+            (ColorTheme::Mocha, "#181825", "#313244"),
         ] {
             let theme = TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, selection).unwrap();
             assert_eq!(theme.selection, selection);
             assert_eq!(theme.background, parse_hex_color(background).unwrap());
+            assert_eq!(theme.window_border, parse_hex_color(border).unwrap());
             assert_ne!(theme.foreground, theme.background);
         }
     }

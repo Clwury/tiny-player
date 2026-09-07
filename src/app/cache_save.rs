@@ -97,7 +97,7 @@ mod tests {
     use gpui::{AppContext as _, Modifiers, TestAppContext, VisualTestContext, px, size};
 
     #[gpui::test]
-    fn settings_dialog_changes_reach_disk_and_survive_reopening(cx: &mut TestAppContext) {
+    fn settings_window_changes_reach_disk_and_survive_reopening(cx: &mut TestAppContext) {
         use crate::player::{PlaybackLanguagePreferences, TrackLanguage};
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("servers.json");
@@ -105,17 +105,33 @@ mod tests {
             theme::init(cx);
             Editor::bind_keys(cx);
         });
-        let (app, cx) = cx.add_window_view(|_, cx| {
+        let (app, main_cx) = cx.add_window_view(|_, cx| {
             let mut app = TinyApp::new(ServerCache::empty(), None, cx);
             app.cache_save_path = Some(path.clone());
             app.window_persistence_enabled = false;
-            app.open_playback_settings_dialog(cx);
             app
         });
-        cx.simulate_resize(size(px(1100.0), px(720.0)));
+        main_cx.simulate_resize(size(px(1100.0), px(720.0)));
+        app.update(main_cx, |app, cx| app.open_settings_window(cx));
+        let settings_window = app.read_with(main_cx, |app, _| app.settings_window.unwrap());
+        let cx = &mut VisualTestContext::from_window(settings_window.into(), &main_cx.cx);
+        cx.simulate_resize(size(px(960.0), px(680.0)));
         cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 2);
+        assert!(main_cx.debug_bounds("playback-settings-panel").is_none());
+        app.update(main_cx, |app, cx| app.open_settings_window(cx));
+        assert_eq!(
+            app.read_with(main_cx, |app, _| app.settings_window),
+            Some(settings_window)
+        );
+        assert_eq!(cx.windows().len(), 2);
         let click = |cx: &mut VisualTestContext, selector| {
             let position = cx.debug_bounds(selector).unwrap().center();
+            if selector == "window-control-close" {
+                cx.simulate_mouse_down(position, gpui::MouseButton::Left, Modifiers::default());
+                cx.run_until_parked();
+                return;
+            }
             cx.simulate_click(position, Modifiers::default());
             cx.run_until_parked();
             for _ in 0..2 {
@@ -166,43 +182,61 @@ mod tests {
             cx.update(|_, cx| theme::get(cx).selection),
             ColorTheme::Latte
         );
-        click(cx, "close-playback-settings");
+        click(cx, "window-control-close");
         let saved = storage::load_or_init_from(&path).unwrap();
         assert_eq!(saved.color_theme, ColorTheme::Latte);
         assert_eq!(saved.playback.cache_secs, 42.5);
         assert_eq!(saved.track_languages, languages);
-        assert!(app.read_with(cx, |app, _| app.playback_settings_dialog.is_none()));
+        assert!(app.read_with(cx, |app, _| app.settings_window.is_none()));
 
-        app.update(cx, |app, cx| app.open_playback_settings_dialog(cx));
+        app.update(cx, |app, cx| app.open_settings_window(cx));
+        assert_eq!(cx.windows().len(), 2);
+        let reopened = app.read_with(cx, |app, _| app.settings_window.unwrap());
+        assert_ne!(reopened, settings_window);
+        reopened
+            .read_with(cx, |window, cx| {
+                let settings = window.settings.read(cx);
+                assert_eq!(settings.track_languages(), languages);
+                assert_eq!(settings.color_theme(), ColorTheme::Latte);
+                assert_eq!(settings.playback_config().cache_secs, 42.5);
+            })
+            .unwrap();
+        // The window manager's close path also clears the handle and preserves the main window.
+        reopened
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(app.read_with(cx, |app, _| app.settings_window.is_none()));
+        assert_eq!(cx.windows().len(), 1);
+    }
+
+    #[gpui::test]
+    fn closing_main_window_closes_settings_and_flushes_pending_changes(cx: &mut TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        cx.update(theme::init);
+        let (app, cx) = cx.add_window_view(|_, cx| {
+            let mut app = TinyApp::new(ServerCache::empty(), None, cx);
+            app.cache_save_path = Some(path.clone());
+            app.window_persistence_enabled = false;
+            app
+        });
+        app.update(cx, |app, cx| {
+            app.open_settings_window(cx);
+            app.cache.playback.cache_secs = 42.5;
+            app.schedule_cache_save("自动保存设置失败", cx);
+        });
+        assert_eq!(cx.windows().len(), 2);
+        assert!(!path.exists());
+        drop(app);
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        assert!(cx.windows().is_empty());
         assert_eq!(
-            app.read_with(cx, |app, cx| {
-                app.playback_settings_dialog
-                    .as_ref()
-                    .unwrap()
-                    .read(cx)
-                    .track_languages()
-            }),
-            languages
-        );
-        assert_eq!(
-            app.read_with(cx, |app, cx| {
-                app.playback_settings_dialog
-                    .as_ref()
-                    .unwrap()
-                    .read(cx)
-                    .color_theme()
-            }),
-            ColorTheme::Latte
-        );
-        assert_eq!(
-            app.read_with(cx, |app, cx| {
-                app.playback_settings_dialog
-                    .as_ref()
-                    .unwrap()
-                    .read(cx)
-                    .playback_config()
-                    .cache_secs
-            }),
+            storage::load_or_init_from(&path)
+                .unwrap()
+                .playback
+                .cache_secs,
             42.5
         );
     }

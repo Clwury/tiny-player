@@ -70,8 +70,8 @@ impl HomeContent {
 
     fn user_item_by_id(&self, item_id: &str) -> Option<UserItem> {
         let current_route_item = match self.navigation.current() {
-            HomeRoute::Root(HomeRoot::Favorites) => {
-                self.favorites.items.iter().find(|item| item.id == item_id)
+            HomeRoute::Root(HomeRoot::Favorites) | HomeRoute::FavoriteItems { .. } => {
+                self.favorites.items().find(|item| item.id == item_id)
             }
             HomeRoute::Root(HomeRoot::Search) => {
                 self.search.items.iter().find(|item| item.id == item_id)
@@ -96,7 +96,7 @@ impl HomeContent {
                     .flat_map(|items| items.items.iter())
                     .find(|item| item.id == item_id)
             })
-            .or_else(|| self.favorites.items.iter().find(|item| item.id == item_id))
+            .or_else(|| self.favorites.items().find(|item| item.id == item_id))
             .or_else(|| self.search.items.iter().find(|item| item.id == item_id))
             .or_else(|| {
                 self.libraries
@@ -167,11 +167,10 @@ impl HomeContent {
             detail.reset_in_flight_effects();
             self.load_media_detail_effects(cx);
         }
-        if self.navigation.current()
-            == &super::super::navigation::HomeRoute::Root(
-                super::super::navigation::HomeRoot::Favorites,
-            )
-        {
+        if matches!(
+            self.navigation.current(),
+            HomeRoute::Root(HomeRoot::Favorites) | HomeRoute::FavoriteItems { .. }
+        ) {
             self.enter_favorites_if_needed(cx);
         }
         cx.emit(HomeContentEvent::TitleChanged);

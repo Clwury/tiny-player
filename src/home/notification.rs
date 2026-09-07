@@ -13,9 +13,6 @@ pub(super) const HOME_USER_VIEWS_NOTIFICATION_KEY: &str = "home:user-views";
 pub(super) const HOME_RESUME_ITEMS_NOTIFICATION_KEY: &str = "home:resume-items";
 pub(super) const HOME_RESUME_DETAIL_NOTIFICATION_KEY: &str = "home:resume-detail";
 pub(super) const HOME_RESUME_ACTION_NOTIFICATION_KEY: &str = "home:resume-action";
-pub(super) const FAVORITES_INITIAL_NOTIFICATION_KEY: &str = "favorites:initial";
-pub(super) const FAVORITES_REFRESH_NOTIFICATION_KEY: &str = "favorites:refresh";
-pub(super) const FAVORITES_LOAD_MORE_NOTIFICATION_KEY: &str = "favorites:load-more";
 pub(super) const SEARCH_INITIAL_NOTIFICATION_KEY: &str = "search:initial";
 pub(super) const SEARCH_LOAD_MORE_NOTIFICATION_KEY: &str = "search:load-more";
 
@@ -154,6 +151,10 @@ fn notification_matches_route(key: &HomeNotificationKey, route: &HomeRoute) -> b
     }
 
     match route {
+        HomeRoute::FavoriteItems { item_type } => key
+            .name
+            .as_ref()
+            .starts_with(&format!("favorites:{}:", item_type.as_str())),
         HomeRoute::Library { view_id, .. } => key
             .name
             .as_ref()
@@ -166,6 +167,7 @@ fn notification_scope_for_route(route: &HomeRoute) -> Option<NotificationScope> 
     match route {
         HomeRoute::Root(HomeRoot::Home) => Some(NotificationScope::Home),
         HomeRoute::Root(HomeRoot::Favorites) => Some(NotificationScope::Favorites),
+        HomeRoute::FavoriteItems { .. } => Some(NotificationScope::Favorites),
         HomeRoute::Root(HomeRoot::Search) => Some(NotificationScope::Search),
         HomeRoute::Library { .. } => Some(NotificationScope::Library),
         HomeRoute::Detail { .. } => Some(NotificationScope::Detail),
@@ -177,6 +179,30 @@ pub(super) type HomeNotificationQueue = NotificationQueue<HomeNotificationKey>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn favorite_category_notifications_only_match_their_category_and_overview() {
+        let key = HomeNotificationKey {
+            scope: NotificationScope::Favorites,
+            name: "favorites:Movie:load-more".into(),
+        };
+        assert!(notification_matches_route(
+            &key,
+            &HomeRoute::Root(HomeRoot::Favorites)
+        ));
+        assert!(notification_matches_route(
+            &key,
+            &HomeRoute::FavoriteItems {
+                item_type: crate::emby::VideoItemType::Movie
+            }
+        ));
+        assert!(!notification_matches_route(
+            &key,
+            &HomeRoute::FavoriteItems {
+                item_type: crate::emby::VideoItemType::Series
+            }
+        ));
+    }
 
     #[test]
     fn notification_scope_follows_the_visible_workspace() {

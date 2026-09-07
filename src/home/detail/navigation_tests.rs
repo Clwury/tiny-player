@@ -17,6 +17,98 @@ fn playback_sources() -> Vec<MediaSource> {
 }
 
 #[gpui::test]
+fn series_logo_stays_in_place_when_episodes_finish_loading(cx: &mut TestAppContext) {
+    use crate::{
+        emby::{EmbyImageRequest, EmbyImageType},
+        images::cache::CachedImageKey,
+    };
+
+    let images = tempfile::tempdir().unwrap();
+    let logo_path = images.path().join("logo.png");
+    image::RgbaImage::from_pixel(400, 100, image::Rgba([255, 255, 255, 255]))
+        .save(&logo_path)
+        .unwrap();
+    cx.update(theme::init);
+    let (page, cx) = cx.add_window_view(|_, cx| {
+        let server = serde_json::from_value(json!({
+            "id": "hero-layout-test",
+            "endpoint": {"protocol": "Https", "address": "example.com", "port": 443, "path": ""},
+            "username": "test", "password": "", "user_id": "test", "added_at_unix": 0
+        }))
+        .unwrap();
+        let mut page = HomeContent::new(server, EmbyClient::new("test".into()).unwrap(), cx);
+        let series = json!({
+            "Id": "series-1", "Name": "Series", "Type": "Series",
+            "ImageTags": {"Logo": "logo-tag"}, "ProductionYear": 2024
+        });
+        let mut detail =
+            SeriesDetailState::new_series(&serde_json::from_value(series.clone()).unwrap());
+        detail.item = Some(serde_json::from_value(series).unwrap());
+        detail.selected_season_id = Some("season-1".into());
+        detail.episodes_request_season_id = Some("season-1".into());
+        detail.effects.episodes = LoadState::Loading;
+        let request = EmbyImageRequest::new("series-1", EmbyImageType::Logo)
+            .with_tag(Some("logo-tag".into()));
+        let key = CachedImageKey::from_request(&page.current_server, &request).unwrap();
+        page.image_loader.finish_job(key, Ok(logo_path));
+        page.navigation.push_detail("series-1".into(), None);
+        page.series_detail = Some(detail);
+        page
+    });
+    cx.simulate_resize(size(px(1200.0), px(900.0)));
+    cx.run_until_parked();
+    let logo_before = cx.debug_bounds("series-detail-logo").unwrap();
+    assert_eq!(logo_before.size.height, px(50.0));
+    let line_before = cx.debug_bounds("series-detail-episode-line").unwrap();
+    assert_eq!(line_before.size.height, px(24.0));
+    page.read_with(cx, |page, _| {
+        assert!(page.series_detail.as_ref().unwrap().hero_line().is_none());
+    });
+
+    // Exercise the real completion path for both a populated and an empty season.
+    for items in [
+        json!([{
+            "Id": "episode-1", "Name": "Episode 1", "Type": "Episode",
+            "SeasonId": "season-1", "ParentIndexNumber": 1, "IndexNumber": 1
+        }]),
+        json!([]),
+    ] {
+        let count = items.as_array().unwrap().len();
+        page.update(cx, |page, cx| {
+            let detail = page.series_detail.as_mut().unwrap();
+            detail.effects.episodes = LoadState::Loading;
+            detail.episodes_request_season_id = Some("season-1".into());
+            page.finish_series_episodes(
+                page.request_identity(),
+                DetailRequestRevisions {
+                    detail: page.detail_generation,
+                    user_data: page.user_data_request_revision(),
+                },
+                "series-1".into(),
+                "season-1".into(),
+                Ok(
+                    serde_json::from_value(json!({"Items": items, "TotalRecordCount": count}))
+                        .unwrap(),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert_eq!(
+                page.series_detail.as_ref().unwrap().hero_line().is_some(),
+                count > 0
+            );
+        });
+        assert_eq!(cx.debug_bounds("series-detail-logo").unwrap(), logo_before);
+        assert_eq!(
+            cx.debug_bounds("series-detail-episode-line").unwrap(),
+            line_before
+        );
+    }
+}
+
+#[gpui::test]
 fn resume_restores_played_version_when_server_keeps_returning_group_id(cx: &mut TestAppContext) {
     cx.update(theme::init);
     let (page, cx) = cx.add_window_view(|_, cx| {

@@ -7,17 +7,22 @@ use gpui::{
 };
 
 use crate::{
-    emby::{SortOrder, UserItem, UserItemsSort},
+    emby::{SortOrder, UserItem, UserItemsSort, VideoItemType},
     theme,
 };
 
 use super::{
     HomeContent,
     carousel::{
-        HOME_ITEM_CARD_GAP_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
+        DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX, DETAIL_EPISODE_CARD_WIDTH_PX, HOME_ITEM_CARD_GAP_PX,
+        HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
         HOME_MAIN_SCROLLBAR_WIDTH_PX, home_main_content_width_for_window_width,
     },
-    components::{user_episode_card, user_item_card, user_item_card_with_favorite_badge},
+    components::{
+        favorite_episode_card, user_episode_card, user_item_card,
+        user_item_card_with_favorite_badge,
+    },
+    favorites::{favorite_section_title, render::favorite_action},
     library::{LibraryState, available_library_sorts},
     navigation::HomeRoute,
     paged_items::PagedItemsState,
@@ -36,22 +41,40 @@ const USER_ITEM_GRID_ROW_STEP_PX: f32 = USER_ITEM_GRID_ROW_HEIGHT_PX + HOME_ITEM
 const USER_ITEM_GRID_OVERSCAN_ROWS: usize = 1;
 
 #[derive(Clone, Copy)]
-enum UserItemGridSource {
-    Favorites,
+pub(super) enum UserItemGridSource {
+    Favorites(VideoItemType),
     Search,
 }
 
 impl UserItemGridSource {
+    pub(super) fn card_width(self) -> f32 {
+        match self {
+            Self::Favorites(VideoItemType::Episode) => DETAIL_EPISODE_CARD_WIDTH_PX,
+            _ => HOME_ITEM_CARD_WIDTH_PX,
+        }
+    }
+
+    fn row_step(self) -> f32 {
+        match self {
+            // Episode covers are 16:9, with the same padding and two text lines.
+            Self::Favorites(VideoItemType::Episode) => {
+                USER_ITEM_GRID_ROW_STEP_PX - HOME_ITEM_CARD_IMAGE_HEIGHT_PX
+                    + DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX
+            }
+            _ => USER_ITEM_GRID_ROW_STEP_PX,
+        }
+    }
+
     fn scroll_id(self) -> &'static str {
         match self {
-            Self::Favorites => "favorite-grid-scroll",
+            Self::Favorites(_) => "favorite-grid-scroll",
             Self::Search => "search-grid-scroll",
         }
     }
 
     fn card_id_prefix(self) -> &'static str {
         match self {
-            Self::Favorites => "favorite-grid-item",
+            Self::Favorites(_) => "favorite-grid-item",
             Self::Search => "search-grid-item",
         }
     }
@@ -260,65 +283,114 @@ impl HomeContent {
             })
     }
 
-    pub(super) fn render_favorites_scrollable_content(
+    pub(super) fn render_favorite_items_content(
         &self,
         window: &Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let HomeRoute::FavoriteItems { item_type } = self.navigation.current() else {
+            unreachable!("favorite category renderer requires a FavoriteItems route");
+        };
+        let item_type = *item_type;
+        let theme = theme::get(cx);
+        let state = &self.favorites[item_type].paged;
         let page = cx.entity().downgrade();
-        let scroll_handle = self.favorites.scroll_handle.clone();
-        let auto_load_observer = canvas(
-            |bounds, _, _| bounds,
+        let scroll_handle = state.scroll_handle.clone();
+        let observer = canvas(
+            |_, _, _| {},
             move |_, _, window, _| {
                 if !workspace_scroll_is_near_end(&scroll_handle) {
                     return;
                 }
-                let page = page.clone();
                 window.on_next_frame(move |_, cx| {
-                    page.update(cx, |page, cx| page.auto_load_more_favorites(cx))
+                    page.update(cx, |page, cx| page.auto_load_more_favorites(item_type, cx))
                         .ok();
                 });
             },
         )
-        .w_full()
-        .h(px(1.0))
         .absolute()
+        .bottom_0()
         .left_0()
-        .right_0()
-        .bottom_0();
+        .w_full()
+        .h(px(1.0));
         let grid = self.render_virtual_items_grid(
-            UserItemGridSource::Favorites,
+            UserItemGridSource::Favorites(item_type),
             self.workspace_grid_columns.max(1),
-            self.favorites.scroll_handle.clone(),
-            &self.favorites.grid_columns,
+            state.scroll_handle.clone(),
+            &state.grid_columns,
             f32::from(window.bounds().size.height),
             cx,
         );
-
         div()
             .absolute()
             .top_0()
             .right_0()
             .bottom_0()
             .left_0()
-            .id("home-favorites-content")
-            .when(
-                self.favorites.initial != super::LoadState::Loading
-                    && self.favorites.initial_error.is_none()
-                    && self.favorites.items.is_empty(),
-                |this| {
-                    this.child(div().size_full().p_6().child(self.render_center_message(
-                        "暂无收藏的电影或剧集",
-                        false,
+            .id("home-favorite-items-content")
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_4()
+                    .child(library_back_button(
+                        cx.listener(Self::close_series_detail),
                         cx,
-                    )))
-                },
+                    ))
+                    .when(!state.items.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .debug_selector(|| "favorite-items-title".to_string())
+                                .text_lg()
+                                .text_color(theme.foreground)
+                                .child(favorite_section_title(item_type)),
+                        )
+                        .when_some(
+                            state.total_record_count,
+                            |this, total| {
+                                this.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!("共 {total} 项")),
+                                )
+                            },
+                        )
+                    }),
             )
-            .when(!self.favorites.items.is_empty(), |this| {
-                this.child(div().size_full().p_6().child(grid)).when(
-                    self.favorites.can_auto_load_more() && !self.resize_in_progress,
-                    |this| this.child(auto_load_observer),
-                )
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .px_6()
+                    .pb_6()
+                    .when(!state.items.is_empty(), |this| this.child(grid))
+                    .when(
+                        state.can_auto_load_more() && !self.resize_in_progress,
+                        |this| this.child(observer),
+                    ),
+            )
+            .when(state.initial == super::LoadState::Failed, |this| {
+                this.child(favorite_action(
+                    "favorite-items-retry".into(),
+                    "重试",
+                    cx,
+                    cx.listener(move |page, _, _, cx| page.load_favorites_initial(item_type, cx)),
+                ))
+            })
+            .when(state.load_more == super::LoadState::Failed, |this| {
+                this.child(favorite_action(
+                    "favorite-items-load-more-retry".into(),
+                    "重试加载更多",
+                    cx,
+                    cx.listener(move |page, _, _, cx| page.load_more_favorites(item_type, cx)),
+                ))
             })
     }
 
@@ -430,10 +502,11 @@ impl HomeContent {
     ) -> impl IntoElement {
         let columns = columns.max(1);
         let item_count = match source {
-            UserItemGridSource::Favorites => self.favorites.items.len(),
+            UserItemGridSource::Favorites(item_type) => self.favorites[item_type].paged.items.len(),
             UserItemGridSource::Search => self.search.items.len(),
         };
         let row_count = user_item_grid_row_count(item_count, columns);
+        let row_step = source.row_step();
         let tracked_viewport_height = f32::from(scroll_handle.bounds().size.height).max(0.0);
         let scroll_viewport_height = if tracked_viewport_height > 0.0 {
             tracked_viewport_height
@@ -446,6 +519,7 @@ impl HomeContent {
             columns,
             row_count,
             scroll_viewport_height,
+            row_step,
         );
         // The tracked bounds describe the previous frame during a native resize,
         // while `viewport_height` already describes the new window. Use the new
@@ -456,10 +530,15 @@ impl HomeContent {
         } else {
             USER_ITEM_GRID_OVERSCAN_ROWS
         };
-        let visible_rows =
-            user_item_grid_visible_rows(row_count, scroll_top, viewport_height, overscan_rows);
-        let total_height = row_count as f32 * USER_ITEM_GRID_ROW_STEP_PX;
-        let grid_width = user_item_grid_content_width(columns);
+        let visible_rows = user_item_grid_visible_rows(
+            row_count,
+            scroll_top,
+            viewport_height,
+            overscan_rows,
+            row_step,
+        );
+        let total_height = row_count as f32 * row_step;
+        let grid_width = user_item_grid_content_width(columns, source.card_width());
 
         // The regular scroll container owns only one total-height spacer and the
         // visible fixed-height rows. Unlike GPUI's general-purpose list elements,
@@ -493,7 +572,7 @@ impl HomeContent {
                             cx,
                         )
                         .absolute()
-                        .top(px(row as f32 * USER_ITEM_GRID_ROW_STEP_PX))
+                        .top(px(row as f32 * row_step))
                         .left_0()
                     })),
             )
@@ -509,7 +588,7 @@ impl HomeContent {
         cx: &Context<Self>,
     ) -> gpui::Div {
         let items = match source {
-            UserItemGridSource::Favorites => &self.favorites.items,
+            UserItemGridSource::Favorites(item_type) => &self.favorites[item_type].paged.items,
             UserItemGridSource::Search => &self.search.items,
         };
         let start = row.saturating_mul(columns.max(1));
@@ -517,12 +596,12 @@ impl HomeContent {
             // A request can finish between the render and prepaint passes (for
             // example when a search query is replaced). Keep the uniform row
             // height stable instead of slicing past the newly shortened list.
-            return div().w(px(grid_width)).h(px(USER_ITEM_GRID_ROW_STEP_PX));
+            return div().w(px(grid_width)).h(px(source.row_step()));
         }
         let end = (start + columns.max(1)).min(items.len());
         div()
             .w(px(grid_width))
-            .h(px(USER_ITEM_GRID_ROW_STEP_PX))
+            .h(px(source.row_step()))
             .flex()
             .flex_none()
             .items_start()
@@ -532,7 +611,7 @@ impl HomeContent {
             }))
     }
 
-    fn render_user_item_grid_card(
+    pub(super) fn render_user_item_grid_card(
         &self,
         item: &UserItem,
         index: usize,
@@ -551,9 +630,13 @@ impl HomeContent {
         // open the wrong item.
         let item_id = gpui::ElementId::from((id_prefix, item_fingerprint));
         if item.item_type.as_deref() == Some("Episode") {
-            let image_path = self.image_path_for_episode_user_item(&item);
-            user_episode_card(&item, image_path, cx)
-                .id(item_id)
+            let card = if matches!(source, UserItemGridSource::Favorites(_)) {
+                favorite_episode_card(&item, self.image_path_for_favorite_episode(&item), cx)
+            } else {
+                user_episode_card(&item, self.image_path_for_episode_user_item(&item), cx)
+            };
+            card.id(item_id)
+                .debug_selector(|| format!("{id_prefix}-{}", item.id))
                 .cursor_pointer()
                 .on_click(open)
         } else {
@@ -561,7 +644,7 @@ impl HomeContent {
             user_item_card_with_favorite_badge(
                 &item,
                 image_path,
-                !matches!(source, UserItemGridSource::Favorites),
+                !matches!(source, UserItemGridSource::Favorites(_)),
                 cx,
             )
             .id(item_id)
@@ -578,7 +661,9 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let item_id = match source {
-            UserItemGridSource::Favorites => self.favorites.items.get(index),
+            UserItemGridSource::Favorites(item_type) => {
+                self.favorites[item_type].paged.items.get(index)
+            }
             UserItemGridSource::Search => self.search.items.get(index),
         }
         .filter(|item| user_item_id_fingerprint(&item.id) == expected_fingerprint)
@@ -690,6 +775,7 @@ fn sync_workspace_grid_scroll(
     columns: usize,
     row_count: usize,
     viewport_height: f32,
+    row_step: f32,
 ) -> f32 {
     let columns = columns.max(1);
     let old_columns = previous_columns.get().max(1);
@@ -701,6 +787,7 @@ fn sync_workspace_grid_scroll(
         columns,
         row_count,
         viewport_height,
+        row_step,
     );
     previous_columns.set(columns);
 
@@ -717,6 +804,7 @@ fn remap_workspace_grid_scroll_top(
     columns: usize,
     row_count: usize,
     viewport_height: f32,
+    row_step: f32,
 ) -> f32 {
     if row_count == 0 {
         return 0.0;
@@ -729,21 +817,21 @@ fn remap_workspace_grid_scroll_top(
     } else {
         0.0
     };
-    let old_row = (old_scroll_top / USER_ITEM_GRID_ROW_STEP_PX).floor() as usize;
-    let offset_in_row = old_scroll_top - old_row as f32 * USER_ITEM_GRID_ROW_STEP_PX;
+    let old_row = (old_scroll_top / row_step).floor() as usize;
+    let offset_in_row = old_scroll_top - old_row as f32 * row_step;
     let first_visible_item = old_row.saturating_mul(old_columns);
     let new_row = (first_visible_item / columns).min(row_count - 1);
     let target = if old_columns == columns {
         old_scroll_top
     } else {
-        new_row as f32 * USER_ITEM_GRID_ROW_STEP_PX + offset_in_row
+        new_row as f32 * row_step + offset_in_row
     };
     let viewport_height = if viewport_height.is_finite() {
         viewport_height.max(0.0)
     } else {
         0.0
     };
-    let max_scroll = (row_count as f32 * USER_ITEM_GRID_ROW_STEP_PX - viewport_height).max(0.0);
+    let max_scroll = (row_count as f32 * row_step - viewport_height).max(0.0);
     target.clamp(0.0, max_scroll)
 }
 
@@ -752,6 +840,7 @@ fn user_item_grid_visible_rows(
     scroll_top: f32,
     viewport_height: f32,
     overscan_rows: usize,
+    row_step: f32,
 ) -> Range<usize> {
     if row_count == 0 {
         return 0..0;
@@ -772,21 +861,24 @@ fn user_item_grid_visible_rows(
     // the newly exposed rows are present in this same frame. The full window
     // height is a conservative upper bound for the page viewport, so this may
     // build one extra row but cannot omit a visible one.
-    let content_height = row_count as f32 * USER_ITEM_GRID_ROW_STEP_PX;
+    let content_height = row_count as f32 * row_step;
     let scroll_top = scroll_top.min((content_height - viewport_height).max(0.0));
-    let first = (scroll_top / USER_ITEM_GRID_ROW_STEP_PX).floor() as usize;
-    let last = ((scroll_top + viewport_height) / USER_ITEM_GRID_ROW_STEP_PX).ceil() as usize;
+    let first = (scroll_top / row_step).floor() as usize;
+    let last = ((scroll_top + viewport_height) / row_step).ceil() as usize;
 
     first.saturating_sub(overscan_rows).min(row_count)
         ..last.saturating_add(overscan_rows).min(row_count)
 }
 
-pub(super) fn user_item_grid_columns(window: &Window) -> usize {
-    user_item_grid_columns_for_window_width(f32::from(window.bounds().size.width))
-}
-
-pub(super) fn user_item_grid_columns_for_window_width(window_width: f32) -> usize {
-    user_item_grid_columns_for_width(home_main_content_width_for_window_width(window_width))
+pub(super) fn user_item_grid_columns(window: &Window, route: &HomeRoute) -> usize {
+    let source = match route {
+        HomeRoute::FavoriteItems { item_type } => UserItemGridSource::Favorites(*item_type),
+        _ => UserItemGridSource::Search,
+    };
+    user_item_grid_columns_for_width(
+        home_main_content_width_for_window_width(f32::from(window.bounds().size.width)),
+        source.card_width(),
+    )
 }
 
 pub(super) fn responsive_user_item_grid_columns(measured: usize) -> usize {
@@ -796,8 +888,8 @@ pub(super) fn responsive_user_item_grid_columns(measured: usize) -> usize {
     measured.max(1)
 }
 
-fn user_item_grid_columns_for_width(available_width: f32) -> usize {
-    let card_outer_width = HOME_ITEM_CARD_WIDTH_PX + HOME_ITEM_CARD_PADDING_PX * 2.0;
+fn user_item_grid_columns_for_width(available_width: f32, card_width: f32) -> usize {
+    let card_outer_width = card_width + HOME_ITEM_CARD_PADDING_PX * 2.0;
     ((available_width.max(0.0) + HOME_ITEM_CARD_GAP_PX)
         / (card_outer_width + HOME_ITEM_CARD_GAP_PX))
         .floor()
@@ -808,9 +900,9 @@ fn user_item_grid_row_count(item_count: usize, columns: usize) -> usize {
     item_count.div_ceil(columns.max(1))
 }
 
-fn user_item_grid_content_width(columns: usize) -> f32 {
+fn user_item_grid_content_width(columns: usize, card_width: f32) -> f32 {
     let columns = columns.max(1);
-    let card_outer_width = HOME_ITEM_CARD_WIDTH_PX + HOME_ITEM_CARD_PADDING_PX * 2.0;
+    let card_outer_width = card_width + HOME_ITEM_CARD_PADDING_PX * 2.0;
     columns as f32 * card_outer_width + columns.saturating_sub(1) as f32 * HOME_ITEM_CARD_GAP_PX
 }
 
@@ -822,6 +914,7 @@ fn library_back_button(
 
     div()
         .id("home-library-back-button")
+        .debug_selector(|| "home-library-back-button".into())
         .flex()
         .size(px(32.0))
         .flex_none()
@@ -1018,9 +1111,18 @@ mod tests {
 
     #[test]
     fn user_item_grid_columns_fit_the_available_width() {
-        assert_eq!(user_item_grid_columns_for_width(719.0), 3);
-        assert_eq!(user_item_grid_columns_for_width(720.0), 4);
-        assert_eq!(user_item_grid_columns_for_width(1.0), 1);
+        assert_eq!(
+            user_item_grid_columns_for_width(719.0, HOME_ITEM_CARD_WIDTH_PX),
+            3
+        );
+        assert_eq!(
+            user_item_grid_columns_for_width(720.0, HOME_ITEM_CARD_WIDTH_PX),
+            4
+        );
+        assert_eq!(
+            user_item_grid_columns_for_width(1.0, HOME_ITEM_CARD_WIDTH_PX),
+            1
+        );
     }
 
     #[test]
@@ -1033,9 +1135,18 @@ mod tests {
 
     #[test]
     fn virtual_grid_surface_width_changes_only_at_column_thresholds() {
-        assert_eq!(user_item_grid_content_width(0), 168.0);
-        assert_eq!(user_item_grid_content_width(1), 168.0);
-        assert_eq!(user_item_grid_content_width(3), 536.0);
+        assert_eq!(
+            user_item_grid_content_width(0, HOME_ITEM_CARD_WIDTH_PX),
+            168.0
+        );
+        assert_eq!(
+            user_item_grid_content_width(1, HOME_ITEM_CARD_WIDTH_PX),
+            168.0
+        );
+        assert_eq!(
+            user_item_grid_content_width(3, HOME_ITEM_CARD_WIDTH_PX),
+            536.0
+        );
     }
 
     #[test]
@@ -1048,7 +1159,14 @@ mod tests {
     #[test]
     fn grid_column_change_preserves_the_first_visible_card() {
         let old_scroll_top = USER_ITEM_GRID_ROW_STEP_PX * 2.0 + 42.0;
-        let remapped = remap_workspace_grid_scroll_top(old_scroll_top, 3, 4, 20, 600.0);
+        let remapped = remap_workspace_grid_scroll_top(
+            old_scroll_top,
+            3,
+            4,
+            20,
+            600.0,
+            USER_ITEM_GRID_ROW_STEP_PX,
+        );
 
         // Old row 2 starts with item 6, which belongs to new row 1.
         assert_eq!(remapped, USER_ITEM_GRID_ROW_STEP_PX + 42.0);
@@ -1057,15 +1175,15 @@ mod tests {
     #[test]
     fn unchanged_grid_keeps_and_clamps_pixel_scroll_position() {
         assert_eq!(
-            remap_workspace_grid_scroll_top(653.0, 4, 4, 20, 600.0),
+            remap_workspace_grid_scroll_top(653.0, 4, 4, 20, 600.0, USER_ITEM_GRID_ROW_STEP_PX),
             653.0
         );
         assert_eq!(
-            remap_workspace_grid_scroll_top(653.0, 4, 4, 3, 800.0),
+            remap_workspace_grid_scroll_top(653.0, 4, 4, 3, 800.0, USER_ITEM_GRID_ROW_STEP_PX),
             154.0
         );
         assert_eq!(
-            remap_workspace_grid_scroll_top(f32::NAN, 4, 4, 3, 800.0),
+            remap_workspace_grid_scroll_top(f32::NAN, 4, 4, 3, 800.0, USER_ITEM_GRID_ROW_STEP_PX),
             0.0
         );
     }
@@ -1073,10 +1191,14 @@ mod tests {
     #[test]
     fn virtual_grid_only_builds_visible_rows_with_small_overscan() {
         let scroll_top = USER_ITEM_GRID_ROW_STEP_PX * 10.0 + 20.0;
-        let visible = user_item_grid_visible_rows(100, scroll_top, 640.0, 1);
+        let visible =
+            user_item_grid_visible_rows(100, scroll_top, 640.0, 1, USER_ITEM_GRID_ROW_STEP_PX);
 
         assert_eq!(visible, 9..14);
-        assert_eq!(user_item_grid_visible_rows(0, 0.0, 640.0, 1), 0..0);
+        assert_eq!(
+            user_item_grid_visible_rows(0, 0.0, 640.0, 1, USER_ITEM_GRID_ROW_STEP_PX),
+            0..0
+        );
         assert!(visible.len() <= 5);
     }
 
@@ -1085,7 +1207,7 @@ mod tests {
         let scroll_top = USER_ITEM_GRID_ROW_STEP_PX * 10.0 + 20.0;
 
         assert_eq!(
-            user_item_grid_visible_rows(100, scroll_top, 640.0, 0),
+            user_item_grid_visible_rows(100, scroll_top, 640.0, 0, USER_ITEM_GRID_ROW_STEP_PX),
             10..13
         );
     }
@@ -1097,10 +1219,25 @@ mod tests {
             USER_ITEM_GRID_ROW_STEP_PX * 15.0,
             USER_ITEM_GRID_ROW_STEP_PX * 10.0,
             1,
+            USER_ITEM_GRID_ROW_STEP_PX,
         );
 
         // Expanding at the bottom clamps the top row from 15 to 10. Include
         // that new viewport plus only the normal one-row overscan.
         assert_eq!(visible, 9..20);
+    }
+
+    #[test]
+    fn episode_favorites_grid_uses_landscape_row_height_for_scrolling_and_resize() {
+        let step = UserItemGridSource::Favorites(VideoItemType::Episode).row_step();
+        assert_eq!(step, 202.0);
+        assert_eq!(
+            user_item_grid_visible_rows(100, 10.0 * step, 600.0, 1, step),
+            9..14
+        );
+        assert_eq!(
+            remap_workspace_grid_scroll_top(2.0 * step + 20.0, 3, 4, 20, 600.0, step),
+            step + 20.0
+        );
     }
 }

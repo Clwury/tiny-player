@@ -21,6 +21,9 @@ impl HomeRoot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HomeRoute {
     Root(HomeRoot),
+    FavoriteItems {
+        item_type: VideoItemType,
+    },
     Library {
         view_id: String,
         title: String,
@@ -36,6 +39,9 @@ impl HomeRoute {
     pub(crate) fn title(&self) -> Option<&str> {
         match self {
             Self::Root(root) => Some(root.title()),
+            Self::FavoriteItems { item_type } => {
+                Some(super::favorites::favorite_section_title(*item_type))
+            }
             Self::Library { title, .. } => Some(title),
             Self::Detail { .. } => None,
         }
@@ -97,6 +103,10 @@ impl HomeNavigation {
             root_item_id,
             episode_id,
         });
+    }
+
+    pub(crate) fn push_favorite_items(&mut self, item_type: VideoItemType) {
+        self.stack.push(HomeRoute::FavoriteItems { item_type });
     }
 
     pub(crate) fn pop(&mut self) -> bool {

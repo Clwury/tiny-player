@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, App, AppContext, ClickEvent, Context, Entity, EventEmitter, InteractiveElement,
-    IntoElement, ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, Subscription,
-    Window, div, point, prelude::FluentBuilder, px, relative, svg,
+    AnyElement, App, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
+    ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled, Subscription, Window,
+    div, point, prelude::FluentBuilder, px, relative, svg,
 };
 
 use crate::{
@@ -196,6 +196,13 @@ pub struct SettingsChanged;
 
 impl EventEmitter<SettingsChanged> for PlaybackSettingsDialogState {}
 
+impl Render for PlaybackSettingsDialogState {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rounded_window = !window.is_maximized() && !window.is_fullscreen();
+        self.render_content(cx.entity(), rounded_window, cx)
+    }
+}
+
 impl PlaybackSettingsDialogState {
     pub fn new(config: &PlaybackCacheConfig, cx: &mut Context<Self>) -> Self {
         let config = config.clone().normalized();
@@ -379,150 +386,63 @@ impl PlaybackSettingsDialogState {
         config.normalized()
     }
 
-    pub fn render_layer(
+    fn render_content(
         &self,
         dialog: Entity<Self>,
         rounded_window: bool,
-        on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         cx: &App,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
         let dropdown = self.dropdown.clone();
         let query = self.search.read(cx).value();
         let searching = !query.trim().is_empty();
         div()
-            .absolute()
-            .top_0()
-            .right_0()
-            .bottom_0()
-            .left_0()
+            .id("playback-settings-panel")
+            .debug_selector(|| "playback-settings-panel".into())
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme.overlay)
-            // Keep clicks and wheel events inside the modal, including its backdrop.
-            .occlude()
-            .when(rounded_window, |this| {
-                this.rounded(theme.radius_lg).overflow_hidden()
-            })
+            .size_full()
+            .min_h_0()
+            .overflow_hidden()
+            // Keep the panel transparent so the window supplies the rounded background.
+            .child(self.render_sidebar(dialog.clone(), searching, rounded_window, cx))
             .child(
                 div()
-                    .id("playback-settings-panel")
-                    .debug_selector(|| "playback-settings-panel".into())
-                    .flex()
-                    .flex_col()
-                    .w(px(960.0))
-                    .max_w(relative(0.94))
-                    .h(px(680.0))
-                    .max_h(relative(0.92))
-                    .overflow_hidden()
-                    .rounded(theme.radius_lg)
-                    .border_1()
-                    .border_color(theme.input_border)
-                    .bg(theme.dialog_background)
-                    .shadow_lg()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
                     .child(
                         div()
-                            .flex()
-                            .flex_shrink_0()
-                            .items_center()
-                            .justify_between()
-                            .h(px(44.0))
-                            .px_5()
-                            .border_b_1()
-                            .border_color(theme.title_bar_border)
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2p5()
-                                    .child(
-                                        svg()
-                                            .path("icons/setting.svg")
-                                            .size(px(18.0))
-                                            .text_color(theme.muted_foreground),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_base()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(theme.foreground)
-                                            .child("设置"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("close-playback-settings")
-                                    .debug_selector(|| "close-playback-settings".into())
-                                    .role(gpui::Role::Button)
-                                    .aria_label("关闭设置")
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(24.0))
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(theme.secondary_hover))
-                                    .child(
-                                        svg()
-                                            .path("icons/window-close.svg")
-                                            .size(px(14.0))
-                                            .text_color(theme.muted_foreground),
-                                    )
-                                    .on_click(move |event, window, cx| on_close(event, window, cx)),
-                            ),
+                            .id("playback-settings-scroll")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll_handle)
+                            .on_scroll_wheel(move |_, _, cx| {
+                                dropdown.update(cx, |state, cx| state.close(cx))
+                            })
+                            .px_8()
+                            .child(self.render_settings(dialog, query.trim(), cx)),
                     )
                     .child(
                         div()
-                            .flex()
-                            .flex_1()
-                            .min_h_0()
-                            .child(self.render_sidebar(dialog.clone(), searching, cx))
-                            .child(
-                                div().flex().flex_col().flex_1().min_w_0().child(
-                                    div()
-                                        .relative()
-                                        .flex_1()
-                                        .min_h_0()
-                                        .child(
-                                            div()
-                                                .id("playback-settings-scroll")
-                                                .size_full()
-                                                .overflow_y_scroll()
-                                                .track_scroll(&self.scroll_handle)
-                                                .on_scroll_wheel(move |_, _, cx| {
-                                                    dropdown.update(cx, |state, cx| state.close(cx))
-                                                })
-                                                .px_8()
-                                                .child(self.render_settings(
-                                                    dialog.clone(),
-                                                    query.trim(),
-                                                    cx,
-                                                )),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("playback-settings-scrollbar")
-                                                .debug_selector(|| {
-                                                    "playback-settings-scrollbar".into()
-                                                })
-                                                .absolute()
-                                                .top_0()
-                                                .right_0()
-                                                .bottom_0()
-                                                .left_0()
-                                                .child(
-                                                    Scrollbar::vertical(&self.scroll_handle)
-                                                        .right_inset(px(4.0)),
-                                                ),
-                                        ),
-                                ),
-                            ),
+                            .id("playback-settings-scrollbar")
+                            .debug_selector(|| "playback-settings-scrollbar".into())
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .left_0()
+                            .child(Scrollbar::vertical(&self.scroll_handle).right_inset(px(4.0))),
                     ),
             )
     }
 
-    fn render_sidebar(&self, dialog: Entity<Self>, searching: bool, cx: &App) -> impl IntoElement {
+    fn render_sidebar(
+        &self,
+        dialog: Entity<Self>,
+        searching: bool,
+        rounded_window: bool,
+        cx: &App,
+    ) -> impl IntoElement {
         let theme = theme::get(cx);
         div()
             .flex()
@@ -533,7 +453,10 @@ impl PlaybackSettingsDialogState {
             .gap_4()
             .border_r_1()
             .border_color(theme.title_bar_border)
-            .bg(theme.background)
+            .bg(theme.title_bar)
+            .when(rounded_window, |this| {
+                this.rounded_bl(theme.radius_lg).overflow_hidden()
+            })
             .child(
                 div()
                     .flex()
@@ -810,7 +733,7 @@ impl PlaybackSettingsDialogState {
                 "普通缓存",
                 "自动模式根据媒体来源决定是否启用缓存。",
                 "mode auto",
-                mode_selector(dialog.clone(), self.mode, cx),
+                mode_selector(dialog.clone(), self.mode, self.dropdown.clone()),
             ),
             SettingItem::new(
                 General,
@@ -818,7 +741,7 @@ impl PlaybackSettingsDialogState {
                 "回看缓存",
                 "保留已读取的数据，以便向后跳转和重复播放。",
                 "seekable_cache seek",
-                seekable_selector(dialog.clone(), self.seekable_cache, cx),
+                seekable_selector(dialog.clone(), self.seekable_cache, self.dropdown.clone()),
             ),
             SettingItem::new(
                 General,
@@ -1009,7 +932,7 @@ impl PlaybackSettingsDialogState {
                 "缓存文件清理",
                 "选择何时移除磁盘上的缓存文件。",
                 "unlink_files",
-                unlink_selector(dialog.clone(), self.unlink_files, cx),
+                unlink_selector(dialog.clone(), self.unlink_files, self.dropdown.clone()),
             ),
             SettingItem::new(
                 Readahead,
@@ -1270,11 +1193,11 @@ fn matches_search(query: &str, fields: &[&str]) -> bool {
 fn mode_selector(
     dialog: Entity<PlaybackSettingsDialogState>,
     selected: PlaybackCacheMode,
-    cx: &App,
+    dropdown: Entity<DropdownState>,
 ) -> impl IntoElement {
     selector_row(
         ("cache-mode-dropdown", "普通缓存"),
-        dialog.read(cx).dropdown.clone(),
+        dropdown,
         [
             ("cache-mode-auto", "自动", PlaybackCacheMode::Auto),
             ("cache-mode-enabled", "启用", PlaybackCacheMode::Enabled),
@@ -1288,11 +1211,11 @@ fn mode_selector(
 fn seekable_selector(
     dialog: Entity<PlaybackSettingsDialogState>,
     selected: PlaybackSeekableCacheMode,
-    cx: &App,
+    dropdown: Entity<DropdownState>,
 ) -> impl IntoElement {
     selector_row(
         ("seekable-cache-dropdown", "回看缓存"),
-        dialog.read(cx).dropdown.clone(),
+        dropdown,
         [
             (
                 "seekable-cache-auto",
@@ -1318,11 +1241,11 @@ fn seekable_selector(
 fn unlink_selector(
     dialog: Entity<PlaybackSettingsDialogState>,
     selected: CacheUnlinkPolicy,
-    cx: &App,
+    dropdown: Entity<DropdownState>,
 ) -> impl IntoElement {
     selector_row(
         ("unlink-dropdown", "缓存文件清理"),
-        dialog.read(cx).dropdown.clone(),
+        dropdown,
         [
             ("unlink-immediate", "立即删除", CacheUnlinkPolicy::Immediate),
             (

@@ -1,6 +1,6 @@
 use gpui::{
     AppContext as _, Context, Entity, IntoElement, Modifiers, ParentElement, Render, Styled,
-    TestAppContext, VisualTestContext, Window, div, prelude::FluentBuilder, px, size,
+    TestAppContext, VisualTestContext, Window, div, px, size,
 };
 
 use super::{BYTES_PER_MIB, PlaybackSettingsDialogState, SettingsChanged, matches_search};
@@ -14,23 +14,22 @@ struct SettingsWindow {
     dialog: Entity<PlaybackSettingsDialogState>,
     saved: Option<PlaybackCacheConfig>,
     saved_theme: Option<ColorTheme>,
-    closed: bool,
     change_count: usize,
 }
 
 impl Render for SettingsWindow {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div().relative().size_full().when(!self.closed, |this| {
-            this.child(self.dialog.read(cx).render_layer(
-                self.dialog.clone(),
-                false,
-                cx.listener(|this, _, _, cx| {
-                    this.closed = true;
-                    cx.notify();
-                }),
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(div().flex_none().child(crate::ui::titlebar::app_titlebar(
+                window,
                 cx,
-            ))
-        })
+                "设置".into(),
+            )))
+            .child(div().flex_1().min_h_0().child(self.dialog.clone()))
     }
 }
 
@@ -62,7 +61,6 @@ fn settings_window_with_config(
             dialog,
             saved: Some(config),
             saved_theme: Some(ColorTheme::Mocha),
-            closed: false,
             change_count: 0,
         }
     })
@@ -70,6 +68,15 @@ fn settings_window_with_config(
 
 fn click(cx: &mut VisualTestContext, selector: &'static str) {
     let bounds = cx.debug_bounds(selector).expect(selector);
+    if selector == "window-control-close" {
+        cx.simulate_mouse_down(
+            bounds.center(),
+            gpui::MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        return;
+    }
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
     settle_menu_frames(cx);
@@ -178,16 +185,16 @@ fn theme_selection_applies_and_autosaves_without_reverting_on_close(cx: &mut Tes
         cx.update(|_, cx| theme::get(cx).selection),
         ColorTheme::Frappe
     );
-    click(cx, "close-playback-settings");
+    click(cx, "window-control-close");
     assert_eq!(
-        cx.update(|_, cx| theme::get(cx).selection),
+        cx.cx.update(|cx| theme::get(cx).selection),
         ColorTheme::Frappe
     );
     assert_eq!(
         root.read_with(cx, |root, _| root.saved_theme),
         Some(ColorTheme::Frappe)
     );
-    assert!(root.read_with(cx, |root, _| root.closed));
+    assert!(cx.windows().is_empty());
 }
 
 #[gpui::test]
@@ -251,7 +258,7 @@ fn search_and_category_changes_preserve_automatically_saved_edits(cx: &mut TestA
     cx.simulate_keystrokes("ctrl-a");
     cx.simulate_input("no-matching-setting");
     assert!(cx.debug_bounds("启用磁盘缓存").is_none());
-    assert!(cx.debug_bounds("close-playback-settings").is_some());
+    assert!(cx.debug_bounds("window-control-close").is_some());
 
     click(cx, "settings-category-内存缓存");
     assert!(search.read_with(cx, |search, _| search.value().is_empty()));
@@ -311,7 +318,7 @@ fn cache_directory_is_read_only_and_saving_preserves_its_configuration(cx: &mut 
 }
 
 #[gpui::test]
-fn content_fills_panel_and_scrolls_below_fixed_header_at_supported_window_sizes(
+fn content_fills_window_and_scrolls_below_fixed_titlebar_at_supported_window_sizes(
     cx: &mut TestAppContext,
 ) {
     let (root, cx) = settings_window(cx);
@@ -322,17 +329,23 @@ fn content_fills_panel_and_scrolls_below_fixed_header_at_supported_window_sizes(
         cx.run_until_parked();
         click(cx, "settings-category-内存缓存");
         let panel = cx.debug_bounds("playback-settings-panel").unwrap();
-        let close = cx.debug_bounds("close-playback-settings").unwrap();
+        let close = cx.debug_bounds("window-control-close").unwrap();
         let scroll = dialog.read_with(cx, |dialog, _| dialog.scroll_handle.clone());
-        assert!(panel.left() >= px(0.0) && panel.right() <= px(width));
-        assert!(panel.top() >= px(0.0) && panel.bottom() <= px(height));
+        assert_eq!(panel.left(), px(0.0));
+        assert_eq!(panel.right(), px(width));
+        assert_eq!(panel.top(), px(crate::ui::titlebar::APP_TITLEBAR_HEIGHT_PX));
+        assert_eq!(panel.bottom(), px(height));
         assert!(close.bottom() <= scroll.bounds().top());
-        assert_eq!(scroll.bounds().bottom(), panel.bottom() - px(1.0));
+        assert_eq!(scroll.bounds().bottom(), panel.bottom());
         assert_eq!(
             cx.debug_bounds("playback-settings-scrollbar").unwrap(),
             scroll.bounds()
         );
-        assert!(scroll.max_offset().y > px(0.0));
+        if height <= 720.0 {
+            assert!(scroll.max_offset().y > px(0.0));
+        } else {
+            assert_eq!(scroll.max_offset().y, px(0.0));
+        }
         cx.update(|_, cx| {
             dialog.update(cx, |_, cx| {
                 scroll.set_offset(gpui::point(px(0.0), -scroll.max_offset().y));
@@ -343,7 +356,7 @@ fn content_fills_panel_and_scrolls_below_fixed_header_at_supported_window_sizes(
         let last_control = cx.debug_bounds("settings-toggle-共享空闲回看预算").unwrap();
         assert!(last_control.top() >= scroll.bounds().top());
         assert!(last_control.bottom() <= scroll.bounds().bottom());
-        assert_eq!(cx.debug_bounds("close-playback-settings").unwrap(), close);
+        assert_eq!(cx.debug_bounds("window-control-close").unwrap(), close);
 
         click(cx, "settings-category-磁盘缓存");
         assert_eq!(scroll.offset().y, px(0.0));
@@ -598,7 +611,7 @@ fn autosaving_an_option_preserves_other_fields_at_full_precision(cx: &mut TestAp
             ..config
         })
     );
-    click(cx, "close-playback-settings");
+    click(cx, "window-control-close");
     assert_eq!(root.read_with(cx, |root, _| root.change_count), 2);
 }
 

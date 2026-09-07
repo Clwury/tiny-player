@@ -289,6 +289,7 @@ fn server_card_menu(
         .occlude()
         .right_0()
         .top_full()
+        .mt(px(4.0))
         .flex()
         .flex_col()
         .w(px(112.0))

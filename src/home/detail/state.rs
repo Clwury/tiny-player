@@ -296,7 +296,7 @@ impl SeriesDetailState {
 
     pub(crate) fn hero_line(&self) -> Option<String> {
         if self.is_movie() {
-            self.item.as_ref().map(|item| item.name.clone())
+            None
         } else {
             self.hero_episode().map(MediaItem::episode_label)
         }
@@ -1388,7 +1388,7 @@ mod tests {
         detail.sync_media_source_selection();
 
         assert!(detail.is_movie());
-        assert_eq!(detail.hero_line().as_deref(), Some("电影"));
+        assert_eq!(detail.hero_line(), None);
         assert_eq!(detail.selected_media_source_label(), "4K HDR");
         assert_eq!(
             detail.selected_playback_item().map(|item| item.id.as_str()),

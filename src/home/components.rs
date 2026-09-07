@@ -2,9 +2,9 @@ use std::{fs, path::Path, sync::Arc};
 
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{
-    App, Asset, ClickEvent, Context, ImageCacheError, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, RenderImage, StatefulInteractiveElement, Styled, StyledImage, Window, div, img,
-    prelude::FluentBuilder, px, svg,
+    App, Asset, Bounds, ClickEvent, ContentMask, Context, ImageCacheError, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, RenderImage, StatefulInteractiveElement, Styled,
+    StyledImage, Window, canvas, div, fill, img, point, prelude::FluentBuilder, px, size, svg,
 };
 use image::{Frame, imageops::FilterType};
 
@@ -23,6 +23,7 @@ use super::carousel::{
 
 const IMAGE_PROGRESS_BAR_HEIGHT_PX: f32 = 4.0;
 const IMAGE_PROGRESS_BAR_HORIZONTAL_INSET_PX: f32 = 8.0;
+const COVER_IMAGE_CORNER_RADIUS: gpui::Rems = gpui::rems(0.5);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CoverImageSource {
@@ -56,7 +57,7 @@ pub(super) fn cover_img(path: Arc<Path>, width: f32, height: f32) -> impl IntoEl
     img(move |window: &mut Window, cx: &mut App| window.use_asset::<CoverImageAsset>(&source, cx))
         .w(px(width))
         .h(px(height))
-        .rounded_lg()
+        .rounded(COVER_IMAGE_CORNER_RADIUS)
 }
 
 fn load_cover_image(source: CoverImageSource) -> Result<Arc<RenderImage>> {
@@ -242,7 +243,7 @@ fn resume_item_card_image<T>(
         .relative()
         .w(px(USER_VIEW_CARD_WIDTH_PX))
         .h(px(USER_VIEW_CARD_IMAGE_HEIGHT_PX))
-        .rounded_lg()
+        .rounded(COVER_IMAGE_CORNER_RADIUS)
         .overflow_hidden()
         .bg(theme.input_background)
         .when_some(image_path, |this, path| {
@@ -261,7 +262,7 @@ fn resume_item_card_image<T>(
             )
         })
         .when_some(played_fraction, |this, fraction| {
-            this.child(image_progress_bar(USER_VIEW_CARD_WIDTH_PX, fraction, cx))
+            this.child(cover_image_progress_bar(fraction, cx))
         })
         .when(is_favorite, |this| {
             this.child(
@@ -283,6 +284,51 @@ fn resume_item_card_image<T>(
                     ),
             )
         })
+}
+
+fn cover_image_progress_bar<T>(played_fraction: f32, cx: &Context<T>) -> impl IntoElement {
+    let theme = theme::get(cx);
+    let track_color = theme.background.opacity(0.72);
+    let progress_color = theme.input_border_focused;
+
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let radius = COVER_IMAGE_CORNER_RADIUS.to_pixels(window.rem_size());
+            let height = px(IMAGE_PROGRESS_BAR_HEIGHT_PX).min(bounds.size.height);
+            let track_bounds = Bounds::new(
+                point(bounds.left(), bounds.bottom() - height),
+                size(bounds.size.width, height),
+            );
+            let progress_bounds = Bounds::new(
+                track_bounds.origin,
+                size(bounds.size.width * played_fraction.clamp(0.0, 1.0), height),
+            );
+
+            // GPUI overflow masks are rectangular. Reveal only the bottom strip
+            // of full-cover rounded quads so both colors follow the cover corners.
+            window.with_content_mask(
+                Some(ContentMask {
+                    bounds: track_bounds,
+                }),
+                |window| {
+                    window.paint_quad(fill(bounds, track_color).corner_radii(radius));
+                },
+            );
+            window.with_content_mask(
+                Some(ContentMask {
+                    bounds: progress_bounds,
+                }),
+                |window| {
+                    window.paint_quad(fill(bounds, progress_color).corner_radii(radius));
+                },
+            );
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
 }
 
 fn image_progress_bar<T>(image_width: f32, played_fraction: f32, cx: &Context<T>) -> gpui::Div {
@@ -423,14 +469,80 @@ pub(super) fn user_episode_card<T>(
     image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> gpui::Div {
-    let theme = theme::get(cx);
-    let has_image = image_path.is_some();
-    let played_fraction = item
-        .user_data
+    user_episode_card_with_image(
+        item,
+        compact_episode_card_image(image_path, user_episode_played_fraction(item), cx),
+        HOME_ITEM_CARD_WIDTH_PX,
+        HOME_ITEM_CARD_PADDING_PX,
+        cx,
+    )
+}
+
+pub(super) fn favorite_episode_card<T>(
+    item: &UserItem,
+    image_path: Option<Arc<Path>>,
+    cx: &Context<T>,
+) -> gpui::Div {
+    user_episode_card_with_image(
+        item,
+        episode_card_image(image_path, user_episode_played_fraction(item), cx),
+        DETAIL_EPISODE_CARD_WIDTH_PX,
+        DETAIL_EPISODE_CARD_PADDING_PX,
+        cx,
+    )
+}
+
+fn user_episode_played_fraction(item: &UserItem) -> Option<f32> {
+    item.user_data
         .as_ref()
         .and_then(|data| data.played_percentage)
         .filter(|percentage| percentage.is_finite())
-        .map(|percentage| (percentage.clamp(0.0, 100.0) / 100.0) as f32);
+        .map(|percentage| (percentage.clamp(0.0, 100.0) / 100.0) as f32)
+}
+
+fn compact_episode_card_image<T>(
+    image_path: Option<Arc<Path>>,
+    played_fraction: Option<f32>,
+    cx: &Context<T>,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+    let has_image = image_path.is_some();
+    div()
+        .relative()
+        .w(px(HOME_ITEM_CARD_WIDTH_PX))
+        .h(px(HOME_ITEM_CARD_WIDTH_PX * 9.0 / 16.0))
+        .rounded_lg()
+        .overflow_hidden()
+        .bg(theme.input_background)
+        .when_some(image_path, |this, path| {
+            this.child(
+                img(path)
+                    .w_full()
+                    .h_full()
+                    .object_fit(gpui::ObjectFit::Cover),
+            )
+        })
+        .when(!has_image, |this| {
+            this.flex().items_center().justify_center().child(
+                svg()
+                    .path("icons/clapperboard.svg")
+                    .size(px(32.0))
+                    .text_color(theme.muted_foreground),
+            )
+        })
+        .when_some(played_fraction, |this, fraction| {
+            this.child(image_progress_bar(HOME_ITEM_CARD_WIDTH_PX, fraction, cx))
+        })
+}
+
+fn user_episode_card_with_image<T>(
+    item: &UserItem,
+    image: impl IntoElement,
+    width: f32,
+    padding: f32,
+    cx: &Context<T>,
+) -> gpui::Div {
+    let theme = theme::get(cx);
     let episode_number = match (item.parent_index_number, item.index_number) {
         (Some(season), Some(episode)) => Some(format!("S{season:02}E{episode:02}")),
         (None, Some(episode)) => Some(format!("E{episode:02}")),
@@ -455,39 +567,12 @@ pub(super) fn user_episode_card<T>(
         .flex_col()
         .gap_2()
         .rounded_lg()
-        .p(px(HOME_ITEM_CARD_PADDING_PX))
+        .p(px(padding))
         .hover(move |style| style.bg(theme.secondary_hover))
+        .child(image)
         .child(
             div()
-                .relative()
-                .w(px(HOME_ITEM_CARD_WIDTH_PX))
-                .h(px(HOME_ITEM_CARD_WIDTH_PX * 9.0 / 16.0))
-                .rounded_lg()
-                .overflow_hidden()
-                .bg(theme.input_background)
-                .when_some(image_path, |this, path| {
-                    this.child(
-                        img(path)
-                            .w_full()
-                            .h_full()
-                            .object_fit(gpui::ObjectFit::Cover),
-                    )
-                })
-                .when(!has_image, |this| {
-                    this.flex().items_center().justify_center().child(
-                        svg()
-                            .path("icons/clapperboard.svg")
-                            .size(px(32.0))
-                            .text_color(theme.muted_foreground),
-                    )
-                })
-                .when_some(played_fraction, |this, fraction| {
-                    this.child(image_progress_bar(HOME_ITEM_CARD_WIDTH_PX, fraction, cx))
-                }),
-        )
-        .child(
-            div()
-                .w(px(HOME_ITEM_CARD_WIDTH_PX))
+                .w(px(width))
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -595,7 +680,7 @@ fn episode_card_image<T>(
         .w(px(DETAIL_EPISODE_CARD_WIDTH_PX))
         .h(px(DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX))
         .overflow_hidden()
-        .rounded_lg()
+        .rounded(COVER_IMAGE_CORNER_RADIUS)
         .bg(theme.input_background)
         .when_some(image_path, |this, path| {
             this.child(cover_img(
@@ -613,11 +698,7 @@ fn episode_card_image<T>(
             )
         })
         .when_some(played_fraction, |this, fraction| {
-            this.child(image_progress_bar(
-                DETAIL_EPISODE_CARD_WIDTH_PX,
-                fraction,
-                cx,
-            ))
+            this.child(cover_image_progress_bar(fraction, cx))
         })
 }
 
@@ -849,6 +930,113 @@ mod tests {
             parent_backdrop_item_id: None,
             parent_backdrop_image_tags: None,
             user_data: None,
+        }
+    }
+
+    #[gpui::test]
+    fn resume_progress_matches_cover_corners_and_stays_inside_visible_bounds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_cover_progress_bounds(cx, false);
+    }
+
+    #[gpui::test]
+    fn detail_episode_progress_matches_cover_corners_and_stays_inside_visible_bounds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_cover_progress_bounds(cx, true);
+    }
+
+    fn assert_cover_progress_bounds(cx: &mut gpui::TestAppContext, detail_episode: bool) {
+        use gpui::{Render, ScaledPixels};
+
+        struct ProgressCard {
+            detail_episode: bool,
+            fraction: Option<f32>,
+            rem_size: f32,
+            visible_width: f32,
+        }
+
+        impl Render for ProgressCard {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                window.set_rem_size(px(self.rem_size));
+                div().size_full().p(px(16.0)).child(
+                    div().w(px(self.visible_width)).overflow_hidden().child(
+                        if self.detail_episode {
+                            episode_card_image(None, self.fraction, cx).into_any_element()
+                        } else {
+                            resume_item_card_image(None, self.fraction, false, cx)
+                                .into_any_element()
+                        },
+                    ),
+                )
+            }
+        }
+
+        cx.update(theme::init);
+        let cover_width = if detail_episode {
+            DETAIL_EPISODE_CARD_WIDTH_PX
+        } else {
+            USER_VIEW_CARD_WIDTH_PX
+        };
+        let (card, cx) = cx.add_window_view(|_, _| ProgressCard {
+            detail_episode,
+            fraction: None,
+            rem_size: 16.0,
+            visible_width: cover_width,
+        });
+
+        for rem_size in [16.0, 20.0] {
+            for visible_width in [cover_width, 180.0] {
+                for fraction in [None, Some(-0.1), Some(0.0), Some(0.5), Some(1.0), Some(1.1)] {
+                    card.update(cx, |card, cx| {
+                        card.fraction = fraction;
+                        card.rem_size = rem_size;
+                        card.visible_width = visible_width;
+                        cx.notify();
+                    });
+                    cx.run_until_parked();
+                    cx.update(|window, cx| {
+                        let theme = theme::get(cx);
+                        let quads = window.painted_quads();
+                        let cover = quads
+                            .iter()
+                            .find(|quad| quad.background == theme.input_background.into())
+                            .expect("cover background is painted");
+                        let track = quads
+                            .iter()
+                            .find(|quad| quad.background == theme.background.opacity(0.72).into());
+                        let progress = quads
+                            .iter()
+                            .find(|quad| quad.background == theme.input_border_focused.into());
+
+                        assert_eq!(track.is_some(), fraction.is_some());
+                        assert_eq!(
+                            progress.is_some(),
+                            fraction.is_some_and(|value| value > 0.0)
+                        );
+                        for (quad, width) in track
+                            .map(|quad| (quad, visible_width))
+                            .into_iter()
+                            .chain(progress.map(|quad| {
+                                let width = cover_width * fraction.unwrap().clamp(0.0, 1.0);
+                                (quad, width.min(visible_width))
+                            }))
+                        {
+                            assert_eq!(quad.bounds, cover.bounds);
+                            assert_eq!(quad.corner_radii, cover.corner_radii);
+                            let mask = quad.content_mask.bounds;
+                            assert_eq!(mask.left(), cover.bounds.left());
+                            assert_eq!(mask.bottom(), cover.bounds.bottom());
+                            assert_eq!(
+                                mask.size.width,
+                                ScaledPixels(width * window.scale_factor())
+                            );
+                            assert_eq!(mask.size.height, ScaledPixels(4.0 * window.scale_factor()));
+                        }
+                    });
+                }
+            }
         }
     }
 

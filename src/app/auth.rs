@@ -25,6 +25,10 @@ impl TinyApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.begin_select_server(server, cx);
+    }
+
+    fn begin_select_server(&mut self, server: &CachedServer, cx: &mut Context<Self>) {
         self.open_server_menu = None;
         self.clear_app_notifications();
         self.clear_server_notifications();
@@ -177,8 +181,18 @@ impl TinyApp {
             &home_page,
             move |app: &mut TinyApp, _, event, cx| match event {
                 HomeEvent::BackToServers => app.show_servers_page_from_home(cx),
+                HomeEvent::SwitchServer(server_id) => {
+                    if let Some(server) = app
+                        .servers
+                        .iter()
+                        .find(|server| &server.id == server_id)
+                        .cloned()
+                    {
+                        app.begin_select_server(&server, cx);
+                    }
+                }
                 HomeEvent::SectionChanged | HomeEvent::TitleChanged => cx.notify(),
-                HomeEvent::OpenSettings => app.open_playback_settings_dialog(cx),
+                HomeEvent::OpenSettings => app.open_settings_window(cx),
                 HomeEvent::OpenPlayback(request) => {
                     app.open_playback_page(playback_return_to.clone(), request.as_ref().clone(), cx)
                 }
@@ -274,4 +288,81 @@ fn has_cached_auth(server: &CachedServer) -> bool {
             .access_token
             .as_deref()
             .is_some_and(|access_token| !access_token.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{storage::ServerCache, theme};
+    use gpui::{Modifiers, TestAppContext, px, size};
+
+    #[gpui::test]
+    fn sidebar_switches_servers_and_uses_the_existing_login_flow(cx: &mut TestAppContext) {
+        cx.update(theme::init);
+        let (app, cx) = cx.add_window_view(|_, cx| {
+            let mut cache = ServerCache::empty();
+            cache.servers = ["first", "second", "login-required"]
+                .into_iter()
+                .map(|id| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": id, "server_name": id,
+                        // An invalid endpoint makes all requests fail locally, without network access.
+                        "endpoint": {"protocol": "Https", "address": "", "port": 443, "path": ""},
+                        "username": id, "password": "", "user_id": id,
+                        "access_token": (id != "login-required").then_some("test-token"),
+                        "added_at_unix": 0
+                    }))
+                    .unwrap()
+                })
+                .collect();
+            let mut app = TinyApp::new(cache, None, cx);
+            app.window_persistence_enabled = false;
+            app.open_home_for_server(app.servers[0].clone(), cx);
+            app
+        });
+        cx.simulate_resize(size(px(1100.0), px(720.0)));
+        cx.run_until_parked();
+        let original_home = app.read_with(cx, |app, _| match &app.page {
+            Page::Home(home) => home.entity_id(),
+            _ => panic!("expected initial home page"),
+        });
+        let current = cx.debug_bounds("sidebar-server-first").unwrap();
+        cx.simulate_click(current.center(), Modifiers::default());
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(matches!(&app.page, Page::Home(home) if home.entity_id() == original_home));
+        });
+
+        let mut previous_home = original_home;
+        for selector in ["sidebar-server-second", "sidebar-server-first"] {
+            let target = cx.debug_bounds(selector).unwrap();
+            cx.simulate_click(target.center(), Modifiers::default());
+            cx.run_until_parked();
+            let switched_home = app.read_with(cx, |app, _| {
+                let Page::Home(home) = &app.page else {
+                    panic!("cached authentication must switch directly to Home");
+                };
+                assert!(app.selecting_server_id.is_none());
+                home.entity_id()
+            });
+            assert_ne!(switched_home, previous_home);
+            // Clicking the newly active server must keep its current page and state.
+            let current = cx.debug_bounds(selector).unwrap();
+            cx.simulate_click(current.center(), Modifiers::default());
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                assert!(matches!(&app.page, Page::Home(home) if home.entity_id() == switched_home));
+            });
+            previous_home = switched_home;
+        }
+
+        let target = cx.debug_bounds("sidebar-server-login-required").unwrap();
+        cx.simulate_click(target.center(), Modifiers::default());
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(matches!(app.page, Page::Servers));
+            assert!(app.selecting_server_id.is_none());
+            assert!(app.has_server_page_notifications());
+        });
+    }
 }

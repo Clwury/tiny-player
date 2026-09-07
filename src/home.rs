@@ -30,11 +30,10 @@ use crate::{
     ui::editor::Editor,
 };
 use carousel::CarouselState;
-use favorites::FavoriteRollback;
+use favorites::{FavoriteRollback, FavoritesState};
 use library::LibraryState;
 use navigation::{HomeNavigation, HomeRoot, HomeRoute};
 use notification::HomeNotificationQueue;
-use paged_items::PagedItemsState;
 use resume_actions::ResumeItemContextMenu;
 use search::SearchState;
 
@@ -48,6 +47,7 @@ use gpui::{
 #[derive(Clone, Debug)]
 pub enum HomeEvent {
     BackToServers,
+    SwitchServer(String),
     SectionChanged,
     TitleChanged,
     OpenSettings,
@@ -131,7 +131,7 @@ struct HomeContent {
     latest_queue: VecDeque<String>,
     latest_in_flight: HashSet<(String, u64)>,
     libraries: HashMap<String, LibraryState>,
-    favorites: PagedItemsState,
+    favorites: FavoritesState,
     search: SearchState,
     search_input: Entity<Editor>,
     user_data_overrides: HashMap<String, UserItemData>,
@@ -225,7 +225,7 @@ impl HomeContent {
             latest_queue: VecDeque::new(),
             latest_in_flight: HashSet::new(),
             libraries: HashMap::new(),
-            favorites: PagedItemsState::default(),
+            favorites: FavoritesState::default(),
             search: SearchState::default(),
             search_input,
             user_data_overrides: HashMap::new(),
@@ -332,6 +332,7 @@ impl HomeContent {
     }
 
     fn sync_previous_offsets(&mut self) {
+        self.favorites.sync_previous_offsets();
         self.user_views_carousel.sync_previous_offset();
         self.resume_items_carousel.sync_previous_offset();
         for row in self.user_view_items_rows.values_mut() {
@@ -430,6 +431,14 @@ impl HomePage {
 
     fn back_to_servers(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(HomeEvent::BackToServers);
+    }
+
+    fn switch_server(&mut self, server_id: &str, cx: &mut Context<Self>) {
+        if server_id != self.current_server.id
+            && self.servers.iter().any(|server| server.id == server_id)
+        {
+            cx.emit(HomeEvent::SwitchServer(server_id.to_string()));
+        }
     }
 
     fn open_settings(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {

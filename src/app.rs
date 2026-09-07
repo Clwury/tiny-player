@@ -7,6 +7,7 @@ mod render;
 mod resize;
 mod server_cache;
 mod server_card;
+mod settings_window;
 mod window;
 
 use std::{
@@ -14,9 +15,10 @@ use std::{
     time::Instant,
 };
 
-use gpui::{Context, Entity, SharedString, Task};
+use gpui::{Context, Entity, SharedString, Task, WindowHandle};
 
 pub(crate) use resize::WINDOW_RESIZE_EDGE_WIDTH_PX;
+pub(crate) use window::app_window_options;
 
 use crate::{
     emby::{EmbyClient, ItemCounts},
@@ -25,13 +27,12 @@ use crate::{
     server::CachedServer,
     storage::ServerCache,
     ui::add_server_dialog::AddServerDialogState,
-    ui::playback_settings_dialog::PlaybackSettingsDialogState,
 };
 use notification::AppNotificationQueue;
 
 pub struct TinyApp {
     add_server_dialog: Option<Entity<AddServerDialogState>>,
-    playback_settings_dialog: Option<Entity<PlaybackSettingsDialogState>>,
+    settings_window: Option<WindowHandle<settings_window::SettingsWindow>>,
     open_server_menu: Option<String>,
     cache: ServerCache,
     emby_client: Option<EmbyClient>,
@@ -78,8 +79,30 @@ impl TinyApp {
             Err(error) => (None, Some(format!("{error}").into())),
         };
         let initial_error = startup_error.or(emby_client_error);
-        cx.on_release(|app, _| app.save_pending_cache_on_release())
-            .detach();
+        cx.on_release(|app, cx| {
+            app.save_pending_cache_on_release();
+            if let Some(settings) = app.settings_window.take() {
+                settings
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            }
+        })
+        .detach();
+        let app = cx.weak_entity();
+        cx.on_window_closed(move |cx, window_id| {
+            app.update(cx, |app, cx| {
+                if app
+                    .settings_window
+                    .is_some_and(|window| window.window_id() == window_id)
+                {
+                    app.settings_window = None;
+                    app.flush_scheduled_cache_save(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
         cx.on_app_quit(|app, cx| {
             app.flush_scheduled_cache_save(cx);
             async {}
@@ -87,7 +110,7 @@ impl TinyApp {
         .detach();
         let mut app = Self {
             add_server_dialog: None,
-            playback_settings_dialog: None,
+            settings_window: None,
             open_server_menu: None,
             cache,
             emby_client,

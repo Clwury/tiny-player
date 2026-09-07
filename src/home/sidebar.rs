@@ -1,6 +1,6 @@
 use gpui::{
     App, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, svg,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, rgb, svg,
 };
 
 use crate::{app_metadata::APP_NAME, server::CachedServer, theme};
@@ -62,16 +62,34 @@ impl HomePage {
                 cx,
                 on_search,
             ))
-            .child(div().my_3().h(px(1.0)).bg(theme.title_bar_border))
-            .child(div().flex().min_h_0().flex_1().flex_col().gap_1().children(
-                self.servers.iter().map(|server| {
-                    server_list_item(
-                        server_title(server),
-                        server.id == self.current_server.id,
-                        cx,
-                    )
-                }),
-            ))
+            .child(
+                div()
+                    .my_3()
+                    .h(px(1.0))
+                    .flex_none()
+                    .bg(theme.title_bar_border),
+            )
+            .child(
+                div()
+                    .id("sidebar-servers")
+                    .debug_selector(|| "sidebar-servers".to_string())
+                    .flex()
+                    .min_h_0()
+                    .flex_1()
+                    .flex_col()
+                    .gap_1()
+                    .overflow_y_scroll()
+                    .scrollbar_width(px(0.0))
+                    .children(self.servers.iter().map(|server| {
+                        let server_id = server.id.clone();
+                        server_list_item(
+                            server,
+                            server.id == self.current_server.id,
+                            cx,
+                            cx.listener(move |page, _, _, cx| page.switch_server(&server_id, cx)),
+                        )
+                    })),
+            )
             .child(user_row(username, cx, on_settings))
     }
 
@@ -85,6 +103,7 @@ impl HomePage {
         div()
             .relative()
             .flex()
+            .flex_none()
             .h(px(36.0))
             .items_center()
             .justify_center()
@@ -129,25 +148,21 @@ fn sidebar_nav_item(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
-    let color = if active {
-        theme.foreground
-    } else {
-        theme.muted_foreground
-    };
 
     div()
         .id(id)
         .flex()
+        .flex_none()
         .h(px(34.0))
         .items_center()
         .gap_2()
         .rounded_md()
         .px_3()
         .text_sm()
-        .text_color(color)
+        .text_color(theme.foreground)
         .when(active, |this| this.bg(theme.secondary_hover))
         .hover(move |style| style.bg(theme.secondary_hover))
-        .child(svg().path(icon).size(px(16.0)).text_color(color))
+        .child(svg().path(icon).size(px(16.0)).text_color(theme.foreground))
         .child(label)
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
@@ -158,23 +173,50 @@ fn sidebar_nav_item(
         })
 }
 
-fn server_list_item(title: String, active: bool, cx: &Context<HomePage>) -> impl IntoElement {
+fn server_list_item(
+    server: &CachedServer,
+    active: bool,
+    cx: &Context<HomePage>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     let theme = theme::get(cx);
+    let server_id = server.id.clone();
 
     div()
+        .id((gpui::ElementId::from("sidebar-server"), server_id.clone()))
+        .debug_selector(move || format!("sidebar-server-{server_id}"))
         .flex()
-        .h(px(30.0))
+        .flex_none()
+        .h(px(36.0))
+        .min_w_0()
         .items_center()
+        .gap_2()
         .rounded_md()
         .px_3()
         .text_sm()
-        .text_color(if active {
-            theme.foreground
-        } else {
-            theme.muted_foreground
-        })
+        .text_color(theme.foreground)
         .when(active, |this| this.bg(theme.secondary_hover))
-        .child(title)
+        .hover(move |style| style.bg(theme.secondary_hover))
+        .cursor_pointer()
+        .child(
+            svg()
+                .path("icons/emby.svg")
+                .size(px(18.0))
+                .flex_none()
+                .text_color(rgb(0x53b34c)),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .child(server_title(server)),
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            on_click(event, window, cx);
+        })
 }
 
 fn user_row(
@@ -185,8 +227,10 @@ fn user_row(
     let theme = theme::get(cx);
 
     div()
+        .debug_selector(|| "sidebar-user".to_string())
         .mt_3()
         .flex()
+        .flex_none()
         .h(px(38.0))
         .items_center()
         .justify_between()
@@ -221,8 +265,8 @@ fn user_row(
                 .child(
                     svg()
                         .path("icons/setting.svg")
-                        .size(px(17.0))
-                        .text_color(theme.muted_foreground),
+                        .size(px(18.0))
+                        .text_color(theme.foreground),
                 )
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
@@ -241,4 +285,46 @@ fn server_title(server: &CachedServer) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or(&server.endpoint.address)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emby::EmbyClient;
+    use gpui::{TestAppContext, size};
+
+    #[gpui::test]
+    fn sidebar_server_rows_keep_their_height_when_the_list_overflows(cx: &mut TestAppContext) {
+        cx.update(theme::init);
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            let servers = (0..20)
+                .map(|index| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": format!("server-{index}"),
+                        "server_name": "A long server name that should truncate within the sidebar",
+                        "endpoint": {"protocol": "Https", "address": "example.com", "port": 443, "path": ""},
+                        "username": "test", "password": "", "added_at_unix": 0
+                    }))
+                    .unwrap()
+                })
+                .collect::<Vec<CachedServer>>();
+            // Missing user IDs prevent background effects from starting.
+            HomePage::new(servers[0].clone(), servers, EmbyClient::new("test".into()).unwrap(), cx)
+        });
+        for height in [900.0, 500.0, 720.0] {
+            cx.simulate_resize(size(px(1100.0), px(height)));
+            cx.run_until_parked();
+            let first = cx.debug_bounds("sidebar-server-server-0").unwrap();
+            let second = cx.debug_bounds("sidebar-server-server-1").unwrap();
+            let list = cx.debug_bounds("sidebar-servers").unwrap();
+            let user = cx.debug_bounds("sidebar-user").unwrap();
+            assert_eq!(first.size.height, px(36.0));
+            assert_eq!(second.top() - first.bottom(), px(4.0));
+            assert!(first.left() >= list.left());
+            assert!(first.right() <= list.right());
+            assert!(list.bottom() < user.top());
+            assert_eq!(user.size.height, px(38.0));
+            assert!(user.bottom() <= px(height));
+        }
+    }
 }

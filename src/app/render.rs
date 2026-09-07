@@ -9,6 +9,7 @@ use super::{
     Page, TinyApp,
     resize::resize_handles,
     server_card::{ServerCardActions, add_server_card, server_card},
+    window::window_border,
 };
 
 impl TinyApp {
@@ -101,9 +102,7 @@ impl Render for TinyApp {
         let close_menu = cx.listener(Self::close_server_menu);
         let submit_dialog = cx.listener(Self::submit_add_server_dialog);
         let dialog = self.add_server_dialog.clone();
-        let close_playback_settings = cx.listener(Self::close_playback_settings_dialog);
-        let playback_settings_dialog = self.playback_settings_dialog.clone();
-        let modal_open = dialog.is_some() || playback_settings_dialog.is_some();
+        let modal_open = dialog.is_some();
 
         div()
             .relative()
@@ -138,16 +137,9 @@ impl Render for TinyApp {
                     cx,
                 ))
             })
-            .when_some(playback_settings_dialog, |this, dialog| {
-                this.child(dialog.read(cx).render_layer(
-                    dialog.clone(),
-                    rounded_window,
-                    close_playback_settings,
-                    cx,
-                ))
-            })
             .when(rounded_window && !modal_open, |this| {
                 this.children(resize_handles())
             })
+            .when(rounded_window, |this| this.child(window_border(cx)))
     }
 }

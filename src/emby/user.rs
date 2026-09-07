@@ -136,7 +136,11 @@ fn add_query_user_items_query(url: &mut url::Url, query: &UserItemsQuery) {
         pairs.append_pair("IncludeItemTypes", &include_types);
     }
     if let Some(is_favorite) = query.is_favorite {
-        pairs.append_pair("IsFavorite", if is_favorite { "true" } else { "false" });
+        if is_favorite {
+            pairs.append_pair("Filters", "IsFavorite");
+        } else {
+            pairs.append_pair("IsFavorite", "false");
+        }
     }
     if query.group_programs_by_series {
         pairs.append_pair("GroupProgramsBySeries", "true");
@@ -977,20 +981,40 @@ mod tests {
         add_query_user_items_query(
             &mut query_url,
             &UserItemsQuery {
-                include_item_types: vec![VideoItemType::Movie, VideoItemType::Series],
+                include_item_types: vec![VideoItemType::Series],
                 is_favorite: Some(true),
-                sort_by: Some(UserItemsSort::SortName),
+                sort_by: Some(UserItemsSort::DateCreated),
+                sort_order: SortOrder::Descending,
+                limit: 30,
+                fields: Some(
+                    "BasicSyncInfo,CommunityRating,ProductionYear,EndDate,Container".into(),
+                ),
                 ..UserItemsQuery::default()
             },
         );
         assert_eq!(
             query_url
                 .query_pairs()
-                .find(|(key, _)| key == "IsFavorite")
+                .find(|(key, _)| key == "Filters")
                 .unwrap()
                 .1,
-            "true"
+            "IsFavorite"
         );
+        let pairs = query_url.query_pairs().collect::<HashMap<_, _>>();
+        for (name, expected) in [
+            ("IncludeItemTypes", "Series"),
+            ("Limit", "30"),
+            ("Recursive", "true"),
+            ("SortBy", "DateCreated,DateLastContentAdded,SortName"),
+            ("SortOrder", "Descending"),
+            ("EnableImageTypes", "Primary,Backdrop,Thumb"),
+            (
+                "Fields",
+                "BasicSyncInfo,CommunityRating,ProductionYear,EndDate,Container",
+            ),
+        ] {
+            assert_eq!(pairs.get(name).map(|value| value.as_ref()), Some(expected));
+        }
 
         let favorite_url = favorite_item_url(&endpoint, "user-1", "item-1").unwrap();
         assert_eq!(

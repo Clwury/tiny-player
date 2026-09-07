@@ -1,3 +1,12 @@
+#[cfg(test)]
+mod integration_tests;
+pub(super) mod render;
+mod state;
+
+pub(crate) use state::{
+    FAVORITE_ITEM_TYPES, FAVORITES_PAGE_LIMIT, FavoritesState, favorite_section_title,
+};
+
 use std::{borrow::Cow, collections::HashMap};
 
 use gpui::{AppContext as _, ClickEvent, Context, SharedString, Window};
@@ -8,205 +17,222 @@ use crate::emby::{
 };
 
 use super::{
-    HomeContent, LoadState,
+    HomeContent, HomeContentEvent, LoadState,
     navigation::{HomeRoot, HomeRoute},
-    notification::{
-        FAVORITES_INITIAL_NOTIFICATION_KEY, FAVORITES_LOAD_MORE_NOTIFICATION_KEY,
-        FAVORITES_REFRESH_NOTIFICATION_KEY, NotificationScope,
-    },
-    paged_items::PAGED_ITEMS_LIMIT,
+    notification::NotificationScope,
 };
 
 #[derive(Clone, Debug)]
 pub(crate) struct FavoriteRollback {
     previous_override: Option<UserItemData>,
-    removed: Option<(usize, UserItem)>,
+    removed: Option<(VideoItemType, usize, UserItem)>,
+}
+
+struct FavoritesRequest {
+    identity: super::WorkspaceIdentity,
+    item_type: VideoItemType,
+    user_data_revision: u64,
+    generation: u64,
+    start_index: u32,
+    initial: bool,
 }
 
 impl HomeContent {
     pub(super) fn enter_favorites_if_needed(&mut self, cx: &mut Context<Self>) {
-        if self.favorites.initial == LoadState::Idle
-            || self.favorites.initial == LoadState::Failed
-            || self.favorites.dirty
-        {
-            self.load_favorites_initial(cx);
+        let item_types = match self.navigation.current() {
+            HomeRoute::FavoriteItems { item_type } => vec![*item_type],
+            _ => FAVORITE_ITEM_TYPES.to_vec(),
+        };
+        for item_type in item_types {
+            let state = &self.favorites[item_type].paged;
+            if matches!(state.initial, LoadState::Idle | LoadState::Failed) || state.dirty {
+                self.load_favorites_initial(item_type, cx);
+            }
         }
     }
 
-    pub(super) fn auto_load_more_favorites(&mut self, cx: &mut Context<Self>) {
-        if self.navigation.current() != &HomeRoute::Root(HomeRoot::Favorites) {
+    pub(super) fn open_favorite_items(&mut self, item_type: VideoItemType, cx: &mut Context<Self>) {
+        self.favorites.sync_previous_offsets();
+        self.navigation.push_favorite_items(item_type);
+        self.enter_favorites_if_needed(cx);
+        cx.emit(HomeContentEvent::TitleChanged);
+        cx.notify();
+    }
+
+    pub(super) fn auto_load_more_favorites(
+        &mut self,
+        item_type: VideoItemType,
+        cx: &mut Context<Self>,
+    ) {
+        if self.navigation.current() != &(HomeRoute::FavoriteItems { item_type })
+            || self.favorites[item_type].paged.dirty
+            || !self.favorites[item_type].paged.can_auto_load_more()
+        {
             return;
         }
-        self.load_more_favorites(cx);
+        self.load_more_favorites(item_type, cx);
     }
 
-    pub(super) fn load_more_favorites(&mut self, cx: &mut Context<Self>) {
-        let Some((generation, start_index)) = self.favorites.begin_load_more() else {
+    pub(super) fn load_more_favorites(&mut self, item_type: VideoItemType, cx: &mut Context<Self>) {
+        self.request_favorites_page(item_type, false, cx);
+    }
+
+    pub(super) fn load_favorites_initial(
+        &mut self,
+        item_type: VideoItemType,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_favorites_page(item_type, true, cx);
+    }
+
+    fn clear_favorite_notifications(&mut self, item_type: VideoItemType) {
+        for phase in ["initial", "refresh", "load-more"] {
+            self.clear_notification(
+                NotificationScope::Favorites,
+                &favorite_notification_key(item_type, phase),
+            );
+        }
+    }
+
+    fn request_favorites_page(
+        &mut self,
+        item_type: VideoItemType,
+        initial: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let state = &mut self.favorites[item_type].paged;
+        if !initial && state.dirty {
+            return;
+        }
+        let request = if initial {
+            state
+                .begin_initial(state.items.is_empty())
+                .map(|generation| (generation, 0))
+        } else {
+            state.begin_load_more()
+        };
+        let Some((generation, start_index)) = request else {
             return;
         };
-        self.clear_notification(
-            NotificationScope::Favorites,
-            FAVORITES_LOAD_MORE_NOTIFICATION_KEY,
-        );
+        if initial {
+            self.clear_favorite_notifications(item_type);
+        } else {
+            self.clear_notification(
+                NotificationScope::Favorites,
+                &favorite_notification_key(item_type, "load-more"),
+            );
+        }
+        let request = FavoritesRequest {
+            identity: self.request_identity(),
+            item_type,
+            user_data_revision: self.user_data_request_revision(),
+            generation,
+            start_index,
+            initial,
+        };
         cx.notify();
         let server = self.current_server.clone();
-        let identity = self.request_identity();
-        let user_data_revision = self.user_data_request_revision();
         let client = self.emby_client.clone();
         let task = cx.background_spawn(async move {
-            client.query_user_items(&server, &favorite_query(start_index))
+            client.query_user_items(&server, &favorite_query(item_type, start_index))
         });
         cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
-                page.finish_favorites_load_more(
-                    identity,
-                    user_data_revision,
-                    generation,
-                    start_index,
-                    result,
-                    cx,
-                );
+                page.finish_favorites_page(request, result, cx)
             })
             .ok();
         })
         .detach();
     }
 
-    fn load_favorites_initial(&mut self, cx: &mut Context<Self>) {
-        let clear = self.favorites.items.is_empty();
-        let Some(generation) = self.favorites.begin_initial(clear) else {
-            return;
-        };
-        self.clear_notifications_for_scope(NotificationScope::Favorites);
-        cx.notify();
-        let server = self.current_server.clone();
-        let identity = self.request_identity();
-        let user_data_revision = self.user_data_request_revision();
-        let client = self.emby_client.clone();
-        let task = cx
-            .background_spawn(async move { client.query_user_items(&server, &favorite_query(0)) });
-        cx.spawn(async move |page, cx| {
-            let result = task.await;
-            page.update(cx, |page, cx| {
-                page.finish_favorites_initial(identity, user_data_revision, generation, result, cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn finish_favorites_initial(
+    fn finish_favorites_page(
         &mut self,
-        identity: super::WorkspaceIdentity,
-        user_data_revision: u64,
-        generation: u64,
+        request: FavoritesRequest,
         mut result: anyhow::Result<UserItems>,
         cx: &mut Context<Self>,
     ) {
-        if !self.matches_request_identity(&identity) {
-            return;
-        }
-        if !self.favorites.accepts_initial(generation) {
-            return;
-        }
-        let raw_count = result
-            .as_ref()
-            .ok()
-            .map(|items| items.items.len() as u32)
-            .unwrap_or_default();
-        if let Ok(items) = result.as_mut() {
-            items.items.retain(is_movie_or_series);
-            self.absorb_user_items_user_data(items, user_data_revision);
-            items.items.retain(|item| {
-                self.user_data_overrides
-                    .get(&item.id)
-                    .is_none_or(|data| data.is_favorite)
-            });
-            self.ensure_user_items_images(items, cx);
-        }
-        let finished = self.favorites.finish_initial_with_raw_count(
-            generation,
-            result,
-            PAGED_ITEMS_LIMIT,
-            raw_count,
-        );
-        if finished {
-            if self.favorites.initial == LoadState::Failed {
-                let (key, message): (&str, SharedString) =
-                    if let Some(error) = self.favorites.initial_error.clone() {
-                        (
-                            FAVORITES_INITIAL_NOTIFICATION_KEY,
-                            format!("加载收藏失败：{error}").into(),
-                        )
-                    } else if let Some(error) = self.favorites.refresh_error.clone() {
-                        (FAVORITES_REFRESH_NOTIFICATION_KEY, error)
-                    } else {
-                        (FAVORITES_INITIAL_NOTIFICATION_KEY, "加载收藏失败".into())
-                    };
-                self.push_error_notification(NotificationScope::Favorites, key, message, cx);
-            } else {
-                self.clear_notifications_for_scope(NotificationScope::Favorites);
-            }
-            cx.notify();
-        }
-    }
-
-    fn finish_favorites_load_more(
-        &mut self,
-        identity: super::WorkspaceIdentity,
-        user_data_revision: u64,
-        generation: u64,
-        start_index: u32,
-        mut result: anyhow::Result<UserItems>,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.matches_request_identity(&identity) {
-            return;
-        }
-        if !self.favorites.accepts_load_more(generation, start_index) {
-            return;
-        }
-        let raw_count = result
-            .as_ref()
-            .ok()
-            .map(|items| items.items.len() as u32)
-            .unwrap_or_default();
-        if let Ok(items) = result.as_mut() {
-            items.items.retain(is_movie_or_series);
-            self.absorb_user_items_user_data(items, user_data_revision);
-            items.items.retain(|item| {
-                self.user_data_overrides
-                    .get(&item.id)
-                    .is_none_or(|data| data.is_favorite)
-            });
-            self.ensure_user_items_images(items, cx);
-        }
-        let finished = self.favorites.finish_load_more_with_raw_count(
+        let FavoritesRequest {
+            identity,
+            item_type,
+            user_data_revision,
             generation,
             start_index,
-            result,
-            PAGED_ITEMS_LIMIT,
-            raw_count,
-        );
-        if finished {
-            if self.favorites.load_more == LoadState::Failed {
-                if let Some(error) = self.favorites.load_more_error.clone() {
-                    self.push_error_notification(
-                        NotificationScope::Favorites,
-                        FAVORITES_LOAD_MORE_NOTIFICATION_KEY,
-                        format!("加载更多收藏失败：{error}"),
-                        cx,
-                    );
-                }
-            } else {
-                self.clear_notification(
-                    NotificationScope::Favorites,
-                    FAVORITES_LOAD_MORE_NOTIFICATION_KEY,
-                );
-            }
-            cx.notify();
+            initial,
+        } = request;
+        if !self.matches_request_identity(&identity) {
+            return;
         }
+        let state = &self.favorites[item_type].paged;
+        if !(if initial {
+            state.accepts_initial(generation)
+        } else {
+            state.accepts_load_more(generation, start_index)
+        }) {
+            return;
+        }
+        let raw_count = result
+            .as_ref()
+            .ok()
+            .map(|items| items.items.len() as u32)
+            .unwrap_or_default();
+        if let Ok(items) = result.as_mut() {
+            items.items.retain(|item| {
+                !item.id.trim().is_empty() && item.item_type.as_deref() == Some(item_type.as_str())
+            });
+            self.absorb_user_items_user_data(items, user_data_revision);
+            items.items.retain(|item| {
+                self.user_data_overrides
+                    .get(&item.id)
+                    .is_none_or(|data| data.is_favorite)
+            });
+            self.ensure_favorite_items_images(items, cx);
+        }
+        let state = &mut self.favorites[item_type].paged;
+        if initial {
+            state.finish_initial_with_raw_count(
+                generation,
+                result,
+                FAVORITES_PAGE_LIMIT,
+                raw_count,
+            );
+        } else {
+            state.finish_load_more_with_raw_count(
+                generation,
+                start_index,
+                result,
+                FAVORITES_PAGE_LIMIT,
+                raw_count,
+            );
+        }
+        let error = if initial {
+            state
+                .initial_error
+                .clone()
+                .map(|error| ("initial", error))
+                .or_else(|| state.refresh_error.clone().map(|error| ("refresh", error)))
+        } else {
+            state
+                .load_more_error
+                .clone()
+                .map(|error| ("load-more", error))
+        };
+        if let Some((phase, error)) = error {
+            self.push_error_notification(
+                NotificationScope::Favorites,
+                favorite_notification_key(item_type, phase),
+                format!("加载收藏{}失败：{error}", favorite_section_title(item_type)),
+                cx,
+            );
+        } else if initial {
+            self.clear_favorite_notifications(item_type);
+        } else {
+            self.clear_notification(
+                NotificationScope::Favorites,
+                &favorite_notification_key(item_type, "load-more"),
+            );
+        }
+        cx.notify();
     }
 
     pub(super) fn toggle_detail_favorite(
@@ -303,8 +329,8 @@ impl HomeContent {
                             self.user_data_overrides.remove(&item_id);
                         }
                     }
-                    if let Some((index, item)) = rollback.removed {
-                        self.favorites.restore_item(index, item);
+                    if let Some((item_type, index, item)) = rollback.removed {
+                        self.favorites.restore_item(item_type, index, item);
                     }
                 }
                 let message: SharedString = format!("更新收藏失败：{error}").into();
@@ -324,8 +350,11 @@ impl HomeContent {
         }
         self.schedule_home_snapshot_save(cx);
         self.favorites.mark_dirty();
-        if self.navigation.current() == &HomeRoute::Root(HomeRoot::Favorites) {
-            self.load_favorites_initial(cx);
+        if matches!(
+            self.navigation.current(),
+            HomeRoute::Root(HomeRoot::Favorites) | HomeRoute::FavoriteItems { .. }
+        ) {
+            self.enter_favorites_if_needed(cx);
         }
         cx.notify();
     }
@@ -397,21 +426,22 @@ impl HomeContent {
     }
 }
 
-fn favorite_query(start_index: u32) -> UserItemsQuery {
+fn favorite_query(item_type: VideoItemType, start_index: u32) -> UserItemsQuery {
     UserItemsQuery {
-        include_item_types: vec![VideoItemType::Movie, VideoItemType::Series],
+        include_item_types: vec![item_type],
+        fields: Some("BasicSyncInfo,CommunityRating,ProductionYear,EndDate,Container,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,UserData".into()),
         is_favorite: Some(true),
         recursive: true,
         start_index,
-        limit: PAGED_ITEMS_LIMIT,
-        sort_by: Some(UserItemsSort::SortName),
-        sort_order: SortOrder::Ascending,
+        limit: FAVORITES_PAGE_LIMIT,
+        sort_by: Some(UserItemsSort::DateCreated),
+        sort_order: SortOrder::Descending,
         ..UserItemsQuery::default()
     }
 }
 
-fn is_movie_or_series(item: &UserItem) -> bool {
-    !item.id.trim().is_empty() && matches!(item.item_type.as_deref(), Some("Movie" | "Series"))
+fn favorite_notification_key(item_type: VideoItemType, phase: &str) -> String {
+    format!("favorites:{}:{phase}", item_type.as_str())
 }
 
 fn effective_user_item<'a>(
@@ -465,16 +495,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn favorite_query_uses_v1_types_and_sorting() {
-        let query = favorite_query(60);
-        assert_eq!(
-            query.include_item_types,
-            vec![VideoItemType::Movie, VideoItemType::Series]
-        );
-        assert_eq!(query.is_favorite, Some(true));
-        assert_eq!(query.start_index, 60);
-        assert_eq!(query.limit, 60);
-        assert_eq!(query.sort_by, Some(UserItemsSort::SortName));
+    fn favorite_queries_load_each_type_independently_with_newest_first() {
+        for item_type in FAVORITE_ITEM_TYPES {
+            let query = favorite_query(item_type, 30);
+            assert_eq!(query.include_item_types, vec![item_type]);
+            assert_eq!(query.is_favorite, Some(true));
+            assert!(query.recursive);
+            assert_eq!(query.start_index, 30);
+            assert_eq!(query.limit, 30);
+            assert_eq!(query.sort_by, Some(UserItemsSort::DateCreated));
+            assert_eq!(query.sort_order, SortOrder::Descending);
+            let fields = query.fields.as_deref().unwrap();
+            for field in [
+                "BasicSyncInfo",
+                "CommunityRating",
+                "ProductionYear",
+                "EndDate",
+                "Container",
+                "SeriesId",
+                "SeriesName",
+            ] {
+                assert!(fields.split(',').any(|value| value == field));
+            }
+        }
     }
 
     #[test]
