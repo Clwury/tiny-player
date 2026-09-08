@@ -115,6 +115,9 @@ impl RenderOnce for SettingsDropdown {
         let focused_border = theme.input_border_focused;
         let background = theme.input_background;
         let hover = theme.secondary_hover;
+        let selected_background = theme.element_selected;
+        let selected_hover = theme.element_selected_hover;
+        let accent = theme.accent_text;
         let foreground = theme.foreground;
         let muted = theme.muted_foreground;
         let menu_background = theme.dialog_background;
@@ -302,10 +305,25 @@ impl RenderOnce for SettingsDropdown {
                                 .px_1p5()
                                 .rounded(px(4.0))
                                 .text_sm()
-                                .text_color(foreground)
+                                .text_color(if index == selected {
+                                    accent
+                                } else {
+                                    foreground
+                                })
+                                .bg(if index == selected {
+                                    selected_background
+                                } else {
+                                    menu_background
+                                })
                                 .cursor_pointer()
-                                .when(index == active, |this| this.bg(hover))
-                                .hover(move |style| style.bg(hover))
+                                .when(index == active && index != selected, |this| this.bg(hover))
+                                .hover(move |style| {
+                                    style.bg(if index == selected {
+                                        selected_hover
+                                    } else {
+                                        hover
+                                    })
+                                })
                                 .on_hover(move |hovered, _, cx| {
                                     if *hovered {
                                         hover_state.update(cx, |state, cx| {

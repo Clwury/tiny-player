@@ -1,7 +1,160 @@
 use super::*;
 use crate::player::PlaybackLanguagePreferences;
 
+fn detail_icon_button(
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    enabled: bool,
+    cx: &gpui::App,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = theme::get(cx);
+    div()
+        .id(id)
+        .group(id)
+        .debug_selector(move || id.into())
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .tooltip(move |_, cx| text_tooltip(label, cx))
+        .flex()
+        .flex_none()
+        .size(px(32.0))
+        .items_center()
+        .justify_center()
+        .child(
+            svg()
+                .path(icon)
+                .size(px(18.0))
+                .text_color(theme.foreground)
+                .when(enabled, |this| {
+                    this.group_hover(id, move |style| style.text_color(theme.accent_text))
+                }),
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .when(enabled, |this| this.cursor_pointer())
+        .when(!enabled, |this| this.cursor_default().opacity(0.55))
+}
+
 impl HomeContent {
+    fn render_series_actions_menu(
+        &self,
+        detail: &SeriesDetailState,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = theme::get(cx);
+        let data = self.effective_user_data(
+            &detail.series_id,
+            detail
+                .item
+                .as_ref()
+                .and_then(|item| item.user_data.as_ref()),
+        );
+        let favorite = data.is_some_and(|data| data.is_favorite);
+        let played = data.is_some_and(|data| data.played);
+        let enabled = !self.detail_user_data_pending();
+        div()
+            .id("series-detail-actions-menu")
+            .debug_selector(|| "series-detail-actions-menu".into())
+            .absolute()
+            .top(px(34.0))
+            .left_0()
+            .w(px(164.0))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.input_border)
+            .bg(theme.dialog_background)
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when_some(detail.action_menu_focus.as_ref(), |this, focus| {
+                this.track_focus(focus)
+            })
+            .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    if let Some(detail) = page.series_detail.as_mut() {
+                        detail.open_select = None;
+                    }
+                    window.blur(cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .children(
+                [
+                    (
+                        "series-detail-series-favorite",
+                        if favorite {
+                            "取消剧集收藏"
+                        } else {
+                            "收藏剧集"
+                        },
+                        if favorite {
+                            "icons/heart-filled.svg"
+                        } else {
+                            "icons/heart.svg"
+                        },
+                        true,
+                    ),
+                    (
+                        "series-detail-series-played",
+                        if played {
+                            "标记为未观看"
+                        } else {
+                            "标记为已观看"
+                        },
+                        if played {
+                            "icons/circle-check-filled.svg"
+                        } else {
+                            "icons/circle-check.svg"
+                        },
+                        false,
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, label, icon, favorite_action)| {
+                    div()
+                        .id(id)
+                        .debug_selector(move || id.into())
+                        .role(gpui::Role::MenuItem)
+                        .aria_label(label)
+                        .h(px(30.0))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded_md()
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .child(
+                            svg()
+                                .path(icon)
+                                .size(px(16.0))
+                                .flex_none()
+                                .text_color(theme.foreground),
+                        )
+                        .child(label)
+                        .when(enabled, |this| {
+                            this.cursor_pointer()
+                                .hover(move |style| style.bg(theme.secondary_hover))
+                                .on_click(cx.listener(move |page, _, window, cx| {
+                                    cx.stop_propagation();
+                                    window.blur(cx);
+                                    if favorite_action {
+                                        page.toggle_series_favorite(cx);
+                                    } else {
+                                        page.toggle_detail_played(true, cx);
+                                    }
+                                }))
+                        })
+                        .when(!enabled, |this| this.opacity(0.55))
+                }),
+            )
+    }
+
     pub(super) fn render_series_detail_controls(
         &self,
         detail: &SeriesDetailState,
@@ -15,16 +168,12 @@ impl HomeContent {
         let toggle_video = cx.listener(Self::toggle_series_media_source_select);
         let toggle_subtitle = cx.listener(Self::toggle_series_subtitle_select);
         let toggle_favorite = cx.listener(Self::toggle_detail_favorite);
-        let favorite = self
-            .effective_user_data(
-                &detail.series_id,
-                detail
-                    .item
-                    .as_ref()
-                    .and_then(|item| item.user_data.as_ref()),
-            )
-            .is_some_and(|data| data.is_favorite);
-        let favorite_pending = self.favorite_is_pending(&detail.series_id);
+        let selected_item = detail.selected_playback_item();
+        let selected_data = selected_item
+            .and_then(|item| self.effective_user_data(&item.id, item.user_data.as_ref()));
+        let favorite = selected_data.is_some_and(|data| data.is_favorite);
+        let played = selected_data.is_some_and(|data| data.played);
+        let actions_enabled = selected_item.is_some() && !self.detail_user_data_pending();
         let media_sources = detail.selected_media_sources().unwrap_or_default();
         let source_count = media_sources.len();
         let selected_source_index = detail.selected_media_source_index();
@@ -66,45 +215,90 @@ impl HomeContent {
                         .rounded(px(8.0))
                         .id("series-detail-play-button")
                         .border_1()
-                        .border_color(theme.input_border_focused)
-                        .bg(theme.foreground)
+                        .border_color(theme.accent)
+                        .bg(theme.accent)
                         .px_4()
                         .text_base()
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.background)
+                        .text_color(theme.accent_foreground)
                         .child(detail_play_button_icon(detail.playback_loading, theme))
                         .child(play_label)
-                        .when(can_play, |this| this.cursor_pointer().on_click(play))
+                        .when(can_play, |this| {
+                            this.cursor_pointer()
+                                .hover(move |style| style.bg(theme.accent_hover))
+                                .on_click(play)
+                        })
                         .when(!can_play, |this| this.cursor_default().opacity(0.62)),
                 )
                 .child(
                     div()
-                        .id("series-detail-favorite-button")
                         .flex()
-                        .size(px(32.0))
                         .flex_none()
                         .items_center()
-                        .justify_center()
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(theme.input_border)
-                        .bg(theme.input_background)
+                        .gap_1()
                         .child(
-                            svg()
-                                .path(if favorite {
+                            detail_icon_button(
+                                "series-detail-favorite-button",
+                                if favorite {
                                     "icons/heart-filled.svg"
                                 } else {
                                     "icons/heart.svg"
-                                })
-                                .size(px(14.0))
-                                .text_color(theme.foreground),
+                                },
+                                if favorite { "取消收藏" } else { "收藏" },
+                                actions_enabled,
+                                cx,
+                            )
+                            .when(actions_enabled, |this| this.on_click(toggle_favorite)),
                         )
-                        .when(!favorite_pending, |this| {
-                            this.cursor_pointer()
-                                .hover(move |style| style.bg(theme.secondary_hover))
-                                .on_click(toggle_favorite)
-                        })
-                        .when(favorite_pending, |this| this.cursor_default().opacity(0.55)),
+                        .child(
+                            detail_icon_button(
+                                "series-detail-played-button",
+                                if played {
+                                    "icons/circle-check-filled.svg"
+                                } else {
+                                    "icons/circle-check.svg"
+                                },
+                                if played {
+                                    "标记为未观看"
+                                } else {
+                                    "标记为已观看"
+                                },
+                                actions_enabled,
+                                cx,
+                            )
+                            .when(actions_enabled, |this| {
+                                this.on_click(cx.listener(|page, _, _, cx| {
+                                    page.toggle_detail_played(false, cx)
+                                }))
+                            }),
+                        )
+                        .when(detail.is_series(), |this| {
+                            this.child(
+                                div()
+                                    .relative()
+                                    .child(
+                                        detail_icon_button(
+                                            "series-detail-more-button",
+                                            "icons/ellipsis.svg",
+                                            "剧集操作",
+                                            true,
+                                            cx,
+                                        )
+                                        .on_click(cx.listener(Self::toggle_detail_actions_menu)),
+                                    )
+                                    .when(
+                                        detail.open_select == Some(SeriesDetailSelectKind::Actions),
+                                        |this| {
+                                            this.child(
+                                                deferred(
+                                                    self.render_series_actions_menu(detail, cx),
+                                                )
+                                                .with_priority(2),
+                                            )
+                                        },
+                                    ),
+                            )
+                        }),
                 )
                 .child(
                     div()

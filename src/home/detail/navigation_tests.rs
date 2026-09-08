@@ -17,6 +17,160 @@ fn playback_sources() -> Vec<MediaSource> {
 }
 
 #[gpui::test]
+fn latte_hero_uses_local_dark_scrims_without_fallback_names(cx: &mut TestAppContext) {
+    cx.update(|cx| theme::set(theme::ColorTheme::Latte, cx));
+    let (page, cx) = cx.add_window_view(|_, cx| {
+        let server = serde_json::from_value(json!({
+            "id": "hero-theme-test", "user_id": "test",
+            "endpoint": {"protocol": "Https", "address": "example.com", "port": 443, "path": ""},
+            "username": "test", "password": "", "added_at_unix": 0
+        }))
+        .unwrap();
+        HomeContent::new(server, EmbyClient::new("test".into()).unwrap(), cx)
+    });
+    for (item_type, logo_tag) in [
+        ("Series", Some("pending-logo")),
+        ("Movie", Some("pending-logo")),
+        ("Episode", Some("pending-logo")),
+        ("Series", None),
+        ("Movie", None),
+        ("Episode", None),
+    ] {
+        page.update(cx, |page, cx| {
+            let item = json!({
+                "Id": "hero-1", "Name": "Hidden title", "Type": item_type,
+                "SeriesId": "hero-series", "SeriesName": "Hidden series title",
+                "ImageTags": logo_tag.map(|tag| json!({"Logo": tag})), "CommunityRating": 8.5,
+                "Genres": ["Drama"], "OfficialRating": "PG"
+            });
+            let mut detail =
+                SeriesDetailState::from_user_item(&serde_json::from_value(item.clone()).unwrap())
+                    .unwrap();
+            detail.item = Some(serde_json::from_value(item).unwrap());
+            page.navigation.push_detail("hero-1".into(), None);
+            page.series_detail = Some(detail);
+            cx.notify();
+        });
+        for height in [600.0, 900.0] {
+            cx.simulate_resize(size(px(1100.0), px(height)));
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("series-detail-title").is_none());
+            assert!(cx.debug_bounds("series-detail-logo").is_none());
+            let hero = cx.debug_bounds("series-detail-hero").unwrap();
+            let scrim = cx.debug_bounds("series-detail-hero-bottom-scrim").unwrap();
+            assert_eq!(scrim.size.height, px(120.0));
+            assert!(scrim.top() > hero.top());
+            cx.update(|window, cx| {
+                let quads = window.painted_quads();
+                let theme = theme::get(cx);
+                assert!(
+                    quads
+                        .iter()
+                        .all(|quad| { quad.background != theme.background.opacity(0.35).into() })
+                );
+                let media = theme::media_overlay(cx);
+                assert!(quads.iter().any(|quad| {
+                    quad.background == media.dialog_background.opacity(0.94).into()
+                }));
+                assert!(quads.iter().any(|quad| {
+                    quad.background == media.dialog_background.opacity(0.86).into()
+                }));
+                assert_eq!(
+                    quads
+                        .iter()
+                        .filter(|quad| quad.background.as_solid().is_none())
+                        .count(),
+                    2,
+                );
+            });
+        }
+    }
+}
+
+#[gpui::test]
+fn logos_adapt_to_aspect_ratio_and_stay_inside_small_heroes(cx: &mut TestAppContext) {
+    use crate::{
+        emby::{EmbyImageRequest, EmbyImageType},
+        images::cache::CachedImageKey,
+    };
+
+    let images = tempfile::tempdir().unwrap();
+    cx.update(theme::init);
+    let (page, cx) = cx.add_window_view(|_, cx| {
+        let server = serde_json::from_value(json!({
+            "id": "logo-sizing-test", "user_id": "test",
+            "endpoint": {"protocol": "Https", "address": "example.com", "port": 443, "path": ""},
+            "username": "test", "password": "", "added_at_unix": 0
+        }))
+        .unwrap();
+        HomeContent::new(server, EmbyClient::new("test".into()).unwrap(), cx)
+    });
+    for (item_type, width, height) in [
+        ("Movie", 1200, 100),
+        ("Movie", 100, 100),
+        ("Movie", 100, 300),
+        ("Series", 100, 150),
+        ("Series", 100, 300),
+        ("Series", 50, 500),
+    ] {
+        let tag = format!("{width}-{height}");
+        let path = images.path().join(format!("{tag}.png"));
+        image::RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 255]))
+            .save(&path)
+            .unwrap();
+        page.update(cx, |page, cx| {
+            let item = json!({
+                "Id": "logo-sizing", "Name": "Title", "Type": item_type,
+                "ImageTags": {"Logo": tag}, "CommunityRating": 8.5
+            });
+            let mut detail =
+                SeriesDetailState::from_user_item(&serde_json::from_value(item.clone()).unwrap())
+                    .unwrap();
+            detail.item = Some(serde_json::from_value(item).unwrap());
+            let request =
+                EmbyImageRequest::new("logo-sizing", EmbyImageType::Logo).with_tag(Some(tag));
+            let key = CachedImageKey::from_request(&page.current_server, &request).unwrap();
+            page.image_loader.finish_job(key, Ok(path));
+            page.navigation.push_detail("logo-sizing".into(), None);
+            page.series_detail = Some(detail);
+            cx.notify();
+        });
+        for (window_width, window_height) in [(1100.0, 900.0), (1100.0, 600.0), (360.0, 400.0)] {
+            cx.simulate_resize(size(px(window_width), px(window_height)));
+            cx.run_until_parked();
+            // Image decoding schedules the layout update for the next frame.
+            cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.run_until_parked();
+            let logo = cx.debug_bounds("series-detail-logo").unwrap();
+            let hero = cx.debug_bounds("series-detail-hero").unwrap();
+            assert!(logo.size.width > px(0.0) && logo.size.height > px(0.0));
+            assert!(logo.left() >= hero.left() + px(24.0));
+            assert!(logo.right() <= hero.right() - px(24.0));
+            assert!(logo.top() >= hero.top());
+            assert!(logo.bottom() <= hero.bottom() - px(24.0));
+            assert!(logo.size.height <= px(200.0));
+            if width <= height {
+                // Portrait and square logos should use more than the old 80px height,
+                // while retaining their aspect ratio even in a short window.
+                assert!(logo.size.height >= px(if window_height >= 600.0 { 160.0 } else { 120.0 }));
+                let ratio = logo.size.width / logo.size.height;
+                assert!((ratio - width as f32 / height as f32).abs() < 0.02);
+            } else {
+                assert!(logo.size.height <= px(80.0));
+            }
+            if width > height && window_width > 1000.0 {
+                // The old fixed width reduced this 12:1 logo to only 17px tall.
+                assert!(
+                    logo.size.width >= px(400.0),
+                    "logo: {logo:?}, hero: {hero:?}"
+                );
+            }
+            assert!(cx.debug_bounds("series-detail-title").is_none());
+        }
+    }
+}
+
+#[gpui::test]
 fn series_logo_stays_in_place_when_episodes_finish_loading(cx: &mut TestAppContext) {
     use crate::{
         emby::{EmbyImageRequest, EmbyImageType},
@@ -58,7 +212,10 @@ fn series_logo_stays_in_place_when_episodes_finish_loading(cx: &mut TestAppConte
     cx.simulate_resize(size(px(1200.0), px(900.0)));
     cx.run_until_parked();
     let logo_before = cx.debug_bounds("series-detail-logo").unwrap();
-    assert_eq!(logo_before.size.height, px(50.0));
+    assert_eq!(logo_before.size, size(px(320.0), px(80.0)));
+    let scrim = cx.debug_bounds("series-detail-hero-bottom-scrim").unwrap();
+    assert!(logo_before.top() < scrim.top());
+    assert!(logo_before.bottom() < scrim.top() + scrim.size.height * 0.45);
     let line_before = cx.debug_bounds("series-detail-episode-line").unwrap();
     assert_eq!(line_before.size.height, px(24.0));
     page.read_with(cx, |page, _| {

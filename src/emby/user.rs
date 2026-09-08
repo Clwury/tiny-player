@@ -467,6 +467,8 @@ pub struct UserItemData {
     pub playback_position_ticks: Option<u64>,
     #[serde(default)]
     pub is_favorite: bool,
+    #[serde(default)]
+    pub played: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

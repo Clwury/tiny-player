@@ -28,7 +28,7 @@ impl TinyApp {
         self.begin_select_server(server, cx);
     }
 
-    fn begin_select_server(&mut self, server: &CachedServer, cx: &mut Context<Self>) {
+    pub(super) fn begin_select_server(&mut self, server: &CachedServer, cx: &mut Context<Self>) {
         self.open_server_menu = None;
         self.clear_app_notifications();
         self.clear_server_notifications();

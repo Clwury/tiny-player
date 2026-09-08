@@ -22,7 +22,7 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
     ShapedLine, SharedString, StatefulInteractiveElement, Style, Styled, Task, TextRun,
     UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::FluentBuilder, px,
-    relative, rgba, size, svg,
+    relative, size, svg,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -1526,7 +1526,7 @@ impl Element for EditorElement {
             raw_content.clone()
         };
         let text_color = if raw_content.is_empty() {
-            theme.muted_foreground
+            theme.placeholder_foreground
         } else {
             style.color
         };
@@ -1609,7 +1609,7 @@ impl Element for EditorElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x89b4fa55),
+                    theme.selection_background,
                 )),
                 None,
             )

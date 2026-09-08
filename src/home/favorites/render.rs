@@ -12,7 +12,7 @@ use super::super::{
         carousel_content_width_for, carousel_visible_range_between_for, home_main_content_width,
         max_carousel_scroll_offset_for,
     },
-    components::{carousel_button, home_section_title},
+    components::{carousel_button, home_section_more_button, home_section_title},
     render::home_carousel_track,
     workspace_render::UserItemGridSource,
 };
@@ -72,14 +72,16 @@ impl HomeContent {
                     .mb_3()
                     .child(home_section_title(title, cx))
                     .when(has_items, |this| {
-                        this.child(favorite_action(
-                            format!("favorite-more-{}", item_type.as_str()),
-                            "更多",
-                            cx,
-                            cx.listener(move |page, _, _, cx| {
-                                page.open_favorite_items(item_type, cx)
-                            }),
-                        ))
+                        this.child(
+                            home_section_more_button(
+                                ElementId::from(format!("favorite-more-{}", item_type.as_str())),
+                                cx,
+                            )
+                            .debug_selector(move || format!("favorite-more-{}", item_type.as_str()))
+                            .on_click(cx.listener(
+                                move |page, _, _, cx| page.open_favorite_items(item_type, cx),
+                            )),
+                        )
                     }),
             )
             .when(has_items, |this| {

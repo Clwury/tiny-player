@@ -244,20 +244,33 @@ impl HomeContent {
         let Some(item_id) = self
             .series_detail
             .as_ref()
-            .map(|detail| detail.series_id.clone())
+            .and_then(|detail| detail.selected_playback_item())
+            .map(|item| item.id.clone())
         else {
             return;
         };
-        if self.favorite_requests.contains(&item_id) {
-            return;
-        }
         let fallback = self
             .series_detail
             .as_ref()
-            .and_then(|detail| detail.item.as_ref())
-            .and_then(|item| item.user_data.as_ref());
+            .and_then(|detail| detail.selected_playback_item())
+            .and_then(|item| item.user_data.clone());
+        self.toggle_item_favorite(item_id, fallback, cx);
+    }
+
+    pub(super) fn toggle_item_favorite(
+        &mut self,
+        item_id: String,
+        fallback: Option<UserItemData>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.detail_user_data_pending() {
+            return;
+        }
+        if let Some(detail) = self.series_detail.as_mut() {
+            detail.open_select = None;
+        }
         let old = self
-            .effective_user_data(&item_id, fallback)
+            .effective_user_data(&item_id, fallback.as_ref())
             .cloned()
             .unwrap_or_default();
         let desired = !old.is_favorite;
@@ -334,10 +347,12 @@ impl HomeContent {
                     }
                 }
                 let message: SharedString = format!("更新收藏失败：{error}").into();
-                let is_detail = self
-                    .series_detail
-                    .as_ref()
-                    .is_some_and(|detail| detail.series_id == item_id);
+                let is_detail = self.series_detail.as_ref().is_some_and(|detail| {
+                    detail.series_id == item_id
+                        || detail.episodes.as_ref().is_some_and(|episodes| {
+                            episodes.items.iter().any(|item| item.id == item_id)
+                        })
+                });
                 if is_detail {
                     self.push_error_notification(
                         NotificationScope::Detail,
@@ -371,7 +386,11 @@ impl HomeContent {
 
     pub(super) fn absorb_user_items_user_data(&mut self, items: &UserItems, request_revision: u64) {
         for item in &items.items {
-            self.absorb_user_data(&item.id, item.user_data.as_ref(), request_revision);
+            if self
+                .series_user_data_response_is_current(item.series_id.as_deref(), request_revision)
+            {
+                self.absorb_user_data(&item.id, item.user_data.as_ref(), request_revision);
+            }
         }
     }
 
@@ -381,7 +400,11 @@ impl HomeContent {
         request_revision: u64,
     ) {
         for item in &items.items {
-            self.absorb_user_data(&item.id, item.user_data.as_ref(), request_revision);
+            if self
+                .series_user_data_response_is_current(item.series_id.as_deref(), request_revision)
+            {
+                self.absorb_user_data(&item.id, item.user_data.as_ref(), request_revision);
+            }
         }
     }
 
@@ -391,12 +414,14 @@ impl HomeContent {
         data: Option<&UserItemData>,
         request_revision: u64,
     ) {
-        if !user_data_response_is_current(
-            item_id,
-            request_revision,
-            &self.favorite_requests,
-            &self.user_data_item_revisions,
-        ) {
+        if self.played_request.is_some()
+            || !user_data_response_is_current(
+                item_id,
+                request_revision,
+                &self.favorite_requests,
+                &self.user_data_item_revisions,
+            )
+        {
             return;
         }
         if let Some(data) = data {
@@ -419,10 +444,6 @@ impl HomeContent {
 
     pub(super) fn effective_resume_item<'a>(&self, item: &'a ResumeItem) -> Cow<'a, ResumeItem> {
         effective_resume_item(item, &self.user_data_overrides)
-    }
-
-    pub(super) fn favorite_is_pending(&self, item_id: &str) -> bool {
-        self.favorite_requests.contains(item_id)
     }
 }
 

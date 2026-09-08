@@ -120,7 +120,7 @@ fn playback_detail_section_element<T>(
     section: PlaybackDetailSection,
     cx: &Context<T>,
 ) -> impl IntoElement {
-    let theme = theme::get(cx);
+    let theme = theme::media_overlay(cx);
 
     div()
         .flex()
@@ -580,7 +580,7 @@ pub(super) fn track_select_option(
     selected: bool,
     cx: &Context<PlaybackPage>,
 ) -> gpui::Div {
-    let theme = theme::get(cx);
+    let theme = theme::media_overlay(cx);
     let hover_background = if selected {
         theme.input_border_focused.opacity(0.34)
     } else {

@@ -443,6 +443,18 @@ impl HomeContent {
             return;
         }
 
+        if !self.series_user_data_response_is_current(Some(&series_id), revisions.user_data) {
+            // A season selected during the mutation may still have an older
+            // request in flight. Replace it instead of leaving the row loading.
+            if let Some(detail) = self.series_detail.as_mut()
+                && detail.effects.episodes == LoadState::Loading
+            {
+                detail.effects.episodes = LoadState::Idle;
+                self.load_series_episodes_if_needed(cx);
+            }
+            return;
+        }
+
         match result {
             Ok(mut episodes) => {
                 for episode in &episodes.items {

@@ -30,7 +30,7 @@ impl HomePage {
             .flex_col()
             .border_r_1()
             .border_color(theme.title_bar_border)
-            .bg(theme.title_bar)
+            .bg(theme.panel_background)
             .when(rounded_window, |this| {
                 this.rounded_bl(theme.radius_lg).overflow_hidden()
             })
@@ -144,13 +144,15 @@ fn sidebar_nav_item(
     icon: &'static str,
     label: &'static str,
     active: bool,
-    cx: &Context<HomePage>,
+    cx: &App,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
 
     div()
         .id(id)
+        .cursor_pointer()
+        .debug_selector(move || id.to_string())
         .flex()
         .flex_none()
         .h(px(34.0))
@@ -160,9 +162,22 @@ fn sidebar_nav_item(
         .px_3()
         .text_sm()
         .text_color(theme.foreground)
-        .when(active, |this| this.bg(theme.secondary_hover))
-        .hover(move |style| style.bg(theme.secondary_hover))
-        .child(svg().path(icon).size(px(16.0)).text_color(theme.foreground))
+        .when(active, |this| {
+            this.bg(theme.element_selected)
+                .text_color(theme.accent_text)
+        })
+        .hover(move |style| {
+            style.bg(if active {
+                theme.element_selected_hover
+            } else {
+                theme.secondary_hover
+            })
+        })
+        .child(svg().path(icon).size(px(16.0)).text_color(if active {
+            theme.accent_text
+        } else {
+            theme.foreground
+        }))
         .child(label)
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
@@ -195,8 +210,17 @@ fn server_list_item(
         .px_3()
         .text_sm()
         .text_color(theme.foreground)
-        .when(active, |this| this.bg(theme.secondary_hover))
-        .hover(move |style| style.bg(theme.secondary_hover))
+        .when(active, |this| {
+            this.bg(theme.element_selected)
+                .text_color(theme.accent_text)
+        })
+        .hover(move |style| {
+            style.bg(if active {
+                theme.element_selected_hover
+            } else {
+                theme.secondary_hover
+            })
+        })
         .cursor_pointer()
         .child(
             svg()
@@ -291,7 +315,64 @@ fn server_title(server: &CachedServer) -> String {
 mod tests {
     use super::*;
     use crate::emby::EmbyClient;
-    use gpui::{TestAppContext, size};
+    use gpui::{Modifiers, Render, TestAppContext, point, size};
+
+    struct SidebarHover;
+
+    impl Render for SidebarHover {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .bg(theme::get(cx).panel_background)
+                .flex()
+                .flex_col()
+                .p_3()
+                .children([false, true].map(|selected| {
+                    sidebar_nav_item(
+                        if selected { "selected" } else { "idle" },
+                        "icons/home.svg",
+                        "Home",
+                        selected,
+                        cx,
+                        |_, _, _| {},
+                    )
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn latte_sidebar_items_change_fill_when_hovered(cx: &mut TestAppContext) {
+        cx.update(|cx| theme::set(theme::ColorTheme::Latte, cx));
+        let (_, cx) = cx.add_window_view(|_, _| SidebarHover);
+        cx.run_until_parked();
+        for selector in ["idle", "selected"] {
+            cx.simulate_mouse_move(point(px(400.0), px(400.0)), None, Modifiers::default());
+            cx.run_until_parked();
+            let hover = cx.update(|_, cx| {
+                let theme = theme::get(cx);
+                if selector == "selected" {
+                    theme.element_selected_hover
+                } else {
+                    theme.secondary_hover
+                }
+            });
+            assert!(cx.update(|window, _| {
+                window
+                    .painted_quads()
+                    .iter()
+                    .all(|quad| quad.background != hover.into())
+            }));
+            let bounds = cx.debug_bounds(selector).unwrap();
+            cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+            cx.run_until_parked();
+            assert!(cx.update(|window, _| {
+                window
+                    .painted_quads()
+                    .iter()
+                    .any(|quad| quad.background == hover.into())
+            }));
+        }
+    }
 
     #[gpui::test]
     fn sidebar_server_rows_keep_their_height_when_the_list_overflows(cx: &mut TestAppContext) {

@@ -453,7 +453,7 @@ impl PlaybackSettingsDialogState {
             .gap_4()
             .border_r_1()
             .border_color(theme.title_bar_border)
-            .bg(theme.title_bar)
+            .bg(theme.panel_background)
             .when(rounded_window, |this| {
                 this.rounded_bl(theme.radius_lg).overflow_hidden()
             })
@@ -500,16 +500,26 @@ impl PlaybackSettingsDialogState {
                             .cursor_pointer()
                             .text_sm()
                             .text_color(if selected {
-                                theme.foreground
+                                theme.accent_text
                             } else {
                                 theme.muted_foreground
                             })
                             .when(selected, |this| {
-                                this.bg(theme.secondary_hover)
+                                this.bg(theme.element_selected)
                                     .font_weight(gpui::FontWeight::MEDIUM)
                             })
                             .hover(|style| {
-                                style.bg(theme.secondary_hover).text_color(theme.foreground)
+                                style
+                                    .bg(if selected {
+                                        theme.element_selected_hover
+                                    } else {
+                                        theme.secondary_hover
+                                    })
+                                    .text_color(if selected {
+                                        theme.accent_text
+                                    } else {
+                                        theme.foreground
+                                    })
                             })
                             .child(category.title())
                             .on_click(move |_, window, cx| {
@@ -1299,12 +1309,14 @@ fn toggle_switch(
             gpui::Toggled::False
         })
         .debug_selector(move || format!("settings-toggle-{label}"))
+        .group("settings-toggle")
         .flex()
         .items_center()
         .p(px(3.0))
         .cursor_pointer()
         .child(
             div()
+                .id("switch-track")
                 .flex()
                 .items_center()
                 .w(px(32.0))
@@ -1318,20 +1330,26 @@ fn toggle_switch(
                     theme.input_border
                 })
                 .bg(if selected {
-                    theme.input_border_focused.opacity(0.3)
+                    theme.accent
                 } else {
                     theme.input_background
                 })
+                .group_hover("settings-toggle", |style| {
+                    style
+                        .bg(if selected {
+                            theme.accent_hover
+                        } else {
+                            theme.secondary_hover
+                        })
+                        .border_color(theme.accent)
+                })
                 .when(selected, |this| this.justify_end())
-                .child(
-                    div()
-                        .size(px(12.0))
-                        .rounded_full()
-                        .bg(theme.foreground)
-                        .opacity(if selected { 1.0 } else { 0.5 }),
-                ),
+                .child(div().size(px(12.0)).rounded_full().bg(if selected {
+                    theme.accent_foreground
+                } else {
+                    theme.muted_foreground
+                })),
         )
-        .hover(|style| style.opacity(0.85))
         .on_click(move |_, _, cx| dialog.update(cx, |dialog, cx| dialog.toggle(setting, cx)))
 }
 

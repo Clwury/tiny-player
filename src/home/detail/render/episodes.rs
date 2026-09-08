@@ -87,7 +87,14 @@ impl HomeContent {
                                         });
                                     let image_path = self.image_path_for_episode_primary(episode);
 
-                                    episode_card(episode, image_path, selected, cx)
+                                    let mut episode = episode.clone();
+                                    episode.user_data = self
+                                        .effective_user_data(
+                                            &episode.id,
+                                            episode.user_data.as_ref(),
+                                        )
+                                        .cloned();
+                                    episode_card(&episode, image_path, selected, cx)
                                         .id((
                                             gpui::ElementId::from("series-detail-episode-card"),
                                             episode_id,

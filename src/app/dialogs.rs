@@ -1,10 +1,11 @@
-use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, Window};
+use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, Pixels, Point, Window};
 
 use crate::{server::CachedServer, ui::add_server_dialog::AddServerDialogState};
 
 use super::{
     TinyApp,
     server_cache::{fetch_public_info_and_cache, fetch_public_info_and_update_cache},
+    server_card::ServerContextMenu,
 };
 
 impl TinyApp {
@@ -35,10 +36,21 @@ impl TinyApp {
     pub(super) fn close_server_menu(
         &mut self,
         _: &MouseDownEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.open_server_menu.take().is_some() {
+        self.dismiss_server_menu(window, cx);
+    }
+
+    pub(super) fn dismiss_server_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(menu) = self.open_server_menu.take() {
+            if menu.focus.is_focused(window) {
+                if let Some(focus) = menu.previous_focus {
+                    focus.focus(window, cx);
+                } else {
+                    window.blur(cx);
+                }
+            }
             cx.notify();
         }
     }
@@ -92,17 +104,30 @@ impl TinyApp {
         }
     }
 
-    pub(super) fn toggle_server_menu(
+    pub(super) fn open_server_context_menu(
         &mut self,
-        server: &CachedServer,
-        _: &mut Window,
+        server_id: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_server_menu = if self.open_server_menu.as_deref() == Some(server.id.as_str()) {
-            None
+        if self.selecting_server_id.as_deref() == Some(server_id)
+            || !self.servers.iter().any(|server| server.id == server_id)
+        {
+            return;
+        }
+        let (focus, previous_focus) = if let Some(menu) = self.open_server_menu.take() {
+            (menu.focus, menu.previous_focus)
         } else {
-            Some(server.id.clone())
+            (cx.focus_handle(), window.focused(cx))
         };
+        focus.focus(window, cx);
+        self.open_server_menu = Some(ServerContextMenu {
+            server_id: server_id.to_owned(),
+            position,
+            focus,
+            previous_focus,
+        });
         cx.notify();
     }
 

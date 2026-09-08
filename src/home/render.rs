@@ -24,8 +24,8 @@ use super::{
         home_main_content_width, max_carousel_scroll_offset, max_carousel_scroll_offset_for,
     },
     components::{
-        carousel_button, home_section_title, home_section_title_text, resume_item_card,
-        user_episode_card, user_item_card, user_view_card,
+        carousel_button, home_section_more_button, home_section_title, home_section_title_text,
+        resume_item_card, user_episode_card, user_item_card, user_view_card,
     },
     navigation::{HomeRoot, HomeRoute},
     resume_actions::{ResumeItemAction, ResumeItemContextMenu},
@@ -726,7 +726,6 @@ impl HomeContent {
         viewport_width: f32,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
         let row = self.user_view_items_rows.get(&view.id);
         let items = row.and_then(|row| row.items.as_ref());
         let visible = items.is_some_and(|items| !items.items.is_empty());
@@ -748,24 +747,8 @@ impl HomeContent {
                         .gap_3()
                         .child(home_section_title_text(title, cx))
                         .child(
-                            div()
-                                .id(view_all_action_id)
+                            home_section_more_button(view_all_action_id, cx)
                                 .debug_selector(|| format!("view-all-{}", view.id))
-                                .flex()
-                                .flex_none()
-                                .h(px(28.0))
-                                .px_2()
-                                .items_center()
-                                .justify_center()
-                                .rounded_md()
-                                .text_sm()
-                                .text_color(theme.foreground)
-                                .hover(move |style| style.bg(theme.secondary_hover))
-                                .cursor_pointer()
-                                .child("更多")
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation();
-                                })
                                 .on_click(open_library),
                         ),
                 )

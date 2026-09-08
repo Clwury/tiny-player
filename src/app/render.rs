@@ -1,6 +1,6 @@
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Styled, Window,
-    deferred, div, prelude::FluentBuilder,
+    Context, DragMoveEvent, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Render, Styled, Window, deferred, div, prelude::FluentBuilder,
 };
 
 use crate::{theme, ui::titlebar::app_titlebar};
@@ -8,7 +8,11 @@ use crate::{theme, ui::titlebar::app_titlebar};
 use super::{
     Page, TinyApp,
     resize::resize_handles,
-    server_card::{ServerCardActions, add_server_card, server_card},
+    server_card::{
+        DraggedServer, ServerCardActions, ServerCardState, add_server_card, server_card,
+        server_card_menu,
+    },
+    server_reorder::animated_card,
     window::window_border,
 };
 
@@ -33,11 +37,31 @@ impl TinyApp {
             .flex_1()
             .min_h_0()
             .on_mouse_down(MouseButton::Left, close_menu)
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::close_server_menu))
             .when(matches!(self.page, Page::Servers), |this| {
                 this.child(self.render_servers_page(cx))
             })
             .when_some(home_page, |this, page| this.child(page))
             .when_some(playback_page, |this, page| this.child(page))
+            .when_some(self.open_server_menu.clone(), |this, menu| {
+                if let Some(server) = self
+                    .servers
+                    .iter()
+                    .find(|server| server.id == menu.server_id)
+                {
+                    this.child(
+                        deferred(server_card_menu(
+                            server.clone(),
+                            menu,
+                            self.cache.auto_start_server_id.as_deref() == Some(&server.id),
+                            cx,
+                        ))
+                        .with_priority(2),
+                    )
+                } else {
+                    this
+                }
+            })
             .when(
                 matches!(self.page, Page::Home(_)) && self.has_app_notifications(),
                 |this| {
@@ -56,33 +80,92 @@ impl TinyApp {
 
     fn render_servers_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let add_server = cx.listener(Self::open_add_server_dialog);
+        let can_reorder = self.selecting_server_id.is_none() && self.add_server_dialog.is_none();
+        let servers = self.preview_servers();
+        self.server_card_positions
+            .retain(|id, _| self.servers.iter().any(|server| &server.id == id));
 
         div().relative().flex_1().min_h_0().size_full().p_4().child(
             div()
+                .id("server-grid")
                 .flex()
                 .flex_wrap()
                 .gap_3()
-                .children(self.servers.iter().cloned().map(|server| {
-                    let menu_open = self.open_server_menu.as_deref() == Some(server.id.as_str());
+                .when_some(self.server_reorder.as_ref(), |this, reorder| {
+                    this.track_focus(&reorder.focus).on_key_down(cx.listener(
+                        |app, event: &gpui::KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape" {
+                                cx.stop_active_drag(window);
+                                app.finish_server_reorder(false, window, cx);
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
+                })
+                .children(servers.into_iter().enumerate().map(|(index, server)| {
                     let counts = self.item_counts.get(&server.id).cloned();
                     let loading = self.selecting_server_id.as_deref() == Some(server.id.as_str());
+                    let auto_start = self.cache.auto_start_server_id.as_deref() == Some(&server.id);
+                    let placeholder = self
+                        .server_reorder
+                        .as_ref()
+                        .is_some_and(|reorder| reorder.server_id == server.id);
+                    let position = self
+                        .server_card_positions
+                        .entry(server.id.clone())
+                        .or_default()
+                        .clone();
                     let select_server = cx.listener(Self::select_server);
-                    let toggle_menu = cx.listener(Self::toggle_server_menu);
-                    let edit_server = cx.listener(Self::open_edit_server_dialog);
-                    let delete_server = cx.listener(Self::delete_server);
-                    server_card(
+                    let server_id = server.id.clone();
+                    let slot_id = (gpui::ElementId::from("server-slot"), server.id.clone());
+                    let slot_selector = format!("server-slot-{index}");
+                    let open_menu = cx.listener(move |app, event: &MouseDownEvent, window, cx| {
+                        app.open_server_context_menu(&server_id, event.position, window, cx);
+                    });
+                    let card = server_card(
                         server,
                         counts,
-                        menu_open,
-                        loading,
+                        ServerCardState {
+                            loading,
+                            can_reorder,
+                            placeholder,
+                            auto_start,
+                        },
                         cx,
                         ServerCardActions {
                             on_select: select_server,
-                            on_menu_toggle: toggle_menu,
-                            on_edit: edit_server,
-                            on_delete: delete_server,
+                            on_context_menu: open_menu,
                         },
-                    )
+                    );
+                    div()
+                        .id(slot_id)
+                        .debug_selector(move || slot_selector.clone())
+                        .flex_none()
+                        .when(can_reorder, |this| {
+                            this.on_drag_move(cx.listener(
+                                move |app, event: &DragMoveEvent<DraggedServer>, _, cx| {
+                                    if event.drag(cx).owner == cx.entity_id()
+                                        && event.bounds.contains(&event.event.position)
+                                    {
+                                        app.preview_server_reorder(index, cx);
+                                    }
+                                },
+                            ))
+                            .on_drop(cx.listener(
+                                move |app, drag: &DraggedServer, window, cx| {
+                                    if drag.owner == cx.entity_id() {
+                                        app.preview_server_reorder(index, cx);
+                                        app.finish_server_reorder(true, window, cx);
+                                    }
+                                },
+                            ))
+                        })
+                        .child(animated_card(
+                            card.into_any_element(),
+                            position,
+                            index,
+                            placeholder,
+                        ))
                 }))
                 .child(add_server_card(cx, add_server)),
         )
@@ -92,6 +175,9 @@ impl TinyApp {
 impl Render for TinyApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.observe_window_bounds_once(window, cx);
+        if self.server_reorder.is_some() && !cx.has_active_drag() {
+            self.finish_server_reorder(false, window, cx);
+        }
 
         let theme = theme::get(cx);
         let title = self.title(cx);
@@ -123,6 +209,10 @@ impl Render for TinyApp {
                         this.child(
                             div()
                                 .on_mouse_down(MouseButton::Left, close_menu)
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(Self::close_server_menu),
+                                )
                                 .child(app_titlebar(window, cx, title)),
                         )
                     })

@@ -21,6 +21,7 @@ pub(crate) enum SeriesDetailSelectKind {
     Season,
     MediaSource,
     Subtitle,
+    Actions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +49,7 @@ pub(crate) struct SeriesDetailState {
     pub(crate) seasons_failed: Option<gpui::SharedString>,
     pub(crate) next_up: Option<MediaItems>,
     pub(crate) next_up_failed: Option<gpui::SharedString>,
-    resume_episode: Option<ResumeItem>,
+    pub(super) resume_episode: Option<ResumeItem>,
     // Keep the original playable item separate from its series/episode group.
     resume_media_item_id: Option<String>,
     pub(crate) resume_media_sources: Option<Vec<MediaSource>>,
@@ -69,6 +70,7 @@ pub(crate) struct SeriesDetailState {
     /// Explicit selection only; automatic choices follow the current language preference.
     pub(crate) selected_subtitle_index: Option<usize>,
     pub(crate) open_select: Option<SeriesDetailSelectKind>,
+    pub(crate) action_menu_focus: Option<gpui::FocusHandle>,
     pub(crate) scroll_handle: ScrollHandle,
     pub(crate) season_scroll_handle: ScrollHandle,
     pub(crate) media_source_scroll_handle: ScrollHandle,
@@ -244,6 +246,7 @@ impl SeriesDetailState {
             manual_video_version: None,
             selected_subtitle_index: None,
             open_select: None,
+            action_menu_focus: None,
             scroll_handle: ScrollHandle::new(),
             season_scroll_handle: ScrollHandle::new(),
             media_source_scroll_handle: ScrollHandle::new(),
@@ -959,6 +962,7 @@ mod tests {
             manual_video_version: None,
             selected_subtitle_index: None,
             open_select: None,
+            action_menu_focus: None,
             scroll_handle: ScrollHandle::new(),
             season_scroll_handle: ScrollHandle::new(),
             media_source_scroll_handle: ScrollHandle::new(),
@@ -1382,6 +1386,7 @@ mod tests {
             played_percentage: Some(25.0),
             playback_position_ticks: Some(10_800_000_000),
             is_favorite: false,
+            played: false,
         });
         detail.item = Some(item);
 
@@ -1497,6 +1502,7 @@ mod tests {
             played_percentage: Some(50.0),
             playback_position_ticks: Some(9_050_000_000),
             is_favorite: false,
+            played: false,
         });
 
         let mut detail = SeriesDetailState::from_resume_episode(&episode).expect("valid episode");
@@ -1538,6 +1544,7 @@ mod tests {
             played_percentage: None,
             playback_position_ticks: Some(12_000_000_000),
             is_favorite: false,
+            played: false,
         });
         detail.next_up = Some(MediaItems {
             items: vec![next_up],

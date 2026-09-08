@@ -14,6 +14,70 @@ use crate::{
 use super::{Page, TinyApp};
 
 impl TinyApp {
+    pub(super) fn toggle_server_auto_start(
+        &mut self,
+        server: &CachedServer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_server_menu(window, cx);
+        if !matches!(self.page, Page::Servers)
+            || self.add_server_dialog.is_some()
+            || !self
+                .cache
+                .servers
+                .iter()
+                .any(|cached| cached.id == server.id)
+        {
+            return;
+        }
+        self.cache.auto_start_server_id = (self.cache.auto_start_server_id.as_deref()
+            != Some(&server.id))
+        .then(|| server.id.clone());
+        self.schedule_cache_save("保存自动启动设置失败", cx);
+        cx.notify();
+    }
+
+    pub(super) fn reorder_server(
+        &mut self,
+        server_id: &str,
+        target_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.page, Page::Servers)
+            || self.selecting_server_id.is_some()
+            || self.add_server_dialog.is_some()
+        {
+            return;
+        }
+        let Some(source) = self
+            .cache
+            .servers
+            .iter()
+            .position(|server| server.id == server_id)
+        else {
+            return;
+        };
+        let Some(target) = self
+            .cache
+            .servers
+            .iter()
+            .position(|server| server.id == target_id)
+        else {
+            return;
+        };
+        if source == target {
+            return;
+        }
+
+        // Move the current cached record so a drag never restores stale server data.
+        let server = self.cache.servers.remove(source);
+        self.cache.servers.insert(target, server);
+        self.servers = self.cache.servers.clone();
+        self.schedule_cache_save("保存服务器顺序失败", cx);
+        cx.notify();
+    }
+
     pub(super) fn delete_server(
         &mut self,
         server: &CachedServer,

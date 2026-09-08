@@ -501,8 +501,17 @@ fn protocol_button(
         .text_xs()
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.foreground)
-        .when(selected, |this| this.bg(theme.secondary_hover))
-        .hover(move |style| style.bg(theme.secondary_hover))
+        .when(selected, |this| {
+            this.bg(theme.element_selected)
+                .text_color(theme.accent_text)
+        })
+        .hover(move |style| {
+            style.bg(if selected {
+                theme.element_selected_hover
+            } else {
+                theme.secondary_hover
+            })
+        })
         .child(protocol.label())
         .on_click(move |_, _, cx| {
             dialog.update(cx, |dialog, cx| dialog.select_protocol(protocol, cx));
@@ -529,18 +538,18 @@ fn dialog_button(
         .text_sm()
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(if primary {
-            theme.background
+            theme.accent_foreground
         } else {
             theme.foreground
         })
         .border_1()
         .border_color(if primary {
-            theme.input_border_focused
+            theme.accent
         } else {
             theme.input_border
         })
         .bg(if primary {
-            theme.foreground
+            theme.accent
         } else {
             theme.input_background
         })
@@ -549,7 +558,9 @@ fn dialog_button(
             if disabled {
                 style
             } else if primary {
-                style.bg(theme.foreground).text_color(theme.background)
+                style
+                    .bg(theme.accent_hover)
+                    .text_color(theme.accent_foreground)
             } else {
                 style.bg(theme.secondary_hover).text_color(theme.foreground)
             }

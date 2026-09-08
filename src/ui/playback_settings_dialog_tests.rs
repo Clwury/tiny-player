@@ -92,6 +92,61 @@ fn settle_menu_frames(cx: &mut VisualTestContext) {
     }
 }
 
+#[gpui::test]
+fn latte_selected_categories_dropdowns_and_switches_have_hover_feedback(cx: &mut TestAppContext) {
+    let (root, cx) = settings_window(cx);
+    cx.update(|_, cx| theme::set(ColorTheme::Latte, cx));
+    cx.simulate_resize(size(px(1100.0), px(720.0)));
+    cx.run_until_parked();
+    for selector in ["settings-category-外观", "color-theme-dropdown"] {
+        let bounds = cx.debug_bounds(selector).unwrap();
+        cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| {
+            let theme = theme::get(cx);
+            let expected = if selector == "settings-category-外观" {
+                theme.element_selected_hover
+            } else {
+                theme.secondary_hover
+            };
+            window
+                .painted_quads()
+                .iter()
+                .any(|quad| quad.background == expected.into())
+        }));
+    }
+    click(cx, "settings-category-磁盘缓存");
+    let selector = "settings-toggle-启用磁盘缓存";
+    for _ in 0..2 {
+        cx.simulate_mouse_move(
+            gpui::point(px(400.0), px(400.0)),
+            None,
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds(selector).unwrap();
+        cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| {
+            let theme = theme::get(cx);
+            let enabled = root.read(cx).dialog.read(cx).playback_config().disk_cache;
+            let expected = if enabled {
+                theme.accent_hover
+            } else {
+                theme.secondary_hover
+            };
+            let quads = window.painted_quads();
+            quads.iter().any(|fill| {
+                fill.background == expected.into()
+                    && quads.iter().any(|border| {
+                        border.bounds == fill.bounds && border.border_color == theme.accent
+                    })
+            })
+        }));
+        click(cx, selector);
+    }
+}
+
 #[test]
 fn search_matches_chinese_and_multiple_case_insensitive_keywords() {
     let fields = [

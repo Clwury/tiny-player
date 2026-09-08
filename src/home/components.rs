@@ -11,6 +11,7 @@ use image::{Frame, imageops::FilterType};
 use crate::{
     emby::{MediaItem, MediaPerson, ResumeItem, UserItem},
     theme,
+    ui::tooltip::text_tooltip,
 };
 
 use super::carousel::{
@@ -123,6 +124,31 @@ pub(super) fn home_section_title_text<T>(
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(theme.foreground)
         .child(title.into())
+}
+
+pub(super) fn home_section_more_button(id: gpui::ElementId, cx: &App) -> gpui::Stateful<gpui::Div> {
+    let theme = theme::get(cx);
+
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label("更多")
+        .tooltip(|_, cx| text_tooltip("更多", cx))
+        .flex()
+        .flex_none()
+        .size(px(28.0))
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(move |style| style.bg(theme.secondary_hover))
+        .child(
+            svg()
+                .path("icons/ellipsis.svg")
+                .size(px(18.0))
+                .text_color(theme.foreground),
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
 
 pub(super) fn carousel_button(
@@ -569,7 +595,10 @@ fn user_episode_card_with_image<T>(
         .rounded_lg()
         .p(px(padding))
         .hover(move |style| style.bg(theme.secondary_hover))
-        .child(image)
+        .child(div().relative().child(image).when(
+            item.user_data.as_ref().is_some_and(|data| data.played),
+            |this| this.child(episode_played_badge(cx)),
+        ))
         .child(
             div()
                 .w(px(width))
@@ -619,10 +648,14 @@ pub(super) fn episode_card<T>(
         .gap_2()
         .rounded_lg()
         .p(px(DETAIL_EPISODE_CARD_PADDING_PX))
-        .when(selected, |this| {
-            this.bg(theme.secondary_hover.opacity(0.45))
+        .when(selected, |this| this.bg(theme.element_selected))
+        .hover(move |style| {
+            style.bg(if selected {
+                theme.element_selected_hover
+            } else {
+                theme.secondary_hover
+            })
         })
-        .hover(move |style| style.bg(theme.secondary_hover))
         .when(selected, |this| {
             this.child(
                 div()
@@ -636,7 +669,15 @@ pub(super) fn episode_card<T>(
                     .border_color(theme.input_border_focused),
             )
         })
-        .child(episode_card_image(image_path, played_fraction, cx))
+        .child(
+            div()
+                .relative()
+                .child(episode_card_image(image_path, played_fraction, cx))
+                .when(
+                    episode.user_data.as_ref().is_some_and(|data| data.played),
+                    |this| this.child(episode_played_badge(cx)),
+                ),
+        )
         .child(
             div()
                 .w(px(DETAIL_EPISODE_CARD_WIDTH_PX))
@@ -664,6 +705,28 @@ pub(super) fn episode_card<T>(
                         )
                     },
                 ),
+        )
+}
+
+fn episode_played_badge(cx: &gpui::App) -> impl IntoElement {
+    let theme = theme::media_overlay(cx);
+    div()
+        .id("episode-played-badge")
+        .debug_selector(|| "episode-watched".into())
+        .absolute()
+        .top(px(6.0))
+        .right(px(6.0))
+        .size(px(24.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .aria_label("已观看")
+        .tooltip(|_, cx| text_tooltip("已观看", cx))
+        .child(
+            svg()
+                .path("icons/circle-check-filled.svg")
+                .size(px(18.0))
+                .text_color(theme.foreground),
         )
 }
 
@@ -913,6 +976,64 @@ fn resume_item_card_text(item: &ResumeItem) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn latte_cards_change_fill_over_the_image_and_label(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, Render, point};
+
+        struct CardHover(bool);
+
+        impl Render for CardHover {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let item = serde_json::json!({"Id": "1", "Name": "Movie", "Type": "Movie"});
+                let card = if self.0 {
+                    episode_card(&serde_json::from_value(item).unwrap(), None, true, cx)
+                } else {
+                    user_item_card(&serde_json::from_value(item).unwrap(), None, cx)
+                };
+                div()
+                    .size_full()
+                    .bg(theme::get(cx).background)
+                    .p_4()
+                    .child(card.id("card").debug_selector(|| "card".into()))
+            }
+        }
+
+        cx.update(|cx| theme::set(theme::ColorTheme::Latte, cx));
+        let (view, cx) = cx.add_window_view(|_, _| CardHover(false));
+        for selected in [false, true] {
+            view.update(cx, |view, cx| {
+                view.0 = selected;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            cx.simulate_mouse_move(point(px(2.0), px(2.0)), None, Modifiers::default());
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds("card").unwrap();
+            for position in [
+                bounds.origin + point(px(20.0), px(20.0)),
+                point(bounds.center().x, bounds.bottom() - px(12.0)),
+            ] {
+                cx.simulate_mouse_move(position, None, Modifiers::default());
+                cx.run_until_parked();
+                assert!(
+                    cx.update(|window, cx| {
+                        let theme = theme::get(cx);
+                        let expected = if selected {
+                            theme.element_selected_hover
+                        } else {
+                            theme.secondary_hover
+                        };
+                        window
+                            .painted_quads()
+                            .iter()
+                            .any(|quad| quad.background == expected.into())
+                    }),
+                    "selected={selected} position={position:?} bounds={bounds:?}"
+                );
+            }
+        }
+    }
 
     fn resume_item(item_type: &str, name: &str) -> ResumeItem {
         ResumeItem {

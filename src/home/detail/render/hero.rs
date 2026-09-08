@@ -1,4 +1,45 @@
+use std::{path::Path, sync::Arc};
+
 use super::*;
+use gpui::{
+    App, ImgResourceLoader, RenderOnce, Resource, black, linear_color_stop, linear_gradient,
+};
+
+const HERO_TEXT_SCRIM_OPACITY: f32 = 0.72;
+const HERO_BOTTOM_SCRIM_HEIGHT_PX: f32 = 120.0;
+const HERO_LOGO_HEIGHT_PX: f32 = 80.0;
+const HERO_LOGO_MAX_WIDTH_PX: f32 = 480.0;
+const HERO_LOGO_COMPACT_WIDTH_PX: f32 = 200.0;
+const HERO_LOGO_MAX_HEIGHT_PX: f32 = 200.0;
+
+#[derive(IntoElement)]
+struct HeroLogo {
+    path: Arc<Path>,
+    hero_height: f32,
+}
+
+impl RenderOnce for HeroLogo {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // Reuse the original image's decoder/cache to inspect its dimensions.
+        // No separate image processing or synchronous file reads are needed.
+        let image = window.use_asset::<ImgResourceLoader>(&Resource::Path(self.path.clone()), cx);
+        let max_height = (self.hero_height * 0.5).min(HERO_LOGO_MAX_HEIGHT_PX);
+        let height = image
+            .and_then(Result::ok)
+            .map(|image| {
+                let size = image.size(0);
+                let ratio = size.width.0.max(1) as f32 / size.height.0.max(1) as f32;
+                (HERO_LOGO_COMPACT_WIDTH_PX / ratio).clamp(HERO_LOGO_HEIGHT_PX, max_height)
+            })
+            .unwrap_or(HERO_LOGO_HEIGHT_PX);
+
+        img(self.path)
+            .debug_selector(|| "series-detail-logo".to_string())
+            .h(px(height))
+            .max_w_full()
+            .object_fit(gpui::ObjectFit::Contain)
+    }
+}
 
 impl HomeContent {
     pub(crate) fn render_series_detail_scrollable_content(
@@ -30,6 +71,7 @@ impl HomeContent {
                 MouseButton::Left,
                 cx.listener(Self::close_series_detail_select),
             )
+            .on_mouse_down_out(cx.listener(Self::close_series_detail_select))
             .child(div().flex().flex_col().w_full().when_some(
                 self.series_detail.as_ref(),
                 |this, detail| {
@@ -130,11 +172,12 @@ impl HomeContent {
     }
 
     pub(crate) fn render_series_detail_back_button(&self, cx: &Context<Self>) -> impl IntoElement {
-        let theme = theme::get(cx);
+        let theme = theme::media_overlay(cx);
         let close_detail = cx.listener(Self::close_series_detail);
 
         div()
             .id("series-detail-back-button")
+            .debug_selector(|| "series-detail-back-button".to_string())
             .absolute()
             .left_4()
             .top_4()
@@ -143,6 +186,10 @@ impl HomeContent {
             .items_center()
             .justify_center()
             .rounded_md()
+            .bg(theme.dialog_background.opacity(0.94))
+            .border_1()
+            .border_color(theme.input_border)
+            .cursor_pointer()
             .occlude()
             .hover(move |style| style.bg(theme.secondary_hover))
             .child(
@@ -163,7 +210,7 @@ impl HomeContent {
         hero_height: f32,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
+        let theme = theme::media_overlay(cx);
         let backdrop_path = detail
             .item
             .as_ref()
@@ -172,19 +219,10 @@ impl HomeContent {
             .item
             .as_ref()
             .and_then(|item| self.image_path_for_series_logo(item));
-        let show_title_fallback = !detail.is_movie()
-            && detail
-                .item
-                .as_ref()
-                .is_some_and(|item| item.logo_image_tag().is_none());
-        let display_title = detail
-            .item
-            .as_ref()
-            .map(|item| item.name.clone())
-            .unwrap_or_else(|| detail.title.clone());
         let episode_line = detail.hero_line();
 
         div()
+            .debug_selector(|| "series-detail-hero".to_string())
             .relative()
             .w_full()
             .h(px(hero_height))
@@ -213,7 +251,29 @@ impl HomeContent {
                     .right_0()
                     .bottom_0()
                     .left_0()
-                    .bg(theme.background.opacity(0.35)),
+                    // Shade the text side while keeping the artwork on the right clear.
+                    .debug_selector(|| "series-detail-hero-side-scrim".to_string())
+                    .bg(linear_gradient(
+                        90.0,
+                        linear_color_stop(black().opacity(HERO_TEXT_SCRIM_OPACITY), 0.0),
+                        linear_color_stop(black().opacity(0.0), 1.0),
+                    )),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(hero_height.min(HERO_BOTTOM_SCRIM_HEIGHT_PX)))
+                    .debug_selector(|| "series-detail-hero-bottom-scrim".to_string())
+                    // Fade across the entire height to avoid a flat dark band
+                    // where the gradient used to reach its final opacity early.
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(black().opacity(0.0), 0.0),
+                        linear_color_stop(black().opacity(HERO_TEXT_SCRIM_OPACITY), 1.0),
+                    )),
             )
             .child(
                 div()
@@ -222,36 +282,17 @@ impl HomeContent {
                     .right_6()
                     .bottom_6()
                     .flex()
-                    .w(px(760.0))
-                    .max_w_full()
+                    .max_w(px(760.0))
                     .flex_col()
                     .gap_3()
                     .text_color(theme.foreground)
-                    .when(logo_path.is_some() || show_title_fallback, |this| {
+                    .when_some(logo_path, |this, path| {
                         this.child(
                             div()
                                 .flex()
-                                .flex_col()
                                 .w_full()
-                                .gap_2()
-                                .when_some(logo_path.clone(), |this, path| {
-                                    this.child(
-                                        img(path)
-                                            .debug_selector(|| "series-detail-logo".to_string())
-                                            .w(px(200.0)),
-                                    )
-                                })
-                                .when(show_title_fallback, |this| {
-                                    this.child(
-                                        div()
-                                            .w_full()
-                                            .min_w_0()
-                                            .whitespace_normal()
-                                            .text_lg()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child(display_title),
-                                    )
-                                }),
+                                .max_w(px(HERO_LOGO_MAX_WIDTH_PX))
+                                .child(HeroLogo { path, hero_height }),
                         )
                     })
                     // Reserve the episode line before asynchronous episode data arrives.
@@ -284,7 +325,7 @@ impl HomeContent {
         item: &MediaItem,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
+        let theme = theme::media_overlay(cx);
         let official_rating = item
             .official_rating
             .as_deref()

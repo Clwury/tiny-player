@@ -297,13 +297,23 @@ fn detail_select_option<T>(
         } else {
             gpui::FontWeight::NORMAL
         })
-        .text_color(theme.foreground)
+        .text_color(if selected {
+            theme.accent_text
+        } else {
+            theme.foreground
+        })
         .bg(if selected {
-            theme.secondary_hover
+            theme.element_selected
         } else {
             theme.dialog_background
         })
-        .hover(move |style| style.bg(theme.secondary_hover))
+        .hover(move |style| {
+            style.bg(if selected {
+                theme.element_selected_hover
+            } else {
+                theme.secondary_hover
+            })
+        })
         .when(show_tooltip, |this| {
             this.tooltip(move |_, cx| text_tooltip(tooltip_label.clone(), cx))
         })
@@ -315,7 +325,7 @@ fn detail_select_label_needs_tooltip(label: &str) -> bool {
 }
 
 fn detail_play_button_icon(playback_loading: bool, theme: &theme::TinyTheme) -> impl IntoElement {
-    let color = theme.background;
+    let color = theme.accent_foreground;
 
     div()
         .flex()

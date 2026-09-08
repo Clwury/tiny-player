@@ -174,6 +174,7 @@ fn playback_user_data_after_update(
 ) -> UserItemData {
     let mut data = previous.unwrap_or_default();
     if update.ended {
+        data.played = true;
         data.playback_position_ticks = Some(0);
         data.played_percentage = Some(100.0);
         return data;

@@ -19,6 +19,8 @@ pub struct ServerCache {
     pub device_id: String,
     pub servers: Vec<CachedServer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_start_server_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     window: Option<WindowState>,
     /// Global playback tuning persisted alongside the server list. The
     /// `default` attribute keeps older cache files backward compatible.
@@ -42,6 +44,7 @@ impl ServerCache {
             version: CACHE_VERSION,
             device_id: Uuid::new_v4().to_string(),
             servers: Vec::new(),
+            auto_start_server_id: None,
             window: None,
             playback: PlaybackCacheConfig::default(),
             color_theme: ColorTheme::default(),
@@ -108,6 +111,9 @@ pub fn update_server_by_id(cache: &mut ServerCache, server: CachedServer) -> boo
 pub fn delete_server_by_id(cache: &mut ServerCache, id: &str) -> bool {
     let original_len = cache.servers.len();
     cache.servers.retain(|server| server.id != id);
+    if cache.auto_start_server_id.as_deref() == Some(id) {
+        cache.auto_start_server_id = None;
+    }
     cache.servers.len() != original_len
 }
 
@@ -326,6 +332,7 @@ mod tests {
 
         assert_eq!(loaded.device_id, "device-local");
         assert_eq!(loaded.window_size(), None);
+        assert_eq!(loaded.auto_start_server_id, None);
         assert_eq!(loaded.playback, PlaybackCacheConfig::default());
         assert_eq!(loaded.color_theme, ColorTheme::Mocha);
         assert_eq!(
@@ -381,10 +388,12 @@ mod tests {
     fn upserts_same_server_and_user() {
         let mut cache = ServerCache::empty();
         upsert_server(&mut cache, server("first", "old"));
+        cache.auto_start_server_id = Some("first".into());
         upsert_server(&mut cache, server("second", "new"));
 
         assert_eq!(cache.servers.len(), 1);
         assert_eq!(cache.servers[0].id, "first");
+        assert_eq!(cache.auto_start_server_id.as_deref(), Some("first"));
         assert_eq!(cache.servers[0].access_token.as_deref(), Some("new"));
     }
 
@@ -392,6 +401,7 @@ mod tests {
     fn updates_server_by_id() {
         let mut cache = ServerCache::empty();
         cache.servers.push(server("server-local", "old"));
+        cache.auto_start_server_id = Some("server-local".into());
         let mut updated = server("server-local", "new");
         updated.endpoint.address = "updated.example.com".to_string();
         updated.username = "new-user".to_string();
@@ -405,6 +415,7 @@ mod tests {
         assert_eq!(cache.servers[0].username, "new-user");
         assert_eq!(cache.servers[0].password, "new-secret");
         assert_eq!(cache.servers[0].access_token.as_deref(), Some("new"));
+        assert_eq!(cache.auto_start_server_id.as_deref(), Some("server-local"));
     }
 
     #[test]
@@ -426,11 +437,15 @@ mod tests {
         let mut second = server("second", "new");
         second.endpoint.address = "other.example.com".to_string();
         cache.servers.push(second);
+        cache.auto_start_server_id = Some("second".into());
 
         assert!(delete_server_by_id(&mut cache, "first"));
 
         assert_eq!(cache.servers.len(), 1);
         assert_eq!(cache.servers[0].id, "second");
+        assert_eq!(cache.auto_start_server_id.as_deref(), Some("second"));
+        assert!(delete_server_by_id(&mut cache, "second"));
+        assert_eq!(cache.auto_start_server_id, None);
     }
 
     #[test]

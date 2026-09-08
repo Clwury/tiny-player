@@ -7,6 +7,7 @@ mod render;
 mod resize;
 mod server_cache;
 mod server_card;
+mod server_reorder;
 mod settings_window;
 mod window;
 
@@ -29,11 +30,14 @@ use crate::{
     ui::add_server_dialog::AddServerDialogState,
 };
 use notification::AppNotificationQueue;
+use server_card::ServerContextMenu;
 
 pub struct TinyApp {
     add_server_dialog: Option<Entity<AddServerDialogState>>,
     settings_window: Option<WindowHandle<settings_window::SettingsWindow>>,
-    open_server_menu: Option<String>,
+    open_server_menu: Option<ServerContextMenu>,
+    server_reorder: Option<server_reorder::ServerReorder>,
+    server_card_positions: HashMap<String, server_reorder::CardPosition>,
     cache: ServerCache,
     emby_client: Option<EmbyClient>,
     servers: Vec<CachedServer>,
@@ -112,6 +116,8 @@ impl TinyApp {
             add_server_dialog: None,
             settings_window: None,
             open_server_menu: None,
+            server_reorder: None,
+            server_card_positions: HashMap::new(),
             cache,
             emby_client,
             servers,
@@ -133,6 +139,14 @@ impl TinyApp {
         };
         if let Some(error) = initial_error {
             app.push_app_error_notification(error, cx);
+        } else if let Some(server) = app
+            .cache
+            .auto_start_server_id
+            .as_ref()
+            .and_then(|id| app.servers.iter().find(|server| &server.id == id))
+            .cloned()
+        {
+            app.begin_select_server(&server, cx);
         }
         app
     }

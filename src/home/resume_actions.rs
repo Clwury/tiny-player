@@ -71,6 +71,8 @@ impl HomeContent {
     ) {
         if item_id.trim().is_empty()
             || self.resume_item_requests.contains(&item_id)
+            || self.played_request.is_some()
+            || self.favorite_requests.contains(&item_id)
             || self
                 .resume_items
                 .as_ref()
@@ -178,6 +180,7 @@ fn user_data_after_mark_played(
     }
     response.playback_position_ticks = Some(0);
     response.played_percentage = Some(100.0);
+    response.played = true;
     response
 }
 
@@ -212,6 +215,7 @@ mod tests {
                 played_percentage: Some(45.0),
                 playback_position_ticks: Some(450),
                 is_favorite: true,
+                played: false,
             }),
             UserItemData::default(),
         );

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use gpui::{App, Global, Hsla, Pixels, hsla, px};
@@ -30,6 +30,17 @@ impl ColorTheme {
         }
     }
 
+    // The bundled themes use different colors for `primary` and `ring`.
+    // Keep the application's accent consistently Catppuccin Mauve in every flavor.
+    fn mauve(self) -> Hsla {
+        hex(match self {
+            Self::Latte => 0x8839ef,
+            Self::Frappe => 0xca9ee6,
+            Self::Macchiato => 0xc6a0f6,
+            Self::Mocha => 0xcba6f7,
+        })
+    }
+
     pub fn id(self) -> &'static str {
         match self {
             Self::Latte => "theme-latte",
@@ -40,6 +51,7 @@ impl ColorTheme {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub struct TinyTheme {
     pub selection: ColorTheme,
     pub background: Hsla,
@@ -47,15 +59,27 @@ pub struct TinyTheme {
     pub title_bar: Hsla,
     pub title_bar_border: Hsla,
     pub window_border: Hsla,
+    pub panel_background: Hsla,
     pub secondary_hover: Hsla,
+    pub element_selected: Hsla,
+    pub element_selected_hover: Hsla,
+    pub selection_background: Hsla,
+    pub accent: Hsla,
+    pub accent_text: Hsla,
+    pub accent_hover: Hsla,
+    pub accent_foreground: Hsla,
     pub input_background: Hsla,
     pub input_border: Hsla,
     pub input_border_focused: Hsla,
     pub muted_foreground: Hsla,
+    pub placeholder_foreground: Hsla,
     pub dialog_background: Hsla,
     pub overlay: Hsla,
     pub warning: Hsla,
     pub error: Hsla,
+    pub scrollbar_track: Hsla,
+    pub scrollbar_thumb: Hsla,
+    pub scrollbar_thumb_hover: Hsla,
     pub radius_lg: Pixels,
 }
 
@@ -87,6 +111,20 @@ pub fn get(cx: &App) -> &TinyTheme {
     cx.global::<TinyTheme>()
 }
 
+/// Image and video overlays use light text on dark scrims in every application theme.
+pub fn media_overlay(cx: &App) -> &TinyTheme {
+    static DARK_THEME: LazyLock<TinyTheme> = LazyLock::new(|| {
+        TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, ColorTheme::Mocha)
+            .unwrap_or_else(|_| TinyTheme::catppuccin_mocha_fallback())
+    });
+    let theme = get(cx);
+    if theme.selection == ColorTheme::Latte {
+        &DARK_THEME
+    } else {
+        theme
+    }
+}
+
 type ThemeColors = HashMap<String, Option<String>>;
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +140,36 @@ struct ThemeConfig {
     colors: ThemeColors,
 }
 
+// Source colors stay in the bundled JSON. UI roles are derived separately so
+// editor-oriented panel, selection and disabled-text colors do not leak into widgets.
+struct ThemePalette {
+    background: Hsla,
+    foreground: Hsla,
+    title_bar: Hsla,
+    title_bar_border: Hsla,
+    window_border: Hsla,
+    input_border: Hsla,
+    warning: Hsla,
+    error: Hsla,
+    scrollbar_thumb: Hsla,
+}
+
+impl ThemePalette {
+    fn mocha_fallback() -> Self {
+        Self {
+            background: hex(0x181825),
+            foreground: hex(0xcdd6f4),
+            title_bar: hex(0x11111b),
+            title_bar_border: hex(0x313244),
+            window_border: hex(0x313244),
+            input_border: hex(0x6c7086),
+            warning: hex(0xf9e2af),
+            error: hex(0xf38ba8),
+            scrollbar_thumb: hex(0x4e4e5e),
+        }
+    }
+}
+
 impl TinyTheme {
     fn from_theme_set_json(json: &str, selection: ColorTheme) -> Result<Self> {
         let theme_set: ThemeSet = serde_json::from_str(json).context("解析主题 JSON 失败")?;
@@ -115,10 +183,8 @@ impl TinyTheme {
     }
 
     fn from_theme_config(config: &ThemeConfig, selection: ColorTheme) -> Result<Self> {
-        let fallback = Self::catppuccin_mocha_fallback();
-
-        Ok(Self {
-            selection,
+        let fallback = ThemePalette::mocha_fallback();
+        let palette = ThemePalette {
             background: color_or_any(config, &["background"], fallback.background)?,
             foreground: color_or_any(config, &["foreground"], fallback.foreground)?,
             title_bar: color_or_any(
@@ -132,67 +198,105 @@ impl TinyTheme {
                 fallback.title_bar_border,
             )?,
             window_border: color_or_any(config, &["border"], fallback.window_border)?,
-            secondary_hover: color_or_any(
-                config,
-                &["secondary.hover.background", "secondary.active.background"],
-                fallback.secondary_hover,
-            )?,
-            input_background: color_or_any(
-                config,
-                &[
-                    "input.background",
-                    "title_bar.background",
-                    "popover.background",
-                    "background",
-                ],
-                fallback.input_background,
-            )?,
             input_border: color_or_any(config, &["input.border", "border"], fallback.input_border)?,
-            input_border_focused: color_or_any(
-                config,
-                &["ring", "primary.background", "link.foreground"],
-                fallback.input_border_focused,
-            )?,
-            muted_foreground: color_or_any(
-                config,
-                &["muted.foreground"],
-                fallback.muted_foreground,
-            )?,
-            dialog_background: color_or_any(
-                config,
-                &["popover.background", "panel.background", "background"],
-                fallback.dialog_background,
-            )?,
-            overlay: color_or_any(config, &["overlay"], fallback.overlay)?,
             warning: color_or_any(
                 config,
                 &["warning.foreground", "warning.background", "base.yellow"],
                 fallback.warning,
             )?,
             error: color_or_any(config, &["danger.background", "base.red"], fallback.error)?,
-            radius_lg: px(config.radius_lg.unwrap_or(16.0)),
-        })
+            scrollbar_thumb: color_or_any(
+                config,
+                &["scrollbar.thumb.background"],
+                fallback.scrollbar_thumb,
+            )?,
+        };
+        Ok(Self::from_palette(
+            selection,
+            palette,
+            px(config.radius_lg.unwrap_or(16.0)),
+        ))
+    }
+
+    fn from_palette(selection: ColorTheme, palette: ThemePalette, radius_lg: Pixels) -> Self {
+        let light = selection == ColorTheme::Latte;
+        let background = palette.background;
+        let foreground = palette.foreground;
+        let accent = selection.mauve();
+        let white = hex(0xffffff);
+        let black = hex(0x000000);
+        let input_background = if light {
+            background.blend(white.opacity(0.45))
+        } else {
+            palette.title_bar
+        };
+
+        Self {
+            selection,
+            background,
+            foreground,
+            title_bar: palette.title_bar,
+            title_bar_border: palette.title_bar_border,
+            window_border: palette.window_border,
+            // Sidebars share the window chrome; popups sit above the content surface.
+            panel_background: palette.title_bar,
+            dialog_background: background.blend(if light {
+                white.opacity(0.75)
+            } else {
+                foreground.opacity(0.04)
+            }),
+            // Opaque, composited fills keep hover/selection consistent on every surface.
+            secondary_hover: background.blend(foreground.opacity(if light { 0.16 } else { 0.08 })),
+            element_selected: background.blend(accent.opacity(if light { 0.10 } else { 0.16 })),
+            element_selected_hover: background.blend(accent.opacity(if light {
+                0.18
+            } else {
+                0.20
+            })),
+            selection_background: accent.opacity(0.24),
+            accent,
+            accent_text: if light {
+                accent.blend(black.opacity(0.22))
+            } else {
+                accent
+            },
+            accent_hover: accent.blend(if light {
+                black.opacity(0.12)
+            } else {
+                white.opacity(0.18)
+            }),
+            accent_foreground: if light { white } else { background },
+            input_background,
+            input_border: background.blend(palette.input_border.opacity(0.7)),
+            input_border_focused: accent,
+            // Metadata must remain readable: the source `muted.foreground` is also
+            // used for disabled editor text and is too faint for regular UI labels.
+            muted_foreground: background.blend(foreground.opacity(if light { 0.96 } else { 0.80 })),
+            placeholder_foreground: input_background.blend(foreground.opacity(if light {
+                0.83
+            } else {
+                0.60
+            })),
+            overlay: black.opacity(if light { 0.25 } else { 0.55 }),
+            warning: if light {
+                palette.warning.blend(black.opacity(0.4))
+            } else {
+                palette.warning
+            },
+            error: if light {
+                palette.error.blend(black.opacity(0.25))
+            } else {
+                palette.error
+            },
+            scrollbar_track: background.opacity(0.0),
+            scrollbar_thumb: palette.scrollbar_thumb.blend(foreground.opacity(0.18)),
+            scrollbar_thumb_hover: palette.scrollbar_thumb.blend(foreground.opacity(0.46)),
+            radius_lg,
+        }
     }
 
     fn catppuccin_mocha_fallback() -> Self {
-        Self {
-            selection: ColorTheme::Mocha,
-            background: hex(0x1e1e2e),
-            foreground: hex(0xcdd6f4),
-            title_bar: hex(0x181825),
-            title_bar_border: hex(0x313244),
-            window_border: hex(0x313244),
-            secondary_hover: hsla(0.647, 0.20, 0.36, 0.55),
-            input_background: hex(0x11111b),
-            input_border: hex(0x45475a),
-            input_border_focused: hex(0x89b4fa),
-            muted_foreground: hex(0x6c7086),
-            dialog_background: hex(0x1e1e2e),
-            overlay: hsla(0.0, 0.0, 0.0, 0.55),
-            warning: hex(0xf9e2af),
-            error: hex(0xf38ba8),
-            radius_lg: px(16.0),
-        }
+        Self::from_palette(ColorTheme::Mocha, ThemePalette::mocha_fallback(), px(16.0))
     }
 }
 
@@ -282,16 +386,18 @@ mod tests {
 
     #[test]
     fn all_bundled_color_themes_load_their_own_palette() {
-        for (selection, background, border) in [
-            (ColorTheme::Latte, "#E5E9EF", "#CCD0DA"),
-            (ColorTheme::Frappe, "#232634", "#3e4255"),
-            (ColorTheme::Macchiato, "#1E2030", "#494d64"),
-            (ColorTheme::Mocha, "#181825", "#313244"),
+        for (selection, background, border, accent) in [
+            (ColorTheme::Latte, "#e5e9ef", "#ccd0da", "#8839ef"),
+            (ColorTheme::Frappe, "#232634", "#3e4255", "#ca9ee6"),
+            (ColorTheme::Macchiato, "#1e2030", "#494d64", "#c6a0f6"),
+            (ColorTheme::Mocha, "#181825", "#313244", "#cba6f7"),
         ] {
             let theme = TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, selection).unwrap();
             assert_eq!(theme.selection, selection);
             assert_eq!(theme.background, parse_hex_color(background).unwrap());
             assert_eq!(theme.window_border, parse_hex_color(border).unwrap());
+            assert_eq!(theme.accent, parse_hex_color(accent).unwrap());
+            assert_eq!(theme.input_border_focused, theme.accent);
             assert_ne!(theme.foreground, theme.background);
         }
     }
@@ -351,14 +457,107 @@ mod tests {
         let theme = TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, ColorTheme::Mocha).unwrap();
 
         assert_eq!(theme.background, parse_hex_color("#181825").unwrap());
-        assert_eq!(theme.title_bar, parse_hex_color("#11111B").unwrap());
-        assert_eq!(theme.input_background, parse_hex_color("#11111B").unwrap());
+        assert_eq!(theme.title_bar, parse_hex_color("#11111b").unwrap());
+        assert_eq!(theme.input_background, parse_hex_color("#11111b").unwrap());
         assert_eq!(
             theme.input_border_focused,
             parse_hex_color("#cba6f7").unwrap()
         );
         assert_eq!(theme.warning, parse_hex_color("#f9e2af").unwrap());
         assert_eq!(theme.error, parse_hex_color("#f38ba8").unwrap());
+    }
+
+    #[test]
+    fn fallback_uses_the_same_ui_colors_as_bundled_mocha() {
+        assert_eq!(
+            TinyTheme::catppuccin_mocha_fallback(),
+            TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, ColorTheme::Mocha).unwrap(),
+        );
+    }
+
+    fn contrast_ratio(foreground: Hsla, background: Hsla) -> f32 {
+        fn luminance(color: Hsla) -> f32 {
+            let color = color.to_rgb();
+            [color.r, color.g, color.b]
+                .into_iter()
+                .zip([0.2126, 0.7152, 0.0722])
+                .map(|(channel, weight)| {
+                    weight
+                        * if channel <= 0.04045 {
+                            channel / 12.92
+                        } else {
+                            ((channel + 0.055) / 1.055).powf(2.4)
+                        }
+                })
+                .sum()
+        }
+        let foreground = luminance(background.blend(foreground));
+        let background = luminance(background);
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
+
+    #[test]
+    fn bundled_text_remains_readable_on_surfaces_and_controls() {
+        for selection in ColorTheme::ALL {
+            let theme = TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, selection).unwrap();
+            for surface in [
+                theme.background,
+                theme.panel_background,
+                theme.dialog_background,
+                theme.secondary_hover,
+                theme.element_selected,
+                theme.element_selected_hover,
+            ] {
+                assert_eq!(surface.a, 1.0, "{selection:?} surface must be opaque");
+                for text in [theme.foreground, theme.muted_foreground] {
+                    assert!(contrast_ratio(text, surface) >= 4.5, "{selection:?}");
+                }
+            }
+            for (text, surface) in [
+                (theme.accent_text, theme.element_selected),
+                (theme.accent_text, theme.element_selected_hover),
+                (theme.accent_foreground, theme.accent),
+                (theme.accent_foreground, theme.accent_hover),
+                (theme.placeholder_foreground, theme.input_background),
+                (theme.warning, theme.dialog_background),
+                (theme.error, theme.dialog_background),
+                (
+                    theme.foreground,
+                    theme.input_background.blend(theme.selection_background),
+                ),
+            ] {
+                assert!(contrast_ratio(text, surface) >= 4.5, "{selection:?}");
+            }
+            assert_ne!(theme.background, theme.panel_background);
+            assert_ne!(theme.background, theme.dialog_background);
+            assert_ne!(theme.secondary_hover, theme.element_selected);
+            assert_ne!(theme.scrollbar_thumb, theme.scrollbar_thumb_hover);
+        }
+    }
+
+    #[test]
+    fn latte_hover_is_visible_on_content_and_sidebar_surfaces() {
+        let theme = TinyTheme::from_theme_set_json(DEFAULT_THEME_JSON, ColorTheme::Latte).unwrap();
+        assert!(contrast_ratio(theme.secondary_hover, theme.background) >= 1.25);
+        assert!(contrast_ratio(theme.secondary_hover, theme.panel_background) >= 1.15);
+        assert!(contrast_ratio(theme.element_selected_hover, theme.element_selected) >= 1.1);
+    }
+
+    #[gpui::test]
+    fn video_controls_remain_readable_when_switching_to_a_light_theme(cx: &mut TestAppContext) {
+        for selection in ColorTheme::ALL.into_iter().chain([ColorTheme::Latte]) {
+            cx.update(|cx| {
+                set(selection, cx);
+                // The application keeps its selected theme; only the video overlay is dark.
+                assert_eq!(get(cx).selection, selection);
+                let video = media_overlay(cx);
+                assert!(contrast_ratio(video.foreground, hex(0x373737)) >= 4.5);
+                assert!(contrast_ratio(video.muted_foreground, hex(0x373737)) >= 4.5);
+                if selection != ColorTheme::Latte {
+                    assert!(std::ptr::eq(video, get(cx)));
+                }
+            });
+        }
     }
 
     #[test]

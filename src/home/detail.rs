@@ -1,9 +1,11 @@
+mod actions;
 mod images;
 mod render;
 mod state;
 mod video_sources;
 
 use super::notification::{HOME_RESUME_DETAIL_NOTIFICATION_KEY, NotificationScope};
+pub(super) use actions::PlayedRequest;
 pub(crate) use state::{SeriesDetailSelectKind, SeriesDetailState};
 
 use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, SharedString, Window};

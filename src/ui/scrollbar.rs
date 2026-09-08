@@ -236,8 +236,12 @@ impl Element for Scrollbar {
         let state = prepaint.state.clone();
         let state_value = state.get();
         let theme = theme::get(cx);
-        let track_color = theme.input_border.opacity(0.18);
-        let thumb_color = theme.muted_foreground.opacity(0.68);
+        let track_color = theme.scrollbar_track;
+        let thumb_color = if state_value.dragging || state_value.hovered_thumb {
+            theme.scrollbar_thumb_hover
+        } else {
+            theme.scrollbar_thumb
+        };
 
         window.set_cursor_style(
             if state_value.dragging {

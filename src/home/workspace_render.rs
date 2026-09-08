@@ -1011,17 +1011,23 @@ fn library_sort_option<T>(
             gpui::FontWeight::NORMAL
         })
         .text_color(if selected {
-            theme.foreground
+            theme.accent_text
         } else {
             theme.muted_foreground
         })
         .bg(if selected {
-            theme.secondary_hover
+            theme.element_selected
         } else {
             theme.dialog_background
         })
         .cursor_pointer()
-        .hover(move |style| style.bg(theme.secondary_hover))
+        .hover(move |style| {
+            style.bg(if selected {
+                theme.element_selected_hover
+            } else {
+                theme.secondary_hover
+            })
+        })
         .child(div().min_w_0().truncate().child(label))
         .when(selected, |this| {
             this.child(

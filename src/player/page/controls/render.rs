@@ -9,7 +9,7 @@ impl PlaybackPage {
         enabled: bool,
         cx: &Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let theme = theme::get(cx);
+        let theme = theme::media_overlay(cx);
         let color = if enabled {
             theme.foreground.opacity(0.92)
         } else {
@@ -37,7 +37,7 @@ impl PlaybackPage {
         window: &Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
+        let theme = theme::media_overlay(cx);
         let presenter_snapshot = self.video.dependent().map(VideoPresenter::snapshot);
         let viewport_size = window.viewport_size();
         let display_size = RenderSize {
@@ -112,7 +112,7 @@ impl PlaybackPage {
         kind: PlaybackTrackKind,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
+        let theme = theme::media_overlay(cx);
         let (id, tracks, selected) = match kind {
             PlaybackTrackKind::Audio => (
                 "playback-audio-menu",
@@ -200,7 +200,7 @@ impl PlaybackPage {
     }
 
     pub(in super::super) fn render_back_button(&self, cx: &Context<Self>) -> impl IntoElement {
-        let theme = theme::get(cx);
+        let theme = theme::media_overlay(cx);
 
         div()
             .id("playback-back-button")
@@ -236,7 +236,7 @@ impl PlaybackPage {
     }
 
     pub(in super::super) fn render_volume_indicator(&self, cx: &Context<Self>) -> impl IntoElement {
-        let theme = theme::get(cx);
+        let theme = theme::media_overlay(cx);
         let volume = clamp_playback_volume(self.volume.level);
         let fill_height = VOLUME_INDICATOR_BAR_HEIGHT_PX * volume;
         let percent = playback_volume_percent(volume);
@@ -423,7 +423,7 @@ impl PlaybackPage {
         &self,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
+        let theme = theme::media_overlay(cx);
         let segments = cache_status_segments(self.timeline.cache_state.as_ref());
         segments.into_iter().fold(
             div()
@@ -499,7 +499,7 @@ impl PlaybackPage {
         state: ProgressTimelineRenderState,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
+        let theme = theme::media_overlay(cx);
         let played_color = if state.cached_seek_preview == Some(false) {
             theme.warning
         } else {
@@ -565,7 +565,7 @@ impl PlaybackPage {
             return div().id("playback-progress-empty").into_any_element();
         };
 
-        let theme = theme::get(cx);
+        let theme = theme::media_overlay(cx);
         let position = self
             .timeline
             .progress_drag_position
