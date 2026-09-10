@@ -21,6 +21,15 @@ pub struct VideoOutputQueueSnapshot {
     pub queue_capacity: usize,
     pub dropped_frames: u64,
     pub render_backpressure: RenderBackpressure,
+    pub last_presentation: Option<VideoPresentation>,
+}
+
+/// A rendered frame handed to the UI for display, scoped to the current VO
+/// presentation generation. This is feedback, not the decoder's forward PTS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoPresentation {
+    pub sequence: u64,
+    pub timeline_nsecs: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +172,8 @@ struct VideoOutputQueueState {
     buffer_pool: FrameBufferPool,
     render_backpressure: RenderBackpressure,
     dropped_frames: u64,
+    presentation_sequence: u64,
+    last_presentation: Option<VideoPresentation>,
 }
 
 struct VulkanPrewarmState {
@@ -196,6 +207,8 @@ impl VideoOutputQueue {
             buffer_pool,
             render_backpressure,
             dropped_frames: 0,
+            presentation_sequence: 0,
+            last_presentation: None,
         };
     }
 
@@ -211,12 +224,30 @@ impl VideoOutputQueue {
         state.pending_size_change = None;
         state.vulkan_prewarm = None;
         state.presentation_generation = state.presentation_generation.wrapping_add(1);
+        state.last_presentation = None;
         discarded
     }
 
     pub fn presentation_identity(&self) -> (PlaybackSessionId, u64) {
         let state = self.inner.lock().expect("video output queue poisoned");
         (state.active_session_id, state.presentation_generation)
+    }
+
+    pub fn record_presentation(
+        &self,
+        identity: (PlaybackSessionId, u64),
+        timeline_nsecs: u64,
+    ) -> bool {
+        let mut state = self.inner.lock().expect("video output queue poisoned");
+        if (state.active_session_id, state.presentation_generation) != identity {
+            return false;
+        }
+        state.presentation_sequence = state.presentation_sequence.wrapping_add(1);
+        state.last_presentation = Some(VideoPresentation {
+            sequence: state.presentation_sequence,
+            timeline_nsecs,
+        });
+        true
     }
 
     #[allow(dead_code)]
@@ -396,6 +427,7 @@ impl VideoOutputQueue {
             queue_capacity: VIDEO_OUTPUT_QUEUE_CAPACITY,
             dropped_frames: state.dropped_frames,
             render_backpressure: state.render_backpressure,
+            last_presentation: state.last_presentation,
         };
         drop(state);
         log_video_output_queue_snapshot_timing(started_at.elapsed(), lock_wait, snapshot);
@@ -631,6 +663,27 @@ mod tests {
         VulkanDecodeDevice, VulkanDecodeQueue, VulkanDecodeQueues,
     };
     use std::ptr;
+
+    #[test]
+    fn presentation_feedback_rejects_stale_sessions_and_seek_generations() {
+        let queue = VideoOutputQueue::default();
+        let session = PlaybackSessionId(1);
+        queue.begin_session(session);
+        let before_seek = queue.presentation_identity();
+        assert!(queue.record_presentation(before_seek, 1_000_000_000));
+        assert_eq!(
+            queue.snapshot().last_presentation.unwrap().timeline_nsecs,
+            1_000_000_000
+        );
+        queue.discard_pending_frames(session);
+        assert_eq!(queue.snapshot().last_presentation, None);
+        assert!(!queue.record_presentation(before_seek, 1_040_000_000));
+        assert!(queue.record_presentation(queue.presentation_identity(), 20_000_000_000));
+        assert_eq!(queue.snapshot().last_presentation.unwrap().sequence, 2);
+        queue.begin_session(PlaybackSessionId(2));
+        assert!(!queue.record_presentation(before_seek, 1_080_000_000));
+        assert_eq!(queue.snapshot().last_presentation, None);
+    }
 
     #[test]
     fn video_output_queue_queues_frames_and_reports_size_changes() {

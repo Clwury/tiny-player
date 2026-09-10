@@ -326,6 +326,27 @@ impl TimestampMapper {
         self.map_with_monotonic_fallback(timestamp, time_base, true)
     }
 
+    /// Read a packet PTS in the established playback timeline without learning
+    /// an origin, advancing the decoded-frame clock, or synthesizing timestamps.
+    pub(super) fn map_known_timestamp(
+        &self,
+        timestamp: i64,
+        time_base: ffi::AVRational,
+    ) -> Option<u64> {
+        let nsecs = timestamp_to_nsecs(timestamp, time_base)?;
+        if let Some(start_nsecs) = self.start_nsecs {
+            let timeline_nsecs = nsecs.saturating_sub(start_nsecs);
+            // The decoded-frame path synthesizes zero timestamps after a
+            // seek. A raw zero therefore cannot prove that a packet is late.
+            (self.start_position_nsecs == 0 || timeline_nsecs > 0).then_some(timeline_nsecs)
+        } else {
+            // Before the learned anchor the synthetic playback mapping is
+            // ambiguous. Such packets cannot safely drive decoder dropping.
+            let offset = nsecs.checked_sub(self.fallback_first_nsecs?)?;
+            self.start_position_nsecs.checked_add(offset)
+        }
+    }
+
     /// Maps a timestamp from a verified decoder replay without carrying the
     /// pre-flush monotonic high-water forward. Decoder replay deliberately
     /// starts at an older safe anchor, so its original PTS must remain visible

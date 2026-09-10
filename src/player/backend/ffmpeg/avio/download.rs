@@ -1,4 +1,4 @@
-use std::{error::Error as StdError, io::Read, sync::Arc, time::Duration};
+use std::{error::Error as StdError, sync::Arc, time::Duration};
 
 use super::{
     HTTP_CACHE_NETWORK_READ_TIMEOUT,
@@ -7,11 +7,16 @@ use super::{
         HttpRingCacheShared,
     },
     http::{
-        content_len_from_content_range, content_len_from_response, content_range_from_headers,
+        content_len_from_response, content_range_from_headers,
         http_cache_playback_range_request_bytes, http_cache_range_header,
-        http_cache_range_request_len, http_cache_range_request_timeout, http_cache_read_timed_out,
+        http_cache_range_request_len, http_cache_range_request_timeout,
+        unsatisfied_content_range_len,
     },
 };
+
+#[path = "download/transport.rs"]
+mod transport;
+use transport::HttpClient;
 
 const HTTP_CACHE_MAX_RETRIES: u32 = 5;
 const HTTP_CACHE_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
@@ -29,14 +34,25 @@ struct HttpDownloadError {
     offset: u64,
     message: String,
     retryable: bool,
+    cancelled: bool,
 }
 
 impl HttpDownloadError {
+    fn cancelled(offset: u64) -> Self {
+        Self {
+            offset,
+            message: "HTTP 请求已被替代或取消".into(),
+            retryable: false,
+            cancelled: true,
+        }
+    }
+
     fn new(offset: u64, message: String, retryable: bool) -> Self {
         Self {
             offset,
             message,
             retryable,
+            cancelled: false,
         }
     }
 }
@@ -75,14 +91,7 @@ pub(super) fn http_ring_cache_download_loop(
     url: String,
     headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
 ) {
-    let client = match reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        // The blocking client's timeout is applied afresh to send/read
-        // operations. Do not attach a RequestBuilder timeout to the active
-        // open-ended response, because that is a total body deadline.
-        .timeout(HTTP_CACHE_NETWORK_READ_TIMEOUT)
-        .build()
-    {
+    let client = match HttpClient::new() {
         Ok(client) => client,
         Err(error) => {
             shared.set_error_at(0, format!("创建 HTTP 视频缓存客户端失败：{error}"));
@@ -112,10 +121,14 @@ pub(super) fn http_ring_cache_download_loop(
             CacheAppendPermit::Stopped => return,
         }
 
+        let request_generation = shared.download_generation();
         match download_http_cache_range(&client, &url, &headers, Arc::clone(&shared), offset) {
             Ok(HttpDownloadOutcome::Eof) => {
                 retry_state.reset();
-                shared.mark_eof();
+                if !shared.mark_eof(request_generation) {
+                    offset = shared.download_offset();
+                    continue;
+                }
                 match shared.wait_for_restart_after_eof() {
                     Some(next_offset) => offset = next_offset,
                     None => return,
@@ -135,6 +148,11 @@ pub(super) fn http_ring_cache_download_loop(
                     retry_state.reset();
                     continue;
                 }
+                if error.cancelled {
+                    offset = shared.download_offset();
+                    retry_state.reset();
+                    continue;
+                }
                 offset = error.offset;
                 if error.retryable
                     && let Some((retry, delay)) = retry_state.next_delay(error.offset)
@@ -147,7 +165,7 @@ pub(super) fn http_ring_cache_download_loop(
                         error = %error.message,
                         "retrying HTTP stream cache range after transient failure"
                     );
-                    if !shared.wait_for_retry_delay(delay) {
+                    if !shared.wait_for_retry_delay(delay, request_generation, None) {
                         return;
                     }
                     continue;
@@ -198,11 +216,7 @@ pub(super) fn http_ring_cache_side_download_loop(
     url: String,
     headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
 ) {
-    let client = match reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(HTTP_CACHE_NETWORK_READ_TIMEOUT)
-        .build()
-    {
+    let client = match HttpClient::new() {
         Ok(client) => client,
         Err(error) => {
             tracing::warn!(%error, "creating HTTP side-cache client failed");
@@ -219,6 +233,7 @@ pub(super) fn http_ring_cache_side_download_loop(
         };
         let mut offset = request.offset;
         let mut retry_state = HttpRetryState::default();
+        let request_generation = request.generation;
         loop {
             match download_http_side_cache_range(
                 &client,
@@ -238,12 +253,19 @@ pub(super) fn http_ring_cache_side_download_loop(
                 }
                 Ok(HttpDownloadOutcome::Stopped) => {
                     shared.finish_side_download(request, false);
-                    return;
+                    if shared.should_stop() {
+                        return;
+                    }
+                    break;
                 }
                 Err(error) => {
                     if shared.should_stop() {
                         shared.finish_side_download(request, false);
                         return;
+                    }
+                    if error.cancelled {
+                        shared.finish_side_download(request, false);
+                        break;
                     }
                     offset = error.offset;
                     if error.retryable
@@ -259,7 +281,7 @@ pub(super) fn http_ring_cache_side_download_loop(
                             error = %error.message,
                             "retrying HTTP side-cache range after transient failure"
                         );
-                        if !shared.wait_for_retry_delay(delay) {
+                        if !shared.wait_for_retry_delay(delay, request_generation, Some(request)) {
                             shared.finish_side_download(request, false);
                             return;
                         }
@@ -274,12 +296,15 @@ pub(super) fn http_ring_cache_side_download_loop(
 }
 
 fn download_http_cache_range(
-    client: &reqwest::blocking::Client,
+    client: &HttpClient,
     url: &str,
     headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
     shared: Arc<HttpRingCacheShared>,
     mut offset: u64,
 ) -> std::result::Result<HttpDownloadOutcome, HttpDownloadError> {
+    let generation = shared
+        .begin_download_at(offset)
+        .ok_or_else(|| HttpDownloadError::cancelled(offset))?;
     let known_content_len = shared.content_len_now();
     if known_content_len.is_some_and(|content_len| offset >= content_len) {
         return Ok(HttpDownloadOutcome::Eof);
@@ -325,6 +350,7 @@ fn download_http_cache_range(
         "requesting HTTP stream cache range"
     );
     let mut request = client
+        .inner
         .get(url)
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .header(reqwest::header::CONNECTION, "keep-alive")
@@ -336,62 +362,17 @@ fn download_http_cache_range(
         request = request.header(name, value);
     }
 
-    let mut response = request.send().map_err(|error| {
-        let retryable = http_cache_request_should_retry(&error);
-        HttpDownloadError::new(
-            offset,
-            format!("HTTP 视频缓存请求失败：{}", error.without_url()),
-            retryable,
-        )
-    })?;
-    let status = response.status();
-    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-        shared.set_content_len(content_len_from_content_range(response.headers()));
+    let mut response = client.send(request, Arc::clone(&shared), None, offset, generation)?;
+    let status = response.response.status();
+    let requested_end = continuous_content_end
+        .map(|end| end + 1)
+        .or_else(|| range_len.map(|len| offset.saturating_add(len)));
+    let validated = validate_http_response(&response.response, offset, requested_end)?;
+    shared.set_content_len(response.generation(), validated.content_len);
+    if validated.eof {
         return Ok(HttpDownloadOutcome::Eof);
     }
-    if offset > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(HttpDownloadError::new(
-            offset,
-            format!("HTTP 视频缓存 Range 请求失败：服务器返回 {status}"),
-            http_cache_status_should_retry(status),
-        ));
-    }
-    if offset == 0
-        && status != reqwest::StatusCode::OK
-        && status != reqwest::StatusCode::PARTIAL_CONTENT
-    {
-        return Err(HttpDownloadError::new(
-            offset,
-            format!("HTTP 视频缓存请求失败：服务器返回 {status}"),
-            http_cache_status_should_retry(status),
-        ));
-    }
-    let response_end_exclusive = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        let content_range = content_range_from_headers(response.headers()).ok_or_else(|| {
-            HttpDownloadError::new(
-                offset,
-                "HTTP 视频缓存 Range 响应缺少 Content-Range".to_string(),
-                false,
-            )
-        })?;
-        if content_range.start != offset {
-            return Err(HttpDownloadError::new(
-                offset,
-                format!(
-                    "HTTP 视频缓存 Range 响应偏移不匹配：请求 {offset}，返回 {}",
-                    content_range.start
-                ),
-                false,
-            ));
-        }
-        Some(content_range.end.saturating_add(1))
-    } else {
-        response
-            .content_length()
-            .map(|len| offset.saturating_add(len))
-    };
-    let content_len = content_len_from_response(&response, offset);
-    shared.set_content_len(content_len);
+    let response_end_exclusive = validated.end;
 
     let mut chunk = vec![0; shared.chunk_size()];
     loop {
@@ -410,7 +391,7 @@ fn download_http_cache_range(
         // dozens of arbitrary byte-range seams during a few seconds of Vulkan
         // playback. Apart from wasting requests, those seams make a proxy-side
         // short/incorrect splice indistinguishable from a damaged HEVC packet.
-        let capacity = match shared.wait_for_append_capacity(offset) {
+        let capacity = match shared.wait_for_download_capacity(offset, Some(generation)) {
             CacheAppendPermit::Ready(capacity) => capacity,
             #[cfg(test)]
             CacheAppendPermit::Full => continue,
@@ -429,27 +410,7 @@ fn download_http_cache_range(
         if read_capacity == 0 {
             return Ok(HttpDownloadOutcome::Restart(offset));
         }
-        let read = match response.read(&mut chunk[..read_capacity]) {
-            Ok(read) => read,
-            Err(error) => {
-                if let Some(next_offset) = shared.take_restart_offset() {
-                    tracing::debug!(
-                        offset,
-                        next_offset,
-                        range = %range,
-                        %error,
-                        "HTTP stream cache read stopped for a pending restart"
-                    );
-                    return Ok(HttpDownloadOutcome::Restart(next_offset));
-                }
-                let retryable = http_cache_read_should_restart(&error);
-                return Err(HttpDownloadError::new(
-                    offset,
-                    format!("读取 HTTP 视频缓存失败：{error}"),
-                    retryable,
-                ));
-            }
-        };
+        let read = response.read(offset, &mut chunk[..read_capacity])?;
         if read == 0 {
             if response_end_exclusive.is_some_and(|response_end| offset < response_end) {
                 return Err(HttpDownloadError::new(
@@ -463,7 +424,7 @@ fn download_http_cache_range(
             }
             return Ok(HttpDownloadOutcome::Eof);
         }
-        match shared.append_or_restart(offset, &chunk[..read]) {
+        match shared.append_download_bytes(response.generation(), offset, &chunk[..read]) {
             CacheAppendResult::Appended => {
                 offset = offset.saturating_add(read as u64);
             }
@@ -476,7 +437,7 @@ fn download_http_cache_range(
 }
 
 fn download_http_side_cache_range(
-    client: &reqwest::blocking::Client,
+    client: &HttpClient,
     url: &str,
     headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
     shared: Arc<HttpRingCacheShared>,
@@ -508,6 +469,7 @@ fn download_http_side_cache_range(
         "requesting HTTP side cache range"
     );
     let mut http_request = client
+        .inner
         .get(url)
         .timeout(request_timeout)
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
@@ -517,57 +479,24 @@ fn download_http_side_cache_range(
         http_request = http_request.header(name, value);
     }
 
-    let mut response = http_request.send().map_err(|error| {
-        let retryable = http_cache_request_should_retry(&error);
-        HttpDownloadError::new(
-            offset,
-            format!("HTTP 视频缓存辅助请求失败：{}", error.without_url()),
-            retryable,
-        )
-    })?;
-    let status = response.status();
-    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-        shared.set_content_len(content_len_from_content_range(response.headers()));
+    let mut response = client.send(
+        http_request,
+        Arc::clone(&shared),
+        Some(request),
+        offset,
+        request.generation,
+    )?;
+    let validated = validate_http_response(
+        &response.response,
+        offset,
+        Some(offset.saturating_add(range_len)),
+    )?;
+    let content_len = validated.content_len;
+    shared.set_content_len(response.generation(), content_len);
+    if validated.eof {
         return Ok(HttpDownloadOutcome::Eof);
     }
-    if offset > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(HttpDownloadError::new(
-            offset,
-            format!("HTTP 视频缓存辅助 Range 请求失败：服务器返回 {status}"),
-            http_cache_status_should_retry(status),
-        ));
-    }
-    if offset == 0
-        && status != reqwest::StatusCode::OK
-        && status != reqwest::StatusCode::PARTIAL_CONTENT
-    {
-        return Err(HttpDownloadError::new(
-            offset,
-            format!("HTTP 视频缓存辅助请求失败：服务器返回 {status}"),
-            http_cache_status_should_retry(status),
-        ));
-    }
-    if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        let content_range = content_range_from_headers(response.headers()).ok_or_else(|| {
-            HttpDownloadError::new(
-                offset,
-                "HTTP 视频缓存辅助 Range 响应缺少 Content-Range".to_string(),
-                false,
-            )
-        })?;
-        if content_range.start != offset {
-            return Err(HttpDownloadError::new(
-                offset,
-                format!(
-                    "HTTP 视频缓存辅助 Range 响应偏移不匹配：请求 {offset}，返回 {}",
-                    content_range.start
-                ),
-                false,
-            ));
-        }
-    }
-    let content_len = content_len_from_response(&response, offset);
-    shared.set_content_len(content_len);
+    let response_end_exclusive = validated.end;
 
     let mut chunk = vec![0; shared.chunk_size()];
     loop {
@@ -579,27 +508,21 @@ fn download_http_side_cache_range(
         else {
             return Ok(HttpDownloadOutcome::Eof);
         };
+        if response_end_exclusive.is_some_and(|end| offset >= end) {
+            return Ok(HttpDownloadOutcome::Restart(offset));
+        }
+        let response_remaining = response_end_exclusive
+            .map(|end| end.saturating_sub(offset))
+            .unwrap_or(u64::MAX);
         let read_capacity = chunk
             .len()
-            .min(usize::try_from(request_remaining).unwrap_or(usize::MAX));
-        let read = response
-            .read(&mut chunk[..read_capacity])
-            .map_err(|error| {
-                let retryable = http_cache_read_should_restart(&error);
-                HttpDownloadError::new(
-                    offset,
-                    format!("读取 HTTP 视频缓存辅助 range 失败：{error}"),
-                    retryable,
-                )
-            })?;
+            .min(usize::try_from(request_remaining.min(response_remaining)).unwrap_or(usize::MAX));
+        let read = response.read(offset, &mut chunk[..read_capacity])?;
         if read == 0 {
-            if content_len.is_some_and(|content_len| offset < content_len)
-                && side_request_remaining_bytes(request, offset, content_len, range_request_bytes)
-                    .is_some()
-            {
+            if response_end_exclusive.is_some_and(|end| offset < end) {
                 return Err(HttpDownloadError::new(
                     offset,
-                    "HTTP 视频缓存辅助响应在预期 range 结束前提前关闭".to_string(),
+                    "HTTP 视频缓存辅助响应在声明的 range 结束前提前关闭".into(),
                     true,
                 ));
             }
@@ -622,6 +545,81 @@ fn download_http_side_cache_range(
     }
 }
 
+struct ValidatedHttpResponse {
+    content_len: Option<u64>,
+    end: Option<u64>,
+    eof: bool,
+}
+
+fn validate_http_response(
+    response: &reqwest::Response,
+    offset: u64,
+    requested_end: Option<u64>,
+) -> Result<ValidatedHttpResponse, HttpDownloadError> {
+    let status = response.status();
+    if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        let total = unsatisfied_content_range_len(response.headers()).ok_or_else(|| {
+            HttpDownloadError::new(offset, "HTTP 416 响应缺少有效文件长度".into(), false)
+        })?;
+        if offset < total {
+            return Err(HttpDownloadError::new(
+                offset,
+                "HTTP 416 与请求偏移及文件长度不一致".into(),
+                true,
+            ));
+        }
+        return Ok(ValidatedHttpResponse {
+            content_len: Some(total),
+            end: Some(total),
+            eof: true,
+        });
+    }
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        let range = content_range_from_headers(response.headers()).ok_or_else(|| {
+            HttpDownloadError::new(
+                offset,
+                "HTTP Range 响应缺少有效 Content-Range".into(),
+                false,
+            )
+        })?;
+        let end = range.end + 1;
+        if range.start != offset || requested_end.is_some_and(|requested| end > requested) {
+            return Err(HttpDownloadError::new(
+                offset,
+                "HTTP Range 响应范围与请求不匹配".into(),
+                false,
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len != end - offset)
+        {
+            return Err(HttpDownloadError::new(
+                offset,
+                "HTTP Content-Length 与 Content-Range 不一致".into(),
+                false,
+            ));
+        }
+        return Ok(ValidatedHttpResponse {
+            content_len: range.total,
+            end: Some(end),
+            eof: false,
+        });
+    }
+    if status == reqwest::StatusCode::OK && offset == 0 {
+        return Ok(ValidatedHttpResponse {
+            content_len: content_len_from_response(response, offset),
+            end: response.content_length(),
+            eof: false,
+        });
+    }
+    Err(HttpDownloadError::new(
+        offset,
+        format!("HTTP Range 请求失败：服务器返回 {status}"),
+        http_cache_status_should_retry(status),
+    ))
+}
+
 fn side_request_remaining_bytes(
     request: CacheRestartRequest,
     offset: u64,
@@ -634,10 +632,7 @@ fn side_request_remaining_bytes(
 }
 
 fn http_cache_request_should_retry(error: &reqwest::Error) -> bool {
-    error.is_timeout()
-        || error.is_connect()
-        || error.is_body()
-        || transient_http_error_message(&error.to_string())
+    error.is_timeout() || error.is_connect() || error.is_body() || transient_error_chain(error)
 }
 
 fn http_cache_status_should_retry(status: reqwest::StatusCode) -> bool {
@@ -648,19 +643,6 @@ fn http_cache_status_should_retry(status: reqwest::StatusCode) -> bool {
             | reqwest::StatusCode::SERVICE_UNAVAILABLE
             | reqwest::StatusCode::GATEWAY_TIMEOUT
     )
-}
-
-fn http_cache_read_should_restart(error: &std::io::Error) -> bool {
-    http_cache_read_timed_out(error)
-        || matches!(
-            error.kind(),
-            std::io::ErrorKind::Interrupted
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::BrokenPipe
-        )
-        || transient_error_chain(error)
 }
 
 fn transient_error_chain(error: &(dyn StdError + 'static)) -> bool {
@@ -694,7 +676,7 @@ mod tests {
         time::Duration,
     };
 
-    use reqwest::blocking::Client;
+    use super::HttpClient;
 
     use super::super::super::{
         HTTP_CACHE_RANGE_REQUEST_BYTES, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
@@ -705,6 +687,236 @@ mod tests {
         HTTP_CACHE_MAX_RETRIES, HttpDownloadOutcome, HttpRetryState, download_http_cache_range,
         http_cache_status_should_retry, side_request_remaining_bytes, transient_http_error_message,
     };
+
+    fn serve_response(response: String) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/video", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn range_416_is_eof_only_when_its_length_proves_the_requested_offset_is_at_eof() {
+        for (header, valid) in [
+            ("Content-Range: bytes */100\r\n", true),
+            ("Content-Range: bytes */1000\r\n", false),
+            ("", false),
+        ] {
+            let (url, server) = serve_response(format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\n{header}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ));
+            let cache = HttpRingCache::from_state_for_test(
+                HttpRingCacheState::new(100).with_content_len_hint(Some(1000)),
+            );
+            let client = HttpClient::new().unwrap();
+            let result = download_http_cache_range(
+                &client,
+                &url,
+                &[],
+                cache.shared_for_download_test(),
+                100,
+            );
+            if valid {
+                assert!(matches!(result, Ok(HttpDownloadOutcome::Eof)));
+                assert_eq!(cache.content_len(), Some(100));
+            } else {
+                assert!(result.is_err());
+                assert_eq!(cache.content_len(), Some(1000));
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn side_download_continues_a_short_valid_206_without_retrying_it_as_a_failure() {
+        let (url, server) = spawn_partial_content_server(500, 256, 256, 1_000_000);
+        let cache = test_download_cache(1_000_000);
+        let shared = cache.shared_for_download_test();
+        // Exercise the same queue admission used by the side worker.
+        cache.note_reader_offset(500, HttpCacheRangeKind::TailMetadataProbe);
+        let mut bytes = [0; 1];
+        let _ = cache.read_cached_at(500, &mut bytes);
+        let queued = shared.wait_for_side_download_request().unwrap();
+        assert_eq!(queued.offset, 500);
+        let client = HttpClient::new().unwrap();
+        let outcome =
+            super::download_http_side_cache_range(&client, &url, &[], shared, queued, 500).unwrap();
+        assert!(matches!(outcome, HttpDownloadOutcome::Restart(756)));
+        assert!(cache.has_cached_byte_at(755));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_short_forward_seek_consumes_the_rest_of_the_same_http_response() {
+        use std::{sync::mpsc, time::Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/video", listener.local_addr().unwrap());
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 131072\r\nContent-Range: bytes 0-131071/1000000\r\nConnection: close\r\n\r\n").unwrap();
+            stream.write_all(&[0x5a; 4096]).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            stream.write_all(&vec![0x5a; 131072 - 4096]).unwrap();
+        });
+        let cache = HttpRingCache::from_state_for_test(
+            HttpRingCacheState::new(0).with_content_len_hint(Some(1_000_000)),
+        );
+        let downloading = cache.clone();
+        let worker = thread::spawn(move || {
+            let client = HttpClient::new().unwrap();
+            download_http_cache_range(
+                &client,
+                &url,
+                &[],
+                downloading.shared_for_download_test(),
+                0,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cache.next_offset_for_test() < 4096 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(cache.next_offset_for_test(), 4096);
+        let generation = cache.shared_for_download_test().download_generation();
+        cache.note_reader_offset(8192, HttpCacheRangeKind::Playback);
+        resume_tx.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap().unwrap(),
+            HttpDownloadOutcome::Restart(131072)
+        ));
+        assert_eq!(
+            cache.shared_for_download_test().download_generation(),
+            generation
+        );
+        let mut bytes = [0; 1];
+        assert!(matches!(
+            cache.read_cached_at(8192, &mut bytes),
+            super::super::cache::CacheReadResult::Data(1)
+        ));
+        assert_eq!(bytes, [0x5a]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn obsolete_requests_cancel_while_waiting_for_headers_or_body() {
+        use std::sync::mpsc;
+        for send_headers in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/video", listener.local_addr().unwrap());
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                if send_headers {
+                    stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1000000\r\nContent-Range: bytes 0-999999/1000000\r\n\r\n").unwrap();
+                }
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            });
+            let cache = HttpRingCache::from_state_for_test(
+                HttpRingCacheState::new(0).with_content_len_hint(Some(1_000_000)),
+            );
+            let downloading = cache.clone();
+            let (result_tx, result_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let client = HttpClient::new().unwrap();
+                let result = download_http_cache_range(
+                    &client,
+                    &url,
+                    &[],
+                    downloading.shared_for_download_test(),
+                    0,
+                );
+                result_tx.send(result).unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            cache.note_reader_offset(500_000, HttpCacheRangeKind::Playback);
+            let result = result_rx.recv_timeout(Duration::from_secs(1));
+            release_tx.send(()).unwrap();
+            worker.join().unwrap();
+            server.join().unwrap();
+            assert!(
+                result.unwrap().unwrap_err().cancelled,
+                "headers={send_headers}"
+            );
+            assert_eq!(
+                cache.shared_for_download_test().take_restart_offset(),
+                Some(500_000)
+            );
+            assert!(!cache.has_cached_byte_at(500_000));
+        }
+    }
+
+    #[test]
+    fn shutting_down_cancels_a_pending_body_read_without_waiting_for_network_timeout() {
+        use std::sync::mpsc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/video", listener.local_addr().unwrap());
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1000\r\nContent-Range: bytes 0-999/1000\r\n\r\n").unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+        });
+        let cache = HttpRingCache::from_state_for_test(
+            HttpRingCacheState::new(0).with_content_len_hint(Some(1000)),
+        );
+        let downloading = cache.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let client = HttpClient::new().unwrap();
+            result_tx
+                .send(download_http_cache_range(
+                    &client,
+                    &url,
+                    &[],
+                    downloading.shared_for_download_test(),
+                    0,
+                ))
+                .unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        cache.shutdown();
+        let result = result_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+        assert!(matches!(
+            result.unwrap(),
+            Ok(HttpDownloadOutcome::Stopped)
+                | Err(super::HttpDownloadError {
+                    cancelled: true,
+                    ..
+                })
+        ));
+    }
 
     fn spawn_partial_content_server(
         response_start: u64,
@@ -770,7 +982,7 @@ mod tests {
         let total_len = HTTP_CACHE_RANGE_REQUEST_BYTES * 4;
         let (url, server) = spawn_partial_content_server(0, range_len, range_len, total_len);
         let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new(0));
-        let client = Client::builder().build().expect("test HTTP client builds");
+        let client = HttpClient::new().expect("test HTTP client builds");
 
         let outcome =
             download_http_cache_range(&client, &url, &[], cache.shared_for_download_test(), 0)
@@ -795,7 +1007,7 @@ mod tests {
         let (url, server) =
             spawn_partial_content_server(range_start, range_len, range_len, total_len);
         let cache = test_download_cache(total_len);
-        let client = Client::builder().build().expect("test HTTP client builds");
+        let client = HttpClient::new().expect("test HTTP client builds");
 
         let outcome = download_http_cache_range(
             &client,
@@ -818,20 +1030,20 @@ mod tests {
     }
 
     #[test]
-    fn active_range_waits_through_output_backpressure_without_new_range_seam() {
+    fn active_range_waits_at_demux_limit_without_new_range_seam() {
         let range_start = 1;
         let range_len = 256 * 1024;
         let total_len = 1024 * 1024;
         let (url, server) =
             spawn_partial_content_server(range_start, range_len, range_len, total_len);
         let cache = test_download_cache(total_len);
-        assert!(cache.set_output_backpressure_prefetch_paused(true));
+        assert!(cache.update_demux_high_water_prefetch_paused(100, 100, true, false));
         let resume_cache = cache.clone();
         let resume = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
-            assert!(resume_cache.set_output_backpressure_prefetch_paused(false));
+            assert!(resume_cache.update_demux_high_water_prefetch_paused(99, 100, false, false));
         });
-        let client = Client::builder().build().expect("test HTTP client builds");
+        let client = HttpClient::new().expect("test HTTP client builds");
 
         let outcome = download_http_cache_range(
             &client,
@@ -840,7 +1052,7 @@ mod tests {
             cache.shared_for_download_test(),
             range_start,
         )
-        .expect("temporary output backpressure preserves the active response");
+        .expect("a temporary demux limit preserves the active response");
 
         let range_end = range_start + range_len;
         assert!(matches!(outcome, HttpDownloadOutcome::Restart(offset) if offset == range_end));
@@ -870,7 +1082,7 @@ mod tests {
         let (url, server) =
             spawn_partial_content_server(range_start, range_len, truncated_len, total_len);
         let cache = test_download_cache(total_len);
-        let client = Client::builder().build().expect("test HTTP client builds");
+        let client = HttpClient::new().expect("test HTTP client builds");
 
         let error = download_http_cache_range(
             &client,
@@ -938,6 +1150,7 @@ mod tests {
     #[test]
     fn side_request_remaining_bytes_stops_at_side_range_boundary() {
         let request = CacheRestartRequest {
+            generation: 0,
             offset: 500,
             range_kind: HttpCacheRangeKind::Playback,
         };

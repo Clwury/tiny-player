@@ -65,8 +65,9 @@ fn http_cache_probe_read_reports_queued_side_download_activity() {
         shared: Arc::new(HttpRingCacheShared {
             state: Mutex::new(state),
             ready: Condvar::new(),
-            output_backpressure_paused: AtomicBool::new(false),
             demux_high_water_paused: AtomicBool::new(false),
+            recovery_input_required: AtomicBool::new(false),
+            active_readers: AtomicU64::new(0),
             cache_config_generation: AtomicU64::new(0),
             input_progress_generation: AtomicU64::new(0),
             control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),

@@ -75,6 +75,9 @@ impl HttpRingCacheState {
         &mut self,
         offset: u64,
     ) -> bool {
+        if self.short_seek_may_produce(offset) {
+            return false;
+        }
         let range_kind = self.take_range_kind_for_miss(offset);
         self.request_side_download_at(offset, range_kind)
     }
@@ -128,8 +131,21 @@ impl HttpRingCacheState {
             active_next_offset = self.next_offset,
             "queueing HTTP side download range"
         );
-        self.side_download_requests
-            .push_back(CacheRestartRequest { offset, range_kind });
+        let request = CacheRestartRequest {
+            offset,
+            range_kind,
+            generation: self.request_generation,
+        };
+        if range_kind == HttpCacheRangeKind::Playback {
+            let insertion = self
+                .side_download_requests
+                .iter()
+                .position(|request| request.range_kind == HttpCacheRangeKind::TailMetadataProbe)
+                .unwrap_or(self.side_download_requests.len());
+            self.side_download_requests.insert(insertion, request);
+        } else {
+            self.side_download_requests.push_back(request);
+        }
         true
     }
 
@@ -138,10 +154,13 @@ impl HttpRingCacheState {
         offset: u64,
     ) -> bool {
         let request = CacheRestartRequest {
+            generation: self.request_generation,
             offset,
             range_kind: HttpCacheRangeKind::Playback,
         };
-        if self.restart_request == Some(request) {
+        if self.restart_request.is_some_and(|pending| {
+            pending.offset == offset && pending.range_kind == request.range_kind
+        }) {
             return false;
         }
         tracing::debug!(
@@ -151,7 +170,13 @@ impl HttpRingCacheState {
             reader_offset = self.reader_offset,
             "requesting HTTP active playback restart"
         );
-        self.restart_request = Some(request);
+        self.request_generation = self.request_generation.wrapping_add(1);
+        self.restart_request = Some(CacheRestartRequest {
+            generation: self.request_generation,
+            ..request
+        });
+        self.continuous_request_active = false;
+        self.short_seek_target = None;
         self.eof = false;
         self.prefetch_paused = false;
         true
@@ -240,6 +265,13 @@ impl HttpRingCacheState {
         request: CacheRestartRequest,
         completed: bool,
     ) {
+        if request.generation != self.request_generation
+            || !self.side_download_active.contains(&request)
+        {
+            self.side_download_active
+                .retain(|active| *active != request);
+            return;
+        }
         if let Some(index) = self
             .side_download_active
             .iter()
@@ -305,6 +337,7 @@ impl HttpRingCacheState {
             "scheduling HTTP active playback continuation after side range"
         );
         self.restart_request = Some(CacheRestartRequest {
+            generation: self.request_generation,
             offset: continuation_offset,
             range_kind: HttpCacheRangeKind::Playback,
         });

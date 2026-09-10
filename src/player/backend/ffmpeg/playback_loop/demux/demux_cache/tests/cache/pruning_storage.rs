@@ -946,21 +946,119 @@ fn demux_packet_disk_cache_restores_packet_payload() {
         Some(0),
     )
     .expect("packet caches");
-    let mut disk_cache = DemuxPacketDiskCache::new(1024, None, CacheUnlinkPolicy::WhenDone)
+    let disk_cache = DemuxPacketDiskCache::new(1024, None, CacheUnlinkPolicy::WhenDone)
         .expect("disk cache creates");
     let expected_dir = std::env::var("TINY_DEMUX_PACKET_CACHE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join(crate::app_metadata::APP_ID));
+        .unwrap_or_else(|_| crate::app_metadata::default_playback_cache_dir());
     assert_eq!(disk_cache.path.parent(), Some(expected_dir.as_path()));
 
     cached
-        .spill_to_disk(&mut disk_cache)
+        .spill_to_disk(&disk_cache)
         .expect("packet spills to disk");
     let restored = cached
         .packet_ref(Some(&disk_cache))
         .expect("packet restores from disk");
 
     assert_eq!(restored.data(), Some(&b"packet-payload"[..]));
+}
+
+#[test]
+fn disk_packet_eviction_reuses_space_without_overwriting_an_in_flight_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk =
+        DemuxPacketDiskCache::new(8, Some(dir.path().into()), CacheUnlinkPolicy::WhenDone).unwrap();
+    let make_packet = |data: &[u8]| {
+        let props = AvPacket::new().unwrap();
+        let packet = AvPacket::from_data_and_props(data, &props).unwrap();
+        CachedDemuxPacket::from_packet(
+            &packet,
+            0,
+            true,
+            CachedDemuxPacketRecovery {
+                recovery_point: true,
+                recovery_kind: VideoRecoveryPointKind::Keyframe,
+                safe_seek_point: true,
+            },
+            Some(0),
+            Some(1),
+            Some(0),
+        )
+        .unwrap()
+    };
+    let mut first = make_packet(b"original");
+    first.spill_to_disk(&disk).unwrap();
+    let reader = first.read_source(Some(&disk), 0).unwrap();
+    drop(first);
+    let mut next = make_packet(b"replaced");
+    next.spill_to_disk(&disk).unwrap();
+    assert!(matches!(next.payload, CachedDemuxPacketPayload::Memory(_)));
+    let (restored, _) = reader
+        .packet_ref(&mut DemuxPacketCacheReadTiming::default())
+        .unwrap();
+    assert_eq!(restored.data(), Some(&b"original"[..]));
+    next.spill_to_disk(&disk).unwrap();
+    assert!(matches!(
+        next.payload,
+        CachedDemuxPacketPayload::Disk { .. }
+    ));
+    for _ in 0..100 {
+        drop(next);
+        next = make_packet(b"replaced");
+        next.spill_to_disk(&disk).unwrap();
+        assert!(matches!(
+            next.payload,
+            CachedDemuxPacketPayload::Disk { .. }
+        ));
+        assert_eq!(
+            next.packet_ref(Some(&disk)).unwrap().data(),
+            Some(&b"replaced"[..])
+        );
+    }
+    assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), 8);
+}
+
+#[test]
+fn reducing_disk_quota_restores_evicted_packets_before_reclaiming_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut disk =
+        DemuxPacketDiskCache::new(16, Some(dir.path().into()), CacheUnlinkPolicy::WhenDone)
+            .unwrap();
+    let prefix = disk.write_packet(b"12345678").unwrap();
+    let props = AvPacket::new().unwrap();
+    let packet = AvPacket::from_data_and_props(b"retained", &props).unwrap();
+    let mut cached = CachedDemuxPacket::from_packet(
+        &packet,
+        0,
+        true,
+        CachedDemuxPacketRecovery {
+            recovery_point: true,
+            recovery_kind: VideoRecoveryPointKind::Keyframe,
+            safe_seek_point: true,
+        },
+        Some(0),
+        Some(1),
+        Some(0),
+    )
+    .unwrap();
+    cached.spill_to_disk(&disk).unwrap();
+    // A total of 9 bytes reserves 1 for HTTP and 8 for demux.
+    disk.set_limit(&PlaybackCacheConfig {
+        disk_cache_max_bytes: 9,
+        ..PlaybackCacheConfig::default()
+    });
+    cached.restore_outside_disk_limit(&disk).unwrap();
+    disk.maintain_file_size();
+    assert!(matches!(
+        cached.payload,
+        CachedDemuxPacketPayload::Memory(_)
+    ));
+    assert_eq!(
+        cached.packet_ref(Some(&disk)).unwrap().data(),
+        Some(&b"retained"[..])
+    );
+    assert_eq!(std::fs::metadata(&disk.path).unwrap().len(), 8);
+    assert_eq!(prefix.len, 8);
 }
 
 #[test]

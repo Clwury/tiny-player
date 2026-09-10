@@ -81,6 +81,10 @@ pub(super) fn service_playback_commands(
     }
 
     if let Some(cache_config) = drained_commands.cache_config {
+        context
+            .pipeline
+            .video_decode_pipeline
+            .set_decoder_framedrop(cache_config.decoder_framedrop);
         apply_playback_cache_config(
             context.source,
             context.demux_cache,

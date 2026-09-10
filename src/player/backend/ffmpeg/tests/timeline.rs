@@ -1,6 +1,50 @@
 use super::*;
 
 #[test]
+fn packet_timestamp_mapping_uses_stream_origin_without_advancing_decoded_clock() {
+    let mut mapper = TimestampMapper::new(Some(10_000_000_000), 0, Some(40_000_000));
+    let time_base = ffi::AVRational { num: 1, den: 1_000 };
+    assert_eq!(mapper.map(10_000, time_base).timeline_nsecs, 0);
+    assert_eq!(
+        mapper.map_known_timestamp(10_500, time_base),
+        Some(500_000_000)
+    );
+    assert_eq!(
+        mapper.map_known_timestamp(10_100, time_base),
+        Some(100_000_000)
+    );
+    assert_eq!(mapper.map(10_040, time_base).timeline_nsecs, 40_000_000);
+    assert_eq!(
+        mapper.map_known_timestamp(ffi::AV_NOPTS_VALUE, time_base),
+        None
+    );
+}
+
+#[test]
+fn packet_timestamp_mapping_rejects_zero_that_would_be_synthesized_after_seek() {
+    let mut mapper = TimestampMapper::new(Some(0), 20_000_000_000, Some(40_000_000));
+    let time_base = ffi::AVRational { num: 1, den: 1_000 };
+    assert_eq!(mapper.map_known_timestamp(0, time_base), None);
+    assert_eq!(mapper.map(0, time_base).timeline_nsecs, 20_000_000_000);
+    assert_eq!(mapper.map_known_timestamp(0, time_base), None);
+}
+
+#[test]
+fn packet_timestamp_mapping_requires_a_learned_origin_after_seek() {
+    let mut mapper = TimestampMapper::new(None, 20_000_000_000, Some(40_000_000));
+    let time_base = ffi::AVRational { num: 1, den: 1_000 };
+    assert_eq!(mapper.map_known_timestamp(2_000, time_base), None);
+    assert_eq!(mapper.timeline_origin_nsecs(), None);
+    mapper.map(1_000, time_base);
+    assert_eq!(
+        mapper.map_known_timestamp(2_000, time_base),
+        Some(21_000_000_000)
+    );
+    assert_eq!(mapper.map_known_timestamp(900, time_base), None);
+    assert_eq!(mapper.map(1_040, time_base).timeline_nsecs, 20_040_000_000);
+}
+
+#[test]
 fn timestamp_mapper_reports_dynamic_timeline_origin() {
     let mut mapper = TimestampMapper::new(None, 10_000_000_000, None);
     let time_base = ffi::AVRational { num: 1, den: 1_000 };

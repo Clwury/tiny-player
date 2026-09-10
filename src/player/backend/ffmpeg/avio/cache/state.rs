@@ -95,6 +95,9 @@ impl HttpRingCacheState {
             active_range_kind: HttpCacheRangeKind::Playback,
             pending_seek_range_kind: None,
             reader_offset: start_offset,
+            request_generation: 0,
+            continuous_request_active: false,
+            short_seek_target: None,
             byte_level_seeks: 0,
             input_rate_samples: VecDeque::new(),
             retained_access_generation: 0,
@@ -112,7 +115,21 @@ impl HttpRingCacheState {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg) fn apply_cache_config(
+        &mut self,
+        cache_config: &PlaybackCacheConfig,
+    ) {
+        let config = HttpCacheConfig::from_playback_config(cache_config);
+        if self.disk_cache.is_none() {
+            self.disk_cache = config.disk_cache_bytes.and_then(|limit| {
+                HttpDiskCache::new(limit, config.cache_dir.clone(), config.unlink_files)
+            });
+        }
+        self.apply_prepared_cache_config(cache_config);
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn apply_prepared_cache_config(
         &mut self,
         cache_config: &PlaybackCacheConfig,
     ) {
@@ -125,17 +142,15 @@ impl HttpRingCacheState {
         }
 
         if let Some(max_bytes) = config.disk_cache_bytes {
-            if self.disk_cache.is_none() {
-                self.disk_cache =
-                    HttpDiskCache::new(max_bytes, config.cache_dir.clone(), config.unlink_files);
-            }
             if let Some(disk_cache) = self.disk_cache.as_mut() {
-                disk_cache.max_bytes = max_bytes;
-                disk_cache.trim_to_limit();
+                disk_cache.set_limit(max_bytes);
             }
             self.disk_cache_writable = self.disk_cache.is_some();
         } else {
             self.disk_cache_writable = false;
+            if let Some(cache) = self.disk_cache.as_mut() {
+                cache.set_limit(cache_config.effective_disk_cache_budgets().0);
+            }
         }
 
         self.config = config;

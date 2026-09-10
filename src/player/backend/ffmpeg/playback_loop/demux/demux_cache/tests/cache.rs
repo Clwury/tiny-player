@@ -16,6 +16,8 @@ mod reporting_reader;
 mod seek;
 #[path = "cache/state.rs"]
 mod state;
+#[path = "cache/storage_worker.rs"]
+mod storage_worker;
 #[path = "cache/stream_alignment.rs"]
 mod stream_alignment;
 #[path = "cache/timeline.rs"]
@@ -228,6 +230,7 @@ fn cached_packet_with_keyframe(
         start_nsecs,
         end_nsecs,
         byte_len: 1024,
+        properties_byte_len: 0,
     }
 }
 
@@ -293,7 +296,7 @@ fn shared_with_codec_and_config_for_test(
         consumer_lock_pressure_until_nanos: AtomicU64::new(0),
         playback_recovery_critical: AtomicBool::new(false),
         playback_recovery_demand: AtomicU8::new(0),
-        output_backpressure_prefetch_paused: AtomicBool::new(false),
+        disk_worker_started: AtomicBool::new(false),
     };
     (shared, event_rx)
 }

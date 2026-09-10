@@ -40,7 +40,20 @@ pub(in crate::player::backend::ffmpeg::avio::cache) fn http_stream_cache_status_
     let Some(previous) = previous else {
         return true;
     };
-    if previous.disk_cache_enabled != next.disk_cache_enabled
+    if previous.storage.memory_limit_bytes != next.storage.memory_limit_bytes
+        || previous.storage.disk_limit_bytes != next.storage.disk_limit_bytes
+        || previous.storage.disk_pending_bytes != next.storage.disk_pending_bytes
+        || previous
+            .storage
+            .memory_bytes
+            .abs_diff(next.storage.memory_bytes)
+            >= cached_bytes_threshold
+        || previous
+            .storage
+            .disk_bytes
+            .abs_diff(next.storage.disk_bytes)
+            >= cached_bytes_threshold
+        || previous.disk_cache_enabled != next.disk_cache_enabled
         || previous.idle != next.idle
         || previous.content_length != next.content_length
         || previous.ranges.len() != next.ranges.len()

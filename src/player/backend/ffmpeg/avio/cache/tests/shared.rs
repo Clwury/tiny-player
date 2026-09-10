@@ -20,6 +20,142 @@ use super::super::{
 };
 
 #[test]
+fn recovery_demand_bypasses_demux_pause_but_keeps_the_byte_capacity_limit() {
+    let cache =
+        HttpRingCache::from_state_for_test(HttpRingCacheState::new_with_cache_capacity(0, 128));
+    cache.update_demux_high_water_prefetch_paused(100, 100, true, false);
+    assert!(matches!(
+        cache.shared.append_capacity_now(0),
+        CacheAppendPermit::Full
+    ));
+    cache.set_recovery_input_required(true);
+    assert!(matches!(
+        cache.shared.append_capacity_now(0),
+        CacheAppendPermit::Ready(_)
+    ));
+    let capacity = cache.shared.state.lock().unwrap().active_memory_capacity();
+    cache.shared.append_or_restart(0, &vec![0; capacity]);
+    assert!(matches!(
+        cache.shared.append_capacity_now(capacity as u64),
+        CacheAppendPermit::Full
+    ));
+    cache.set_recovery_input_required(false);
+    assert!(matches!(
+        cache.shared.append_capacity_now(0),
+        CacheAppendPermit::Full
+    ));
+}
+
+#[test]
+fn an_avio_read_unblocks_http_despite_a_stale_demux_pause() {
+    let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new(0));
+    cache.update_demux_high_water_prefetch_paused(100, 100, true, false);
+    let reader = cache.clone();
+    let worker = thread::spawn(move || {
+        let mut bytes = [0; 1];
+        assert!(matches!(
+            reader.read_at(0, &mut bytes),
+            CacheReadResult::Data(1)
+        ));
+        assert_eq!(bytes, [7]);
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while cache.shared.active_readers.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert!(matches!(
+        cache.shared.append_capacity_now(0),
+        CacheAppendPermit::Ready(_)
+    ));
+    cache.shared.append_or_restart(0, &[7]);
+    worker.join().unwrap();
+    assert!(matches!(
+        cache.shared.append_capacity_now(1),
+        CacheAppendPermit::Full
+    ));
+}
+
+#[test]
+fn a_new_playback_position_interrupts_retry_backoff_and_resets_the_active_range() {
+    let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new(0));
+    let retry = cache.clone();
+    let generation = cache.shared.download_generation();
+    let worker = thread::spawn(move || {
+        retry
+            .shared
+            .wait_for_retry_delay(Duration::from_secs(2), generation, None)
+    });
+    cache.note_reader_offset(1_000_000, HttpCacheRangeKind::Playback);
+    assert!(worker.join().unwrap());
+    assert_eq!(cache.shared.take_restart_offset(), Some(1_000_000));
+    assert_eq!(cache.shared.download_offset(), 1_000_000);
+    assert!(cache.shared.state.lock().unwrap().restart_request.is_none());
+}
+
+#[test]
+fn late_bytes_headers_and_eof_from_an_old_request_do_not_change_the_new_range() {
+    let cache = HttpRingCache::from_state_for_test(
+        HttpRingCacheState::new(0).with_content_len_hint(Some(1_000_000)),
+    );
+    let generation = cache.shared.download_generation();
+    cache.note_reader_offset(500_000, HttpCacheRangeKind::Playback);
+    cache.shared.take_restart_offset();
+    assert!(matches!(
+        cache
+            .shared
+            .append_download_bytes(generation, 500_000, b"old"),
+        super::super::CacheAppendResult::Restart(500_000)
+    ));
+    cache.shared.set_content_len(generation, Some(12));
+    assert!(!cache.shared.mark_eof(generation));
+    assert_eq!(cache.content_len(), Some(1_000_000));
+    assert!(!cache.has_cached_byte_at(500_000));
+    assert!(!cache.shared.state.lock().unwrap().eof);
+}
+
+#[test]
+fn an_old_side_completion_cannot_remove_a_replacement_request_at_the_same_offset() {
+    let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new(0));
+    let old = CacheRestartRequest {
+        generation: 0,
+        offset: 900,
+        range_kind: HttpCacheRangeKind::TailMetadataProbe,
+    };
+    cache
+        .shared
+        .state
+        .lock()
+        .unwrap()
+        .side_download_active
+        .push(old);
+    cache.note_reader_offset(500_000, HttpCacheRangeKind::Playback);
+    let replacement = CacheRestartRequest {
+        generation: cache.shared.download_generation(),
+        ..old
+    };
+    cache
+        .shared
+        .state
+        .lock()
+        .unwrap()
+        .side_download_active
+        .push(replacement);
+    assert!(cache.shared.request_cancelled(old.generation, Some(old)));
+    assert!(matches!(
+        cache.shared.append_side_download_or_stop(old, 900, b"old"),
+        super::super::CacheAppendResult::Stopped
+    ));
+    cache
+        .shared
+        .finish_side_download_with_error(old, 900, "obsolete error".into());
+    cache.shared.finish_side_download(old, true);
+    let guard = cache.shared.state.lock().unwrap();
+    assert_eq!(guard.side_download_active, vec![replacement]);
+    assert!(guard.error.is_none());
+    assert!(!guard.cached_range_contains(900));
+}
+
+#[test]
 fn http_cache_read_error_does_not_poison_cached_prefix() {
     let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(1_000));
     assert!(state.append_at(0, b"abcdef"));
@@ -86,6 +222,7 @@ fn http_cache_read_error_waits_while_side_range_can_recover_gap() {
     );
     cache.shared.set_error_at(500, "temporary gap".to_string());
     let request = CacheRestartRequest {
+        generation: 0,
         offset: 500,
         range_kind: HttpCacheRangeKind::Playback,
     };
@@ -111,6 +248,7 @@ fn http_cache_successful_side_append_clears_matching_read_error() {
     );
     cache.shared.set_error_at(500, "temporary gap".to_string());
     let request = CacheRestartRequest {
+        generation: 0,
         offset: 500,
         range_kind: HttpCacheRangeKind::Playback,
     };
@@ -145,14 +283,16 @@ fn http_cache_tail_side_failure_does_not_set_playback_error() {
     let shared = HttpRingCacheShared {
         state: Mutex::new(HttpRingCacheState::new(0).with_content_len_hint(Some(1_000))),
         ready: Condvar::new(),
-        output_backpressure_paused: AtomicBool::new(false),
         demux_high_water_paused: AtomicBool::new(false),
+        recovery_input_required: AtomicBool::new(false),
+        active_readers: AtomicU64::new(0),
         cache_config_generation: AtomicU64::new(0),
         input_progress_generation: AtomicU64::new(0),
         control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
         event_tx,
     };
     let request = CacheRestartRequest {
+        generation: 0,
         offset: 900,
         range_kind: HttpCacheRangeKind::TailMetadataProbe,
     };
@@ -174,14 +314,16 @@ fn http_cache_playback_side_failure_only_sets_error_for_active_reader_range() {
     let shared = HttpRingCacheShared {
         state: Mutex::new(HttpRingCacheState::new(0).with_content_len_hint(Some(1_000))),
         ready: Condvar::new(),
-        output_backpressure_paused: AtomicBool::new(false),
         demux_high_water_paused: AtomicBool::new(false),
+        recovery_input_required: AtomicBool::new(false),
+        active_readers: AtomicU64::new(0),
         cache_config_generation: AtomicU64::new(0),
         input_progress_generation: AtomicU64::new(0),
         control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
         event_tx,
     };
     let request = CacheRestartRequest {
+        generation: 0,
         offset: 500,
         range_kind: HttpCacheRangeKind::Playback,
     };
@@ -206,14 +348,16 @@ fn http_cache_playback_side_failure_ahead_of_reader_stays_background_only() {
     let shared = HttpRingCacheShared {
         state: Mutex::new(HttpRingCacheState::new(0).with_content_len_hint(Some(1_000))),
         ready: Condvar::new(),
-        output_backpressure_paused: AtomicBool::new(false),
         demux_high_water_paused: AtomicBool::new(false),
+        recovery_input_required: AtomicBool::new(false),
+        active_readers: AtomicU64::new(0),
         cache_config_generation: AtomicU64::new(0),
         input_progress_generation: AtomicU64::new(0),
         control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
         event_tx,
     };
     let request = CacheRestartRequest {
+        generation: 0,
         offset: 500,
         range_kind: HttpCacheRangeKind::Playback,
     };
@@ -235,8 +379,9 @@ fn http_cache_shared_reports_idle_when_eof_reached() {
     let shared = HttpRingCacheShared {
         state: Mutex::new(HttpRingCacheState::new(0)),
         ready: Condvar::new(),
-        output_backpressure_paused: AtomicBool::new(false),
         demux_high_water_paused: AtomicBool::new(false),
+        recovery_input_required: AtomicBool::new(false),
+        active_readers: AtomicU64::new(0),
         cache_config_generation: AtomicU64::new(0),
         input_progress_generation: AtomicU64::new(0),
         control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
@@ -249,7 +394,7 @@ fn http_cache_shared_reports_idle_when_eof_reached() {
         assert!(guard.take_stream_cache_status_report().is_some());
     }
 
-    shared.mark_eof();
+    shared.mark_eof(shared.download_generation());
 
     let event = event_rx.try_recv().expect("EOF status event is sent");
     assert!(matches!(
@@ -266,8 +411,9 @@ fn http_cache_shared_reports_idle_after_last_side_download_finishes() {
     let shared = HttpRingCacheShared {
         state: Mutex::new(HttpRingCacheState::new(100).with_content_len_hint(Some(1_000))),
         ready: Condvar::new(),
-        output_backpressure_paused: AtomicBool::new(false),
         demux_high_water_paused: AtomicBool::new(false),
+        recovery_input_required: AtomicBool::new(false),
+        active_readers: AtomicU64::new(0),
         cache_config_generation: AtomicU64::new(0),
         input_progress_generation: AtomicU64::new(0),
         control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
@@ -320,28 +466,6 @@ fn http_cache_playback_status_skips_busy_state_lock() {
 }
 
 #[test]
-fn http_cache_backpressure_update_never_waits_for_busy_state_lock() {
-    let cache = HttpRingCache::from_state_for_test(
-        HttpRingCacheState::new(0).with_content_len_hint(Some(1_000)),
-    );
-    let _guard = cache.shared.state.lock().expect("state locks");
-    let started_at = Instant::now();
-
-    assert!(cache.set_output_backpressure_prefetch_paused(true));
-
-    assert!(
-        started_at.elapsed() < Duration::from_millis(10),
-        "atomic playback backpressure update unexpectedly blocked"
-    );
-    assert!(
-        cache
-            .shared
-            .output_backpressure_paused
-            .load(Ordering::Acquire)
-    );
-}
-
-#[test]
 fn http_cache_config_update_defers_busy_lock_and_keeps_only_latest_generation() {
     let cache = HttpRingCache::from_state_for_test(
         HttpRingCacheState::new(0).with_content_len_hint(Some(1_000)),
@@ -378,7 +502,7 @@ fn http_cache_config_update_defers_busy_lock_and_keeps_only_latest_generation() 
 }
 
 #[test]
-fn http_cache_demux_waterline_uses_atomic_hysteresis_without_state_lock() {
+fn http_cache_demux_waterline_resumes_immediately_below_full_without_state_lock() {
     let cache = HttpRingCache::from_state_for_test(
         HttpRingCacheState::new(0).with_content_len_hint(Some(1_000)),
     );
@@ -386,10 +510,13 @@ fn http_cache_demux_waterline_uses_atomic_hysteresis_without_state_lock() {
     let started_at = Instant::now();
 
     assert!(!cache.update_demux_high_water_prefetch_paused(89, 100, false, false));
-    assert!(cache.update_demux_high_water_prefetch_paused(90, 100, false, false));
+    assert!(!cache.update_demux_high_water_prefetch_paused(90, 100, false, false));
+    assert!(!cache.update_demux_high_water_prefetch_paused(99, 100, false, false));
+    assert!(cache.update_demux_high_water_prefetch_paused(100, 100, true, false));
     assert!(cache.shared.demux_high_water_paused.load(Ordering::Acquire));
-    assert!(!cache.update_demux_high_water_prefetch_paused(76, 100, false, false));
-    assert!(cache.update_demux_high_water_prefetch_paused(74, 100, false, false));
+    // A small forward seek must refill even when more than 75% remains.
+    assert!(cache.update_demux_high_water_prefetch_paused(99, 100, false, false));
+    assert!(!cache.update_demux_high_water_prefetch_paused(90, 100, false, false));
     assert!(!cache.shared.demux_high_water_paused.load(Ordering::Acquire));
     assert!(
         started_at.elapsed() < Duration::from_millis(10),
@@ -409,6 +536,57 @@ fn http_cache_demux_underrun_resumes_prefetch_above_high_water() {
 }
 
 #[test]
+fn http_cache_demux_time_limit_is_honored_without_a_byte_limit() {
+    let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new(0));
+    assert!(cache.update_demux_high_water_prefetch_paused(10, 0, true, false));
+    assert!(matches!(
+        cache.shared.append_capacity_now(0),
+        CacheAppendPermit::Full
+    ));
+    assert!(cache.update_demux_high_water_prefetch_paused(10, 0, false, false));
+    assert!(matches!(
+        cache.shared.append_capacity_now(0),
+        CacheAppendPermit::Ready(_)
+    ));
+}
+
+#[test]
+fn http_cache_refills_as_soon_as_demux_has_room_after_a_forward_seek() {
+    let cache =
+        HttpRingCache::from_state_for_test(HttpRingCacheState::new_with_cache_capacity(0, 1024));
+    assert!(cache.update_demux_high_water_prefetch_paused(150, 150, true, false));
+    assert!(matches!(
+        cache.shared.append_capacity_now(0),
+        CacheAppendPermit::Full
+    ));
+
+    // Only 5 MiB was consumed by the seek. The old 75% watermark held the
+    // transport paused, requiring an AVIO demand read to fetch each chunk.
+    assert!(cache.update_demux_high_water_prefetch_paused(145, 150, false, false));
+    let CacheAppendPermit::Ready(capacity) = cache.shared.append_capacity_now(0) else {
+        panic!("forward seek should immediately resume HTTP prefetch");
+    };
+    cache.shared.append_or_restart(0, &vec![7; capacity]);
+    assert!(matches!(
+        cache.shared.append_capacity_now(capacity as u64),
+        CacheAppendPermit::Full
+    ));
+    assert_eq!(cache.shared.active_readers.load(Ordering::Acquire), 0);
+
+    let mut output = [0; 16];
+    assert!(matches!(
+        cache.read_at(0, &mut output),
+        CacheReadResult::Data(16)
+    ));
+    assert_eq!(output, [7; 16]);
+    assert!(matches!(
+        cache.shared.append_capacity_now(capacity as u64),
+        CacheAppendPermit::Ready(16)
+    ));
+    assert_eq!(cache.shared.active_readers.load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn http_cache_shared_uses_small_range_for_initial_empty_playback_request() {
     let (event_tx, _) = mpsc::channel();
     let config = HttpCacheConfig {
@@ -418,8 +596,9 @@ fn http_cache_shared_uses_small_range_for_initial_empty_playback_request() {
     let shared = HttpRingCacheShared {
         state: Mutex::new(HttpRingCacheState::new_with_config(0, config)),
         ready: Condvar::new(),
-        output_backpressure_paused: AtomicBool::new(false),
         demux_high_water_paused: AtomicBool::new(false),
+        recovery_input_required: AtomicBool::new(false),
+        active_readers: AtomicU64::new(0),
         cache_config_generation: AtomicU64::new(0),
         input_progress_generation: AtomicU64::new(0),
         control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
@@ -510,8 +689,9 @@ fn http_cache_shared_dispatches_multiple_side_downloads_to_active_set() {
                 .with_content_len_hint(Some(HTTP_CACHE_RANGE_REQUEST_BYTES * 4)),
         ),
         ready: Condvar::new(),
-        output_backpressure_paused: AtomicBool::new(false),
         demux_high_water_paused: AtomicBool::new(false),
+        recovery_input_required: AtomicBool::new(false),
+        active_readers: AtomicU64::new(0),
         cache_config_generation: AtomicU64::new(0),
         input_progress_generation: AtomicU64::new(0),
         control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),

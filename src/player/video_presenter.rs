@@ -107,7 +107,18 @@ impl VideoPresenter {
                 .take_ready_frame(self.latest_generation)?;
         }
         self.update_render_backpressure();
-        Ok(ready_frame)
+        Ok(ready_frame.map(|(frame, pts)| {
+            if let Some(pts) = pts {
+                self.vo_queue.record_presentation(
+                    (
+                        self.last_seen_session_id,
+                        self.last_seen_presentation_generation,
+                    ),
+                    pts.nsecs,
+                );
+            }
+            frame
+        }))
     }
 
     pub fn discard_pending_frames(&mut self) {
@@ -286,7 +297,10 @@ impl VideoRenderWorker {
         }
     }
 
-    fn take_ready_frame(&self, latest_generation: u64) -> Result<Option<Arc<RenderImage>>> {
+    fn take_ready_frame(
+        &self,
+        latest_generation: u64,
+    ) -> Result<Option<(Arc<RenderImage>, Option<FramePts>)>> {
         let mut ready_frame = None;
         while let Ok(result) = self.results.try_recv() {
             self.state.consume_ready_result();
@@ -300,7 +314,7 @@ impl VideoRenderWorker {
                 continue;
             }
             match result.frame {
-                Ok(frame) => ready_frame = Some(frame),
+                Ok(frame) => ready_frame = Some((frame, result.pts)),
                 Err(error) => return Err(anyhow!(error)),
             }
         }
@@ -815,6 +829,38 @@ mod tests {
     }
 
     #[test]
+    fn presentation_feedback_advances_only_when_a_rendered_frame_reaches_the_ui() {
+        let vo_queue = VideoOutputQueue::default();
+        let session = PlaybackSessionId(1);
+        vo_queue.begin_session(session);
+        let mut presenter = presenter_with_manual_render_worker(vo_queue.clone());
+        let (result_tx, result_rx) = mpsc::channel();
+        presenter.render_worker.results = result_rx;
+        let size = RenderSize {
+            width: 2,
+            height: 1,
+        };
+        assert!(vo_queue.push(session, test_render_request(1).frame));
+        assert!(presenter.render_if_needed(size).unwrap().is_none());
+        assert_eq!(vo_queue.snapshot().last_presentation, None);
+        presenter.render_worker.state.record_ready_result();
+        result_tx
+            .send(VideoRenderResult {
+                generation: presenter.latest_generation,
+                pts: Some(FramePts {
+                    nsecs: 1_000_000_000,
+                }),
+                frame: Ok(render_image_from_bgra(vec![0; 8], 2, 1).unwrap()),
+            })
+            .unwrap();
+        assert!(presenter.render_if_needed(size).unwrap().is_some());
+        let feedback = vo_queue.snapshot().last_presentation.unwrap();
+        assert_eq!(feedback.timeline_nsecs, 1_000_000_000);
+        assert!(presenter.render_if_needed(size).unwrap().is_none());
+        assert_eq!(vo_queue.snapshot().last_presentation, Some(feedback));
+    }
+
+    #[test]
     fn video_presenter_leaves_vo_queue_intact_while_render_worker_is_busy() {
         let vo_queue = VideoOutputQueue::default();
         let session_id = PlaybackSessionId(1);
@@ -942,6 +988,7 @@ mod tests {
         let snapshot = video_presenter_snapshot(
             VideoOutputQueueSnapshot {
                 active_session_id: PlaybackSessionId(1),
+                last_presentation: None,
                 queued_frames: 1,
                 queue_capacity: 3,
                 dropped_frames: 0,
@@ -973,6 +1020,7 @@ mod tests {
         let snapshot = video_presenter_snapshot(
             VideoOutputQueueSnapshot {
                 active_session_id: PlaybackSessionId(1),
+                last_presentation: None,
                 queued_frames: 3,
                 queue_capacity: 3,
                 dropped_frames: 2,

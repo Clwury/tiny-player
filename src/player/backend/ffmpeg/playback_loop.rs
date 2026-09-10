@@ -61,6 +61,8 @@ mod audio_output_gate;
 mod decoded_audio_frame;
 #[path = "playback_loop/audio/pending_audio_queue.rs"]
 mod pending_audio_queue;
+#[path = "playback_loop/video/video_decode_framedrop.rs"]
+mod video_decode_framedrop;
 
 #[path = "playback_loop/coordinator/commands.rs"]
 mod commands;

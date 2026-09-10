@@ -18,8 +18,9 @@ use super::decoder_packet_queue::DecoderPacketQueues;
 use super::output_gate::{DECODE_RECOVERY_HOLD_GAP_MAX_NSECS, decode_recovery_gap_within_limit};
 use super::scheduled_video_queue::{
     VIDEO_TIMESTAMP_ROUNDING_TOLERANCE_NSECS, queued_video_continuity_gap_threshold_nsecs,
-    video_timestamp_gap_within_threshold,
+    should_drop_late_video_frame, video_timestamp_gap_within_threshold,
 };
+use super::video_decode_framedrop::{VideoDecodeDropPolicy, VideoDecodeFrameDrop};
 use super::video_decode_worker::{
     VideoDecodeDrainResult, VideoDecodeEnqueueResult, VideoDecodePacketStatus, VideoDecodeWorker,
     VideoDecodeWorkerInfo, VideoDecodeWorkerSnapshot, VideoDecodeWorkerState, VideoDecodedFrame,
@@ -110,6 +111,7 @@ const EXACT_SEEK_FRAME_DROP_TOLERANCE_NSECS: u64 = 5_000_000;
 pub(super) struct PendingVideoDecodePacket {
     pub(super) generation: u64,
     pub(super) packet: AvPacket,
+    drop_policy: VideoDecodeDropPolicy,
     pub(super) realign_after_decode_recovery: bool,
     hevc_startup_in_flight_watchdog: bool,
     from_hevc_hw_replay: bool,
@@ -1521,7 +1523,7 @@ pub(super) struct HevcStartupStallObservation {
     pub(super) fallback_target_nsecs: u64,
 }
 
-pub(super) struct VideoPacketAdmissionContext {
+pub(super) struct VideoPacketAdmissionContext<'a> {
     pub(super) session_id: PlaybackSessionId,
     pub(super) video_stream: StreamInfo,
     pub(super) output_snapshot: PlaybackOutputSnapshot,
@@ -1529,6 +1531,8 @@ pub(super) struct VideoPacketAdmissionContext {
     pub(super) has_audio_output: bool,
     pub(super) skip_nonref_for_pressure: bool,
     pub(super) played_until_nsecs: Option<u64>,
+    pub(super) video_clock: &'a super::TimestampMapper,
+    pub(super) presentation: Option<crate::player::render_host::VideoPresentation>,
 }
 
 #[derive(Clone, Copy)]
@@ -1537,6 +1541,7 @@ pub(super) struct VideoPacketAdmissionPressure {
     pub(super) skip_nonref_for_pressure: bool,
     pub(super) played_until_nsecs: Option<u64>,
     pub(super) output_resource_pressure: bool,
+    pub(super) presentation: Option<crate::player::render_host::VideoPresentation>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2336,6 +2341,7 @@ fn hevc_hw_replay_packets(
         .map(|packet| PendingVideoDecodePacket {
             generation: playback_generation.advance(),
             packet,
+            drop_policy: VideoDecodeDropPolicy::None,
             realign_after_decode_recovery: true,
             hevc_startup_in_flight_watchdog: false,
             from_hevc_hw_replay: true,
@@ -4383,6 +4389,7 @@ fn hevc_startup_in_flight_stall_context(input: HevcStartupStallObservation) -> b
 
 pub(super) struct VideoDecodePipeline {
     worker: VideoDecodeWorker,
+    frame_drop: VideoDecodeFrameDrop,
     requested_hardware_mode: HardwareDecodeMode,
     decoder_epoch: u64,
     admitted_video_sequence: u64,

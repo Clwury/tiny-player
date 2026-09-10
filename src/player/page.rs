@@ -105,6 +105,16 @@ pub struct PlaybackPage {
 impl EventEmitter<PlaybackEvent> for PlaybackPage {}
 
 impl PlaybackPage {
+    pub(crate) fn apply_playback_config(
+        &mut self,
+        config: super::backend::PlaybackCacheConfig,
+    ) -> super::backend::Result<()> {
+        if let Some(backend) = self.video.owner_mut() {
+            backend.command(BackendCommand::SetCacheConfig(config))?;
+        }
+        Ok(())
+    }
+
     pub fn new(request: PlaybackRequest, cx: &mut Context<Self>) -> Self {
         Self::new_with_cache_config(request, Default::default(), cx)
     }

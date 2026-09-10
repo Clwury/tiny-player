@@ -3,10 +3,33 @@ use crate::player::backend::CacheUnlinkPolicy;
 use super::super::HttpDiskCache;
 
 #[test]
-fn http_disk_cache_uses_the_application_temp_directory_by_default() {
+fn large_media_offsets_and_repeated_eviction_never_grow_the_disk_file_past_its_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache =
+        HttpDiskCache::new(16, Some(dir.path().into()), CacheUnlinkPolicy::WhenDone).unwrap();
+    for index in 0..100 {
+        let offset = 10_000_000_000 + index * 4;
+        cache.write_at(offset, &[index as u8; 4]).unwrap();
+        let mut restored = [0; 4];
+        assert_eq!(cache.read_at(offset, &mut restored), Some(4));
+        assert_eq!(restored, [index as u8; 4]);
+        assert!(std::fs::metadata(&cache.path).unwrap().len() <= 16);
+        assert!(cache.cached_bytes() <= 16);
+    }
+    cache.set_limit(4);
+    cache.storage.maintain_file_size();
+    assert!(std::fs::metadata(&cache.path).unwrap().len() <= 4);
+    cache.write_at(100, b"last").unwrap();
+    let mut restored = [0; 4];
+    assert_eq!(cache.read_at(100, &mut restored), Some(4));
+    assert_eq!(&restored, b"last");
+}
+
+#[test]
+fn http_disk_cache_uses_the_user_cache_directory_by_default() {
     let expected = std::env::var("TINY_HTTP_CACHE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join(crate::app_metadata::APP_ID));
+        .unwrap_or_else(|_| crate::app_metadata::default_playback_cache_dir());
     let mut disk_cache = HttpDiskCache::new(1024, None, CacheUnlinkPolicy::WhenDone)
         .expect("default disk cache directory creates");
     let path = disk_cache.path.clone();
@@ -97,4 +120,30 @@ fn http_disk_cache_can_leave_file_for_inspection() {
 
     assert!(path.exists());
     std::fs::remove_file(path).expect("leftover cache file removes");
+}
+
+#[test]
+fn quota_change_before_http_write_publication_reclaims_the_rejected_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache =
+        HttpDiskCache::new(16, Some(dir.path().into()), CacheUnlinkPolicy::WhenDone).unwrap();
+    cache.write_at(0, b"retained").unwrap();
+    let block = cache.reserve_write(100, 8).unwrap();
+    let result = block.write(b"rejected");
+    let write = super::super::PendingHttpDiskCacheWrite {
+        block,
+        result,
+        storage: cache.storage.clone(),
+    };
+    cache.set_limit(8);
+    cache.storage.maintain_file_size();
+    assert_eq!(std::fs::metadata(&cache.path).unwrap().len(), 16);
+    super::super::shared::finish_http_disk_write(Some(write), |write| {
+        // A config/restart may reject publication after the writer finished.
+        drop(write);
+    });
+    assert_eq!(std::fs::metadata(&cache.path).unwrap().len(), 8);
+    let mut output = [0; 8];
+    assert_eq!(cache.read_at(0, &mut output), Some(8));
+    assert_eq!(&output, b"retained");
 }

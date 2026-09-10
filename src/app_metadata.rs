@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 
 pub(crate) const APP_ID: &str = "tiny-player";
 pub(crate) const APP_NAME: &str = "Tiny Player";
@@ -19,7 +19,10 @@ pub(crate) fn cache_dir() -> Result<PathBuf> {
 }
 
 pub(crate) fn default_playback_cache_dir() -> PathBuf {
-    std::env::temp_dir().join(APP_ID)
+    BaseDirs::new()
+        .map(|dirs| dirs.home_dir().join(".cache"))
+        .unwrap_or_else(|| PathBuf::from(".cache"))
+        .join(APP_ID)
 }
 
 fn project_dirs() -> Result<ProjectDirs> {
@@ -33,6 +36,15 @@ mod tests {
 
     const APP_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/tiny-player.png");
     const DESKTOP_ENTRY: &str = include_str!("../tiny-player.desktop");
+
+    #[test]
+    fn playback_cache_defaults_to_dot_cache_under_the_user_home() {
+        let home = BaseDirs::new().expect("user home exists");
+        assert_eq!(
+            default_playback_cache_dir(),
+            home.home_dir().join(".cache/tiny-player")
+        );
+    }
 
     #[test]
     fn desktop_entry_matches_application_metadata() {

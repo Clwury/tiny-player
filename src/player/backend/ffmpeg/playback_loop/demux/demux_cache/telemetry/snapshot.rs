@@ -33,6 +33,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop) struct DemuxPacketQueueSna
     pub(in crate::player::backend::ffmpeg::playback_loop) total_packets: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) total_bytes: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) memory_limit_bytes: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop) prefetch_limit_bytes: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) read_index: usize,
     pub(in crate::player::backend::ffmpeg::playback_loop) exact_seek_target_nsecs: u64,
     pub(in crate::player::backend::ffmpeg::playback_loop) streams:

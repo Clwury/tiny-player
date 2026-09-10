@@ -58,8 +58,9 @@ impl DemuxPacketCache {
             consumer_lock_pressure_until_nanos: AtomicU64::new(0),
             playback_recovery_critical: AtomicBool::new(false),
             playback_recovery_demand: AtomicU8::new(0),
-            output_backpressure_prefetch_paused: AtomicBool::new(false),
+            disk_worker_started: AtomicBool::new(false),
         });
+        shared.start_storage_worker()?;
         shared.enter_initial_cache_pause_if_needed();
         let thread_shared = Arc::clone(&shared);
         let thread_input = DemuxPacketCacheThreadInput {

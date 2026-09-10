@@ -370,6 +370,7 @@ pub(super) fn service_playback_tick(
         output_gate_status.played_until_nsecs,
         output_gate_status.has_audio_output,
         context.vo_queue.snapshot(),
+        !context.control.is_paused(),
     );
     log_cached_seek_watchdog_tick_stage(
         context.session_id,
@@ -1115,6 +1116,7 @@ fn service_startup_first_frame_decoder_warmup(
             output_gate_status.played_until_nsecs,
             output_gate_status.has_audio_output,
             context.vo_queue.snapshot(),
+            !context.control.is_paused(),
         );
         let decoder_input_outcome =
             context

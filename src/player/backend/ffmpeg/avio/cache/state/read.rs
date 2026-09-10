@@ -1,4 +1,7 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const HTTP_SHORT_SEEK_MAX_BYTES: usize = 128 * 1024;
+const HTTP_SHORT_SEEK_WAIT: Duration = Duration::from_millis(500);
 
 use super::{
     ByteRingBuffer, HTTP_CACHE_STALL_LOG_INTERVAL, HttpCacheRangeKind, HttpCacheReadError,
@@ -10,7 +13,7 @@ impl HttpRingCacheState {
     pub(in crate::player::backend::ffmpeg::avio::cache) fn read_wait_observation(
         &self,
         current_offset: u64,
-        output_backpressure_paused: bool,
+        demux_prefetch_paused: bool,
     ) -> HttpReadWaitObservation {
         let position = if current_offset < self.base_offset {
             HttpReadWaitPosition::BeforeActiveRange
@@ -25,7 +28,7 @@ impl HttpRingCacheState {
             position,
             active_range_kind: self.active_range_kind,
             prefetch_paused: self.prefetch_paused,
-            output_backpressure_paused,
+            demux_prefetch_paused,
             restart_pending: self.restart_request.is_some(),
             side_download_pending: self.side_download_may_produce(current_offset),
             eof: self.eof,
@@ -141,6 +144,12 @@ impl HttpRingCacheState {
 
     pub(in crate::player::backend::ffmpeg) fn set_reader_offset(&mut self, offset: u64) {
         self.reader_offset = offset;
+        if self
+            .short_seek_target
+            .is_some_and(|(target, _)| offset >= target && self.next_offset > target)
+        {
+            self.short_seek_target = None;
+        }
         if self.offset_in_active_range(offset) {
             self.trim_to_capacity(self.active_memory_capacity());
         }
@@ -159,12 +168,57 @@ impl HttpRingCacheState {
         self.pending_seek_range_kind = Some((offset, range_kind));
         if range_kind == HttpCacheRangeKind::Playback {
             self.restart_request = None;
+            self.short_seek_target = None;
+            let short_seek_limit =
+                HTTP_SHORT_SEEK_MAX_BYTES.min(self.active_memory_capacity() / 4) as u64;
+            let healthy_response = self.config.continuous_playback_requests
+                && self.continuous_request_active
+                && !self.eof
+                && self.error.is_none()
+                && self.buffer.len() > 0
+                && self
+                    .input_rate_samples
+                    .back()
+                    .is_some_and(|sample| sample.at.elapsed() < HTTP_SHORT_SEEK_WAIT);
+            if !offset_cached
+                && offset > self.next_offset
+                && offset - self.next_offset <= short_seek_limit
+                && healthy_response
+            {
+                self.short_seek_target = Some((offset, Instant::now()));
+                self.reader_offset = offset;
+                self.prefetch_paused = false;
+                return;
+            }
             if !offset_in_active_range {
+                self.request_generation = self.request_generation.wrapping_add(1);
+                self.continuous_request_active = false;
+                self.side_download_requests.clear();
+                self.side_download_active.clear();
                 self.demote_active_range_to_retained();
             }
             self.set_reader_offset(offset);
             if !offset_cached {
                 self.request_active_playback_restart_at(offset);
+            }
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn short_seek_may_produce(
+        &self,
+        offset: u64,
+    ) -> bool {
+        self.short_seek_target
+            .is_some_and(|(target, _)| target == offset)
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn expire_short_seek(&mut self) {
+        if let Some((target, started)) = self.short_seek_target {
+            if self.next_offset > target {
+                self.short_seek_target = None;
+            } else if started.elapsed() >= HTTP_SHORT_SEEK_WAIT {
+                self.short_seek_target = None;
+                self.request_active_playback_restart_at(target);
             }
         }
     }

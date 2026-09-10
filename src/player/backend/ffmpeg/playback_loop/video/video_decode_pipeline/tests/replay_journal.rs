@@ -542,6 +542,7 @@ fn hevc_hw_replay_stays_ahead_of_live_packets_after_backpressure() {
             .push_pending_input(PendingVideoDecodePacket {
                 generation: generation.advance(),
                 packet: hevc_packet(0x02, 9, 120, false),
+                drop_policy: VideoDecodeDropPolicy::None,
                 realign_after_decode_recovery: true,
                 hevc_startup_in_flight_watchdog: false,
                 from_hevc_hw_replay: false,

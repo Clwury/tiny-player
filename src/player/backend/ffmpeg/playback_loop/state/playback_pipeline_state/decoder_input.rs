@@ -128,6 +128,7 @@ impl PlaybackPipelineState {
         played_until_nsecs: Option<u64>,
         has_audio_output: bool,
         vo_snapshot: VideoOutputQueueSnapshot,
+        playback_running: bool,
     ) -> VideoPacketAdmissionPressure {
         let output_snapshot = self
             .output_scheduler
@@ -144,15 +145,18 @@ impl PlaybackPipelineState {
         );
         VideoPacketAdmissionPressure {
             output_snapshot,
-            skip_nonref_for_pressure: self.output_scheduler.video_decode_skip_nonref_for_pressure(
-                self.video_stream.codec_id,
-                played_until_nsecs,
-                has_audio_output,
-                audio_output_pending_nsecs,
-                self.video_decode_skip_nonref_active,
-            ),
+            skip_nonref_for_pressure: self.video_decode_pipeline.decoder_framedrop_enabled()
+                && playback_running
+                && self.output_scheduler.video_decode_skip_nonref_for_pressure(
+                    self.video_stream.codec_id,
+                    played_until_nsecs,
+                    has_audio_output,
+                    audio_output_pending_nsecs,
+                    self.video_decode_skip_nonref_active,
+                ),
             played_until_nsecs,
             output_resource_pressure,
+            presentation: vo_snapshot.last_presentation,
         }
     }
 
@@ -218,6 +222,8 @@ impl PlaybackPipelineState {
                 has_audio_output: self.audio_output.is_some(),
                 skip_nonref_for_pressure: pressure.skip_nonref_for_pressure,
                 played_until_nsecs: pressure.played_until_nsecs,
+                video_clock: &self.video_clock,
+                presentation: pressure.presentation,
             },
         )
     }

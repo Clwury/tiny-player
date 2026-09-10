@@ -6028,6 +6028,7 @@ dependencies = [
  "serde_json",
  "strsim",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",

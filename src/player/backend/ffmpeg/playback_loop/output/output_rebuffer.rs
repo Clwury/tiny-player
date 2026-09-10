@@ -459,6 +459,8 @@ pub(in crate::player::backend::ffmpeg) fn should_block_for_demux_read(
     output_state.restart_pending() || output_state.rebuffering()
 }
 
+// This queue-pressure signal only enables catch-up consideration. Packet
+// admission must also prove that the packet's PTS is too late to present.
 pub(in crate::player::backend::ffmpeg) fn video_decode_should_skip_nonref_for_pressure(
     codec_id: ffi::AVCodecID,
     output_state: PlaybackOutputState,

@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     os::raw::c_int,
     sync::{
         Arc, Condvar, Mutex,
@@ -52,7 +52,6 @@ mod storage;
 #[path = "demux_cache/telemetry.rs"]
 mod telemetry;
 
-#[cfg(test)]
 use model::CachedDemuxPacketPayload;
 #[cfg(test)]
 use model::CachedDemuxPacketRecovery;
@@ -102,14 +101,26 @@ struct DemuxPacketCacheShared {
     consumer_lock_pressure_until_nanos: AtomicU64,
     playback_recovery_critical: AtomicBool,
     playback_recovery_demand: AtomicU8,
-    output_backpressure_prefetch_paused: AtomicBool,
+    disk_worker_started: AtomicBool,
 }
 
 struct DemuxPacketCacheState {
     packets: HashMap<PacketId, CachedDemuxPacket>,
     ranges: BTreeMap<RangeId, DemuxCachedRange>,
-    disk_cache: Option<DemuxPacketDiskCache>,
+    disk_cache: Option<Arc<DemuxPacketDiskCache>>,
     disk_cache_writable: bool,
+    disk_write_blocked: bool,
+    disk_config_generation: u64,
+    pending_disk_config: Option<PlaybackCacheConfig>,
+    disk_budget_bytes: usize,
+    resident_bytes: usize,
+    disk_read_requests: BTreeSet<PacketId>,
+    disk_write_requests: BTreeSet<PacketId>,
+    disk_hot_packets: BTreeSet<PacketId>,
+    disk_packets: BTreeSet<PacketId>,
+    disk_restore_requests: BTreeSet<PacketId>,
+    disk_worker_active: bool,
+    disk_cached_bytes: usize,
     read_index: usize,
     consumed_packet_ids: HashSet<PacketId>,
     reader_heads: BTreeMap<c_int, PacketId>,
@@ -135,12 +146,10 @@ struct DemuxPacketCacheState {
     memory_limit_bytes: usize,
     backbuffer_limit_bytes: usize,
     donate_backbuffer: bool,
-    configured_readahead_nsecs: u64,
     readahead_nsecs: u64,
     configured_hysteresis_nsecs: u64,
     automatic_hysteresis: bool,
     hysteresis_nsecs: u64,
-    adaptive_readahead: bool,
     max_cached_ranges: usize,
     hysteresis_active: bool,
     cache_pause_enabled: bool,

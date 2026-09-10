@@ -14,6 +14,7 @@ use ffmpeg_sys_next as ffi;
 
 use crate::player::render_host::{FfmpegFrameRef, RenderSize, VulkanDecodeDevice};
 
+use super::video_decode_framedrop::{VideoDecodeDropPolicy, VideoDecodeDropStats};
 use super::{
     AvFrame, AvPacket, DECODE_PACKET_SLOW_LOG_AFTER, Decoder,
     VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VideoFrameConvertContext,
@@ -135,6 +136,9 @@ pub(super) struct VideoDecodeWorkerSnapshot {
     pub(super) result_consumed_sequence: u64,
     pub(super) last_result_produced_at: Option<Instant>,
     pub(super) oldest_submitted_packet_nsecs: Option<u64>,
+    pub(super) decoder_framedrop_enabled: bool,
+    pub(super) decoder_drop_budget: u64,
+    pub(super) decoder_drop_stats: VideoDecodeDropStats,
 }
 
 impl Default for VideoDecodeWorkerSnapshot {
@@ -153,6 +157,9 @@ impl Default for VideoDecodeWorkerSnapshot {
             result_consumed_sequence: 0,
             last_result_produced_at: None,
             oldest_submitted_packet_nsecs: None,
+            decoder_framedrop_enabled: false,
+            decoder_drop_budget: 0,
+            decoder_drop_stats: VideoDecodeDropStats::default(),
         }
     }
 }
@@ -179,6 +186,7 @@ pub(super) struct VideoDecodePacketStatus {
     pub(super) decoded_frames: u64,
     pub(super) elapsed: Duration,
     pub(super) drained: bool,
+    pub(super) drop_policy: VideoDecodeDropPolicy,
 }
 
 pub(super) struct VideoDecodedFrame {
@@ -207,9 +215,17 @@ struct QueuedVideoDecodeDrainResult {
 }
 
 enum VideoDecodeCommand {
-    Decode { generation: u64, packet: AvPacket },
-    FlushBuffers { generation: u64 },
-    Drain { generation: u64 },
+    Decode {
+        generation: u64,
+        packet: AvPacket,
+        drop_policy: VideoDecodeDropPolicy,
+    },
+    FlushBuffers {
+        generation: u64,
+    },
+    Drain {
+        generation: u64,
+    },
     SetSkipNonref(bool),
     Shutdown,
 }
@@ -224,6 +240,7 @@ enum VideoDecodeResult {
         result: std::result::Result<(), String>,
         decoded_frames: u64,
         elapsed: Duration,
+        drop_policy: VideoDecodeDropPolicy,
     },
     Flushed {
         generation: u64,
@@ -235,7 +252,10 @@ enum VideoDecodeResult {
 }
 
 impl VideoDecodeWorker {
-    pub(super) fn spawn(decoder: Decoder) -> std::result::Result<Self, String> {
+    pub(super) fn spawn(
+        decoder: Decoder,
+        framedrop_epoch: Arc<AtomicU64>,
+    ) -> std::result::Result<Self, String> {
         let info = VideoDecodeWorkerInfo {
             stream_index: decoder.stream_index,
             time_base: decoder.time_base,
@@ -258,7 +278,15 @@ impl VideoDecodeWorker {
         let worker_progress = Arc::clone(&progress);
         let handle = thread::Builder::new()
             .name("tiny-ffmpeg-video-decode".to_string())
-            .spawn(move || run_video_decode_worker(decoder, command_rx, result_tx, worker_progress))
+            .spawn(move || {
+                run_video_decode_worker(
+                    decoder,
+                    command_rx,
+                    result_tx,
+                    worker_progress,
+                    framedrop_epoch,
+                )
+            })
             .map_err(|error| format!("创建 FFmpeg video decode worker 失败：{error}"))?;
 
         Ok(Self {
@@ -382,6 +410,9 @@ impl VideoDecodeWorker {
             result_consumed_sequence: progress.result_consumed_sequence,
             last_result_produced_at: progress.last_result_produced_at,
             oldest_submitted_packet_nsecs: None,
+            decoder_framedrop_enabled: false,
+            decoder_drop_budget: 0,
+            decoder_drop_stats: VideoDecodeDropStats::default(),
         }
     }
 
@@ -394,6 +425,7 @@ impl VideoDecodeWorker {
         &mut self,
         packet: &AvPacket,
         generation: u64,
+        drop_policy: VideoDecodeDropPolicy,
     ) -> std::result::Result<VideoDecodeEnqueueResult, String> {
         self.pump_available_results()?;
         if self.recovering {
@@ -404,10 +436,11 @@ impl VideoDecodeWorker {
         }
 
         let packet = AvPacket::ref_from(packet)?;
-        match self
-            .command_tx
-            .try_send(VideoDecodeCommand::Decode { generation, packet })
-        {
+        match self.command_tx.try_send(VideoDecodeCommand::Decode {
+            generation,
+            packet,
+            drop_policy,
+        }) {
             Ok(()) => {
                 self.submitted_not_consumed_packets =
                     self.submitted_not_consumed_packets.saturating_add(1);
@@ -622,6 +655,7 @@ impl VideoDecodeWorker {
                 result,
                 decoded_frames,
                 elapsed,
+                drop_policy,
             } => {
                 self.submitted_not_consumed_packets =
                     self.submitted_not_consumed_packets.saturating_sub(1);
@@ -631,6 +665,7 @@ impl VideoDecodeWorker {
                     decoded_frames,
                     elapsed,
                     drained: false,
+                    drop_policy,
                 });
             }
             VideoDecodeResult::Drained { generation, result } => {
@@ -720,6 +755,7 @@ fn run_video_decode_worker(
     command_rx: mpsc::Receiver<VideoDecodeCommand>,
     result_tx: mpsc::SyncSender<VideoDecodeResult>,
     progress: Arc<VideoDecodeWorkerProgress>,
+    framedrop_epoch: Arc<AtomicU64>,
 ) {
     let mut frame = match AvFrame::new() {
         Ok(frame) => frame,
@@ -728,6 +764,7 @@ fn run_video_decode_worker(
             return;
         }
     };
+    let mut last_drop_policy = VideoDecodeDropPolicy::None;
     loop {
         let recv_started_at = Instant::now();
         let command = match command_rx.recv() {
@@ -739,12 +776,25 @@ fn run_video_decode_worker(
         let command_generation = video_decode_command_generation(&command);
         log_video_decode_worker_recv_wait(command_kind, command_generation, recv_wait);
         match command {
-            VideoDecodeCommand::Decode { generation, packet } => {
+            VideoDecodeCommand::Decode {
+                generation,
+                packet,
+                drop_policy,
+            } => {
                 let started = Instant::now();
                 let mut decoded_frames = 0u64;
                 let mut frame_send_elapsed = Duration::ZERO;
                 let packet_pts = packet.best_timestamp();
                 let packet_bytes = packet.byte_len();
+                // Apply the policy with its packet. An independent control
+                // command can overtake pending input under backpressure and
+                // leave NONREF enabled for frames that must be presented.
+                let drop_policy = drop_policy.effective(framedrop_epoch.load(Ordering::Acquire));
+                if drop_policy != last_drop_policy {
+                    tracing::debug!(generation, ?drop_policy, packet_pts = ?packet.pts(), "applying packet-scoped decoder frame-drop policy");
+                    last_drop_policy = drop_policy;
+                }
+                decoder.set_skip_nonref_frames(drop_policy.skip_nonref());
                 let result = decoder.decode_packet(packet.as_ptr(), &mut frame, |frame| {
                     decoded_frames = decoded_frames.saturating_add(1);
                     let frame =
@@ -769,6 +819,7 @@ fn run_video_decode_worker(
                     result,
                     decoded_frames,
                     elapsed: total_elapsed,
+                    drop_policy,
                 });
                 let packet_done_send_elapsed = packet_done_send_started_at.elapsed();
                 log_video_decode_worker_decode_timing(VideoDecodeWorkerDecodeTiming {
@@ -1019,9 +1070,9 @@ mod tests {
     use crate::player::render_host::{FfmpegFrameRef, RenderSize};
 
     use super::{
-        AvFrame, SOFTWARE_DECODED_VIDEO_QUEUE_CAPACITY, VideoDecodeCommand, VideoDecodeResult,
-        VideoDecodeWorker, VideoDecodeWorkerInfo, VideoDecodeWorkerState, VideoDecodedFrame,
-        VideoFrameConvertContext,
+        AvFrame, AvPacket, SOFTWARE_DECODED_VIDEO_QUEUE_CAPACITY, VideoDecodeCommand,
+        VideoDecodeDropPolicy, VideoDecodeEnqueueResult, VideoDecodeResult, VideoDecodeWorker,
+        VideoDecodeWorkerInfo, VideoDecodeWorkerState, VideoDecodedFrame, VideoFrameConvertContext,
     };
 
     fn test_worker() -> (VideoDecodeWorker, mpsc::SyncSender<VideoDecodeResult>) {
@@ -1105,6 +1156,7 @@ mod tests {
             result: Ok(()),
             decoded_frames: 1,
             elapsed: Duration::from_millis(1),
+            drop_policy: VideoDecodeDropPolicy::None,
         });
 
         assert!(worker.poll_packet_status(generation).unwrap().is_none());
@@ -1132,6 +1184,7 @@ mod tests {
                 result: Ok(()),
                 decoded_frames: 0,
                 elapsed: Duration::from_millis(1),
+                drop_policy: VideoDecodeDropPolicy::None,
             })
             .unwrap();
         worker.service().unwrap();
@@ -1161,6 +1214,48 @@ mod tests {
             VideoDecodeCommand::SetSkipNonref(false)
         ));
         assert_eq!(worker.pending_skip_nonref, None);
+    }
+
+    #[test]
+    fn packet_skip_policy_travels_with_decode_command_after_backpressure() {
+        let (mut worker, _result_tx, command_rx) = test_worker_with_command_rx();
+        let packet = AvPacket::new().expect("packet allocates");
+        assert_eq!(
+            worker
+                .try_enqueue_packet(&packet, 1, VideoDecodeDropPolicy::SeekPreroll)
+                .unwrap(),
+            VideoDecodeEnqueueResult::Queued
+        );
+        assert_eq!(
+            worker
+                .try_enqueue_packet(&packet, 2, VideoDecodeDropPolicy::None)
+                .unwrap(),
+            VideoDecodeEnqueueResult::InputFull
+        );
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            VideoDecodeCommand::Decode {
+                generation: 1,
+                drop_policy: VideoDecodeDropPolicy::SeekPreroll,
+                ..
+            }
+        ));
+        assert_eq!(
+            worker
+                .try_enqueue_packet(&packet, 2, VideoDecodeDropPolicy::None)
+                .unwrap(),
+            VideoDecodeEnqueueResult::Queued
+        );
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            VideoDecodeCommand::Decode {
+                generation: 2,
+                drop_policy: VideoDecodeDropPolicy::None,
+                ..
+            }
+        ));
+        assert!(command_rx.try_recv().is_err());
+        assert_eq!(worker.submitted_not_consumed_packets, 2);
     }
 
     #[test]

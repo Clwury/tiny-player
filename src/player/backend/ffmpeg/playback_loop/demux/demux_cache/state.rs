@@ -45,5 +45,7 @@ mod report;
 mod seek;
 #[path = "state/seek_algorithm.rs"]
 mod seek_algorithm;
+#[path = "state/storage_policy.rs"]
+mod storage_policy;
 #[path = "state/trim.rs"]
 mod trim;

@@ -180,16 +180,6 @@ impl PlaybackPipelineState {
         }
     }
 
-    pub(in super::super::super) fn output_backpressure_prefetch_should_pause(&self) -> bool {
-        output_backpressure_prefetch_should_pause_for(
-            self.output_scheduler.playback_output_state,
-            self.video_decode_pipeline.snapshot().state,
-            self.audio_decode_pipeline
-                .as_ref()
-                .map(|pipeline| pipeline.snapshot().state),
-        )
-    }
-
     pub(in super::super::super) fn exact_seek_actual_anchor_nsecs(&self) -> Option<u64> {
         match self.video_decode_recovery.recovery_scope() {
             VideoDecodeRecoveryScope::ExactLowLevelSeek {

@@ -20,7 +20,6 @@ mod timeline;
 #[path = "model/types.rs"]
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) mod types;
 
-#[cfg(test)]
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use packet::CachedDemuxPacketPayload;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use packet::{
     CachedDemuxPacket, CachedDemuxPacketRecovery, DemuxPacketReadSource,

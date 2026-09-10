@@ -48,6 +48,30 @@ impl HttpRingCacheState {
             retained_bytes: self.retained_memory_bytes() as u64,
             prefetch_paused: self.prefetch_paused,
             retained_range_count: self.retained_ranges.len(),
+            storage: crate::player::backend::CacheStorageState {
+                memory_bytes: (self.buffer.len() + self.retained_memory_bytes()) as u64,
+                memory_limit_bytes: self.config.memory_capacity as u64,
+                disk_bytes: self
+                    .disk_cache
+                    .as_ref()
+                    .map(|cache| cache.cached_bytes())
+                    .unwrap_or(0),
+                disk_file_bytes: self
+                    .disk_cache
+                    .as_ref()
+                    .map(|cache| cache.file_bytes())
+                    .unwrap_or(0),
+                disk_limit_bytes: self
+                    .disk_cache
+                    .as_ref()
+                    .map(|cache| cache.max_bytes)
+                    .unwrap_or(0),
+                disk_pending_bytes: self
+                    .disk_cache
+                    .as_ref()
+                    .map(|cache| cache.file_bytes().saturating_sub(cache.max_bytes))
+                    .unwrap_or(0),
+            },
         }
     }
 

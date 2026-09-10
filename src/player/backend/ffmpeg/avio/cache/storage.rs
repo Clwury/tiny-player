@@ -1,14 +1,15 @@
 use std::{
     env,
-    fs::{File, OpenOptions},
-    os::unix::fs::FileExt,
+    fs::OpenOptions,
     path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{app_metadata::default_playback_cache_dir, player::backend::CacheUnlinkPolicy};
 
 use super::{HttpCachedByteRange, HttpDiskCache};
+use crate::player::backend::ffmpeg::disk_cache::{BoundedDiskFile, DiskBlock};
 
 impl HttpDiskCache {
     pub(in crate::player::backend::ffmpeg::avio::cache) fn new(
@@ -54,8 +55,9 @@ impl HttpDiskCache {
             }
         }
 
+        let file = Arc::new(file);
         Some(Self {
-            file: std::sync::Arc::new(file),
+            storage: BoundedDiskFile::new(Arc::clone(&file), max_bytes),
             path,
             ranges: Vec::new(),
             max_bytes,
@@ -70,30 +72,38 @@ impl HttpDiskCache {
         offset: u64,
         data: &[u8],
     ) -> std::io::Result<()> {
-        Self::write_file_at(&self.file, offset, data)?;
-        self.add_range(offset, offset.saturating_add(data.len() as u64));
-        self.trim_to_limit();
+        if let Some(block) = self.reserve_write(offset, data.len()) {
+            block.write(data)?;
+            self.add_range(offset, block);
+        }
         Ok(())
     }
 
-    pub(in crate::player::backend::ffmpeg::avio::cache) fn write_file_at(
-        file: &File,
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn reserve_write(
+        &mut self,
         offset: u64,
-        data: &[u8],
-    ) -> std::io::Result<()> {
-        let mut written = 0;
-        while written < data.len() {
-            let written_now =
-                file.write_at(&data[written..], offset.saturating_add(written as u64))?;
-            if written_now == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "disk cache write returned zero bytes",
-                ));
-            }
-            written += written_now;
+        len: usize,
+    ) -> Option<Arc<DiskBlock>> {
+        if len == 0 || len as u64 > self.max_bytes {
+            return None;
         }
-        Ok(())
+        let end = offset.checked_add(len as u64)?;
+        // Drop overlapping old entries before reserving space. An in-flight
+        // write retains its lease and cannot be reused by another worker.
+        self.ranges
+            .retain(|range| range.end <= offset || range.start >= end);
+        loop {
+            if let Some(block) = self.storage.reserve(len) {
+                return Some(block);
+            }
+            let victim = self
+                .ranges
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, range)| range.last_used_generation)
+                .map(|(index, _)| index)?;
+            self.ranges.remove(victim);
+        }
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn read_at(
@@ -101,80 +111,50 @@ impl HttpDiskCache {
         offset: u64,
         output: &mut [u8],
     ) -> Option<usize> {
-        let range_index = self.range_index_containing(offset)?;
-        let range = self.ranges[range_index];
-        let len = output.len().min(usize::try_from(range.end - offset).ok()?);
-        if len == 0 {
-            return None;
-        }
-        let read = self
-            .file
-            .read_at(&mut output[..len], offset)
+        let index = self.range_index_containing(offset)?;
+        let range = &self.ranges[index];
+        let read = range
+            .block
+            .read_at(offset - range.start, output)
             .ok()
             .filter(|read| *read > 0)?;
         let generation = self.next_access_generation();
-        if let Some(range) = self.ranges.get_mut(range_index) {
-            range.last_used_generation = generation;
-        }
+        self.ranges[index].last_used_generation = generation;
         Some(read)
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn add_range(
         &mut self,
         start: u64,
-        end: u64,
+        block: Arc<DiskBlock>,
     ) {
-        if end <= start {
+        if !self.storage.accepts(&block) {
             return;
         }
-        let generation = self.next_access_generation();
+        let Some(end) = start.checked_add(block.len as u64) else {
+            return;
+        };
+        self.ranges
+            .retain(|range| range.end <= start || range.start >= end);
+        let last_used_generation = self.next_access_generation();
         self.ranges.push(HttpCachedByteRange {
             start,
             end,
-            last_used_generation: generation,
+            block,
+            last_used_generation,
         });
         self.ranges.sort_by_key(|range| range.start);
-
-        let mut merged: Vec<HttpCachedByteRange> = Vec::with_capacity(self.ranges.len());
-        for range in self.ranges.drain(..) {
-            if let Some(last) = merged.last_mut()
-                && range.start <= last.end
-            {
-                last.end = last.end.max(range.end);
-                last.last_used_generation =
-                    last.last_used_generation.max(range.last_used_generation);
-                continue;
-            }
-            merged.push(range);
-        }
-        self.ranges = merged;
     }
 
-    pub(in crate::player::backend::ffmpeg::avio::cache) fn trim_to_limit(&mut self) {
-        loop {
-            let cached_bytes = self.cached_bytes();
-            if cached_bytes <= self.max_bytes {
-                break;
-            }
-            let Some(range_index) = self
-                .ranges
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, range)| range.last_used_generation)
-                .map(|(index, _)| index)
-            else {
-                break;
-            };
-            let overflow = cached_bytes.saturating_sub(self.max_bytes);
-            let Some(range) = self.ranges.get_mut(range_index) else {
-                break;
-            };
-            let trim = overflow.min(range.end.saturating_sub(range.start));
-            range.start = range.start.saturating_add(trim);
-            if range.start >= range.end {
-                self.ranges.remove(range_index);
-            }
-        }
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn file_bytes(&self) -> u64 {
+        self.storage.file_len()
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio::cache) fn set_limit(&mut self, max_bytes: u64) {
+        self.max_bytes = max_bytes;
+        self.storage.set_limit(max_bytes);
+        self.ranges
+            .retain(|range| self.storage.accepts(&range.block));
     }
 
     pub(in crate::player::backend::ffmpeg::avio::cache) fn cached_bytes(&self) -> u64 {

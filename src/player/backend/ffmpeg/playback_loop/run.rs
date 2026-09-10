@@ -296,6 +296,7 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
     } = open_playback_input_with_fallback(&source, Arc::clone(&control), &event_tx)?;
     let initial_playback_file_info = input.playback_file_info();
     let mut video_decode_pipeline = VideoDecodePipeline::spawn(video_decoder)?;
+    video_decode_pipeline.set_decoder_framedrop(source.cache_config.decoder_framedrop);
     let initial_playback_video_info =
         playback_video_info_from_worker(video_stream, video_decode_pipeline.info());
     let playback_generation = PlaybackGeneration::default();
@@ -612,18 +613,32 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
             let requested_input_drainable = demux_packet_snapshot
                 .consumer_drainable_for_streams(&cache_pause_work.requested_streams);
             let output_snapshot = pipeline.output_scheduler.snapshot();
-            let output_backpressure_prefetch_paused =
-                pipeline.output_backpressure_prefetch_should_pause();
-            demux_cache
-                .set_output_backpressure_prefetch_paused(output_backpressure_prefetch_paused);
+            let recovering = pipeline
+                .output_scheduler
+                .playback_output_state
+                .restart_pending()
+                || pipeline
+                    .output_scheduler
+                    .playback_output_state
+                    .rebuffering()
+                || demux_reader_watermark.underrun;
+            let recovery_input_required = recovering
+                && demux_packet_snapshot.streams.iter().any(|stream| {
+                    cache_pause_work
+                        .requested_streams
+                        .contains(&stream.stream_index)
+                        && !stream.consumer_drainable
+                });
+            // Decoded output pressure controls decoder admission. Compressed
+            // prefetch follows its own byte/time budget, also during seek
+            // recovery, so a full decoder queue cannot throttle cache refill.
             if let Some(http_cache) = http_cache.as_ref() {
-                http_cache
-                    .set_output_backpressure_prefetch_paused(output_backpressure_prefetch_paused);
+                http_cache.set_recovery_input_required(recovery_input_required);
                 http_cache.update_demux_high_water_prefetch_paused(
                     demux_packet_snapshot.total_bytes,
-                    demux_packet_snapshot.memory_limit_bytes,
+                    demux_packet_snapshot.prefetch_limit_bytes,
                     demux_packet_snapshot.prefetch_queue_full(),
-                    demux_reader_watermark.underrun,
+                    demux_reader_watermark.underrun || recovery_input_required,
                 );
             }
             let output_reference_nsecs = pipeline
@@ -736,6 +751,7 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
                             Some(pipeline.current_start_position_nsecs),
                             pipeline.audio_output.is_some(),
                             video_output_queue.snapshot(),
+                            !control.is_paused(),
                         );
                         let outcome = pipeline_services.decoder_input.service_cached_input(
                             DecoderInputServiceContext {

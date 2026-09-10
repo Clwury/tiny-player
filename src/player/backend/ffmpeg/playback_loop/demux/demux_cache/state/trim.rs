@@ -29,13 +29,30 @@ impl DemuxPacketCacheState {
         // Match mpv's demuxer-max-bytes semantics: this limit applies to the
         // forward packet window. Retained/donated backbuffer bytes are governed
         // separately by effective_backbuffer_limit().
-        self.memory_limit_bytes > 0 && self.forward_bytes() >= self.memory_limit_bytes
+        self.storage_memory_full()
+            || (self.media_limits().0 > 0 && self.forward_bytes() >= self.media_limits().0)
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn backbuffer_pressure(
         &self,
     ) -> bool {
         self.backward_bytes() > self.effective_backbuffer_limit()
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn backbuffer_trim_urgent(
+        &self,
+    ) -> bool {
+        // Recovery may defer small amounts of maintenance, but repeated
+        // forward seeks must not accumulate an unbounded donated backbuffer
+        // while the producer refills at network speed.
+        self.memory_limit_bytes > 0
+            && self.cached_bytes
+                > self
+                    .memory_limit_bytes
+                    .saturating_add(self.backbuffer_limit_bytes)
+                    .saturating_add(self.disk_budget_bytes)
+                    .saturating_add(DEMUX_PACKET_APPEND_TRIM_MAX_OVERRUN_BYTES)
+            && self.backbuffer_pressure()
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn append_trim_due(
@@ -780,6 +797,7 @@ impl DemuxPacketCacheState {
             self.low_level_append_blocked_packet_generations
                 .remove(&packet_id);
             if let Some(packet) = self.packets.remove(&packet_id) {
+                self.track_packet_storage_remove(packet_id, &packet);
                 range.remove_packet_from_indices(
                     stream_index,
                     packet_id,
@@ -856,21 +874,34 @@ impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn effective_backbuffer_limit(
         &self,
     ) -> usize {
-        if self.backbuffer_limit_bytes == 0 {
+        let (forward_limit, back_limit) = self.media_limits();
+        if self.storage_memory_full()
+            && (self.disk_write_blocked
+                || !self.disk_cache_writable
+                || self.disk_write_requests.is_empty())
+        {
+            return back_limit.min(
+                self.backward_bytes().saturating_sub(
+                    self.resident_bytes
+                        .saturating_sub(self.resident_limit_bytes())
+                        .saturating_add(1),
+                ),
+            );
+        }
+        if back_limit == 0 {
             return 0;
         }
         if !self.donate_backbuffer {
-            return self.backbuffer_limit_bytes;
+            return back_limit;
         }
         let forward_bytes = self.forward_bytes();
         let Some(forward_with_guard) = forward_bytes.checked_add(1) else {
-            return self.backbuffer_limit_bytes;
+            return back_limit;
         };
-        if self.memory_limit_bytes <= forward_with_guard {
-            return self.backbuffer_limit_bytes;
+        if forward_limit <= forward_with_guard {
+            return back_limit;
         }
-        self.backbuffer_limit_bytes
-            .saturating_add(self.memory_limit_bytes - forward_with_guard)
+        back_limit.saturating_add(forward_limit - forward_with_guard)
     }
 }
 

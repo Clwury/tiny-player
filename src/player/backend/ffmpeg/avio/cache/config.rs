@@ -39,10 +39,10 @@ impl HttpCacheConfig {
             .unwrap_or(config.http_cache_range_request_bytes)
             .clamp(64 * 1024, 128 * 1024 * 1024)
             .max(u64::try_from(chunk_size).unwrap_or(u64::MAX));
-        let configured_hysteresis_seconds = http_cache_hysteresis_seconds(
-            config.demuxer_hysteresis_secs,
-            config.automatic_hysteresis,
-        );
+        // Transport is a bounded staging buffer for the demuxer. Do not add
+        // an automatic time/half-buffer refill delay to the demux policy.
+        let configured_hysteresis_seconds =
+            http_cache_hysteresis_seconds(config.demuxer_hysteresis_secs);
         Self {
             memory_capacity,
             chunk_size,
@@ -69,7 +69,10 @@ impl HttpCacheConfig {
                     .min(u64::try_from(memory_capacity).unwrap_or(u64::MAX)),
             ),
             disk_cache_bytes: config.disk_cache.then(|| {
-                env_u64("TINY_HTTP_CACHE_DISK_BYTES").unwrap_or(config.disk_cache_max_bytes)
+                let budget = config.effective_disk_cache_budgets().0;
+                env_u64("TINY_HTTP_CACHE_DISK_BYTES")
+                    .unwrap_or(budget)
+                    .min(budget)
             }),
             cache_dir: config.cache_dir,
             unlink_files: config.unlink_files,
@@ -96,15 +99,8 @@ impl HttpCacheConfig {
     }
 }
 
-fn http_cache_hysteresis_seconds(configured: f64, automatic: bool) -> f64 {
-    if !automatic {
-        return if configured.is_finite() && configured >= 0.0 {
-            configured
-        } else {
-            0.0
-        };
-    }
-    if configured.is_finite() && configured > 0.0 {
+fn http_cache_hysteresis_seconds(configured: f64) -> f64 {
+    if configured.is_finite() && configured >= 0.0 {
         configured
     } else {
         HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS
@@ -130,7 +126,7 @@ fn env_f64(name: &str, default: f64) -> f64 {
     env::var(name)
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
+        .filter(|value| value.is_finite() && *value >= 0.0)
         .unwrap_or(default)
 }
 
@@ -139,20 +135,23 @@ mod tests {
     use super::{HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS, http_cache_hysteresis_seconds};
 
     #[test]
-    fn http_cache_uses_default_hysteresis_when_demux_hysteresis_is_zero() {
+    fn http_cache_refills_without_an_automatic_hysteresis_band() {
         assert_eq!(
-            http_cache_hysteresis_seconds(0.0, true),
+            http_cache_hysteresis_seconds(0.0),
             HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS
         );
+        assert_eq!(http_cache_hysteresis_seconds(0.0), 0.0);
     }
 
     #[test]
     fn http_cache_preserves_explicit_hysteresis() {
-        assert_eq!(http_cache_hysteresis_seconds(2.5, true), 2.5);
+        assert_eq!(http_cache_hysteresis_seconds(2.5), 2.5);
     }
 
     #[test]
-    fn http_cache_honors_explicitly_disabled_hysteresis() {
-        assert_eq!(http_cache_hysteresis_seconds(0.0, false), 0.0);
+    fn http_cache_ignores_invalid_hysteresis() {
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(http_cache_hysteresis_seconds(invalid), 0.0);
+        }
     }
 }

@@ -440,7 +440,7 @@ impl HttpRingCacheState {
     fn record_external_disk_cache_write(
         &mut self,
         offset: u64,
-        len: usize,
+        _len: usize,
         disk_write: Option<PendingHttpDiskCacheWrite>,
         side_range: bool,
     ) {
@@ -450,14 +450,12 @@ impl HttpRingCacheState {
         let Some(disk_cache) = self.disk_cache.as_mut() else {
             return;
         };
-        if !self.disk_cache_writable || !std::sync::Arc::ptr_eq(&disk_cache.file, &disk_write.file)
-        {
+        if !self.disk_cache_writable || !disk_cache.storage.accepts(&disk_write.block) {
             return;
         }
         match disk_write.result {
             Ok(()) => {
-                disk_cache.add_range(offset, offset.saturating_add(len as u64));
-                disk_cache.trim_to_limit();
+                disk_cache.add_range(offset, disk_write.block);
             }
             Err(error) => {
                 if side_range {
@@ -673,9 +671,8 @@ impl HttpRingCacheState {
         target: u64,
     ) -> u64 {
         let Some((content_len, duration)) = self.content_len.zip(self.duration_seconds) else {
-            // A zero hysteresis is an explicit opt-out when automatic
-            // hysteresis is disabled. Keep the conservative half-target only
-            // for the automatically selected fallback band.
+            // With no media bitrate, only an explicitly configured nonzero
+            // hysteresis uses a conservative half-target fallback.
             return if self.config.hysteresis_seconds == 0.0 {
                 target
             } else {

@@ -24,8 +24,12 @@ impl DemuxPacketCacheState {
         cache_config: PlaybackCacheConfig,
     ) -> Self {
         let cache_config = cache_config.normalized();
-        let disk_cache = DemuxPacketDiskCache::from_config(&cache_config);
+        let disk_cache = DemuxPacketDiskCache::from_config(&cache_config).map(std::sync::Arc::new);
         let disk_cache_writable = disk_cache.is_some();
+        let disk_budget_bytes = disk_cache
+            .as_ref()
+            .map(|cache| usize::try_from(cache.limit()).unwrap_or(usize::MAX))
+            .unwrap_or(0);
         let memory_limit_bytes =
             usize::try_from(cache_config.effective_demuxer_max_bytes()).unwrap_or(usize::MAX);
         let cache_active = !matches!(cache_config.mode, PlaybackCacheMode::Disabled);
@@ -48,6 +52,18 @@ impl DemuxPacketCacheState {
             ranges,
             disk_cache,
             disk_cache_writable,
+            disk_write_blocked: false,
+            disk_config_generation: 0,
+            pending_disk_config: None,
+            disk_budget_bytes,
+            resident_bytes: 0,
+            disk_cached_bytes: 0,
+            disk_read_requests: Default::default(),
+            disk_write_requests: Default::default(),
+            disk_hot_packets: Default::default(),
+            disk_packets: Default::default(),
+            disk_restore_requests: Default::default(),
+            disk_worker_active: false,
             read_index: 0,
             consumed_packet_ids: HashSet::new(),
             reader_heads: BTreeMap::new(),
@@ -72,12 +88,10 @@ impl DemuxPacketCacheState {
             memory_limit_bytes,
             backbuffer_limit_bytes,
             donate_backbuffer: cache_config.demuxer_donate_buffer,
-            configured_readahead_nsecs: readahead_nsecs,
             readahead_nsecs,
             configured_hysteresis_nsecs,
             automatic_hysteresis: cache_config.automatic_hysteresis,
             hysteresis_nsecs,
-            adaptive_readahead: cache_config.adaptive_readahead,
             max_cached_ranges: cache_config.demuxer_max_ranges,
             hysteresis_active: false,
             cache_pause_enabled: cache_active && cache_config.cache_pause,
@@ -195,15 +209,12 @@ impl DemuxPacketCacheState {
             0
         };
         self.donate_backbuffer = cache_config.demuxer_donate_buffer;
-        self.adaptive_readahead = cache_config.adaptive_readahead;
         self.max_cached_ranges = cache_config.demuxer_max_ranges;
         self.append_trim_pressure_packets = 0;
         self.append_trim_active = false;
         self.append_trim_pending = false;
         self.read_trim_pressure_packets = 0;
-        self.configured_readahead_nsecs =
-            demux_packet_cache_readahead_nsecs(&cache_config, cache_active);
-        self.readahead_nsecs = self.configured_readahead_nsecs;
+        self.readahead_nsecs = demux_packet_cache_readahead_nsecs(&cache_config, cache_active);
         self.configured_hysteresis_nsecs = seconds_to_nsecs(cache_config.demuxer_hysteresis_secs);
         self.automatic_hysteresis = cache_config.automatic_hysteresis;
         self.hysteresis_nsecs =
@@ -219,15 +230,16 @@ impl DemuxPacketCacheState {
         }
 
         let disk_cache_requested = cache_config.disk_cache || demux_packet_disk_cache_enabled();
-        if disk_cache_requested {
-            if self.disk_cache.is_none() {
-                self.disk_cache = DemuxPacketDiskCache::from_config(&cache_config);
-            }
-            self.disk_cache_writable = self.disk_cache.is_some();
+        self.disk_budget_bytes = if disk_cache_requested && self.disk_cache.is_some() {
+            usize::try_from(cache_config.effective_disk_cache_budgets().1).unwrap_or(usize::MAX)
         } else {
-            self.disk_cache_writable = false;
-        }
-
+            0
+        };
+        self.disk_cache_writable = disk_cache_requested && self.disk_cache.is_some();
+        self.disk_config_generation = self.disk_config_generation.wrapping_add(1);
+        self.pending_disk_config = Some(cache_config);
+        // The disk worker creates/resizes files and restores out-of-budget
+        // payloads without holding this mutex or blocking the coordinator.
         self.trim_to_limit();
         self.enforce_cached_range_limit();
         self.refresh_readahead_hysteresis();

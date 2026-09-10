@@ -537,10 +537,54 @@ pub(super) fn cache_status_segments(cache_state: Option<&PlaybackCacheState>) ->
             segments.push(format!("Byte ranges {}", byte_cache.retained_range_count));
         }
     }
-    if let Some(file_cache_bytes) = cache_state.demux.file_cache_bytes
-        && file_cache_bytes > 0
-    {
-        segments.push(format!("磁盘 {}", format_cache_bytes(file_cache_bytes)));
+    let demux_storage = &cache_state.demux.storage;
+    let byte_storage = cache_state.byte.as_ref().map(|cache| &cache.storage);
+    let memory = demux_storage
+        .memory_bytes
+        .saturating_add(byte_storage.map_or(0, |s| s.memory_bytes));
+    let memory_limit = demux_storage
+        .memory_limit_bytes
+        .saturating_add(byte_storage.map_or(0, |s| s.memory_limit_bytes));
+    if memory > 0 || memory_limit > 0 {
+        segments.push(format!(
+            "缓存内存 ≈{}/{}",
+            format_cache_bytes(memory),
+            if demux_storage.memory_limit_bytes == 0 {
+                "不限".to_string()
+            } else {
+                format_cache_bytes(memory_limit)
+            }
+        ));
+    }
+    if cache_state.demux.forward_limit_bytes > 0 {
+        segments.push(format!(
+            "媒体前向 {}/{}",
+            format_cache_bytes(cache_state.demux.forward_bytes),
+            format_cache_bytes(cache_state.demux.forward_limit_bytes)
+        ));
+    }
+    let disk = demux_storage
+        .disk_bytes
+        .saturating_add(byte_storage.map_or(0, |s| s.disk_bytes));
+    let disk_file = demux_storage
+        .disk_file_bytes
+        .saturating_add(byte_storage.map_or(0, |s| s.disk_file_bytes));
+    let disk_limit = demux_storage
+        .disk_limit_bytes
+        .saturating_add(byte_storage.map_or(0, |s| s.disk_limit_bytes));
+    if disk_file > 0 || disk_limit > 0 {
+        segments.push(format!(
+            "磁盘有效 {} · 文件 {}/{}",
+            format_cache_bytes(disk),
+            format_cache_bytes(disk_file),
+            format_cache_bytes(disk_limit)
+        ));
+    }
+    let pending = demux_storage
+        .disk_pending_bytes
+        .saturating_add(byte_storage.map_or(0, |s| s.disk_pending_bytes));
+    if pending > 0 {
+        segments.push(format!("磁盘待回收 {}", format_cache_bytes(pending)));
     }
     segments.push(if cache_state.demux.idle {
         "状态 空闲".to_string()
@@ -767,7 +811,14 @@ mod tests {
             demux: DemuxCacheState {
                 cache_duration: Some(2.25),
                 idle: true,
-                file_cache_bytes: Some(4 * 1024 * 1024),
+                storage: crate::player::backend::CacheStorageState {
+                    memory_bytes: 2 * 1024 * 1024,
+                    memory_limit_bytes: 8 * 1024 * 1024,
+                    disk_bytes: 3 * 1024 * 1024,
+                    disk_file_bytes: 4 * 1024 * 1024,
+                    disk_limit_bytes: 16 * 1024 * 1024,
+                    ..Default::default()
+                },
                 raw_input_rate: Some(1536),
                 cached_seeks: 1,
                 low_level_seeks: 2,
@@ -816,7 +867,8 @@ mod tests {
                 "V 2.0s 空闲".to_string(),
                 "A 1.5s 断供".to_string(),
                 "Byte 8.0 KiB".to_string(),
-                "磁盘 4.0 MiB".to_string(),
+                "缓存内存 ≈2.0 MiB/8.0 MiB".to_string(),
+                "磁盘有效 3.0 MiB · 文件 4.0 MiB/16.0 MiB".to_string(),
                 "状态 空闲".to_string(),
                 "缓冲 42%".to_string(),
                 "Seek 1/2/3".to_string(),

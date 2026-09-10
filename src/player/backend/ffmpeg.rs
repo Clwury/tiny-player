@@ -12,6 +12,7 @@ mod bsf;
 mod clock;
 mod codec;
 mod constants;
+mod disk_cache;
 mod dovi;
 mod format;
 mod hw;

@@ -1,4 +1,4 @@
-use std::{sync::atomic::Ordering, time::Instant};
+use std::time::Instant;
 
 use super::{
     BackendEvent, BackendEventKind, CachedSeekMiss, CachedSeekMissReason,
@@ -24,26 +24,6 @@ fn require_safe_cached_seek_anchor(
 }
 
 impl DemuxPacketCache {
-    pub(in crate::player::backend::ffmpeg::playback_loop) fn set_output_backpressure_prefetch_paused(
-        &self,
-        paused: bool,
-    ) -> bool {
-        let changed = self
-            .shared
-            .output_backpressure_prefetch_paused
-            .swap(paused, Ordering::AcqRel)
-            != paused;
-        if changed {
-            self.shared.notify_ready();
-            tracing::debug!(
-                paused,
-                reason = "output_gate_and_decoder_queue_full",
-                "updated FFmpeg demux/HTTP prefetch pause for output backpressure"
-            );
-        }
-        changed
-    }
-
     pub(in crate::player::backend::ffmpeg::playback_loop) fn set_playback_recovery_demand(
         &self,
         critical: bool,

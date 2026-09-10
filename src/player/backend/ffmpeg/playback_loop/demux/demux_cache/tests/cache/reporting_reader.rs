@@ -739,7 +739,8 @@ fn demux_packet_cache_reports_per_stream_packet_queue_limit_without_pausing() {
     assert_eq!(video_queue.queued_packets, DEMUX_STREAM_PACKET_QUEUE_LIMIT);
     assert_eq!(video_queue.packet_limit, DEMUX_STREAM_PACKET_QUEUE_LIMIT);
     assert!(video_queue.packet_queue_full);
-    assert!(video_queue.prefetch_packet_queue_full);
+    assert!(!video_queue.prefetch_packet_queue_full);
+    assert!(!snapshot.prefetch_queue_full());
     assert!(video_queue.reader_head_available);
     // The readable count saturates at the snapshot scan limit to keep the
     // per-read monitor refresh cheap.

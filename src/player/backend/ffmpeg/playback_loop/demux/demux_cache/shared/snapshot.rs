@@ -10,7 +10,6 @@ const DEMUX_SLOW_READ_LOW_WATER_NSECS: u64 = 250_000_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlowDemuxReadClass {
     Shutdown,
-    OutputBackpressure,
     CachePause,
     Buffered,
     LowWater,
@@ -20,7 +19,6 @@ impl SlowDemuxReadClass {
     fn as_str(self) -> &'static str {
         match self {
             Self::Shutdown => "shutdown",
-            Self::OutputBackpressure => "output_backpressure",
             Self::CachePause => "cache_pause",
             Self::Buffered => "buffered_consumer_coverage",
             Self::LowWater => "low_water_stall",
@@ -34,14 +32,11 @@ impl SlowDemuxReadClass {
 
 fn classify_slow_demux_read(
     stopping: bool,
-    output_backpressure_paused: bool,
     cache_paused: bool,
     forward_duration_nsecs: u64,
 ) -> SlowDemuxReadClass {
     if stopping {
         SlowDemuxReadClass::Shutdown
-    } else if output_backpressure_paused {
-        SlowDemuxReadClass::OutputBackpressure
     } else if cache_paused {
         SlowDemuxReadClass::CachePause
     } else if forward_duration_nsecs > DEMUX_SLOW_READ_LOW_WATER_NSECS {
@@ -135,12 +130,8 @@ impl DemuxPacketCacheShared {
             .expect("FFmpeg demux packet cache poisoned");
         let forward_duration_nsecs = guard.forward_duration_nsecs();
         let cache_paused = self.control.is_cache_paused();
-        let output_backpressure_paused = self
-            .output_backpressure_prefetch_paused
-            .load(Ordering::Acquire);
         let class = classify_slow_demux_read(
             guard.shutdown || self.control.should_stop(),
-            output_backpressure_paused,
             cache_paused,
             forward_duration_nsecs,
         );
@@ -157,7 +148,6 @@ impl DemuxPacketCacheShared {
                 demux_position_detached = guard.demux_position_detached,
                 raw_input_rate_bps = ?guard.raw_input_rate(),
                 cache_paused,
-                output_backpressure_paused,
                 slow_read_class = class.as_str(),
                 "FFmpeg demux av_read_frame slow read at low water"
             );
@@ -174,7 +164,6 @@ impl DemuxPacketCacheShared {
                 demux_position_detached = guard.demux_position_detached,
                 raw_input_rate_bps = ?guard.raw_input_rate(),
                 cache_paused,
-                output_backpressure_paused,
                 slow_read_class = class.as_str(),
                 "FFmpeg demux av_read_frame slow read completed without consumer starvation"
             );
@@ -189,23 +178,19 @@ mod tests {
     #[test]
     fn slow_demux_read_warns_only_at_unexplained_low_water() {
         assert_eq!(
-            classify_slow_demux_read(false, false, false, 250_000_000),
+            classify_slow_demux_read(false, false, 250_000_000),
             SlowDemuxReadClass::LowWater
         );
         assert_eq!(
-            classify_slow_demux_read(false, false, false, 250_000_001),
+            classify_slow_demux_read(false, false, 250_000_001),
             SlowDemuxReadClass::Buffered
         );
         assert_eq!(
-            classify_slow_demux_read(false, true, false, 0),
-            SlowDemuxReadClass::OutputBackpressure
-        );
-        assert_eq!(
-            classify_slow_demux_read(false, false, true, 0),
+            classify_slow_demux_read(false, true, 0),
             SlowDemuxReadClass::CachePause
         );
         assert_eq!(
-            classify_slow_demux_read(true, false, false, 0),
+            classify_slow_demux_read(true, false, 0),
             SlowDemuxReadClass::Shutdown
         );
     }

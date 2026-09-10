@@ -139,6 +139,23 @@ impl AvPacket {
             .unwrap_or(0)
     }
 
+    pub(in super::super) fn properties_byte_len(&self) -> usize {
+        // FFmpeg copies side data when referencing a packet or its properties.
+        // It remains resident even after the compressed payload moves to disk.
+        let packet = unsafe { &*self.ptr };
+        let mut bytes = std::mem::size_of::<ffi::AVPacket>();
+        if !packet.side_data.is_null() && packet.side_data_elems > 0 {
+            let side_data =
+                unsafe { slice::from_raw_parts(packet.side_data, packet.side_data_elems as usize) };
+            for entry in side_data {
+                bytes = bytes
+                    .saturating_add(std::mem::size_of_val(entry))
+                    .saturating_add(entry.size);
+            }
+        }
+        bytes
+    }
+
     pub(in super::super) fn data(&self) -> Option<&[u8]> {
         let (data, size) = unsafe { ((*self.ptr).data, (*self.ptr).size) };
         if data.is_null() || size <= 0 {

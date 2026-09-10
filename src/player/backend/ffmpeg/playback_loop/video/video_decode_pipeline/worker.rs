@@ -92,6 +92,13 @@ impl VideoDecodePipeline {
         generation: u64,
     ) -> std::result::Result<Option<VideoDecodePacketStatus>, String> {
         let result = self.worker.poll_packet_status(generation);
+        if let Ok(Some(status)) = &result {
+            self.frame_drop.completed(
+                status.drop_policy,
+                status.decoded_frames,
+                status.result.is_ok(),
+            );
+        }
         self.observe_hevc_same_hardware_worker_progress(Instant::now());
         result
     }
@@ -126,6 +133,7 @@ impl VideoDecodePipeline {
     }
 
     pub(in super::super) fn clear_packets(&mut self) {
+        self.frame_drop.reset();
         self.packets.clear();
         self.hevc_hw_replay.clear();
     }

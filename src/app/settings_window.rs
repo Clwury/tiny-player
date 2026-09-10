@@ -6,7 +6,7 @@ use gpui::{
 use crate::{
     theme,
     ui::{
-        playback_settings_dialog::{PlaybackSettingsDialogState, SettingsChanged},
+        settings_dialog::{SettingsChanged, SettingsDialogMode, SettingsDialogState},
         titlebar::app_titlebar,
     },
 };
@@ -14,11 +14,19 @@ use crate::{
 use super::{TinyApp, app_window_options, resize::resize_handles, window::window_border};
 
 pub(super) struct SettingsWindow {
-    pub(super) settings: Entity<PlaybackSettingsDialogState>,
+    pub(super) settings: Entity<SettingsDialogState>,
 }
 
 impl TinyApp {
     pub(super) fn open_settings_window(&mut self, cx: &mut Context<Self>) {
+        self.open_settings_window_with_mode(SettingsDialogMode::from_env(), cx);
+    }
+
+    pub(super) fn open_settings_window_with_mode(
+        &mut self,
+        mode: SettingsDialogMode,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(handle) = self.settings_window.take()
             && handle
                 .update(cx, |_, window, _| window.activate_window())
@@ -31,18 +39,26 @@ impl TinyApp {
         self.open_server_menu = None;
         self.clear_app_notifications();
         let config = self.cache.playback.clone();
-        let settings = cx.new(|cx| PlaybackSettingsDialogState::new(&config, cx));
+        let settings = cx.new(|cx| SettingsDialogState::new(&config, mode, cx));
         cx.subscribe(&settings, |app, settings, _: &SettingsChanged, cx| {
             let settings = settings.read(cx);
-            app.cache.playback = settings.playback_config();
-            app.cache.color_theme = settings.color_theme();
-            app.cache.track_languages = settings.track_languages();
+            app.cache.playback = settings.playback_config(cx);
+            app.cache.color_theme = settings.color_theme(cx);
+            app.cache.track_languages = settings.track_languages(cx);
+            if let super::Page::Playback { page, .. } = &app.page {
+                let config = app.cache.playback.clone();
+                if let Err(error) = page.update(cx, |page, _| page.apply_playback_config(config)) {
+                    app.push_app_error_notification(format!("应用播放设置失败：{error}"), cx);
+                }
+            }
             app.schedule_cache_save("自动保存设置失败", cx);
         })
         .detach();
-        let bounds = Bounds::centered(None, size(px(960.0), px(680.0)), cx);
+        let initial_size = size(px(960.0), px(680.0));
+        let minimum_size = size(px(900.0), px(600.0));
+        let bounds = Bounds::centered(None, initial_size, cx);
         match cx.open_window(
-            app_window_options("设置".into(), bounds, size(px(900.0), px(600.0))),
+            app_window_options(mode.title().into(), bounds, minimum_size),
             |_, cx| cx.new(|_| SettingsWindow { settings }),
         ) {
             Ok(window) => self.settings_window = Some(window),
@@ -61,6 +77,7 @@ impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme::get(cx);
         let rounded_window = !window.is_maximized() && !window.is_fullscreen();
+        let title = self.settings.read(cx).mode().title();
         div()
             .relative()
             .size_full()
@@ -76,7 +93,7 @@ impl Render for SettingsWindow {
                     .child(
                         div()
                             .flex_none()
-                            .child(app_titlebar(window, cx, "设置".into())),
+                            .child(app_titlebar(window, cx, title.into())),
                     )
                     .child(div().flex_1().min_h_0().child(self.settings.clone())),
             )
@@ -96,45 +113,57 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         cx.update(theme::init);
-        let (_, cx) = cx.add_window_view(|_, cx| SettingsWindow {
-            settings: cx
-                .new(|cx| PlaybackSettingsDialogState::new(&PlaybackCacheConfig::default(), cx)),
+        let (root, cx) = cx.add_window_view(|_, cx| SettingsWindow {
+            settings: cx.new(|cx| {
+                SettingsDialogState::new(
+                    &PlaybackCacheConfig::default(),
+                    SettingsDialogMode::Development,
+                    cx,
+                )
+            }),
         });
-        for selection in [ColorTheme::Mocha, ColorTheme::Latte] {
-            cx.update(|_, cx| theme::set(selection, cx));
-            for (width, height) in [(900.0, 600.0), (1100.0, 720.0)] {
-                cx.simulate_resize(size(px(width), px(height)));
-                cx.run_until_parked();
-                cx.update(|window, cx| {
-                    let theme = theme::get(cx);
-                    let scale = window.scale_factor();
-                    let radius = ScaledPixels(f32::from(theme.radius_lg) * scale);
-                    let mut bottom_left = false;
-                    let mut bottom_right = false;
-                    let mut sidebar_background = false;
-                    assert_ne!(theme.title_bar, theme.background);
-                    for quad in window.painted_quads().iter().filter(|quad| {
-                        (quad.background == theme.background.into()
-                            || quad.background == theme.title_bar.into())
-                            && quad.bounds.bottom() == ScaledPixels(height * scale)
-                    }) {
-                        if quad.bounds.left() == ScaledPixels(0.0) {
-                            assert_eq!(quad.corner_radii.bottom_left, radius);
-                            bottom_left = true;
+        for mode in [SettingsDialogMode::Development, SettingsDialogMode::User] {
+            root.update(cx, |window, cx| {
+                window.settings = cx
+                    .new(|cx| SettingsDialogState::new(&PlaybackCacheConfig::default(), mode, cx));
+                cx.notify();
+            });
+            for selection in [ColorTheme::Mocha, ColorTheme::Latte] {
+                cx.update(|_, cx| theme::set(selection, cx));
+                for (width, height) in [(900.0, 600.0), (1100.0, 720.0)] {
+                    cx.simulate_resize(size(px(width), px(height)));
+                    cx.run_until_parked();
+                    cx.update(|window, cx| {
+                        let theme = theme::get(cx);
+                        let scale = window.scale_factor();
+                        let radius = ScaledPixels(f32::from(theme.radius_lg) * scale);
+                        let mut bottom_left = false;
+                        let mut bottom_right = false;
+                        let mut sidebar_background = false;
+                        assert_ne!(theme.title_bar, theme.background);
+                        for quad in window.painted_quads().iter().filter(|quad| {
+                            (quad.background == theme.background.into()
+                                || quad.background == theme.title_bar.into())
+                                && quad.bounds.bottom() == ScaledPixels(height * scale)
+                        }) {
+                            if quad.bounds.left() == ScaledPixels(0.0) {
+                                assert_eq!(quad.corner_radii.bottom_left, radius);
+                                bottom_left = true;
+                            }
+                            if quad.bounds.right() == ScaledPixels(width * scale) {
+                                assert_eq!(quad.corner_radii.bottom_right, radius);
+                                bottom_right = true;
+                            }
+                            if quad.background == theme.title_bar.into() {
+                                assert_eq!(quad.bounds.left(), ScaledPixels(0.0));
+                                assert_eq!(quad.bounds.size.width, ScaledPixels(226.0 * scale));
+                                assert_eq!(quad.corner_radii.bottom_right, ScaledPixels(0.0));
+                                sidebar_background = true;
+                            }
                         }
-                        if quad.bounds.right() == ScaledPixels(width * scale) {
-                            assert_eq!(quad.corner_radii.bottom_right, radius);
-                            bottom_right = true;
-                        }
-                        if quad.background == theme.title_bar.into() {
-                            assert_eq!(quad.bounds.left(), ScaledPixels(0.0));
-                            assert_eq!(quad.bounds.size.width, ScaledPixels(226.0 * scale));
-                            assert_eq!(quad.corner_radii.bottom_right, ScaledPixels(0.0));
-                            sidebar_background = true;
-                        }
-                    }
-                    assert!(bottom_left && bottom_right && sidebar_background);
-                });
+                        assert!(bottom_left && bottom_right && sidebar_background);
+                    });
+                }
             }
         }
     }

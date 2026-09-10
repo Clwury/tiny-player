@@ -71,7 +71,7 @@ impl VideoDecodePipeline {
             .map_err(|error| format!("FFmpeg 硬解 worker 退役失败：{error}"))?;
         let decoder = Decoder::open_video(stream, HardwareDecodeMode::Off)
             .map_err(|error| format!("FFmpeg 重新打开软件视频解码器失败：{error}"))?;
-        let worker = VideoDecodeWorker::spawn(decoder)?;
+        let worker = VideoDecodeWorker::spawn(decoder, self.frame_drop.epoch_handle())?;
         self.worker = worker;
         self.decoder_epoch = self.decoder_epoch.saturating_add(1).max(1);
         self.clear_packets();

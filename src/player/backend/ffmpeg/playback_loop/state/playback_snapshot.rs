@@ -502,6 +502,13 @@ impl PlaybackPipelineSnapshot {
                 .map(|gap| gap as f64 / 1_000_000.0),
             scheduler_dropped_video_frames =
                 self.output_snapshot.scheduler_dropped_video_frames,
+            decoder_framedrop_enabled = self.video_decode_snapshot.decoder_framedrop_enabled,
+            decoder_drop_budget = self.video_decode_snapshot.decoder_drop_budget,
+            decoder_pressure_drop_attempts = self.video_decode_snapshot.decoder_drop_stats.pressure_attempts,
+            decoder_seek_preroll_drop_attempts = self.video_decode_snapshot.decoder_drop_stats.seek_preroll_attempts,
+            decoder_estimated_pressure_drops = self.video_decode_snapshot.decoder_drop_stats.estimated_pressure_drops,
+            decoder_estimated_seek_preroll_drops = self.video_decode_snapshot.decoder_drop_stats.estimated_seek_preroll_drops,
+            vo_last_presentation = ?self.vo_snapshot.last_presentation,
             recent_coordinator_stall_ms = ?self
                 .output_snapshot
                 .recent_coordinator_stall_nsecs
@@ -735,6 +742,7 @@ mod tests {
     ) -> VideoOutputQueueSnapshot {
         VideoOutputQueueSnapshot {
             active_session_id: PlaybackSessionId(1),
+            last_presentation: None,
             queued_frames,
             queue_capacity,
             dropped_frames: 0,

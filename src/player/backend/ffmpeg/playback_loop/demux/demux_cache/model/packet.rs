@@ -1,9 +1,10 @@
 use std::{
-    fs::File,
     os::raw::c_int,
     sync::{Arc, Mutex},
     time::Instant,
 };
+
+use crate::player::backend::ffmpeg::disk_cache::DiskBlock;
 
 use super::{
     AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, DemuxPacketCacheReadTiming,
@@ -31,6 +32,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct Cached
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) start_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) end_nsecs: Option<u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) byte_len: usize,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) properties_byte_len: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -46,11 +48,12 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) enum CachedDe
     Memory(Arc<Mutex<AvPacket>>),
     Disk {
         props: Arc<Mutex<AvPacket>>,
-        offset: u64,
-        len: usize,
+        block: Arc<DiskBlock>,
+        hot: Option<Arc<Mutex<AvPacket>>>,
     },
 }
 
+#[cfg(test)]
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct PreparedDemuxPacketDiskSpill
 {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) data: Vec<u8>,
@@ -66,10 +69,8 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxP
 enum DemuxPacketReadPayload {
     Memory(Arc<Mutex<AvPacket>>),
     Disk {
-        file: Arc<File>,
         props: Arc<Mutex<AvPacket>>,
-        offset: u64,
-        len: usize,
+        block: Arc<DiskBlock>,
     },
 }
 
@@ -86,14 +87,9 @@ impl DemuxPacketReadSource {
                     .map_err(|_| "FFmpeg demux packet cache packet lock poisoned".to_string())?;
                 AvPacket::ref_from(&packet)?
             }
-            DemuxPacketReadPayload::Disk {
-                file,
-                props,
-                offset,
-                len,
-            } => {
+            DemuxPacketReadPayload::Disk { block, props } => {
                 let disk_read_started_at = Instant::now();
-                let data = read_demux_packet_disk_payload(&file, offset, len)?;
+                let data = read_demux_packet_disk_payload(&block.file, block.offset, block.len)?;
                 timing.disk_read += disk_read_started_at.elapsed();
                 timing.disk_reads = timing.disk_reads.saturating_add(1);
                 let props = props
@@ -118,6 +114,7 @@ impl DemuxPacketReadSource {
 }
 
 impl CachedDemuxPacket {
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn prepare_disk_spill(
         &self,
     ) -> std::result::Result<Option<PreparedDemuxPacketDiskSpill>, String> {
@@ -140,19 +137,62 @@ impl CachedDemuxPacket {
         }))
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn finish_disk_spill(
         &mut self,
-        offset: u64,
+        block: Arc<DiskBlock>,
         spill: PreparedDemuxPacketDiskSpill,
+        keep_hot: bool,
     ) {
         if !matches!(&self.payload, CachedDemuxPacketPayload::Memory(_)) {
             return;
         }
+        let hot = keep_hot.then(|| self.memory_packet()).flatten();
         self.payload = CachedDemuxPacketPayload::Disk {
+            hot,
             props: Arc::new(Mutex::new(spill.props)),
-            offset,
-            len: spill.data.len(),
+            block,
         };
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn memory_packet(
+        &self,
+    ) -> Option<Arc<Mutex<AvPacket>>> {
+        match &self.payload {
+            CachedDemuxPacketPayload::Memory(packet) => Some(Arc::clone(packet)),
+            CachedDemuxPacketPayload::Disk { hot, .. } => hot.clone(),
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn resident_bytes(
+        &self,
+    ) -> usize {
+        // Include a conservative per-entry estimate for queue/index nodes and
+        // AVPacket properties. Decoder-held references are accounted separately
+        // from cache ownership; this is not a process RSS measurement.
+        let (resident, copies) = match &self.payload {
+            CachedDemuxPacketPayload::Memory(_) => (true, 1usize),
+            CachedDemuxPacketPayload::Disk { hot, .. } => {
+                (hot.is_some(), 1 + usize::from(hot.is_some()))
+            }
+        };
+        std::mem::size_of::<Self>()
+            .saturating_add(512)
+            .saturating_add(self.properties_byte_len.saturating_mul(copies))
+            .saturating_add(if resident {
+                self.byte_len.saturating_add(64)
+            } else {
+                0
+            })
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn disk_bytes(
+        &self,
+    ) -> usize {
+        match &self.payload {
+            CachedDemuxPacketPayload::Memory(_) => 0,
+            CachedDemuxPacketPayload::Disk { block, .. } => block.len,
+        }
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn seek_end_nsecs(
@@ -207,6 +247,7 @@ impl CachedDemuxPacket {
             start_nsecs,
             end_nsecs,
             byte_len: packet.byte_len(),
+            properties_byte_len: packet.properties_byte_len(),
         })
     }
 
@@ -223,29 +264,43 @@ impl CachedDemuxPacket {
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn read_source(
         &self,
-        disk_cache: Option<&DemuxPacketDiskCache>,
+        _disk_cache: Option<&DemuxPacketDiskCache>,
         stream_offset: usize,
     ) -> std::result::Result<DemuxPacketReadSource, String> {
         let payload = match &self.payload {
             CachedDemuxPacketPayload::Memory(packet) => {
                 DemuxPacketReadPayload::Memory(Arc::clone(packet))
             }
-            CachedDemuxPacketPayload::Disk { props, offset, len } => {
-                let disk_cache = disk_cache
-                    .ok_or_else(|| "FFmpeg demux packet disk cache unavailable".to_string())?;
-                DemuxPacketReadPayload::Disk {
-                    file: Arc::clone(&disk_cache.file),
-                    props: Arc::clone(props),
-                    offset: *offset,
-                    len: *len,
-                }
-            }
+            CachedDemuxPacketPayload::Disk {
+                hot: Some(packet), ..
+            } => DemuxPacketReadPayload::Memory(Arc::clone(packet)),
+            CachedDemuxPacketPayload::Disk { props, block, .. } => DemuxPacketReadPayload::Disk {
+                block: Arc::clone(block),
+                props: Arc::clone(props),
+            },
         };
         Ok(DemuxPacketReadSource {
             stream_offset,
             payload,
             diagnostic: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn restore_outside_disk_limit(
+        &mut self,
+        cache: &DemuxPacketDiskCache,
+    ) -> Result<(), String> {
+        if let CachedDemuxPacketPayload::Disk { block, .. } = &self.payload
+            && !cache.accepts(block)
+        {
+            let packet = self
+                .read_source(Some(cache), 0)?
+                .packet_ref(&mut DemuxPacketCacheReadTiming::default())?
+                .0;
+            self.payload = CachedDemuxPacketPayload::Memory(Arc::new(Mutex::new(packet)));
+        }
+        Ok(())
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn storage_kind(
@@ -260,13 +315,17 @@ impl CachedDemuxPacket {
     #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn spill_to_disk(
         &mut self,
-        disk_cache: &mut DemuxPacketDiskCache,
+        disk_cache: &DemuxPacketDiskCache,
     ) -> std::result::Result<(), String> {
         let Some(spill) = self.prepare_disk_spill()? else {
             return Ok(());
         };
-        let offset = disk_cache.write_packet(&spill.data)?;
-        self.finish_disk_spill(offset, spill);
+        if let Some(block) = disk_cache.reserve_packet(spill.data.len()) {
+            block
+                .write(&spill.data)
+                .map_err(|error| error.to_string())?;
+            self.finish_disk_spill(block, spill, false);
+        }
         Ok(())
     }
 }

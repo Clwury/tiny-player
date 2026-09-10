@@ -315,7 +315,7 @@ impl VideoDecodePipeline {
                 .fail(error.clone());
             return Err(error);
         };
-        let worker = match VideoDecodeWorker::spawn(decoder) {
+        let worker = match VideoDecodeWorker::spawn(decoder, self.frame_drop.epoch_handle()) {
             Ok(worker) => worker,
             Err(error) => {
                 self.hevc_same_hardware_recovery

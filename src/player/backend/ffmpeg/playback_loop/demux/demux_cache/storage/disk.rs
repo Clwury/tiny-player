@@ -11,12 +11,11 @@ use std::{
 use super::AvPacket;
 use super::{CacheUnlinkPolicy, PlaybackCacheConfig};
 use crate::app_metadata::default_playback_cache_dir;
+use crate::player::backend::ffmpeg::disk_cache::{BoundedDiskFile, DiskBlock};
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxPacketDiskCache {
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) file: Arc<File>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) path: PathBuf,
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) next_offset: u64,
-    max_bytes: u64,
+    storage: BoundedDiskFile,
     unlink_on_drop: bool,
 }
 
@@ -27,11 +26,13 @@ impl DemuxPacketDiskCache {
         if !config.disk_cache && !demux_packet_disk_cache_enabled() {
             return None;
         }
+        let budget = config.effective_disk_cache_budgets().1;
         let max_bytes = env::var("TINY_DEMUX_PACKET_CACHE_BYTES")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(config.disk_cache_max_bytes);
+            .unwrap_or(budget)
+            .min(budget);
         Self::new(max_bytes, config.cache_dir.clone(), config.unlink_files)
     }
 
@@ -81,11 +82,10 @@ impl DemuxPacketDiskCache {
                 }
             }
         }
+        let file = Arc::new(file);
         Some(Self {
-            file: Arc::new(file),
+            storage: BoundedDiskFile::new(Arc::clone(&file), max_bytes),
             path,
-            next_offset: 0,
-            max_bytes,
             unlink_on_drop,
         })
     }
@@ -94,57 +94,64 @@ impl DemuxPacketDiskCache {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn write_packet(
         &mut self,
         data: &[u8],
-    ) -> std::result::Result<u64, String> {
-        let (offset, file) = self.reserve_packet(data.len())?;
-        Self::write_reserved_packet(&file, offset, data)?;
-        Ok(offset)
+    ) -> std::result::Result<Arc<DiskBlock>, String> {
+        let block = self
+            .reserve_packet(data.len())
+            .ok_or("FFmpeg demux packet disk cache 已满")?;
+        block.write(data).map_err(|error| error.to_string())?;
+        Ok(block)
     }
 
-    /// Reserve space while the cache state mutex is held. The actual I/O is
-    /// intentionally performed by `write_reserved_packet` after that mutex is
-    /// released, so a slow filesystem cannot block packet consumers.
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn reserve_packet(
-        &mut self,
+        &self,
         len: usize,
-    ) -> std::result::Result<(u64, Arc<File>), String> {
-        let len = u64::try_from(len).map_err(|_| "FFmpeg demux packet payload 过大".to_string())?;
-        let offset = self.next_offset;
-        let next = offset
-            .checked_add(len)
-            .ok_or_else(|| "FFmpeg demux packet disk cache offset overflow".to_string())?;
-        if next > self.max_bytes {
-            return Err("FFmpeg demux packet disk cache 已满".to_string());
-        }
-        self.next_offset = next;
-        Ok((offset, Arc::clone(&self.file)))
+    ) -> Option<Arc<DiskBlock>> {
+        self.storage.reserve(len)
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn write_reserved_packet(
-        file: &File,
-        offset: u64,
-        data: &[u8],
-    ) -> std::result::Result<(), String> {
-        let mut written = 0;
-        while written < data.len() {
-            let written_now = file
-                .write_at(&data[written..], offset.saturating_add(written as u64))
-                .map_err(|error| format!("写入 FFmpeg demux packet disk cache 失败：{error}"))?;
-            if written_now == 0 {
-                return Err("写入 FFmpeg demux packet disk cache 返回 0 字节".to_string());
-            }
-            written += written_now;
-        }
-        Ok(())
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn file_bytes(&self) -> u64 {
+        self.storage.file_len()
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn limit(&self) -> u64 {
+        self.storage.limit()
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_limit(
+        &self,
+        config: &PlaybackCacheConfig,
+    ) {
+        let budget = config.effective_disk_cache_budgets().1;
+        let limit = env::var("TINY_DEMUX_PACKET_CACHE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(budget)
+            .min(budget);
+        self.storage.set_limit(limit);
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn maintain_file_size(
+        &self,
+    ) {
+        self.storage.maintain_file_size();
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn accepts(
+        &self,
+        block: &DiskBlock,
+    ) -> bool {
+        self.storage.accepts(block)
     }
 
     #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn read_packet(
         &self,
-        offset: u64,
+        block: Arc<DiskBlock>,
         len: usize,
         props: &AvPacket,
     ) -> std::result::Result<AvPacket, String> {
-        let data = read_demux_packet_disk_payload(&self.file, offset, len)?;
+        let data = read_demux_packet_disk_payload(&block.file, block.offset, len)?;
         AvPacket::from_data_and_props(&data, props)
     }
 }

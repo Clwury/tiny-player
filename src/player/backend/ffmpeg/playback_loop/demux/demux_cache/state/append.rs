@@ -83,6 +83,7 @@ impl DemuxPacketCacheState {
         let queue_insert_started_at = Instant::now();
         let packet_byte_len = packet.byte_len;
         self.cached_bytes = self.cached_bytes.saturating_add(packet_byte_len);
+        self.track_packet_storage_insert(packet_id, &packet);
         self.packets.insert(packet_id, packet);
         let packet_is_seek_boundary = self.packets.get(&packet_id).is_some_and(|packet| {
             Self::packet_is_stream_seek_boundary_for(
@@ -381,38 +382,6 @@ impl DemuxPacketCacheState {
             .map(|sample| sample.bytes)
             .sum();
         (bytes > 0).then(|| u64::try_from(bytes).unwrap_or(u64::MAX))
-    }
-
-    /// Return a rate only after a short observation window. A single large
-    /// packet arriving immediately after a seek must not collapse the
-    /// adaptive read-ahead target to an unusably small value.
-    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn adaptive_input_rate(
-        &self,
-    ) -> Option<u64> {
-        let now = Instant::now();
-        let first = self
-            .input_rate_samples
-            .iter()
-            .find(|sample| now.saturating_duration_since(sample.at) <= Duration::from_secs(1))?;
-        let elapsed = now.saturating_duration_since(first.at);
-        if elapsed < Duration::from_millis(250) {
-            return None;
-        }
-        let bytes: u128 = self
-            .input_rate_samples
-            .iter()
-            .filter(|sample| now.saturating_duration_since(sample.at) <= Duration::from_secs(1))
-            .map(|sample| sample.bytes as u128)
-            .sum();
-        if bytes == 0 {
-            return None;
-        }
-        let nanos = elapsed.as_nanos().max(1);
-        let rate = bytes
-            .saturating_mul(1_000_000_000)
-            .checked_div(nanos)
-            .unwrap_or(u128::from(u64::MAX));
-        Some(u64::try_from(rate.max(1)).unwrap_or(u64::MAX))
     }
 
     fn prune_input_rate_samples(&mut self) {

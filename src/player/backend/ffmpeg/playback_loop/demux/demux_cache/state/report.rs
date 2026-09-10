@@ -134,7 +134,7 @@ impl DemuxPacketCacheState {
                 eof_cached: seekable_report.eof_cached,
                 total_bytes: u64::try_from(self.cached_bytes).unwrap_or(u64::MAX),
                 forward_bytes: u64::try_from(forward_bytes).unwrap_or(u64::MAX),
-                file_cache_bytes: self.disk_cache.as_ref().map(|cache| cache.next_offset),
+                file_cache_bytes: self.disk_cache.as_ref().map(|cache| cache.file_bytes()),
                 raw_input_rate: self.raw_input_rate(),
                 ts_last: self.demux_ts_nsecs.map(nsecs_to_seconds),
                 cached_seeks: self.cached_seeks,
@@ -148,6 +148,28 @@ impl DemuxPacketCacheState {
                 backbuffer_limit_bytes: u64::try_from(self.backbuffer_limit_bytes)
                     .unwrap_or(u64::MAX),
                 cached_range_count: self.ranges.len(),
+                forward_limit_bytes: self.media_limits().0 as u64,
+                storage: crate::player::backend::CacheStorageState {
+                    memory_bytes: self.resident_bytes as u64,
+                    memory_limit_bytes: self.resident_limit_bytes() as u64,
+                    disk_bytes: self.disk_cached_bytes as u64,
+                    disk_file_bytes: self
+                        .disk_cache
+                        .as_ref()
+                        .map(|cache| cache.file_bytes())
+                        .unwrap_or(0),
+                    disk_limit_bytes: self
+                        .disk_cache
+                        .as_ref()
+                        .map(|cache| cache.limit())
+                        .unwrap_or(0),
+                    disk_pending_bytes: self
+                        .disk_restore_requests
+                        .iter()
+                        .filter_map(|id| self.packets.get(id))
+                        .map(|packet| packet.disk_bytes() as u64)
+                        .sum(),
+                },
             },
             paused_for_cache,
             buffering_percent: self.cache_buffering_percent,
@@ -306,25 +328,14 @@ impl DemuxPacketCacheState {
             .sum()
     }
 
-    /// Readahead expressed in time after applying the currently observed
-    /// compressed input rate. The configured value remains the upper bound;
-    /// the byte budget can only shorten it. This keeps high-bitrate streams
-    /// from waiting for an impossible time target.
+    /// Keep media time and forward bytes as independent limits, like mpv's
+    /// read_packet(). Input throughput measures download/demux speed, not media
+    /// bitrate: dividing the byte budget by it makes faster input stop earlier
+    /// and donate most of the forward budget to the backbuffer.
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn effective_readahead_nsecs(
         &self,
     ) -> u64 {
-        if !self.adaptive_readahead || self.memory_limit_bytes == 0 {
-            return self.configured_readahead_nsecs;
-        }
-        let Some(rate) = self.adaptive_input_rate().filter(|rate| *rate > 0) else {
-            return self.configured_readahead_nsecs;
-        };
-        let byte_limited = (self.memory_limit_bytes as u128)
-            .saturating_mul(1_000_000_000u128)
-            .checked_div(rate as u128)
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or(self.configured_readahead_nsecs);
-        self.configured_readahead_nsecs.min(byte_limited.max(1))
+        self.readahead_nsecs
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn effective_hysteresis_nsecs(
@@ -340,8 +351,8 @@ impl DemuxPacketCacheState {
     }
 
     /// Cache-pause recovery should never wait longer than the current demux
-    /// target. This keeps a large user-configured pause window from defeating
-    /// adaptive readahead on high-bitrate streams.
+    /// time target. Byte-limited recovery is handled by cache_pause_recovered()
+    /// once the selected streams cover the requested playback position.
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn effective_cache_pause_wait_nsecs(
         &self,
     ) -> u64 {
@@ -418,7 +429,8 @@ impl DemuxPacketCacheState {
         if self.stream_window_needs_reader_packet(window) {
             return false;
         }
-        if self.memory_limit_bytes > 0 && forward_bytes >= self.memory_limit_bytes {
+        let forward_limit = self.media_limits().0;
+        if self.storage_memory_full() || (forward_limit > 0 && forward_bytes >= forward_limit) {
             return true;
         }
         let forward_duration = window.duration_nsecs();

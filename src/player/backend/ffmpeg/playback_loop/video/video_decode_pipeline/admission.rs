@@ -1,5 +1,44 @@
 use super::*;
 
+impl VideoPacketAdmissionContext<'_> {
+    pub(super) fn packet_timeline_nsecs(&self, packet: &AvPacket) -> Option<u64> {
+        packet.pts().and_then(|pts| {
+            self.video_clock
+                .map_known_timestamp(pts, self.video_stream.time_base)
+        })
+    }
+
+    fn packet_duration_nsecs(&self, packet: &AvPacket) -> Option<u64> {
+        packet
+            .duration()
+            .and_then(|duration| timestamp_to_nsecs(duration, self.video_stream.time_base))
+            .filter(|duration| *duration > 0)
+            .or(self.video_stream.frame_duration_nsecs)
+            .filter(|duration| *duration > 0)
+    }
+
+    pub(super) fn should_skip_nonref_for_pressure(&self, packet: &AvPacket) -> bool {
+        if !self.skip_nonref_for_pressure {
+            return false;
+        }
+        // A low output queue is normal while filling after startup or a seek.
+        // Like mpv's A/V-lateness check, only discard input that is already too
+        // late to present. Skipping future packets makes that queue sparse and
+        // prolongs the very underfill that triggered the pressure signal.
+        // DTS can precede PTS with reordered frames, so it cannot prove lateness.
+        let Some(packet_pts_nsecs) = self.packet_timeline_nsecs(packet) else {
+            return false;
+        };
+        let Some(played_until_nsecs) = self.played_until_nsecs else {
+            return false;
+        };
+        let Some(frame_duration_nsecs) = self.packet_duration_nsecs(packet) else {
+            return false;
+        };
+        should_drop_late_video_frame(packet_pts_nsecs, frame_duration_nsecs, played_until_nsecs)
+    }
+}
+
 impl VideoDecodePipeline {
     #[allow(clippy::too_many_arguments)]
     pub(in super::super) fn admit_demux_packet(
@@ -10,7 +49,7 @@ impl VideoDecodePipeline {
         recovery: &mut VideoDecodeRecovery,
         dovi_pipeline: &mut DoviPipeline,
         skip_nonref_active: &mut bool,
-        context: VideoPacketAdmissionContext,
+        context: VideoPacketAdmissionContext<'_>,
     ) -> std::result::Result<DecodePacketAdmissionStatus, String> {
         *video_packet_count = video_packet_count.saturating_add(1);
         let codec_id = context.video_stream.codec_id;
@@ -241,25 +280,46 @@ impl VideoDecodePipeline {
         }
 
         let bounded_decode_recovery_active = self.hevc_same_hardware_recovery.is_some();
+        let packet_timeline_nsecs = context.packet_timeline_nsecs(packet);
         let skip_nonref_for_exact_seek = recovery.should_skip_nonref_for_seek_preroll(
-            packet_nsecs,
+            packet_timeline_nsecs,
             bounded_decode_recovery_active,
             hardware_accelerated,
         );
-        let skip_nonref = context.skip_nonref_for_pressure || skip_nonref_for_exact_seek;
+        self.frame_drop.observe_output(
+            context.skip_nonref_for_pressure
+                && !recovery.requires_exact_seek_output()
+                && !bounded_decode_recovery_active,
+            context.presentation,
+            context.played_until_nsecs,
+            context.packet_duration_nsecs(packet),
+        );
+        let drop_policy = if skip_nonref_for_exact_seek {
+            VideoDecodeDropPolicy::SeekPreroll
+        } else {
+            self.frame_drop
+                .pressure_policy(context.should_skip_nonref_for_pressure(packet))
+        };
+        let skip_nonref_for_pressure =
+            matches!(drop_policy, VideoDecodeDropPolicy::Pressure { .. });
+        let skip_nonref = drop_policy.skip_nonref();
         if skip_nonref != *skip_nonref_active {
-            self.set_skip_nonref_frames(skip_nonref)?;
             *skip_nonref_active = skip_nonref;
             tracing::debug!(
                 session_id = ?context.session_id,
                 transaction_id = ?recovery.recovery_scope().transaction_id(),
                 recovery_scope = recovery.recovery_scope().as_str(),
                 skip_nonref,
-                skip_nonref_for_pressure = context.skip_nonref_for_pressure,
+                skip_nonref_for_pressure,
+                video_output_under_pressure = context.skip_nonref_for_pressure,
                 skip_nonref_for_exact_seek,
                 bounded_decode_recovery_active,
                 output_state = ?context.output_snapshot.state,
                 played_until_nsecs = context.played_until_nsecs,
+                packet_pts_nsecs = ?packet.pts().and_then(|pts|
+                    timestamp_to_nsecs(pts, context.video_stream.time_base)),
+                packet_timeline_nsecs,
+                decoder_drop_budget = self.frame_drop.remaining_budget(),
                 queued_video_frames = context.output_snapshot.queued_video_frames,
                 queued_video_ms = context.output_snapshot.queued_video_duration_nsecs as f64
                     / 1_000_000.0,
@@ -285,6 +345,7 @@ impl VideoDecodePipeline {
         let pending_packet = PendingVideoDecodePacket {
             generation,
             packet: AvPacket::ref_from(decode_packet)?,
+            drop_policy,
             realign_after_decode_recovery: context.output_snapshot.first_video_frame_pending,
             hevc_startup_in_flight_watchdog: hevc_startup_in_flight_packet_should_arm(
                 codec_id,

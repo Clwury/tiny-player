@@ -20,7 +20,6 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_P
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_APPEND_TRIM_TIME_BUDGET: Duration = Duration::from_millis(1);
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_CACHE_CONSUMER_LOCK_PRESSURE_AFTER: Duration = Duration::from_millis(20);
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_CACHE_CONSUMER_PRIORITY_HOLD: Duration = Duration::from_millis(50);
-pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_RECOVERY_YIELD_MAX_WAIT: Duration = Duration::from_millis(100);
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) const DEMUX_PACKET_RECOVERY_DEMAND_DIAG_INTERVAL: Duration = Duration::from_millis(500);
 // The monitor snapshot is refreshed while holding the cache mutex on every
 // consumer read; callers only need "any readable packet" plus a diagnostic
@@ -56,10 +55,9 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn demux_pack
 /// Hysteresis band for the demux PACKET cache read-ahead.
 ///
 /// Keep an explicit hysteresis value separate from the automatic refill band.
-/// mpv can use a zero band because its demux thread does not share the packet
-/// mutex with the playback consumer; tiny's producer and coordinator do. The
-/// automatic band prevents wake/read/append churn, while the UI can disable it
-/// by setting `automatic_hysteresis` to false.
+/// Both mpv and tiny release the packet mutex for input I/O. The optional
+/// automatic band only batches time-limited refill; byte-limited network
+/// prefetch resumes as soon as forward bytes fall below the limit.
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn demux_packet_cache_hysteresis_nsecs(
     cache_config: &PlaybackCacheConfig,
     readahead_nsecs: u64,

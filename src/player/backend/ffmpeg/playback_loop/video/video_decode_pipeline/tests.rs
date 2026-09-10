@@ -4,6 +4,8 @@ mod decode_gaps;
 mod dovi;
 #[path = "tests/exact_seek.rs"]
 mod exact_seek;
+#[path = "tests/pressure.rs"]
+mod pressure;
 #[path = "tests/recovery_policy.rs"]
 mod recovery_policy;
 #[path = "tests/replay_journal.rs"]
@@ -50,18 +52,19 @@ use super::{
     HevcSameHardwareRecoveryTransaction, HevcSeekPrerollProgressObservation,
     HevcStartupStallObservation, HevcStreamFormat, PendingVideoDecodePacket, PlaybackBlockReason,
     PlaybackGeneration, StrippedHevcDoviDecodeAction, VIDEO_DECODE_PENDING_INPUT_QUEUE_CAPACITY,
-    VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VideoDecodePacketQueues, VideoDecodePacketStatus,
-    VideoDecodePipeline, VideoDecodeRecovery, VideoDecodeRecoveryScope, VideoDecodeWorkerInfo,
-    VideoDecodeWorkerSnapshot, VideoDecodeWorkerState, hevc_cra_low_level_landing_repeats,
-    hevc_decode_chain_fallback_loop_action, hevc_decode_chain_fallback_record_after,
-    hevc_decode_chain_recovery_record_after_reset, hevc_decode_packet_evidence_scope,
-    hevc_decoder_drain_work_pending, hevc_dovi_decode_action_for_inspection,
-    hevc_drain_video_result_progressed, hevc_hw_replay_packets,
-    hevc_low_level_seek_would_repeat_cra, hevc_safe_anchor_can_roll_past_preserved_evidence,
-    hevc_same_hardware_reopen_mode, hevc_startup_in_flight_packet_should_arm,
-    hevc_startup_zero_output_timeout, hevc_zero_output_log_milestone,
-    requeue_backpressured_video_decode_input, runtime_hevc_software_fallback_allowed,
-    take_next_video_decode_input, video_decode_error_requires_hevc_resource_pressure_recovery,
+    VIDEO_DECODE_RECOVERY_MAX_SKIPPED_PACKETS, VideoDecodeDropPolicy, VideoDecodePacketQueues,
+    VideoDecodePacketStatus, VideoDecodePipeline, VideoDecodeRecovery, VideoDecodeRecoveryScope,
+    VideoDecodeWorkerInfo, VideoDecodeWorkerSnapshot, VideoDecodeWorkerState,
+    hevc_cra_low_level_landing_repeats, hevc_decode_chain_fallback_loop_action,
+    hevc_decode_chain_fallback_record_after, hevc_decode_chain_recovery_record_after_reset,
+    hevc_decode_packet_evidence_scope, hevc_decoder_drain_work_pending,
+    hevc_dovi_decode_action_for_inspection, hevc_drain_video_result_progressed,
+    hevc_hw_replay_packets, hevc_low_level_seek_would_repeat_cra,
+    hevc_safe_anchor_can_roll_past_preserved_evidence, hevc_same_hardware_reopen_mode,
+    hevc_startup_in_flight_packet_should_arm, hevc_startup_zero_output_timeout,
+    hevc_zero_output_log_milestone, requeue_backpressured_video_decode_input,
+    runtime_hevc_software_fallback_allowed, take_next_video_decode_input,
+    video_decode_error_requires_hevc_resource_pressure_recovery,
     video_decode_pending_input_snapshot,
 };
 

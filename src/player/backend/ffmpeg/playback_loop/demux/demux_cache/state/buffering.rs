@@ -10,7 +10,10 @@ impl DemuxPacketCacheState {
         if self.selected_eager_stream_needs_packet() {
             return false;
         }
-        if self.memory_limit_bytes > 0 && self.forward_bytes() >= self.memory_limit_bytes {
+        let forward_limit = self.media_limits().0;
+        if self.storage_memory_full()
+            || (forward_limit > 0 && self.forward_bytes() >= forward_limit)
+        {
             return true;
         }
         let forward_duration = self.forward_duration_nsecs();

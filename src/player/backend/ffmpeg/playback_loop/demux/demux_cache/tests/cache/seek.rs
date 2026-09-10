@@ -24,7 +24,8 @@ fn cache_full_decoder_empty_drains_existing_packets() {
         .iter()
         .find(|stream| stream.stream_index == 0)
         .expect("video stream snapshot exists");
-    assert!(video_queue.prefetch_packet_queue_full);
+    assert!(video_queue.packet_queue_full);
+    assert!(!video_queue.prefetch_packet_queue_full);
     assert!(video_queue.consumer_drainable);
     assert!(video_queue.reader_head_available);
     assert_eq!(
@@ -82,6 +83,7 @@ fn demux_packet_cache_reads_needed_eager_stream_despite_other_stream_queue_limit
     assert!(state.stream_packet_queue_full());
     assert!(state.has_demux_underrun());
     assert!(!state.should_pause_demux());
+    assert!(!snapshot.prefetch_queue_full());
     assert_eq!(
         demux_cache_blocked_on(&state, false),
         "demux_cache_underrun"

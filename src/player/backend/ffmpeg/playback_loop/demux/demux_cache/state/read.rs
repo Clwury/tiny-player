@@ -23,7 +23,7 @@ impl DemuxPacketCacheState {
         let Some(packet) = self.packets.get(&packet_id) else {
             return Err("FFmpeg demux packet cache entry missing".to_string());
         };
-        packet.read_source(self.disk_cache.as_ref(), stream_offset)
+        packet.read_source(self.disk_cache.as_deref(), stream_offset)
     }
 
     fn packet_end_nsecs(&self, packet_id: u64) -> Option<u64> {
@@ -52,6 +52,15 @@ impl DemuxPacketCacheState {
             let Some(packet_id) = self.next_packet_id_for_stream(stream_index) else {
                 continue;
             };
+            if self.disk_worker_active
+                && self
+                    .packets
+                    .get(&packet_id)
+                    .is_some_and(|packet| packet.memory_packet().is_none())
+            {
+                self.disk_read_requests.insert(packet_id);
+                continue;
+            }
             let read_index_before = self.read_index;
             let read_range_id = self.read_range_id;
             let cache_generation = self.generation;
@@ -362,6 +371,7 @@ impl DemuxPacketCacheState {
         }
         self.reader_heads.iter().any(|(stream_index, packet_id)| {
             self.reader_head_current_for_stream(*stream_index, *packet_id)
+                && self.packet_resident_for_read(*packet_id)
         })
     }
 
@@ -370,6 +380,7 @@ impl DemuxPacketCacheState {
     ) -> bool {
         self.reader_heads.iter().any(|(stream_index, packet_id)| {
             self.reader_head_current_for_stream(*stream_index, *packet_id)
+                && self.packet_resident_for_read(*packet_id)
         })
     }
 
@@ -383,7 +394,7 @@ impl DemuxPacketCacheState {
             has_required_stream = true;
             if self
                 .next_packet_id_for_stream(self.timeline_anchor_stream_index)
-                .is_none()
+                .is_none_or(|id| !self.packet_resident_for_read(id))
             {
                 return false;
             }
@@ -393,7 +404,10 @@ impl DemuxPacketCacheState {
             let Some(audio_stream) = self.selected_streams.audio_stream else {
                 return false;
             };
-            if self.next_packet_id_for_stream(audio_stream.index).is_none() {
+            if self
+                .next_packet_id_for_stream(audio_stream.index)
+                .is_none_or(|id| !self.packet_resident_for_read(id))
+            {
                 return false;
             }
         }
@@ -421,8 +435,9 @@ impl DemuxPacketCacheState {
         self.reader_heads
             .iter()
             .filter_map(|(stream_index, packet_id)| {
-                self.reader_head_current_for_stream(*stream_index, *packet_id)
-                    .then_some(*stream_index)
+                (self.reader_head_current_for_stream(*stream_index, *packet_id)
+                    && self.packet_resident_for_read(*packet_id))
+                .then_some(*stream_index)
             })
             .collect()
     }
@@ -681,6 +696,7 @@ impl DemuxPacketCacheState {
             .into_iter()
             .map(|window| (window.kind, window))
             .collect::<Vec<_>>();
+        let prefetch_paused = self.should_pause_demux();
         let mut streams = Vec::new();
         for stream_index in stream_ids {
             let kind = self
@@ -694,11 +710,12 @@ impl DemuxPacketCacheState {
             }
             let packet_limit = self.stream_packet_queue_limit(stream_index);
             let packet_queue_full = queued_packets >= packet_limit;
-            // Match mpv's eager/lazy split: audio/video queues can stop the
-            // producer, while subtitle queues are drained opportunistically
-            // and must never globally pause media prefetch.
-            let prefetch_packet_queue_full = packet_queue_full
-                && matches!(kind, StreamCacheKind::Video | StreamCacheKind::Audio);
+            // Packet counts are decoder queue diagnostics, not a demux cache
+            // limit. HTTP prefetch must follow the same byte/time policy as
+            // the demux producer, or small audio packets cap seekable ranges
+            // long before the forward byte budget is filled.
+            let prefetch_packet_queue_full =
+                prefetch_paused && matches!(kind, StreamCacheKind::Video | StreamCacheKind::Audio);
             let readable_packets_for_stream = self.readable_packet_count_for_stream(stream_index);
             let reader_head_available = self.next_packet_id_for_stream(stream_index).is_some();
             let consumer_drainable = readable_packets_for_stream > 0;
@@ -741,10 +758,19 @@ impl DemuxPacketCacheState {
             total_packets: streams.iter().map(|stream| stream.queued_packets).sum(),
             total_bytes: streams.iter().map(|stream| stream.queued_bytes).sum(),
             memory_limit_bytes: self.memory_limit_bytes,
+            prefetch_limit_bytes: self.media_limits().0,
             read_index: self.read_index,
             exact_seek_target_nsecs: self.exact_seek_target_nsecs,
             streams,
         }
+    }
+
+    fn packet_resident_for_read(&self, id: PacketId) -> bool {
+        !self.disk_worker_active
+            || self
+                .packets
+                .get(&id)
+                .is_some_and(|packet| packet.memory_packet().is_some())
     }
 
     fn readable_packet_count_for_stream(&self, stream_index: c_int) -> usize {
@@ -762,6 +788,7 @@ impl DemuxPacketCacheState {
             .skip(position)
             .take(DEMUX_PACKET_SNAPSHOT_READABLE_SCAN_LIMIT)
             .filter(|packet_id| self.packet_readable_in_current_generation(**packet_id))
+            .take_while(|packet_id| self.packet_resident_for_read(**packet_id))
             .count()
     }
 

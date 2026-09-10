@@ -715,6 +715,7 @@ mod tests {
     fn demux_packet_pump_only_waits_for_cache_lock_when_output_waits_for_demux() {
         let decoder_input = decoder_input_snapshot(vec![0], 0, None, None);
         let pressure = VideoPacketAdmissionPressure {
+            presentation: None,
             output_snapshot: playback_output_snapshot_for_test(
                 10,
                 duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION) + 1,
@@ -748,6 +749,7 @@ mod tests {
     fn demux_packet_pump_waits_for_cache_lock_when_output_window_needs_packets() {
         let decoder_input = decoder_input_snapshot(vec![0], 0, None, None);
         let full_output = VideoPacketAdmissionPressure {
+            presentation: None,
             output_snapshot: playback_output_snapshot_for_test(
                 10,
                 duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION) + 1,
@@ -757,6 +759,7 @@ mod tests {
             output_resource_pressure: false,
         };
         let draining_output = VideoPacketAdmissionPressure {
+            presentation: None,
             output_snapshot: playback_output_snapshot_for_test(
                 9,
                 duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION),
@@ -795,6 +798,7 @@ mod tests {
     fn demux_packet_pump_waits_for_cache_lock_for_audio_only_input_when_output_needs_packets() {
         let decoder_input = decoder_input_snapshot(vec![2], 0, Some(2), None);
         let draining_output = VideoPacketAdmissionPressure {
+            presentation: None,
             output_snapshot: playback_output_snapshot_for_test(
                 3,
                 duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
@@ -820,6 +824,7 @@ mod tests {
     fn demux_packet_pump_does_not_wait_for_audio_only_input_when_output_has_headroom() {
         let decoder_input = decoder_input_snapshot(vec![2], 0, Some(2), None);
         let full_output = VideoPacketAdmissionPressure {
+            presentation: None,
             output_snapshot: playback_output_snapshot_for_test(
                 10,
                 duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION) + 1,
@@ -843,6 +848,7 @@ mod tests {
         decoder_input.video_decode_snapshot.state = VideoDecodeWorkerState::HaveFrame;
         decoder_input.video_decode_snapshot.queued_frames = 7;
         let full_output = VideoPacketAdmissionPressure {
+            presentation: None,
             output_snapshot: playback_output_snapshot_for_test(
                 12,
                 duration_nsecs(AUDIO_VIDEO_QUEUE_LIMIT_DURATION) + 1,
@@ -852,6 +858,7 @@ mod tests {
             output_resource_pressure: false,
         };
         let draining_output = VideoPacketAdmissionPressure {
+            presentation: None,
             output_snapshot: playback_output_snapshot_for_test(
                 3,
                 duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
@@ -885,6 +892,7 @@ mod tests {
     fn demux_packet_pump_waits_for_cache_lock_before_video_headroom_is_low() {
         let decoder_input = decoder_input_snapshot(vec![0], 0, None, None);
         let one_second_headroom = VideoPacketAdmissionPressure {
+            presentation: None,
             output_snapshot: playback_output_snapshot_for_test(
                 12,
                 duration_nsecs(Duration::from_millis(1_200)),
@@ -1063,6 +1071,7 @@ mod tests {
     fn demux_packet_pump_does_not_force_cache_wait_after_first_startup_frame() {
         let decoder_input = decoder_input_snapshot(vec![0, 1], 0, Some(1), None);
         let pressure = VideoPacketAdmissionPressure {
+            presentation: None,
             output_snapshot: startup_output_snapshot_for_test(40_000_000),
             skip_nonref_for_pressure: false,
             played_until_nsecs: None,
@@ -1079,6 +1088,7 @@ mod tests {
     fn demux_packet_pump_uses_short_lock_wait_when_cached_reader_is_ready() {
         let decoder_input = decoder_input_snapshot(vec![0, 1], 0, Some(1), None);
         let pressure = VideoPacketAdmissionPressure {
+            presentation: None,
             output_snapshot: playback_output_snapshot_for_test(
                 3,
                 duration_nsecs(VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION),
@@ -1383,6 +1393,7 @@ mod tests {
             total_packets: streams.iter().map(|stream| stream.queued_packets).sum(),
             total_bytes: streams.iter().map(|stream| stream.queued_bytes).sum(),
             memory_limit_bytes: 1024 * 1024,
+            prefetch_limit_bytes: 1024 * 1024,
             read_index: 0,
             exact_seek_target_nsecs: 0,
             streams,

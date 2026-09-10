@@ -238,20 +238,7 @@ pub(in crate::player::backend::ffmpeg) fn http_cache_range_request_timeout(
     }
 }
 
-pub(super) fn http_cache_read_timed_out(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    ) || error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<reqwest::Error>())
-        .is_some_and(reqwest::Error::is_timeout)
-}
-
-pub(super) fn content_len_from_response(
-    response: &reqwest::blocking::Response,
-    offset: u64,
-) -> Option<u64> {
+pub(super) fn content_len_from_response(response: &reqwest::Response, offset: u64) -> Option<u64> {
     content_len_from_content_range(response.headers()).or_else(|| {
         (response.status() == reqwest::StatusCode::OK)
             .then(|| {
@@ -273,7 +260,21 @@ pub(in crate::player::backend::ffmpeg) struct HttpContentRange {
 pub(in crate::player::backend::ffmpeg) fn content_len_from_content_range(
     headers: &reqwest::header::HeaderMap,
 ) -> Option<u64> {
+    if let Some(total) = unsatisfied_content_range_len(headers) {
+        return Some(total);
+    }
     content_range_from_headers(headers)?.total
+}
+
+pub(super) fn unsatisfied_content_range_len(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .trim()
+        .strip_prefix("bytes */")?
+        .parse()
+        .ok()
 }
 
 pub(in crate::player::backend::ffmpeg) fn content_range_from_headers(
@@ -297,5 +298,43 @@ pub(in crate::player::backend::ffmpeg) fn content_range_from_headers(
     } else {
         Some(total.parse().ok()?)
     };
+    if total.is_some_and(|total| end >= total) || end == u64::MAX {
+        return None;
+    }
     Some(HttpContentRange { start, end, total })
+}
+
+#[cfg(test)]
+mod range_validation_tests {
+    use super::*;
+
+    #[test]
+    fn unsatisfied_range_exposes_the_actual_file_length_including_empty_files() {
+        for (value, length) in [("bytes */1234", 1234), ("bytes */0", 0)] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::CONTENT_RANGE, value.parse().unwrap());
+            assert_eq!(content_len_from_content_range(&headers), Some(length));
+            assert!(content_range_from_headers(&headers).is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_or_out_of_bounds_ranges_cannot_be_combined_with_cached_bytes() {
+        for value in [
+            "bytes 5-4/20",
+            "bytes 0-20/20",
+            "bytes 0-20/10",
+            "bytes 0-18446744073709551615/*",
+            "bytes */*",
+            "bytes x-y/20",
+        ] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::CONTENT_RANGE, value.parse().unwrap());
+            assert!(content_range_from_headers(&headers).is_none(), "{value}");
+            assert!(
+                content_len_from_content_range(&headers).is_none(),
+                "{value}"
+            );
+        }
+    }
 }

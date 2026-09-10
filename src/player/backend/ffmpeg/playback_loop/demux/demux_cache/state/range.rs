@@ -261,6 +261,7 @@ impl DemuxPacketCacheState {
             self.low_level_append_blocked_packet_generations
                 .remove(&packet_id);
             if let Some(packet) = self.packets.remove(&packet_id) {
+                self.track_packet_storage_remove(packet_id, &packet);
                 self.cached_bytes = self.cached_bytes.saturating_sub(packet.byte_len);
             }
         }

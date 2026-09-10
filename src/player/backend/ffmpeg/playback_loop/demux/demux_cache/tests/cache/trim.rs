@@ -736,27 +736,58 @@ fn demux_packet_cache_append_defers_trim_during_playback_recovery() {
 }
 
 #[test]
-fn demux_packet_cache_recovery_priority_yields_then_forces_bounded_producer_progress() {
+fn demux_packet_cache_recovery_does_not_delay_each_packet_when_the_mutex_is_idle() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let shared = Arc::new(shared_for_test(control));
     shared.append_packet(cached_anchor(0, 1_000_000_000));
     shared.set_playback_recovery_demand(true, true, false);
 
-    let barrier = Arc::new(Barrier::new(2));
     let (result_tx, result_rx) = mpsc::channel();
     let thread_shared = Arc::clone(&shared);
-    let thread_barrier = Arc::clone(&barrier);
     let handle = thread::spawn(move || {
-        thread_barrier.wait();
-        result_tx
-            .send(thread_shared.wait_for_demux_permit())
-            .expect("send demux permit result");
+        for _ in 0..20 {
+            assert!(thread_shared.wait_for_demux_permit().is_none());
+        }
+        result_tx.send(()).expect("send demux permit result");
     });
-    barrier.wait();
-
-    assert!(result_rx.recv_timeout(Duration::from_millis(20)).is_err());
-    assert!(result_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+    let result = result_rx.recv_timeout(Duration::from_secs(1));
+    shared.set_playback_recovery_demand(false, false, false);
     handle.join().expect("demux permit waiter joins");
+    assert!(
+        result.is_ok(),
+        "recovery must not sleep 100 ms before every packet"
+    );
+}
+
+#[test]
+fn demux_packet_cache_consumer_priority_cannot_starve_forward_refill() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let shared = Arc::new(shared_for_test(control));
+    shared.append_packet(cached_anchor(0, 1_000_000_000));
+    shared.consumer_waiting_readers.store(1, Ordering::Release);
+    shared
+        .consumer_lock_pressure_until_nanos
+        .store(u64::MAX, Ordering::Release);
+
+    let (result_tx, result_rx) = mpsc::channel();
+    let thread_shared = Arc::clone(&shared);
+    let handle = thread::spawn(move || {
+        for _ in 0..20 {
+            assert!(thread_shared.wait_for_demux_permit().is_none());
+        }
+        result_tx.send(()).expect("send demux permit result");
+    });
+    let result = result_rx.recv_timeout(Duration::from_secs(1));
+    shared.consumer_waiting_readers.store(0, Ordering::Release);
+    shared
+        .consumer_lock_pressure_until_nanos
+        .store(0, Ordering::Release);
+    shared.notify_ready();
+    handle.join().expect("demux permit waiter joins");
+    assert!(
+        result.is_ok(),
+        "consumer priority must yield without suspending input indefinitely"
+    );
 }
 
 #[test]

@@ -164,6 +164,7 @@ fn hevc_decode_packet_diagnostic_window_keeps_recent_packet_deltas() {
                 decoded_frames: 0,
                 elapsed: Duration::from_micros(250),
                 drained: false,
+                drop_policy: VideoDecodeDropPolicy::None,
             },
             &packet,
             video_stream,

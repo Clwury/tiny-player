@@ -3,14 +3,201 @@
 use std::{cell::Cell, rc::Rc};
 
 use gpui::{
-    App, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement, Modifiers,
-    MouseButton, ParentElement, RenderOnce, StatefulInteractiveElement, Styled, Subscription,
-    Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px, svg,
+    App, AppContext as _, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    Modifiers, MouseButton, ParentElement, RenderOnce, StatefulInteractiveElement, Styled,
+    Subscription, Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px, svg,
 };
 
-use crate::theme;
+use crate::{player::TrackLanguage, theme};
 
-use super::{editor::Editor, tooltip::text_tooltip};
+use super::{
+    editor::{Editor, EditorEvent},
+    tooltip::text_tooltip,
+};
+
+pub(crate) const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
+
+pub(crate) fn settings_sidebar(rounded_window: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
+    let theme = theme::get(cx);
+    div()
+        .id("settings-sidebar")
+        .debug_selector(|| "settings-sidebar".into())
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .w(px(226.0))
+        .p_2p5()
+        .gap_4()
+        .border_r_1()
+        .border_color(theme.title_bar_border)
+        .bg(theme.panel_background)
+        .when(rounded_window, |this| {
+            this.rounded_bl(theme.radius_lg).overflow_hidden()
+        })
+}
+
+pub(crate) fn settings_category_button(
+    title: &'static str,
+    selected: bool,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = theme::get(cx);
+    div()
+        .id(title)
+        .role(gpui::Role::Button)
+        .aria_label(title)
+        .debug_selector(move || format!("settings-category-{title}"))
+        .flex()
+        .items_center()
+        .h(px(28.0))
+        .px_2()
+        .gap_2()
+        .rounded(px(4.0))
+        .cursor_pointer()
+        .text_sm()
+        .text_color(if selected {
+            theme.accent_text
+        } else {
+            theme.muted_foreground
+        })
+        .when(selected, |this| {
+            this.bg(theme.element_selected)
+                .font_weight(gpui::FontWeight::MEDIUM)
+        })
+        .hover(|style| {
+            style
+                .bg(if selected {
+                    theme.element_selected_hover
+                } else {
+                    theme.secondary_hover
+                })
+                .text_color(if selected {
+                    theme.accent_text
+                } else {
+                    theme.foreground
+                })
+        })
+        .child(title)
+}
+
+pub(crate) fn toggle_switch(
+    label: &'static str,
+    selected: bool,
+    on_toggle: impl Fn(&mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+    div()
+        .id(label)
+        .role(gpui::Role::Switch)
+        .aria_label(label)
+        .aria_toggled(if selected {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
+        .debug_selector(move || format!("settings-toggle-{label}"))
+        .group("settings-toggle")
+        .flex()
+        .items_center()
+        .p(px(3.0))
+        .cursor_pointer()
+        .child(
+            div()
+                .id("switch-track")
+                .flex()
+                .items_center()
+                .w(px(32.0))
+                .h(px(20.0))
+                .px(px(2.0))
+                .rounded_full()
+                .border_1()
+                .border_color(if selected {
+                    theme.input_border_focused
+                } else {
+                    theme.input_border
+                })
+                .bg(if selected {
+                    theme.accent
+                } else {
+                    theme.input_background
+                })
+                .group_hover("settings-toggle", |style| {
+                    style
+                        .bg(if selected {
+                            theme.accent_hover
+                        } else {
+                            theme.secondary_hover
+                        })
+                        .border_color(theme.accent)
+                })
+                .when(selected, |this| this.justify_end())
+                .child(div().size(px(12.0)).rounded_full().bg(if selected {
+                    theme.accent_foreground
+                } else {
+                    theme.muted_foreground
+                })),
+        )
+        .on_click(move |_, _, cx| on_toggle(cx))
+}
+
+pub(crate) fn disk_cache_capacity_input<T: 'static>(
+    bytes: u64,
+    on_change: impl Fn(&mut T, u64, &mut Context<T>) + 'static,
+    cx: &mut Context<T>,
+) -> Entity<Editor> {
+    let input = cx.new(|cx| {
+        Editor::new("磁盘缓存上限（GiB）", cx)
+            .default_value((bytes / BYTES_PER_GIB).to_string())
+            .borderless()
+            .compact()
+            .height(px(26.0))
+            .centered()
+            .digits_only()
+            .max_chars(12)
+    });
+    cx.subscribe(&input, move |this, input, event, cx| {
+        if matches!(event, EditorEvent::Changed)
+            && let Some(bytes) = input
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .and_then(|value| value.checked_mul(BYTES_PER_GIB))
+                .filter(|value| *value > 0)
+        {
+            on_change(this, bytes, cx);
+        }
+    })
+    .detach();
+    input
+}
+
+pub(crate) fn disk_cache_capacity_control(input: Entity<Editor>, bytes: u64) -> NumberControl {
+    NumberControl::new(
+        ("disk-cache", "磁盘缓存上限"),
+        input,
+        "GiB",
+        NumberRange::integer(1, u64::MAX / BYTES_PER_GIB),
+        (bytes / BYTES_PER_GIB) as f64,
+    )
+}
+
+pub(crate) fn track_language_selector(
+    header: (&'static str, &'static str),
+    state: Entity<DropdownState>,
+    selected: TrackLanguage,
+    on_select: impl Fn(TrackLanguage, &mut App) + 'static,
+) -> impl IntoElement {
+    selector_row(
+        header,
+        state,
+        TrackLanguage::ALL.map(|language| (language.id(), language.label(), language)),
+        selected,
+        on_select,
+    )
+}
 
 pub(crate) struct DropdownState {
     open: Option<&'static str>,
@@ -66,6 +253,31 @@ impl DropdownState {
 }
 
 type SelectCallback = Rc<dyn Fn(usize, &mut App)>;
+
+pub(crate) fn selector_row<T: Copy + PartialEq + 'static>(
+    header: (&'static str, &'static str),
+    state: Entity<DropdownState>,
+    options: impl IntoIterator<Item = (&'static str, &'static str, T)>,
+    selected: T,
+    on_select: impl Fn(T, &mut App) + 'static,
+) -> impl IntoElement {
+    let options: Vec<_> = options.into_iter().collect();
+    let selected_index = options
+        .iter()
+        .position(|(_, _, value)| *value == selected)
+        .expect("settings dropdown must include its current value");
+    SettingsDropdown::new(
+        header.0,
+        header.1,
+        options
+            .iter()
+            .map(|(id, label, _)| (*id, *label))
+            .collect::<Vec<_>>(),
+        selected_index,
+        state,
+        move |index, cx| on_select(options[index].2, cx),
+    )
+}
 
 #[derive(IntoElement)]
 pub(crate) struct SettingsDropdown {

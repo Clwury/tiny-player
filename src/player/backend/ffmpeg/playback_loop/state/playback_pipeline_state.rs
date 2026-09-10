@@ -565,17 +565,6 @@ fn cache_pause_actual_decode_work_for(
         || prepare.completed_frames > 0
 }
 
-fn output_backpressure_prefetch_should_pause_for(
-    output_state: PlaybackOutputState,
-    video_decode_state: VideoDecodeWorkerState,
-    audio_decode_state: Option<AudioDecodeWorkerState>,
-) -> bool {
-    let output_gate_blocked = output_state.restart_pending() || output_state.rebuffering();
-    let decoded_queue_full = video_decode_state == VideoDecodeWorkerState::OutputFull
-        || audio_decode_state == Some(AudioDecodeWorkerState::OutputFull);
-    output_gate_blocked && decoded_queue_full
-}
-
 fn cache_pause_first_frame_input_demand_for(
     output: PlaybackOutputSnapshot,
     video_packet_input_available: bool,
@@ -822,8 +811,8 @@ mod tests {
         cached_seek_recovery_watchdog_decision, decoder_block_reason_blocks_packet_input,
         decoder_input_retry_status_from_streams, decoder_input_streams_for_state,
         mark_video_decode_skip_nonref_inactive, observe_audio_realign_request,
-        output_backpressure_prefetch_should_pause_for, poll_audio_recovery_watchdog,
-        retain_pending_audio_for_realign_once, update_audio_realign_progress,
+        poll_audio_recovery_watchdog, retain_pending_audio_for_realign_once,
+        update_audio_realign_progress,
     };
 
     fn audio_realign_request(target_timeline_nsecs: u64) -> RebufferAudioRealignRequest {
@@ -1766,29 +1755,5 @@ mod tests {
             ]),
             DecodeInputRetryStatus::Idle
         );
-    }
-
-    #[test]
-    fn output_gate_with_full_decoded_queue_pauses_prefetch_only_until_playing() {
-        assert!(output_backpressure_prefetch_should_pause_for(
-            PlaybackOutputState::Syncing,
-            VideoDecodeWorkerState::OutputFull,
-            None,
-        ));
-        assert!(output_backpressure_prefetch_should_pause_for(
-            PlaybackOutputState::Rebuffering,
-            VideoDecodeWorkerState::NeedPacket,
-            Some(AudioDecodeWorkerState::OutputFull),
-        ));
-        assert!(!output_backpressure_prefetch_should_pause_for(
-            PlaybackOutputState::Playing,
-            VideoDecodeWorkerState::OutputFull,
-            Some(AudioDecodeWorkerState::OutputFull),
-        ));
-        assert!(!output_backpressure_prefetch_should_pause_for(
-            PlaybackOutputState::Primed,
-            VideoDecodeWorkerState::NeedPacket,
-            Some(AudioDecodeWorkerState::NeedPacket),
-        ));
     }
 }

@@ -7,11 +7,9 @@ use super::{
     DEMUX_CACHE_CONSUMER_LOCK_PRESSURE_AFTER, DEMUX_CACHE_CONSUMER_PRIORITY_HOLD,
     DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_AFTER, DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
     DEMUX_PACKET_CACHE_WAIT_INTERVAL, DEMUX_PACKET_RECOVERY_DEMAND_DIAG_INTERVAL,
-    DEMUX_PACKET_RECOVERY_YIELD_MAX_WAIT, DemuxPacketCacheShared, DemuxSeekRequest,
-    DemuxSelectedStreams, PlaybackSessionId, duration_nsecs, nsecs_to_seconds,
+    DemuxPacketCacheShared, DemuxSeekRequest, DemuxSelectedStreams, PlaybackSessionId,
+    duration_nsecs, nsecs_to_seconds,
 };
-
-const OUTPUT_BACKPRESSURE_PREFETCH_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 const PLAYBACK_RECOVERY_DEMAND_VIDEO: u8 = 1 << 0;
 const PLAYBACK_RECOVERY_DEMAND_AUDIO: u8 = 1 << 1;
@@ -85,10 +83,7 @@ impl DemuxPacketCacheShared {
         let mut logged_prefetch_pause = false;
         let mut prefetch_pause_started_at = None;
         let mut next_prefetch_pause_log_at = None;
-        let mut output_backpressure_pause_started_at = None;
-        let mut next_output_backpressure_log_at = None;
-        let mut output_backpressure_waits = 0u64;
-        let mut recovery_yield_started_at = None;
+        let mut yielded_for_consumer = false;
         loop {
             if guard.shutdown || self.control.should_stop() {
                 return None;
@@ -98,6 +93,25 @@ impl DemuxPacketCacheShared {
             }
             if self.control.has_pending_seek() {
                 return None;
+            }
+
+            if guard.backbuffer_trim_urgent() {
+                let trimmed = guard.trim_to_limit_for_append_with_outcome();
+                guard.complete_append_trim();
+                if trimmed.performed {
+                    guard.mark_cache_state_emit_dirty();
+                    self.refresh_monitor_snapshot(&guard);
+                    self.notify_ready();
+                    // Retain the existing per-pass trim time/step bounds and
+                    // release the mutex between passes, including in recovery.
+                    drop(guard);
+                    std::thread::yield_now();
+                    guard = self
+                        .state
+                        .lock()
+                        .expect("FFmpeg demux packet cache poisoned");
+                    continue;
+                }
             }
 
             // The demux producer owns full seekable-range validation. Keep it
@@ -119,35 +133,6 @@ impl DemuxPacketCacheShared {
             }
 
             let recovery_critical = self.playback_recovery_critical();
-            let output_backpressure_paused = self
-                .output_backpressure_prefetch_paused
-                .load(Ordering::Acquire);
-            if output_backpressure_paused && !recovery_critical {
-                let now = Instant::now();
-                let started_at = *output_backpressure_pause_started_at.get_or_insert(now);
-                output_backpressure_waits = output_backpressure_waits.saturating_add(1);
-                if next_output_backpressure_log_at.is_none_or(|deadline| now >= deadline) {
-                    tracing::debug!(
-                        session_id = ?guard.session_id,
-                        pause_ms = now.saturating_duration_since(started_at).as_secs_f64()
-                            * 1000.0,
-                        wait_count = output_backpressure_waits,
-                        cached_bytes = guard.cached_bytes,
-                        packet_count = guard.read_range().global_order.len(),
-                        recovery_critical,
-                        reason = "output_gate_and_decoder_queue_full",
-                        "FFmpeg demux/HTTP prefetch paused by output backpressure"
-                    );
-                    next_output_backpressure_log_at =
-                        now.checked_add(OUTPUT_BACKPRESSURE_PREFETCH_LOG_INTERVAL);
-                }
-                guard = self.wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
-                continue;
-            }
-            output_backpressure_pause_started_at = None;
-            next_output_backpressure_log_at = None;
-            output_backpressure_waits = 0;
-
             let recovery_demand = self.playback_recovery_demand();
             let any_consumer_drainable = guard.consumer_drainable_packet_available();
             let recovery_demand_drainable = guard.consumer_drainable_for_recovery_demand(
@@ -156,69 +141,31 @@ impl DemuxPacketCacheShared {
             );
             if recovery_critical
                 && recovery_demand.has_required_streams()
-                && recovery_demand_drainable
+                && !recovery_demand_drainable
+                && any_consumer_drainable
+                && self.should_log_recovery_demand_diagnostic()
             {
-                let now = Instant::now();
-                let yield_started_at = *recovery_yield_started_at.get_or_insert(now);
-                if now.saturating_duration_since(yield_started_at)
-                    < DEMUX_PACKET_RECOVERY_YIELD_MAX_WAIT
-                {
-                    guard = self.wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
-                    continue;
-                }
-                if !guard.should_pause_demux() {
-                    if self.should_log_recovery_demand_diagnostic() {
-                        tracing::debug!(
-                            session_id = ?guard.session_id,
-                            recovery_critical,
-                            recovery_yield_ms = now
-                                .saturating_duration_since(yield_started_at)
-                                .as_secs_f64()
-                                * 1000.0,
-                            recovery_yield_max_ms =
-                                DEMUX_PACKET_RECOVERY_YIELD_MAX_WAIT.as_secs_f64() * 1000.0,
-                            requested_streams = ?guard.recovery_demand_streams(
-                                recovery_demand.video_required,
-                                recovery_demand.audio_required,
-                            ),
-                            drainable_streams = ?guard.drainable_streams(),
-                            cached_bytes = guard.cached_bytes,
-                            forward_bytes = guard.forward_bytes(),
-                            should_pause_demux = false,
-                            "forcing bounded FFmpeg demux producer progress after recovery yield"
-                        );
-                    }
-                    return None;
-                }
-            } else {
-                recovery_yield_started_at = None;
-                if recovery_critical
-                    && recovery_demand.has_required_streams()
-                    && any_consumer_drainable
-                    && self.should_log_recovery_demand_diagnostic()
-                {
-                    let requested_streams = guard.recovery_demand_streams(
-                        recovery_demand.video_required,
-                        recovery_demand.audio_required,
-                    );
-                    let drainable_streams = guard.drainable_streams();
-                    let missing_streams = requested_streams
-                        .iter()
-                        .copied()
-                        .filter(|stream_index| !drainable_streams.contains(stream_index))
-                        .collect::<Vec<_>>();
-                    tracing::debug!(
-                        session_id = ?guard.session_id,
-                        recovery_critical,
-                        requested_streams = ?requested_streams,
-                        drainable_streams = ?drainable_streams,
-                        missing_streams = ?missing_streams,
-                        cached_bytes = guard.cached_bytes,
-                        forward_bytes = guard.forward_bytes(),
-                        should_pause_demux = guard.should_pause_demux(),
-                        "bypassing FFmpeg demux recovery yield for missing demanded streams"
-                    );
-                }
+                let requested_streams = guard.recovery_demand_streams(
+                    recovery_demand.video_required,
+                    recovery_demand.audio_required,
+                );
+                let drainable_streams = guard.drainable_streams();
+                let missing_streams = requested_streams
+                    .iter()
+                    .copied()
+                    .filter(|stream_index| !drainable_streams.contains(stream_index))
+                    .collect::<Vec<_>>();
+                tracing::debug!(
+                    session_id = ?guard.session_id,
+                    recovery_critical,
+                    requested_streams = ?requested_streams,
+                    drainable_streams = ?drainable_streams,
+                    missing_streams = ?missing_streams,
+                    cached_bytes = guard.cached_bytes,
+                    forward_bytes = guard.forward_bytes(),
+                    should_pause_demux = guard.should_pause_demux(),
+                    "prefetching FFmpeg demux packets for missing demanded streams"
+                );
             }
 
             let consumer_priority_drainable = if recovery_demand.has_required_streams() {
@@ -226,8 +173,23 @@ impl DemuxPacketCacheShared {
             } else {
                 any_consumer_drainable
             };
-            if self.consumer_priority_active() && consumer_priority_drainable {
-                guard = self.wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
+            // Like mpv, keep reading until the compressed byte/time target is
+            // full. Recovery is not a reason to sleep before every packet:
+            // the old 100 ms yield throttled refill even with an idle mutex.
+            // Let an actual waiting reader run once, then proceed with I/O
+            // outside the mutex. Historical lock pressure still defers heavy
+            // range maintenance, but cannot starve the producer.
+            if !yielded_for_consumer
+                && self.consumer_waiting_readers.load(Ordering::Acquire) > 0
+                && consumer_priority_drainable
+            {
+                yielded_for_consumer = true;
+                drop(guard);
+                std::thread::yield_now();
+                guard = self
+                    .state
+                    .lock()
+                    .expect("FFmpeg demux packet cache poisoned");
                 continue;
             }
             if guard.read_range_eof() || guard.error.is_some() {

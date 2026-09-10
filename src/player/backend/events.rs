@@ -159,10 +159,14 @@ pub struct PlaybackCacheConfig {
     pub total_cache_max_bytes: u64,
     /// Maximum number of archived demux seek ranges retained in memory.
     pub demuxer_max_ranges: usize,
-    /// Adapt the time target to the observed compressed input rate.
+    /// Adapt HTTP range request sizes to observed input throughput. Demux
+    /// media-time and forward-byte limits remain independent of download speed.
     pub adaptive_readahead: bool,
     /// Distinguish an automatic refill band from an explicitly disabled band.
     pub automatic_hysteresis: bool,
+    /// Opt in to decoder catch-up dropping during ordinary playback. Output
+    /// dropping stays enabled; precise-seek preroll has a separate policy.
+    pub decoder_framedrop: bool,
 }
 
 impl Default for PlaybackCacheConfig {
@@ -192,6 +196,7 @@ impl Default for PlaybackCacheConfig {
             demuxer_max_ranges: 10,
             adaptive_readahead: true,
             automatic_hysteresis: true,
+            decoder_framedrop: false,
         }
     }
 }
@@ -257,33 +262,6 @@ impl PlaybackCacheConfig {
             self.demuxer_readahead_secs.max(self.cache_secs)
         } else {
             self.demuxer_readahead_secs
-        }
-    }
-
-    /// Return the time target after applying the byte ceiling and an observed
-    /// compressed input rate. This is intentionally a pure helper so callers
-    /// can use it without changing the cache state machine.
-    pub fn effective_readahead_secs_for_rate(
-        &self,
-        cache_active: bool,
-        input_rate_bytes_per_sec: Option<u64>,
-    ) -> f64 {
-        let target = self.effective_readahead_secs(cache_active);
-        if !self.adaptive_readahead {
-            return target;
-        }
-        let Some(rate) = input_rate_bytes_per_sec.filter(|rate| *rate > 0) else {
-            return target;
-        };
-        let byte_budget = self.effective_demuxer_max_bytes();
-        if byte_budget == 0 {
-            return target;
-        }
-        let byte_limited = byte_budget as f64 / rate as f64;
-        if byte_limited.is_finite() && byte_limited > 0.0 {
-            target.min(byte_limited)
-        } else {
-            target
         }
     }
 
@@ -356,6 +334,13 @@ impl PlaybackCacheConfig {
         self.effective_cache_budgets().1
     }
 
+    /// Disk space is a single budget: reserve a small slice for HTTP metadata
+    /// probes and give the remainder to seekable demux packet payloads.
+    pub fn effective_disk_cache_budgets(&self) -> (u64, u64) {
+        let http = (self.disk_cache_max_bytes / 8).min(32 * 1024 * 1024);
+        (http, self.disk_cache_max_bytes - http)
+    }
+
     pub fn effective_demuxer_max_back_bytes(&self) -> u64 {
         self.effective_cache_budgets().2
     }
@@ -425,6 +410,18 @@ pub struct StreamCacheState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+pub struct CacheStorageState {
+    /// Cache-owned payloads plus estimated packet/index metadata, not process RSS.
+    pub memory_bytes: u64,
+    pub memory_limit_bytes: u64,
+    /// Live disk-backed media, separately from allocated file length.
+    pub disk_bytes: u64,
+    pub disk_file_bytes: u64,
+    pub disk_limit_bytes: u64,
+    pub disk_pending_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DemuxCacheState {
     pub cache_end: Option<f64>,
     pub reader_pts: Option<f64>,
@@ -451,6 +448,8 @@ pub struct DemuxCacheState {
     pub memory_limit_bytes: u64,
     pub backbuffer_limit_bytes: u64,
     pub cached_range_count: usize,
+    pub storage: CacheStorageState,
+    pub forward_limit_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -475,6 +474,7 @@ pub struct ByteCacheState {
     pub retained_bytes: u64,
     pub prefetch_paused: bool,
     pub retained_range_count: usize,
+    pub storage: CacheStorageState,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -724,6 +724,20 @@ mod tests {
     }
 
     #[test]
+    fn disk_cache_layers_share_one_budget_and_keep_the_http_probe_slice_small() {
+        for total in [0, 1, 8, 1024 * 1024, 4 * 1024 * 1024 * 1024, u64::MAX] {
+            let config = PlaybackCacheConfig {
+                disk_cache_max_bytes: total,
+                ..PlaybackCacheConfig::default()
+            };
+            let (http, demux) = config.effective_disk_cache_budgets();
+            assert_eq!(http + demux, total);
+            assert!(http <= 32 * 1024 * 1024);
+            assert!(http <= total / 8);
+        }
+    }
+
+    #[test]
     fn finite_total_budget_bounds_an_unlimited_forward_layer() {
         let config = PlaybackCacheConfig {
             total_cache_max_bytes: 8 * 1024 * 1024,
@@ -757,26 +771,11 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_readahead_is_capped_by_effective_demux_budget() {
-        let config = PlaybackCacheConfig {
-            cache_secs: 60.0,
-            demuxer_readahead_secs: 2.0,
-            demuxer_max_bytes: 10 * 1024 * 1024,
-            ..PlaybackCacheConfig::default()
-        }
-        .normalized();
-
+    fn shared_cache_default_budget_preserves_mpv_forward_and_backward_limits() {
+        let config = PlaybackCacheConfig::default().normalized();
         assert_eq!(
-            config.effective_readahead_secs_for_rate(true, Some(20 * 1024 * 1024)),
-            0.5
-        );
-        let fixed = PlaybackCacheConfig {
-            adaptive_readahead: false,
-            ..config
-        };
-        assert_eq!(
-            fixed.effective_readahead_secs_for_rate(true, Some(u64::MAX)),
-            60.0
+            config.effective_cache_budgets(),
+            (32 * 1024 * 1024, 150 * 1024 * 1024, 50 * 1024 * 1024)
         );
     }
 
@@ -788,6 +787,22 @@ mod tests {
         assert_eq!(config.total_cache_max_bytes, 256 * 1024 * 1024);
         assert_eq!(config.demuxer_max_ranges, 10);
         assert!(config.adaptive_readahead);
+        assert!(!config.decoder_framedrop);
+    }
+
+    #[test]
+    fn decoder_framedrop_requires_explicit_opt_in_and_survives_config_roundtrip() {
+        assert!(!PlaybackCacheConfig::default().decoder_framedrop);
+        let config: PlaybackCacheConfig =
+            serde_json::from_str(r#"{"decoder_framedrop":true}"#).unwrap();
+        let encoded = serde_json::to_string(&config.normalized()).unwrap();
+        let restored: PlaybackCacheConfig = serde_json::from_str(&encoded).unwrap();
+        assert!(restored.decoder_framedrop);
+        assert!(
+            restored
+                .resolved_for_cacheable_input(false)
+                .decoder_framedrop
+        );
     }
 
     #[test]

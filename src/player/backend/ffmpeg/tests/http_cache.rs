@@ -290,6 +290,7 @@ fn http_ring_cache_probe_read_queues_trimmed_range_without_active_restart() {
     assert_eq!(
         cache.side_download_requests_for_test(),
         vec![CacheRestartRequest {
+            generation: 0,
             offset: 100,
             range_kind: HttpCacheRangeKind::Playback,
         }]
@@ -313,6 +314,7 @@ fn http_ring_cache_probe_read_queues_side_download_without_active_restart() {
     assert_eq!(
         cache.side_download_requests_for_test(),
         vec![CacheRestartRequest {
+            generation: 0,
             offset: 500,
             range_kind: HttpCacheRangeKind::Playback,
         }]

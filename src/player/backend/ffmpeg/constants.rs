@@ -110,7 +110,7 @@ pub(super) const HTTP_CACHE_PROGRESS_REPORT_THRESHOLD: f64 = 0.001;
 pub(super) const HTTP_CACHE_PROBE_READ_WAIT: Duration = Duration::from_millis(250);
 #[cfg(test)]
 pub(super) const HTTP_CACHE_DEFAULT_READAHEAD_SECONDS: f64 = 120.0;
-pub(super) const HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS: f64 = 10.0;
+pub(super) const HTTP_CACHE_DEFAULT_HYSTERESIS_SECONDS: f64 = 0.0;
 pub(super) const FFMPEG_AVIO_BUFFER_SIZE: c_int = 1024 * 1024;
 pub(super) const FFMPEG_FAST_PROBE_SIZE: usize = 1024 * 1024;
 pub(super) const FFMPEG_FAST_ANALYZE_DURATION_US: u64 = 1_000_000;

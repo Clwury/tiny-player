@@ -22,7 +22,7 @@ use super::{
     HTTP_CACHE_PREFETCH_PAUSE_LOG_AFTER, HTTP_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
     HTTP_CACHE_SIDE_DOWNLOAD_WORKERS, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
     HTTP_CACHE_STARTUP_FIRST_BYTE_TIMEOUT, HTTP_CACHE_WAIT_INTERVAL, HttpCacheConfig,
-    HttpCacheRangeKind, HttpDiskCache, HttpReadWaitLogDecision, HttpRingCache, HttpRingCacheShared,
+    HttpCacheRangeKind, HttpReadWaitLogDecision, HttpRingCache, HttpRingCacheShared,
     HttpRingCacheState, PendingHttpDiskCacheWrite, PreparedByteAppend,
     RetainedPlaybackSpliceSource, http_ring_cache_download_loop,
     http_ring_cache_side_download_loop, playback_cache_state_from_http_status,
@@ -41,6 +41,17 @@ fn startup_first_byte_wait_timed_out(
 }
 
 impl HttpRingCache {
+    pub(in crate::player::backend::ffmpeg) fn set_recovery_input_required(&self, required: bool) {
+        if self
+            .shared
+            .recovery_input_required
+            .swap(required, Ordering::AcqRel)
+            != required
+        {
+            self.shared.notify_ready();
+        }
+    }
+
     pub(in crate::player::backend::ffmpeg::avio) fn has_cached_byte_at(&self, offset: u64) -> bool {
         self.shared.has_cached_byte_at(offset)
     }
@@ -78,68 +89,37 @@ impl HttpRingCache {
         self.input_progress_generation() != observed_generation
     }
 
-    pub(in crate::player::backend::ffmpeg) fn set_output_backpressure_prefetch_paused(
+    pub(in crate::player::backend::ffmpeg) fn update_demux_high_water_prefetch_paused(
         &self,
-        paused: bool,
+        forward_bytes: usize,
+        memory_limit_bytes: usize,
+        prefetch_queue_full: bool,
+        underrun: bool,
     ) -> bool {
+        let paused = demux_high_water_prefetch_should_pause(
+            forward_bytes,
+            memory_limit_bytes,
+            prefetch_queue_full,
+            underrun,
+        );
         let changed = self
             .shared
-            .output_backpressure_paused
+            .demux_high_water_paused
             .swap(paused, Ordering::AcqRel)
             != paused;
         if changed {
             self.shared.notify_ready();
             tracing::debug!(
                 paused,
-                reason = "output_gate_and_decoder_queue_full",
-                "updated HTTP stream cache prefetch pause for output backpressure"
-            );
-        }
-        changed
-    }
-
-    pub(in crate::player::backend::ffmpeg) fn update_demux_high_water_prefetch_paused(
-        &self,
-        total_bytes: usize,
-        memory_limit_bytes: usize,
-        prefetch_queue_full: bool,
-        underrun: bool,
-    ) -> bool {
-        let mut current = self.shared.demux_high_water_paused.load(Ordering::Acquire);
-        loop {
-            let paused = demux_high_water_prefetch_should_pause(
-                current,
-                total_bytes,
+                forward_bytes,
                 memory_limit_bytes,
                 prefetch_queue_full,
                 underrun,
+                high_water_percent = 100,
+                "updated HTTP stream cache prefetch pause for demux cache waterline"
             );
-            if paused == current {
-                return false;
-            }
-            match self.shared.demux_high_water_paused.compare_exchange_weak(
-                current,
-                paused,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    self.shared.notify_ready();
-                    tracing::debug!(
-                        paused,
-                        total_bytes,
-                        memory_limit_bytes,
-                        prefetch_queue_full,
-                        underrun,
-                        high_water_percent = 90,
-                        low_water_percent = 75,
-                        "updated HTTP stream cache prefetch pause for demux cache waterline"
-                    );
-                    return true;
-                }
-                Err(observed) => current = observed,
-            }
         }
+        changed
     }
 
     pub(in crate::player::backend::ffmpeg::avio) fn spawn(
@@ -158,8 +138,9 @@ impl HttpRingCache {
                     .with_content_len_hint(content_len_hint),
             ),
             ready: Condvar::new(),
-            output_backpressure_paused: AtomicBool::new(false),
             demux_high_water_paused: AtomicBool::new(false),
+            recovery_input_required: AtomicBool::new(false),
+            active_readers: AtomicU64::new(0),
             cache_config_generation: AtomicU64::new(0),
             input_progress_generation: AtomicU64::new(0),
             control,
@@ -196,38 +177,78 @@ impl HttpRingCache {
             .cache_config_generation
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
+        let config = HttpCacheConfig::from_playback_config(cache_config);
         match self.shared.state.try_lock() {
-            Ok(mut guard) => {
-                guard.apply_cache_config(cache_config);
-                let status = guard.take_stream_cache_status_report();
-                drop(guard);
-                self.shared.send_stream_cache_status(status);
-                self.shared.notify_ready();
-            }
-            Err(TryLockError::WouldBlock) => {
-                let shared = Arc::clone(&self.shared);
-                let cache_config = cache_config.clone();
-                if let Err(error) = thread::Builder::new()
-                    .name("tiny-http-cache-config".to_string())
-                    .spawn(move || {
-                        let status = {
-                            let mut guard =
-                                shared.state.lock().expect("HTTP stream cache poisoned");
-                            if shared.cache_config_generation.load(Ordering::Acquire) != generation
-                            {
-                                return;
-                            }
-                            guard.apply_cache_config(&cache_config);
-                            guard.take_stream_cache_status_report()
-                        };
-                        shared.send_stream_cache_status(status);
-                        shared.notify_ready();
-                    })
-                {
-                    tracing::warn!(%error, "failed to defer contended HTTP cache config update");
+            Ok(mut state) => {
+                let needs_file = state.disk_cache.is_none() && config.disk_cache_bytes.is_some();
+                let shrink_limit = config
+                    .disk_cache_bytes
+                    .unwrap_or_else(|| cache_config.effective_disk_cache_budgets().0);
+                let needs_shrink = state
+                    .disk_cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.file_bytes() > shrink_limit);
+                if !needs_file && !needs_shrink {
+                    state.apply_prepared_cache_config(cache_config);
+                    let status = state.take_stream_cache_status_report();
+                    drop(state);
+                    self.shared.send_stream_cache_status(status);
+                    self.shared.notify_ready();
+                    return;
                 }
             }
+            Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Poisoned(_)) => panic!("HTTP stream cache poisoned"),
+        }
+        let shared = Arc::clone(&self.shared);
+        let cache_config = cache_config.clone();
+        if let Err(error) = thread::Builder::new()
+            .name("tiny-http-cache-config".to_string())
+            .spawn(move || {
+                let needs_file = {
+                    let state = shared.state.lock().expect("HTTP stream cache poisoned");
+                    if shared.cache_config_generation.load(Ordering::Acquire) != generation {
+                        return;
+                    }
+                    state.disk_cache.is_none()
+                };
+                let config = HttpCacheConfig::from_playback_config(&cache_config);
+                let candidate = if needs_file {
+                    config.disk_cache_bytes.and_then(|limit| {
+                        super::HttpDiskCache::new(
+                            limit,
+                            config.cache_dir.clone(),
+                            config.unlink_files,
+                        )
+                    })
+                } else {
+                    None
+                };
+                let mut state = shared.state.lock().expect("HTTP stream cache poisoned");
+                if shared.cache_config_generation.load(Ordering::Acquire) != generation {
+                    drop(state);
+                    drop(candidate);
+                    return;
+                }
+                state.disk_cache = state.disk_cache.take().or(candidate);
+                state.apply_prepared_cache_config(&cache_config);
+                let storage = state.disk_cache.as_ref().map(|cache| cache.storage.clone());
+                drop(state);
+                if let Some(storage) = storage {
+                    storage.maintain_file_size();
+                }
+                let status = {
+                    let mut state = shared.state.lock().expect("HTTP stream cache poisoned");
+                    if shared.cache_config_generation.load(Ordering::Acquire) != generation {
+                        return;
+                    }
+                    state.take_stream_cache_status_report()
+                };
+                shared.send_stream_cache_status(status);
+                shared.notify_ready();
+            })
+        {
+            tracing::warn!(%error, "failed to defer HTTP cache config update");
         }
     }
 
@@ -240,6 +261,9 @@ impl HttpRingCache {
             return CacheReadResult::Data(0);
         }
 
+        // An AVIO read is demand, even when a different decoded stream is full.
+        // Drop this before returning so speculative prefetch obeys watermarks again.
+        let _demand = HttpReadDemand::new(&self.shared);
         let read_started_at = Instant::now();
         let mut guard = self
             .shared
@@ -249,6 +273,7 @@ impl HttpRingCache {
         let mut total = 0usize;
         loop {
             let current_offset = offset.saturating_add(total as u64);
+            guard.expire_short_seek();
             if guard.shutdown || self.shared.control.should_stop() {
                 tracing::trace!(
                     offset,
@@ -330,7 +355,9 @@ impl HttpRingCache {
                 );
                 return CacheReadResult::Error(error.message);
             }
-            if current_offset < guard.base_offset || current_offset > guard.next_offset {
+            if (current_offset < guard.base_offset || current_offset > guard.next_offset)
+                && !guard.short_seek_may_produce(current_offset)
+            {
                 tracing::debug!(
                     offset,
                     current_offset,
@@ -430,7 +457,7 @@ impl HttpRingCache {
                     eof = guard.eof,
                     wait_position = wait_observation.position.as_str(),
                     side_download_pending = wait_observation.side_download_pending,
-                    output_backpressure_paused = wait_observation.output_backpressure_paused,
+                    demux_prefetch_paused = wait_observation.demux_prefetch_paused,
                     "HTTP stream cache read wait state"
                 );
             }
@@ -619,8 +646,9 @@ impl HttpRingCache {
             shared: Arc::new(HttpRingCacheShared {
                 state: Mutex::new(state),
                 ready: Condvar::new(),
-                output_backpressure_paused: AtomicBool::new(false),
                 demux_high_water_paused: AtomicBool::new(false),
+                recovery_input_required: AtomicBool::new(false),
+                active_readers: AtomicU64::new(0),
                 cache_config_generation: AtomicU64::new(0),
                 input_progress_generation: AtomicU64::new(0),
                 control: Arc::new(FfmpegControl::new(PlaybackSessionId::default())),
@@ -714,24 +742,19 @@ impl HttpRingCache {
 }
 
 fn demux_high_water_prefetch_should_pause(
-    currently_paused: bool,
-    total_bytes: usize,
+    forward_bytes: usize,
     memory_limit_bytes: usize,
     prefetch_queue_full: bool,
     underrun: bool,
 ) -> bool {
-    if underrun || memory_limit_bytes == 0 {
+    if underrun {
         return false;
     }
-    if prefetch_queue_full {
-        return true;
-    }
-
-    let (numerator, denominator) = if currently_paused { (3, 4) } else { (9, 10) };
-    let threshold = memory_limit_bytes
-        .saturating_mul(numerator)
-        .div_ceil(denominator);
-    total_bytes >= threshold
+    // The demuxer owns the media byte/time limit. A second 90%/75% band here
+    // stalls refill after a cached seek and drains the live HTTP response into
+    // tiny demand reads. Resume as soon as demux has room, including when an
+    // explicit time target (without a byte limit) stops prefetch.
+    prefetch_queue_full || (memory_limit_bytes > 0 && forward_bytes >= memory_limit_bytes)
 }
 
 impl HttpRingCacheShared {
@@ -739,26 +762,45 @@ impl HttpRingCacheShared {
         &self,
         offset: u64,
         data: &[u8],
+        range_kind: HttpCacheRangeKind,
     ) -> Option<PendingHttpDiskCacheWrite> {
-        let file = {
-            let guard = self.state.lock().expect("HTTP stream cache poisoned");
-            guard
-                .disk_cache_writable
-                .then(|| {
-                    guard
-                        .disk_cache
-                        .as_ref()
-                        .map(|cache| Arc::clone(&cache.file))
-                })
-                .flatten()
-        }?;
-        let result = HttpDiskCache::write_file_at(&file, offset, data);
-        Some(PendingHttpDiskCacheWrite { file, result })
+        // Media payloads are stored by the demux cache. Keep the small file
+        // header and explicit metadata probes, not a second copy of the movie.
+        let data = if range_kind == HttpCacheRangeKind::TailMetadataProbe {
+            data
+        } else {
+            let remaining = HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES.checked_sub(offset)?;
+            &data[..data.len().min(remaining as usize)]
+        };
+        let (block, storage) = {
+            let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+            if !guard.disk_cache_writable {
+                return None;
+            }
+            let cache = guard.disk_cache.as_mut()?;
+            (
+                cache.reserve_write(offset, data.len())?,
+                cache.storage.clone(),
+            )
+        };
+        let result = block.write(data);
+        if !storage.accepts(&block) {
+            drop(block);
+            storage.maintain_file_size();
+            return None;
+        }
+        Some(PendingHttpDiskCacheWrite {
+            block,
+            result,
+            storage,
+        })
     }
 
     fn prefetch_paused_by_downstream(&self) -> bool {
-        self.output_backpressure_paused.load(Ordering::Acquire)
-            || self.demux_high_water_paused.load(Ordering::Acquire)
+        let input_required = self.active_readers.load(Ordering::Acquire) > 0
+            || self.recovery_input_required.load(Ordering::Acquire)
+            || self.control.is_output_rebuffer_paused();
+        !input_required && self.demux_high_water_paused.load(Ordering::Acquire)
     }
 
     fn notify_ready(&self) {
@@ -788,12 +830,59 @@ impl HttpRingCacheShared {
     }
 
     pub(in crate::player::backend::ffmpeg::avio) fn take_restart_offset(&self) -> Option<u64> {
+        let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+        let request = guard.restart_request.take()?;
+        guard.restart_at_with_kind(request.offset, request.range_kind);
+        self.notify_ready();
+        Some(request.offset)
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn download_generation(&self) -> u64 {
         self.state
             .lock()
             .expect("HTTP stream cache poisoned")
-            .restart_request
-            .take()
-            .map(|request| request.offset)
+            .request_generation
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn set_download_active(
+        &self,
+        generation: u64,
+        active: bool,
+    ) {
+        let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+        if generation == guard.request_generation {
+            guard.continuous_request_active = active;
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn begin_download_at(
+        &self,
+        offset: u64,
+    ) -> Option<u64> {
+        let guard = self.state.lock().expect("HTTP stream cache poisoned");
+        (offset == guard.next_offset && guard.restart_request.is_none())
+            .then_some(guard.request_generation)
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn download_offset(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("HTTP stream cache poisoned")
+            .next_offset
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn request_cancelled(
+        &self,
+        generation: u64,
+        side: Option<CacheRestartRequest>,
+    ) -> bool {
+        let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+        guard.expire_short_seek();
+        guard.shutdown
+            || self.control.should_stop()
+            || generation != guard.request_generation
+            || (side.is_none() && guard.restart_request.is_some())
+            || side.is_some_and(|request| !guard.side_download_active.contains(&request))
     }
 
     pub(in crate::player::backend::ffmpeg::avio) fn set_error_at(
@@ -817,6 +906,8 @@ impl HttpRingCacheShared {
     pub(in crate::player::backend::ffmpeg::avio) fn wait_for_retry_delay(
         &self,
         delay: Duration,
+        generation: u64,
+        side: Option<CacheRestartRequest>,
     ) -> bool {
         let deadline = Instant::now()
             .checked_add(delay)
@@ -825,6 +916,12 @@ impl HttpRingCacheShared {
         loop {
             if guard.shutdown || self.control.should_stop() {
                 return false;
+            }
+            if guard.restart_request.is_some()
+                || guard.request_generation != generation
+                || side.is_some_and(|request| !guard.side_download_active.contains(&request))
+            {
+                return true;
             }
             let now = Instant::now();
             if now >= deadline {
@@ -876,14 +973,18 @@ impl HttpRingCacheShared {
         }
     }
 
-    pub(in crate::player::backend::ffmpeg::avio) fn mark_eof(&self) {
+    pub(in crate::player::backend::ffmpeg::avio) fn mark_eof(&self, generation: u64) -> bool {
         let status = {
             let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+            if guard.request_generation != generation || guard.restart_request.is_some() {
+                return false;
+            }
             guard.eof = true;
             guard.take_stream_cache_status_report()
         };
         self.send_stream_cache_status(status);
         self.notify_ready();
+        true
     }
 
     pub(in crate::player::backend::ffmpeg::avio) fn wait_for_restart_after_eof(
@@ -912,6 +1013,9 @@ impl HttpRingCacheShared {
                 return None;
             }
             if let Some(request) = guard.side_download_requests.pop_front() {
+                if request.generation != guard.request_generation {
+                    continue;
+                }
                 guard.side_download_active.push(request);
                 return Some(request);
             }
@@ -941,6 +1045,12 @@ impl HttpRingCacheShared {
     ) {
         let (status, affects_reader) = {
             let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+            if request.generation != guard.request_generation
+                || !guard.side_download_active.contains(&request)
+            {
+                guard.finish_side_download_request(request, false);
+                return;
+            }
             let request_end = request
                 .offset
                 .saturating_add(guard.side_range_request_bytes(request.range_kind).max(1));
@@ -975,10 +1085,14 @@ impl HttpRingCacheShared {
 
     pub(in crate::player::backend::ffmpeg::avio) fn set_content_len(
         &self,
+        generation: u64,
         content_len: Option<u64>,
     ) {
         if let Some(content_len) = content_len {
             let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+            if generation != guard.request_generation {
+                return;
+            }
             guard.content_len = Some(content_len);
             self.notify_ready();
         }
@@ -1057,14 +1171,23 @@ impl HttpRingCacheShared {
         &self,
         offset: u64,
     ) -> CacheAppendPermit {
+        self.wait_for_download_capacity(offset, None)
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn wait_for_download_capacity(
+        &self,
+        offset: u64,
+        generation: Option<u64>,
+    ) -> CacheAppendPermit {
         let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
         let mut logged_prefetch_pause = false;
         let mut prefetch_pause_started_at = None;
         let mut next_prefetch_pause_log_at = None;
-        let mut output_backpressure_pause_started_at = None;
-        let mut next_output_backpressure_log_at = None;
-        let mut output_backpressure_waits = 0u64;
+        let mut demux_prefetch_pause_started_at = None;
+        let mut next_demux_prefetch_log_at = None;
+        let mut demux_prefetch_waits = 0u64;
         loop {
+            guard.expire_short_seek();
             if guard.shutdown || self.control.should_stop() {
                 return CacheAppendPermit::Stopped;
             }
@@ -1072,6 +1195,11 @@ impl HttpRingCacheShared {
                 guard.restart_at_with_kind(request.offset, request.range_kind);
                 self.notify_ready();
                 return CacheAppendPermit::Restart(request.offset);
+            }
+            if offset != guard.next_offset
+                || generation.is_some_and(|generation| generation != guard.request_generation)
+            {
+                return CacheAppendPermit::Restart(guard.next_offset);
             }
             if let Some(source) = guard.take_retained_playback_splice_source(offset) {
                 let (next_guard, next_offset) =
@@ -1084,27 +1212,27 @@ impl HttpRingCacheShared {
             }
             if self.prefetch_paused_by_downstream() {
                 let now = Instant::now();
-                let started_at = *output_backpressure_pause_started_at.get_or_insert(now);
-                output_backpressure_waits = output_backpressure_waits.saturating_add(1);
-                if next_output_backpressure_log_at.is_none_or(|deadline| now >= deadline) {
+                let started_at = *demux_prefetch_pause_started_at.get_or_insert(now);
+                demux_prefetch_waits = demux_prefetch_waits.saturating_add(1);
+                if next_demux_prefetch_log_at.is_none_or(|deadline| now >= deadline) {
                     tracing::debug!(
                         offset,
                         paused_ms =
                             now.saturating_duration_since(started_at).as_secs_f64() * 1000.0,
-                        wait_count = output_backpressure_waits,
+                        wait_count = demux_prefetch_waits,
                         cached_bytes = guard.cached_bytes(),
                         reader_offset = guard.reader_offset,
-                        reason = "output_gate_and_decoder_queue_full",
-                        "HTTP stream cache prefetch paused by output backpressure"
+                        reason = "demux_prefetch_limit",
+                        "HTTP stream cache prefetch paused at demux limit"
                     );
-                    next_output_backpressure_log_at = now.checked_add(Duration::from_secs(1));
+                    next_demux_prefetch_log_at = now.checked_add(Duration::from_secs(1));
                 }
                 guard = self.wait_for_ready_change(guard, HTTP_CACHE_WAIT_INTERVAL);
                 continue;
             }
-            output_backpressure_pause_started_at = None;
-            next_output_backpressure_log_at = None;
-            output_backpressure_waits = 0;
+            demux_prefetch_pause_started_at = None;
+            next_demux_prefetch_log_at = None;
+            demux_prefetch_waits = 0;
             let capacity = guard.append_capacity_from(offset);
             if capacity > 0 {
                 return CacheAppendPermit::Ready(capacity);
@@ -1220,37 +1348,53 @@ impl HttpRingCacheShared {
         self.send_stream_cache_status(status);
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::avio) fn append_or_restart(
         &self,
         offset: u64,
         data: &[u8],
     ) -> CacheAppendResult {
+        self.append_download_bytes(self.download_generation(), offset, data)
+    }
+
+    pub(in crate::player::backend::ffmpeg::avio) fn append_download_bytes(
+        &self,
+        generation: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> CacheAppendResult {
         let prepared = PreparedByteAppend::from_bytes(data);
-        let disk_write = self.write_disk_cache_outside_state_lock(offset, data);
-        let (result, status) = {
-            let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
-            if guard.shutdown || self.control.should_stop() {
-                return CacheAppendResult::Stopped;
-            }
-            if let Some(request) = guard.restart_request.take() {
-                guard.restart_at_with_kind(request.offset, request.range_kind);
-                self.notify_ready();
-                return CacheAppendResult::Restart(request.offset);
-            }
-            if !guard.append_prepared_at_after_disk_write(offset, data, prepared, disk_write) {
-                return CacheAppendResult::Restart(offset);
-            }
-            guard.clear_read_error_covered_by(offset, data.len());
-            (
-                CacheAppendResult::Appended,
-                guard.take_stream_cache_status_report(),
-            )
-        };
-        self.input_progress_generation
-            .fetch_add(1, Ordering::AcqRel);
-        self.notify_ready();
-        self.send_cache_events(status);
-        result
+        let disk_write =
+            self.write_disk_cache_outside_state_lock(offset, data, HttpCacheRangeKind::Playback);
+        finish_http_disk_write(disk_write, |disk_write| {
+            let (result, status) = {
+                let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+                if guard.shutdown || self.control.should_stop() {
+                    return CacheAppendResult::Stopped;
+                }
+                if let Some(request) = guard.restart_request.take() {
+                    guard.restart_at_with_kind(request.offset, request.range_kind);
+                    self.notify_ready();
+                    return CacheAppendResult::Restart(request.offset);
+                }
+                if guard.request_generation != generation {
+                    return CacheAppendResult::Restart(guard.next_offset);
+                }
+                if !guard.append_prepared_at_after_disk_write(offset, data, prepared, disk_write) {
+                    return CacheAppendResult::Restart(offset);
+                }
+                guard.clear_read_error_covered_by(offset, data.len());
+                (
+                    CacheAppendResult::Appended,
+                    guard.take_stream_cache_status_report(),
+                )
+            };
+            self.input_progress_generation
+                .fetch_add(1, Ordering::AcqRel);
+            self.notify_ready();
+            self.send_cache_events(status);
+            result
+        })
     }
 
     pub(in crate::player::backend::ffmpeg::avio) fn append_side_download_or_stop(
@@ -1260,28 +1404,64 @@ impl HttpRingCacheShared {
         data: &[u8],
     ) -> CacheAppendResult {
         let prepared = PreparedByteAppend::from_bytes(data);
-        let disk_write = self.write_disk_cache_outside_state_lock(offset, data);
-        let status = {
-            let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
-            if guard.shutdown || self.control.should_stop() {
-                return CacheAppendResult::Stopped;
-            }
-            if !guard.side_download_active.contains(&request) {
-                return CacheAppendResult::Stopped;
-            }
-            if !guard.append_retained_prepared_at_protected_after_disk_write(
-                offset, data, prepared, request, disk_write,
-            ) {
-                return CacheAppendResult::Restart(offset);
-            }
-            guard.clear_read_error_covered_by(offset, data.len());
-            guard.take_stream_cache_status_report()
-        };
-        self.input_progress_generation
-            .fetch_add(1, Ordering::AcqRel);
-        self.notify_ready();
-        self.send_cache_events(status);
-        CacheAppendResult::Appended
+        let disk_write = self.write_disk_cache_outside_state_lock(offset, data, request.range_kind);
+        finish_http_disk_write(disk_write, |disk_write| {
+            let status = {
+                let mut guard = self.state.lock().expect("HTTP stream cache poisoned");
+                if guard.shutdown || self.control.should_stop() {
+                    return CacheAppendResult::Stopped;
+                }
+                if !guard.side_download_active.contains(&request) {
+                    return CacheAppendResult::Stopped;
+                }
+                if guard.request_generation != request.generation {
+                    return CacheAppendResult::Stopped;
+                }
+                if !guard.append_retained_prepared_at_protected_after_disk_write(
+                    offset, data, prepared, request, disk_write,
+                ) {
+                    return CacheAppendResult::Restart(offset);
+                }
+                guard.clear_read_error_covered_by(offset, data.len());
+                guard.take_stream_cache_status_report()
+            };
+            self.input_progress_generation
+                .fetch_add(1, Ordering::AcqRel);
+            self.notify_ready();
+            self.send_cache_events(status);
+            CacheAppendResult::Appended
+        })
+    }
+}
+
+// Run after publication or rejection has released the last write lease and
+// the HTTP state lock, including restart/shutdown/changed-quota early exits.
+pub(in crate::player::backend::ffmpeg::avio::cache) fn finish_http_disk_write<T>(
+    write: Option<PendingHttpDiskCacheWrite>,
+    publish: impl FnOnce(Option<PendingHttpDiskCacheWrite>) -> T,
+) -> T {
+    let storage = write.as_ref().map(|write| write.storage.clone());
+    let result = publish(write);
+    if let Some(storage) = storage {
+        storage.maintain_file_size();
+    }
+    result
+}
+
+struct HttpReadDemand<'a>(&'a HttpRingCacheShared);
+
+impl<'a> HttpReadDemand<'a> {
+    fn new(shared: &'a HttpRingCacheShared) -> Self {
+        shared.active_readers.fetch_add(1, Ordering::AcqRel);
+        shared.notify_ready();
+        Self(shared)
+    }
+}
+
+impl Drop for HttpReadDemand<'_> {
+    fn drop(&mut self) {
+        self.0.active_readers.fetch_sub(1, Ordering::AcqRel);
+        self.0.notify_ready();
     }
 }
 

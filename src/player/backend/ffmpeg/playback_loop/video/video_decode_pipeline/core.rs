@@ -3,8 +3,10 @@ use super::*;
 impl VideoDecodePipeline {
     pub(in super::super) fn spawn(decoder: Decoder) -> std::result::Result<Self, String> {
         let requested_hardware_mode = decoder.hardware_decode_mode();
+        let frame_drop = VideoDecodeFrameDrop::default();
         Ok(Self {
-            worker: VideoDecodeWorker::spawn(decoder)?,
+            worker: VideoDecodeWorker::spawn(decoder, frame_drop.epoch_handle())?,
+            frame_drop,
             requested_hardware_mode,
             decoder_epoch: 1,
             admitted_video_sequence: 0,
@@ -40,6 +42,9 @@ impl VideoDecodePipeline {
 
     pub(in super::super) fn snapshot(&self) -> VideoDecodeWorkerSnapshot {
         let mut snapshot = self.worker.snapshot();
+        snapshot.decoder_framedrop_enabled = self.frame_drop.enabled();
+        snapshot.decoder_drop_budget = self.frame_drop.remaining_budget();
+        snapshot.decoder_drop_stats = self.frame_drop.stats();
         let (pending_input_packets, pending_input_capacity) = video_decode_pending_input_snapshot(
             self.packets.pending_input_count(),
             self.hevc_hw_replay.len(),
@@ -91,26 +96,49 @@ impl VideoDecodePipeline {
         self.worker.set_skip_nonref_frames(enabled)
     }
 
+    pub(in super::super) fn set_decoder_framedrop(&mut self, enabled: bool) {
+        if self.frame_drop.enabled() != enabled {
+            tracing::debug!(
+                decoder_framedrop_enabled = enabled,
+                "updated ordinary-playback decoder frame-drop policy"
+            );
+        }
+        self.frame_drop.set_enabled(enabled);
+    }
+
+    pub(in super::super) fn decoder_framedrop_enabled(&self) -> bool {
+        self.frame_drop.enabled()
+    }
+
     pub(in super::super) fn try_enqueue_packet(
         &mut self,
         packet: &AvPacket,
         generation: u64,
+        drop_policy: VideoDecodeDropPolicy,
     ) -> std::result::Result<VideoDecodeEnqueueResult, String> {
-        self.worker.try_enqueue_packet(packet, generation)
+        self.worker
+            .try_enqueue_packet(packet, generation, drop_policy)
     }
 
     pub(in super::super) fn try_enqueue_pending_packet(
         &mut self,
-        pending_packet: PendingVideoDecodePacket,
+        mut pending_packet: PendingVideoDecodePacket,
         session_id: PlaybackSessionId,
     ) -> std::result::Result<DecodePacketAdmissionStatus, String> {
         if self.packets.has_pending_input() || !self.hevc_hw_replay.is_empty() {
             return Ok(self.buffer_pending_input_or_backpressure(pending_packet, session_id));
         }
-        let enqueue_result =
-            self.try_enqueue_packet(&pending_packet.packet, pending_packet.generation)?;
+        pending_packet.drop_policy = self
+            .frame_drop
+            .submission_policy(pending_packet.drop_policy);
+        let enqueue_result = self.try_enqueue_packet(
+            &pending_packet.packet,
+            pending_packet.generation,
+            pending_packet.drop_policy,
+        )?;
         match enqueue_result {
             VideoDecodeEnqueueResult::Queued => {
+                self.frame_drop.submitted(pending_packet.drop_policy);
                 self.push_in_flight(pending_packet, session_id);
                 Ok(DecodePacketAdmissionStatus::Queued)
             }
@@ -124,13 +152,20 @@ impl VideoDecodePipeline {
         &mut self,
         session_id: PlaybackSessionId,
     ) -> std::result::Result<DecodeInputRetryStatus, String> {
-        let Some(pending_packet) = self.take_pending_input() else {
+        let Some(mut pending_packet) = self.take_pending_input() else {
             return Ok(DecodeInputRetryStatus::Idle);
         };
-        let enqueue_result =
-            self.try_enqueue_packet(&pending_packet.packet, pending_packet.generation)?;
+        pending_packet.drop_policy = self
+            .frame_drop
+            .submission_policy(pending_packet.drop_policy);
+        let enqueue_result = self.try_enqueue_packet(
+            &pending_packet.packet,
+            pending_packet.generation,
+            pending_packet.drop_policy,
+        )?;
         match enqueue_result {
             VideoDecodeEnqueueResult::Queued => {
+                self.frame_drop.submitted(pending_packet.drop_policy);
                 self.push_in_flight(pending_packet, session_id);
                 Ok(DecodeInputRetryStatus::Queued)
             }

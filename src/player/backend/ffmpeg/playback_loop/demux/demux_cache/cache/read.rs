@@ -373,6 +373,16 @@ impl DemuxPacketCache {
                 return (DemuxReadResult::Packet(packet), Some(stream_offset), timing);
             }
             let activate_started_at = Instant::now();
+            if !guard.disk_read_requests.is_empty() {
+                self.shared.notify_ready();
+                if !wait_for_data {
+                    return (DemuxReadResult::WouldBlock, None, timing);
+                }
+                guard = self
+                    .shared
+                    .wait_for_ready_change(guard, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
+                continue;
+            }
             if guard.activate_detached_append_range() {
                 timing.refresh_reader_tracking += activate_started_at.elapsed();
                 self.shared.notify_ready();

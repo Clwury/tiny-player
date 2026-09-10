@@ -1,3 +1,5 @@
+//! Full settings for development and playback diagnostics.
+
 use std::path::{Path, PathBuf};
 
 use gpui::{
@@ -18,12 +20,16 @@ use crate::{
 use super::{
     editor::{Editor, EditorEvent},
     scrollbar::Scrollbar,
-    settings_controls::{DropdownState, NumberControl, NumberRange, SettingsDropdown},
+    settings_controls::{
+        DropdownState, NumberControl, NumberRange, disk_cache_capacity_control,
+        disk_cache_capacity_input, selector_row, settings_category_button, settings_sidebar,
+        toggle_switch, track_language_selector,
+    },
+    settings_dialog::SettingsChanged,
     tooltip::text_tooltip,
 };
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
-const BYTES_PER_GIB: u64 = 1024 * BYTES_PER_MIB;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SettingsCategory {
@@ -148,6 +154,7 @@ impl SettingItem {
 
 #[derive(Clone, Copy)]
 enum ToggleSetting {
+    DecoderFramedrop,
     DiskCache,
     CachePause,
     CachePauseInitial,
@@ -177,6 +184,7 @@ pub struct PlaybackSettingsDialogState {
     adaptive_readahead: bool,
     automatic_hysteresis: bool,
     demuxer_cache_wait: bool,
+    decoder_framedrop: bool,
     total_cache_mib: Entity<Editor>,
     http_cache_mib: Entity<Editor>,
     http_cache_chunk_mib: Entity<Editor>,
@@ -191,8 +199,6 @@ pub struct PlaybackSettingsDialogState {
     max_ranges: Entity<Editor>,
     disk_cache_gib: Entity<Editor>,
 }
-
-pub struct SettingsChanged;
 
 impl EventEmitter<SettingsChanged> for PlaybackSettingsDialogState {}
 
@@ -244,6 +250,7 @@ impl PlaybackSettingsDialogState {
             adaptive_readahead: config.adaptive_readahead,
             automatic_hysteresis: config.automatic_hysteresis,
             demuxer_cache_wait: config.demuxer_cache_wait,
+            decoder_framedrop: config.decoder_framedrop,
             total_cache_mib: number_input(
                 "总缓存上限（MiB，0=独立上限）",
                 bytes_to_mib(config.total_cache_max_bytes),
@@ -320,10 +327,14 @@ impl PlaybackSettingsDialogState {
                 },
                 cx,
             ),
-            disk_cache_gib: number_input(
-                "磁盘缓存上限（GiB）",
-                bytes_to_gib(config.disk_cache_max_bytes),
-                |config, value| config.disk_cache_max_bytes = value.saturating_mul(BYTES_PER_GIB),
+            disk_cache_gib: disk_cache_capacity_input(
+                config.disk_cache_max_bytes,
+                |this, bytes, cx| {
+                    if this.base_config.disk_cache_max_bytes != bytes {
+                        this.base_config.disk_cache_max_bytes = bytes;
+                        this.changed(cx);
+                    }
+                },
                 cx,
             ),
         }
@@ -383,6 +394,7 @@ impl PlaybackSettingsDialogState {
         config.adaptive_readahead = self.adaptive_readahead;
         config.automatic_hysteresis = self.automatic_hysteresis;
         config.demuxer_cache_wait = self.demuxer_cache_wait;
+        config.decoder_framedrop = self.decoder_framedrop;
         config.normalized()
     }
 
@@ -444,19 +456,7 @@ impl PlaybackSettingsDialogState {
         cx: &App,
     ) -> impl IntoElement {
         let theme = theme::get(cx);
-        div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .w(px(226.0))
-            .p_2p5()
-            .gap_4()
-            .border_r_1()
-            .border_color(theme.title_bar_border)
-            .bg(theme.panel_background)
-            .when(rounded_window, |this| {
-                this.rounded_bl(theme.radius_lg).overflow_hidden()
-            })
+        settings_sidebar(rounded_window, cx)
             .child(
                 div()
                     .flex()
@@ -484,45 +484,8 @@ impl PlaybackSettingsDialogState {
                     .children(SettingsCategory::ALL.into_iter().map(|category| {
                         let selected = !searching && self.category == category;
                         let dialog = dialog.clone();
-                        div()
-                            .id(category.title())
-                            .role(gpui::Role::Button)
-                            .aria_label(category.title())
-                            .debug_selector(move || {
-                                format!("settings-category-{}", category.title())
-                            })
-                            .flex()
-                            .items_center()
-                            .h(px(28.0))
-                            .px_2()
-                            .gap_2()
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_sm()
-                            .text_color(if selected {
-                                theme.accent_text
-                            } else {
-                                theme.muted_foreground
-                            })
-                            .when(selected, |this| {
-                                this.bg(theme.element_selected)
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                            })
-                            .hover(|style| {
-                                style
-                                    .bg(if selected {
-                                        theme.element_selected_hover
-                                    } else {
-                                        theme.secondary_hover
-                                    })
-                                    .text_color(if selected {
-                                        theme.accent_text
-                                    } else {
-                                        theme.foreground
-                                    })
-                            })
-                            .child(category.title())
-                            .on_click(move |_, window, cx| {
+                        settings_category_button(category.title(), selected, cx).on_click(
+                            move |_, window, cx| {
                                 dialog.update(cx, |dialog, cx| {
                                     // Do not leave focus in an editor that disappears with its page.
                                     window.blur(cx);
@@ -534,7 +497,8 @@ impl PlaybackSettingsDialogState {
                                     dialog.scroll_handle.set_offset(point(px(0.0), px(0.0)));
                                     cx.notify();
                                 });
-                            })
+                            },
+                        )
                     })),
             )
     }
@@ -665,8 +629,15 @@ impl PlaybackSettingsDialogState {
     fn setting_items(&self, dialog: Entity<Self>, cx: &App) -> Vec<SettingItem> {
         use SettingsCategory::{Appearance, Disk, General, Memory, Playback, Readahead};
 
-        let toggle =
-            |setting, label, selected| toggle_switch(dialog.clone(), setting, label, selected, cx);
+        let toggle = |setting, label, selected| {
+            let dialog = dialog.clone();
+            toggle_switch(
+                label,
+                selected,
+                move |cx| dialog.update(cx, |dialog, cx| dialog.toggle(setting, cx)),
+                cx,
+            )
+        };
         let cache_dir = SettingItem::new(
             Disk,
             "存储与清理",
@@ -701,10 +672,9 @@ impl PlaybackSettingsDialogState {
                 "音轨语言",
                 "播放时优先选择此语言；Default 或无匹配时使用默认音轨。",
                 "audio preferred language default 音频 语言",
-                selector_row(
+                track_language_selector(
                     ("audio-language-dropdown", "音轨语言"),
                     self.dropdown.clone(),
-                    TrackLanguage::ALL.map(|language| (language.id(), language.label(), language)),
                     self.track_languages.audio,
                     {
                         let dialog = dialog.clone();
@@ -722,10 +692,9 @@ impl PlaybackSettingsDialogState {
                 "字幕语言",
                 "播放时优先选择此语言；Default 或无匹配时使用默认字幕，可在详情页手动选择。",
                 "subtitle preferred language default 字幕 语言",
-                selector_row(
+                track_language_selector(
                     ("subtitle-language-dropdown", "字幕语言"),
                     self.dropdown.clone(),
-                    TrackLanguage::ALL.map(|language| (language.id(), language.label(), language)),
                     self.track_languages.subtitle,
                     {
                         let dialog = dialog.clone();
@@ -735,6 +704,18 @@ impl PlaybackSettingsDialogState {
                             })
                         }
                     },
+                ),
+            ),
+            SettingItem::new(
+                Playback,
+                "流畅度",
+                "解码器追赶丢帧",
+                "视频落后时跳过部分解码以追赶音频，可能降低画面连贯性。默认关闭。",
+                "decoder_framedrop framedrop 解码 丢帧",
+                toggle(
+                    ToggleSetting::DecoderFramedrop,
+                    "解码器追赶丢帧",
+                    self.decoder_framedrop,
                 ),
             ),
             SettingItem::new(
@@ -863,7 +844,7 @@ impl PlaybackSettingsDialogState {
                 Memory,
                 "解复用缓存",
                 "前向缓存上限",
-                "为尚未播放的数据分配内存。0 表示用尽可用预算。",
+                "分配前向内存预算；启用磁盘缓存后按此比例扩展媒体窗口。0 表示用尽可用预算。",
                 "demuxer_max_bytes demux",
                 NumberControl::new(
                     ("demuxer-forward", "前向缓存上限"),
@@ -877,7 +858,7 @@ impl PlaybackSettingsDialogState {
                 Memory,
                 "解复用缓存",
                 "回看缓存上限",
-                "为已播放的数据保留内存。0 表示关闭。",
+                "分配回看内存预算，并确定磁盘回看空间比例。0 表示关闭。",
                 "demuxer_max_back_bytes demux",
                 NumberControl::new(
                     ("demuxer-back", "回看缓存上限"),
@@ -904,12 +885,12 @@ impl PlaybackSettingsDialogState {
             SettingItem::new(
                 Memory,
                 "解复用缓存",
-                "共享空闲回看预算",
-                "允许前向缓存使用尚未占用的回看预算。",
+                "共享空闲前向预算",
+                "允许回看缓存使用尚未占用的前向预算。",
                 "demuxer_donate_buffer demux",
                 toggle(
                     ToggleSetting::DonateBuffer,
-                    "共享空闲回看预算",
+                    "共享空闲前向预算",
                     self.demuxer_donate_buffer,
                 ),
             ),
@@ -917,7 +898,7 @@ impl PlaybackSettingsDialogState {
                 Disk,
                 "存储与清理",
                 "启用磁盘缓存",
-                "将缓存数据写入磁盘，减少内存占用。",
+                "将较远的数据存入磁盘，扩大预读和回看范围。",
                 "disk_cache",
                 toggle(ToggleSetting::DiskCache, "启用磁盘缓存", self.disk_cache),
             ),
@@ -927,12 +908,9 @@ impl PlaybackSettingsDialogState {
                 "磁盘缓存上限",
                 "限制磁盘缓存使用的空间。",
                 "disk_cache_max_bytes",
-                NumberControl::new(
-                    ("disk-cache", "磁盘缓存上限"),
+                disk_cache_capacity_control(
                     self.disk_cache_gib.clone(),
-                    "GiB",
-                    NumberRange::integer(1, u64::MAX / BYTES_PER_GIB),
-                    bytes_to_gib(self.base_config.disk_cache_max_bytes) as f64,
+                    self.base_config.disk_cache_max_bytes,
                 ),
             ),
             cache_dir,
@@ -990,7 +968,7 @@ impl PlaybackSettingsDialogState {
                 Readahead,
                 "动态调整",
                 "自适应预读",
-                "结合媒体码率与可用内存调整预读时长。",
+                "根据下载速度调整网络分段请求大小。",
                 "adaptive_readahead",
                 toggle(
                     ToggleSetting::AdaptiveReadahead,
@@ -1053,6 +1031,7 @@ impl PlaybackSettingsDialogState {
 
     fn toggle(&mut self, setting: ToggleSetting, cx: &mut Context<Self>) {
         match setting {
+            ToggleSetting::DecoderFramedrop => self.decoder_framedrop = !self.decoder_framedrop,
             ToggleSetting::DiskCache => self.disk_cache = !self.disk_cache,
             ToggleSetting::CachePause => self.cache_pause = !self.cache_pause,
             ToggleSetting::CachePauseInitial => {
@@ -1145,10 +1124,6 @@ fn decimal_input(
 
 fn bytes_to_mib(bytes: u64) -> u64 {
     bytes / BYTES_PER_MIB
-}
-
-fn bytes_to_gib(bytes: u64) -> u64 {
-    bytes / BYTES_PER_GIB
 }
 
 fn parse_seconds(value: &str) -> Option<f64> {
@@ -1270,102 +1245,17 @@ fn unlink_selector(
     )
 }
 
-fn selector_row<T: Copy + PartialEq + 'static, const N: usize>(
-    header: (&'static str, &'static str),
-    state: Entity<DropdownState>,
-    options: [(&'static str, &'static str, T); N],
-    selected: T,
-    on_select: impl Fn(T, &mut App) + 'static,
-) -> impl IntoElement {
-    let selected_index = options
-        .iter()
-        .position(|(_, _, value)| *value == selected)
-        .unwrap_or(0);
-    SettingsDropdown::new(
-        header.0,
-        header.1,
-        options.map(|(id, label, _)| (id, label)),
-        selected_index,
-        state,
-        move |index, cx| on_select(options[index].2, cx),
-    )
-}
-
-fn toggle_switch(
-    dialog: Entity<PlaybackSettingsDialogState>,
-    setting: ToggleSetting,
-    label: &'static str,
-    selected: bool,
-    cx: &App,
-) -> impl IntoElement {
-    let theme = theme::get(cx);
-    div()
-        .id(label)
-        .role(gpui::Role::Switch)
-        .aria_label(label)
-        .aria_toggled(if selected {
-            gpui::Toggled::True
-        } else {
-            gpui::Toggled::False
-        })
-        .debug_selector(move || format!("settings-toggle-{label}"))
-        .group("settings-toggle")
-        .flex()
-        .items_center()
-        .p(px(3.0))
-        .cursor_pointer()
-        .child(
-            div()
-                .id("switch-track")
-                .flex()
-                .items_center()
-                .w(px(32.0))
-                .h(px(20.0))
-                .px(px(2.0))
-                .rounded_full()
-                .border_1()
-                .border_color(if selected {
-                    theme.input_border_focused
-                } else {
-                    theme.input_border
-                })
-                .bg(if selected {
-                    theme.accent
-                } else {
-                    theme.input_background
-                })
-                .group_hover("settings-toggle", |style| {
-                    style
-                        .bg(if selected {
-                            theme.accent_hover
-                        } else {
-                            theme.secondary_hover
-                        })
-                        .border_color(theme.accent)
-                })
-                .when(selected, |this| this.justify_end())
-                .child(div().size(px(12.0)).rounded_full().bg(if selected {
-                    theme.accent_foreground
-                } else {
-                    theme.muted_foreground
-                })),
-        )
-        .on_click(move |_, _, cx| dialog.update(cx, |dialog, cx| dialog.toggle(setting, cx)))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::{
-        BYTES_PER_GIB, BYTES_PER_MIB, bytes_to_gib, bytes_to_mib, format_seconds, parse_seconds,
-        resolved_cache_directories,
+        BYTES_PER_MIB, bytes_to_mib, format_seconds, parse_seconds, resolved_cache_directories,
     };
 
     #[test]
     fn byte_units_round_down_for_display() {
         assert_eq!(bytes_to_mib(3 * BYTES_PER_MIB + 1), 3);
-        assert_eq!(bytes_to_gib(2 * BYTES_PER_GIB + 1), 2);
     }
 
     #[test]
@@ -1386,7 +1276,7 @@ mod tests {
 
     #[test]
     fn cache_directories_resolve_the_default_and_respect_backend_overrides() {
-        let default_dir = std::env::temp_dir().join(crate::app_metadata::APP_ID);
+        let default_dir = crate::app_metadata::default_playback_cache_dir();
         assert_eq!(
             resolved_cache_directories(None, [None, None]),
             [default_dir.clone(), default_dir],

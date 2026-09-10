@@ -6,6 +6,48 @@ use super::super::{
 use crate::player::backend::PlaybackCacheByteRange;
 
 #[test]
+fn short_forward_seek_reads_through_the_active_response_without_a_side_request() {
+    let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(1_000_000));
+    assert!(state.append_at(0, &[1; 4096]));
+    state.continuous_request_active = true;
+    state.note_seek_offset(8192, HttpCacheRangeKind::Playback);
+    assert!(state.restart_request.is_none());
+    assert!(!state.queue_read_miss_at(8192));
+    assert_eq!(state.base_offset, 0);
+    assert!(state.append_at(4096, &[2; 8192]));
+    state.expire_short_seek();
+    let mut bytes = [0; 1];
+    assert_eq!(state.copy_available(8192, &mut bytes), Some(1));
+    assert_eq!(bytes, [2]);
+    assert!(state.short_seek_target.is_none());
+}
+
+#[test]
+fn stalled_short_seek_falls_back_to_a_new_range_at_the_target() {
+    let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(1_000_000));
+    assert!(state.append_at(0, &[1; 4096]));
+    state.continuous_request_active = true;
+    state.note_seek_offset(8192, HttpCacheRangeKind::Playback);
+    let generation = state.request_generation;
+    state.short_seek_target.as_mut().unwrap().1 -= std::time::Duration::from_secs(1);
+    state.expire_short_seek();
+    assert_eq!(state.restart_request.unwrap().offset, 8192);
+    assert_ne!(state.request_generation, generation);
+    assert!(state.short_seek_target.is_none());
+}
+
+#[test]
+fn backward_far_and_inactive_seeks_restart_instead_of_waiting_for_read_through() {
+    for (target, active) in [(0, true), (500_000, true), (8192, false)] {
+        let mut state = HttpRingCacheState::new(4096).with_content_len_hint(Some(1_000_000));
+        assert!(state.append_at(4096, &[1; 1024]));
+        state.continuous_request_active = active;
+        state.note_seek_offset(target, HttpCacheRangeKind::Playback);
+        assert_eq!(state.restart_request.unwrap().offset, target);
+    }
+}
+
+#[test]
 fn http_cache_state_queues_tail_side_download_without_active_restart() {
     let mut state = HttpRingCacheState::new(100).with_content_len_hint(Some(1_000));
     assert!(state.append_at(100, b"abcdef"));
@@ -22,6 +64,7 @@ fn http_cache_state_queues_tail_side_download_without_active_restart() {
             .copied()
             .collect::<Vec<_>>(),
         vec![CacheRestartRequest {
+            generation: 0,
             offset: 990,
             range_kind: HttpCacheRangeKind::TailMetadataProbe,
         }]
@@ -45,6 +88,7 @@ fn http_cache_state_queues_playback_read_miss_without_active_restart() {
             .copied()
             .collect::<Vec<_>>(),
         vec![CacheRestartRequest {
+            generation: 0,
             offset: 500,
             range_kind: HttpCacheRangeKind::Playback,
         }]
@@ -92,6 +136,7 @@ fn http_cache_state_proactively_queues_next_playback_range() {
             .copied()
             .collect::<Vec<_>>(),
         vec![CacheRestartRequest {
+            generation: 0,
             offset: 100,
             range_kind: HttpCacheRangeKind::Playback,
         }]
@@ -110,6 +155,7 @@ fn http_cache_state_demotes_active_range_when_playback_seek_leaves_it() {
     assert_eq!(
         state.restart_request,
         Some(CacheRestartRequest {
+            generation: state.request_generation,
             offset: 500,
             range_kind: HttpCacheRangeKind::Playback,
         })
@@ -148,6 +194,7 @@ fn http_cache_state_schedules_active_continuation_after_playback_side_range() {
     assert_eq!(
         state.restart_request,
         Some(CacheRestartRequest {
+            generation: state.request_generation,
             offset: 504,
             range_kind: HttpCacheRangeKind::Playback,
         })
@@ -197,6 +244,7 @@ fn http_cache_state_does_not_schedule_stale_active_continuation_after_side_range
     assert!(state.append_at(0, &vec![0; 600]));
     state.set_reader_offset(500);
     let request = CacheRestartRequest {
+        generation: 0,
         offset: 500,
         range_kind: HttpCacheRangeKind::Playback,
     };
@@ -215,6 +263,7 @@ fn http_cache_state_schedules_backward_continuation_outside_live_active_range() 
     assert!(state.append_at(600, &[0; 100]));
     state.set_reader_offset(100);
     let request = CacheRestartRequest {
+        generation: 0,
         offset: 100,
         range_kind: HttpCacheRangeKind::Playback,
     };
@@ -226,6 +275,7 @@ fn http_cache_state_schedules_backward_continuation_outside_live_active_range() 
     assert_eq!(
         state.restart_request,
         Some(CacheRestartRequest {
+            generation: state.request_generation,
             offset: 104,
             range_kind: HttpCacheRangeKind::Playback,
         })
@@ -246,6 +296,7 @@ fn http_cache_state_backward_uncached_seek_requests_active_restart_without_side_
     assert_eq!(
         state.restart_request,
         Some(CacheRestartRequest {
+            generation: state.request_generation,
             offset: 100,
             range_kind: HttpCacheRangeKind::Playback,
         })
@@ -262,6 +313,7 @@ fn http_cache_state_latest_playback_seek_replaces_or_cancels_active_restart() {
     assert_eq!(
         state.restart_request,
         Some(CacheRestartRequest {
+            generation: state.request_generation,
             offset: 500,
             range_kind: HttpCacheRangeKind::Playback,
         })
@@ -271,6 +323,7 @@ fn http_cache_state_latest_playback_seek_replaces_or_cancels_active_restart() {
     assert_eq!(
         state.restart_request,
         Some(CacheRestartRequest {
+            generation: state.request_generation,
             offset: 600,
             range_kind: HttpCacheRangeKind::Playback,
         })
@@ -344,14 +397,17 @@ fn http_cache_state_queues_multiple_side_downloads_and_suppresses_duplicates() {
             .collect::<Vec<_>>(),
         vec![
             CacheRestartRequest {
+                generation: 0,
                 offset: 1_000,
                 range_kind: HttpCacheRangeKind::TailMetadataProbe,
             },
             CacheRestartRequest {
+                generation: 0,
                 offset: 1_000 + HTTP_CACHE_RANGE_REQUEST_BYTES / 2,
                 range_kind: HttpCacheRangeKind::TailMetadataProbe,
             },
             CacheRestartRequest {
+                generation: 0,
                 offset: 1_000 + HTTP_CACHE_RANGE_REQUEST_BYTES + 1,
                 range_kind: HttpCacheRangeKind::TailMetadataProbe,
             },
@@ -379,14 +435,17 @@ fn http_cache_state_uses_configured_side_download_range_request_budget() {
             .collect::<Vec<_>>(),
         vec![
             CacheRestartRequest {
+                generation: 0,
                 offset: 1_000,
                 range_kind: HttpCacheRangeKind::Playback,
             },
             CacheRestartRequest {
+                generation: 0,
                 offset: 1_500,
                 range_kind: HttpCacheRangeKind::Playback,
             },
             CacheRestartRequest {
+                generation: 0,
                 offset: 2_025,
                 range_kind: HttpCacheRangeKind::Playback,
             },
@@ -400,6 +459,7 @@ fn http_cache_state_preserves_protected_side_range_when_active_is_full() {
         HttpRingCacheState::new_with_cache_capacity(0, 16).with_content_len_hint(Some(1_000));
     assert!(state.append_at(0, b"abcdefghijklmnop"));
     let request = CacheRestartRequest {
+        generation: 0,
         offset: 900,
         range_kind: HttpCacheRangeKind::Playback,
     };
@@ -421,6 +481,7 @@ fn http_cache_state_trims_active_backbuffer_before_preserving_side_range() {
     assert!(state.append_at(0, b"abcdefghijklmnop"));
     state.reader_offset = 4;
     let request = CacheRestartRequest {
+        generation: 0,
         offset: 900,
         range_kind: HttpCacheRangeKind::Playback,
     };
@@ -451,6 +512,7 @@ fn http_cache_state_retained_trim_does_not_remove_protected_side_range() {
         last_used_generation: 0,
     });
     let request = CacheRestartRequest {
+        generation: 0,
         offset: 900,
         range_kind: HttpCacheRangeKind::Playback,
     };
@@ -482,6 +544,7 @@ fn http_cache_state_status_reflects_active_trim_and_protected_side_range() {
     assert!(state.append_at(0, b"abcdefghijklmnop"));
     state.reader_offset = 4;
     let request = CacheRestartRequest {
+        generation: 0,
         offset: 90,
         range_kind: HttpCacheRangeKind::TailMetadataProbe,
     };

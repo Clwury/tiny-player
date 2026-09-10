@@ -162,6 +162,20 @@ fn search_matches_chinese_and_multiple_case_insensitive_keywords() {
 }
 
 #[gpui::test]
+fn decoder_framedrop_toggle_is_off_by_default_and_saves_each_change(cx: &mut TestAppContext) {
+    let (root, cx) = settings_window(cx);
+    cx.simulate_resize(size(px(960.0), px(760.0)));
+    cx.run_until_parked();
+    click(cx, "settings-category-播放");
+    assert!(!root.read_with(cx, |root, _| root.saved.as_ref().unwrap().decoder_framedrop));
+    click(cx, "settings-toggle-解码器追赶丢帧");
+    assert!(root.read_with(cx, |root, _| root.saved.as_ref().unwrap().decoder_framedrop));
+    click(cx, "settings-toggle-解码器追赶丢帧");
+    assert!(!root.read_with(cx, |root, _| root.saved.as_ref().unwrap().decoder_framedrop));
+    assert_eq!(root.read_with(cx, |root, _| root.change_count), 2);
+}
+
+#[gpui::test]
 fn language_dropdowns_default_to_default_and_offer_all_reference_languages(
     cx: &mut TestAppContext,
 ) {
@@ -408,7 +422,7 @@ fn content_fills_window_and_scrolls_below_fixed_titlebar_at_supported_window_siz
             });
         });
         cx.run_until_parked();
-        let last_control = cx.debug_bounds("settings-toggle-共享空闲回看预算").unwrap();
+        let last_control = cx.debug_bounds("settings-toggle-共享空闲前向预算").unwrap();
         assert!(last_control.top() >= scroll.bounds().top());
         assert!(last_control.bottom() <= scroll.bounds().bottom());
         assert_eq!(cx.debug_bounds("window-control-close").unwrap(), close);

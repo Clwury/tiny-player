@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    fs::File,
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
@@ -10,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::player::backend::ffmpeg::disk_cache::{BoundedDiskFile, DiskBlock};
 use crate::player::backend::{BackendEvent, ByteCacheState, CacheUnlinkPolicy};
 
 use super::{ByteRingBuffer, FfmpegControl};
@@ -22,8 +22,9 @@ pub(in crate::player::backend::ffmpeg) struct HttpRingCache {
 pub(in crate::player::backend::ffmpeg::avio) struct HttpRingCacheShared {
     pub(in crate::player::backend::ffmpeg::avio::cache) state: Mutex<HttpRingCacheState>,
     pub(in crate::player::backend::ffmpeg::avio::cache) ready: Condvar,
-    pub(in crate::player::backend::ffmpeg::avio::cache) output_backpressure_paused: AtomicBool,
     pub(in crate::player::backend::ffmpeg::avio::cache) demux_high_water_paused: AtomicBool,
+    pub(in crate::player::backend::ffmpeg::avio::cache) recovery_input_required: AtomicBool,
+    pub(in crate::player::backend::ffmpeg::avio::cache) active_readers: AtomicU64,
     pub(in crate::player::backend::ffmpeg::avio::cache) cache_config_generation: AtomicU64,
     pub(in crate::player::backend::ffmpeg::avio::cache) input_progress_generation: AtomicU64,
     pub(in crate::player::backend::ffmpeg::avio::cache) control: Arc<FfmpegControl>,
@@ -44,6 +45,9 @@ pub(in crate::player::backend::ffmpeg) struct HttpRingCacheState {
     pub(in crate::player::backend::ffmpeg::avio::cache) pending_seek_range_kind:
         Option<(u64, HttpCacheRangeKind)>,
     pub(in crate::player::backend::ffmpeg::avio::cache) reader_offset: u64,
+    pub(in crate::player::backend::ffmpeg::avio::cache) request_generation: u64,
+    pub(in crate::player::backend::ffmpeg::avio::cache) continuous_request_active: bool,
+    pub(in crate::player::backend::ffmpeg::avio::cache) short_seek_target: Option<(u64, Instant)>,
     pub(in crate::player::backend::ffmpeg::avio::cache) byte_level_seeks: u64,
     pub(in crate::player::backend::ffmpeg::avio::cache) input_rate_samples:
         VecDeque<InputRateSample>,
@@ -90,7 +94,7 @@ pub(in crate::player::backend::ffmpeg::avio::cache) struct HttpReadWaitObservati
     pub(in crate::player::backend::ffmpeg::avio::cache) position: HttpReadWaitPosition,
     pub(in crate::player::backend::ffmpeg::avio::cache) active_range_kind: HttpCacheRangeKind,
     pub(in crate::player::backend::ffmpeg::avio::cache) prefetch_paused: bool,
-    pub(in crate::player::backend::ffmpeg::avio::cache) output_backpressure_paused: bool,
+    pub(in crate::player::backend::ffmpeg::avio::cache) demux_prefetch_paused: bool,
     pub(in crate::player::backend::ffmpeg::avio::cache) restart_pending: bool,
     pub(in crate::player::backend::ffmpeg::avio::cache) side_download_pending: bool,
     pub(in crate::player::backend::ffmpeg::avio::cache) eof: bool,
@@ -166,6 +170,7 @@ pub(in crate::player::backend::ffmpeg) enum HttpCacheRangeKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg) struct CacheRestartRequest {
+    pub(in crate::player::backend::ffmpeg) generation: u64,
     pub(in crate::player::backend::ffmpeg) offset: u64,
     pub(in crate::player::backend::ffmpeg) range_kind: HttpCacheRangeKind,
 }
@@ -207,7 +212,7 @@ pub(in crate::player::backend::ffmpeg::avio::cache) struct HttpCacheConfig {
 }
 
 pub(in crate::player::backend::ffmpeg::avio::cache) struct HttpDiskCache {
-    pub(in crate::player::backend::ffmpeg::avio::cache) file: Arc<File>,
+    pub(in crate::player::backend::ffmpeg::avio::cache) storage: BoundedDiskFile,
     pub(in crate::player::backend::ffmpeg::avio::cache) path: PathBuf,
     pub(in crate::player::backend::ffmpeg::avio::cache) ranges: Vec<HttpCachedByteRange>,
     pub(in crate::player::backend::ffmpeg::avio::cache) max_bytes: u64,
@@ -216,12 +221,13 @@ pub(in crate::player::backend::ffmpeg::avio::cache) struct HttpDiskCache {
 }
 
 pub(in crate::player::backend::ffmpeg::avio::cache) struct PendingHttpDiskCacheWrite {
-    pub(in crate::player::backend::ffmpeg::avio::cache) file: Arc<File>,
+    pub(in crate::player::backend::ffmpeg::avio::cache) storage: BoundedDiskFile,
+    pub(in crate::player::backend::ffmpeg::avio::cache) block: Arc<DiskBlock>,
     pub(in crate::player::backend::ffmpeg::avio::cache) result: std::io::Result<()>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg::avio::cache) struct HttpCachedByteRange {
+    pub(in crate::player::backend::ffmpeg::avio::cache) block: Arc<DiskBlock>,
     pub(in crate::player::backend::ffmpeg::avio::cache) start: u64,
     pub(in crate::player::backend::ffmpeg::avio::cache) end: u64,
     pub(in crate::player::backend::ffmpeg::avio::cache) last_used_generation: u64,
