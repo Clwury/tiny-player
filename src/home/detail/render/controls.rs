@@ -207,7 +207,7 @@ impl HomeContent {
                 .child(
                     div()
                         .flex()
-                        .w(px(150.0))
+                        .min_w(px(150.0))
                         .h(px(42.0))
                         .justify_center()
                         .items_center()

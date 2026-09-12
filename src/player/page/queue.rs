@@ -16,14 +16,6 @@ enum PlaybackQueueDirection {
 }
 
 impl PlaybackQueueDirection {
-    fn loading_message(self, automatic: bool) -> &'static str {
-        match (self, automatic) {
-            (Self::Previous, _) => "正在切换到上一集…",
-            (Self::Next, true) => "正在播放下一集…",
-            (Self::Next, false) => "正在切换到下一集…",
-        }
-    }
-
     fn failure_prefix(self) -> &'static str {
         match self {
             Self::Previous => "切换上一集失败",
@@ -35,11 +27,10 @@ impl PlaybackQueueDirection {
 #[derive(Default)]
 pub(super) struct PlaybackQueueSwitchState {
     generation: u64,
-    loading: bool,
+    pub(super) loading: bool,
     resume_on_failure: bool,
     publish_terminal_update_on_failure: bool,
     error: Option<SharedString>,
-    message: Option<SharedString>,
 }
 
 impl PlaybackPage {
@@ -85,7 +76,6 @@ impl PlaybackPage {
         self.queue_switch.resume_on_failure = false;
         self.queue_switch.publish_terminal_update_on_failure = false;
         self.queue_switch.error = None;
-        self.queue_switch.message = None;
     }
 
     fn begin_queue_switch(
@@ -117,7 +107,6 @@ impl PlaybackPage {
             !automatic && !self.timeline.user_paused && !self.timeline.ended;
         self.queue_switch.publish_terminal_update_on_failure = automatic;
         self.queue_switch.error = None;
-        self.queue_switch.message = Some(direction.loading_message(automatic).into());
 
         if self.queue_switch.resume_on_failure {
             let pause_result = self
@@ -128,7 +117,6 @@ impl PlaybackPage {
                 self.queue_switch.loading = false;
                 self.queue_switch.resume_on_failure = false;
                 self.queue_switch.publish_terminal_update_on_failure = false;
-                self.queue_switch.message = None;
                 self.queue_switch.error =
                     Some(format!("{}：{error}", direction.failure_prefix()).into());
                 cx.notify();
@@ -175,7 +163,6 @@ impl PlaybackPage {
             Ok(mut request) => {
                 self.queue_switch.resume_on_failure = false;
                 self.queue_switch.publish_terminal_update_on_failure = false;
-                self.queue_switch.message = None;
                 let mut update = self.close_playback_reporting(false, self.timeline.ended);
                 if let Some(item) = request.queue.items.get_mut(self.queue.current_index) {
                     item.playback_position_ticks = Some(if update.ended {
@@ -195,7 +182,6 @@ impl PlaybackPage {
                 let publish_terminal_update = self.queue_switch.publish_terminal_update_on_failure;
                 self.queue_switch.resume_on_failure = false;
                 self.queue_switch.publish_terminal_update_on_failure = false;
-                self.queue_switch.message = None;
                 self.queue_switch.error =
                     Some(format!("{}：{error}", direction.failure_prefix()).into());
                 if resume_on_failure && !self.timeline.ended {
@@ -252,33 +238,6 @@ impl PlaybackPage {
             .text_align(gpui::TextAlign::Center)
             .occlude()
             .child(error)
-            .into_any_element()
-    }
-
-    pub(super) fn render_queue_switch_status(&self, cx: &Context<Self>) -> impl IntoElement {
-        let Some(message) = self.queue_switch.message.clone() else {
-            return div()
-                .id("playback-queue-switch-status-empty")
-                .into_any_element();
-        };
-        let theme = theme::get(cx);
-        div()
-            .id("playback-queue-switch-status")
-            .absolute()
-            .top(relative(0.5))
-            .left(relative(0.5))
-            .ml(-px(120.0))
-            .mt(-px(20.0))
-            .w(px(240.0))
-            .rounded(px(8.0))
-            .bg(rgba(0x000000b8))
-            .px_3()
-            .py_2()
-            .text_sm()
-            .text_color(theme.foreground)
-            .text_align(gpui::TextAlign::Center)
-            .occlude()
-            .child(message)
             .into_any_element()
     }
 }

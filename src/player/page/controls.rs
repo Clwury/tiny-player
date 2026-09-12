@@ -46,6 +46,9 @@ struct ProgressTimelineRenderState {
     cache_ranges: Vec<(f32, f32)>,
 }
 
+#[path = "controls/download_speed.rs"]
+mod download_speed;
+pub(super) use download_speed::DownloadSpeedDisplay;
 #[path = "controls/progress.rs"]
 mod progress;
 #[path = "controls/render.rs"]
@@ -681,6 +684,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn media_detail_sections_show_loading_text_until_information_is_available() {
+        assert_eq!(
+            playback_video_detail_section(None, false).summary,
+            "Loading…"
+        );
+        assert_eq!(
+            playback_audio_detail_section(None, false, 1.0).summary,
+            "Loading…"
+        );
+        assert_eq!(
+            playback_video_detail_section(None, true).summary,
+            "Unavailable"
+        );
+        assert_eq!(
+            playback_audio_detail_section(None, true, 1.0).summary,
+            "No audio"
+        );
+    }
+
+    #[test]
     fn video_detail_section_contains_mpv_style_status() {
         let info = PlaybackVideoInfo {
             codec: "hevc".to_string(),
@@ -925,15 +948,44 @@ mod tests {
         assert_eq!(playback_volume_percent(f32::NAN), 100);
         assert_eq!(playback_volume_percent(1.5), 100);
         assert_eq!(
-            volume_delta_from_scroll_delta(ScrollDelta::Lines(gpui::Point { x: 0.0, y: 1.0 })),
-            0.05
+            volume_delta_from_scroll_delta(ScrollDelta::Lines(gpui::Point { x: 0.0, y: 3.0 })),
+            0.02
         );
         assert_eq!(
             volume_delta_from_scroll_delta(ScrollDelta::Pixels(gpui::Point {
                 x: px(0.0),
-                y: px(-250.0),
+                y: px(-1000.0),
             })),
             -0.2
         );
+    }
+
+    #[test]
+    fn linux_wheel_detents_change_volume_by_two_percent() {
+        // GPUI reports three lines for one physical notch, including on X11 and Wayland.
+        for (lines, expected) in [
+            (3.0, 0.02),
+            (-3.0, -0.02),
+            (6.0, 0.04),
+            (-6.0, -0.04),
+            (1.5, 0.01),
+            (0.0, 0.0),
+            (90.0, 0.2),
+            (-90.0, -0.2),
+        ] {
+            let delta = ScrollDelta::Lines(gpui::Point { x: 3.0, y: lines });
+            assert_eq!(volume_delta_from_scroll_delta(delta), expected);
+        }
+    }
+
+    #[test]
+    fn continuous_scroll_keeps_proportional_volume_adjustment() {
+        for (pixels, expected) in [(25.0, 0.02), (-25.0, -0.02), (12.5, 0.01), (0.0, 0.0)] {
+            let pixel_delta = ScrollDelta::Pixels(gpui::Point {
+                x: px(25.0),
+                y: px(pixels),
+            });
+            assert_eq!(volume_delta_from_scroll_delta(pixel_delta), expected);
+        }
     }
 }

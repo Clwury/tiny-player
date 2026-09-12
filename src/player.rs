@@ -9,6 +9,7 @@ mod profile;
 mod render_host;
 mod tracks;
 mod video_presenter;
+mod volume;
 
 pub use backend::{
     CacheUnlinkPolicy, PlaybackCacheConfig, PlaybackCacheMode, PlaybackSeekableCacheMode,
@@ -25,3 +26,4 @@ pub(crate) use page::{
 };
 pub use profile::{DeviceProfileConfig, device_profile};
 pub use tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection};
+pub use volume::PlaybackVolumeSettings;

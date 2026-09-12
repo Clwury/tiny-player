@@ -55,7 +55,6 @@ impl PlaybackPage {
         self.tracks.selected_audio_stream_index = track_index;
         self.tracks.open = None;
         self.timeline.buffering = self.timeline.loaded;
-        self.status_message = "正在切换轨道…".into();
 
         let command_succeeded = if let Some(backend) = self.video.owner_mut() {
             match backend.command(BackendCommand::SetAudioTrack {
@@ -98,7 +97,6 @@ impl PlaybackPage {
         self.tracks.selected_subtitle_stream_index = track.as_ref().map(|track| track.stream_index);
         self.tracks.open = None;
         self.timeline.buffering = self.timeline.loaded;
-        self.status_message = "正在切换轨道…".into();
 
         let command_succeeded = if let Some(backend) = self.video.owner_mut() {
             match backend.command(BackendCommand::SetSubtitleTrack {

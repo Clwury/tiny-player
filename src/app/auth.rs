@@ -209,12 +209,21 @@ impl TinyApp {
         cx: &mut Context<Self>,
     ) {
         let playback_cache_config = self.cache.playback.clone();
+        let playback_volume = self.cache.playback_volume;
         let playback_page = cx.new(|cx| {
-            crate::player::PlaybackPage::new_with_cache_config(request, playback_cache_config, cx)
+            crate::player::PlaybackPage::new_with_settings(
+                request,
+                playback_cache_config,
+                playback_volume,
+                cx,
+            )
         });
         cx.subscribe(
             &playback_page,
             |app: &mut TinyApp, _, event, cx| match event {
+                PlaybackEvent::VolumeChanged { settings } => {
+                    app.update_playback_volume(*settings, cx);
+                }
                 PlaybackEvent::Update { update } => app.update_playback_origin(update.clone(), cx),
                 PlaybackEvent::Back { update } => app.return_to_playback_origin(update.clone(), cx),
                 PlaybackEvent::Replace { request, update } => {

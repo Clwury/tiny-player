@@ -15,7 +15,7 @@ pub(crate) fn config_dir() -> Result<PathBuf> {
 }
 
 pub(crate) fn cache_dir() -> Result<PathBuf> {
-    Ok(project_dirs()?.cache_dir().to_path_buf())
+    Ok(default_playback_cache_dir())
 }
 
 pub(crate) fn default_playback_cache_dir() -> PathBuf {
@@ -38,12 +38,12 @@ mod tests {
     const DESKTOP_ENTRY: &str = include_str!("../tiny-player.desktop");
 
     #[test]
-    fn playback_cache_defaults_to_dot_cache_under_the_user_home() {
+    fn caches_default_to_dot_cache_under_the_user_home() {
         let home = BaseDirs::new().expect("user home exists");
-        assert_eq!(
-            default_playback_cache_dir(),
-            home.home_dir().join(".cache/tiny-player")
-        );
+        let expected = home.home_dir().join(".cache/tiny-player");
+
+        assert_eq!(cache_dir().unwrap(), expected);
+        assert_eq!(default_playback_cache_dir(), expected);
     }
 
     #[test]

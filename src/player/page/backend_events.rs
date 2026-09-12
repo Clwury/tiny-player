@@ -40,7 +40,6 @@ impl PlaybackPage {
                     return;
                 }
                 apply_playback_restart_to_timeline(&mut self.timeline);
-                self.status_message = "".into();
                 self.error_message = None;
                 self.handle_playback_restart_reporting(cx);
             }
@@ -93,10 +92,6 @@ impl PlaybackPage {
                     && self.timeline.pending_seek_keeps_frame
                     && self.frame.current.is_some();
                 self.timeline.buffering = buffering && !hidden_by_soft_seek;
-                if !hidden_by_soft_seek {
-                    self.status_message =
-                        playback_status_message(buffering, self.frame.current.is_some());
-                }
             }
             BackendEventKind::PlaybackInfoChanged(info) => {
                 self.playback_info = info;
@@ -227,7 +222,6 @@ impl PlaybackPage {
         self.timeline.cache_buffering_percent = None;
         self.tracks.open = None;
         self.timeline.user_paused = true;
-        self.status_message = "".into();
         self.error_message = None;
         defer_drop_subtitle(self.subtitle.active.take(), window);
         cx.notify();
@@ -322,9 +316,6 @@ impl PlaybackPage {
             match render_result {
                 Ok(Some(frame)) => {
                     self.replace_visible_frame(frame, window, cx);
-                    if !self.timeline.buffering {
-                        self.status_message = "".into();
-                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -518,6 +509,27 @@ mod tests {
         assert!(!timeline.cache_status_open);
         assert_eq!(timeline.pending_seek_position, None);
         assert!(!timeline.pending_seek_keeps_frame);
+    }
+
+    #[test]
+    fn playback_restart_clears_uncached_seek_loader_after_backend_buffering_stops() {
+        use crate::player::page::render::{PlaybackStatus, playback_status};
+
+        let mut timeline = PlaybackTimelineState {
+            loaded: true,
+            user_paused: false,
+            pending_seek_position: Some(120.0),
+            buffering: false,
+            ..PlaybackTimelineState::default()
+        };
+        assert_eq!(
+            playback_status(&timeline, true, false, None),
+            Some(PlaybackStatus::Loading)
+        );
+
+        apply_playback_restart_to_timeline(&mut timeline);
+
+        assert_eq!(playback_status(&timeline, true, false, None), None);
     }
 
     #[test]

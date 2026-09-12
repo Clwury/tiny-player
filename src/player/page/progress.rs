@@ -8,16 +8,6 @@ impl Render for ProgressBarDrag {
     }
 }
 
-pub(super) fn playback_status_message(buffering: bool, has_visible_frame: bool) -> SharedString {
-    if buffering {
-        "正在缓冲视频…".into()
-    } else if has_visible_frame {
-        "".into()
-    } else {
-        "正在加载视频…".into()
-    }
-}
-
 pub(super) fn valid_playback_time(time: f64) -> Option<f64> {
     (time.is_finite() && time >= 0.0).then_some(time)
 }
@@ -149,13 +139,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn playback_status_stays_visible_until_first_frame() {
-        assert_eq!(playback_status_message(true, false), "正在缓冲视频…");
-        assert_eq!(playback_status_message(false, false), "正在加载视频…");
-        assert_eq!(playback_status_message(false, true), "");
-    }
 
     #[test]
     fn playback_time_helpers_reject_invalid_values() {

@@ -8,7 +8,7 @@ use crate::emby::{
 
 use super::super::{HomeContent, data::EPISODE_CARD_IMAGE_MAX_WIDTH};
 
-const SERIES_BACKDROP_IMAGE_MAX_WIDTH: u32 = 3000;
+const SERIES_BACKDROP_IMAGE_MAX_WIDTH: u32 = 1024;
 const SERIES_PERSON_IMAGE_MAX_WIDTH: u32 = 320;
 
 impl HomeContent {
@@ -66,9 +66,15 @@ impl HomeContent {
 }
 
 fn series_backdrop_image_request(item: &MediaItem) -> Option<EmbyImageRequest> {
+    let (image_type, tag) = if let Some(tag) = item.backdrop_image_tag() {
+        (EmbyImageType::Backdrop, tag)
+    } else {
+        (EmbyImageType::Primary, item.primary_image_tag()?)
+    };
+
     Some(
-        EmbyImageRequest::new(item.id.clone(), EmbyImageType::Backdrop)
-            .with_tag(Some(item.backdrop_image_tag()?.to_string()))
+        EmbyImageRequest::new(item.id.clone(), image_type)
+            .with_tag(Some(tag.to_string()))
             .with_max_width(SERIES_BACKDROP_IMAGE_MAX_WIDTH)
             .with_quality(ImageQuality::DEFAULT),
     )
@@ -98,4 +104,67 @@ fn person_primary_image_request(person: &MediaPerson) -> Option<EmbyImageRequest
             .with_max_width(SERIES_PERSON_IMAGE_MAX_WIDTH)
             .with_quality(ImageQuality::DEFAULT),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn hero_prefers_backdrop_when_primary_is_also_available() {
+        let item: MediaItem = serde_json::from_value(json!({
+            "Id": "movie-1",
+            "Name": "Movie",
+            "BackdropImageTags": ["", "backdrop-tag"],
+            "ImageTags": {"Primary": "primary-tag"}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            series_backdrop_image_request(&item),
+            Some(
+                EmbyImageRequest::new("movie-1", EmbyImageType::Backdrop)
+                    .with_tag(Some("backdrop-tag".into()))
+                    .with_max_width(SERIES_BACKDROP_IMAGE_MAX_WIDTH)
+            )
+        );
+    }
+
+    #[test]
+    fn hero_falls_back_to_primary_when_backdrop_tags_are_missing_or_empty() {
+        for tags in [json!(null), json!([]), json!(["", " "])] {
+            let item: MediaItem = serde_json::from_value(json!({
+                "Id": "movie-1",
+                "Name": "Movie",
+                "BackdropImageTags": tags,
+                "ImageTags": {"Primary": "primary-tag"}
+            }))
+            .unwrap();
+
+            assert_eq!(
+                series_backdrop_image_request(&item),
+                Some(
+                    EmbyImageRequest::primary("movie-1", Some("primary-tag".into()))
+                        .with_max_width(SERIES_BACKDROP_IMAGE_MAX_WIDTH)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn hero_skips_image_request_when_backdrop_and_primary_are_unavailable() {
+        for tags in [json!(null), json!({}), json!({"Primary": " "})] {
+            let item: MediaItem = serde_json::from_value(json!({
+                "Id": "movie-1",
+                "Name": "Movie",
+                "BackdropImageTags": [],
+                "ImageTags": tags
+            }))
+            .unwrap();
+
+            assert_eq!(series_backdrop_image_request(&item), None);
+        }
+    }
 }

@@ -85,6 +85,85 @@ fn demux_packet_cache_forced_low_level_seek_bypasses_cached_hit() {
 }
 
 #[test]
+fn audio_restart_low_level_seek_replaces_prefetch_with_missing_audio() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let (shared, _event_rx) = shared_with_config_for_test(control, cache_config_for_test());
+    let shared = Arc::new(shared);
+    let audio_stream = stream_info_for_test(1, ffi::AVCodecID::AV_CODEC_ID_AAC);
+    let old_range_id = {
+        let mut state = shared.state.lock().expect("cache state");
+        state.set_selected_streams(DemuxSelectedStreams {
+            audio_stream: Some(audio_stream),
+            subtitle_stream: None,
+        });
+        for second in 0..10 {
+            if second == 5 || second == 8 {
+                state.set_selected_streams(DemuxSelectedStreams {
+                    audio_stream: (second == 8).then_some(audio_stream),
+                    subtitle_stream: None,
+                });
+            }
+            let start = second * 1_000_000_000;
+            let end = start + 1_000_000_000;
+            state.append_packet(cached_anchor(start, end));
+            // The demux thread drops audio packets while the track is disabled.
+            if state.selected_streams.audio_stream.is_some() {
+                state.append_packet(cached_packet(1, false, Some(start), Some(end)));
+            }
+        }
+        close_seek_range(&mut state, 10_000_000_000);
+        assert!(
+            state
+                .resolve_cached_seek_plan_attempt(500_000_000, PlaybackSeekMode::Precise)
+                .is_ok(),
+            "a cached seek can hit before the later audio gap"
+        );
+        let audio_starts = state.read_range().stream_queues[&1]
+            .iter()
+            .map(|packet_id| state.packets[packet_id].start_nsecs.unwrap() / 1_000_000_000)
+            .collect::<Vec<_>>();
+        assert_eq!(audio_starts, vec![0, 1, 2, 3, 4, 8, 9]);
+        state.read_range_id
+    };
+    let cache = DemuxPacketCache {
+        shared: Arc::clone(&shared),
+        handle: None,
+    };
+
+    assert_eq!(
+        cache.seek_low_level(0.5, PlaybackSessionId(2), 1, "audio_track_change"),
+        DemuxSeekResult::Requested
+    );
+
+    let mut state = shared.state.lock().expect("cache state");
+    assert_ne!(state.read_range_id, old_range_id);
+    assert!(state.stream_reader_head_timeline(1).is_none());
+    let request = state.take_seek_request().expect("demux input seek queued");
+    assert_eq!(request.position_seconds, 0.5);
+    for second in 0..10 {
+        let start = second * 1_000_000_000;
+        let end = start + 1_000_000_000;
+        state.append_packet(cached_anchor(start, end));
+        state.append_packet(cached_packet(1, false, Some(start), Some(end)));
+    }
+
+    let mut timing = DemuxPacketCacheReadTiming::default();
+    for second in 0..10 {
+        let (_, start, end) = state
+            .stream_reader_head_timeline(1)
+            .expect("re-read audio is available");
+        assert_eq!(start, Some(second * 1_000_000_000));
+        assert_eq!(end, Some((second + 1) * 1_000_000_000));
+        assert!(
+            state
+                .take_packet_round_robin(&[1], &mut timing)
+                .expect("audio packet reads")
+                .is_some()
+        );
+    }
+}
+
+#[test]
 fn cached_seek_plan_resolve_does_not_move_readers_before_atomic_commit() {
     let mut state = DemuxPacketCacheState::new(
         0,

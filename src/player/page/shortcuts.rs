@@ -13,6 +13,9 @@ pub(super) enum PlaybackShortcut {
     ToggleInfoOverlay,
     RaiseSubtitle,
     LowerSubtitle,
+    DecreaseVolume,
+    IncreaseVolume,
+    ToggleMute,
 }
 
 impl PlaybackPage {
@@ -22,11 +25,7 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.is_held || event.keystroke.modifiers.modified() {
-            return;
-        }
-
-        let Some(shortcut) = playback_shortcut_for_key(&event.keystroke.key) else {
+        let Some(shortcut) = playback_shortcut_for_event(event) else {
             return;
         };
         if shortcut == PlaybackShortcut::ExitFullscreen && !window.is_fullscreen() {
@@ -70,8 +69,41 @@ impl PlaybackPage {
                     cx,
                 );
             }
+            PlaybackShortcut::DecreaseVolume => {
+                self.adjust_playback_volume(-PLAYBACK_VOLUME_STEP, cx);
+            }
+            PlaybackShortcut::IncreaseVolume => {
+                self.adjust_playback_volume(PLAYBACK_VOLUME_STEP, cx);
+            }
+            PlaybackShortcut::ToggleMute => self.toggle_playback_mute(cx),
         }
     }
+}
+
+fn playback_shortcut_for_event(event: &KeyDownEvent) -> Option<PlaybackShortcut> {
+    let keystroke = &event.keystroke;
+    let modifiers = keystroke.modifiers;
+    if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+        return None;
+    }
+
+    let key = if modifiers.shift {
+        // Some platforms retain Shift when typing symbols such as '*'.
+        keystroke.key_char.as_deref().or_else(|| {
+            matches!(keystroke.key.as_str(), "/" | "*").then_some(keystroke.key.as_str())
+        })?
+    } else {
+        &keystroke.key
+    };
+    let shortcut = playback_shortcut_for_key(key)?;
+    let adjusts_volume = matches!(
+        shortcut,
+        PlaybackShortcut::DecreaseVolume | PlaybackShortcut::IncreaseVolume
+    );
+    if (modifiers.shift || event.is_held) && !adjusts_volume {
+        return None;
+    }
+    Some(shortcut)
 }
 
 pub(super) fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
@@ -95,6 +127,18 @@ pub(super) fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
         Some(PlaybackShortcut::RaiseSubtitle)
     } else if key.eq_ignore_ascii_case("t") {
         Some(PlaybackShortcut::LowerSubtitle)
+    } else if matches!(key, "9" | "/")
+        || key.eq_ignore_ascii_case("divide")
+        || key.eq_ignore_ascii_case("kp_divide")
+    {
+        Some(PlaybackShortcut::DecreaseVolume)
+    } else if matches!(key, "0" | "*")
+        || key.eq_ignore_ascii_case("multiply")
+        || key.eq_ignore_ascii_case("kp_multiply")
+    {
+        Some(PlaybackShortcut::IncreaseVolume)
+    } else if key.eq_ignore_ascii_case("m") {
+        Some(PlaybackShortcut::ToggleMute)
     } else {
         None
     }
@@ -103,6 +147,89 @@ pub(super) fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shortcut_for_keystroke(key: &str, is_held: bool) -> Option<PlaybackShortcut> {
+        playback_shortcut_for_event(&KeyDownEvent {
+            keystroke: gpui::Keystroke::parse(key).unwrap(),
+            is_held,
+            prefer_character_input: false,
+        })
+    }
+
+    #[test]
+    fn mpv_volume_shortcuts_support_the_number_row_and_keypad() {
+        for key in ["9", "/", "divide", "KP_DIVIDE"] {
+            assert_eq!(
+                shortcut_for_keystroke(key, false),
+                Some(PlaybackShortcut::DecreaseVolume),
+                "{key}"
+            );
+        }
+        for key in ["0", "*", "multiply", "KP_MULTIPLY"] {
+            assert_eq!(
+                shortcut_for_keystroke(key, false),
+                Some(PlaybackShortcut::IncreaseVolume),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            shortcut_for_keystroke("m", false),
+            Some(PlaybackShortcut::ToggleMute)
+        );
+    }
+
+    #[test]
+    fn shifted_volume_shortcuts_match_the_typed_character() {
+        for key in ["shift-8->*", "shift-*", "shift-0->0"] {
+            assert_eq!(
+                shortcut_for_keystroke(key, false),
+                Some(PlaybackShortcut::IncreaseVolume),
+                "{key}"
+            );
+        }
+        for key in ["shift-9->9", "shift-7->/"] {
+            assert_eq!(
+                shortcut_for_keystroke(key, false),
+                Some(PlaybackShortcut::DecreaseVolume),
+                "{key}"
+            );
+        }
+        for key in [
+            "shift-9->(",
+            "shift-0->)",
+            "shift-/->?",
+            "shift-m->M",
+            "shift-9",
+        ] {
+            assert_eq!(shortcut_for_keystroke(key, false), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn volume_shortcuts_ignore_control_alt_platform_and_function_modifiers() {
+        for modifier in ["ctrl", "alt", "super", "fn"] {
+            for key in ["9", "0", "/", "*", "m", "shift-8->*"] {
+                let keystroke = format!("{modifier}-{key}");
+                assert_eq!(
+                    shortcut_for_keystroke(&keystroke, false),
+                    None,
+                    "{keystroke}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn held_keys_repeat_volume_adjustment_but_not_toggles() {
+        for key in ["9", "0", "/", "*", "divide", "multiply", "shift-8->*"] {
+            assert!(shortcut_for_keystroke(key, true).is_some(), "{key}");
+        }
+        for key in [
+            "m", "space", "p", "f", "escape", "i", "r", "t", "left", "right",
+        ] {
+            assert_eq!(shortcut_for_keystroke(key, true), None, "{key}");
+        }
+    }
 
     #[test]
     fn playback_shortcut_keys_map_to_player_actions() {

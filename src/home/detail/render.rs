@@ -360,9 +360,14 @@ fn detail_play_button_icon(playback_loading: bool, theme: &theme::TinyTheme) -> 
 
 fn detail_play_button_label(playback_seconds: Option<u64>) -> String {
     if let Some(total_seconds) = playback_seconds {
-        let minutes = total_seconds / 60;
+        let hours = total_seconds / 3600;
+        let minutes = total_seconds / 60 % 60;
         let seconds = total_seconds % 60;
-        format!("继续 {minutes}:{seconds:02}")
+        if hours > 0 {
+            format!("继续 {hours}:{minutes:02}:{seconds:02}")
+        } else {
+            format!("继续 {minutes}:{seconds:02}")
+        }
     } else {
         "播放".to_string()
     }
@@ -412,9 +417,15 @@ mod tests {
     }
 
     #[test]
-    fn play_button_label_shows_resume_time_with_two_digit_seconds() {
+    fn play_button_label_shows_hours_when_resume_time_reaches_one_hour() {
+        assert_eq!(detail_play_button_label(Some(0)), "继续 0:00");
         assert_eq!(detail_play_button_label(Some(905)), "继续 15:05");
         assert_eq!(detail_play_button_label(Some(900)), "继续 15:00");
+        assert_eq!(detail_play_button_label(Some(3599)), "继续 59:59");
+        assert_eq!(detail_play_button_label(Some(3600)), "继续 1:00:00");
+        assert_eq!(detail_play_button_label(Some(3601)), "继续 1:00:01");
+        assert_eq!(detail_play_button_label(Some(3905)), "继续 1:05:05");
+        assert_eq!(detail_play_button_label(Some(90061)), "继续 25:01:01");
         assert_eq!(detail_play_button_label(None), "播放");
     }
 

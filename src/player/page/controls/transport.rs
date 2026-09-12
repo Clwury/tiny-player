@@ -82,21 +82,32 @@ impl PlaybackPage {
     }
 
     pub(in super::super) fn adjust_playback_volume(&mut self, delta: f32, cx: &mut Context<Self>) {
-        let volume = clamp_playback_volume(self.volume.level + delta);
+        self.set_playback_volume(self.volume.level + delta, cx);
+    }
+
+    pub(in super::super) fn toggle_playback_mute(&mut self, cx: &mut Context<Self>) {
+        self.set_playback_volume(self.volume.level_after_mute_toggle(), cx);
+    }
+
+    fn set_playback_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+        let volume = clamp_playback_volume(volume);
         if (self.volume.level - volume).abs() < f32::EPSILON {
             self.show_volume_indicator(cx);
             return;
         }
 
-        let previous_volume = self.volume.level;
-        let was_muted = previous_volume <= f32::EPSILON;
-        self.volume.level = volume;
+        let was_muted = self.volume.level <= f32::EPSILON;
         if let Some(backend) = self.video.owner_mut()
             && let Err(error) = backend.command(BackendCommand::SetVolume { volume })
         {
-            self.volume.level = previous_volume;
             self.error_message = Some(format!("调整音量失败：{error}").into());
+            self.show_volume_indicator(cx);
+            return;
         }
+        self.volume.set_level(volume);
+        cx.emit(PlaybackEvent::VolumeChanged {
+            settings: self.volume.settings(),
+        });
         if was_muted != (self.volume.level <= f32::EPSILON) {
             self.report_playback_progress(true);
         }
@@ -185,8 +196,6 @@ impl PlaybackPage {
         self.timeline.pending_seek_position = Some(position);
         self.timeline.pending_seek_keeps_frame = cached_seek_expected;
         self.timeline.buffering = self.timeline.loaded && !cached_seek_expected;
-        self.status_message =
-            playback_status_message(self.timeline.buffering, self.frame.current.is_some());
         if let Some(presenter) = self.video.dependent_mut() {
             presenter.discard_pending_frames();
         }

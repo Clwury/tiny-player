@@ -1,5 +1,71 @@
 use super::*;
 
+use gpui::{Animation, AnimationExt as _, Transformation, percentage};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PlaybackStatus {
+    Loading,
+    Error(SharedString),
+}
+
+pub(super) fn playback_status(
+    timeline: &PlaybackTimelineState,
+    has_visible_frame: bool,
+    switching_episode: bool,
+    error: Option<&SharedString>,
+) -> Option<PlaybackStatus> {
+    if let Some(error) = error {
+        return Some(PlaybackStatus::Error(error.clone()));
+    }
+
+    let waiting_for_seek =
+        timeline.pending_seek_position.is_some() && !timeline.pending_seek_keeps_frame;
+    let waiting_for_cache = timeline.paused_for_cache && !timeline.user_paused;
+    (switching_episode
+        || (!timeline.ended
+            && (timeline.buffering || waiting_for_seek || waiting_for_cache || !has_visible_frame)))
+        .then_some(PlaybackStatus::Loading)
+}
+
+pub(super) fn playback_loader(id: &'static str, size: Pixels, cx: &gpui::App) -> impl IntoElement {
+    svg()
+        .debug_selector(move || id.to_string())
+        .path("icons/loader.svg")
+        .size(size)
+        .flex_none()
+        .overflow_hidden()
+        .text_color(theme::get(cx).accent)
+        .with_animation(
+            id,
+            Animation::new(Duration::from_millis(1800)).repeat(),
+            |svg, delta| svg.with_transformation(Transformation::rotate(percentage(delta))),
+        )
+}
+
+pub(super) fn render_playback_status(status: PlaybackStatus, cx: &gpui::App) -> impl IntoElement {
+    let content = match status {
+        PlaybackStatus::Loading => {
+            playback_loader("playback-loader", px(24.0), cx).into_any_element()
+        }
+        PlaybackStatus::Error(message) => div()
+            .debug_selector(|| "playback-error-message".to_string())
+            .child(message)
+            .into_any_element(),
+    };
+
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_base()
+        .text_color(theme::media_overlay(cx).muted_foreground)
+        .child(content)
+}
+
 pub(super) fn normalize_video_viewport(bounds: Bounds<Pixels>) -> Option<(u32, u32)> {
     let width = f32::from(bounds.size.width).floor().max(0.0) as u32;
     let height = f32::from(bounds.size.height).floor().max(0.0) as u32;
@@ -98,11 +164,139 @@ pub(super) fn should_request_animation_frame(state: AnimationFrameRequestState) 
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Bounds, point, px, size};
+    use gpui::{Bounds, TestAppContext, point, px, size};
 
     use crate::player::render_host::RenderSize;
 
     use super::*;
+
+    #[test]
+    fn playback_loader_tracks_first_frame_buffering_and_episode_switches() {
+        let mut timeline = PlaybackTimelineState::default();
+        assert_eq!(
+            playback_status(&timeline, false, false, None),
+            Some(PlaybackStatus::Loading)
+        );
+        timeline.loaded = true;
+        assert_eq!(
+            playback_status(&timeline, false, false, None),
+            Some(PlaybackStatus::Loading)
+        );
+        assert_eq!(playback_status(&timeline, true, false, None), None);
+
+        timeline.buffering = true;
+        assert_eq!(
+            playback_status(&timeline, true, false, None),
+            Some(PlaybackStatus::Loading)
+        );
+        timeline.buffering = false;
+        timeline.ended = true;
+        assert_eq!(playback_status(&timeline, false, false, None), None);
+        assert_eq!(
+            playback_status(&timeline, true, true, None),
+            Some(PlaybackStatus::Loading)
+        );
+
+        let error = SharedString::from("加载视频失败：连接断开");
+        assert_eq!(
+            playback_status(&timeline, false, true, Some(&error)),
+            Some(PlaybackStatus::Error(error))
+        );
+    }
+
+    #[test]
+    fn playback_loader_waits_for_uncached_seek_but_keeps_cached_seeks_unobstructed() {
+        let mut timeline = PlaybackTimelineState {
+            loaded: true,
+            pending_seek_position: Some(120.0),
+            ..PlaybackTimelineState::default()
+        };
+        assert_eq!(
+            playback_status(&timeline, true, false, None),
+            Some(PlaybackStatus::Loading)
+        );
+
+        timeline.pending_seek_keeps_frame = true;
+        assert_eq!(playback_status(&timeline, true, false, None), None);
+    }
+
+    #[test]
+    fn playback_loader_shows_cache_stalls_without_treating_user_pause_as_loading() {
+        let mut timeline = PlaybackTimelineState {
+            loaded: true,
+            paused_for_cache: true,
+            user_paused: false,
+            ..PlaybackTimelineState::default()
+        };
+        assert_eq!(
+            playback_status(&timeline, true, false, None),
+            Some(PlaybackStatus::Loading)
+        );
+
+        timeline.user_paused = true;
+        assert_eq!(playback_status(&timeline, true, false, None), None);
+        timeline.user_paused = false;
+        timeline.paused_for_cache = false;
+        assert_eq!(playback_status(&timeline, true, false, None), None);
+    }
+
+    #[gpui::test]
+    fn playback_status_renders_centered_loader_and_replaces_it_with_errors(
+        cx: &mut TestAppContext,
+    ) {
+        struct StatusPreview {
+            status: PlaybackStatus,
+            has_video_frame: bool,
+        }
+
+        impl Render for StatusPreview {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .relative()
+                    .size_full()
+                    .overflow_hidden()
+                    // Match VideoFrameElement's full-size layout while seeking or switching tracks.
+                    .when(self.has_video_frame, |this| {
+                        this.child(div().size_full().bg(rgb(0x000000)))
+                    })
+                    .child(render_playback_status(self.status.clone(), cx))
+            }
+        }
+
+        cx.update(theme::init);
+        let (view, cx) = cx.add_window_view(|_, _| StatusPreview {
+            status: PlaybackStatus::Loading,
+            has_video_frame: false,
+        });
+        for selection in theme::ColorTheme::ALL {
+            cx.update(|_, cx| theme::set(selection, cx));
+            for has_video_frame in [false, true] {
+                view.update(cx, |view, cx| {
+                    view.has_video_frame = has_video_frame;
+                    cx.notify();
+                });
+                for (width, height) in [(640.0, 360.0), (1280.0, 720.0)] {
+                    cx.simulate_resize(size(px(width), px(height)));
+                    cx.run_until_parked();
+                    let loader = cx.debug_bounds("playback-loader").unwrap();
+                    assert_eq!(loader.size, size(px(24.0), px(24.0)));
+                    assert_eq!(loader.center(), point(px(width / 2.0), px(height / 2.0)));
+                    assert!(cx.debug_bounds("playback-error-message").is_none());
+                }
+            }
+        }
+
+        view.update(cx, |view, cx| {
+            view.status = PlaybackStatus::Error("加载视频失败：连接断开".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("playback-loader").is_none());
+        assert_eq!(
+            cx.debug_bounds("playback-error-message").unwrap().center(),
+            point(px(640.0), px(360.0))
+        );
+    }
 
     #[test]
     fn normalize_video_viewport_rejects_zero_sized_bounds() {

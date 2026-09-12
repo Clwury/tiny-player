@@ -19,6 +19,7 @@ use super::{
     render_host::RenderSize,
     tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection},
     video_presenter::{VideoPresenter, VideoPresenterSnapshot},
+    volume::{PlaybackVolumeSettings, clamp_playback_volume},
 };
 
 mod backend_events;
@@ -48,13 +49,13 @@ pub use session::{PlaybackStateUpdate, PlaybackStopCompletion, PlaybackStopResul
 
 use progress::{
     ProgressBarDrag, buffered_until_after_seek, cache_range_fractions, cached_seek_target,
-    clamp_playback_position, format_playback_time, playback_status_message, progress_fraction,
-    progress_fraction_for_cursor, should_apply_backend_position, valid_playback_duration,
-    valid_playback_time,
+    clamp_playback_position, format_playback_time, progress_fraction, progress_fraction_for_cursor,
+    should_apply_backend_position, valid_playback_duration, valid_playback_time,
 };
 use render::{
     AnimationFrameRequestState, aspect_fit_bounds, defer_drop_frame, normalize_video_viewport,
-    render_output_size, should_render_frame, should_request_animation_frame, viewport_changed,
+    playback_status, render_output_size, render_playback_status, should_render_frame,
+    should_request_animation_frame, viewport_changed,
 };
 use runtime::{PlaybackBackend, ShutdownOrder};
 use state::{
@@ -66,6 +67,9 @@ use video_element::VideoFrameElement;
 
 #[derive(Clone, Debug)]
 pub enum PlaybackEvent {
+    VolumeChanged {
+        settings: PlaybackVolumeSettings,
+    },
     Update {
         update: PlaybackStateUpdate,
     },
@@ -84,6 +88,7 @@ pub struct PlaybackPage {
     video: ShutdownOrder<PlaybackBackend, VideoPresenter>,
     frame: PlaybackFrameState,
     timeline: PlaybackTimelineState,
+    download_speed: controls::DownloadSpeedDisplay,
     playback_details_visible: bool,
     fullscreen: FullscreenControlsState,
     source_protocol: Option<String>,
@@ -99,7 +104,6 @@ pub struct PlaybackPage {
     subtitle: SubtitleOverlayState,
     volume: PlaybackVolumeState,
     error_message: Option<SharedString>,
-    status_message: SharedString,
 }
 
 impl EventEmitter<PlaybackEvent> for PlaybackPage {}
@@ -124,8 +128,17 @@ impl PlaybackPage {
         cache_config: super::backend::PlaybackCacheConfig,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_settings(request, cache_config, PlaybackVolumeSettings::default(), cx)
+    }
+
+    pub(crate) fn new_with_settings(
+        request: PlaybackRequest,
+        cache_config: super::backend::PlaybackCacheConfig,
+        volume_settings: PlaybackVolumeSettings,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let volume = PlaybackVolumeState::new(volume_settings);
         let mut error_message = None;
-        let status_message = "正在加载视频…".into();
         let source_protocol = playback_protocol(&request.url);
         let content_length = request.content_length;
         let reporting = session::PlaybackReportingState::new(&request.emby);
@@ -142,7 +155,13 @@ impl PlaybackPage {
                             selected_tracks: request.selected_tracks.clone(),
                             cache_config: cache_config.clone().normalized(),
                         };
-                        if let Err(error) = backend.command(BackendCommand::Load(load_request)) {
+                        // Restore volume before loading so the first audio samples use it.
+                        let load_result = backend
+                            .command(BackendCommand::SetVolume {
+                                volume: volume.level,
+                            })
+                            .and_then(|()| backend.command(BackendCommand::Load(load_request)));
+                        if let Err(error) = load_result {
                             error_message = Some(format!("加载视频失败：{error}").into());
                         }
                         (
@@ -173,6 +192,7 @@ impl PlaybackPage {
             video: ShutdownOrder::new(backend, video_presenter),
             frame: PlaybackFrameState::default(),
             timeline,
+            download_speed: controls::DownloadSpeedDisplay::default(),
             playback_details_visible: false,
             fullscreen: FullscreenControlsState::default(),
             source_protocol,
@@ -190,9 +210,8 @@ impl PlaybackPage {
                 request.selected_tracks,
             ),
             subtitle: SubtitleOverlayState::default(),
-            volume: PlaybackVolumeState::default(),
+            volume,
             error_message,
-            status_message,
         };
         if page.error_message.is_some() {
             let _ = page.close_playback_reporting(true, false);
@@ -344,12 +363,6 @@ impl PlaybackPage {
         cx.notify();
     }
 
-    fn message_text(&self) -> SharedString {
-        self.error_message
-            .clone()
-            .unwrap_or_else(|| self.status_message.clone())
-    }
-
     fn render_mouse_capture(&self, cx: &Context<Self>) -> impl IntoElement {
         div()
             .id("playback-mouse-capture")
@@ -378,19 +391,18 @@ fn playback_protocol(url: &str) -> Option<String> {
         .filter(|protocol| !protocol.is_empty())
 }
 
-fn clamp_playback_volume(volume: f32) -> f32 {
-    let volume = if volume.is_finite() { volume } else { 1.0 };
-    volume.clamp(0.0, 1.0)
-}
-
 fn playback_volume_percent(volume: f32) -> u32 {
     (clamp_playback_volume(volume) * 100.0).round() as u32
 }
 
+const PLAYBACK_VOLUME_STEP: f32 = 0.02;
+// GPUI's Linux Wayland and X11 backends report three lines per wheel detent.
+const SCROLL_LINES_PER_VOLUME_STEP: f32 = 3.0;
+
 fn volume_delta_from_scroll_delta(delta: ScrollDelta) -> f32 {
     match delta {
-        ScrollDelta::Lines(point) => point.y * 0.05,
-        ScrollDelta::Pixels(point) => f32::from(point.y) / 500.0,
+        ScrollDelta::Lines(point) => point.y / SCROLL_LINES_PER_VOLUME_STEP * PLAYBACK_VOLUME_STEP,
+        ScrollDelta::Pixels(point) => f32::from(point.y) / 25.0 * PLAYBACK_VOLUME_STEP,
     }
     .clamp(-0.2, 0.2)
 }
@@ -407,15 +419,21 @@ impl Render for PlaybackPage {
             .clone()
             .zip(self.frame.source_size)
             .map(|(frame, source_size)| VideoFrameElement { frame, source_size });
-        let show_message =
-            self.error_message.is_some() || current_frame.is_none() || self.timeline.buffering;
-        let message_text = self.message_text();
+        let status = playback_status(
+            &self.timeline,
+            current_frame.is_some(),
+            self.queue_switch.loading,
+            self.error_message.as_ref(),
+        );
+        let progress_bar_visible = self.progress_bar_visible();
+        if progress_bar_visible {
+            self.update_download_speed(cx);
+        }
         let theme = theme::get(cx);
         let is_fullscreen = window.is_fullscreen();
         if is_fullscreen && !self.fullscreen.cursor_visible {
             crate::hide_cursor_until_mouse_moves(cx);
         }
-        let progress_bar_visible = self.progress_bar_visible();
         let view = cx.entity().downgrade();
         let viewport_observer = canvas(
             |bounds, _, _| bounds,
@@ -469,21 +487,8 @@ impl Render for PlaybackPage {
                 this.rounded_b(theme.radius_lg).overflow_hidden()
             })
             .when_some(current_video_frame, |this, frame| this.child(frame))
-            .when(show_message, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
-                        .left_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_base()
-                        .text_color(rgb(0x9aa5b1))
-                        .child(message_text),
-                )
+            .when_some(status, |this, status| {
+                this.child(render_playback_status(status, cx))
             })
             .child(viewport_observer)
             .child(self.render_mouse_capture(cx))
@@ -494,10 +499,10 @@ impl Render for PlaybackPage {
             .when(self.volume.indicator_visible, |this| {
                 this.child(self.render_volume_indicator(cx))
             })
-            .child(self.render_queue_switch_status(cx))
             .child(self.render_queue_switch_error(cx))
             .when(progress_bar_visible, |this| {
                 this.child(self.render_progress_bar(cx))
+                    .child(self.render_download_speed(cx))
             })
             .when(
                 fullscreen::playback_back_button_visible(

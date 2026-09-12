@@ -9,6 +9,19 @@ use super::TinyApp;
 const CACHE_SAVE_DEBOUNCE: Duration = Duration::from_millis(350);
 
 impl TinyApp {
+    pub(super) fn update_playback_volume(
+        &mut self,
+        settings: crate::player::PlaybackVolumeSettings,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = settings.normalized();
+        if self.cache.playback_volume == settings {
+            return;
+        }
+        self.cache.playback_volume = settings;
+        self.schedule_cache_save("保存音量失败", cx);
+    }
+
     pub(super) fn schedule_cache_save(
         &mut self,
         error_prefix: &'static str,
@@ -419,6 +432,67 @@ mod tests {
                 .cache_secs,
             75.0
         );
+    }
+
+    #[gpui::test]
+    fn volume_changes_are_coalesced_saved_and_restored_on_restart(cx: &mut TestAppContext) {
+        use crate::player::PlaybackVolumeSettings;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let app = cx.new(|cx| {
+            let mut app = TinyApp::new(ServerCache::empty(), None, cx);
+            app.cache_save_path = Some(path.clone());
+            app
+        });
+        for level in [0.98, 0.96, 0.94] {
+            app.update(cx, |app, cx| {
+                app.update_playback_volume(
+                    PlaybackVolumeSettings {
+                        level,
+                        unmuted_level: level,
+                    },
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            assert!(!path.exists());
+        }
+        cx.executor().advance_clock(CACHE_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        assert_eq!(
+            storage::load_or_init_from(&path)
+                .unwrap()
+                .playback_volume
+                .level,
+            0.94
+        );
+
+        let muted = PlaybackVolumeSettings {
+            level: 0.0,
+            unmuted_level: 0.94,
+        };
+        app.update(cx, |app, cx| app.update_playback_volume(muted, cx));
+        // Closing before the debounce expires must still save the final setting.
+        drop(app);
+        cx.update(|_| {});
+        cx.run_until_parked();
+        let saved = storage::load_or_init_from(&path).unwrap();
+        assert_eq!(saved.playback_volume, muted);
+
+        let reopened = cx.new(|cx| {
+            let mut app = TinyApp::new(saved, None, cx);
+            app.cache_save_path = Some(path.clone());
+            app
+        });
+        assert_eq!(
+            reopened.read_with(cx, |app, _| app.cache.playback_volume),
+            muted
+        );
+        reopened.update(cx, |app, cx| app.update_playback_volume(muted, cx));
+        assert!(reopened.read_with(cx, |app, _| app.pending_cache_save_error_prefix.is_none()));
     }
 
     #[gpui::test]

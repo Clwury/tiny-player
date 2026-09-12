@@ -26,6 +26,7 @@ use super::{
 };
 use crate::player::backend::ffmpeg::worker::{PendingSeek, PendingTrackSelection};
 
+const AUDIO_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON: &str = "audio_track_change";
 const SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON: &str = "internal_subtitle_track_change";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,6 +306,14 @@ fn track_selection_low_level_seek_reason(
     previous: &PlaybackTrackSelection,
     next: &PlaybackTrackSelection,
 ) -> Option<&'static str> {
+    // Unselected audio packets are dropped during prefetch. Even when a reselected track has
+    // cached packets at the playback position, its later packets can have a hole covering the
+    // time it was disabled. Re-read from the current position into a fresh range so that video
+    // waiting for the audio clock cannot deadlock with audio waiting for future video coverage.
+    if next.audio_stream_index.is_some() && next.audio_stream_index != previous.audio_stream_index {
+        return Some(AUDIO_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON);
+    }
+
     let previous_internal_subtitle = internal_subtitle_stream_index(previous);
     let next_internal_subtitle = internal_subtitle_stream_index(next);
 
@@ -394,15 +403,56 @@ mod tests {
     }
 
     #[test]
-    fn audio_only_or_external_subtitle_changes_keep_cached_seek() {
+    fn reenabling_audio_track_forces_low_level_seek() {
+        let previous = PlaybackTrackSelection {
+            audio_stream_index: None,
+            default_audio_stream_index: Some(1),
+            ..PlaybackTrackSelection::default()
+        };
+        let next = PlaybackTrackSelection {
+            audio_stream_index: Some(1),
+            ..previous.clone()
+        };
+
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &next),
+            Some("audio_track_change"),
+            "packets cached before disabling audio do not cover the disabled interval"
+        );
+    }
+
+    #[test]
+    fn changing_audio_track_forces_low_level_seek() {
+        let previous = PlaybackTrackSelection {
+            audio_stream_index: Some(1),
+            ..PlaybackTrackSelection::default()
+        };
+        let next = PlaybackTrackSelection {
+            audio_stream_index: Some(5),
+            ..previous.clone()
+        };
+
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &next),
+            Some("audio_track_change")
+        );
+        assert_eq!(
+            track_selection_low_level_seek_reason(&next, &previous),
+            Some("audio_track_change"),
+            "switching back must not reuse incomplete packets from the previously selected track"
+        );
+    }
+
+    #[test]
+    fn disabling_tracks_or_external_subtitle_changes_keep_cached_seek() {
         let previous = PlaybackTrackSelection {
             audio_stream_index: Some(1),
             subtitle_stream_index: Some(4),
             subtitle_codec: Some("subrip".to_string()),
             ..PlaybackTrackSelection::default()
         };
-        let audio_change = PlaybackTrackSelection {
-            audio_stream_index: Some(5),
+        let audio_off = PlaybackTrackSelection {
+            audio_stream_index: None,
             ..previous.clone()
         };
         let external_subtitle = PlaybackTrackSelection {
@@ -419,7 +469,11 @@ mod tests {
         };
 
         assert_eq!(
-            track_selection_low_level_seek_reason(&previous, &audio_change),
+            track_selection_low_level_seek_reason(&previous, &previous),
+            None
+        );
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &audio_off),
             None
         );
         assert_eq!(

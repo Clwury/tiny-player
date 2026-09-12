@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     app_metadata,
-    player::{PlaybackCacheConfig, PlaybackLanguagePreferences},
+    player::{PlaybackCacheConfig, PlaybackLanguagePreferences, PlaybackVolumeSettings},
     server::CachedServer,
     theme::ColorTheme,
 };
@@ -30,6 +30,8 @@ pub struct ServerCache {
     pub color_theme: ColorTheme,
     #[serde(default)]
     pub track_languages: PlaybackLanguagePreferences,
+    #[serde(default)]
+    pub playback_volume: PlaybackVolumeSettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +51,7 @@ impl ServerCache {
             playback: PlaybackCacheConfig::default(),
             color_theme: ColorTheme::default(),
             track_languages: PlaybackLanguagePreferences::default(),
+            playback_volume: PlaybackVolumeSettings::default(),
         }
     }
 
@@ -150,6 +153,7 @@ pub(crate) fn load_or_init_from(path: &Path) -> Result<ServerCache> {
     // the playback worker. This also makes old cache files (without a
     // `playback` field) behave exactly like a fresh configuration.
     cache.playback = cache.playback.clone().normalized();
+    cache.playback_volume = cache.playback_volume.normalized();
 
     Ok(cache)
 }
@@ -309,6 +313,50 @@ mod tests {
     }
 
     #[test]
+    fn saves_and_restores_volume_and_the_unmuted_level() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut cache = ServerCache::empty();
+        for level in [0.42, 0.0] {
+            cache.playback_volume = PlaybackVolumeSettings {
+                level,
+                unmuted_level: 0.42,
+            };
+            save_to(&cache, &path).unwrap();
+            assert_eq!(
+                load_or_init_from(&path).unwrap().playback_volume,
+                cache.playback_volume
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_volume_is_normalized_without_changing_other_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut cache = ServerCache::empty();
+        cache.device_id = "existing-device".into();
+        cache.playback.cache_secs = 42.5;
+        for (level, unmuted_level, expected_level, expected_unmuted_level) in [
+            (2.0, 0.42, 1.0, 1.0),
+            (-0.1, 0.42, 0.0, 0.42),
+            (0.0, 0.0, 0.0, 1.0),
+            (0.0, 2.0, 0.0, 1.0),
+        ] {
+            cache.playback_volume = PlaybackVolumeSettings {
+                level,
+                unmuted_level,
+            };
+            save_to(&cache, &path).unwrap();
+            let loaded = load_or_init_from(&path).unwrap();
+            assert_eq!(loaded.playback_volume.level, expected_level);
+            assert_eq!(loaded.playback_volume.unmuted_level, expected_unmuted_level);
+            assert_eq!(loaded.device_id, "existing-device");
+            assert_eq!(loaded.playback.cache_secs, 42.5);
+        }
+    }
+
+    #[test]
     fn unknown_color_theme_falls_back_without_discarding_server_settings() {
         let mut json = serde_json::to_value(ServerCache::empty()).unwrap();
         json["color_theme"] = "removed-theme".into();
@@ -335,6 +383,7 @@ mod tests {
         assert_eq!(loaded.auto_start_server_id, None);
         assert_eq!(loaded.playback, PlaybackCacheConfig::default());
         assert_eq!(loaded.color_theme, ColorTheme::Mocha);
+        assert_eq!(loaded.playback_volume, PlaybackVolumeSettings::default());
         assert_eq!(
             loaded.track_languages,
             PlaybackLanguagePreferences::default()
