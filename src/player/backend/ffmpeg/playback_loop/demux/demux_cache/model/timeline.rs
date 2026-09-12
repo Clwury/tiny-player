@@ -2,6 +2,8 @@ use std::{os::raw::c_int, sync::mpsc::Sender};
 
 use ffmpeg_sys_next as ffi;
 
+use crate::player::backend::ffmpeg::playback_loop::subtitle_cue_timeline_nsecs;
+
 use super::{
     AvPacket, BackendEvent, BufferedReporter, CachedDemuxPacket, CachedDemuxPacketRecovery,
     DEFAULT_VIDEO_FRAME_DURATION_NSECS, DemuxSelectedStreams, PlaybackSessionId, StreamInfo,
@@ -18,10 +20,8 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxP
     current_start_position_nsecs: u64,
     video_clock: TimestampMapper,
     audio_clock: TimestampMapper,
-    subtitle_clock: TimestampMapper,
     video_seek_clock: DemuxSeekTimestampMapper,
     audio_seek_clock: DemuxSeekTimestampMapper,
-    subtitle_seek_clock: DemuxSeekTimestampMapper,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) buffered_reporter:
         BufferedReporter,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) session_id:
@@ -57,21 +57,12 @@ impl DemuxPacketTimeline {
                 current_start_position_nsecs,
                 None,
             ),
-            subtitle_clock: TimestampMapper::new(
-                subtitle_stream.and_then(|stream| stream.start_nsecs),
-                current_start_position_nsecs,
-                None,
-            ),
             video_seek_clock: DemuxSeekTimestampMapper::new(
                 video_stream.start_nsecs,
                 current_start_position_nsecs,
             ),
             audio_seek_clock: DemuxSeekTimestampMapper::new(
                 audio_stream.and_then(|stream| stream.start_nsecs),
-                current_start_position_nsecs,
-            ),
-            subtitle_seek_clock: DemuxSeekTimestampMapper::new(
-                subtitle_stream.and_then(|stream| stream.start_nsecs),
                 current_start_position_nsecs,
             ),
             buffered_reporter,
@@ -97,17 +88,8 @@ impl DemuxPacketTimeline {
             self.current_start_position_nsecs,
             None,
         );
-        self.subtitle_clock = TimestampMapper::new(
-            self.subtitle_stream.and_then(|stream| stream.start_nsecs),
-            self.current_start_position_nsecs,
-            None,
-        );
         self.audio_seek_clock = DemuxSeekTimestampMapper::new(
             self.audio_stream.and_then(|stream| stream.start_nsecs),
-            self.current_start_position_nsecs,
-        );
-        self.subtitle_seek_clock = DemuxSeekTimestampMapper::new(
-            self.subtitle_stream.and_then(|stream| stream.start_nsecs),
             self.current_start_position_nsecs,
         );
     }
@@ -131,21 +113,12 @@ impl DemuxPacketTimeline {
             self.current_start_position_nsecs,
             None,
         );
-        self.subtitle_clock = TimestampMapper::new(
-            self.subtitle_stream.and_then(|stream| stream.start_nsecs),
-            self.current_start_position_nsecs,
-            None,
-        );
         self.video_seek_clock = DemuxSeekTimestampMapper::new(
             self.video_stream.start_nsecs,
             self.current_start_position_nsecs,
         );
         self.audio_seek_clock = DemuxSeekTimestampMapper::new(
             self.audio_stream.and_then(|stream| stream.start_nsecs),
-            self.current_start_position_nsecs,
-        );
-        self.subtitle_seek_clock = DemuxSeekTimestampMapper::new(
-            self.subtitle_stream.and_then(|stream| stream.start_nsecs),
             self.current_start_position_nsecs,
         );
         self.buffered_reporter = BufferedReporter::new_with_events(false, false);
@@ -246,23 +219,24 @@ impl DemuxPacketTimeline {
             };
             let raw_timestamp = packet.best_timestamp();
             let timestamp = raw_timestamp.unwrap_or(ffi::AV_NOPTS_VALUE);
-            let mapped = self
-                .subtitle_clock
-                .map(timestamp, subtitle_stream.time_base);
-            let seek_timestamp_nsecs = self
-                .subtitle_seek_clock
-                .map(raw_timestamp, subtitle_stream.time_base);
-            let end_nsecs = packet_end_timeline_nsecs(
-                packet,
+            // Seek lookup, read-ahead throttling and display must share the same
+            // subtitle timeline. A sparse PGS stream start is its first cue, not
+            // the playback origin; subtracting it here skips cues on cached seek.
+            // Like mpv's subtitle packets, preserve equal PTS within a display set
+            // and leave missing timestamps unknown instead of synthesizing them.
+            let start_nsecs = subtitle_cue_timeline_nsecs(
+                None,
+                raw_timestamp,
                 subtitle_stream,
-                timestamp,
-                mapped.timeline_nsecs,
-                Some(0),
+                self.video_clock.timeline_origin_nsecs(),
             );
+            let end_nsecs = start_nsecs.and_then(|start_nsecs| {
+                packet_end_timeline_nsecs(packet, subtitle_stream, timestamp, start_nsecs, Some(0))
+            });
             return DemuxPacketTimestamps {
-                start_nsecs: Some(mapped.timeline_nsecs),
+                start_nsecs,
                 end_nsecs,
-                seek_timestamp_nsecs,
+                seek_timestamp_nsecs: start_nsecs,
             };
         };
         let raw_timestamp = packet.best_timestamp();

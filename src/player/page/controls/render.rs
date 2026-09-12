@@ -508,10 +508,17 @@ impl PlaybackPage {
 
         let track = div()
             .id("playback-progress-track")
+            .debug_selector(|| "playback-progress-track".to_string())
             .relative()
             .flex_1()
             .h(px(28.0))
-            .cursor_pointer()
+            .cursor_default()
+            .on_mouse_move(cx.listener(|page, event: &MouseMoveEvent, _, cx| {
+                page.update_progress_hover(Some(event.position), cx);
+            }))
+            .on_hover(cx.listener(|page, hovered: &bool, window, cx| {
+                page.update_progress_hover(hovered.then(|| window.mouse_position()), cx);
+            }))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_progress_drag))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_progress_drag))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_progress_drag))
@@ -538,7 +545,11 @@ impl PlaybackPage {
                 played_color,
                 state.played_fraction,
             ))
-            .child(progress_track_observer(cx));
+            .child(progress_track_observer(cx))
+            .when_some(
+                progress::render_progress_hover(&self.timeline, cx),
+                |track, preview| track.child(preview),
+            );
 
         div()
             .flex()
@@ -606,11 +617,11 @@ impl PlaybackPage {
         div()
             .id("playback-progress")
             .absolute()
-            .left(relative(0.3))
+            .left(relative((1.0 - PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION) / 2.0))
             .bottom(px(PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX))
             .flex()
             .flex_col()
-            .w(relative(0.4))
+            .w(relative(PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION))
             .h(px(PLAYBACK_PROGRESS_BAR_HEIGHT_PX))
             .justify_center()
             .gap_2()
@@ -619,6 +630,8 @@ impl PlaybackPage {
             .border_color(theme.input_border.opacity(0.42))
             .bg(rgba(0x00000099))
             .px_4()
+            // Reserve space inside the panel for the time below the progress track.
+            .pb(px(8.0))
             .shadow_lg()
             .occlude()
             .on_mouse_down(

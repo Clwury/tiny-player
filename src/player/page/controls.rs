@@ -1,6 +1,7 @@
 use super::fullscreen::{
     PLAYBACK_BACK_BUTTON_OFFSET_PX, PLAYBACK_BACK_BUTTON_SIZE_PX,
     PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX, PLAYBACK_PROGRESS_BAR_HEIGHT_PX,
+    PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION,
 };
 use super::state::effective_playback_paused;
 use super::*;

@@ -448,7 +448,7 @@ mod tests {
 
         assert_eq!(
             subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true),
-            px(407.0)
+            px(393.0)
         );
     }
 
@@ -460,7 +460,7 @@ mod tests {
 
         assert_eq!(
             subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true),
-            px(407.0)
+            px(393.0)
         );
     }
 
@@ -496,7 +496,7 @@ mod tests {
     fn subtitle_render_bottom_offset_is_independent_from_controls_visibility() {
         let video_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
         let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
-        let controls_default_bottom = px(482.0);
+        let controls_default_bottom = px(468.0);
         let hidden_controls_default_bottom = px(525.0);
 
         let manual_offset = subtitle_vertical_offset_after_adjustment(
@@ -514,7 +514,7 @@ mod tests {
                     + video_fitted_bounds.origin.y,
                 Some(manual_offset),
             ),
-            px(477.5)
+            px(463.5)
         );
         assert_eq!(
             subtitle_render_bottom(
@@ -522,7 +522,7 @@ mod tests {
                 hidden_controls_default_bottom,
                 Some(manual_offset),
             ),
-            px(477.5)
+            px(463.5)
         );
     }
 

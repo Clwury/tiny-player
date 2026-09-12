@@ -1,7 +1,8 @@
 use super::*;
 
 pub(super) const PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX: f32 = 24.0;
-pub(super) const PLAYBACK_PROGRESS_BAR_HEIGHT_PX: f32 = 94.0;
+pub(super) const PLAYBACK_PROGRESS_BAR_HEIGHT_PX: f32 = 108.0;
+pub(super) const PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION: f32 = 0.4;
 pub(super) const PLAYBACK_BACK_BUTTON_OFFSET_PX: f32 = 16.0;
 pub(super) const PLAYBACK_BACK_BUTTON_SIZE_PX: f32 = 32.0;
 const FULLSCREEN_CONTROLS_HIDE_DELAY: Duration = Duration::from_millis(500);
@@ -20,6 +21,7 @@ impl PlaybackPage {
         self.fullscreen.controls_visible = false;
         self.fullscreen.mouse_in_controls = false;
         self.fullscreen.mouse_in_back_button = false;
+        self.timeline.progress_hover_cursor = None;
         self.fullscreen.hide_generation = self.fullscreen.hide_generation.wrapping_add(1);
         self.tracks.open = None;
     }
@@ -61,6 +63,7 @@ impl PlaybackPage {
         self.fullscreen.cursor_visible = false;
         self.fullscreen.controls_visible = false;
         self.tracks.open = None;
+        self.timeline.progress_hover_cursor = None;
         if changed {
             cx.notify();
         }
@@ -201,12 +204,13 @@ pub(super) fn playback_back_button_bounds(viewport_bounds: Bounds<Pixels>) -> Bo
 pub(super) fn playback_progress_bar_bounds(viewport_bounds: Bounds<Pixels>) -> Bounds<Pixels> {
     Bounds::new(
         gpui::point(
-            viewport_bounds.origin.x + viewport_bounds.size.width * 0.3,
+            viewport_bounds.origin.x
+                + viewport_bounds.size.width * (1.0 - PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION) / 2.0,
             viewport_bounds.origin.y + viewport_bounds.size.height
                 - px(PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX + PLAYBACK_PROGRESS_BAR_HEIGHT_PX),
         ),
         gpui::size(
-            viewport_bounds.size.width * 0.4,
+            viewport_bounds.size.width * PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION,
             px(PLAYBACK_PROGRESS_BAR_HEIGHT_PX),
         ),
     )
@@ -274,7 +278,7 @@ mod tests {
 
         assert_eq!(
             playback_progress_bar_bounds(viewport),
-            Bounds::new(point(px(300.0), px(882.0)), size(px(400.0), px(94.0)))
+            Bounds::new(point(px(300.0), px(868.0)), size(px(400.0), px(108.0)))
         );
         assert!(playback_controls_contains(
             point(px(500.0), px(900.0)),

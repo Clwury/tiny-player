@@ -300,6 +300,78 @@ fn demux_packet_cache_state_cached_seek_rewinds_to_first_pgs_packet_at_same_pts(
 }
 
 #[test]
+fn cached_seek_replays_current_pgs_display_set_with_sparse_stream_start() {
+    for mode in [PlaybackSeekMode::Fast, PlaybackSeekMode::Precise] {
+        let mut video_stream = stream_info_for_test(0, ffi::AVCodecID::AV_CODEC_ID_HEVC);
+        video_stream.start_nsecs = Some(0);
+        let mut subtitle_stream =
+            stream_info_for_test(2, ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE);
+        subtitle_stream.start_nsecs = Some(11_303_000_000);
+        subtitle_stream.time_base = ffi::AVRational { num: 1, den: 1_000 };
+        let mut timeline = DemuxPacketTimeline::new(
+            video_stream,
+            None,
+            Some(subtitle_stream),
+            1140.222,
+            PlaybackSessionId(1),
+        );
+        let mut state = DemuxPacketCacheState::new(
+            1_140_222_000_000,
+            0,
+            video_stream.codec_id,
+            PlaybackSessionId(1),
+            cache_config_for_test(),
+        );
+        state.set_selected_streams(DemuxSelectedStreams {
+            audio_stream: None,
+            subtitle_stream: Some(subtitle_stream),
+        });
+        state.append_packet(cached_anchor(1_203_202_000_000, 1_205_204_000_000));
+        state.append_packet(cached_anchor(1_205_204_000_000, 1_207_206_000_000));
+        state.append_packet(cached_anchor(1_207_206_000_000, 1_220_000_000_000));
+        let (event_tx, _event_rx) = mpsc::channel();
+        let display_set_start = state.next_packet_id;
+        // The target lies inside the first display set. Subtracting the sparse
+        // subtitle stream start would incorrectly select the future 1214.255s cue.
+        for pts in [1_204_500, 1_204_500, 1_207_000, 1_214_255, 1_217_091] {
+            let mut packet = demux_packet_for_stream(2);
+            unsafe {
+                (*packet.as_mut_ptr()).pts = pts;
+            }
+            let cached = timeline
+                .cache_packet(&packet, &event_tx)
+                .expect("subtitle packet caches")
+                .expect("subtitle stream is selected");
+            state.append_packet(cached);
+        }
+        close_seek_range(&mut state, 1_220_000_000_000);
+
+        let buffered_until = match mode {
+            PlaybackSeekMode::Fast => {
+                state.seek_cached_fast(1_206_604_000_000, PlaybackSessionId(2))
+            }
+            PlaybackSeekMode::Precise => state.seek_cached(1_206_604_000_000, PlaybackSessionId(2)),
+        };
+
+        assert_eq!(buffered_until, Some(1220.0), "{mode:?}");
+        assert_eq!(
+            state.reader_heads.get(&2),
+            Some(&display_set_start),
+            "{mode:?} seek must replay the current display set, including its first packet"
+        );
+        let mut timing = DemuxPacketCacheReadTiming::default();
+        for _ in 0..2 {
+            let source = state
+                .take_packet_round_robin(&[2], &mut timing)
+                .expect("subtitle packet reads")
+                .expect("display set packet is available");
+            let (packet, _) = source.packet_ref(&mut timing).expect("packet restores");
+            assert_eq!(packet.best_timestamp(), Some(1_204_500));
+        }
+    }
+}
+
+#[test]
 fn demux_packet_cache_state_rejects_cached_seek_when_selected_audio_stream_is_missing() {
     let mut state = DemuxPacketCacheState::new(
         0,

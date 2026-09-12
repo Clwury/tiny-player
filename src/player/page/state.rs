@@ -25,6 +25,7 @@ pub(super) struct PlaybackTimelineState {
     pub(super) pending_seek_keeps_frame: bool,
     pub(super) progress_track_bounds: Option<Bounds<Pixels>>,
     pub(super) progress_drag_position: Option<f64>,
+    pub(super) progress_hover_cursor: Option<Point<Pixels>>,
 }
 
 impl Default for PlaybackTimelineState {
@@ -47,6 +48,7 @@ impl Default for PlaybackTimelineState {
             pending_seek_keeps_frame: false,
             progress_track_bounds: None,
             progress_drag_position: None,
+            progress_hover_cursor: None,
         }
     }
 }

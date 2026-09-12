@@ -1,15 +1,15 @@
 use super::subtitles::subtitle_vertical_adjust_step;
 use super::*;
 
-const KEYBOARD_SEEK_STEP_SECONDS: f64 = 5.0;
+const KEYBOARD_SEEK_STEP_SECONDS: i32 = 5;
+const KEYBOARD_LONG_SEEK_STEP_SECONDS: i32 = 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PlaybackShortcut {
     TogglePlayback,
     ToggleFullscreen,
     ExitFullscreen,
-    SeekBackward,
-    SeekForward,
+    SeekRelative(i32),
     ToggleInfoOverlay,
     RaiseSubtitle,
     LowerSubtitle,
@@ -45,11 +45,8 @@ impl PlaybackPage {
                 window.toggle_fullscreen();
                 cx.notify();
             }
-            PlaybackShortcut::SeekBackward => {
-                self.seek_relative(-KEYBOARD_SEEK_STEP_SECONDS, window, cx);
-            }
-            PlaybackShortcut::SeekForward => {
-                self.seek_relative(KEYBOARD_SEEK_STEP_SECONDS, window, cx);
+            PlaybackShortcut::SeekRelative(seconds) => {
+                self.seek_relative(f64::from(seconds), window, cx);
             }
             PlaybackShortcut::ToggleInfoOverlay => {
                 self.playback_details_visible = !self.playback_details_visible;
@@ -118,9 +115,17 @@ pub(super) fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
     } else if key.eq_ignore_ascii_case("escape") {
         Some(PlaybackShortcut::ExitFullscreen)
     } else if key.eq_ignore_ascii_case("left") {
-        Some(PlaybackShortcut::SeekBackward)
+        Some(PlaybackShortcut::SeekRelative(-KEYBOARD_SEEK_STEP_SECONDS))
     } else if key.eq_ignore_ascii_case("right") {
-        Some(PlaybackShortcut::SeekForward)
+        Some(PlaybackShortcut::SeekRelative(KEYBOARD_SEEK_STEP_SECONDS))
+    } else if key.eq_ignore_ascii_case("up") {
+        Some(PlaybackShortcut::SeekRelative(
+            KEYBOARD_LONG_SEEK_STEP_SECONDS,
+        ))
+    } else if key.eq_ignore_ascii_case("down") {
+        Some(PlaybackShortcut::SeekRelative(
+            -KEYBOARD_LONG_SEEK_STEP_SECONDS,
+        ))
     } else if key.eq_ignore_ascii_case("i") {
         Some(PlaybackShortcut::ToggleInfoOverlay)
     } else if key.eq_ignore_ascii_case("r") {
@@ -206,9 +211,20 @@ mod tests {
     }
 
     #[test]
-    fn volume_shortcuts_ignore_control_alt_platform_and_function_modifiers() {
+    fn playback_shortcuts_ignore_control_alt_platform_and_function_modifiers() {
         for modifier in ["ctrl", "alt", "super", "fn"] {
-            for key in ["9", "0", "/", "*", "m", "shift-8->*"] {
+            for key in [
+                "9",
+                "0",
+                "/",
+                "*",
+                "m",
+                "shift-8->*",
+                "left",
+                "right",
+                "up",
+                "down",
+            ] {
                 let keystroke = format!("{modifier}-{key}");
                 assert_eq!(
                     shortcut_for_keystroke(&keystroke, false),
@@ -220,14 +236,30 @@ mod tests {
     }
 
     #[test]
-    fn held_keys_repeat_volume_adjustment_but_not_toggles() {
+    fn held_keys_repeat_volume_adjustment_but_not_toggles_or_seeks() {
         for key in ["9", "0", "/", "*", "divide", "multiply", "shift-8->*"] {
             assert!(shortcut_for_keystroke(key, true).is_some(), "{key}");
         }
         for key in [
-            "m", "space", "p", "f", "escape", "i", "r", "t", "left", "right",
+            "m", "space", "p", "f", "escape", "i", "r", "t", "left", "right", "up", "down",
         ] {
             assert_eq!(shortcut_for_keystroke(key, true), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn arrow_shortcuts_seek_with_mpv_intervals() {
+        for (key, seconds) in [("left", -5), ("right", 5), ("up", 60), ("down", -60)] {
+            assert_eq!(
+                shortcut_for_keystroke(key, false),
+                Some(PlaybackShortcut::SeekRelative(seconds)),
+                "{key}"
+            );
+            assert_eq!(
+                playback_shortcut_for_key(&key.to_uppercase()),
+                Some(PlaybackShortcut::SeekRelative(seconds))
+            );
+            assert_eq!(shortcut_for_keystroke(&format!("shift-{key}"), false), None);
         }
     }
 
@@ -255,11 +287,11 @@ mod tests {
         );
         assert_eq!(
             playback_shortcut_for_key("left"),
-            Some(PlaybackShortcut::SeekBackward)
+            Some(PlaybackShortcut::SeekRelative(-5))
         );
         assert_eq!(
             playback_shortcut_for_key("right"),
-            Some(PlaybackShortcut::SeekForward)
+            Some(PlaybackShortcut::SeekRelative(5))
         );
         assert_eq!(
             playback_shortcut_for_key("i"),
