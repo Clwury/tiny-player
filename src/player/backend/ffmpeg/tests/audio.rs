@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn seeking_inside_time_stretched_audio_trims_pcm_in_media_time() {
+    for (samples, remaining) in [(1920, 960), (480, 240)] {
+        let mut pending = PendingStartAudio::default();
+        pending.push(
+            DecodedAudio {
+                samples: vec![0.25; samples],
+                duration_nsecs: 20_000_000,
+            },
+            1_000_000_000,
+            1_020_000_000,
+        );
+        let mut frame = pending.pop_front_until(1_020_000_000).unwrap();
+        assert!(frame.trim_before(1_010_000_000, 48_000, 2));
+        assert_eq!(frame.samples.len(), remaining);
+        assert_eq!(frame.start_timeline_nsecs, 1_010_000_000);
+        assert_eq!(frame.end_timeline_nsecs, 1_020_000_000);
+    }
+}
+
+#[test]
 fn pending_start_audio_discards_frames_before_first_video() {
     let mut pending = PendingStartAudio::default();
     pending.push(

@@ -64,6 +64,12 @@ impl BackendControl for PlaybackBackend {
         }
     }
 
+    fn set_playback_rate(&mut self, rate: f64) -> Result<()> {
+        match self {
+            Self::Ffmpeg(backend) => backend.set_playback_rate(rate),
+        }
+    }
+
     fn set_cache_config(&mut self, config: PlaybackCacheConfig) -> Result<()> {
         match self {
             Self::Ffmpeg(backend) => backend.set_cache_config(config),

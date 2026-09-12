@@ -130,6 +130,7 @@ pub(super) struct FfmpegControl {
     audio_output_state: AtomicU32,
     seek_transition_guard: Mutex<()>,
     volume: AtomicU32,
+    playback_rate: AtomicU64,
     session_id: AtomicU64,
     seek_generation: AtomicU64,
     handled_seek_generation: AtomicU64,
@@ -151,6 +152,7 @@ impl FfmpegControl {
             audio_output_state: AtomicU32::new(AudioOutputLifecycle::Syncing as u32),
             seek_transition_guard: Mutex::new(()),
             volume: AtomicU32::new(volume_to_storage(volume)),
+            playback_rate: AtomicU64::new(1.0_f64.to_bits()),
             session_id: AtomicU64::new(session_id.0),
             seek_generation: AtomicU64::new(0),
             handled_seek_generation: AtomicU64::new(0),
@@ -357,6 +359,17 @@ impl FfmpegControl {
             .store(volume_to_storage(volume), Ordering::Release);
     }
 
+    pub(super) fn playback_rate(&self) -> f64 {
+        f64::from_bits(self.playback_rate.load(Ordering::Acquire))
+    }
+
+    pub(super) fn set_playback_rate(&self, rate: f64) {
+        self.playback_rate.store(
+            crate::player::rate::clamp_playback_rate(rate).to_bits(),
+            Ordering::Release,
+        );
+    }
+
     pub(super) fn volume(&self) -> f32 {
         self.volume.load(Ordering::Acquire) as f32 / PLAYBACK_VOLUME_SCALE as f32
     }
@@ -511,10 +524,12 @@ pub(super) enum FfmpegCommand {
         session_id: PlaybackSessionId,
         config: PlaybackCacheConfig,
     },
-    #[allow(dead_code)]
     SetPlaybackRate {
         session_id: PlaybackSessionId,
         rate: f64,
+        position_seconds: f64,
+        generation: u64,
+        queued_at: Instant,
     },
 }
 
@@ -558,6 +573,7 @@ pub(super) struct DrainedFfmpegCommands {
     pub(super) pending_seek: Option<PendingSeek>,
     pub(super) pending_track_selection: Option<PendingTrackSelection>,
     pub(super) cache_config: Option<PlaybackCacheConfig>,
+    pub(super) playback_rate: Option<f64>,
 }
 
 impl FfmpegWorker {
@@ -566,9 +582,11 @@ impl FfmpegWorker {
         video_output_queue: VideoOutputQueue,
         event_tx: Sender<BackendEvent>,
         volume: f32,
+        playback_rate: f64,
     ) -> Result<Self> {
         let session_id = input.session_id;
         let control = Arc::new(FfmpegControl::with_volume(session_id, volume));
+        control.set_playback_rate(playback_rate);
         let (command_tx, command_rx) = mpsc::channel();
         let frame_presented = Arc::new(AtomicBool::new(false));
         let worker_control = Arc::clone(&control);
@@ -676,6 +694,32 @@ impl FfmpegWorker {
             BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string())
         })?;
         Ok(())
+    }
+
+    pub(super) fn set_playback_rate(
+        &self,
+        rate: f64,
+        position_seconds: f64,
+        session_id: PlaybackSessionId,
+    ) -> Result<()> {
+        let generation = self.control.request_seek();
+        self.control.set_cache_paused(false);
+        send_playback_command(
+            &self.command_tx,
+            &self.control,
+            FfmpegCommand::SetPlaybackRate {
+                session_id,
+                rate,
+                position_seconds,
+                generation,
+                queued_at: Instant::now(),
+            },
+        )
+        .map_err(|_| {
+            self.control.finish_seek(generation);
+            self.control.finish_seek_audio_pause();
+            BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string())
+        })
     }
 
     pub(super) fn set_paused(&self, paused: bool, session_id: PlaybackSessionId) -> Result<()> {
@@ -884,12 +928,22 @@ fn apply_playback_command(
             control.set_session_id(session_id);
             drained.cache_config = Some(config.normalized());
         }
-        FfmpegCommand::SetPlaybackRate { session_id, rate } => {
-            control.set_session_id(session_id);
-            tracing::debug!(
-                rate,
-                "FFmpeg playback-rate command queued but not implemented yet"
-            );
+        FfmpegCommand::SetPlaybackRate {
+            session_id,
+            rate,
+            position_seconds,
+            generation,
+            queued_at,
+        } => {
+            drained.playback_rate = Some(crate::player::rate::clamp_playback_rate(rate));
+            drained.pending_track_selection = None;
+            drained.pending_seek = Some(PendingSeek {
+                session_id,
+                position_seconds,
+                mode: PlaybackSeekMode::Precise,
+                generation,
+                queued_at,
+            });
         }
     }
 }

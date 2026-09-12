@@ -542,6 +542,9 @@ pub(super) struct AudioResampler {
 
 #[path = "codec/audio_resampler.rs"]
 mod audio_resampler;
+#[path = "codec/audio_tempo.rs"]
+mod audio_tempo;
+pub(super) use audio_tempo::AudioTempo;
 
 impl Drop for AudioResampler {
     fn drop(&mut self) {

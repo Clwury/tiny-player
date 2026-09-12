@@ -57,7 +57,6 @@ pub enum BackendCommand {
     },
     #[allow(dead_code)]
     SetCacheConfig(PlaybackCacheConfig),
-    #[allow(dead_code)]
     SetPlaybackRate {
         rate: f64,
     },
@@ -90,6 +89,9 @@ pub trait BackendControl {
     fn set_volume(&mut self, _volume: f32) -> Result<()> {
         Err(BackendError::UnsupportedCommand("调整音量"))
     }
+    fn set_playback_rate(&mut self, _rate: f64) -> Result<()> {
+        Err(BackendError::UnsupportedCommand("调整播放速度"))
+    }
     fn set_cache_config(&mut self, _config: PlaybackCacheConfig) -> Result<()> {
         Err(BackendError::UnsupportedCommand("调整缓存设置"))
     }
@@ -120,9 +122,7 @@ pub trait BackendControl {
             } => self.set_subtitle_track(track, position_seconds),
             BackendCommand::SetVolume { volume } => self.set_volume(volume),
             BackendCommand::SetCacheConfig(config) => self.set_cache_config(config),
-            BackendCommand::SetPlaybackRate { .. } => {
-                Err(BackendError::UnsupportedCommand("调整播放速度"))
-            }
+            BackendCommand::SetPlaybackRate { rate } => self.set_playback_rate(rate),
         }
     }
 }

@@ -370,7 +370,8 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
         current_start_position_nsecs,
         Some(video_frame_duration_nsecs),
     );
-    let scheduler = PlaybackScheduler::new(current_start_position_nsecs);
+    let mut scheduler = PlaybackScheduler::new(current_start_position_nsecs);
+    scheduler.set_playback_rate(control.playback_rate());
     let position_reporter = PositionReporter::default();
     let dovi_pipeline = DoviPipeline::default();
     let subtitle_pipeline = SubtitlePipeline::new(
@@ -385,7 +386,12 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
     if let Some(decoder) = opened_audio_decoder {
         match AudioOutput::new(Arc::clone(&control)) {
             Ok(output) => {
-                match AudioDecodePipeline::spawn(decoder, output.sample_rate(), output.channels()) {
+                match AudioDecodePipeline::spawn(
+                    decoder,
+                    output.sample_rate(),
+                    output.channels(),
+                    Arc::clone(&control),
+                ) {
                     Ok(worker) => {
                         let audio_info = worker.info();
                         tracing::debug!(

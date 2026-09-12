@@ -34,7 +34,7 @@ use audio::{
     AudioClockHandle, AudioClockMode, AudioOutput, AudioOutputActivitySnapshot,
     AudioOutputDrainStatus, AudioOutputPushResult, AudioOutputServiceStage, AudioOutputSnapshot,
     AudioOutputStableSnapshot, AudioStagedFrame, align_audio_elements_to_frame_boundary,
-    audio_elements_for_duration_floor, audio_elements_for_frames, audio_frames_for_duration_round,
+    audio_elements_for_frames, audio_frames_for_duration_round,
 };
 #[cfg(test)]
 use avio::{

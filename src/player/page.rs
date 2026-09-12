@@ -27,6 +27,7 @@ mod controls;
 mod fullscreen;
 mod progress;
 mod queue;
+mod rate;
 mod render;
 mod request;
 mod runtime;
@@ -103,6 +104,7 @@ pub struct PlaybackPage {
     tracks: TrackSelectState,
     subtitle: SubtitleOverlayState,
     volume: PlaybackVolumeState,
+    rate: rate::PlaybackRateState,
     error_message: Option<SharedString>,
 }
 
@@ -211,6 +213,7 @@ impl PlaybackPage {
             ),
             subtitle: SubtitleOverlayState::default(),
             volume,
+            rate: rate::PlaybackRateState::default(),
             error_message,
         };
         if page.error_message.is_some() {
@@ -498,6 +501,9 @@ impl Render for PlaybackPage {
             .child(self.render_subtitle_overlay(progress_bar_visible))
             .when(self.volume.indicator_visible, |this| {
                 this.child(self.render_volume_indicator(cx))
+            })
+            .when(self.rate.indicator_visible, |this| {
+                this.child(self.render_playback_rate_indicator(cx))
             })
             .child(self.render_queue_switch_error(cx))
             .when(progress_bar_visible, |this| {

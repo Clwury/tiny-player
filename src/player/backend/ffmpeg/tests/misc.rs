@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn video_only_scheduler_scales_time_and_preserves_rate_across_seek_and_pause() {
+    for rate in [0.25, 0.5, 1.1, 2.0, 4.0] {
+        let mut scheduler = PlaybackScheduler::new(0);
+        scheduler.set_playback_rate(rate);
+        scheduler.reset(10_000_000_000);
+        scheduler.set_elapsed_for_test(Duration::from_secs(2));
+        scheduler.delay_by(Duration::from_secs(1));
+        let expected = 10_000_000_000 + (1_000_000_000.0 * rate) as u64;
+        assert!(scheduler.current_timeline_nsecs().abs_diff(expected) < 20_000_000);
+        assert!(scheduler.ready_for(expected - 20_000_000));
+        assert!(!scheduler.ready_for(expected + 100_000_000));
+        let before = scheduler.current_timeline_nsecs();
+        scheduler.set_playback_rate(1.0);
+        assert!(scheduler.current_timeline_nsecs().abs_diff(before) < 20_000_000);
+    }
+}
+
+#[test]
 fn playback_scheduler_holds_target_while_paused() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let waiting_control = Arc::clone(&control);

@@ -19,6 +19,31 @@ use super::super::{
 };
 
 #[test]
+fn audio_drain_timeout_uses_wall_time_at_slow_and_fast_rates() {
+    for rate in [0.25, 0.5, 2.0, 4.0] {
+        let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
+        control.set_playback_rate(rate);
+        let output = AudioOutput::stopped_for_test(control, 9_600, 48_000, 2);
+        output.reset_clock(10_000_000_000);
+        output
+            .shared
+            .buffer
+            .lock()
+            .unwrap()
+            .push_slice(&vec![0.0; 9_600]);
+        output
+            .shared
+            .set_queued_end_timeline_nsecs(10_000_000_000 + (100_000_000.0 * rate) as u64);
+        let deadline = output.drain_deadline().unwrap().unwrap();
+        let wait = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            (Duration::from_millis(330)..=Duration::from_millis(350)).contains(&wait),
+            "{rate}: {wait:?}"
+        );
+    }
+}
+
+#[test]
 fn six_ao_service_stages_publish_atomic_begin_end_and_elapsed() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
     let output = AudioOutput::stopped_for_test(control, 4_800, 48_000, 2);

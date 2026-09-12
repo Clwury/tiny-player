@@ -504,7 +504,10 @@ fn queue_delayed_audio_start_silence(
         return Ok(DelayedAudioStartSilenceStatus::NotNeeded);
     }
 
-    let audio_gap_frames = audio_frames_for_duration_round(gap_nsecs, output.sample_rate());
+    let audio_gap_frames = audio_frames_for_duration_round(
+        (gap_nsecs as f64 / control.playback_rate()).round() as u64,
+        output.sample_rate(),
+    );
     let silence_samples = usize::try_from(audio_elements_for_frames(
         audio_gap_frames,
         output.channels(),

@@ -209,6 +209,7 @@ pub(super) fn frame_is_corrupt(frame: *mut ffi::AVFrame) -> bool {
 pub(super) struct PlaybackScheduler {
     start_instant: Instant,
     start_position_nsecs: u64,
+    playback_rate: f64,
 }
 
 impl PlaybackScheduler {
@@ -216,12 +217,19 @@ impl PlaybackScheduler {
         Self {
             start_instant: Instant::now(),
             start_position_nsecs,
+            playback_rate: 1.0,
         }
     }
 
     pub(super) fn reset(&mut self, start_position_nsecs: u64) {
         self.start_instant = Instant::now();
         self.start_position_nsecs = start_position_nsecs;
+    }
+
+    pub(super) fn set_playback_rate(&mut self, rate: f64) {
+        let position = self.current_timeline_nsecs();
+        self.reset(position);
+        self.playback_rate = crate::player::rate::clamp_playback_rate(rate);
     }
 
     pub(super) fn delay_by(&mut self, duration: Duration) {
@@ -232,7 +240,8 @@ impl PlaybackScheduler {
     }
 
     pub(super) fn ready_for(&self, timeline_nsecs: u64) -> bool {
-        let target_offset = timeline_nsecs.saturating_sub(self.start_position_nsecs);
+        let target_offset = (timeline_nsecs.saturating_sub(self.start_position_nsecs) as f64
+            / self.playback_rate) as u64;
         let target = self
             .start_instant
             .checked_add(Duration::from_nanos(target_offset))
@@ -242,7 +251,8 @@ impl PlaybackScheduler {
 
     pub(super) fn current_timeline_nsecs(&self) -> u64 {
         self.start_position_nsecs.saturating_add(
-            u64::try_from(self.start_instant.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            (self.start_instant.elapsed().as_secs_f64() * self.playback_rate * 1_000_000_000.0)
+                as u64,
         )
     }
 
@@ -259,7 +269,8 @@ impl PlaybackScheduler {
         timeline_nsecs: u64,
         control: &FfmpegControl,
     ) -> WaitStatus {
-        let target_offset = timeline_nsecs.saturating_sub(self.start_position_nsecs);
+        let target_offset = (timeline_nsecs.saturating_sub(self.start_position_nsecs) as f64
+            / self.playback_rate) as u64;
         loop {
             if control.should_interrupt() {
                 return WaitStatus::Interrupted;

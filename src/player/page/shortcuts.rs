@@ -1,5 +1,6 @@
 use super::subtitles::subtitle_vertical_adjust_step;
 use super::*;
+use crate::player::rate::PlaybackRateChange;
 
 const KEYBOARD_SEEK_STEP_SECONDS: i32 = 5;
 const KEYBOARD_LONG_SEEK_STEP_SECONDS: i32 = 60;
@@ -16,6 +17,7 @@ pub(super) enum PlaybackShortcut {
     DecreaseVolume,
     IncreaseVolume,
     ToggleMute,
+    ChangeRate(PlaybackRateChange),
 }
 
 impl PlaybackPage {
@@ -73,6 +75,7 @@ impl PlaybackPage {
                 self.adjust_playback_volume(PLAYBACK_VOLUME_STEP, cx);
             }
             PlaybackShortcut::ToggleMute => self.toggle_playback_mute(cx),
+            PlaybackShortcut::ChangeRate(change) => self.change_playback_rate(change, cx),
         }
     }
 }
@@ -85,10 +88,16 @@ fn playback_shortcut_for_event(event: &KeyDownEvent) -> Option<PlaybackShortcut>
     }
 
     let key = if modifiers.shift {
-        // Some platforms retain Shift when typing symbols such as '*'.
-        keystroke.key_char.as_deref().or_else(|| {
-            matches!(keystroke.key.as_str(), "/" | "*").then_some(keystroke.key.as_str())
-        })?
+        // Platforms may report either the typed symbol or the unshifted key.
+        keystroke
+            .key_char
+            .as_deref()
+            .or(match keystroke.key.as_str() {
+                "[" => Some("{"),
+                "]" => Some("}"),
+                "/" | "*" | "{" | "}" => Some(keystroke.key.as_str()),
+                _ => None,
+            })?
     } else {
         &keystroke.key
     };
@@ -97,7 +106,23 @@ fn playback_shortcut_for_event(event: &KeyDownEvent) -> Option<PlaybackShortcut>
         shortcut,
         PlaybackShortcut::DecreaseVolume | PlaybackShortcut::IncreaseVolume
     );
-    if (modifiers.shift || event.is_held) && !adjusts_volume {
+    let adjusts_rate = matches!(shortcut, PlaybackShortcut::ChangeRate(_));
+    if modifiers.shift && !adjusts_volume && !(adjusts_rate && matches!(key, "[" | "]" | "{" | "}"))
+    {
+        return None;
+    }
+    if event.is_held
+        && !adjusts_volume
+        && !matches!(
+            shortcut,
+            PlaybackShortcut::ChangeRate(
+                PlaybackRateChange::Decrease
+                    | PlaybackRateChange::Increase
+                    | PlaybackRateChange::Halve
+                    | PlaybackRateChange::Double
+            )
+        )
+    {
         return None;
     }
     Some(shortcut)
@@ -142,6 +167,16 @@ pub(super) fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
         || key.eq_ignore_ascii_case("kp_multiply")
     {
         Some(PlaybackShortcut::IncreaseVolume)
+    } else if key == "[" {
+        Some(PlaybackShortcut::ChangeRate(PlaybackRateChange::Decrease))
+    } else if key == "]" {
+        Some(PlaybackShortcut::ChangeRate(PlaybackRateChange::Increase))
+    } else if key == "{" {
+        Some(PlaybackShortcut::ChangeRate(PlaybackRateChange::Halve))
+    } else if key == "}" {
+        Some(PlaybackShortcut::ChangeRate(PlaybackRateChange::Double))
+    } else if key.eq_ignore_ascii_case("backspace") {
+        Some(PlaybackShortcut::ChangeRate(PlaybackRateChange::Reset))
     } else if key.eq_ignore_ascii_case("m") {
         Some(PlaybackShortcut::ToggleMute)
     } else {
@@ -181,6 +216,49 @@ mod tests {
             shortcut_for_keystroke("m", false),
             Some(PlaybackShortcut::ToggleMute)
         );
+    }
+
+    #[test]
+    fn mpv_speed_shortcuts_handle_symbols_shift_and_repeat() {
+        use PlaybackRateChange::*;
+        for (key, change) in [
+            ("[", Decrease),
+            ("]", Increase),
+            ("{", Halve),
+            ("}", Double),
+            ("shift-[->{", Halve),
+            ("shift-]->}", Double),
+            ("shift-[", Halve),
+            ("shift-]", Double),
+            ("shift-{", Halve),
+            ("shift-}", Double),
+        ] {
+            for held in [false, true] {
+                assert_eq!(
+                    shortcut_for_keystroke(key, held),
+                    Some(PlaybackShortcut::ChangeRate(change)),
+                    "{key}"
+                );
+            }
+        }
+        assert_eq!(
+            shortcut_for_keystroke("backspace", false),
+            Some(PlaybackShortcut::ChangeRate(Reset))
+        );
+        assert_eq!(shortcut_for_keystroke("backspace", true), None);
+        assert_eq!(shortcut_for_keystroke("shift-backspace", false), None);
+        assert_eq!(
+            shortcut_for_keystroke("shift-backspace->backspace", false),
+            None
+        );
+        for modifier in ["ctrl", "alt", "super", "fn"] {
+            for key in ["[", "]", "{", "}", "backspace"] {
+                assert_eq!(
+                    shortcut_for_keystroke(&format!("{modifier}-{key}"), false),
+                    None
+                );
+            }
+        }
     }
 
     #[test]

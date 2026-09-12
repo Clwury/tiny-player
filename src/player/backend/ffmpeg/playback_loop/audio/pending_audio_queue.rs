@@ -2,8 +2,7 @@ use std::{collections::VecDeque, os::raw::c_int, time::Duration};
 
 use super::{
     AudioStagedFrame, DecodedAudio, PENDING_AUDIO_CONTINUITY_TOLERANCE,
-    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, align_audio_elements_to_frame_boundary,
-    audio_elements_for_duration_floor, duration_nsecs,
+    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, align_audio_elements_to_frame_boundary, duration_nsecs,
 };
 
 #[derive(Default)]
@@ -24,7 +23,7 @@ impl PendingStartAudioFrame {
     pub(in crate::player::backend::ffmpeg) fn trim_before(
         &mut self,
         timeline_nsecs: u64,
-        sample_rate: c_int,
+        _sample_rate: c_int,
         channels: c_int,
     ) -> bool {
         if timeline_nsecs <= self.start_timeline_nsecs {
@@ -34,15 +33,13 @@ impl PendingStartAudioFrame {
             return false;
         }
 
-        let drop_samples = audio_elements_for_duration_floor(
-            timeline_nsecs.saturating_sub(self.start_timeline_nsecs),
-            sample_rate,
-            channels,
-        );
-        let Ok(mut drop_samples) = usize::try_from(drop_samples) else {
-            return false;
-        };
-        drop_samples = align_audio_elements_to_frame_boundary(drop_samples, channels);
+        // PCM may already be time-stretched. Trim by the fraction of media
+        // time covered by this frame, not by the device's wall-clock rate.
+        let duration = self.end_timeline_nsecs - self.start_timeline_nsecs;
+        let drop_samples = (self.samples.len() as u128
+            * u128::from(timeline_nsecs - self.start_timeline_nsecs)
+            / u128::from(duration)) as usize;
+        let drop_samples = align_audio_elements_to_frame_boundary(drop_samples, channels);
         if drop_samples >= self.samples.len() {
             return false;
         }

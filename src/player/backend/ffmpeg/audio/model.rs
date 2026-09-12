@@ -200,6 +200,7 @@ pub(in crate::player::backend::ffmpeg) struct AudioShared {
     pub(in crate::player::backend::ffmpeg) queued_end_timeline_nsecs: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) output_delay_nsecs: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) output_delay_updated_nsecs: AtomicU64,
+    playback_rate: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) callback_count: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) consumed_callback_count: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) silenced_callback_count: AtomicU64,
@@ -415,6 +416,7 @@ impl AudioShared {
             queued_end_timeline_nsecs: AtomicU64::new(0),
             output_delay_nsecs: AtomicU64::new(0),
             output_delay_updated_nsecs: AtomicU64::new(0),
+            playback_rate: AtomicU64::new(control.playback_rate().to_bits()),
             callback_count: AtomicU64::new(0),
             consumed_callback_count: AtomicU64::new(0),
             silenced_callback_count: AtomicU64::new(0),
@@ -452,6 +454,7 @@ impl AudioShared {
         if let Ok(mut guard) = lock_result {
             guard.clear();
             guard.epoch = epoch;
+            self.capture_playback_rate_for_epoch();
             self.queued_end_timeline_nsecs
                 .store(timeline_nsecs, Ordering::Release);
             self.ready.notify_all();
@@ -485,6 +488,31 @@ impl AudioShared {
             .store(timeline_nsecs, Ordering::Release);
     }
 
+    pub(in crate::player::backend::ffmpeg::audio) fn capture_playback_rate_for_epoch(&self) {
+        self.playback_rate
+            .store(self.control.playback_rate().to_bits(), Ordering::Release);
+    }
+
+    pub(in crate::player::backend::ffmpeg::audio) fn media_duration_to_wall_nsecs(
+        &self,
+        nsecs: u64,
+    ) -> u64 {
+        (nsecs as f64 / f64::from_bits(self.playback_rate.load(Ordering::Acquire))).round() as u64
+    }
+
+    pub(in crate::player::backend::ffmpeg::audio) fn samples_media_duration_nsecs(
+        &self,
+        samples: usize,
+    ) -> u64 {
+        let physical_nsecs = duration_nsecs(audio_elements_duration(
+            samples,
+            self.sample_rate,
+            self.channels,
+        ));
+        (physical_nsecs as f64 * f64::from_bits(self.playback_rate.load(Ordering::Acquire))).round()
+            as u64
+    }
+
     #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::audio) fn queued_duration(
         &self,
@@ -494,10 +522,8 @@ impl AudioShared {
             .lock()
             .map_err(|_| "系统音频缓冲区已损坏".to_string())?
             .len();
-        Ok(audio_elements_duration(
-            queued_samples,
-            self.sample_rate,
-            self.channels,
+        Ok(Duration::from_nanos(
+            self.samples_media_duration_nsecs(queued_samples),
         ))
     }
 
@@ -515,7 +541,9 @@ impl AudioShared {
         }
         let updated = self.output_delay_updated_nsecs.load(Ordering::Relaxed);
         let elapsed = duration_nsecs(self.clock_start.elapsed()).saturating_sub(updated);
-        delay.saturating_sub(elapsed)
+        (delay.saturating_sub(elapsed) as f64
+            * f64::from_bits(self.playback_rate.load(Ordering::Acquire)))
+        .round() as u64
     }
 
     pub(in crate::player::backend::ffmpeg::audio) fn update_output_delay_unfenced(
@@ -648,11 +676,7 @@ impl AudioShared {
         let queued_samples = guard.len();
         let epoch = guard.epoch;
         let queued_end_timeline_nsecs = self.queued_end_timeline_nsecs.load(Ordering::Acquire);
-        let queued_duration_nsecs = duration_nsecs(audio_elements_duration(
-            queued_samples,
-            self.sample_rate,
-            self.channels,
-        ));
+        let queued_duration_nsecs = self.samples_media_duration_nsecs(queued_samples);
         let output_delay_nsecs = self.output_delay_nsecs();
         let pending_nsecs = queued_duration_nsecs.saturating_add(output_delay_nsecs);
         let played_timeline_nsecs = self.played_timeline_nsecs_for_pending(queued_duration_nsecs);

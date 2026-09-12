@@ -7,6 +7,7 @@ use super::decoder_packet_queue::DecoderPacketQueues;
 use super::pending_audio_queue::matching_audio_timeline_gap;
 use std::{
     os::raw::c_int,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -142,9 +143,10 @@ impl AudioDecodePipeline {
         decoder: Decoder,
         output_rate: c_int,
         output_channels: c_int,
+        control: Arc<super::FfmpegControl>,
     ) -> std::result::Result<Self, String> {
         Ok(Self {
-            worker: AudioDecodeWorker::spawn(decoder, output_rate, output_channels)?,
+            worker: AudioDecodeWorker::spawn(decoder, output_rate, output_channels, control)?,
             packets: AudioDecodePacketQueues::default(),
             deferred_output_frame: None,
             backpressure_log_state: None,

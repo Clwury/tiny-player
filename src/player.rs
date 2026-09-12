@@ -6,6 +6,7 @@ mod language;
 mod libplacebo;
 mod page;
 mod profile;
+mod rate;
 mod render_host;
 mod tracks;
 mod video_presenter;

@@ -173,11 +173,7 @@ fn fill_audio_output_samples<T>(
     } else {
         shared.update_output_delay_unfenced(Duration::ZERO);
     }
-    let queued_duration_after_nsecs = duration_nsecs(audio_elements_duration(
-        queued_samples_after,
-        shared.sample_rate,
-        shared.channels,
-    ));
+    let queued_duration_after_nsecs = shared.samples_media_duration_nsecs(queued_samples_after);
     let underrun_samples = output_samples.saturating_sub(usize::try_from(played).unwrap_or(0));
     if underrun_samples > 0 {
         let audio_gap_frames = audio_frames_for_elements(underrun_samples, shared.channels);

@@ -81,6 +81,12 @@ pub(super) fn service_playback_commands(
         return Ok(PlaybackCommandServiceStatus::Stopped);
     }
 
+    if let Some(rate) = drained_commands.playback_rate {
+        context.control.set_playback_rate(rate);
+        context.pipeline.scheduler.set_playback_rate(rate);
+        tracing::debug!(rate, "applying FFmpeg playback rate at position reset");
+    }
+
     if let Some(cache_config) = drained_commands.cache_config {
         context
             .pipeline

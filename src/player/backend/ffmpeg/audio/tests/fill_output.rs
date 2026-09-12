@@ -18,6 +18,34 @@ fn test_audio_shared(max_samples: usize) -> AudioShared {
 }
 
 #[test]
+fn audio_clock_tracks_media_time_at_the_rate_captured_for_its_epoch() {
+    let shared = test_audio_shared(9_600);
+    for rate in [0.25, 0.5, 1.1, 2.0, 4.0] {
+        shared.control.set_playback_rate(rate);
+        shared.reset_clock(10_000_000_000);
+        shared.activate_for_test();
+        shared.buffer.lock().unwrap().push_slice(&vec![0.25; 9_600]);
+        let media_duration = (100_000_000.0 * rate).round() as u64;
+        shared.set_queued_end_timeline_nsecs(10_000_000_000 + media_duration);
+        assert_eq!(shared.played_timeline_nsecs(), 10_000_000_000);
+        // A new requested rate cannot reinterpret PCM from the previous epoch.
+        shared.control.set_playback_rate(1.0);
+        assert_eq!(shared.played_timeline_nsecs(), 10_000_000_000);
+        let mut output = [0.0_f32; 960];
+        fill_audio_output(&mut output, &shared);
+        shared.set_output_delay_for_test(Duration::from_millis(10));
+        assert_eq!(shared.played_timeline_nsecs(), 10_000_000_000, "{rate}");
+        shared.set_output_delay_for_test(Duration::ZERO);
+        assert_eq!(
+            shared.played_timeline_nsecs(),
+            10_000_000_000 + (10_000_000.0 * rate).round() as u64,
+            "{rate}"
+        );
+        assert!(output.iter().all(|sample| *sample > 0.0));
+    }
+}
+
+#[test]
 fn audio_clock_uses_queued_end_minus_pending_audio() {
     let shared = test_audio_shared(960);
     shared.reset_clock(1_000_000_000);

@@ -260,6 +260,64 @@ fn ninth_rapid_seek_advances_audio_clock_and_video_presentations() {
 }
 
 #[test]
+fn playback_rate_commands_coalesce_with_seeks_and_preserve_user_pause() {
+    let control = FfmpegControl::new(PlaybackSessionId(1));
+    control.set_user_paused(true);
+    let (tx, rx) = mpsc::channel();
+    for rate in [1.1, 2.0, 0.5] {
+        tx.send(FfmpegCommand::SetPlaybackRate {
+            session_id: PlaybackSessionId(2),
+            rate,
+            position_seconds: 60.0,
+            generation: control.request_seek(),
+            queued_at: Instant::now(),
+        })
+        .unwrap();
+    }
+    tx.send(FfmpegCommand::Seek {
+        session_id: PlaybackSessionId(3),
+        position_seconds: 90.0,
+        mode: PlaybackSeekMode::Fast,
+        generation: control.request_seek(),
+        queued_at: Instant::now(),
+    })
+    .unwrap();
+    let drained = drain_playback_commands(&rx, &control);
+    assert_eq!(drained.playback_rate, Some(0.5));
+    let seek = drained.pending_seek.unwrap();
+    assert_eq!(seek.position_seconds, 90.0);
+    assert_eq!(seek.generation, control.seek_generation());
+    assert!(control.is_paused());
+    assert_eq!(
+        control.audio_output_control_snapshot().decision(),
+        AudioOutputDecision::Silence
+    );
+    assert_eq!(
+        control.playback_rate(),
+        1.0,
+        "rate changes only when the coordinator resets output"
+    );
+}
+
+#[test]
+fn backend_accepts_playback_rate_commands_before_loading() {
+    use crate::player::backend::{BackendCommand, BackendControl};
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend
+        .command(BackendCommand::SetPlaybackRate { rate: 1.5 })
+        .unwrap();
+    assert_eq!(backend.playback_rate, 1.5);
+    backend
+        .command(BackendCommand::SetPlaybackRate { rate: 100.0 })
+        .unwrap();
+    assert_eq!(backend.playback_rate, 4.0);
+    backend
+        .command(BackendCommand::SetPlaybackRate { rate: 1.0 })
+        .unwrap();
+    assert_eq!(backend.playback_rate, 1.0);
+}
+
+#[test]
 fn drain_playback_commands_keeps_latest_live_cache_config() {
     let control = FfmpegControl::new(PlaybackSessionId(1));
     let (command_tx, command_rx) = mpsc::channel();

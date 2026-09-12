@@ -18,6 +18,7 @@ use super::{
     DEFAULT_PLAYBACK_VOLUME, FFMPEG_FRAME_COUNT, FfmpegPlaybackInput, FfmpegWorker, ffmpeg_error,
     normalize_playback_volume,
 };
+use crate::player::rate::clamp_playback_rate;
 
 fn valid_backend_seconds(seconds: f64) -> Option<f64> {
     (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
@@ -35,6 +36,7 @@ pub struct FfmpegBackend {
     pub(super) user_paused: bool,
     pub(super) paused: bool,
     pub(super) volume: f32,
+    pub(super) playback_rate: f64,
     pub(super) cache_config: PlaybackCacheConfig,
     pub(super) cache_state: PlaybackCacheState,
     pub(super) position_seconds: Option<f64>,
@@ -60,6 +62,7 @@ impl FfmpegBackend {
             user_paused: true,
             paused: true,
             volume: DEFAULT_PLAYBACK_VOLUME,
+            playback_rate: 1.0,
             cache_config: PlaybackCacheConfig::default(),
             cache_state: PlaybackCacheState::default(),
             position_seconds: None,
@@ -130,6 +133,7 @@ impl FfmpegBackend {
             self.video_output_queue.clone(),
             self.event_tx.clone(),
             self.volume,
+            self.playback_rate,
         )?);
         Ok(())
     }
@@ -196,6 +200,15 @@ impl FfmpegBackend {
         position_seconds: f64,
         seek_mode: PlaybackSeekMode,
     ) -> Result<()> {
+        self.seek_with_rate(position_seconds, seek_mode, None)
+    }
+
+    fn seek_with_rate(
+        &mut self,
+        position_seconds: f64,
+        seek_mode: PlaybackSeekMode,
+        rate: Option<f64>,
+    ) -> Result<()> {
         if self.worker.is_none() {
             return Err(BackendError::Ffmpeg(
                 "FFmpeg 尚未加载可跳转的媒体".to_string(),
@@ -216,7 +229,11 @@ impl FfmpegBackend {
             .worker
             .as_ref()
             .expect("worker exists after early return");
-        worker.seek(position_seconds, seek_mode, session_id)?;
+        if let Some(rate) = rate {
+            worker.set_playback_rate(rate, position_seconds, session_id)?;
+        } else {
+            worker.seek(position_seconds, seek_mode, session_id)?;
+        }
         let _ = self.event_tx.send(BackendEvent::new(
             session_id,
             BackendEventKind::PositionChanged(position_seconds),
@@ -263,6 +280,24 @@ impl FfmpegBackend {
         if let Some(worker) = self.worker.as_ref() {
             worker.set_volume(volume);
         }
+        Ok(())
+    }
+
+    pub fn set_playback_rate(&mut self, rate: f64) -> Result<()> {
+        let rate = clamp_playback_rate(rate);
+        if (rate - self.playback_rate).abs() < f64::EPSILON {
+            return Ok(());
+        }
+        if self.worker.is_some() {
+            // Flush already-decoded samples at the current media position so
+            // every output epoch has one rate, including paused playback.
+            self.seek_with_rate(
+                self.position_seconds.unwrap_or(0.0),
+                PlaybackSeekMode::Precise,
+                Some(rate),
+            )?;
+        }
+        self.playback_rate = rate;
         Ok(())
     }
 
@@ -553,6 +588,10 @@ impl BackendControl for FfmpegBackend {
 
     fn set_volume(&mut self, volume: f32) -> Result<()> {
         FfmpegBackend::set_volume(self, volume)
+    }
+
+    fn set_playback_rate(&mut self, rate: f64) -> Result<()> {
+        FfmpegBackend::set_playback_rate(self, rate)
     }
 
     fn set_cache_config(&mut self, config: PlaybackCacheConfig) -> Result<()> {

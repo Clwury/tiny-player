@@ -62,11 +62,12 @@ fn rebuild_audio_pipeline_for_track_switch(
     let Some(decoder) = open_audio_decoder(audio_stream, false)? else {
         return Ok((None, None));
     };
-    let Some(output) = reuse_or_create_audio_output(previous_audio_output, control) else {
+    let Some(output) = reuse_or_create_audio_output(previous_audio_output, Arc::clone(&control))
+    else {
         return Ok((None, None));
     };
 
-    match AudioDecodePipeline::spawn(decoder, output.sample_rate(), output.channels()) {
+    match AudioDecodePipeline::spawn(decoder, output.sample_rate(), output.channels(), control) {
         Ok(worker) => {
             output.reset_clock(current_start_position_nsecs);
             Ok((Some(output), Some(worker)))

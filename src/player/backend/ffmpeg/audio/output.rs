@@ -648,6 +648,7 @@ impl AudioOutput {
         queue.clear();
         buffer.clear();
         buffer.epoch = pending_epoch;
+        self.shared.capture_playback_rate_for_epoch();
         self.shared
             .set_queued_end_timeline_nsecs(reset_timeline_nsecs);
         self.shared.played_samples.store(
@@ -696,8 +697,11 @@ impl AudioOutput {
     pub(in crate::player::backend::ffmpeg) fn drain_deadline(
         &self,
     ) -> std::result::Result<Option<Instant>, String> {
-        let timeout = Duration::from_nanos(self.snapshot()?.total_pending_nsecs)
-            .saturating_add(Duration::from_millis(250));
+        let timeout = Duration::from_nanos(
+            self.shared
+                .media_duration_to_wall_nsecs(self.snapshot()?.total_pending_nsecs),
+        )
+        .saturating_add(Duration::from_millis(250));
         Ok(Instant::now().checked_add(timeout))
     }
 
