@@ -161,8 +161,17 @@ impl PlaybackOutputScheduler {
             || transaction.discontinuity_epoch != token.discontinuity_epoch
             || transaction.seek_generation != token.seek_generation
             || transaction.audio_start_target_nsecs != token.target_nsecs
-            || transaction.audio_prepare_phase != InitialAudioPreparePhase::Preparing
+            || !matches!(
+                transaction.audio_prepare_phase,
+                InitialAudioPreparePhase::Preparing | InitialAudioPreparePhase::Prepared
+            )
             || transaction.audio_prepare_epoch != Some(token.audio_epoch)
+            || transaction.audio_prepare_token.is_some_and(|previous| {
+                token.staged_range_nsecs.0 != previous.staged_range_nsecs.0
+                    || token.staged_until_nsecs < previous.staged_until_nsecs
+                    || token.staged_frames < previous.staged_frames
+                    || token.staged_samples < previous.staged_samples
+            })
         {
             return false;
         }

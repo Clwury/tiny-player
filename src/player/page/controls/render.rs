@@ -373,11 +373,13 @@ impl PlaybackPage {
             .flex()
             .items_center()
             .gap_2()
-            .child(self.render_cache_status_button(
-                state.cache_status_enabled,
-                state.cache_status_open,
-                cx,
-            ))
+            .when(playback_diagnostics_enabled(), |this| {
+                this.child(self.render_cache_status_button(
+                    state.cache_status_enabled,
+                    state.cache_status_open,
+                    cx,
+                ))
+            })
             .child(self.render_track_control_button(
                 PlaybackTrackKind::Audio,
                 "playback-audio-button",
@@ -505,6 +507,10 @@ impl PlaybackPage {
         } else {
             theme.input_border_focused
         };
+        let forward_cache_fill = progress_track_forward_cache_fill(
+            theme.input_border_focused.opacity(0.35),
+            state.forward_cache_fraction,
+        );
 
         let track = div()
             .id("playback-progress-track")
@@ -528,18 +534,18 @@ impl PlaybackPage {
             })
             .on_drag_move(cx.listener(Self::drag_progress))
             .child(progress_track_fill(theme.input_border.opacity(0.48), 1.0))
-            .children(
-                state
-                    .cache_ranges
-                    .into_iter()
-                    .map(|(start_fraction, end_fraction)| {
+            .children(forward_cache_fill)
+            .when(playback_diagnostics_enabled(), |this| {
+                this.children(state.cache_ranges.into_iter().map(
+                    |(start_fraction, end_fraction)| {
                         progress_track_seekable_range_fill(
                             theme.muted_foreground.opacity(0.52),
                             start_fraction,
                             end_fraction,
                         )
-                    }),
-            );
+                    },
+                ))
+            });
         let track = track
             .child(progress_track_played_fill(
                 played_color,
@@ -652,6 +658,7 @@ impl PlaybackPage {
                     duration_time,
                     played_fraction,
                     cached_seek_preview,
+                    forward_cache_fraction: forward_cache_fraction(&self.timeline),
                     cache_ranges,
                 },
                 cx,

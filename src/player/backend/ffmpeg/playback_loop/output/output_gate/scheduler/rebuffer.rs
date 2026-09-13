@@ -177,7 +177,12 @@ impl PlaybackOutputScheduler {
         eligible: bool,
         seek_transition_paused: bool,
     ) -> Option<AudioOutputActivityWatchdogEvent> {
-        if !eligible || activity.shared_buffer_pending_nsecs == 0 {
+        // A rolled-back start can leave callbacks stopped with audio still
+        // waiting upstream. An empty callback buffer must not hide that stall.
+        let audio_pending = activity.shared_buffer_pending_nsecs > 0
+            || activity.queue_pending_nsecs > 0
+            || !self.pending_start_audio.is_empty();
+        if !eligible || !audio_pending {
             self.reset_audio_output_activity_watchdog();
             return None;
         }

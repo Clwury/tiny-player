@@ -150,6 +150,8 @@ pub(in crate::player::backend::ffmpeg) enum AudioOutputStableSnapshot {
 pub(in crate::player::backend::ffmpeg) struct AudioOutputActivitySnapshot {
     pub(in crate::player::backend::ffmpeg) played_timeline_nsecs: u64,
     pub(in crate::player::backend::ffmpeg) shared_buffer_pending_nsecs: u64,
+    /// Queue and worker payload that has not reached the callback buffer yet.
+    pub(in crate::player::backend::ffmpeg) queue_pending_nsecs: u64,
     pub(in crate::player::backend::ffmpeg) callback_count: u64,
     pub(in crate::player::backend::ffmpeg) consumed_callback_count: u64,
     pub(in crate::player::backend::ffmpeg) silenced_callback_count: u64,
@@ -206,6 +208,7 @@ pub(in crate::player::backend::ffmpeg) struct AudioShared {
     pub(in crate::player::backend::ffmpeg::audio) silenced_callback_count: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) underrun_count: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) underrun_active: AtomicBool,
+    pub(in crate::player::backend::ffmpeg::audio) underrun_resume_nsecs: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) underrun_timeline_nsecs: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) misaligned_audio_buffer_count: AtomicU64,
     pub(in crate::player::backend::ffmpeg::audio) last_callback_nsecs: AtomicU64,
@@ -221,6 +224,22 @@ pub(in crate::player::backend::ffmpeg) struct AudioBuffer {
     pub(in crate::player::backend::ffmpeg::audio) write_pos: usize,
     pub(in crate::player::backend::ffmpeg::audio) len: usize,
     pub(in crate::player::backend::ffmpeg::audio) epoch: u64,
+    pub(in crate::player::backend::ffmpeg::audio) timing: VecDeque<AudioBufferTiming>,
+    pub(in crate::player::backend::ffmpeg::audio) device_timing: VecDeque<AudioDeviceTiming>,
+}
+
+pub(in crate::player::backend::ffmpeg::audio) struct AudioBufferTiming {
+    pub(in crate::player::backend::ffmpeg::audio) samples: usize,
+    pub(in crate::player::backend::ffmpeg::audio) consumed: usize,
+    pub(in crate::player::backend::ffmpeg::audio) start_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg::audio) end_nsecs: u64,
+}
+
+pub(in crate::player::backend::ffmpeg::audio) struct AudioDeviceTiming {
+    pub(in crate::player::backend::ffmpeg::audio) wall_start: u64,
+    pub(in crate::player::backend::ffmpeg::audio) wall_end: u64,
+    pub(in crate::player::backend::ffmpeg::audio) media_start: u64,
+    pub(in crate::player::backend::ffmpeg::audio) media_end: u64,
 }
 
 #[derive(Debug)]
@@ -281,9 +300,12 @@ pub(in crate::player::backend::ffmpeg::audio) struct AudioQueueShared {
 
 pub(in crate::player::backend::ffmpeg::audio) struct AudioQueueState {
     pub(in crate::player::backend::ffmpeg::audio) items: VecDeque<AudioQueueItem>,
+    pub(in crate::player::backend::ffmpeg::audio) filtered: VecDeque<AudioQueueItem>,
+    pub(in crate::player::backend::ffmpeg::audio) tempo: Option<super::super::codec::AudioTempo>,
     pub(in crate::player::backend::ffmpeg::audio) queued_samples: usize,
     pub(in crate::player::backend::ffmpeg::audio) queued_duration_nsecs: u64,
     pub(in crate::player::backend::ffmpeg::audio) in_flight: Option<AudioQueueInFlight>,
+    pub(in crate::player::backend::ffmpeg::audio) input_eof: bool,
 }
 
 impl AudioTimelineState {
@@ -422,6 +444,9 @@ impl AudioShared {
             silenced_callback_count: AtomicU64::new(0),
             underrun_count: AtomicU64::new(0),
             underrun_active: AtomicBool::new(false),
+            underrun_resume_nsecs: AtomicU64::new(duration_nsecs(
+                AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION,
+            )),
             underrun_timeline_nsecs: AtomicU64::new(0),
             misaligned_audio_buffer_count: AtomicU64::new(0),
             last_callback_nsecs: AtomicU64::new(0),
@@ -493,13 +518,6 @@ impl AudioShared {
             .store(self.control.playback_rate().to_bits(), Ordering::Release);
     }
 
-    pub(in crate::player::backend::ffmpeg::audio) fn media_duration_to_wall_nsecs(
-        &self,
-        nsecs: u64,
-    ) -> u64 {
-        (nsecs as f64 / f64::from_bits(self.playback_rate.load(Ordering::Acquire))).round() as u64
-    }
-
     pub(in crate::player::backend::ffmpeg::audio) fn samples_media_duration_nsecs(
         &self,
         samples: usize,
@@ -513,17 +531,43 @@ impl AudioShared {
             as u64
     }
 
+    pub(in crate::player::backend::ffmpeg::audio) fn buffer_media_duration_nsecs(
+        &self,
+        buffer: &AudioBuffer,
+    ) -> u64 {
+        buffer
+            .media_duration_nsecs()
+            .unwrap_or_else(|| self.samples_media_duration_nsecs(buffer.len()))
+    }
+
+    pub(in crate::player::backend::ffmpeg::audio) fn update_callback_playback_rate(
+        &self,
+        samples: usize,
+        media_nsecs: u64,
+    ) {
+        let wall_nsecs = duration_nsecs(audio_elements_duration(
+            samples,
+            self.sample_rate,
+            self.channels,
+        ));
+        if wall_nsecs > 0 && media_nsecs > 0 {
+            self.playback_rate.store(
+                (media_nsecs as f64 / wall_nsecs as f64).to_bits(),
+                Ordering::Release,
+            );
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::audio) fn queued_duration(
         &self,
     ) -> std::result::Result<Duration, String> {
-        let queued_samples = self
+        let buffer = self
             .buffer
             .lock()
-            .map_err(|_| "系统音频缓冲区已损坏".to_string())?
-            .len();
+            .map_err(|_| "系统音频缓冲区已损坏".to_string())?;
         Ok(Duration::from_nanos(
-            self.samples_media_duration_nsecs(queued_samples),
+            self.buffer_media_duration_nsecs(&buffer),
         ))
     }
 
@@ -534,16 +578,31 @@ impl AudioShared {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::audio) fn output_delay_nsecs(&self) -> u64 {
+        if let Ok(buffer) = self.buffer.lock()
+            && let Some(delay) =
+                buffer.device_delay_nsecs(duration_nsecs(self.clock_start.elapsed()))
+        {
+            return delay;
+        }
+        self.fallback_output_delay_nsecs()
+    }
+
+    pub(super) fn fallback_output_delay_nsecs(&self) -> u64 {
+        (self.output_delay_wall_nsecs() as f64
+            * f64::from_bits(self.playback_rate.load(Ordering::Acquire)))
+        .round() as u64
+    }
+
+    pub(super) fn output_delay_wall_nsecs(&self) -> u64 {
         let delay = self.output_delay_nsecs.load(Ordering::Relaxed);
         if delay == 0 {
             return 0;
         }
         let updated = self.output_delay_updated_nsecs.load(Ordering::Relaxed);
         let elapsed = duration_nsecs(self.clock_start.elapsed()).saturating_sub(updated);
-        (delay.saturating_sub(elapsed) as f64
-            * f64::from_bits(self.playback_rate.load(Ordering::Acquire)))
-        .round() as u64
+        delay.saturating_sub(elapsed)
     }
 
     pub(in crate::player::backend::ffmpeg::audio) fn update_output_delay_unfenced(
@@ -559,6 +618,7 @@ impl AudioShared {
         );
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::audio) fn played_timeline_nsecs_for_pending(
         &self,
         pending_nsecs: u64,
@@ -569,6 +629,7 @@ impl AudioShared {
         self.played_timeline_nsecs_from_pending(pending_nsecs)
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::audio) fn played_timeline_nsecs_from_pending(
         &self,
         pending_nsecs: u64,
@@ -590,6 +651,10 @@ impl AudioShared {
             Ordering::Acquire,
         ) {
             Ok(_) => {
+                self.underrun_resume_nsecs.store(
+                    duration_nsecs(AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION),
+                    Ordering::Release,
+                );
                 self.underrun_timeline_nsecs
                     .store(played_timeline_nsecs, Ordering::Release);
                 true
@@ -606,10 +671,10 @@ impl AudioShared {
         &self,
         pending_nsecs: u64,
     ) {
-        // Keep the 250 ms watermark for low-water admission and rebuffer
-        // planning, but release the frozen audio/video clock sooner once a
-        // contiguous 120 ms AO window has been rebuilt.
-        if pending_nsecs >= duration_nsecs(AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION) {
+        // The callback retains incoming PCM during underrun, like mpv's AO
+        // rebuffering. Only callback-ready payload can release the clock;
+        // upstream packets and samples still owned by the worker cannot.
+        if pending_nsecs >= self.underrun_resume_nsecs.load(Ordering::Acquire) {
             self.clear_underrun();
         }
     }
@@ -673,13 +738,18 @@ impl AudioShared {
     }
 
     fn snapshot_for_locked_buffer(&self, guard: &AudioBuffer) -> AudioSharedSnapshot {
-        let queued_samples = guard.len();
         let epoch = guard.epoch;
         let queued_end_timeline_nsecs = self.queued_end_timeline_nsecs.load(Ordering::Acquire);
-        let queued_duration_nsecs = self.samples_media_duration_nsecs(queued_samples);
-        let output_delay_nsecs = self.output_delay_nsecs();
+        let queued_duration_nsecs = self.buffer_media_duration_nsecs(guard);
+        let output_delay_nsecs = guard
+            .device_delay_nsecs(duration_nsecs(self.clock_start.elapsed()))
+            .unwrap_or_else(|| self.fallback_output_delay_nsecs());
         let pending_nsecs = queued_duration_nsecs.saturating_add(output_delay_nsecs);
-        let played_timeline_nsecs = self.played_timeline_nsecs_for_pending(queued_duration_nsecs);
+        let played_timeline_nsecs = if self.underrun_active.load(Ordering::Acquire) {
+            self.underrun_timeline_nsecs.load(Ordering::Acquire)
+        } else {
+            queued_end_timeline_nsecs.saturating_sub(pending_nsecs)
+        };
         AudioSharedSnapshot {
             played_timeline_nsecs,
             buffered_nsecs: queued_duration_nsecs,
@@ -695,6 +765,7 @@ impl AudioShared {
 
     #[cfg(test)]
     pub(in crate::player::backend::ffmpeg) fn set_output_delay_for_test(&self, delay: Duration) {
+        self.buffer.lock().unwrap().device_timing.clear();
         let _guard = self
             .callback_publish_guard
             .lock()

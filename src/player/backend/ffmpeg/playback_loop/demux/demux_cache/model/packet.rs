@@ -16,6 +16,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct Cached
         CachedDemuxPacketPayload,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_index: c_int,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) timeline_anchor: bool,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) demux_keyframe: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) recovery_point: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) recovery_kind:
         VideoRecoveryPointKind,
@@ -114,6 +115,28 @@ impl DemuxPacketReadSource {
 }
 
 impl CachedDemuxPacket {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn is_cached_seek_anchor(
+        &self,
+    ) -> bool {
+        // Like mpv's demux keyframe runs, cached video seeks also accept
+        // AV_PKT_FLAG_KEY on open-GOP/non-IDR packets. Keep decoder recovery
+        // metadata strict: those packets cannot reset a broken reference chain.
+        // Audio still requires its codec-specific recovery point (e.g. TrueHD).
+        self.recovery_point || (self.timeline_anchor && self.demux_keyframe)
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cached_seek_anchor_kind(
+        &self,
+    ) -> VideoRecoveryPointKind {
+        if self.recovery_kind.is_recovery_point() {
+            self.recovery_kind
+        } else if self.timeline_anchor && self.demux_keyframe {
+            VideoRecoveryPointKind::Keyframe
+        } else {
+            VideoRecoveryPointKind::None
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn prepare_disk_spill(
         &self,
@@ -238,6 +261,7 @@ impl CachedDemuxPacket {
             )?))),
             stream_index,
             timeline_anchor,
+            demux_keyframe: packet.is_key(),
             recovery_point: recovery.recovery_point,
             recovery_kind: recovery.recovery_kind,
             safe_seek_point: recovery.safe_seek_point,

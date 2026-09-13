@@ -39,8 +39,7 @@ const DETAIL_SELECT_WIDTH_PX: f32 = 250.0;
 const DETAIL_SELECT_TOOLTIP_WIDTH_UNITS: usize = 30;
 const SEASON_SELECT_MIN_WIDTH_PX: f32 = 100.0;
 const SEASON_SELECT_MAX_WIDTH_PX: f32 = 320.0;
-const SEASON_SELECT_HORIZONTAL_PADDING_PX: f32 = 32.0;
-const SELECT_TEXT_UNIT_WIDTH_PX: f32 = 7.0;
+const SEASON_SELECT_HORIZONTAL_PADDING_PX: f32 = 8.0;
 
 #[path = "render/controls.rs"]
 mod controls;
@@ -176,6 +175,11 @@ fn season_popup_menu_trigger<T>(
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
+    let text = StyledText::new(value.clone());
+    let text_layout = text.layout().clone();
+    let text = InteractiveText::new("series-detail-season-value", text).tooltip(move |_, _, cx| {
+        (text_layout.text() != value).then(|| text_tooltip(value.clone(), cx))
+    });
 
     div()
         .flex()
@@ -192,7 +196,7 @@ fn season_popup_menu_trigger<T>(
             theme.input_border.opacity(0.62)
         })
         .bg(theme.dialog_background.opacity(0.88))
-        .px_4()
+        .px(px(SEASON_SELECT_HORIZONTAL_PADDING_PX))
         .text_sm()
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(if enabled {
@@ -207,7 +211,15 @@ fn season_popup_menu_trigger<T>(
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
-        .child(div().min_w_0().truncate().child(value))
+        .child(
+            div()
+                .debug_selector(|| "series-detail-season-value".into())
+                .flex_1()
+                .min_w_0()
+                .text_center()
+                .truncate()
+                .child(text),
+        )
 }
 
 fn detail_select_menu<T, I, E>(
@@ -380,14 +392,34 @@ fn detail_select_label_width_units(label: &str) -> usize {
         .sum::<usize>()
 }
 
-fn season_select_width<'a>(labels: impl IntoIterator<Item = &'a str>) -> f32 {
-    let label_units = labels
+fn season_select_width<'a>(labels: impl IntoIterator<Item = &'a str>, window: &Window) -> f32 {
+    let mut text_style = window.text_style();
+    let font_size = window.rem_size() * 0.875;
+    let label_width = labels
         .into_iter()
-        .map(detail_select_label_width_units)
-        .max()
-        .unwrap_or_else(|| detail_select_label_width_units("请选择"));
+        .chain(std::iter::once("请选择"))
+        .flat_map(str::lines)
+        .map(|label| {
+            // Measure both the trigger and selected option using the same fonts
+            // and size they render with, including fallback glyphs for CJK text.
+            [gpui::FontWeight::MEDIUM, gpui::FontWeight::SEMIBOLD]
+                .into_iter()
+                .map(|weight| {
+                    text_style.font_weight = weight;
+                    let line = window.text_system().shape_line(
+                        label.to_owned().into(),
+                        font_size,
+                        &[text_style.to_run(label.len())],
+                        None,
+                    );
+                    f32::from(line.width)
+                })
+                .fold(0.0, f32::max)
+        })
+        .fold(0.0, f32::max);
 
-    (label_units as f32 * SELECT_TEXT_UNIT_WIDTH_PX + SEASON_SELECT_HORIZONTAL_PADDING_PX)
+    // Account for padding on both sides and the two one-pixel borders.
+    (label_width.ceil() + SEASON_SELECT_HORIZONTAL_PADDING_PX * 2.0 + 2.0)
         .clamp(SEASON_SELECT_MIN_WIDTH_PX, SEASON_SELECT_MAX_WIDTH_PX)
 }
 
@@ -429,15 +461,20 @@ mod tests {
         assert_eq!(detail_play_button_label(None), "播放");
     }
 
-    #[test]
-    fn season_select_width_clamps_short_and_long_labels() {
-        assert_eq!(
-            season_select_width(["第一季", "第二季"]),
-            SEASON_SELECT_MIN_WIDTH_PX
-        );
-        assert_eq!(
-            season_select_width(["This is an exceptionally long season name for testing"]),
-            SEASON_SELECT_MAX_WIDTH_PX
-        );
+    #[gpui::test]
+    fn season_select_width_clamps_short_and_long_labels(cx: &mut gpui::TestAppContext) {
+        cx.add_empty_window().update(|window, _| {
+            assert_eq!(
+                season_select_width(["第一季", "第二季"], window),
+                SEASON_SELECT_MIN_WIDTH_PX
+            );
+            assert_eq!(
+                season_select_width(
+                    ["This is an exceptionally long season name for testing"],
+                    window,
+                ),
+                SEASON_SELECT_MAX_WIDTH_PX
+            );
+        });
     }
 }

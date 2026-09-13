@@ -81,10 +81,19 @@ pub(super) fn service_playback_commands(
         return Ok(PlaybackCommandServiceStatus::Stopped);
     }
 
-    if let Some(rate) = drained_commands.playback_rate {
-        context.control.set_playback_rate(rate);
+    if drained_commands.playback_rate.is_some() {
+        // The UI publishes the latest request to AO directly, including at
+        // EOF. Do not overwrite a newer request with an older drained command.
+        let rate = context.control.playback_rate();
         context.pipeline.scheduler.set_playback_rate(rate);
-        tracing::debug!(rate, "applying FFmpeg playback rate at position reset");
+        context
+            .pipeline
+            .output_scheduler
+            .note_output_housekeeping_change();
+        tracing::debug!(
+            rate,
+            "updated FFmpeg playback rate without resetting playback"
+        );
     }
 
     if let Some(cache_config) = drained_commands.cache_config {

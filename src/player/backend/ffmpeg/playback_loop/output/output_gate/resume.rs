@@ -1263,6 +1263,14 @@ where
         if delayed_audio_start_timeline_nsecs.is_some() || resume_decision.reset_audio_to_video {
             output.reset_clock(resume_decision.timeline_nsecs);
         }
+        output.hold_for_underrun_prefill(
+            if delayed_audio_start_timeline_nsecs.is_some() || resume_decision.reset_audio_to_video
+            {
+                resume_decision.timeline_nsecs
+            } else {
+                audio_snapshot.played_timeline_nsecs
+            },
+        );
         let mut audio_flush_until_timeline_nsecs = output_scheduler
             .scheduled_video_queue
             .buffered_until_from_nsecs(audio_start_timeline_nsecs)

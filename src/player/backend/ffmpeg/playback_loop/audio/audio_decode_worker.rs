@@ -1,15 +1,11 @@
 use std::{
     collections::VecDeque,
     os::raw::c_int,
-    sync::{
-        Arc,
-        mpsc::{self, Receiver},
-    },
+    sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use crate::player::backend::ffmpeg::{FfmpegControl, codec::AudioTempo};
 use ffmpeg_sys_next as ffi;
 
 use super::{
@@ -166,7 +162,6 @@ impl AudioDecodeWorker {
         decoder: Decoder,
         output_rate: c_int,
         output_channels: c_int,
-        control: Arc<FfmpegControl>,
     ) -> std::result::Result<Self, String> {
         let info = AudioDecodeWorkerInfo {
             stream_index: decoder.stream_index,
@@ -183,7 +178,6 @@ impl AudioDecodeWorker {
                     decoder,
                     output_rate,
                     output_channels,
-                    control,
                     command_rx,
                     result_tx,
                 )
@@ -599,7 +593,6 @@ fn run_audio_decode_worker(
     decoder: Decoder,
     output_rate: c_int,
     output_channels: c_int,
-    control: Arc<FfmpegControl>,
     command_rx: mpsc::Receiver<AudioDecodeCommand>,
     result_tx: mpsc::SyncSender<AudioDecodeResult>,
 ) {
@@ -617,7 +610,6 @@ fn run_audio_decode_worker(
             return;
         }
     };
-    let mut tempo = AudioTempo::new(output_rate, output_channels, decoder.time_base);
 
     while let Ok(command) = command_rx.recv() {
         match command {
@@ -627,25 +619,18 @@ fn run_audio_decode_worker(
                 let result = decoder.decode_packet(packet.as_ptr(), &mut frame, |frame| {
                     let raw_timestamp = frame_best_effort_timestamp(frame);
                     if let Some(audio) = resampler.convert(frame)? {
-                        tempo.process(
-                            audio,
-                            raw_timestamp,
-                            control.playback_rate(),
-                            |audio, raw_timestamp| {
-                                decoded_frames = decoded_frames.saturating_add(1);
-                                result_tx
-                                    .send(AudioDecodeResult::Frame {
-                                        generation,
-                                        frame: AudioDecodedFrame {
-                                            audio,
-                                            raw_timestamp,
-                                        },
-                                    })
-                                    .map_err(|_| {
-                                        "FFmpeg audio decode result receiver stopped".to_string()
-                                    })
-                            },
-                        )?;
+                        decoded_frames = decoded_frames.saturating_add(1);
+                        result_tx
+                            .send(AudioDecodeResult::Frame {
+                                generation,
+                                frame: AudioDecodedFrame {
+                                    audio,
+                                    raw_timestamp,
+                                },
+                            })
+                            .map_err(|_| {
+                                "FFmpeg audio decode result receiver stopped".to_string()
+                            })?;
                     }
                     Ok(())
                 });
@@ -664,8 +649,8 @@ fn run_audio_decode_worker(
             AudioDecodeCommand::FlushBuffers { generation } => {
                 decoder.flush_buffers();
                 frame.unref();
-                tempo.reset();
-                // A rate change and a seek both discard all delayed PCM.
+                // Only a seek/decoder reset discards delayed PCM. Playback
+                // speed is applied to raw decoded audio by the AO worker.
                 resampler = match AudioResampler::new(output_rate, output_channels) {
                     Ok(resampler) => resampler,
                     Err(error) => {
@@ -686,30 +671,6 @@ fn run_audio_decode_worker(
                 let result = decoder.flush(&mut frame, |frame| {
                     let raw_timestamp = frame_best_effort_timestamp(frame);
                     if let Some(audio) = resampler.convert(frame)? {
-                        tempo.process(
-                            audio,
-                            raw_timestamp,
-                            control.playback_rate(),
-                            |audio, raw_timestamp| {
-                                decoded_frames = decoded_frames.saturating_add(1);
-                                result_tx
-                                    .send(AudioDecodeResult::Frame {
-                                        generation,
-                                        frame: AudioDecodedFrame {
-                                            audio,
-                                            raw_timestamp,
-                                        },
-                                    })
-                                    .map_err(|_| {
-                                        "FFmpeg audio decode result receiver stopped".to_string()
-                                    })
-                            },
-                        )?;
-                    }
-                    Ok(())
-                });
-                let result = result.and_then(|()| {
-                    tempo.drain(|audio, raw_timestamp| {
                         decoded_frames = decoded_frames.saturating_add(1);
                         result_tx
                             .send(AudioDecodeResult::Frame {
@@ -719,8 +680,11 @@ fn run_audio_decode_worker(
                                     raw_timestamp,
                                 },
                             })
-                            .map_err(|_| "FFmpeg audio decode result receiver stopped".to_string())
-                    })
+                            .map_err(|_| {
+                                "FFmpeg audio decode result receiver stopped".to_string()
+                            })?;
+                    }
+                    Ok(())
                 });
                 if result_tx
                     .send(AudioDecodeResult::Drained {

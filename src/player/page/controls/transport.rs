@@ -38,7 +38,7 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if self.timeline.cache_state.is_none() {
+        if !playback_diagnostics_enabled() || self.timeline.cache_state.is_none() {
             return;
         }
         self.tracks.open = None;

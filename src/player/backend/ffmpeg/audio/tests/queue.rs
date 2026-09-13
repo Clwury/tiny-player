@@ -10,13 +10,49 @@ use crate::player::render_host::PlaybackSessionId;
 
 use super::super::{
     AUDIO_OUTPUT_QUEUE_LIMIT_DURATION, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AudioBuffer,
-    AudioOutput, AudioOutputServiceStage, AudioOutputStableSnapshot, AudioQueueInFlight,
-    AudioQueueItem, AudioQueueShared, AudioQueueState, AudioShared, AudioTimelineState,
-    FfmpegControl, audio_elements_duration, duration_nsecs, fill_audio_output,
-    spawn_audio_queue_worker, stable_audio_output_snapshot_with_compose_hook_for_test,
+    AudioOutput, AudioOutputLifecycle, AudioOutputPushResult, AudioOutputServiceStage,
+    AudioOutputStableSnapshot, AudioQueueInFlight, AudioQueueItem, AudioQueueShared,
+    AudioQueueState, AudioShared, AudioTimelineState, FfmpegControl, audio_elements_duration,
+    duration_nsecs, fill_audio_output, spawn_audio_queue_worker,
+    stable_audio_output_snapshot_with_compose_hook_for_test,
     stable_audio_output_snapshot_with_hook_for_test,
     stable_audio_output_snapshot_with_retry_hook_for_test, write_audio_queue_item,
 };
+
+#[test]
+fn coordinator_snapshots_cannot_release_underrun_with_only_worker_queue_payload() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId(542)));
+    control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing);
+    let output = AudioOutput::stopped_for_test(Arc::clone(&control), 48_000, 48_000, 2);
+    output.reset_clock(541_828_000_000);
+    output.hold_for_underrun_prefill(541_828_000_000);
+    assert!(matches!(
+        output
+            .try_push_timed(
+                vec![0.25; 24_000],
+                541_828_000_000,
+                542_078_000_000,
+                &control
+            )
+            .unwrap(),
+        AudioOutputPushResult::Queued
+    ));
+    assert!(output.activate_current_audio_output(&control));
+    let snapshot = output.snapshot().unwrap();
+    assert_eq!(snapshot.queue_pending_nsecs, 250_000_000);
+    assert_eq!(snapshot.shared_payload_nsecs, 0);
+    assert!(output.underrun_active());
+    assert!(output.try_snapshot().unwrap().is_some());
+    assert!(output.underrun_active());
+    let mut samples = [0.0_f32; 960];
+    output.invoke_callback_for_test(&mut samples);
+    assert!(output.underrun_active());
+    assert!(samples.iter().all(|sample| *sample == 0.0));
+    assert!(output.transfer_next_queued_frame_for_test().unwrap());
+    output.invoke_callback_for_test(&mut samples);
+    assert!(!output.underrun_active());
+    assert!(samples.iter().all(|sample| *sample == 0.25));
+}
 
 #[test]
 fn audio_drain_timeout_uses_wall_time_at_slow_and_fast_rates() {
@@ -599,6 +635,135 @@ fn stable_snapshot_reconciles_deferred_fenced_reset_after_lock_contention() {
     assert_eq!(snapshot.queue_frames, 0);
     assert_eq!(snapshot.payload_range_nsecs, None);
     assert_eq!(output.shared.buffer.lock().unwrap().epoch, fenced_epoch);
+}
+
+#[test]
+fn ordinary_snapshots_reconcile_busy_initial_audio_abort() {
+    for use_try_snapshot in [false, true] {
+        let control = Arc::new(FfmpegControl::new(PlaybackSessionId(112)));
+        let output = AudioOutput::stopped_for_test(control, 4_800, 48_000, 2);
+        let target_nsecs = 7_240_223_637_186;
+        output.reset_clock(target_nsecs);
+        let stale_epoch = output.audio_epoch();
+        {
+            let mut queue = output.queue.state.lock().unwrap();
+            queue.push(AudioQueueItem {
+                samples: vec![0.25; 960],
+                start_timeline_nsecs: target_nsecs,
+                end_timeline_nsecs: target_nsecs + 10_000_000,
+                duration_nsecs: 10_000_000,
+                generation: stale_epoch,
+            });
+            assert!(
+                output
+                    .try_abort_staged_audio(stale_epoch, target_nsecs)
+                    .unwrap()
+                    .is_none()
+            );
+            // Model an old worker discarding the fenced items without being
+            // allowed to debit the new epoch's pending duration ledger.
+            queue.items.clear();
+        }
+        let snapshot = if use_try_snapshot {
+            output
+                .try_snapshot()
+                .unwrap()
+                .expect("uncontended status snapshot")
+        } else {
+            output.snapshot().unwrap()
+        };
+        assert!(snapshot.audio_epoch > stale_epoch);
+        assert_eq!(snapshot.queue_generation, snapshot.audio_epoch);
+        assert_eq!(
+            snapshot.total_pending_nsecs, 0,
+            "aborted audio must not satisfy rebuffer waterlines"
+        );
+        assert_eq!(snapshot.queue_frames, 0);
+        assert_eq!(snapshot.payload_range_nsecs, None);
+        assert_eq!(
+            output.shared.buffer.lock().unwrap().epoch,
+            snapshot.audio_epoch
+        );
+        assert!(!snapshot.queue_active);
+    }
+}
+
+#[test]
+fn deferred_audio_abort_blocks_new_payload_and_activation_until_reset_then_resumes() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId(112)));
+    control.set_audio_output_lifecycle(AudioOutputLifecycle::Ready);
+    let output = AudioOutput::stopped_for_test(Arc::clone(&control), 4_800, 48_000, 2);
+    output.reset_clock(1_000_000_000);
+    let old_epoch = output.audio_epoch();
+    let target_nsecs = 2_000_000_000;
+    let frame_end_nsecs = target_nsecs + 10_000_000;
+    let samples = vec![0.25; 960];
+    let buffer = output.shared.buffer.lock().unwrap();
+    assert!(
+        output
+            .try_abort_staged_audio(old_epoch, target_nsecs)
+            .unwrap()
+            .is_some()
+    );
+    let retry_epoch = output.audio_epoch();
+    assert!(retry_epoch > old_epoch);
+
+    let AudioOutputPushResult::WouldBlock { samples, .. } = output
+        .try_push_timed_for_epoch(
+            samples,
+            target_nsecs,
+            frame_end_nsecs,
+            retry_epoch,
+            &control,
+        )
+        .unwrap()
+    else {
+        panic!("new audio must wait for the old buffer's deferred reset");
+    };
+    assert!(!output.activate_audio_output(retry_epoch, control.seek_generation(), &control));
+    assert!(!output.stream_active());
+    assert!(output.try_snapshot().unwrap().is_none());
+    drop(buffer);
+
+    assert!(matches!(
+        output
+            .try_push_timed_for_epoch(
+                samples,
+                target_nsecs,
+                frame_end_nsecs,
+                retry_epoch,
+                &control
+            )
+            .unwrap(),
+        AudioOutputPushResult::Queued
+    ));
+    let snapshot = output.snapshot().unwrap();
+    assert_eq!(snapshot.played_timeline_nsecs, target_nsecs);
+    assert_eq!(snapshot.total_pending_nsecs, 10_000_000);
+    assert_eq!(snapshot.queue_frames, 1);
+    assert_eq!(
+        snapshot.payload_range_nsecs,
+        Some((target_nsecs, frame_end_nsecs))
+    );
+    let activity = output.activity_snapshot().unwrap();
+    assert_eq!(activity.queue_pending_nsecs, 10_000_000);
+    assert_eq!(activity.shared_buffer_pending_nsecs, 0);
+    assert!(output.activate_audio_output(retry_epoch, control.seek_generation(), &control));
+    assert!(output.transfer_next_queued_frame_for_test().unwrap());
+    let mut callback_samples = vec![0.0; 960];
+    output.invoke_callback_for_test(&mut callback_samples);
+    assert!(callback_samples.iter().all(|sample| *sample == 0.25));
+    assert_eq!(
+        output.activity_snapshot().unwrap().consumed_callback_count,
+        1
+    );
+    // The callback submits a full frame before its native output delay elapses.
+    output.shared.set_output_delay_for_test(Duration::ZERO);
+    assert_eq!(
+        output.snapshot().unwrap().played_timeline_nsecs,
+        frame_end_nsecs
+    );
+    assert_eq!(output.stream_control_counts_for_test().0, 1);
 }
 
 #[test]

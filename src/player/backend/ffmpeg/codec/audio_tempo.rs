@@ -15,6 +15,7 @@ pub(in super::super) struct AudioTempo {
     graph: *mut ffi::AVFilterGraph,
     source: *mut ffi::AVFilterContext,
     sink: *mut ffi::AVFilterContext,
+    stages: [*mut ffi::AVFilterContext; 2],
     sample_rate: i32,
     channels: i32,
     time_base: ffi::AVRational,
@@ -24,6 +25,10 @@ pub(in super::super) struct AudioTempo {
     origin_nsecs: Option<u64>,
     input_end_nsecs: Option<u64>,
 }
+
+// The graph has no thread affinity. Its owner serializes all access (the AO
+// queue mutex in playback); it is never used from the real-time callback.
+unsafe impl Send for AudioTempo {}
 
 impl AudioTempo {
     pub(in super::super) fn new(
@@ -35,6 +40,7 @@ impl AudioTempo {
             graph: ptr::null_mut(),
             source: ptr::null_mut(),
             sink: ptr::null_mut(),
+            stages: [ptr::null_mut(); 2],
             sample_rate,
             channels,
             time_base,
@@ -50,6 +56,7 @@ impl AudioTempo {
         unsafe { ffi::avfilter_graph_free(&mut self.graph) };
         self.source = ptr::null_mut();
         self.sink = ptr::null_mut();
+        self.stages = [ptr::null_mut(); 2];
         self.input_frames = 0;
         self.output_frames = 0;
         self.origin_nsecs = None;
@@ -68,12 +75,11 @@ impl AudioTempo {
         let discontinuity = timestamp_nsecs
             .zip(self.input_end_nsecs)
             .is_some_and(|(pts, end)| pts.abs_diff(end) > 100_000_000);
-        if rate != self.rate || discontinuity {
+        if discontinuity {
             self.drain(&mut emit)?;
-            self.reset();
-            self.rate = rate;
         }
-        if rate == 1.0 {
+        self.set_rate(rate, &mut emit)?;
+        if rate == 1.0 && self.graph.is_null() {
             return emit(audio, timestamp);
         }
         if self.sample_rate <= 0
@@ -133,6 +139,54 @@ impl AudioTempo {
         Ok(())
     }
 
+    pub(in super::super) fn pending_range_nsecs(&self) -> Option<(u64, u64)> {
+        let start = self
+            .origin_nsecs?
+            .saturating_add(self.media_offset(self.output_frames));
+        let end = self.input_end_nsecs?;
+        (end > start).then_some((start, end))
+    }
+
+    pub(in super::super) fn set_rate(
+        &mut self,
+        rate: f64,
+        emit: &mut impl FnMut(DecodedAudio, i64) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let rate = crate::player::rate::clamp_playback_rate(rate);
+        if rate == self.rate {
+            return Ok(());
+        }
+        if !self.graph.is_null() {
+            // Finish already-produced output at its original rate, then
+            // update atempo in place like mpv's SET_SPEED filter command.
+            // Preserve overlap/history and reanchor only the media mapping.
+            self.receive(emit)?;
+            let offset = self.media_offset(self.output_frames);
+            self.origin_nsecs = self
+                .origin_nsecs
+                .map(|origin| origin.saturating_add(offset));
+            self.output_frames = 0;
+            for (stage, factor) in self.stages.into_iter().zip(tempo_factors(rate)) {
+                let value = CString::new(factor.to_string()).map_err(|error| error.to_string())?;
+                unsafe {
+                    check(
+                        ffi::avfilter_process_command(
+                            stage,
+                            c"tempo".as_ptr(),
+                            value.as_ptr(),
+                            ptr::null_mut(),
+                            0,
+                            0,
+                        ),
+                        "实时更新音频倍速",
+                    )?;
+                }
+            }
+        }
+        self.rate = rate;
+        Ok(())
+    }
+
     fn configure(&mut self) -> Result<(), String> {
         self.graph = unsafe { ffi::avfilter_graph_alloc() };
         if self.graph.is_null() {
@@ -148,10 +202,7 @@ impl AudioTempo {
         );
         self.source = self.add_filter(c"abuffer", "input", &args)?;
         let mut previous = self.source;
-        let mut remaining = self.rate;
-        let mut index = 0;
-        loop {
-            let factor = remaining.clamp(0.5, 2.0);
+        for (index, factor) in tempo_factors(self.rate).into_iter().enumerate() {
             let next = self.add_filter(
                 c"atempo",
                 &format!("tempo{index}"),
@@ -161,11 +212,7 @@ impl AudioTempo {
                 check(ffi::avfilter_link(previous, 0, next, 0), "连接音频变速滤镜")?;
             }
             previous = next;
-            remaining /= factor;
-            if (remaining - 1.0).abs() < 1e-8 {
-                break;
-            }
-            index += 1;
+            self.stages[index] = next;
         }
         self.sink = self.add_filter(c"abuffersink", "output", "")?;
         unsafe {
@@ -267,6 +314,11 @@ impl AudioTempo {
     }
 }
 
+fn tempo_factors(rate: f64) -> [f64; 2] {
+    let first = rate.clamp(0.5, 2.0);
+    [first, rate / first]
+}
+
 impl Drop for AudioTempo {
     fn drop(&mut self) {
         self.reset();
@@ -296,6 +348,61 @@ mod tests {
                 .collect(),
             duration_nsecs: count as u64 * 1_000_000_000 / 48_000,
         }
+    }
+
+    #[test]
+    fn live_rate_changes_preserve_filter_history_pitch_and_media_timeline() {
+        let mut tempo = AudioTempo::new(48_000, 2, tempo_time_base());
+        let mut previous_end = 0;
+        let mut previous_graph: *mut ffi::AVFilterGraph = ptr::null_mut();
+        let mut input = 0;
+        for rate in [1.0, 2.0, 0.5, 1.0, 4.0, 0.25, 1.331, 1.0] {
+            let mut samples = Vec::new();
+            for _ in 0..50 {
+                tempo
+                    .process(tone(input, 960), input as i64, rate, |audio, pts| {
+                        let start = timestamp_to_nsecs(pts, tempo_time_base()).unwrap();
+                        assert!(
+                            start.abs_diff(previous_end) < 50_000,
+                            "{rate}: {start} != {previous_end}"
+                        );
+                        previous_end = start + audio.duration_nsecs;
+                        samples.extend(audio.samples.chunks_exact(2).map(|frame| {
+                            assert_eq!(frame[0], frame[1]);
+                            frame[0]
+                        }));
+                        Ok(())
+                    })
+                    .unwrap();
+                input += 960;
+            }
+            if !previous_graph.is_null() {
+                assert_eq!(
+                    tempo.graph, previous_graph,
+                    "rate updates must keep the filter graph"
+                );
+            }
+            previous_graph = tempo.graph;
+            let middle = &samples[samples.len() / 4..samples.len() * 3 / 4];
+            let crossings = middle
+                .windows(2)
+                .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+                .count();
+            let hz = crossings as f64 * 48_000.0 / middle.len() as f64;
+            assert!((hz - 1000.0).abs() < 12.0, "rate {rate}: {hz} Hz");
+        }
+        tempo
+            .drain(|audio, pts| {
+                let start = timestamp_to_nsecs(pts, tempo_time_base()).unwrap();
+                assert!(start.abs_diff(previous_end) < 50_000);
+                previous_end = start + audio.duration_nsecs;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            previous_end.abs_diff(8_000_000_000) < 100_000_000,
+            "{previous_end}"
+        );
     }
 
     #[test]

@@ -195,21 +195,37 @@ pub(in crate::player::backend::ffmpeg) fn flush_pending_start_audio(
         clock_mode,
         delayed_audio_start_silence,
         control,
-        queued_video_frames,
         session_id,
-        vo_queue,
-        frame_presented,
-        position_reporter,
         event_tx,
-        subtitle_pipeline,
         buffered_reporter,
     )?;
     if result.staged_frames > 0 {
         output.activate_audio_output(expected_audio_epoch, control.seek_generation(), control);
     }
-    Ok(result.made_progress)
+    let mut made_progress = result.made_progress;
+    if result.would_block
+        && let Some(audio_snapshot) = output.try_snapshot()?
+    {
+        made_progress |= present_due_audio_clocked_frames_to_vo(
+            queued_video_frames,
+            audio_snapshot.played_timeline_nsecs,
+            session_id,
+            vo_queue,
+            frame_presented,
+            position_reporter,
+            event_tx,
+        );
+        subtitle_pipeline.update_overlay(
+            audio_snapshot.played_timeline_nsecs,
+            session_id,
+            event_tx,
+        );
+    }
+    Ok(made_progress)
 }
 
+/// Only transfers audio ownership. Initial A/V preparation must retain its
+/// video anchor until the transaction publishes it and commits audio output.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::player::backend::ffmpeg) fn stage_pending_audio(
     pending_audio: &mut PendingStartAudio,
@@ -220,13 +236,8 @@ pub(in crate::player::backend::ffmpeg) fn stage_pending_audio(
     clock_mode: AudioClockMode,
     delayed_audio_start_silence: DelayedAudioStartSilencePolicy,
     control: &FfmpegControl,
-    queued_video_frames: &mut ScheduledVideoQueue,
     session_id: PlaybackSessionId,
-    vo_queue: &VideoOutputQueue,
-    frame_presented: &AtomicBool,
-    position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
-    subtitle_pipeline: &mut SubtitlePipeline,
     buffered_reporter: &mut BufferedReporter,
 ) -> std::result::Result<AudioStageResult, String> {
     stage_pending_audio_with_checkpoint(
@@ -238,13 +249,8 @@ pub(in crate::player::backend::ffmpeg) fn stage_pending_audio(
         clock_mode,
         delayed_audio_start_silence,
         control,
-        queued_video_frames,
         session_id,
-        vo_queue,
-        frame_presented,
-        position_reporter,
         event_tx,
-        subtitle_pipeline,
         buffered_reporter,
         |_| {},
     )
@@ -260,13 +266,8 @@ pub(in crate::player::backend::ffmpeg) fn stage_pending_audio_with_checkpoint(
     clock_mode: AudioClockMode,
     delayed_audio_start_silence: DelayedAudioStartSilencePolicy,
     control: &FfmpegControl,
-    queued_video_frames: &mut ScheduledVideoQueue,
     session_id: PlaybackSessionId,
-    vo_queue: &VideoOutputQueue,
-    frame_presented: &AtomicBool,
-    position_reporter: &mut PositionReporter,
     event_tx: &Sender<BackendEvent>,
-    subtitle_pipeline: &mut SubtitlePipeline,
     buffered_reporter: &mut BufferedReporter,
     mut observe_checkpoint: impl FnMut(AudioStageCheckpoint),
 ) -> std::result::Result<AudioStageResult, String> {
@@ -384,22 +385,6 @@ pub(in crate::player::backend::ffmpeg) fn stage_pending_audio_with_checkpoint(
             } => {
                 frame.samples = samples;
                 pending_audio.push_front_frame(frame);
-                if let Some(audio_snapshot) = output.try_snapshot()? {
-                    result.made_progress |= present_due_audio_clocked_frames_to_vo(
-                        queued_video_frames,
-                        audio_snapshot.played_timeline_nsecs,
-                        session_id,
-                        vo_queue,
-                        frame_presented,
-                        position_reporter,
-                        event_tx,
-                    );
-                    subtitle_pipeline.update_overlay(
-                        audio_snapshot.played_timeline_nsecs,
-                        session_id,
-                        event_tx,
-                    );
-                }
                 tracing::debug!(
                     session_id = ?session_id,
                     blocked_on = PlaybackBlockReason::AudioOutput.as_str(),
@@ -410,7 +395,7 @@ pub(in crate::player::backend::ffmpeg) fn stage_pending_audio_with_checkpoint(
                     clock_mode = clock_mode.as_str(),
                     audio_start_timeline_nsecs,
                     audio_flush_until_timeline_nsecs,
-                    "audio output queue full while flushing pending FFmpeg audio"
+                    "audio output busy while staging pending FFmpeg audio"
                 );
                 result.would_block = true;
                 return Ok(result);
@@ -504,10 +489,7 @@ fn queue_delayed_audio_start_silence(
         return Ok(DelayedAudioStartSilenceStatus::NotNeeded);
     }
 
-    let audio_gap_frames = audio_frames_for_duration_round(
-        (gap_nsecs as f64 / control.playback_rate()).round() as u64,
-        output.sample_rate(),
-    );
+    let audio_gap_frames = audio_frames_for_duration_round(gap_nsecs, output.sample_rate());
     let silence_samples = usize::try_from(audio_elements_for_frames(
         audio_gap_frames,
         output.channels(),
@@ -630,6 +612,9 @@ pub(in crate::player::backend::ffmpeg) fn recover_pending_start_audio_after_unde
         dropped_video_frames = queued_video_frames.discard_before(reset_timeline_nsecs);
         output.reset_clock(reset_timeline_nsecs);
     }
+    // Reset may have cleared the old underrun latch. Re-arm it before
+    // activating AO so partial staging passes can accumulate real PCM.
+    output.hold_for_underrun_prefill(plan.audio_start_timeline_nsecs);
 
     let made_progress = flush_pending_start_audio(
         pending_audio,
@@ -660,7 +645,7 @@ pub(in crate::player::backend::ffmpeg) fn recover_pending_start_audio_after_unde
             pending_audio_frames = pending_audio.len(),
             pending_audio_ms = pending_audio.buffered_duration().as_secs_f64() * 1000.0,
             audio_output_pending_ms = recovered_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
-            "recovered native audio output underrun from pending FFmpeg audio"
+            "staged pending FFmpeg audio for native output underrun prefill"
         );
     }
 

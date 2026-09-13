@@ -67,7 +67,7 @@ fn rebuild_audio_pipeline_for_track_switch(
         return Ok((None, None));
     };
 
-    match AudioDecodePipeline::spawn(decoder, output.sample_rate(), output.channels(), control) {
+    match AudioDecodePipeline::spawn(decoder, output.sample_rate(), output.channels()) {
         Ok(worker) => {
             output.reset_clock(current_start_position_nsecs);
             Ok((Some(output), Some(worker)))

@@ -691,7 +691,7 @@ impl DemuxPacketCacheState {
     ) -> bool {
         if stream_index == timeline_anchor_stream_index {
             return packet.timeline_anchor
-                && packet.recovery_point
+                && packet.is_cached_seek_anchor()
                 && packet.seek_timestamp_nsecs.is_some();
         }
         if require_recovery_point {
@@ -802,7 +802,7 @@ impl DemuxPacketCacheState {
                     stream_index,
                     packet_id,
                     packet.seek_timestamp_nsecs,
-                    packet.recovery_point,
+                    packet.is_cached_seek_anchor(),
                 );
                 self.cached_bytes = self.cached_bytes.saturating_sub(packet.byte_len);
                 range.subtract_report_bytes(packet.byte_len);

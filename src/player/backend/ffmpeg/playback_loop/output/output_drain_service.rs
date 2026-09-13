@@ -1,3 +1,5 @@
+use super::audio_output_gate::{DelayedAudioStartSilencePolicy, flush_pending_start_audio};
+use super::output_gate::{OutputGateResumeStatus, service_initial_video_clock_until_audio_start};
 use super::playback_snapshot::PlaybackPipelineTelemetry;
 use super::playback_wait_service::{
     PlaybackLoopDeadline, PlaybackPipelineWaitContext, PlaybackPipelineWaitService,
@@ -14,7 +16,8 @@ use crate::player::{
 };
 
 use super::{
-    AudioOutput, AudioOutputDrainStatus, DemuxPacketCache, FfmpegControl, PlaybackPipelineState,
+    AudioClockMode, AudioOutput, AudioOutputDrainStatus, AudioOutputLifecycle, DemuxPacketCache,
+    FfmpegControl, PlaybackPipelineState,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +70,16 @@ fn drain_audio_clocked_output_until_idle(
     context: &mut OutputDrainContext<'_>,
 ) -> std::result::Result<(), String> {
     loop {
+        let audio_progress = service_eof_pending_audio(context)?;
+        if output_drain_stop_or_seek_status(context.control).is_some() {
+            return Ok(());
+        }
+        if context.pipeline.output_scheduler.restart_pending() {
+            // The initial transaction owns the unpublished video anchor even
+            // at EOF. Do not let the ordinary drain pop it during AO retries.
+            wait_after_output_drain_stall(context, "eof_initial_audio_prefill");
+            continue;
+        }
         let drain_status = {
             let Some(output) = context.pipeline.audio_output.as_ref() else {
                 return Ok(());
@@ -84,25 +97,153 @@ fn drain_audio_clocked_output_until_idle(
             )?
         };
         match drain_status {
-            AudioClockedVideoDrainStatus::Drained | AudioClockedVideoDrainStatus::Interrupted => {
+            AudioClockedVideoDrainStatus::Interrupted => {
                 break;
             }
+            AudioClockedVideoDrainStatus::Drained
+                if context
+                    .pipeline
+                    .output_scheduler
+                    .pending_start_audio
+                    .is_empty() =>
+            {
+                break;
+            }
+            AudioClockedVideoDrainStatus::Drained => {}
             AudioClockedVideoDrainStatus::WaitingAudio { .. } => {}
         }
         if output_drain_stop_or_seek_status(context.control).is_some() {
             return Ok(());
         }
-        if !drain_status.made_progress() {
+        if !audio_progress && !drain_status.made_progress() {
             wait_after_output_drain_stall(context, "eof_audio_clocked_output_drain");
         }
     }
     Ok(())
 }
 
+fn service_eof_pending_audio(
+    context: &mut OutputDrainContext<'_>,
+) -> std::result::Result<bool, String> {
+    let pipeline = &mut *context.pipeline;
+    let Some(output) = pipeline.audio_output.as_ref() else {
+        return Ok(false);
+    };
+    if context.control.should_interrupt() {
+        return Ok(false);
+    }
+    if pipeline.output_scheduler.restart_pending()
+        && !pipeline.output_scheduler.scheduled_video_queue.is_empty()
+        && (!pipeline.output_scheduler.pending_start_audio.is_empty()
+            || pipeline
+                .output_scheduler
+                .initial_audio_prepare_token()
+                .is_some())
+    {
+        let target_nsecs = pipeline
+            .output_scheduler
+            .initial_audio_prepare_target_nsecs()
+            .unwrap_or(pipeline.current_start_position_nsecs);
+        let status = service_initial_video_clock_until_audio_start(
+            &mut pipeline.output_scheduler,
+            output,
+            Some(context.demux_cache),
+            target_nsecs,
+            Some(0),
+            context.control,
+            context.session_id,
+            context.vo_queue,
+            context.frame_presented,
+            &mut pipeline.position_reporter,
+            context.event_tx,
+            &mut pipeline.subtitle_pipeline,
+            &mut pipeline.buffered_reporter,
+            &mut pipeline.current_start_position_nsecs,
+            &mut pipeline.scheduler,
+        )?;
+        match status {
+            OutputGateResumeStatus::Resumed => {}
+            OutputGateResumeStatus::Rebuffering => {
+                pipeline.output_scheduler.clear_rebuffer(context.control);
+            }
+            _ => return Ok(false),
+        }
+    }
+    if pipeline.output_scheduler.restart_pending()
+        && (pipeline.output_scheduler.scheduled_video_queue.is_empty()
+            || (pipeline.output_scheduler.pending_start_audio.is_empty()
+                && pipeline
+                    .output_scheduler
+                    .initial_audio_prepare_token()
+                    .is_none()))
+    {
+        // No video anchor remains at EOF; only the final audio tail can drain.
+        output.activate_current_audio_output(context.control);
+        pipeline
+            .output_scheduler
+            .set_state(super::PlaybackOutputState::Playing);
+    }
+    if pipeline.output_scheduler.pending_start_audio.is_empty() {
+        let _ = output.finish_audio_input()?;
+        context
+            .control
+            .set_audio_output_lifecycle(AudioOutputLifecycle::Draining);
+        return Ok(false);
+    }
+    // EOF can leave less than a prefill window, or audio beyond the last
+    // video frame. Drain all remaining PCM without a video lead waterline.
+    let snapshot = output.snapshot()?;
+    let mut start_nsecs = snapshot
+        .buffered_until_timeline_nsecs
+        .max(snapshot.played_timeline_nsecs);
+    if snapshot.total_pending_nsecs == 0
+        && let Some(first_nsecs) = pipeline
+            .output_scheduler
+            .pending_start_audio
+            .first_start_timeline_nsecs()
+        && first_nsecs
+            > start_nsecs.saturating_add(super::duration_nsecs(
+                super::AUDIO_OUTPUT_VIDEO_LEAD_DURATION,
+            ))
+    {
+        // A terminal timestamp gap cannot acquire more packets at EOF.
+        // Resume at the remaining payload once the previous audio has drained.
+        output.reset_clock(first_nsecs);
+        start_nsecs = first_nsecs;
+    }
+    let end_nsecs = pipeline
+        .output_scheduler
+        .pending_start_audio
+        .range_nsecs()
+        .map(|(_, end)| end)
+        .unwrap_or(start_nsecs);
+    let made_progress = flush_pending_start_audio(
+        &mut pipeline.output_scheduler.pending_start_audio,
+        output,
+        start_nsecs,
+        end_nsecs,
+        AudioClockMode::AudioStarted,
+        DelayedAudioStartSilencePolicy::Allow,
+        context.control,
+        &mut pipeline.output_scheduler.scheduled_video_queue,
+        context.session_id,
+        context.vo_queue,
+        context.frame_presented,
+        &mut pipeline.position_reporter,
+        context.event_tx,
+        &mut pipeline.subtitle_pipeline,
+        &mut pipeline.buffered_reporter,
+    )?;
+    context
+        .control
+        .set_audio_output_lifecycle(AudioOutputLifecycle::Draining);
+    Ok(made_progress)
+}
+
 fn drain_audio_output_until_idle(
     context: &mut OutputDrainContext<'_>,
 ) -> std::result::Result<(), String> {
-    let Some(deadline) = context
+    let Some(mut deadline) = context
         .pipeline
         .audio_output
         .as_ref()
@@ -112,7 +253,20 @@ fn drain_audio_output_until_idle(
     else {
         return Ok(());
     };
+    let mut previous_rate = context.control.playback_rate();
+    let mut was_paused = context.control.is_paused();
     loop {
+        let rate = context.control.playback_rate();
+        let paused = context.control.is_paused();
+        if rate != previous_rate || was_paused {
+            if let Some(output) = context.pipeline.audio_output.as_ref()
+                && let Some(updated) = output.drain_deadline()?
+            {
+                deadline = updated;
+            }
+            previous_rate = rate;
+        }
+        was_paused = paused;
         let drain_status = {
             let Some(output) = context.pipeline.audio_output.as_ref() else {
                 return Ok(());
@@ -141,6 +295,10 @@ fn drain_video_clocked_output_until_idle(context: &mut OutputDrainContext<'_>) {
         .queued_video_frames
         > 0
     {
+        context
+            .pipeline
+            .scheduler
+            .set_playback_rate(context.control.playback_rate());
         if context.control.is_paused() {
             let playback_loop_deadline = if context.control.is_user_paused() {
                 PlaybackLoopDeadline::default()

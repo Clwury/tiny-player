@@ -87,6 +87,9 @@ impl PlaybackPipelineState {
                     played_timeline_nsecs = activity.played_timeline_nsecs,
                     shared_buffer_pending_ms =
                         activity.shared_buffer_pending_nsecs as f64 / 1_000_000.0,
+                    queue_pending_ms = activity.queue_pending_nsecs as f64 / 1_000_000.0,
+                    pending_audio_frames = self.output_scheduler.pending_start_audio.len(),
+                    audio_stream_active = output.stream_active(),
                     callback_count = activity.callback_count,
                     consumed_callback_count = activity.consumed_callback_count,
                     silenced_callback_count = activity.silenced_callback_count,
@@ -102,6 +105,9 @@ impl PlaybackPipelineState {
                     played_timeline_nsecs = activity.played_timeline_nsecs,
                     shared_buffer_pending_ms =
                         activity.shared_buffer_pending_nsecs as f64 / 1_000_000.0,
+                    queue_pending_ms = activity.queue_pending_nsecs as f64 / 1_000_000.0,
+                    pending_audio_frames = self.output_scheduler.pending_start_audio.len(),
+                    audio_stream_active = output.stream_active(),
                     callback_count = activity.callback_count,
                     consumed_callback_count = activity.consumed_callback_count,
                     silenced_callback_count = activity.silenced_callback_count,

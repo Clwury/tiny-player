@@ -39,6 +39,8 @@ mod sample_format;
 mod service_watchdog;
 #[path = "audio/stream.rs"]
 mod stream;
+#[path = "audio/tempo.rs"]
+mod tempo;
 #[cfg(test)]
 #[path = "audio/tests.rs"]
 mod tests;

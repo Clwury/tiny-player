@@ -18,6 +18,58 @@ fn test_audio_shared(max_samples: usize) -> AudioShared {
 }
 
 #[test]
+fn underrun_retains_truehd_small_frames_until_callback_prefill_is_ready() {
+    let shared = test_audio_shared(48_000);
+    shared.reset_clock(541_828_000_000);
+    shared.activate_for_test();
+    let mut output = [0.0_f32; 960];
+    fill_audio_output(&mut output, &shared);
+    assert!(shared.underrun_active_for_test());
+    let frozen_clock = shared.played_timeline_nsecs();
+    let initial_played_samples = shared.played_samples.load(Ordering::Acquire);
+    // Forty stereo sample frames per packet: 0.833 ms, as in the TrueHD log.
+    for index in 1..=300 {
+        shared.buffer.lock().unwrap().push_slice(&[0.25; 80]);
+        shared.set_queued_end_timeline_nsecs(541_828_000_000 + index * 40 * 1_000_000_000 / 48_000);
+        fill_audio_output(&mut output, &shared);
+        if index < 300 {
+            assert!(shared.underrun_active_for_test());
+            assert!(output.iter().all(|sample| *sample == 0.0));
+            assert_eq!(
+                shared.played_samples.load(Ordering::Acquire),
+                initial_played_samples
+            );
+            assert_eq!(shared.buffer.lock().unwrap().len(), index as usize * 80);
+            assert_eq!(shared.played_timeline_nsecs(), frozen_clock);
+        }
+    }
+    assert!(!shared.underrun_active_for_test());
+    assert!(output.iter().all(|sample| *sample == 0.25));
+    assert_eq!(
+        shared.played_samples.load(Ordering::Acquire),
+        initial_played_samples + 960
+    );
+    assert_eq!(shared.buffer.lock().unwrap().len(), 24_000 - 960);
+}
+
+#[test]
+fn underrun_prefill_allows_short_eof_tail_to_drain() {
+    let shared = test_audio_shared(48_000);
+    let mut output = [0.0_f32; 960];
+    fill_audio_output(&mut output, &shared);
+    assert!(shared.underrun_active_for_test());
+    shared.buffer.lock().unwrap().push_slice(&[0.25; 960]);
+    shared.set_queued_end_timeline_nsecs(10_000_000);
+    shared
+        .control
+        .set_audio_output_lifecycle(AudioOutputLifecycle::Draining);
+    fill_audio_output(&mut output, &shared);
+    assert!(output.iter().all(|sample| *sample == 0.25));
+    assert!(!shared.underrun_active_for_test());
+    assert!(shared.buffer.lock().unwrap().is_empty());
+}
+
+#[test]
 fn audio_clock_tracks_media_time_at_the_rate_captured_for_its_epoch() {
     let shared = test_audio_shared(9_600);
     for rate in [0.25, 0.5, 1.1, 2.0, 4.0] {

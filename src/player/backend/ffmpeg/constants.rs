@@ -12,7 +12,8 @@ pub(super) const AUDIO_OUTPUT_QUEUE_LIMIT_DURATION: Duration = Duration::from_mi
 pub(super) const AUDIO_QUEUE_WAIT_LOG_AFTER: Duration = Duration::from_millis(50);
 pub(super) const AUDIO_CALLBACK_GAP_LOG_AFTER: Duration = Duration::from_millis(50);
 pub(super) const AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION: Duration = Duration::from_millis(250);
-pub(super) const AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION: Duration = Duration::from_millis(120);
+pub(super) const AUDIO_OUTPUT_UNDERRUN_CLOCK_RESUME_DURATION: Duration =
+    AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION;
 pub(super) const AUDIO_REBUFFER_DELAYED_START_MAX: Duration = Duration::from_secs(2);
 pub(super) const AUDIO_REBUFFER_PREFILL_TARGET: Duration = Duration::from_millis(500);
 pub(super) const AUDIO_REBUFFER_PREFILL_LOOP_TARGET: Duration = Duration::from_millis(750);

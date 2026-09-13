@@ -88,7 +88,7 @@ impl HomeContent {
                                 .when(detail.is_series(), |this| {
                                     this.when_some(detail.seasons.as_ref(), |this, seasons| {
                                         this.child(self.render_series_detail_season_selector(
-                                            detail, seasons, cx,
+                                            detail, seasons, window, cx,
                                         ))
                                     })
                                     .when_some(

@@ -108,7 +108,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop) use initial_audio::{
     PrestartAudioOwnershipInput, classify_prestart_audio_ownership,
 };
 pub(in crate::player::backend::ffmpeg) use initial_start::expire_initial_av_start_hard_deadline;
-pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) use initial_start::service_initial_video_clock_until_audio_start;
+pub(in crate::player::backend::ffmpeg::playback_loop) use initial_start::service_initial_video_clock_until_audio_start;
 #[cfg(test)]
 pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) use initial_start::{
     InitialAudioAmmunitionSnapshot, InitialAudioCommitCheckpoint, InitialAudioNoPayloadDisposition,
@@ -211,6 +211,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop) enum InitialAudioTransient
     OutputSnapshotBusy,
     StableSnapshotUnstable,
     AudioStageWouldBlock,
+    AudioPrefillIncomplete,
     PreparedSnapshotUnstable,
     VideoOutputWouldBlock,
 }
@@ -221,6 +222,7 @@ impl InitialAudioTransientRetry {
             Self::OutputSnapshotBusy => "audio_output_snapshot_busy",
             Self::StableSnapshotUnstable => "audio_output_snapshot_unstable",
             Self::AudioStageWouldBlock => "audio_stage_would_block_without_payload",
+            Self::AudioPrefillIncomplete => "audio_prefill_incomplete",
             Self::PreparedSnapshotUnstable => "prepared_snapshot_unstable",
             Self::VideoOutputWouldBlock => "initial_video_publish_would_block",
         }
@@ -475,6 +477,7 @@ pub(in crate::player::backend::ffmpeg) struct PlaybackOutputScheduler {
     video_deadline_service: Option<VideoDeadlineService>,
     video_deadline_audio_clock_available: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop) pending_start_audio: PendingStartAudio,
+    pub(in crate::player::backend::ffmpeg::playback_loop) audio_input_eof: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop) playback_output_state:
         PlaybackOutputState,
     pub(in crate::player::backend::ffmpeg::playback_loop) first_frame_needed: bool,

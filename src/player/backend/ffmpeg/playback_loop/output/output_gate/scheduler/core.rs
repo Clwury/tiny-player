@@ -57,6 +57,7 @@ impl PlaybackOutputScheduler {
             video_deadline_service: None,
             video_deadline_audio_clock_available: false,
             pending_start_audio: PendingStartAudio::default(),
+            audio_input_eof: false,
             first_frame_needed: true,
             first_frame_presented: false,
             output_clock_running: false,
@@ -130,6 +131,7 @@ impl PlaybackOutputScheduler {
             self.scheduled_video_queue.clear();
         }
         self.pending_start_audio.clear();
+        self.audio_input_eof = false;
         self.pending_start_audio_pressure_level = PendingStartAudioPressureLevel::Normal;
         self.startup_first_frame_stall_logged = false;
         self.initial_delayed_audio_start_timeline_nsecs = None;

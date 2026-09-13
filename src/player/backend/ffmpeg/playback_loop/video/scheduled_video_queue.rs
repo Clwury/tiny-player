@@ -182,7 +182,8 @@ pub(in crate::player::backend::ffmpeg) fn queued_video_buffered_until_from_nsecs
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
     timeline_nsecs: u64,
 ) -> Option<u64> {
-    let start_index = queued_video_contiguous_start_index(queued_video_frames, timeline_nsecs)?;
+    let start_index =
+        queued_video_contiguous_start_index(queued_video_frames, timeline_nsecs, None)?;
     let max_gap_nsecs = queued_video_continuity_gap_threshold_nsecs(
         queued_video_frames.get(start_index)?.duration_nsecs,
     );
@@ -210,7 +211,7 @@ fn queued_video_contiguous_frame_count_from_nsecs(
     timeline_nsecs: u64,
 ) -> usize {
     let Some(start_index) =
-        queued_video_contiguous_start_index(queued_video_frames, timeline_nsecs)
+        queued_video_contiguous_start_index(queued_video_frames, timeline_nsecs, None)
     else {
         return 0;
     };
@@ -237,7 +238,11 @@ fn queued_video_contiguous_buffered_until_from_nsecs_with_gap(
     timeline_nsecs: u64,
     fixed_max_gap_nsecs: Option<u64>,
 ) -> Option<u64> {
-    let start_index = queued_video_contiguous_start_index(queued_video_frames, timeline_nsecs)?;
+    let start_index = queued_video_contiguous_start_index(
+        queued_video_frames,
+        timeline_nsecs,
+        fixed_max_gap_nsecs,
+    )?;
     let first = queued_video_frames.get(start_index)?;
     let mut buffered_until = first.timeline_nsecs.saturating_add(first.duration_nsecs);
     let mut previous_duration_nsecs = first.duration_nsecs;
@@ -261,16 +266,38 @@ fn queued_video_contiguous_buffered_until_from_nsecs_with_gap(
 fn queued_video_contiguous_start_index(
     queued_video_frames: &VecDeque<QueuedVideoFrame>,
     timeline_nsecs: u64,
+    fixed_max_gap_nsecs: Option<u64>,
 ) -> Option<usize> {
     let first = queued_video_frames.front()?;
     if timeline_nsecs <= first.timeline_nsecs {
         return Some(0);
     }
 
-    queued_video_frames.iter().position(|frame| {
+    let mut previous_end_nsecs = None;
+    for (index, frame) in queued_video_frames.iter().enumerate() {
+        if frame.timeline_nsecs > timeline_nsecs {
+            // A query can land between a frame's duration and the next muxed
+            // PTS. Apply the same gap policy as the forward continuity scan,
+            // otherwise a sub-millisecond gap can stop AO refill indefinitely.
+            // Check the entire gap, not just the distance to the next frame:
+            // landing near the end of a real discontinuity is still uncovered.
+            let gap_nsecs = frame.timeline_nsecs.saturating_sub(previous_end_nsecs?);
+            let max_gap_nsecs = fixed_max_gap_nsecs.unwrap_or_else(|| {
+                queued_video_continuity_gap_threshold_nsecs(frame.duration_nsecs)
+            });
+            return video_timestamp_gap_within_threshold(gap_nsecs, max_gap_nsecs).then_some(index);
+        }
         let frame_end_nsecs = frame.timeline_nsecs.saturating_add(frame.duration_nsecs);
-        frame.timeline_nsecs <= timeline_nsecs && frame_end_nsecs > timeline_nsecs
-    })
+        if frame_end_nsecs > timeline_nsecs {
+            return Some(index);
+        }
+        previous_end_nsecs = Some(
+            previous_end_nsecs
+                .unwrap_or(frame_end_nsecs)
+                .max(frame_end_nsecs),
+        );
+    }
+    None
 }
 
 pub(in crate::player::backend::ffmpeg) fn queued_video_largest_gap_nsecs(
@@ -1172,6 +1199,63 @@ mod tests {
             duration_nsecs,
             source_duration_nsecs: duration_nsecs,
         }
+    }
+
+    #[test]
+    fn continuity_query_inside_quantized_frame_gap_keeps_audio_refill_covered() {
+        let mut queue = ScheduledVideoQueue::default();
+        for pts in [2_329_035_000_000, 2_329_077_000_000, 2_329_119_000_000] {
+            queue.push_queued(queued_video_frame(pts, 41_708_333));
+        }
+        let tail = 2_329_160_708_333;
+        // The 1.331x AO tail at 38:49 lies 215272ns after one video frame's
+        // duration and 76395ns before the next quantized millisecond PTS.
+        for query in [2_329_076_708_333, 2_329_076_923_605, 2_329_076_999_999] {
+            assert_eq!(queue.buffered_until_from_nsecs(query), Some(tail));
+            assert_eq!(queue.strict_forward_nsecs_from(query), Some(tail - query));
+            assert_eq!(queue.contiguous_frame_count_from(query), 2);
+            assert_eq!(
+                queue.audio_output_lead_until_from_nsecs(query),
+                Some(tail + duration_nsecs(AUDIO_OUTPUT_VIDEO_LEAD_DURATION))
+            );
+        }
+    }
+
+    #[test]
+    fn continuity_query_inside_gap_honors_the_requested_gap_threshold() {
+        let mut queue = ScheduledVideoQueue::default();
+        queue.push_queued(queued_video_frame(1_000_000_000, 40_000_000));
+        queue.push_queued(queued_video_frame(1_050_000_000, 40_000_000));
+        let query = 1_045_000_000;
+        assert_eq!(queue.buffered_until_from_nsecs(query), Some(1_090_000_000));
+        assert_eq!(queue.strict_forward_nsecs_from(query), None);
+        queue.with_frames(|frames| {
+            assert_eq!(
+                queued_video_contiguous_buffered_until_from_nsecs(frames, query, 10_000_000),
+                Some(1_090_000_000)
+            );
+            assert_eq!(
+                queued_video_contiguous_buffered_until_from_nsecs(frames, query, 5_000_000),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn continuity_query_cannot_bridge_a_large_gap_or_extend_past_the_tail() {
+        let mut queue = ScheduledVideoQueue::default();
+        queue.push_queued(queued_video_frame(1_000_000_000, 40_000_000));
+        queue.push_queued(queued_video_frame(2_000_000_000, 40_000_000));
+        for query in [1_040_000_000, 1_500_000_000, 1_999_999_999, 2_040_000_000] {
+            assert_eq!(queue.buffered_until_from_nsecs(query), None);
+            assert_eq!(queue.strict_forward_nsecs_from(query), None);
+            assert_eq!(queue.contiguous_frame_count_from(query), 0);
+            assert_eq!(queue.audio_output_lead_until_from_nsecs(query), None);
+        }
+        assert_eq!(
+            queue.buffered_until_from_nsecs(2_000_000_000),
+            Some(2_040_000_000)
+        );
     }
 
     #[test]

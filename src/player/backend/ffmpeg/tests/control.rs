@@ -260,19 +260,107 @@ fn ninth_rapid_seek_advances_audio_clock_and_video_presentations() {
 }
 
 #[test]
+fn live_rate_commands_preserve_session_loaded_state_pause_and_events() {
+    for paused in [false, true] {
+        let mut backend = FfmpegBackend::new().unwrap();
+        let session_id = backend.current_session_id;
+        let control = Arc::new(FfmpegControl::new(session_id));
+        control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing);
+        control.set_user_paused(paused);
+        control.set_cache_paused(paused);
+        let before_output = control.audio_output_control_snapshot();
+        let before_seek = control.seek_generation();
+        let (worker, commands) =
+            super::super::FfmpegWorker::command_queue_for_test(Arc::clone(&control));
+        backend.worker = Some(worker);
+        backend.loaded = true;
+        backend.paused = paused;
+        backend.user_paused = paused;
+        backend.position_seconds = Some(2329.0);
+        backend
+            .event_tx
+            .send(BackendEvent::new(
+                session_id,
+                BackendEventKind::PositionChanged(2329.0),
+            ))
+            .unwrap();
+        for rate in [2.0, 0.5, 4.0, 1.0] {
+            backend.set_playback_rate(rate).unwrap();
+            assert_eq!(control.playback_rate(), rate);
+        }
+        let drained = drain_playback_commands(&commands, &control);
+        assert_eq!(drained.playback_rate, Some(1.0));
+        assert!(drained.pending_seek.is_none());
+        assert!(drained.pending_track_selection.is_none());
+        assert_eq!(control.seek_generation(), before_seek);
+        assert_eq!(control.audio_output_control_snapshot(), before_output);
+        assert_eq!(backend.current_session_id, session_id);
+        assert_eq!(control.session_id(), session_id);
+        assert!(backend.loaded);
+        assert_eq!(backend.paused, paused);
+        assert_eq!(backend.user_paused, paused);
+        assert_eq!(backend.position_seconds, Some(2329.0));
+        assert!(matches!(
+            backend.event_rx.try_recv().unwrap().kind,
+            BackendEventKind::PositionChanged(2329.0)
+        ));
+        assert!(
+            backend.event_rx.try_recv().is_err(),
+            "rate updates must not emit loading/cache/pause events"
+        );
+    }
+}
+
+#[test]
+fn live_rate_update_does_not_supersede_an_existing_seek_or_track_switch() {
+    for switch_track in [false, true] {
+        let control = FfmpegControl::new(PlaybackSessionId(1));
+        let (tx, rx) = mpsc::channel();
+        let generation = control.request_seek();
+        tx.send(if switch_track {
+            FfmpegCommand::SetTrackSelection {
+                session_id: PlaybackSessionId(2),
+                selected_tracks: Default::default(),
+                position_seconds: 60.0,
+                generation,
+                pause_after_switch: true,
+            }
+        } else {
+            FfmpegCommand::Seek {
+                session_id: PlaybackSessionId(2),
+                position_seconds: 60.0,
+                mode: PlaybackSeekMode::Fast,
+                generation,
+                queued_at: Instant::now(),
+            }
+        })
+        .unwrap();
+        tx.send(FfmpegCommand::SetPlaybackRate { rate: 2.0 })
+            .unwrap();
+        let drained = drain_playback_commands(&rx, &control);
+        assert_eq!(drained.playback_rate, Some(2.0));
+        assert_eq!(control.seek_generation(), generation);
+        if switch_track {
+            let switch = drained.pending_track_selection.unwrap();
+            assert_eq!(switch.generation, generation);
+            assert!(switch.pause_after_switch);
+            assert_eq!(switch.position_seconds, 60.0);
+        } else {
+            let seek = drained.pending_seek.unwrap();
+            assert_eq!(seek.generation, generation);
+            assert_eq!(seek.mode, PlaybackSeekMode::Fast);
+            assert_eq!(seek.position_seconds, 60.0);
+        }
+    }
+}
+
+#[test]
 fn playback_rate_commands_coalesce_with_seeks_and_preserve_user_pause() {
     let control = FfmpegControl::new(PlaybackSessionId(1));
     control.set_user_paused(true);
     let (tx, rx) = mpsc::channel();
     for rate in [1.1, 2.0, 0.5] {
-        tx.send(FfmpegCommand::SetPlaybackRate {
-            session_id: PlaybackSessionId(2),
-            rate,
-            position_seconds: 60.0,
-            generation: control.request_seek(),
-            queued_at: Instant::now(),
-        })
-        .unwrap();
+        tx.send(FfmpegCommand::SetPlaybackRate { rate }).unwrap();
     }
     tx.send(FfmpegCommand::Seek {
         session_id: PlaybackSessionId(3),
@@ -295,7 +383,7 @@ fn playback_rate_commands_coalesce_with_seeks_and_preserve_user_pause() {
     assert_eq!(
         control.playback_rate(),
         1.0,
-        "rate changes only when the coordinator resets output"
+        "draining commands must not create a seek or alter output state"
     );
 }
 

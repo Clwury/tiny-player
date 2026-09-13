@@ -1,6 +1,117 @@
 use super::*;
 
 #[test]
+fn precise_cached_seek_uses_indexed_audio_recovery_and_preserves_other_preroll() {
+    for codec_id in [
+        ffi::AVCodecID::AV_CODEC_ID_TRUEHD,
+        ffi::AVCodecID::AV_CODEC_ID_MLP,
+        ffi::AVCodecID::AV_CODEC_ID_AAC,
+    ] {
+        for mode in [PlaybackSeekMode::Precise, PlaybackSeekMode::Fast] {
+            let mut state = DemuxPacketCacheState::new(
+                0,
+                0,
+                ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+                PlaybackSessionId(1),
+                cache_config_for_test(),
+            );
+            state.set_selected_streams(DemuxSelectedStreams {
+                audio_stream: Some(stream_info_for_test(1, codec_id)),
+                subtitle_stream: None,
+            });
+            state.append_packet(cached_anchor(0, 10_000_000_000));
+            for index in 0..=50_u64 {
+                let start = index * 200_000_000;
+                let packet = if index.is_multiple_of(5) {
+                    cached_key_packet(1, false, Some(start), Some(start + 200_000_000))
+                } else {
+                    cached_packet(1, false, Some(start), Some(start + 200_000_000))
+                };
+                state.append_packet(packet);
+            }
+            close_seek_range(&mut state, 10_000_000_000);
+
+            let hit = state
+                .seek_cached_with_generation_hit(9_500_000_000, mode, PlaybackSessionId(2), 1)
+                .expect("the target is cached");
+            assert_eq!(hit.anchor_nsecs, 0);
+            let (audio_head, audio_start, _) = state.stream_reader_head_timeline(1).unwrap();
+            assert_eq!(
+                audio_start,
+                Some(
+                    if mode == PlaybackSeekMode::Precise
+                        && codec_id != ffi::AVCodecID::AV_CODEC_ID_AAC
+                    {
+                        9_000_000_000
+                    } else {
+                        0
+                    }
+                )
+            );
+            assert!(state.packets.get(&audio_head).unwrap().recovery_point);
+        }
+    }
+}
+
+#[test]
+fn reading_small_packets_keeps_large_backbuffer_and_reader_snapshots_consistent() {
+    let mut config = cache_config_for_test();
+    config.demuxer_max_bytes = 150 * 1024 * 1024;
+    config.demuxer_max_back_bytes = 75 * 1024 * 1024;
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        config,
+    );
+    state.set_selected_streams(DemuxSelectedStreams {
+        audio_stream: Some(stream_info_for_test(1, ffi::AVCodecID::AV_CODEC_ID_TRUEHD)),
+        subtitle_stream: None,
+    });
+    state.append_packet(cached_anchor(0, 60_000_000_000));
+    for index in 0..50_000_u64 {
+        let start = index * 1_000_000;
+        state.append_packet(if index.is_multiple_of(32) {
+            cached_key_packet(1, false, Some(start), Some(start + 1_000_000))
+        } else {
+            cached_packet(1, false, Some(start), Some(start + 1_000_000))
+        });
+    }
+    state.set_reader_head_for_current_generation(1, 40_001);
+    state.refresh_reader_tracking();
+    let refresh_count = state.reader_tracking_full_refresh_count;
+    let started = std::time::Instant::now();
+    let mut timing = DemuxPacketCacheReadTiming::default();
+    for index in 40_000..42_000_u64 {
+        let packet = state
+            .take_packet_round_robin_with_trim(&[1], &mut timing, false)
+            .unwrap()
+            .expect("audio packet is readable");
+        drop(packet);
+        let snapshot = state.packet_queue_snapshot();
+        let audio = snapshot
+            .streams
+            .iter()
+            .find(|stream| stream.stream_index == 1)
+            .unwrap();
+        assert_eq!(audio.reader_nsecs, Some((index + 1) * 1_000_000));
+        assert_eq!(audio.queued_packets, (50_000 - index - 1) as usize);
+        assert_eq!(audio.readable_packets_for_stream, 256);
+    }
+    eprintln!(
+        "2,000 small-packet reads with 50k cache: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(state.reader_tracking_full_refresh_count, refresh_count);
+    assert!(
+        state.packets.contains_key(&40_001),
+        "consumed audio stays seekable"
+    );
+    assert_eq!(state.next_packet_id_for_stream(1), Some(42_001));
+}
+
+#[test]
 fn demux_packet_cache_state_keeps_consumed_packet_in_seekable_backbuffer_range() {
     let mut state = DemuxPacketCacheState::new(
         0,

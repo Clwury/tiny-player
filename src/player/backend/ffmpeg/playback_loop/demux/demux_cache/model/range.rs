@@ -23,8 +23,9 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxC
     /// non-monotonic in demux/decode order.
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_pts_index:
         BTreeMap<c_int, BTreeMap<(u64, PacketId), PacketId>>,
-    /// Presentation-time ordered recovery points (IDR/BLA/CRA for video and
-    /// major-sync packets for codecs that require an audio recovery point).
+    /// Presentation-time ordered video demux keyframes/recovery points and
+    /// codec-specific audio recovery points. Decoder recovery eligibility
+    /// remains separate packet metadata.
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_recovery_point_index:
         BTreeMap<c_int, BTreeMap<(u64, PacketId), PacketId>>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_boundaries:
@@ -62,7 +63,7 @@ impl DemuxCachedRange {
         stream_index: c_int,
         packet_id: PacketId,
         seek_timestamp_nsecs: Option<u64>,
-        recovery_point: bool,
+        cached_seek_anchor: bool,
     ) {
         let Some(seek_timestamp_nsecs) = seek_timestamp_nsecs else {
             return;
@@ -72,7 +73,7 @@ impl DemuxCachedRange {
             .entry(stream_index)
             .or_default()
             .insert(key, packet_id);
-        if recovery_point {
+        if cached_seek_anchor {
             self.stream_recovery_point_index
                 .entry(stream_index)
                 .or_default()
@@ -85,7 +86,7 @@ impl DemuxCachedRange {
         stream_index: c_int,
         packet_id: PacketId,
         seek_timestamp_nsecs: Option<u64>,
-        recovery_point: bool,
+        cached_seek_anchor: bool,
     ) {
         let Some(seek_timestamp_nsecs) = seek_timestamp_nsecs else {
             return;
@@ -97,7 +98,7 @@ impl DemuxCachedRange {
                 self.stream_pts_index.remove(&stream_index);
             }
         }
-        if recovery_point
+        if cached_seek_anchor
             && let Some(index) = self.stream_recovery_point_index.get_mut(&stream_index)
         {
             index.remove(&key);

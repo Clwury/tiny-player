@@ -2,6 +2,8 @@
 mod archived_seek;
 #[path = "cache/config.rs"]
 mod config;
+#[path = "cache/h264_ranges.rs"]
+mod h264_ranges;
 #[path = "cache/hevc_ranges.rs"]
 mod hevc_ranges;
 #[path = "cache/pause_read.rs"]
@@ -212,11 +214,13 @@ fn cached_packet_with_keyframe(
     let mut packet = AvPacket::new().expect("packet allocates");
     unsafe {
         (*packet.as_mut_ptr()).stream_index = stream_index;
+        (*packet.as_mut_ptr()).flags = if keyframe { ffi::AV_PKT_FLAG_KEY } else { 0 };
     }
     CachedDemuxPacket {
         payload: CachedDemuxPacketPayload::Memory(Arc::new(Mutex::new(packet))),
         stream_index,
         timeline_anchor,
+        demux_keyframe: keyframe,
         recovery_point: keyframe,
         recovery_kind: if keyframe {
             VideoRecoveryPointKind::Keyframe

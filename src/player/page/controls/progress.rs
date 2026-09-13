@@ -157,7 +157,96 @@ impl PlaybackPage {
 mod tests {
     use gpui::{TestAppContext, point, size};
 
+    use crate::player::backend::{DemuxCacheState, PlaybackCacheTimeRange};
+
     use super::*;
+
+    #[gpui::test]
+    fn forward_cache_remains_drawn_when_seekable_start_passes_the_playhead(
+        cx: &mut TestAppContext,
+    ) {
+        struct ProgressPreview {
+            timeline: PlaybackTimelineState,
+        }
+
+        impl Render for ProgressPreview {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = theme::media_overlay(cx);
+                div()
+                    .relative()
+                    .w(px(400.0))
+                    .h(px(28.0))
+                    .child(progress_track_fill(theme.input_border, 1.0))
+                    .children(progress_track_forward_cache_fill(
+                        theme.input_border_focused.opacity(0.35),
+                        forward_cache_fraction(&self.timeline),
+                    ))
+                    .child(progress_track_played_fill(
+                        theme.input_border_focused,
+                        progress_fraction(
+                            self.timeline.position.unwrap(),
+                            self.timeline.duration.unwrap(),
+                        ),
+                    ))
+            }
+        }
+
+        cx.update(theme::init);
+        let (view, cx) = cx.add_window_view(|_, _| ProgressPreview {
+            timeline: PlaybackTimelineState {
+                position: Some(82.8),
+                duration: Some(200.0),
+                buffered_until: Some(127.6),
+                cache_state: Some(PlaybackCacheState {
+                    demux: DemuxCacheState {
+                        seekable_ranges: vec![PlaybackCacheTimeRange {
+                            start: 69.666666667,
+                            end: 124.6,
+                        }],
+                        ..DemuxCacheState::default()
+                    },
+                    ..PlaybackCacheState::default()
+                }),
+                ..PlaybackTimelineState::default()
+            },
+        });
+        cx.run_until_parked();
+        let before = cx.debug_bounds("playback-progress-forward-cache").unwrap();
+        assert!((f32::from(before.size.width) - 255.2).abs() <= 1.0);
+
+        view.update(cx, |view, cx| {
+            view.timeline
+                .cache_state
+                .as_mut()
+                .unwrap()
+                .demux
+                .seekable_ranges[0]
+                .start = 84.3;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.debug_bounds("playback-progress-forward-cache"),
+            Some(before)
+        );
+
+        view.update(cx, |view, cx| {
+            view.timeline.position = Some(84.4);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.debug_bounds("playback-progress-forward-cache"),
+            Some(before)
+        );
+
+        view.update(cx, |view, cx| {
+            view.timeline.buffered_until = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("playback-progress-forward-cache").is_none());
+    }
 
     #[test]
     fn progress_hover_time_follows_the_cursor_and_formats_hours() {

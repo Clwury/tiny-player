@@ -1,3 +1,4 @@
+use super::model::{AudioBufferTiming, AudioDeviceTiming};
 use super::{
     AUDIO_OUTPUT_QUEUE_LIMIT_DURATION, AUDIO_QUEUE_WAIT_LOG_AFTER, Arc, AtomicBool, AudioBuffer,
     AudioQueueInFlight, AudioQueueItem, AudioQueueShared, AudioQueueSnapshot, AudioQueueState,
@@ -6,6 +7,9 @@ use super::{
     TryLockError, VecDeque, duration_nsecs, interpolated_audio_timeline_nsecs,
     log_audio_queue_snapshot_timing, thread,
 };
+
+// Match mpv's default AO window while keeping decoder read-ahead as raw PCM.
+const AUDIO_FILTER_AHEAD_DURATION: Duration = Duration::from_millis(200);
 
 impl AudioBuffer {
     #[cfg(test)]
@@ -23,6 +27,8 @@ impl AudioBuffer {
             write_pos: 0,
             len: 0,
             epoch,
+            timing: VecDeque::new(),
+            device_timing: VecDeque::new(),
         }
     }
 
@@ -43,6 +49,139 @@ impl AudioBuffer {
         self.read_pos = 0;
         self.write_pos = 0;
         self.len = 0;
+        self.timing.clear();
+        self.device_timing.clear();
+    }
+
+    pub(super) fn push_timed_slice(
+        &mut self,
+        samples: &[f32],
+        start_nsecs: u64,
+        end_nsecs: u64,
+    ) -> usize {
+        let written = self.push_slice(samples);
+        if written > 0 {
+            self.timing.push_back(AudioBufferTiming {
+                samples: written,
+                consumed: 0,
+                start_nsecs,
+                end_nsecs: interpolated_audio_timeline_nsecs(
+                    start_nsecs,
+                    end_nsecs,
+                    written,
+                    samples.len(),
+                ),
+            });
+        }
+        written
+    }
+
+    pub(super) fn media_duration_nsecs(&self) -> Option<u64> {
+        (!self.timing.is_empty()).then(|| {
+            self.timing
+                .iter()
+                .map(|span| {
+                    span.end_nsecs
+                        .saturating_sub(interpolated_audio_timeline_nsecs(
+                            span.start_nsecs,
+                            span.end_nsecs,
+                            span.consumed,
+                            span.samples,
+                        ))
+                })
+                .sum()
+        })
+    }
+
+    pub(super) fn consume_timing(
+        &mut self,
+        mut samples: usize,
+        wall_start: u64,
+        now: u64,
+        sample_rate: i32,
+        channels: i32,
+    ) {
+        // Retain the timestamps of audio already submitted to the device.
+        // Its latency can straddle several rates; multiplying all of it by
+        // the newest rate would jump the video clock at each speed change.
+        while self
+            .device_timing
+            .front()
+            .is_some_and(|span| span.wall_end <= now)
+        {
+            self.device_timing.pop_front();
+        }
+        let mut written = 0;
+        while samples > 0 {
+            let Some(span) = self.timing.front_mut() else {
+                break;
+            };
+            let consumed = samples.min(span.samples - span.consumed);
+            let media_start = interpolated_audio_timeline_nsecs(
+                span.start_nsecs,
+                span.end_nsecs,
+                span.consumed,
+                span.samples,
+            );
+            span.consumed += consumed;
+            let media_end = interpolated_audio_timeline_nsecs(
+                span.start_nsecs,
+                span.end_nsecs,
+                span.consumed,
+                span.samples,
+            );
+            samples -= consumed;
+            if span.consumed == span.samples {
+                self.timing.pop_front();
+            }
+            let start = wall_start.saturating_add(duration_nsecs(super::audio_elements_duration(
+                written,
+                sample_rate,
+                channels,
+            )));
+            written += consumed;
+            let end = wall_start.saturating_add(duration_nsecs(super::audio_elements_duration(
+                written,
+                sample_rate,
+                channels,
+            )));
+            // Callback timestamps can overlap slightly because of host clock
+            // rounding; replace only the portion covered by this callback.
+            while self
+                .device_timing
+                .back()
+                .is_some_and(|span| span.wall_start >= start)
+            {
+                self.device_timing.pop_back();
+            }
+            if let Some(previous) = self.device_timing.back_mut()
+                && previous.wall_end > start
+            {
+                previous.media_end = interpolate_device_media(previous, start);
+                previous.wall_end = start;
+            }
+            self.device_timing.push_back(AudioDeviceTiming {
+                wall_start: start,
+                wall_end: end,
+                media_start,
+                media_end,
+            });
+        }
+    }
+
+    pub(super) fn device_delay_nsecs(&self, now: u64) -> Option<u64> {
+        let end = self.device_timing.back()?.media_end;
+        let mut played = self.device_timing.front()?.media_start;
+        for span in &self.device_timing {
+            if now < span.wall_start {
+                break;
+            }
+            played = interpolate_device_media(span, now);
+            if now < span.wall_end {
+                break;
+            }
+        }
+        Some(end.saturating_sub(played))
     }
 
     pub(in crate::player::backend::ffmpeg) fn push_slice(&mut self, samples: &[f32]) -> usize {
@@ -77,13 +216,28 @@ impl AudioBuffer {
     }
 }
 
+fn interpolate_device_media(span: &AudioDeviceTiming, now: u64) -> u64 {
+    let duration = span.wall_end.saturating_sub(span.wall_start);
+    if duration == 0 {
+        return span.media_end;
+    }
+    span.media_start.saturating_add(
+        (u128::from(span.media_end.saturating_sub(span.media_start))
+            * u128::from(now.saturating_sub(span.wall_start).min(duration))
+            / u128::from(duration)) as u64,
+    )
+}
+
 impl AudioQueueState {
     pub(in crate::player::backend::ffmpeg::audio) fn new() -> Self {
         Self {
             items: VecDeque::new(),
+            filtered: VecDeque::new(),
+            tempo: None,
             queued_samples: 0,
             queued_duration_nsecs: 0,
             in_flight: None,
+            input_eof: false,
         }
     }
 
@@ -91,8 +245,7 @@ impl AudioQueueState {
         &self,
         additional_duration_nsecs: u64,
     ) -> bool {
-        self.queued_duration_nsecs
-            .saturating_add(additional_duration_nsecs)
+        duration_nsecs(self.pending_duration()).saturating_add(additional_duration_nsecs)
             <= duration_nsecs(AUDIO_OUTPUT_QUEUE_LIMIT_DURATION)
     }
 
@@ -115,13 +268,24 @@ impl AudioQueueState {
 
     pub(in crate::player::backend::ffmpeg::audio) fn clear(&mut self) {
         self.items.clear();
+        self.filtered.clear();
+        self.tempo = None;
         self.queued_samples = 0;
         self.queued_duration_nsecs = 0;
         self.in_flight = None;
+        self.input_eof = false;
     }
 
     pub(in crate::player::backend::ffmpeg::audio) fn pending_duration(&self) -> Duration {
-        Duration::from_nanos(self.queued_duration_nsecs)
+        Duration::from_nanos(
+            self.queued_duration_nsecs.saturating_add(
+                self.tempo
+                    .as_ref()
+                    .and_then(|tempo| tempo.pending_range_nsecs())
+                    .map(|(start, end)| end.saturating_sub(start))
+                    .unwrap_or_default(),
+            ),
+        )
     }
 }
 
@@ -186,8 +350,8 @@ impl AudioQueueShared {
 
     fn snapshot_for_locked_state(&self, state: &AudioQueueState) -> AudioQueueSnapshot {
         AudioQueueSnapshot {
-            pending_nsecs: state.queued_duration_nsecs,
-            queued_nsecs: state.queued_duration_nsecs.saturating_sub(
+            pending_nsecs: duration_nsecs(state.pending_duration()),
+            queued_nsecs: duration_nsecs(state.pending_duration()).saturating_sub(
                 state
                     .in_flight
                     .map(|in_flight| in_flight.remaining_duration_nsecs)
@@ -197,7 +361,7 @@ impl AudioQueueShared {
                 .in_flight
                 .map(|in_flight| in_flight.remaining_duration_nsecs)
                 .unwrap_or_default(),
-            frames: state.items.len(),
+            frames: state.items.len() + state.filtered.len(),
             in_flight_frames: usize::from(state.in_flight.is_some()),
             generation: self.generation(),
             payload_range_nsecs: queue_payload_range(state),
@@ -224,36 +388,43 @@ impl AudioQueueShared {
 
     pub(in crate::player::backend::ffmpeg::audio) fn pop(
         &self,
+        sample_rate: i32,
+        channels: i32,
     ) -> std::result::Result<Option<AudioQueueItem>, String> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| "系统音频解码队列已损坏".to_string())?;
-        while state.items.is_empty() || !self.timeline.active() {
+        loop {
             if self.shutdown.load(Ordering::Acquire) || self.control.should_stop() {
                 return Ok(None);
+            }
+            // Capture the epoch before checking active. A lock-free fence
+            // deactivates first, then advances it; never label old queued PCM
+            // with a newer epoch observed after the active check.
+            let generation = self.generation();
+            if self.timeline.active() {
+                let _mutation = self.timeline.begin_mutation();
+                if let Some(item) = state.pop_filtered(
+                    sample_rate,
+                    channels,
+                    self.control.playback_rate(),
+                    generation,
+                )? {
+                    state.in_flight = Some(AudioQueueInFlight {
+                        generation: item.generation,
+                        start_timeline_nsecs: item.start_timeline_nsecs,
+                        end_timeline_nsecs: item.end_timeline_nsecs,
+                        remaining_samples: item.samples.len(),
+                        remaining_duration_nsecs: item.duration_nsecs,
+                    });
+                    return Ok(Some(item));
+                }
             }
             state = self
                 .ready
                 .wait(state)
                 .map_err(|_| "系统音频解码队列已损坏".to_string())?;
-        }
-        if self.shutdown.load(Ordering::Acquire) || self.control.should_stop() {
-            Ok(None)
-        } else {
-            let mutation = self.timeline.begin_mutation();
-            let item = state.items.pop_front();
-            if let Some(item) = item.as_ref() {
-                state.in_flight = Some(AudioQueueInFlight {
-                    generation: item.generation,
-                    start_timeline_nsecs: item.start_timeline_nsecs,
-                    end_timeline_nsecs: item.end_timeline_nsecs,
-                    remaining_samples: item.samples.len(),
-                    remaining_duration_nsecs: item.duration_nsecs,
-                });
-            }
-            drop(mutation);
-            Ok(item)
         }
     }
 
@@ -319,9 +490,16 @@ impl AudioQueueShared {
 fn queue_payload_range(state: &AudioQueueState) -> Option<(u64, u64)> {
     let queued = state
         .items
-        .front()
-        .zip(state.items.back())
-        .map(|(first, last)| (first.start_timeline_nsecs, last.end_timeline_nsecs));
+        .iter()
+        .chain(state.filtered.iter())
+        .map(|item| (item.start_timeline_nsecs, item.end_timeline_nsecs))
+        .chain(
+            state
+                .tempo
+                .as_ref()
+                .and_then(|tempo| tempo.pending_range_nsecs()),
+        )
+        .reduce(|(start, end), (next_start, next_end)| (start.min(next_start), end.max(next_end)));
     let in_flight = state.in_flight.map(|in_flight| {
         let consumed_nsecs = in_flight
             .end_timeline_nsecs
@@ -356,7 +534,11 @@ pub(in crate::player::backend::ffmpeg::audio) fn spawn_audio_queue_worker(
 
 fn run_audio_queue_worker(shared: Arc<AudioShared>, queue: Arc<AudioQueueShared>) {
     loop {
-        let item = match queue.pop() {
+        if let Err(error) = wait_for_audio_output_demand(&shared, &queue) {
+            tracing::warn!(%error, "FFmpeg audio queue worker failed to wait for output");
+            break;
+        }
+        let item = match queue.pop(shared.sample_rate, shared.channels) {
             Ok(Some(item)) => item,
             Ok(None) => break,
             Err(error) => {
@@ -384,6 +566,39 @@ fn run_audio_queue_worker(shared: Arc<AudioShared>, queue: Arc<AudioQueueShared>
             queue.finish_item(generation, remaining_samples, remaining_duration_nsecs);
         }
     }
+}
+
+fn wait_for_audio_output_demand(
+    shared: &AudioShared,
+    queue: &AudioQueueShared,
+) -> Result<(), String> {
+    // Keep only a small wall-time window already stretched. The much larger
+    // raw-PCM queues still protect against decoder stalls and use the latest
+    // speed as they enter AO. Underrun/startup retain their media waterlines.
+    let target_samples = super::audio_elements_for_duration_floor(
+        duration_nsecs(AUDIO_FILTER_AHEAD_DURATION),
+        shared.sample_rate,
+        shared.channels,
+    ) as usize;
+    let mut buffer = shared
+        .buffer
+        .lock()
+        .map_err(|_| "系统音频缓冲区已损坏".to_string())?;
+    while buffer.len() >= target_samples
+        && !queue.shutdown.load(Ordering::Acquire)
+        && !shared.control.should_interrupt()
+        && queue.timeline.active()
+        && !(shared.underrun_active.load(Ordering::Acquire)
+            && shared.buffer_media_duration_nsecs(&buffer)
+                < shared.underrun_resume_nsecs.load(Ordering::Acquire))
+    {
+        buffer = shared
+            .ready
+            .wait_timeout(buffer, SCHEDULER_POLL_INTERVAL)
+            .map_err(|_| "系统音频缓冲区已损坏".to_string())?
+            .0;
+    }
+    Ok(())
 }
 
 pub(in crate::player::backend::ffmpeg::audio) fn write_audio_queue_item(
@@ -459,7 +674,21 @@ pub(in crate::player::backend::ffmpeg::audio) fn write_audio_queue_item(
         let previous_offset = offset;
         let end = (offset + capacity).min(item.samples.len());
         let mutation = queue.timeline.begin_mutation();
-        let written = guard.push_slice(&item.samples[offset..end]);
+        let written = guard.push_timed_slice(
+            &item.samples[offset..end],
+            interpolated_audio_timeline_nsecs(
+                item.start_timeline_nsecs,
+                item.end_timeline_nsecs,
+                offset,
+                total_samples,
+            ),
+            interpolated_audio_timeline_nsecs(
+                item.start_timeline_nsecs,
+                item.end_timeline_nsecs,
+                end,
+                total_samples,
+            ),
+        );
         offset += written;
 
         if total_samples > 0 && written > 0 {

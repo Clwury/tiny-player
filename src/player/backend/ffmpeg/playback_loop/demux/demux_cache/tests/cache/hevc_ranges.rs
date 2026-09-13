@@ -422,7 +422,7 @@ fn demux_packet_cache_state_requires_previous_keyframe() {
 }
 
 #[test]
-fn demux_packet_cache_state_requires_previous_recovery_point() {
+fn demux_packet_cache_state_requires_previous_cached_seek_anchor() {
     let mut state = DemuxPacketCacheState::new(
         0,
         0,
@@ -430,8 +430,8 @@ fn demux_packet_cache_state_requires_previous_recovery_point() {
         PlaybackSessionId(1),
         cache_config_for_test(),
     );
-    let mut key_packet = cached_key_packet(0, true, Some(0), Some(1_000_000_000));
-    key_packet.recovery_point = false;
+    let mut key_packet = cached_packet(0, true, Some(0), Some(1_000_000_000));
+    key_packet.safe_seek_point = true;
     state.append_packet(key_packet);
     state.append_packet(cached_packet(
         0,

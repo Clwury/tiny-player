@@ -1,3 +1,4 @@
+use super::diagnostics::playback_diagnostics_enabled;
 use super::fullscreen::{
     PLAYBACK_BACK_BUTTON_OFFSET_PX, PLAYBACK_BACK_BUTTON_SIZE_PX,
     PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX, PLAYBACK_PROGRESS_BAR_HEIGHT_PX,
@@ -44,6 +45,7 @@ struct ProgressTimelineRenderState {
     duration_time: String,
     played_fraction: f32,
     cached_seek_preview: Option<bool>,
+    forward_cache_fraction: Option<f32>,
     cache_ranges: Vec<(f32, f32)>,
 }
 
@@ -74,6 +76,18 @@ fn progress_track_played_fill(color: gpui::Hsla, width_fraction: f32) -> impl In
     let width_fraction = width_fraction.clamp(0.0, 1.0);
     progress_track_fill(color, width_fraction)
         .when(width_fraction > 0.0, |fill| fill.min_w(px(6.0)))
+}
+
+fn progress_track_forward_cache_fill(
+    color: gpui::Hsla,
+    end_fraction: Option<f32>,
+) -> Option<gpui::Div> {
+    // The played fill covers this layer, keeping its rounded end continuous
+    // with the visible forward cache segment without a seam between caps.
+    Some(
+        progress_track_fill(color, end_fraction?)
+            .debug_selector(|| "playback-progress-forward-cache".to_string()),
+    )
 }
 
 fn progress_track_seekable_range_fill(

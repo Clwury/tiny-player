@@ -77,6 +77,8 @@ fn audio_snapshot(played_timeline_nsecs: u64, total_pending_nsecs: u64) -> Audio
     }
 }
 
+#[path = "tests/audio_refill.rs"]
+mod audio_refill;
 #[path = "tests/demux_watermark.rs"]
 mod demux_watermark;
 #[path = "tests/initial_start.rs"]

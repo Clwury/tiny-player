@@ -33,8 +33,8 @@ impl PendingStartAudioFrame {
             return false;
         }
 
-        // PCM may already be time-stretched. Trim by the fraction of media
-        // time covered by this frame, not by the device's wall-clock rate.
+        // Trim by the fraction of the frame's media interval so timestamp
+        // rounding and merged small gaps keep sample ownership consistent.
         let duration = self.end_timeline_nsecs - self.start_timeline_nsecs;
         let drop_samples = (self.samples.len() as u128
             * u128::from(timeline_nsecs - self.start_timeline_nsecs)

@@ -497,7 +497,7 @@ impl DemuxPacketCacheState {
             .stream_queues
             .get(&stream_index)
             .and_then(|queue| {
-                let position = queue.iter().position(|candidate| *candidate == packet_id)?;
+                let position = ordered_packet_position(queue, packet_id)?;
                 queue
                     .iter()
                     .skip(position.saturating_add(1))
@@ -604,7 +604,7 @@ impl DemuxPacketCacheState {
                     .is_none_or(|blocked_generation| *blocked_generation > generation)
                 && stream_queues
                     .get(stream_index)
-                    .is_some_and(|queue| queue.iter().any(|candidate| *candidate == *packet_id))
+                    .is_some_and(|queue| ordered_packet_position(queue, *packet_id).is_some())
         });
         self.reader_head_generations
             .retain(|stream_index, _| self.reader_heads.contains_key(stream_index));
@@ -660,12 +660,12 @@ impl DemuxPacketCacheState {
         packet_id: PacketId,
         previous_position: usize,
     ) -> Option<usize> {
-        self.read_range()
-            .global_order
-            .iter()
-            .enumerate()
-            .skip(previous_position.saturating_add(1))
-            .find_map(|(position, candidate)| (*candidate == packet_id).then_some(position))
+        let queue = &self.read_range().global_order;
+        let next_position = previous_position.saturating_add(1);
+        if queue.get(next_position) == Some(&packet_id) {
+            return Some(next_position);
+        }
+        ordered_packet_position(queue, packet_id).filter(|position| *position > previous_position)
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn packet_queue_snapshot(
@@ -780,7 +780,7 @@ impl DemuxPacketCacheState {
         let Some(queue) = self.read_range().stream_queues.get(&stream_index) else {
             return 0;
         };
-        let Some(position) = queue.iter().position(|candidate| *candidate == packet_id) else {
+        let Some(position) = ordered_packet_position(queue, packet_id) else {
             return 0;
         };
         queue

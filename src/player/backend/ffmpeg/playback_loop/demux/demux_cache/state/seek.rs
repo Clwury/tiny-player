@@ -325,6 +325,7 @@ impl DemuxPacketCacheState {
                 range_id: range.id,
                 timeline_anchor_stream_index: self.timeline_anchor_stream_index,
                 cached_seek_preroll_nsecs,
+                precise: mode == PlaybackSeekMode::Precise,
                 recovery_point_stream_index: self.recovery_point_stream_index(),
                 required_stream_indices: &required_stream_indices,
                 stream_pts_index: &range.stream_pts_index,
@@ -348,6 +349,7 @@ impl DemuxPacketCacheState {
                     seek_target.target_nsecs,
                     cached_seek_preroll_nsecs,
                     &required_stream_indices,
+                    mode,
                     reason,
                 );
                 return Err(CachedSeekMiss {
@@ -369,6 +371,7 @@ impl DemuxPacketCacheState {
         target_nsecs: u64,
         cached_seek_preroll_nsecs: u64,
         required_stream_indices: &[c_int],
+        mode: PlaybackSeekMode,
         reason: CachedSeekMissReason,
     ) -> CachedSeekMissReason {
         let next_generation = self.generation.saturating_add(1);
@@ -384,6 +387,7 @@ impl DemuxPacketCacheState {
                     range_id: range.id,
                     timeline_anchor_stream_index: self.timeline_anchor_stream_index,
                     cached_seek_preroll_nsecs,
+                    precise: mode == PlaybackSeekMode::Precise,
                     recovery_point_stream_index: self.recovery_point_stream_index(),
                     required_stream_indices,
                     stream_pts_index: &range.stream_pts_index,

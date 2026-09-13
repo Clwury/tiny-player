@@ -296,6 +296,20 @@ impl AudioOutput {
             return Ok(AudioOutputPushResult::Interrupted { samples });
         }
 
+        // A nonblocking abort can fence the epoch before it can clear the
+        // physical buffers. Finish that reset before accepting new samples,
+        // otherwise a later reconciliation would discard the retry payload.
+        if let Err(message) = self.try_reconcile_pending_fenced_reset() {
+            return Err(AudioOutputPushError::new(samples, message));
+        }
+        if self.pending_fenced_reset_epoch.load(Ordering::Acquire) != 0 {
+            return Ok(AudioOutputPushResult::WouldBlock {
+                samples,
+                queued_frames: 0,
+                queued_duration: Duration::ZERO,
+            });
+        }
+
         let duration_nsecs = end_timeline_nsecs.saturating_sub(start_timeline_nsecs);
         let sample_count = samples.len();
         let lock_started_at = Instant::now();
@@ -326,6 +340,7 @@ impl AudioOutput {
         let queue_lock_wait = lock_started_at.elapsed();
         if state.can_accept(duration_nsecs)
             && self.queue.generation() == expected_epoch
+            && self.pending_fenced_reset_epoch.load(Ordering::Acquire) == 0
             && !control.should_interrupt()
         {
             let _mutation = self.timeline.begin_mutation();
@@ -466,6 +481,13 @@ impl AudioOutput {
         expected_seek_generation: u64,
         control: &FfmpegControl,
     ) -> bool {
+        if let Err(error) = self.try_reconcile_pending_fenced_reset() {
+            tracing::warn!(%error, "failed to reconcile deferred audio reset before output commit");
+            return false;
+        }
+        if self.pending_fenced_reset_epoch.load(Ordering::Acquire) != 0 {
+            return false;
+        }
         let activated = control
             .compare_and_commit_audio_output_start(expected_seek_generation, || {
                 self.timeline.activate_if_epoch(expected_epoch)
@@ -602,8 +624,8 @@ impl AudioOutput {
 
     /// Completes the physical half of a lock-free epoch fence once all AO
     /// locks can be acquired without waiting. Without this reconciliation the
-    /// timeline and queue move to the new epoch while the ring buffer remains
-    /// on the old one, making every subsequent stable snapshot fail forever.
+    /// timeline and queue move to the new epoch while the ring buffer and
+    /// pending duration counters still describe audio from the old epoch.
     fn try_reconcile_pending_fenced_reset(&self) -> std::result::Result<bool, String> {
         let pending_epoch = self.pending_fenced_reset_epoch.load(Ordering::Acquire);
         if pending_epoch == 0 || self.timeline.epoch() != pending_epoch || self.timeline.active() {
@@ -679,7 +701,7 @@ impl AudioOutput {
                 audio_epoch = pending_epoch,
                 reset_timeline_nsecs,
                 stale_queue_items,
-                "reconciled deferred physical audio reset before stable snapshot"
+                "reconciled deferred physical audio reset"
             );
         }
         Ok(completed)
@@ -687,6 +709,27 @@ impl AudioOutput {
 
     pub(in crate::player::backend::ffmpeg) fn underrun_active(&self) -> bool {
         self.shared.underrun_active.load(Ordering::Acquire)
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn hold_for_underrun_prefill(
+        &self,
+        timeline_nsecs: u64,
+    ) {
+        self.shared.mark_underrun(timeline_nsecs);
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn hold_for_initial_prefill(
+        &self,
+        timeline_nsecs: u64,
+        prefill_nsecs: u64,
+    ) {
+        // AO preparation fills the worker queue while inactive. The callback
+        // waits for that same window to reach its ring after activation.
+        debug_assert!(!self.timeline.active());
+        self.shared.mark_underrun(timeline_nsecs);
+        self.shared
+            .underrun_resume_nsecs
+            .store(prefill_nsecs, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -697,11 +740,55 @@ impl AudioOutput {
     pub(in crate::player::backend::ffmpeg) fn drain_deadline(
         &self,
     ) -> std::result::Result<Option<Instant>, String> {
-        let timeout = Duration::from_nanos(
-            self.shared
-                .media_duration_to_wall_nsecs(self.snapshot()?.total_pending_nsecs),
-        )
-        .saturating_add(Duration::from_millis(250));
+        // Raw input will use the new speed; already-filtered PCM and device
+        // latency retain their actual wall duration across a live update.
+        let buffer = self
+            .shared
+            .buffer
+            .lock()
+            .map_err(|_| "系统音频缓冲区已损坏".to_string())?;
+        let ring_wall =
+            super::audio_elements_duration(buffer.len(), self.sample_rate, self.channels);
+        let device_wall = Duration::from_nanos(self.shared.output_delay_wall_nsecs());
+        drop(buffer);
+        let state = self
+            .queue
+            .state
+            .lock()
+            .map_err(|_| "系统音频解码队列已损坏".to_string())?;
+        let raw_media_nsecs = state
+            .items
+            .iter()
+            .map(|item| item.duration_nsecs)
+            .sum::<u64>()
+            .saturating_add(
+                state
+                    .tempo
+                    .as_ref()
+                    .and_then(|tempo| tempo.pending_range_nsecs())
+                    .map(|(start, end)| end.saturating_sub(start))
+                    .unwrap_or_default(),
+            );
+        let filtered_samples = state
+            .filtered
+            .iter()
+            .map(|item| item.samples.len())
+            .sum::<usize>()
+            .saturating_add(
+                state
+                    .in_flight
+                    .map(|item| item.remaining_samples)
+                    .unwrap_or_default(),
+            );
+        let queue_wall =
+            super::audio_elements_duration(filtered_samples, self.sample_rate, self.channels)
+                .saturating_add(Duration::from_secs_f64(
+                    raw_media_nsecs as f64 / 1_000_000_000.0 / self.shared.control.playback_rate(),
+                ));
+        let timeout = ring_wall
+            .saturating_add(device_wall)
+            .saturating_add(queue_wall)
+            .saturating_add(Duration::from_millis(250));
         Ok(Instant::now().checked_add(timeout))
     }
 
@@ -712,6 +799,9 @@ impl AudioOutput {
     ) -> std::result::Result<AudioOutputDrainStatus, String> {
         if control.should_interrupt() {
             return Ok(AudioOutputDrainStatus::Interrupted);
+        }
+        if !self.finish_audio_input()? || control.is_paused() {
+            return Ok(AudioOutputDrainStatus::Waiting);
         }
         let snapshot = self.snapshot()?;
         if snapshot.total_pending_nsecs == 0 {
@@ -739,23 +829,15 @@ impl AudioOutput {
     ) -> std::result::Result<AudioOutputSnapshot, String> {
         let _stage = self.begin_service_stage(AudioOutputServiceStage::StatusSnapshot);
         let started_at = Instant::now();
+        let _ = self.try_reconcile_pending_fenced_reset()?;
         let shared_started_at = Instant::now();
-        let mut shared = self.shared.snapshot()?;
-        let mut shared_snapshot = shared_started_at.elapsed();
+        let shared = self.shared.snapshot()?;
+        let shared_snapshot = shared_started_at.elapsed();
         let queue_started_at = Instant::now();
         let queue = self.queue.snapshot()?;
         let queue_snapshot = queue_started_at.elapsed();
-        let total_pending_nsecs = shared.pending_nsecs.saturating_add(queue.pending_nsecs);
-        let mut underrun_recheck = Duration::ZERO;
-        if self.shared.underrun_active.load(Ordering::Acquire) {
-            self.shared.clear_underrun_if_recovered(total_pending_nsecs);
-            if !self.shared.underrun_active.load(Ordering::Acquire) {
-                let recheck_started_at = Instant::now();
-                shared = self.shared.snapshot()?;
-                underrun_recheck = recheck_started_at.elapsed();
-                shared_snapshot += underrun_recheck;
-            }
-        }
+        // Reading coordinator status must not release underrun using samples
+        // that the queue worker has not yet delivered to the callback.
         let snapshot = compose_audio_output_snapshot(
             shared,
             queue,
@@ -769,7 +851,7 @@ impl AudioOutput {
             total: started_at.elapsed(),
             shared_snapshot,
             queue_snapshot,
-            underrun_recheck,
+            underrun_recheck: Duration::ZERO,
             misaligned_audio_buffer_count: self.misaligned_audio_buffer_count(),
             snapshot,
         });
@@ -782,22 +864,16 @@ impl AudioOutput {
         &self,
     ) -> std::result::Result<Option<AudioOutputSnapshot>, String> {
         let _stage = self.begin_service_stage(AudioOutputServiceStage::StatusSnapshot);
-        let Some(mut shared) = self.shared.try_snapshot()? else {
+        let _ = self.try_reconcile_pending_fenced_reset()?;
+        if self.pending_fenced_reset_epoch.load(Ordering::Acquire) != 0 {
+            return Ok(None);
+        }
+        let Some(shared) = self.shared.try_snapshot()? else {
             return Ok(None);
         };
         let Some(queue) = self.queue.try_snapshot()? else {
             return Ok(None);
         };
-        let total_pending_nsecs = shared.pending_nsecs.saturating_add(queue.pending_nsecs);
-        if self.shared.underrun_active.load(Ordering::Acquire) {
-            self.shared.clear_underrun_if_recovered(total_pending_nsecs);
-            if !self.shared.underrun_active.load(Ordering::Acquire) {
-                let Some(rechecked) = self.shared.try_snapshot()? else {
-                    return Ok(None);
-                };
-                shared = rechecked;
-            }
-        }
         Ok(Some(compose_audio_output_snapshot(
             shared,
             queue,
@@ -884,11 +960,48 @@ impl AudioOutput {
     }
 
     #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg) fn stage_filtered_audio_for_test(
+        &self,
+        samples: Vec<f32>,
+        start_timeline_nsecs: u64,
+        end_timeline_nsecs: u64,
+    ) {
+        let mut state = self.queue.state.lock().unwrap();
+        let item = AudioQueueItem {
+            samples,
+            start_timeline_nsecs,
+            end_timeline_nsecs,
+            duration_nsecs: end_timeline_nsecs - start_timeline_nsecs,
+            generation: self.audio_epoch(),
+        };
+        state.queued_samples += item.samples.len();
+        state.queued_duration_nsecs += item.duration_nsecs;
+        state.filtered.push_back(item);
+    }
+
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg) fn transfer_next_queued_frame_for_test(
         &self,
     ) -> std::result::Result<bool, String> {
-        let Some(item) = self.queue.pop()? else {
-            return Ok(false);
+        let item = {
+            let mut state = self.queue.state.lock().unwrap();
+            let Some(item) = state.pop_filtered(
+                self.sample_rate,
+                self.channels,
+                self.shared.control.playback_rate(),
+                self.audio_epoch(),
+            )?
+            else {
+                return Ok(false);
+            };
+            state.in_flight = Some(super::AudioQueueInFlight {
+                generation: item.generation,
+                start_timeline_nsecs: item.start_timeline_nsecs,
+                end_timeline_nsecs: item.end_timeline_nsecs,
+                remaining_samples: item.samples.len(),
+                remaining_duration_nsecs: item.duration_nsecs,
+            });
+            item
         };
         let generation = item.generation;
         let samples = item.samples.len();
@@ -907,10 +1020,13 @@ impl AudioOutput {
     pub(in crate::player::backend::ffmpeg) fn activity_snapshot(
         &self,
     ) -> std::result::Result<AudioOutputActivitySnapshot, String> {
-        let shared = self.shared.snapshot()?;
+        let snapshot = self.snapshot()?;
         Ok(AudioOutputActivitySnapshot {
-            played_timeline_nsecs: shared.played_timeline_nsecs,
-            shared_buffer_pending_nsecs: shared.buffered_nsecs,
+            played_timeline_nsecs: snapshot.played_timeline_nsecs,
+            shared_buffer_pending_nsecs: snapshot.shared_payload_nsecs,
+            queue_pending_nsecs: snapshot
+                .queue_pending_nsecs
+                .saturating_add(snapshot.worker_in_flight_nsecs),
             callback_count: self.shared.callback_count.load(Ordering::Acquire),
             consumed_callback_count: self.shared.consumed_callback_count.load(Ordering::Acquire),
             silenced_callback_count: self.shared.silenced_callback_count.load(Ordering::Acquire),

@@ -386,12 +386,7 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
     if let Some(decoder) = opened_audio_decoder {
         match AudioOutput::new(Arc::clone(&control)) {
             Ok(output) => {
-                match AudioDecodePipeline::spawn(
-                    decoder,
-                    output.sample_rate(),
-                    output.channels(),
-                    Arc::clone(&control),
-                ) {
+                match AudioDecodePipeline::spawn(decoder, output.sample_rate(), output.channels()) {
                     Ok(worker) => {
                         let audio_info = worker.info();
                         tracing::debug!(

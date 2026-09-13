@@ -227,9 +227,13 @@ impl PlaybackScheduler {
     }
 
     pub(super) fn set_playback_rate(&mut self, rate: f64) {
+        let rate = crate::player::rate::clamp_playback_rate(rate);
+        if self.playback_rate == rate {
+            return;
+        }
         let position = self.current_timeline_nsecs();
         self.reset(position);
-        self.playback_rate = crate::player::rate::clamp_playback_rate(rate);
+        self.playback_rate = rate;
     }
 
     pub(super) fn delay_by(&mut self, duration: Duration) {

@@ -333,6 +333,7 @@ fn playing_audio_activity_watchdog_releases_seek_then_runs_one_bounded_reanchor(
     let frozen = AudioOutputActivitySnapshot {
         played_timeline_nsecs: 846_233_000_000,
         shared_buffer_pending_nsecs: 92_879_818,
+        queue_pending_nsecs: 0,
         callback_count: 1,
         consumed_callback_count: 0,
         silenced_callback_count: 1,
@@ -412,6 +413,7 @@ fn user_cache_or_rebuffer_pause_disarms_playing_audio_watchdog() {
     let frozen = AudioOutputActivitySnapshot {
         played_timeline_nsecs: 1_000_000_000,
         shared_buffer_pending_nsecs: 100_000_000,
+        queue_pending_nsecs: 0,
         callback_count: 1,
         consumed_callback_count: 0,
         silenced_callback_count: 1,
@@ -428,6 +430,100 @@ fn user_cache_or_rebuffer_pause_disarms_playing_audio_watchdog() {
         None
     );
     assert!(!scheduler.audio_output_clock_stall_fallback_active());
+}
+
+#[test]
+fn playing_audio_watchdog_recovers_empty_output_with_pending_audio() {
+    for audio_in_output_queue in [false, true] {
+        let mut scheduler = PlaybackOutputScheduler::new();
+        scheduler.set_state(PlaybackOutputState::Playing);
+        let now = Instant::now();
+        let frozen = AudioOutputActivitySnapshot {
+            played_timeline_nsecs: 7_240_223_637_186,
+            shared_buffer_pending_nsecs: 0,
+            queue_pending_nsecs: if audio_in_output_queue { 10_000_000 } else { 0 },
+            callback_count: 0,
+            consumed_callback_count: 0,
+            silenced_callback_count: 0,
+            underrun_count: 0,
+        };
+        if !audio_in_output_queue {
+            scheduler.push_pending_start_audio_for_test(
+                DecodedAudio {
+                    samples: vec![0.25; 960],
+                    duration_nsecs: 10_000_000,
+                },
+                frozen.played_timeline_nsecs,
+                frozen.played_timeline_nsecs + 10_000_000,
+            );
+        }
+        assert_eq!(
+            scheduler.observe_audio_output_activity(now, frozen, true, false),
+            None
+        );
+        let warning = scheduler
+            .observe_audio_output_activity(
+                now + AUDIO_OUTPUT_ACTIVITY_STALL_AFTER,
+                frozen,
+                true,
+                false,
+            )
+            .expect("pending decoded audio must arm the empty-output watchdog");
+        assert_eq!(
+            warning.action,
+            AudioOutputActivityWatchdogAction::WarnFrozenClock
+        );
+        let recovery = scheduler
+            .observe_audio_output_activity(
+                now + AUDIO_OUTPUT_ACTIVITY_RECOVERY_AFTER,
+                frozen,
+                true,
+                false,
+            )
+            .expect("frozen empty output must receive bounded recovery");
+        assert_eq!(
+            recovery.action,
+            AudioOutputActivityWatchdogAction::RecoverAndReanchor
+        );
+        assert!(scheduler.audio_output_clock_stall_fallback_active());
+        assert_eq!(
+            scheduler.observe_audio_output_activity(
+                now + AUDIO_OUTPUT_ACTIVITY_RECOVERY_AFTER + Duration::from_secs(1),
+                frozen,
+                true,
+                false,
+            ),
+            None,
+            "recovery must stay bounded while the clock is frozen"
+        );
+    }
+}
+
+#[test]
+fn playing_audio_watchdog_waits_for_data_when_all_audio_queues_are_empty() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+    let now = Instant::now();
+    let empty = AudioOutputActivitySnapshot {
+        played_timeline_nsecs: 7_240_223_637_186,
+        shared_buffer_pending_nsecs: 0,
+        queue_pending_nsecs: 0,
+        callback_count: 0,
+        consumed_callback_count: 0,
+        silenced_callback_count: 0,
+        underrun_count: 0,
+    };
+    for elapsed in [
+        Duration::ZERO,
+        AUDIO_OUTPUT_ACTIVITY_STALL_AFTER,
+        AUDIO_OUTPUT_ACTIVITY_RECOVERY_AFTER,
+    ] {
+        assert_eq!(
+            scheduler.observe_audio_output_activity(now + elapsed, empty, true, false),
+            None
+        );
+        assert!(!scheduler.audio_output_clock_stall_fallback_active());
+    }
 }
 
 #[test]
@@ -1104,24 +1200,26 @@ fn exact_165_266_seek_stages_audio_before_video_publish_and_enters_playing() {
     let mut current_start_position_nsecs = VIDEO_TARGET_NSECS;
     let mut scheduler = PlaybackScheduler::new(VIDEO_TARGET_NSECS);
 
-    let status = service_initial_video_clock_until_audio_start(
-        &mut output_scheduler,
-        &output,
-        None,
-        AUDIO_TARGET_NSECS,
-        Some(0),
-        &control,
-        session_id,
-        &vo_queue,
-        &frame_presented,
-        &mut position_reporter,
-        &event_tx,
-        &mut subtitle_pipeline,
-        &mut buffered_reporter,
-        &mut current_start_position_nsecs,
-        &mut scheduler,
-    )
-    .expect("exact seek initial transaction commits");
+    let status = retry_initial_prefill(|| {
+        service_initial_video_clock_until_audio_start(
+            &mut output_scheduler,
+            &output,
+            None,
+            AUDIO_TARGET_NSECS,
+            Some(0),
+            &control,
+            session_id,
+            &vo_queue,
+            &frame_presented,
+            &mut position_reporter,
+            &event_tx,
+            &mut subtitle_pipeline,
+            &mut buffered_reporter,
+            &mut current_start_position_nsecs,
+            &mut scheduler,
+        )
+        .expect("exact seek initial transaction commits")
+    });
 
     assert_eq!(status, OutputGateResumeStatus::Resumed);
     assert_eq!(
@@ -1151,11 +1249,7 @@ fn exact_165_266_seek_stages_audio_before_video_publish_and_enters_playing() {
     assert!(prepared_range.1 > AUDIO_TARGET_NSECS);
 
     let callback_started_at = Instant::now();
-    assert!(
-        output
-            .transfer_next_queued_frame_for_test()
-            .expect("queue worker transfer")
-    );
+    transfer_prefilled_audio(&output);
     let mut callback_samples = vec![0.0; 960];
     output.invoke_callback_for_test(&mut callback_samples);
     let callback_elapsed = callback_started_at.elapsed();
@@ -1238,24 +1332,26 @@ fn eighty_ms_real_audio_delay_commits_bounded_silence_and_consumes_the_first_cal
     let mut current_start_position_nsecs = TARGET_NSECS;
     let mut scheduler = PlaybackScheduler::new(TARGET_NSECS);
 
-    let status = service_initial_video_clock_until_audio_start(
-        &mut output_scheduler,
-        &output,
-        None,
-        TARGET_NSECS,
-        Some(0),
-        &control,
-        session_id,
-        &vo_queue,
-        &frame_presented,
-        &mut position_reporter,
-        &event_tx,
-        &mut subtitle_pipeline,
-        &mut buffered_reporter,
-        &mut current_start_position_nsecs,
-        &mut scheduler,
-    )
-    .expect("bounded delayed audio commits");
+    let status = retry_initial_prefill(|| {
+        service_initial_video_clock_until_audio_start(
+            &mut output_scheduler,
+            &output,
+            None,
+            TARGET_NSECS,
+            Some(0),
+            &control,
+            session_id,
+            &vo_queue,
+            &frame_presented,
+            &mut position_reporter,
+            &event_tx,
+            &mut subtitle_pipeline,
+            &mut buffered_reporter,
+            &mut current_start_position_nsecs,
+            &mut scheduler,
+        )
+        .expect("bounded delayed audio commits")
+    });
 
     assert_eq!(status, OutputGateResumeStatus::Resumed);
     assert_eq!(
@@ -1277,11 +1373,7 @@ fn eighty_ms_real_audio_delay_commits_bounded_silence_and_consumes_the_first_cal
     );
 
     let callback_started_at = Instant::now();
-    assert!(
-        output
-            .transfer_next_queued_frame_for_test()
-            .expect("queue worker transfer")
-    );
+    transfer_prefilled_audio(&output);
     let mut callback_samples = vec![1.0; 960];
     output.invoke_callback_for_test(&mut callback_samples);
     let callback_elapsed = callback_started_at.elapsed();
@@ -1626,6 +1718,167 @@ fn primed_initial_transaction_never_pushes_decoded_audio_directly() {
 }
 
 const PRODUCTION_STAGE_TARGET_NSECS: u64 = 1_050_500_000_000;
+
+fn transfer_prefilled_audio(output: &AudioOutput) {
+    assert!(output.snapshot().unwrap().queue_frames > 0);
+    while output.snapshot().unwrap().queue_frames > 0 {
+        assert!(output.transfer_next_queued_frame_for_test().unwrap());
+    }
+}
+
+fn retry_initial_prefill(
+    mut service: impl FnMut() -> OutputGateResumeStatus,
+) -> OutputGateResumeStatus {
+    for _ in 0..100 {
+        let status = service();
+        if status != OutputGateResumeStatus::Waiting {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    panic!("initial audio prefill did not complete within bounded retries");
+}
+
+#[test]
+fn truehd_initial_start_retains_partial_prefill_until_two_hundred_ms_or_eof() {
+    const TARGET: u64 = 541_828_000_000;
+    for (input_eof, eof_after_stage) in [(false, false), (true, false), (false, true)] {
+        let session_id = PlaybackSessionId(542);
+        let control = Arc::new(FfmpegControl::new(session_id));
+        let generation = control.request_seek();
+        control.finish_seek(generation);
+        let output = AudioOutput::stopped_for_test(Arc::clone(&control), 96_000, 48_000, 2);
+        output.reset_clock(TARGET);
+        let epoch = output.audio_epoch();
+        let mut output_scheduler = PlaybackOutputScheduler::new();
+        output_scheduler.audio_input_eof = input_eof;
+        for index in 0..10 {
+            output_scheduler
+                .push_decoded_video_for_test(test_queued_video_frame(TARGET + index * 33_333_333));
+        }
+        let push_frame = |scheduler: &mut PlaybackOutputScheduler, index: u64| {
+            let start = TARGET + index * 40 * 1_000_000_000 / 48_000;
+            let end = TARGET + (index + 1) * 40 * 1_000_000_000 / 48_000;
+            scheduler.push_pending_start_audio_for_test(
+                DecodedAudio {
+                    samples: vec![0.25; 80],
+                    duration_nsecs: end - start,
+                },
+                start,
+                end,
+            );
+        };
+        push_frame(&mut output_scheduler, 0);
+        output_scheduler.begin_initial_av_start_transaction_for_generations(
+            TARGET,
+            TARGET,
+            generation,
+            Instant::now() - Duration::from_millis(100),
+        );
+        let vo_queue = VideoOutputQueue::default();
+        vo_queue.begin_session(session_id);
+        let frame_presented = AtomicBool::new(false);
+        let (event_tx, _event_rx) = mpsc::channel();
+        let mut position = PositionReporter::default();
+        let mut subtitles = SubtitlePipeline::empty_for_test();
+        let mut buffered = BufferedReporter::new_with_events(true, false);
+        let mut current_start = TARGET;
+        let mut playback_scheduler = PlaybackScheduler::new(TARGET);
+        let mut service = |scheduler: &mut PlaybackOutputScheduler| {
+            service_initial_video_clock_until_audio_start(
+                scheduler,
+                &output,
+                None,
+                TARGET,
+                Some(0),
+                &control,
+                session_id,
+                &vo_queue,
+                &frame_presented,
+                &mut position,
+                &event_tx,
+                &mut subtitles,
+                &mut buffered,
+                &mut current_start,
+                &mut playback_scheduler,
+            )
+            .unwrap()
+        };
+        let status = service(&mut output_scheduler);
+        if input_eof {
+            assert_eq!(status, OutputGateResumeStatus::Resumed);
+        } else {
+            assert_eq!(status, OutputGateResumeStatus::WaitingForDecodedAudio);
+            assert!(!output.stream_active());
+            assert!(!frame_presented.load(Ordering::Acquire));
+            let token = output_scheduler.initial_audio_prepare_token().unwrap();
+            assert_eq!(token.staged_frames, 1);
+            assert_eq!(token.staged_samples, 80);
+            assert_eq!(
+                output_scheduler
+                    .scheduled_video_queue
+                    .range_nsecs()
+                    .unwrap()
+                    .0,
+                TARGET
+            );
+            if eof_after_stage {
+                output_scheduler.audio_input_eof = true;
+                output_scheduler.note_output_housekeeping_change();
+                assert_eq!(
+                    retry_initial_prefill(|| service(&mut output_scheduler)),
+                    OutputGateResumeStatus::Resumed
+                );
+                assert!(output.stream_active());
+                assert!(frame_presented.load(Ordering::Acquire));
+                assert_eq!(output.audio_epoch(), epoch);
+                output_scheduler.reset(&control);
+                assert!(!output_scheduler.audio_input_eof);
+                continue;
+            }
+            for index in 1..300 {
+                push_frame(&mut output_scheduler, index);
+            }
+            let status = retry_initial_prefill(|| {
+                output_scheduler.note_output_housekeeping_change();
+                let status = service(&mut output_scheduler);
+                if status != OutputGateResumeStatus::Resumed {
+                    assert!(!output.stream_active());
+                    assert!(!frame_presented.load(Ordering::Acquire));
+                    assert_eq!(output.audio_epoch(), epoch);
+                }
+                status
+            });
+            assert_eq!(status, OutputGateResumeStatus::Resumed);
+            let snapshot = output.snapshot().unwrap();
+            assert!(snapshot.queue_pending_nsecs >= 200_000_000);
+            assert_eq!(
+                snapshot.queue_frames + output_scheduler.pending_start_audio.len(),
+                300
+            );
+            assert_eq!(snapshot.payload_range_nsecs.unwrap().0, TARGET);
+            // The native stream can call back before its worker transfers
+            // the full upstream prefill. That first small frame must survive.
+            assert!(output.transfer_next_queued_frame_for_test().unwrap());
+            let mut callback = [0.0_f32; 960];
+            output.invoke_callback_for_test(&mut callback);
+            assert!(callback.iter().all(|sample| *sample == 0.0));
+            assert_eq!(output.snapshot().unwrap().shared_payload_nsecs, 833_333);
+            assert_eq!(
+                output.activity_snapshot().unwrap().consumed_callback_count,
+                0
+            );
+            transfer_prefilled_audio(&output);
+            output.invoke_callback_for_test(&mut callback);
+            assert!(!output.underrun_active());
+            assert!(callback.iter().all(|sample| *sample == 0.25));
+        }
+        assert!(output.stream_active());
+        assert!(frame_presented.load(Ordering::Acquire));
+        assert_eq!(output.audio_epoch(), epoch);
+    }
+}
+
 const PRODUCTION_STAGE_FRAME_NSECS: u64 = 10_000_000;
 const PRODUCTION_STAGE_SAMPLES_PER_FRAME: usize = 20;
 
@@ -1717,11 +1970,6 @@ impl ProductionInitialAudioState {
         flush_until_nsecs: u64,
         observe_checkpoint: impl FnMut(AudioStageCheckpoint),
     ) -> super::super::AudioStageResult {
-        let vo_queue = VideoOutputQueue::default();
-        vo_queue.begin_session(self.session_id);
-        let frame_presented = AtomicBool::new(false);
-        let mut position_reporter = PositionReporter::default();
-        let mut subtitle_pipeline = SubtitlePipeline::empty_for_test();
         let mut buffered_reporter = BufferedReporter::new_with_events(true, false);
         stage_pending_audio_with_checkpoint(
             &mut self.scheduler.pending_start_audio,
@@ -1732,13 +1980,8 @@ impl ProductionInitialAudioState {
             AudioClockMode::AudioStarted,
             DelayedAudioStartSilencePolicy::Skip,
             &self.control,
-            &mut self.scheduler.scheduled_video_queue,
             self.session_id,
-            &vo_queue,
-            &frame_presented,
-            &mut position_reporter,
             &self.event_tx,
-            &mut subtitle_pipeline,
             &mut buffered_reporter,
             observe_checkpoint,
         )
@@ -1810,6 +2053,52 @@ impl ProductionInitialAudioState {
             ))
         );
     }
+}
+
+#[test]
+fn initial_audio_stage_backpressure_preserves_unpublished_video_anchor() {
+    let mut state = ProductionInitialAudioState::new(50, 1);
+    let video_anchor_nsecs = PRODUCTION_STAGE_TARGET_NSECS - 32_637_186;
+    state
+        .scheduler
+        .push_decoded_video_for_test(test_queued_video_frame(video_anchor_nsecs));
+    state
+        .scheduler
+        .push_decoded_video_for_test(test_queued_video_frame(
+            PRODUCTION_STAGE_TARGET_NSECS + 10_000_000,
+        ));
+    let queue_limit_nsecs = duration_nsecs(super::super::AUDIO_OUTPUT_QUEUE_LIMIT_DURATION);
+    assert!(matches!(
+        state
+            .output
+            .try_push_timed_for_epoch(
+                vec![0.25; 3_000],
+                PRODUCTION_STAGE_TARGET_NSECS,
+                PRODUCTION_STAGE_TARGET_NSECS + queue_limit_nsecs,
+                state.preparing_token.audio_epoch,
+                &state.control,
+            )
+            .unwrap(),
+        AudioOutputPushResult::Queued
+    ));
+
+    let result = state.stage(|_| {});
+
+    assert!(result.would_block);
+    assert_eq!(result.staged_frames, 0);
+    assert_eq!(state.scheduler.pending_start_audio.len(), 1);
+    assert_eq!(
+        state
+            .scheduler
+            .scheduled_video_queue
+            .range_nsecs()
+            .map(|range| range.0),
+        Some(video_anchor_nsecs),
+        "audio preparation must leave the first video frame for transaction commit"
+    );
+    assert!(!state.scheduler.first_frame_presented);
+    assert!(!state.output.stream_active());
+    assert!(!result.made_progress);
 }
 
 #[test]

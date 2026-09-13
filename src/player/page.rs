@@ -24,6 +24,7 @@ use super::{
 
 mod backend_events;
 mod controls;
+mod diagnostics;
 mod fullscreen;
 mod progress;
 mod queue;
@@ -50,8 +51,9 @@ pub use session::{PlaybackStateUpdate, PlaybackStopCompletion, PlaybackStopResul
 
 use progress::{
     ProgressBarDrag, buffered_until_after_seek, cache_range_fractions, cached_seek_target,
-    clamp_playback_position, format_playback_time, progress_fraction, progress_fraction_for_cursor,
-    should_apply_backend_position, valid_playback_duration, valid_playback_time,
+    clamp_playback_position, format_playback_time, forward_cache_fraction, progress_fraction,
+    progress_fraction_for_cursor, should_apply_backend_position, valid_playback_duration,
+    valid_playback_time,
 };
 use render::{
     AnimationFrameRequestState, aspect_fit_bounds, defer_drop_frame, normalize_video_viewport,

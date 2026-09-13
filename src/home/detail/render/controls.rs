@@ -421,6 +421,7 @@ impl HomeContent {
         &self,
         detail: &SeriesDetailState,
         seasons: &MediaItems,
+        window: &Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let selected_season = detail.selected_season();
@@ -429,8 +430,10 @@ impl HomeContent {
             .map(|season| season.name.clone())
             .unwrap_or_else(|| "请选择".to_string());
         let season_count = seasons.items.len();
-        let select_width =
-            season_select_width(seasons.items.iter().map(|season| season.name.as_str()));
+        let select_width = season_select_width(
+            seasons.items.iter().map(|season| season.name.as_str()),
+            window,
+        );
         let menu_open =
             detail.open_select == Some(SeriesDetailSelectKind::Season) && season_count > 0;
         let toggle = cx.listener(Self::toggle_series_season_select);
@@ -469,6 +472,7 @@ impl HomeContent {
                                 ),
                                 cx,
                             )
+                            .px(px(4.0))
                             .text_center()
                             .on_click(on_click)
                         }),

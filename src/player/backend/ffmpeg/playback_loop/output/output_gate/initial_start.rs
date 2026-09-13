@@ -211,6 +211,25 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn initial_au
     .covers_target()
 }
 
+fn initial_audio_prefill_ready(
+    snapshot: AudioOutputSnapshot,
+    target_nsecs: u64,
+    input_eof: bool,
+) -> bool {
+    let payload_nsecs = snapshot
+        .shared_payload_nsecs
+        .saturating_add(snapshot.queue_pending_nsecs)
+        .saturating_add(snapshot.worker_in_flight_nsecs);
+    snapshot.payload_range_nsecs.is_some_and(|(start, end)| {
+        start <= target_nsecs
+            && end > target_nsecs
+            && payload_nsecs > 0
+            && (input_eof
+                || payload_nsecs.min(end - target_nsecs)
+                    >= duration_nsecs(INITIAL_AUDIO_START_MIN_AMMUNITION))
+    })
+}
+
 #[cfg(test)]
 pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn initial_audio_clock_reset_required(
     ammunition: InitialAudioAmmunitionSnapshot,
@@ -811,7 +830,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn abort_init
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_initial_video_clock_until_audio_start(
+pub(in crate::player::backend::ffmpeg::playback_loop) fn service_initial_video_clock_until_audio_start(
     output_scheduler: &mut PlaybackOutputScheduler,
     output: &AudioOutput,
     demux_cache: Option<&DemuxPacketCache>,
@@ -1141,7 +1160,21 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
         );
         return Ok(OutputGateResumeStatus::Rebuffering);
     }
-    let start_action = initial_audio_start_action(transaction_decision, ammunition);
+    let start_action = if output_scheduler.audio_input_eof
+        && transaction_decision == InitialAvStartDecision::Commit
+        && ammunition
+            .pending_audio_nsecs
+            .saturating_add(ammunition.device_audio_nsecs)
+            > 0
+    {
+        if ammunition.covers_target() {
+            InitialAudioStartAction::CommitCovered
+        } else {
+            InitialAudioStartAction::CommitDegraded
+        }
+    } else {
+        initial_audio_start_action(transaction_decision, ammunition)
+    };
     let degraded_commit = match start_action {
         InitialAudioStartAction::FailNoAmmunition => {
             tracing::warn!(
@@ -1231,7 +1264,12 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
         return Ok(OutputGateResumeStatus::Rebuffering);
     }
 
-    if ownership == PrestartAudioOwnership::PreparedCurrentEpoch {
+    let prefill_ready = initial_audio_prefill_ready(
+        audio_snapshot,
+        transaction.audio_start_target_nsecs,
+        output_scheduler.audio_input_eof,
+    );
+    if ownership == PrestartAudioOwnership::PreparedCurrentEpoch && prefill_ready {
         let Some(token) = transaction.audio_prepare_token else {
             return Ok(OutputGateResumeStatus::Waiting);
         };
@@ -1286,6 +1324,17 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
                 return Ok(OutputGateResumeStatus::Rebuffering);
             }
         }
+        if control.is_cache_paused()
+            && let Some(demux_cache) = demux_cache
+        {
+            demux_cache.clear_cache_pause_for_decoded_resume();
+        }
+        if !stage_guard.scheduler().audio_input_eof {
+            output.hold_for_initial_prefill(
+                token.target_nsecs,
+                duration_nsecs(INITIAL_AUDIO_START_MIN_AMMUNITION),
+            );
+        }
         if !stage_guard.commit(control) {
             stage_guard.abort("prepared_audio_commit_interrupted");
             return Ok(OutputGateResumeStatus::Waiting);
@@ -1294,10 +1343,19 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
             session_id = ?session_id,
             transaction_id = transaction.transaction_id,
             presented_video_frames,
+            prepared_range = ?token.staged_range_nsecs,
+            prefill_ms = audio_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
             "atomically published initial video and activated prepared audio"
         );
         drop(stage_guard);
         return Ok(OutputGateResumeStatus::Resumed);
+    }
+
+    if ownership == PrestartAudioOwnership::PreparedCurrentEpoch
+        && output_scheduler.pending_start_audio.is_empty()
+    {
+        output_scheduler.wait_initial_audio_start_for_state_change(transaction.transaction_id);
+        return Ok(OutputGateResumeStatus::WaitingForDecodedAudio);
     }
 
     if control.should_interrupt() {
@@ -1322,22 +1380,26 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
     }
 
     let audio_epoch = output.audio_epoch();
-    if !output_scheduler.begin_initial_audio_prepare(transaction.transaction_id, audio_epoch) {
-        return Ok(OutputGateResumeStatus::Waiting);
-    }
-    let preparing_token = InitialAudioPrepareToken {
-        transaction_id: transaction.transaction_id,
-        discontinuity_epoch: transaction.discontinuity_epoch,
-        seek_generation: transaction.seek_generation,
-        audio_epoch,
-        target_nsecs: transaction.audio_start_target_nsecs,
-        staged_range_nsecs: (
-            transaction.audio_start_target_nsecs,
-            transaction.audio_start_target_nsecs,
-        ),
-        staged_frames: 0,
-        staged_samples: 0,
-        staged_until_nsecs: transaction.audio_start_target_nsecs,
+    let preparing_token = if let Some(token) = transaction.audio_prepare_token {
+        token
+    } else {
+        if !output_scheduler.begin_initial_audio_prepare(transaction.transaction_id, audio_epoch) {
+            return Ok(OutputGateResumeStatus::Waiting);
+        }
+        InitialAudioPrepareToken {
+            transaction_id: transaction.transaction_id,
+            discontinuity_epoch: transaction.discontinuity_epoch,
+            seek_generation: transaction.seek_generation,
+            audio_epoch,
+            target_nsecs: transaction.audio_start_target_nsecs,
+            staged_range_nsecs: (
+                transaction.audio_start_target_nsecs,
+                transaction.audio_start_target_nsecs,
+            ),
+            staged_frames: 0,
+            staged_samples: 0,
+            staged_until_nsecs: transaction.audio_start_target_nsecs,
+        }
     };
     let mut stage_guard = InitialAudioStageGuard::new(
         output_scheduler,
@@ -1347,7 +1409,10 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
         event_tx,
     );
 
-    let audio_flush_start_timeline_nsecs = retention_plan.anchor_timeline_nsecs;
+    // A bounded staging pass may contain only a few TrueHD sub-millisecond
+    // frames. Retain that ownership and append on the next pass; a successful
+    // enqueue alone must never publish video or start AO (mpv's AO prefill).
+    let audio_flush_start_timeline_nsecs = preparing_token.staged_until_nsecs;
     let audio_flush_until_timeline_nsecs = stage_guard
         .scheduler()
         .scheduled_video_queue
@@ -1366,7 +1431,12 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
                     .buffered_until_from(delayed_start_nsecs)
             })
         })
-        .unwrap_or(audio_flush_start_timeline_nsecs);
+        .unwrap_or(audio_flush_start_timeline_nsecs)
+        .max(
+            transaction
+                .audio_start_target_nsecs
+                .saturating_add(duration_nsecs(INITIAL_AUDIO_START_MIN_AMMUNITION)),
+        );
     let stage_attempt = {
         let _stage = output.begin_service_stage(AudioOutputServiceStage::StagePending);
         let scheduler = stage_guard.scheduler_mut();
@@ -1379,13 +1449,8 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
             AudioClockMode::AudioStarted,
             delayed_start_silence_policy,
             control,
-            &mut scheduler.scheduled_video_queue,
             session_id,
-            vo_queue,
-            frame_presented,
-            position_reporter,
             event_tx,
-            subtitle_pipeline,
             buffered_reporter,
         )
     };
@@ -1445,9 +1510,20 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
     };
     let token = InitialAudioPrepareToken {
         staged_until_nsecs: staged_range_nsecs.1,
-        staged_range_nsecs,
-        staged_frames: stage_result.staged_frames,
-        staged_samples: stage_result.staged_samples,
+        staged_range_nsecs: (
+            if preparing_token.staged_frames > 0 {
+                preparing_token.staged_range_nsecs.0
+            } else {
+                staged_range_nsecs.0
+            },
+            staged_range_nsecs.1,
+        ),
+        staged_frames: preparing_token
+            .staged_frames
+            .saturating_add(stage_result.staged_frames),
+        staged_samples: preparing_token
+            .staged_samples
+            .saturating_add(stage_result.staged_samples),
         ..preparing_token
     };
     stage_guard.set_token(token);
@@ -1533,6 +1609,30 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
         );
         return Ok(OutputGateResumeStatus::Rebuffering);
     }
+    if !initial_audio_prefill_ready(
+        started_audio_snapshot,
+        transaction.audio_start_target_nsecs,
+        stage_guard.scheduler().audio_input_eof,
+    ) {
+        let pending_empty = stage_guard.scheduler().pending_start_audio.is_empty();
+        tracing::debug!(
+            session_id = ?session_id,
+            transaction_id = token.transaction_id,
+            prepared_range = ?token.staged_range_nsecs,
+            staged_frames = token.staged_frames,
+            prefill_ms = started_audio_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
+            target_ms = INITIAL_AUDIO_START_MIN_AMMUNITION.as_secs_f64() * 1000.0,
+            "retained prepared audio until initial output prefill completes"
+        );
+        stage_guard.preserve_for_retry(InitialAudioTransientRetry::AudioPrefillIncomplete);
+        if pending_empty {
+            stage_guard
+                .scheduler_mut()
+                .wait_initial_audio_start_for_state_change(transaction.transaction_id);
+            return Ok(OutputGateResumeStatus::WaitingForDecodedAudio);
+        }
+        return Ok(OutputGateResumeStatus::Waiting);
+    }
     match publish_initial_video_for_audio_commit(
         stage_guard.scheduler_mut(),
         transaction,
@@ -1574,6 +1674,12 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) fn service_in
         && let Some(demux_cache) = demux_cache
     {
         demux_cache.clear_cache_pause_for_decoded_resume();
+    }
+    if !stage_guard.scheduler().audio_input_eof {
+        output.hold_for_initial_prefill(
+            token.target_nsecs,
+            duration_nsecs(INITIAL_AUDIO_START_MIN_AMMUNITION),
+        );
     }
     if !stage_guard.commit(control) {
         return Ok(OutputGateResumeStatus::Waiting);

@@ -33,6 +33,13 @@ pub(super) struct PlaybackEofDrainContext<'a> {
 pub(super) fn service_playback_eof_drain(
     mut context: PlaybackEofDrainContext<'_>,
 ) -> std::result::Result<PlaybackEofDrainStatus, String> {
+    // No more compressed input can arrive. Like mpv's EOF exception to AO
+    // prefill, allow a short final payload to start without a full waterline.
+    context.pipeline.output_scheduler.audio_input_eof = true;
+    context
+        .pipeline
+        .output_scheduler
+        .note_output_housekeeping_change();
     if let Some(status) = decoder_drain_status_to_eof(with_decoder_drain_context(
         &mut context,
         |service, context| service.drain_decode_pipelines_until_idle(context),

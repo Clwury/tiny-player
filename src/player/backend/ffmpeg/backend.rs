@@ -200,15 +200,6 @@ impl FfmpegBackend {
         position_seconds: f64,
         seek_mode: PlaybackSeekMode,
     ) -> Result<()> {
-        self.seek_with_rate(position_seconds, seek_mode, None)
-    }
-
-    fn seek_with_rate(
-        &mut self,
-        position_seconds: f64,
-        seek_mode: PlaybackSeekMode,
-        rate: Option<f64>,
-    ) -> Result<()> {
         if self.worker.is_none() {
             return Err(BackendError::Ffmpeg(
                 "FFmpeg 尚未加载可跳转的媒体".to_string(),
@@ -229,11 +220,7 @@ impl FfmpegBackend {
             .worker
             .as_ref()
             .expect("worker exists after early return");
-        if let Some(rate) = rate {
-            worker.set_playback_rate(rate, position_seconds, session_id)?;
-        } else {
-            worker.seek(position_seconds, seek_mode, session_id)?;
-        }
+        worker.seek(position_seconds, seek_mode, session_id)?;
         let _ = self.event_tx.send(BackendEvent::new(
             session_id,
             BackendEventKind::PositionChanged(position_seconds),
@@ -288,14 +275,8 @@ impl FfmpegBackend {
         if (rate - self.playback_rate).abs() < f64::EPSILON {
             return Ok(());
         }
-        if self.worker.is_some() {
-            // Flush already-decoded samples at the current media position so
-            // every output epoch has one rate, including paused playback.
-            self.seek_with_rate(
-                self.position_seconds.unwrap_or(0.0),
-                PlaybackSeekMode::Precise,
-                Some(rate),
-            )?;
+        if let Some(worker) = self.worker.as_ref() {
+            worker.set_playback_rate(rate)?;
         }
         self.playback_rate = rate;
         Ok(())

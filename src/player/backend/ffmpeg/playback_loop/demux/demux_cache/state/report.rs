@@ -815,7 +815,7 @@ impl DemuxPacketCacheState {
         let appended_closes_seek_block = self.packets.get(&packet_id).is_some_and(|packet| {
             packet.timeline_anchor
                 && packet.seek_timestamp_nsecs.is_some()
-                && Self::packet_is_cached_seek_anchor(packet)
+                && packet.is_cached_seek_anchor()
         });
         if !appended_closes_seek_block {
             return;
@@ -827,7 +827,7 @@ impl DemuxPacketCacheState {
         };
         let closing_anchor = self.packets.get(&packet_id).map(|packet| {
             (
-                packet.recovery_kind,
+                packet.cached_seek_anchor_kind(),
                 packet.seek_timestamp_nsecs,
                 packet.safe_seek_point,
             )
@@ -977,7 +977,7 @@ impl DemuxPacketCacheState {
                 continue;
             };
             let block_timestamp_nsecs = packet.seek_block_timestamp_nsecs().unwrap_or(start_nsecs);
-            let is_recovery = Self::packet_is_cached_seek_anchor(packet);
+            let is_recovery = packet.is_cached_seek_anchor();
 
             if recovery_start_nsecs.is_none() {
                 block_min_nsecs = Some(block_min_nsecs.unwrap_or(start_nsecs).min(start_nsecs));
@@ -989,7 +989,7 @@ impl DemuxPacketCacheState {
                 if is_recovery {
                     recovery_start_nsecs = Some(start_nsecs);
                     recovery_packet_id = Some(candidate_id);
-                    recovery_kind = packet.recovery_kind;
+                    recovery_kind = packet.cached_seek_anchor_kind();
                 }
             } else if is_recovery {
                 previous_recovery_start_nsecs = Some(start_nsecs);

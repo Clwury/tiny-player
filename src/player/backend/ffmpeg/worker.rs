@@ -525,11 +525,7 @@ pub(super) enum FfmpegCommand {
         config: PlaybackCacheConfig,
     },
     SetPlaybackRate {
-        session_id: PlaybackSessionId,
         rate: f64,
-        position_seconds: f64,
-        generation: u64,
-        queued_at: Instant,
     },
 }
 
@@ -577,6 +573,21 @@ pub(super) struct DrainedFfmpegCommands {
 }
 
 impl FfmpegWorker {
+    #[cfg(test)]
+    pub(super) fn command_queue_for_test(
+        control: Arc<FfmpegControl>,
+    ) -> (Self, Receiver<FfmpegCommand>) {
+        let (command_tx, command_rx) = mpsc::channel();
+        (
+            Self {
+                control,
+                command_tx,
+                handle: thread::spawn(|| {}),
+            },
+            command_rx,
+        )
+    }
+
     pub(super) fn spawn(
         input: FfmpegPlaybackInput,
         video_output_queue: VideoOutputQueue,
@@ -696,30 +707,22 @@ impl FfmpegWorker {
         Ok(())
     }
 
-    pub(super) fn set_playback_rate(
-        &self,
-        rate: f64,
-        position_seconds: f64,
-        session_id: PlaybackSessionId,
-    ) -> Result<()> {
-        let generation = self.control.request_seek();
-        self.control.set_cache_paused(false);
-        send_playback_command(
+    pub(super) fn set_playback_rate(&self, rate: f64) -> Result<()> {
+        // AO also needs the request while the coordinator is draining EOF or
+        // waiting on user pause. Publish before the command's wake-up.
+        let previous_rate = self.control.playback_rate();
+        self.control.set_playback_rate(rate);
+        if send_playback_command(
             &self.command_tx,
             &self.control,
-            FfmpegCommand::SetPlaybackRate {
-                session_id,
-                rate,
-                position_seconds,
-                generation,
-                queued_at: Instant::now(),
-            },
+            FfmpegCommand::SetPlaybackRate { rate },
         )
-        .map_err(|_| {
-            self.control.finish_seek(generation);
-            self.control.finish_seek_audio_pause();
-            BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string())
-        })
+        .is_err()
+        {
+            self.control.set_playback_rate(previous_rate);
+            return Err(BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string()));
+        }
+        Ok(())
     }
 
     pub(super) fn set_paused(&self, paused: bool, session_id: PlaybackSessionId) -> Result<()> {
@@ -928,22 +931,8 @@ fn apply_playback_command(
             control.set_session_id(session_id);
             drained.cache_config = Some(config.normalized());
         }
-        FfmpegCommand::SetPlaybackRate {
-            session_id,
-            rate,
-            position_seconds,
-            generation,
-            queued_at,
-        } => {
+        FfmpegCommand::SetPlaybackRate { rate } => {
             drained.playback_rate = Some(crate::player::rate::clamp_playback_rate(rate));
-            drained.pending_track_selection = None;
-            drained.pending_seek = Some(PendingSeek {
-                session_id,
-                position_seconds,
-                mode: PlaybackSeekMode::Precise,
-                generation,
-                queued_at,
-            });
         }
     }
 }

@@ -312,7 +312,7 @@ impl DemuxPacketCacheState {
                     .flat_map(|queue| queue.iter().rev().copied())
                     .find_map(|packet_id| {
                         let packet = self.packets.get(&packet_id)?;
-                        (packet.timeline_anchor && packet.recovery_point)
+                        (packet.timeline_anchor && packet.is_cached_seek_anchor())
                             .then_some((packet_id, packet))
                     })
             });
@@ -327,7 +327,7 @@ impl DemuxPacketCacheState {
                     stream_index = self.timeline_anchor_stream_index,
                     closure_reason = "EOF",
                     anchor_packet_id,
-                    anchor_kind = anchor.recovery_kind.as_str(),
+                    anchor_kind = anchor.cached_seek_anchor_kind().as_str(),
                     anchor_nsecs = ?anchor.seek_timestamp_nsecs,
                     preroll_nsecs = self.cached_seek_preroll_nsecs,
                     seek_start_nsecs = ?boundary.and_then(|boundary| boundary.seek_start_nsecs),
