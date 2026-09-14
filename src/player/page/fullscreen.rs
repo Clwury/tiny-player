@@ -3,17 +3,19 @@ use super::*;
 pub(super) const PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX: f32 = 24.0;
 pub(super) const PLAYBACK_PROGRESS_BAR_HEIGHT_PX: f32 = 108.0;
 pub(super) const PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION: f32 = 0.4;
+const PLAYBACK_PROGRESS_BAR_MIN_WIDTH_PX: f32 = 480.0;
 pub(super) const PLAYBACK_BACK_BUTTON_OFFSET_PX: f32 = 16.0;
 pub(super) const PLAYBACK_BACK_BUTTON_SIZE_PX: f32 = 32.0;
-const FULLSCREEN_CONTROLS_HIDE_DELAY: Duration = Duration::from_millis(500);
+const FULLSCREEN_CONTROLS_HIDE_DELAY: Duration = Duration::from_secs(1);
 const FULLSCREEN_CONTROLS_HOT_ZONE_FRACTION: f32 = 0.5;
 
 impl PlaybackPage {
     pub(super) fn progress_bar_visible(&self) -> bool {
-        playback_progress_bar_visible(
-            self.timeline.duration.is_some(),
-            self.fullscreen.controls_visible,
-        )
+        !self.episode_list.open
+            && playback_progress_bar_visible(
+                self.timeline.duration.is_some(),
+                self.fullscreen.controls_visible,
+            )
     }
 
     pub(super) fn reset_fullscreen_controls(&mut self) {
@@ -24,6 +26,7 @@ impl PlaybackPage {
         self.timeline.progress_hover_cursor = None;
         self.fullscreen.hide_generation = self.fullscreen.hide_generation.wrapping_add(1);
         self.tracks.open = None;
+        self.episode_list.open = false;
     }
 
     pub(super) fn schedule_fullscreen_controls_hide(&mut self, cx: &mut Context<Self>) {
@@ -47,13 +50,15 @@ impl PlaybackPage {
         generation: u64,
         cx: &mut Context<Self>,
     ) {
-        if !playback_controls_should_hide(
-            self.fullscreen.hide_generation,
-            generation,
-            self.fullscreen.mouse_in_controls,
-            self.fullscreen.mouse_in_back_button,
-            self.timeline.progress_drag_position.is_some(),
-        ) {
+        if self.episode_list.open
+            || !playback_controls_should_hide(
+                self.fullscreen.hide_generation,
+                generation,
+                self.fullscreen.mouse_in_controls,
+                self.fullscreen.mouse_in_back_button,
+                self.timeline.progress_drag_position.is_some(),
+            )
+        {
             return;
         }
 
@@ -202,17 +207,16 @@ pub(super) fn playback_back_button_bounds(viewport_bounds: Bounds<Pixels>) -> Bo
 }
 
 pub(super) fn playback_progress_bar_bounds(viewport_bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    let width = (viewport_bounds.size.width * PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION)
+        .max(px(PLAYBACK_PROGRESS_BAR_MIN_WIDTH_PX))
+        .min((viewport_bounds.size.width - px(32.0)).max(px(0.0)));
     Bounds::new(
         gpui::point(
-            viewport_bounds.origin.x
-                + viewport_bounds.size.width * (1.0 - PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION) / 2.0,
+            viewport_bounds.origin.x + (viewport_bounds.size.width - width) / 2.0,
             viewport_bounds.origin.y + viewport_bounds.size.height
                 - px(PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX + PLAYBACK_PROGRESS_BAR_HEIGHT_PX),
         ),
-        gpui::size(
-            viewport_bounds.size.width * PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION,
-            px(PLAYBACK_PROGRESS_BAR_HEIGHT_PX),
-        ),
+        gpui::size(width, px(PLAYBACK_PROGRESS_BAR_HEIGHT_PX)),
     )
 }
 
@@ -278,7 +282,7 @@ mod tests {
 
         assert_eq!(
             playback_progress_bar_bounds(viewport),
-            Bounds::new(point(px(300.0), px(868.0)), size(px(400.0), px(108.0)))
+            Bounds::new(point(px(260.0), px(868.0)), size(px(480.0), px(108.0)))
         );
         assert!(playback_controls_contains(
             point(px(500.0), px(900.0)),

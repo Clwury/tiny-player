@@ -6,6 +6,9 @@ pub const EMBY_TICKS_PER_SECOND: u64 = 10_000_000;
 pub struct PlaybackQueueItem {
     pub item_id: String,
     pub title: SharedString,
+    pub episode_label: SharedString,
+    pub overview: Option<String>,
+    pub primary_image_tag: Option<String>,
     pub series_id: Option<String>,
     pub season_id: Option<String>,
     pub run_time_ticks: Option<u64>,
@@ -551,6 +554,9 @@ mod tests {
         PlaybackQueueItem {
             item_id: item_id.to_string(),
             title: item_id.to_string().into(),
+            episode_label: item_id.to_string().into(),
+            overview: None,
+            primary_image_tag: None,
             series_id: Some("series-1".to_string()),
             season_id: Some("season-1".to_string()),
             run_time_ticks: None,

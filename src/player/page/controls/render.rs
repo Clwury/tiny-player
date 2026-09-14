@@ -18,6 +18,7 @@ impl PlaybackPage {
 
         div()
             .id(id)
+            .debug_selector(move || id.to_string())
             .flex()
             .size(button_size)
             .items_center()
@@ -380,6 +381,7 @@ impl PlaybackPage {
                     cx,
                 ))
             })
+            .child(self.render_episode_list_button(cx))
             .child(self.render_track_control_button(
                 PlaybackTrackKind::Audio,
                 "playback-audio-button",
@@ -577,12 +579,18 @@ impl PlaybackPage {
             )
     }
 
-    pub(in super::super) fn render_progress_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+    pub(in super::super) fn render_progress_bar(
+        &self,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let Some(duration) = self.timeline.duration else {
             return div().id("playback-progress-empty").into_any_element();
         };
 
         let theme = theme::media_overlay(cx);
+        let bounds =
+            fullscreen::playback_progress_bar_bounds(fullscreen::window_viewport_bounds(window));
         let position = self
             .timeline
             .progress_drag_position
@@ -622,12 +630,13 @@ impl PlaybackPage {
 
         div()
             .id("playback-progress")
+            .debug_selector(|| "playback-progress".into())
             .absolute()
-            .left(relative((1.0 - PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION) / 2.0))
+            .left(bounds.left())
             .bottom(px(PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX))
             .flex()
             .flex_col()
-            .w(relative(PLAYBACK_PROGRESS_BAR_WIDTH_FRACTION))
+            .w(bounds.size.width)
             .h(px(PLAYBACK_PROGRESS_BAR_HEIGHT_PX))
             .justify_center()
             .gap_2()

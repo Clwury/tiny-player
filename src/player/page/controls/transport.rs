@@ -9,6 +9,7 @@ impl PlaybackPage {
     ) {
         cx.stop_propagation();
         self.close_track_select(cx);
+        self.close_episode_list(cx);
         self.toggle_playback_pause_command(cx);
     }
 
@@ -28,6 +29,7 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         self.close_track_select(cx);
+        self.close_episode_list(cx);
         cx.stop_propagation();
     }
 
@@ -42,6 +44,7 @@ impl PlaybackPage {
             return;
         }
         self.tracks.open = None;
+        self.close_episode_list(cx);
         self.timeline.cache_status_open = !self.timeline.cache_status_open;
         cx.notify();
     }

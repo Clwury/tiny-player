@@ -30,6 +30,10 @@ impl PlaybackPage {
         let Some(shortcut) = playback_shortcut_for_event(event) else {
             return;
         };
+        if shortcut == PlaybackShortcut::ExitFullscreen && self.close_episode_list(cx) {
+            cx.stop_propagation();
+            return;
+        }
         if shortcut == PlaybackShortcut::ExitFullscreen && !window.is_fullscreen() {
             return;
         }
@@ -58,18 +62,10 @@ impl PlaybackPage {
                 cx.notify();
             }
             PlaybackShortcut::RaiseSubtitle => {
-                self.adjust_subtitle_vertical_offset_fraction(
-                    subtitle_vertical_adjust_step(),
-                    window,
-                    cx,
-                );
+                self.adjust_subtitle_vertical_offset_fraction(subtitle_vertical_adjust_step(), cx);
             }
             PlaybackShortcut::LowerSubtitle => {
-                self.adjust_subtitle_vertical_offset_fraction(
-                    -subtitle_vertical_adjust_step(),
-                    window,
-                    cx,
-                );
+                self.adjust_subtitle_vertical_offset_fraction(-subtitle_vertical_adjust_step(), cx);
             }
             PlaybackShortcut::DecreaseVolume => {
                 self.adjust_playback_volume(-PLAYBACK_VOLUME_STEP, cx);

@@ -213,6 +213,9 @@ fn playback_queue_item(
     PlaybackQueueItem {
         item_id: item.id.clone(),
         title,
+        episode_label: item.episode_label().into(),
+        overview: item.overview.clone(),
+        primary_image_tag: item.primary_image_tag().map(str::to_string),
         series_id,
         season_id,
         run_time_ticks: item.run_time_ticks,
@@ -320,6 +323,10 @@ mod tests {
                     {
                         "Id": "episode-1",
                         "Name": "First",
+                        "ParentIndexNumber": 1,
+                        "IndexNumber": 1,
+                        "Overview": "First episode overview",
+                        "ImageTags": {"Primary": "first-cover"},
                         "Type": "Episode",
                         "SeasonId": "season-1",
                         "MediaSources": [{ "Id": "source-1" }]
@@ -357,6 +364,10 @@ mod tests {
         );
         assert_eq!(queue.current_index, 1);
         assert_eq!(queue.next_index(), None);
+        let current = queue.current().unwrap();
+        assert_eq!(current.episode_label.as_ref(), "S1E1: First");
+        assert_eq!(current.overview.as_deref(), Some("First episode overview"));
+        assert_eq!(current.primary_image_tag.as_deref(), Some("first-cover"));
     }
 
     #[test]

@@ -25,6 +25,7 @@ use super::{
 mod backend_events;
 mod controls;
 mod diagnostics;
+mod episodes;
 mod fullscreen;
 mod progress;
 mod queue;
@@ -100,6 +101,7 @@ pub struct PlaybackPage {
     playback_info: Option<PlaybackVideoInfo>,
     playback_audio_info: Option<PlaybackAudioInfo>,
     queue: PlaybackQueue,
+    episode_list: episodes::PlaybackEpisodeListState,
     emby: EmbyPlaybackContext,
     reporting: session::PlaybackReportingState,
     queue_switch: queue::PlaybackQueueSwitchState,
@@ -205,6 +207,7 @@ impl PlaybackPage {
             playback_info: None,
             playback_audio_info: None,
             queue: request.queue,
+            episode_list: episodes::PlaybackEpisodeListState::default(),
             emby: request.emby,
             reporting,
             queue_switch: queue::PlaybackQueueSwitchState::default(),
@@ -452,7 +455,10 @@ impl Render for PlaybackPage {
             },
         )
         .absolute()
-        .size_full();
+        .top_0()
+        .right_0()
+        .bottom_0()
+        .left_0();
         let has_viewport = self
             .frame
             .viewport_bounds
@@ -500,7 +506,7 @@ impl Render for PlaybackPage {
             .when(self.playback_details_visible, |this| {
                 this.child(self.render_playback_details_overlay(window, cx))
             })
-            .child(self.render_subtitle_overlay(progress_bar_visible))
+            .child(self.render_subtitle_overlay())
             .when(self.volume.indicator_visible, |this| {
                 this.child(self.render_volume_indicator(cx))
             })
@@ -508,8 +514,11 @@ impl Render for PlaybackPage {
                 this.child(self.render_playback_rate_indicator(cx))
             })
             .child(self.render_queue_switch_error(cx))
+            .when(self.episode_list.open, |this| {
+                this.child(self.render_episode_list_backdrop(cx))
+            })
             .when(progress_bar_visible, |this| {
-                this.child(self.render_progress_bar(cx))
+                this.child(self.render_progress_bar(window, cx))
                     .child(self.render_download_speed(cx))
             })
             .when(
@@ -519,5 +528,8 @@ impl Render for PlaybackPage {
                 ),
                 |this| this.child(self.render_back_button(cx)),
             )
+            .when(self.episode_list.open, |this| {
+                this.child(deferred(self.render_episode_list(window, cx)).with_priority(2))
+            })
     }
 }

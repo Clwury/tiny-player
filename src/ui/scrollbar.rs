@@ -2,8 +2,9 @@ use std::{cell::Cell, ops::Deref, panic::Location, rc::Rc};
 
 use gpui::{
     App, Bounds, ContentMask, CursorStyle, Element, ElementId, GlobalElementId, Hitbox,
-    HitboxBehavior, InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Position, ScrollHandle, Style, Window, fill, point, px, relative, size,
+    HitboxBehavior, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Position, ScrollHandle, Style, Window, fill, point, px,
+    relative, size,
 };
 
 use crate::theme;
@@ -157,6 +158,9 @@ impl Element for Scrollbar {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style {
             position: Position::Absolute,
+            // Absolute elements without insets follow their static flow position,
+            // which can place the track below a preceding full-height list.
+            inset: gpui::Edges::all(px(0.0).into()),
             ..Style::default()
         };
         style.size.width = relative(1.0).into();
@@ -206,7 +210,7 @@ impl Element for Scrollbar {
             size(SCROLLBAR_WIDTH, px(metrics.thumb_height)),
         );
         let hitbox = window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            window.insert_hitbox(track_bounds, HitboxBehavior::Normal)
+            window.insert_hitbox(track_bounds, HitboxBehavior::BlockMouseExceptScroll)
         });
 
         ScrollbarPrepaintState {
@@ -243,6 +247,11 @@ impl Element for Scrollbar {
             theme.scrollbar_thumb
         };
 
+        if state_value.dragging {
+            // Hitbox IDs change when the video page redraws. Keep pointer
+            // capture attached to this frame's scrollbar throughout the drag.
+            window.capture_pointer(hitbox.id);
+        }
         window.set_cursor_style(
             if state_value.dragging {
                 CursorStyle::ClosedHand
@@ -265,18 +274,22 @@ impl Element for Scrollbar {
         let scroll_handle = self.scroll_handle.clone();
         window.on_mouse_event({
             let state = state.clone();
-            move |event: &MouseDownEvent, phase, _, cx| {
-                if !phase.bubble() || !track_bounds.contains(&event.position) {
+            let hitbox = hitbox.clone();
+            move |event: &MouseDownEvent, phase, window, cx| {
+                if !phase.bubble()
+                    || event.button != MouseButton::Left
+                    || !hitbox.is_hovered(window)
+                {
                     return;
                 }
                 cx.stop_propagation();
 
+                let mut next = state.get();
+                next.dragging = true;
                 if thumb_bounds.contains(&event.position) {
-                    let mut next = state.get();
-                    next.dragging = true;
                     next.drag_offset_y = event.position.y - thumb_bounds.top();
-                    state.set(next);
                 } else {
+                    next.drag_offset_y = px(metrics.thumb_height / 2.0);
                     let thumb_range =
                         (f32::from(track_bounds.size.height) - metrics.thumb_height).max(0.0);
                     if thumb_range > 0.0 {
@@ -289,20 +302,37 @@ impl Element for Scrollbar {
                             .set_offset(point(offset.x, px(-(metrics.max_offset * percentage))));
                     }
                 }
+                state.set(next);
+                window.capture_pointer(hitbox.id);
                 cx.notify(view_id);
+                window.refresh();
             }
         });
 
         let scroll_handle = self.scroll_handle.clone();
         window.on_mouse_event({
             let state = state.clone();
-            move |event: &MouseMoveEvent, _, _, cx| {
+            let hitbox = hitbox.clone();
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                // Handle a captured drag before the playback surface can start
+                // moving the window, including when the pointer leaves the track.
+                if !phase.capture() {
+                    return;
+                }
                 let mut next = state.get();
-                let hovered_thumb = thumb_bounds.contains(&event.position);
+                let hovered_thumb =
+                    hitbox.is_hovered(window) && thumb_bounds.contains(&event.position);
                 let mut changed = next.hovered_thumb != hovered_thumb;
                 next.hovered_thumb = hovered_thumb;
 
-                if next.dragging && event.dragging() {
+                if next.dragging && !event.dragging() {
+                    // A release outside the window may not deliver MouseUp.
+                    next.dragging = false;
+                    if window.captured_hitbox() == Some(hitbox.id) {
+                        window.release_pointer();
+                    }
+                    changed = true;
+                } else if next.dragging {
                     cx.stop_propagation();
                     let thumb_range =
                         (f32::from(track_bounds.size.height) - metrics.thumb_height).max(0.0);
@@ -312,7 +342,7 @@ impl Element for Scrollbar {
                                 .clamp(0.0, thumb_range);
                         let target = metrics.max_offset * (thumb_top / thumb_range);
                         let offset = scroll_handle.offset();
-                        if (f32::from(offset.y) + target).abs() >= 1.0 {
+                        if offset.y != px(-target) {
                             scroll_handle.set_offset(point(offset.x, px(-target)));
                             changed = true;
                         }
@@ -322,20 +352,27 @@ impl Element for Scrollbar {
                 state.set(next);
                 if changed {
                     cx.notify(view_id);
+                    window.refresh();
                 }
             }
         });
 
         window.on_mouse_event({
             let state = state.clone();
-            move |_: &MouseUpEvent, phase, _, cx| {
-                if !phase.bubble() || !state.get().dragging {
+            let hitbox = hitbox.clone();
+            move |event: &MouseUpEvent, phase, window, cx| {
+                if !phase.capture() || event.button != MouseButton::Left || !state.get().dragging {
                     return;
                 }
+                cx.stop_propagation();
                 let mut next = state.get();
                 next.dragging = false;
                 state.set(next);
+                if window.captured_hitbox() == Some(hitbox.id) {
+                    window.release_pointer();
+                }
                 cx.notify(view_id);
+                window.refresh();
             }
         });
     }

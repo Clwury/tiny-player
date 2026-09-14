@@ -54,16 +54,42 @@ impl gpui::Element for VideoFrameElement {
         _request_layout: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
         window: &mut Window,
-        _cx: &mut gpui::App,
+        cx: &mut gpui::App,
     ) {
         let Some(fitted_bounds) = aspect_fit_bounds(bounds, self.source_size) else {
             return;
         };
 
+        let mut corner_radii = gpui::Corners::default();
+        if !window.is_maximized() && !window.is_fullscreen() {
+            // GPUI's parent overflow mask is rectangular, so the video sprite
+            // must also respect the playback viewport's bottom corners.
+            let radius = theme::get(cx)
+                .radius_lg
+                .min(bounds.size.width / 2.0)
+                .min(bounds.size.height / 2.0)
+                .max(px(0.0));
+            // Match paint_image's device-pixel edge snapping, including during
+            // fractional-scale resizing. Aspect-fit leaves a gap on one axis;
+            // subtracting that gap keeps the sprite inside the window's arc
+            // and leaves video corners square when black bars cover the arc.
+            let bottom_inset = (window.pixel_snap(bounds.bottom())
+                - window.pixel_snap(fitted_bounds.bottom()))
+            .max(px(0.0));
+            let left_inset = (window.pixel_snap(fitted_bounds.left())
+                - window.pixel_snap(bounds.left()))
+            .max(px(0.0));
+            let right_inset = (window.pixel_snap(bounds.right())
+                - window.pixel_snap(fitted_bounds.right()))
+            .max(px(0.0));
+            corner_radii.bottom_left = (radius - bottom_inset.max(left_inset)).max(px(0.0));
+            corner_radii.bottom_right = (radius - bottom_inset.max(right_inset)).max(px(0.0));
+        }
+
         _ = window.paint_image(
+            bounds,
             fitted_bounds,
-            fitted_bounds,
-            gpui::Corners::default(),
+            corner_radii,
             self.frame.clone(),
             0,
             false,

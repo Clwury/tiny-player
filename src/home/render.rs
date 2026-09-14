@@ -163,14 +163,6 @@ impl HomeContent {
             .relative()
             .size_full()
             .bg(theme.background)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(Self::close_resume_item_context_menu),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(Self::close_resume_item_context_menu),
-            )
             .when(rounded_window, |this| {
                 this.rounded_br(theme.radius_lg).overflow_hidden()
             })
@@ -279,6 +271,7 @@ impl HomeContent {
             .child(
                 div()
                     .id("resume-item-context-menu")
+                    .debug_selector(|| "resume-item-context-menu".into())
                     .occlude()
                     .flex()
                     .flex_col()
@@ -291,7 +284,9 @@ impl HomeContent {
                     .p(px(4.0))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down_out(cx.listener(Self::close_resume_item_context_menu))
                     .child(resume_item_context_menu_option(
+                        "resume-item-mark-played",
                         ResumeItemAction::MarkPlayed.label(),
                         false,
                         pending,
@@ -299,6 +294,7 @@ impl HomeContent {
                         cx,
                     ))
                     .child(resume_item_context_menu_option(
+                        "resume-item-hide-from-resume",
                         ResumeItemAction::HideFromResume.label(),
                         true,
                         pending,
@@ -659,7 +655,13 @@ impl HomeContent {
                                     },
                                 );
                                 let card = resume_item_card(&item, image_path, cx)
-                                    .id((gpui::ElementId::from("resume-item-card"), card_item_id))
+                                    .id((
+                                        gpui::ElementId::from("resume-item-card"),
+                                        card_item_id.clone(),
+                                    ))
+                                    .debug_selector(move || {
+                                        format!("resume-item-card-{card_item_id}")
+                                    })
                                     .when(pending, |this| this.opacity(0.62))
                                     .on_mouse_down(MouseButton::Right, open_context_menu);
 
@@ -974,15 +976,18 @@ impl HomeContent {
 }
 
 fn resume_item_context_menu_option(
+    id: &'static str,
     label: &'static str,
     destructive: bool,
     disabled: bool,
     on_mouse_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     cx: &Context<HomeContent>,
-) -> gpui::Div {
+) -> impl IntoElement {
     let theme = theme::get(cx);
 
     div()
+        .id(id)
+        .debug_selector(move || id.to_string())
         .flex()
         .h(px(32.0))
         .items_center()
@@ -1238,6 +1243,9 @@ impl Render for HomePage {
 
 #[cfg(test)]
 mod resize_tests;
+
+#[cfg(test)]
+mod resume_menu_tests;
 
 #[cfg(test)]
 mod tests {

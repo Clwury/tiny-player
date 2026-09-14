@@ -632,7 +632,15 @@ fn side_request_remaining_bytes(
 }
 
 fn http_cache_request_should_retry(error: &reqwest::Error) -> bool {
-    error.is_timeout() || error.is_connect() || error.is_body() || transient_error_chain(error)
+    // Response::chunk() wraps body I/O failures as Decode, including an idle
+    // connection closing during a long playback pause. This downloader reads
+    // raw range bytes, so these errors must also resume at the last appended
+    // offset through the bounded retry loop.
+    error.is_timeout()
+        || error.is_connect()
+        || error.is_body()
+        || error.is_decode()
+        || transient_error_chain(error)
 }
 
 fn http_cache_status_should_retry(status: reqwest::StatusCode) -> bool {

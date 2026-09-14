@@ -10,16 +10,18 @@ use super::state::effective_playback_paused;
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PlaybackQueueDirection {
+enum PlaybackQueueAction {
     Previous,
     Next,
+    Select(usize),
 }
 
-impl PlaybackQueueDirection {
+impl PlaybackQueueAction {
     fn failure_prefix(self) -> &'static str {
         match self {
             Self::Previous => "切换上一集失败",
             Self::Next => "切换下一集失败",
+            Self::Select(_) => "切换剧集失败",
         }
     }
 }
@@ -34,6 +36,15 @@ pub(super) struct PlaybackQueueSwitchState {
 }
 
 impl PlaybackPage {
+    pub(super) fn switch_to_episode(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_queue_switch(PlaybackQueueAction::Select(index), false, window, cx);
+    }
+
     pub(super) fn can_switch_to_previous_episode(&self) -> bool {
         !self.queue_switch.loading && self.queue.previous_index().is_some()
     }
@@ -49,7 +60,7 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        self.begin_queue_switch(PlaybackQueueDirection::Previous, false, window, cx);
+        self.begin_queue_switch(PlaybackQueueAction::Previous, false, window, cx);
     }
 
     pub(super) fn switch_to_next_episode(
@@ -59,7 +70,7 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        self.begin_queue_switch(PlaybackQueueDirection::Next, false, window, cx);
+        self.begin_queue_switch(PlaybackQueueAction::Next, false, window, cx);
     }
 
     pub(super) fn switch_to_next_episode_after_end(
@@ -67,7 +78,7 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.begin_queue_switch(PlaybackQueueDirection::Next, true, window, cx);
+        self.begin_queue_switch(PlaybackQueueAction::Next, true, window, cx);
     }
 
     pub(super) fn cancel_queue_switch(&mut self) {
@@ -80,7 +91,7 @@ impl PlaybackPage {
 
     fn begin_queue_switch(
         &mut self,
-        direction: PlaybackQueueDirection,
+        action: PlaybackQueueAction,
         automatic: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
@@ -88,9 +99,12 @@ impl PlaybackPage {
         if self.queue_switch.loading {
             return;
         }
-        let target_index = match direction {
-            PlaybackQueueDirection::Previous => self.queue.previous_index(),
-            PlaybackQueueDirection::Next => self.queue.next_index(),
+        let target_index = match action {
+            PlaybackQueueAction::Previous => self.queue.previous_index(),
+            PlaybackQueueAction::Next => self.queue.next_index(),
+            PlaybackQueueAction::Select(index) => {
+                (index != self.queue.current_index).then_some(index)
+            }
         };
         let Some(target_index) = target_index else {
             return;
@@ -100,6 +114,7 @@ impl PlaybackPage {
         };
 
         self.close_track_select(cx);
+        self.close_episode_list(cx);
         self.queue_switch.generation = self.queue_switch.generation.wrapping_add(1);
         let generation = self.queue_switch.generation;
         self.queue_switch.loading = true;
@@ -118,7 +133,7 @@ impl PlaybackPage {
                 self.queue_switch.resume_on_failure = false;
                 self.queue_switch.publish_terminal_update_on_failure = false;
                 self.queue_switch.error =
-                    Some(format!("{}：{error}", direction.failure_prefix()).into());
+                    Some(format!("{}：{error}", action.failure_prefix()).into());
                 cx.notify();
                 return;
             }
@@ -140,7 +155,7 @@ impl PlaybackPage {
         cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
-                page.finish_queue_switch(generation, direction, result, cx);
+                page.finish_queue_switch(generation, action, result, cx);
             })
             .ok();
         })
@@ -150,7 +165,7 @@ impl PlaybackPage {
     fn finish_queue_switch(
         &mut self,
         generation: u64,
-        direction: PlaybackQueueDirection,
+        action: PlaybackQueueAction,
         result: Result<PlaybackRequest>,
         cx: &mut Context<Self>,
     ) {
@@ -183,7 +198,7 @@ impl PlaybackPage {
                 self.queue_switch.resume_on_failure = false;
                 self.queue_switch.publish_terminal_update_on_failure = false;
                 self.queue_switch.error =
-                    Some(format!("{}：{error}", direction.failure_prefix()).into());
+                    Some(format!("{}：{error}", action.failure_prefix()).into());
                 if resume_on_failure && !self.timeline.ended {
                     let resume_result = self
                         .video
@@ -193,7 +208,7 @@ impl PlaybackPage {
                         self.queue_switch.error = Some(
                             format!(
                                 "{}：{error}；恢复当前播放失败：{resume_error}",
-                                direction.failure_prefix()
+                                action.failure_prefix()
                             )
                             .into(),
                         );
@@ -222,6 +237,7 @@ impl PlaybackPage {
         let theme = theme::get(cx);
         div()
             .id("playback-queue-switch-error")
+            .debug_selector(|| "playback-queue-switch-error".into())
             .absolute()
             .top(px(72.0))
             .left(relative(0.5))
@@ -350,6 +366,9 @@ mod tests {
         PlaybackQueueItem {
             item_id: item_id.to_string(),
             title: item_id.to_string().into(),
+            episode_label: item_id.to_string().into(),
+            overview: None,
+            primary_image_tag: None,
             series_id: Some("series-1".to_string()),
             season_id: Some("season-1".to_string()),
             run_time_ticks: None,

@@ -1,4 +1,3 @@
-use super::fullscreen::playback_progress_bar_bounds;
 use super::*;
 
 const SUBTITLE_VERTICAL_ADJUST_STEP_FRACTION: f32 = 0.01;
@@ -7,10 +6,9 @@ impl PlaybackPage {
     pub(super) fn adjust_subtitle_vertical_offset_fraction(
         &mut self,
         delta: f32,
-        window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let current_offset_fraction = self.current_subtitle_vertical_offset_fraction(window);
+        let current_offset_fraction = self.subtitle.vertical_offset_fraction.unwrap_or(0.0);
         self.subtitle.vertical_offset_fraction = Some(subtitle_vertical_offset_after_adjustment(
             current_offset_fraction,
             delta,
@@ -18,37 +16,7 @@ impl PlaybackPage {
         cx.notify();
     }
 
-    pub(super) fn current_subtitle_vertical_offset_fraction(&self, window: &Window) -> f32 {
-        self.subtitle
-            .vertical_offset_fraction
-            .or_else(|| self.default_subtitle_vertical_offset_fraction(window))
-            .unwrap_or(0.0)
-    }
-
-    pub(super) fn default_subtitle_vertical_offset_fraction(
-        &self,
-        _window: &Window,
-    ) -> Option<f32> {
-        let (video_bounds, video_fitted_bounds) = self.current_video_layout_bounds()?;
-        let default_bottom = subtitle_overlay_bottom(
-            video_fitted_bounds,
-            video_bounds,
-            self.progress_bar_visible(),
-        );
-
-        Some(subtitle_vertical_offset_fraction(
-            video_fitted_bounds,
-            subtitle_video_bottom(video_fitted_bounds) - default_bottom,
-        ))
-    }
-
-    pub(super) fn current_video_layout_bounds(&self) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
-        let video_bounds = local_video_viewport_bounds(self.frame.viewport_bounds?);
-        let video_fitted_bounds = aspect_fit_bounds(video_bounds, self.frame.source_size?)?;
-        Some((video_bounds, video_fitted_bounds))
-    }
-
-    pub(super) fn render_subtitle_overlay(&self, progress_bar_visible: bool) -> impl IntoElement {
+    pub(super) fn render_subtitle_overlay(&self) -> impl IntoElement {
         let Some(cue) = self.subtitle.active.as_ref() else {
             return div()
                 .id("playback-subtitle-overlay-empty")
@@ -84,8 +52,7 @@ impl PlaybackPage {
             aspect_fit_bounds(video_bounds, bitmap_canvas_size).unwrap_or(video_fitted_bounds);
         let scale_x = bitmap_bounds.size.width / px(bitmap_canvas_size.width as f32);
         let scale_y = bitmap_bounds.size.height / px(bitmap_canvas_size.height as f32);
-        let subtitle_bottom =
-            subtitle_overlay_bottom(video_fitted_bounds, video_bounds, progress_bar_visible);
+        let subtitle_bottom = subtitle_video_bottom(video_fitted_bounds);
         let subtitle_render_bottom = subtitle_render_bottom(
             video_fitted_bounds,
             subtitle_bottom,
@@ -179,20 +146,6 @@ pub(super) fn local_video_viewport_bounds(bounds: Bounds<Pixels>) -> Bounds<Pixe
     Bounds::new(gpui::point(px(0.0), px(0.0)), bounds.size)
 }
 
-pub(super) fn subtitle_overlay_bottom(
-    video_fitted_bounds: Bounds<Pixels>,
-    video_bounds: Bounds<Pixels>,
-    progress_bar_visible: bool,
-) -> Pixels {
-    let video_bottom = subtitle_video_bottom(video_fitted_bounds);
-    if progress_bar_visible {
-        let controls_top = playback_progress_bar_bounds(video_bounds).origin.y;
-        video_bottom.min(controls_top)
-    } else {
-        video_bottom
-    }
-}
-
 pub(super) fn subtitle_video_bottom(video_fitted_bounds: Bounds<Pixels>) -> Pixels {
     video_fitted_bounds.origin.y + video_fitted_bounds.size.height
 }
@@ -258,28 +211,6 @@ pub(super) fn subtitle_vertical_offset_pixels(
     offset_fraction: f32,
 ) -> Pixels {
     video_fitted_bounds.size.height * offset_fraction
-}
-
-pub(super) fn subtitle_vertical_offset_fraction(
-    video_fitted_bounds: Bounds<Pixels>,
-    offset: Pixels,
-) -> f32 {
-    let video_height = f32::from(video_fitted_bounds.size.height);
-    if video_height > 0.0 {
-        f32::from(offset) / video_height
-    } else {
-        0.0
-    }
-}
-
-#[cfg(test)]
-pub(super) fn subtitle_text_overlay_height(
-    video_fitted_bounds: Bounds<Pixels>,
-    video_bounds: Bounds<Pixels>,
-    progress_bar_visible: bool,
-) -> Pixels {
-    let bottom = subtitle_overlay_bottom(video_fitted_bounds, video_bounds, progress_bar_visible);
-    subtitle_text_overlay_height_for_bottom(video_fitted_bounds, bottom)
 }
 
 pub(super) fn subtitle_text_overlay_height_for_bottom(
@@ -442,41 +373,21 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_text_overlay_height_stops_at_progress_bar_top() {
-        let video_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
-        let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
-
-        assert_eq!(
-            subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true),
-            px(393.0)
-        );
-    }
-
-    #[test]
-    fn subtitle_text_overlay_height_uses_video_bounds_origin_for_controls_top() {
-        let video_bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(800.0), px(600.0)));
-        let video_fitted_bounds =
-            Bounds::new(point(px(10.0), px(95.0)), size(px(800.0), px(450.0)));
-
-        assert_eq!(
-            subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true),
-            px(393.0)
-        );
-    }
-
-    #[test]
-    fn subtitle_text_overlay_height_uses_video_bottom_without_visible_progress_bar() {
-        let video_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(700.0)));
-        let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
-
-        assert_eq!(
-            subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true),
-            px(450.0)
-        );
-        assert_eq!(
-            subtitle_text_overlay_height(video_fitted_bounds, video_bounds, false),
-            px(450.0)
-        );
+    fn subtitle_text_overlay_uses_full_video_bounds() {
+        for video_fitted_bounds in [
+            Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0))),
+            Bounds::new(point(px(10.0), px(95.0)), size(px(800.0), px(450.0))),
+            Bounds::new(point(px(0.0), px(0.0)), size(px(1600.0), px(900.0))),
+        ] {
+            assert_eq!(
+                subtitle_text_overlay_bounds(
+                    video_fitted_bounds,
+                    subtitle_video_bottom(video_fitted_bounds),
+                    None,
+                ),
+                video_fitted_bounds,
+            );
+        }
     }
 
     #[test]
@@ -493,36 +404,19 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_render_bottom_offset_is_independent_from_controls_visibility() {
-        let video_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)));
+    fn subtitle_render_bottom_adjusts_from_video_bottom() {
         let video_fitted_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
-        let controls_default_bottom = px(468.0);
-        let hidden_controls_default_bottom = px(525.0);
-
-        let manual_offset = subtitle_vertical_offset_after_adjustment(
-            subtitle_vertical_offset_fraction(
-                video_fitted_bounds,
-                px(525.0) - controls_default_bottom,
-            ),
-            subtitle_vertical_adjust_step(),
-        );
+        let default_bottom = subtitle_video_bottom(video_fitted_bounds);
+        let manual_offset =
+            subtitle_vertical_offset_after_adjustment(0.0, subtitle_vertical_adjust_step());
 
         assert_eq!(
-            subtitle_render_bottom(
-                video_fitted_bounds,
-                subtitle_text_overlay_height(video_fitted_bounds, video_bounds, true)
-                    + video_fitted_bounds.origin.y,
-                Some(manual_offset),
-            ),
-            px(463.5)
+            subtitle_render_bottom(video_fitted_bounds, default_bottom, None),
+            px(525.0)
         );
         assert_eq!(
-            subtitle_render_bottom(
-                video_fitted_bounds,
-                hidden_controls_default_bottom,
-                Some(manual_offset),
-            ),
-            px(463.5)
+            subtitle_render_bottom(video_fitted_bounds, default_bottom, Some(manual_offset)),
+            px(520.5)
         );
     }
 

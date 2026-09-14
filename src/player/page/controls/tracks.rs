@@ -12,6 +12,7 @@ impl PlaybackPage {
             return;
         }
         self.timeline.cache_status_open = false;
+        self.close_episode_list(cx);
         self.tracks.open = if self.tracks.open == Some(PlaybackTrackKind::Audio) {
             None
         } else {
@@ -32,6 +33,7 @@ impl PlaybackPage {
             return;
         }
         self.timeline.cache_status_open = false;
+        self.close_episode_list(cx);
         self.tracks.open = if self.tracks.open == Some(PlaybackTrackKind::Subtitle) {
             None
         } else {

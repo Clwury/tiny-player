@@ -632,6 +632,7 @@ pub(super) fn episode_card<T>(
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
+    let label = episode.episode_card_label();
     let played_fraction = if selected {
         episode
             .played_percentage()
@@ -686,22 +687,26 @@ pub(super) fn episode_card<T>(
                 .gap_1()
                 .child(
                     div()
+                        .id("episode-card-label")
                         .truncate()
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.foreground)
-                        .child(episode.episode_card_label()),
+                        .child(label.clone())
+                        .tooltip(move |_, cx| text_tooltip(label.clone(), cx)),
                 )
                 .when_some(
                     compact_episode_overview(episode.overview.as_deref()),
                     |this, overview| {
                         this.child(
                             div()
+                                .id("episode-card-overview")
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .text_ellipsis()
                                 .line_clamp(3)
-                                .child(overview),
+                                .child(overview.clone())
+                                .tooltip(move |_, cx| text_tooltip(overview.clone(), cx)),
                         )
                     },
                 ),

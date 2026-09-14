@@ -88,10 +88,21 @@ impl HttpClient {
                         return Err(HttpDownloadError::cancelled(offset));
                     }
                     return result.map_err(|error| {
+                        let error = error.without_url();
                         let retryable = http_cache_request_should_retry(&error);
+                        // Display omits the underlying cause; retain it in the
+                        // diagnostic log to distinguish body, TLS and I/O errors.
+                        tracing::debug!(
+                            offset,
+                            generation,
+                            side_request = side.is_some(),
+                            retryable,
+                            error = ?error,
+                            "HTTP video cache transport failed"
+                        );
                         HttpDownloadError::new(
                             offset,
-                            format!("HTTP 视频缓存网络请求失败：{}", error.without_url()),
+                            format!("HTTP 视频缓存网络请求失败：{error}"),
                             retryable,
                         )
                     });
