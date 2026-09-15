@@ -151,6 +151,10 @@ impl SubtitleDecodeWorker {
         }
     }
 
+    pub(super) fn service(&mut self) -> std::result::Result<(), String> {
+        self.pump_available_results()
+    }
+
     pub(super) fn try_enqueue_packet(
         &mut self,
         packet: &AvPacket,
@@ -495,3 +499,7 @@ fn subtitle_cue_update(
     }
     None
 }
+
+#[cfg(test)]
+#[path = "subtitle_decode_worker/tests.rs"]
+mod tests;

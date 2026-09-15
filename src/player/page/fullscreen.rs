@@ -19,6 +19,7 @@ impl PlaybackPage {
     }
 
     pub(super) fn reset_fullscreen_controls(&mut self) {
+        self.window_drag = WindowDragState::Idle;
         self.fullscreen.cursor_visible = false;
         self.fullscreen.controls_visible = false;
         self.fullscreen.mouse_in_controls = false;

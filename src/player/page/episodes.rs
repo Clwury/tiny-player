@@ -372,4 +372,4 @@ impl PlaybackPage {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::player::page) mod tests;

@@ -36,75 +36,32 @@ impl PlaybackPage {
     pub(in super::super) fn render_playback_details_overlay(
         &self,
         window: &Window,
-        cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = theme::media_overlay(cx);
         let presenter_snapshot = self.video.dependent().map(VideoPresenter::snapshot);
         let viewport_size = window.viewport_size();
         let display_size = RenderSize {
-            width: f32::from(viewport_size.width).round().max(0.0) as u32,
-            height: f32::from(viewport_size.height).round().max(0.0) as u32,
+            width: (f32::from(viewport_size.width) * window.scale_factor())
+                .round()
+                .max(0.0) as u32,
+            height: (f32::from(viewport_size.height) * window.scale_factor())
+                .round()
+                .max(0.0) as u32,
         };
-        let output_size = self
-            .frame
-            .viewport_bounds
-            .zip(self.frame.source_size)
-            .and_then(|(viewport, source)| render_output_size(viewport, source));
-        let sections = vec![
-            playback_file_detail_section(
-                self.title.as_ref(),
-                self.content_length,
-                self.source_protocol.as_deref(),
-                self.playback_file_info.as_ref(),
-                self.timeline.duration,
-                self.timeline.cache_state.as_ref(),
-            ),
-            playback_display_detail_section(display_size, output_size, presenter_snapshot),
-            playback_video_detail_section(self.playback_info.as_ref(), self.timeline.loaded),
-            playback_audio_detail_section(
-                self.playback_audio_info.as_ref(),
-                self.timeline.loaded,
-                self.volume.level,
-            ),
-        ];
-
-        sections.into_iter().fold(
-            div()
-                .id("playback-details-overlay")
-                .absolute()
-                .left_4()
-                .top(px(if window.is_fullscreen() {
-                    16.0
-                } else {
-                    PLAYBACK_DETAILS_TOP_PX
-                }))
-                .flex()
-                .flex_col()
-                .w(px(PLAYBACK_DETAILS_WIDTH_PX))
-                .max_w(relative(0.82))
-                .max_h(relative(if window.is_fullscreen() { 0.92 } else { 0.82 }))
-                .gap_3()
-                .overflow_y_scroll()
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(theme.input_border.opacity(0.42))
-                .bg(rgba(0x000000c8))
-                .px_3()
-                .py_3()
-                .shadow_lg()
-                .occlude()
-                .text_xs()
-                .text_color(theme.foreground.opacity(0.92))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                    cx.stop_propagation();
-                })
-                .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                    cx.stop_propagation();
-                })
-                .on_scroll_wheel(|_, _, cx| {
-                    cx.stop_propagation();
-                }),
-            |this, section| this.child(playback_detail_section_element(section, cx)),
+        playback_details_overlay(
+            [
+                Some(playback_file_detail_section(
+                    &self.source_url,
+                    self.title.as_ref(),
+                    self.content_length,
+                    self.playback_file_info.as_ref(),
+                    self.timeline.cache_state.as_ref(),
+                )),
+                presenter_snapshot
+                    .map(|presenter| playback_display_detail_section(display_size, presenter)),
+                playback_video_detail_section(self.playback_info.as_ref()),
+                playback_audio_detail_section(self.playback_audio_info.as_ref(), self.volume.level),
+            ],
+            window,
         )
     }
 
@@ -648,15 +605,10 @@ impl PlaybackPage {
             // Reserve space inside the panel for the time below the progress track.
             .pb(px(8.0))
             .shadow_lg()
+            // Leave blank space and labels inert without passing input through
+            // to the video. Buttons and the progress track handle their own input.
             .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(Self::close_track_select_on_mouse_down),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(Self::close_track_select_on_mouse_down),
-            )
+            // Hover still keeps the controls and cursor visible.
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .text_xs()
             .text_color(theme.foreground.opacity(0.86))

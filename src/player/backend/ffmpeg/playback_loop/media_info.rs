@@ -14,7 +14,7 @@ pub(super) fn playback_video_info_from_worker(
 
     Some(PlaybackVideoInfo {
         codec: codec_name(video_stream.codec_id),
-        codec_description: codec_description(video_stream),
+        codec_description: codec_description(video_stream.codec_id),
         profile: codec_profile(video_stream.codec_id, unsafe {
             (*codec_parameters).profile
         }),
@@ -54,7 +54,7 @@ pub(super) fn playback_audio_info_from_stream(
 
     Some(PlaybackAudioInfo {
         codec: codec_name(audio_stream.codec_id),
-        codec_description: codec_description(audio_stream),
+        codec_description: codec_description(audio_stream.codec_id),
         profile: codec_profile(audio_stream.codec_id, unsafe {
             (*codec_parameters).profile
         }),
@@ -89,9 +89,11 @@ fn codec_name(codec_id: ffi::AVCodecID) -> String {
         .unwrap_or_else(|| format!("{codec_id:?}"))
 }
 
-fn codec_description(stream: StreamInfo) -> Option<String> {
-    let decoder = unsafe { stream.decoder.as_ref()? };
-    non_empty_c_string(decoder.long_name)
+fn codec_description(codec_id: ffi::AVCodecID) -> Option<String> {
+    // mpv's codec-desc is the format description, independent of the selected
+    // decoder (e.g. AV1 vs. libdav1d). The decoder has its own stats suffix.
+    let descriptor = unsafe { ffi::avcodec_descriptor_get(codec_id).as_ref()? };
+    non_empty_c_string(descriptor.long_name)
 }
 
 fn decoder_name(stream: StreamInfo) -> String {
@@ -162,4 +164,18 @@ fn non_empty_c_string(value: *const std::os::raw::c_char) -> Option<String> {
     let value = unsafe { CStr::from_ptr(value) }.to_string_lossy();
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codec_description_identifies_the_format_instead_of_a_decoder_library() {
+        assert_eq!(
+            codec_description(ffi::AVCodecID::AV_CODEC_ID_AV1).as_deref(),
+            Some("Alliance for Open Media AV1")
+        );
+        assert_eq!(codec_description(ffi::AVCodecID::AV_CODEC_ID_NONE), None);
+    }
 }

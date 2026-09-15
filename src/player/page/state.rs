@@ -1,5 +1,13 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum WindowDragState {
+    #[default]
+    Idle,
+    Pending,
+    Blocked,
+}
+
 #[derive(Default)]
 pub(super) struct PlaybackFrameState {
     pub(super) viewport_bounds: Option<Bounds<Pixels>>,

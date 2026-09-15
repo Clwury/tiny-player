@@ -58,6 +58,16 @@ impl SubtitlePipeline {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn with_worker_for_test(
+        worker: SubtitleDecodeWorker,
+    ) -> Self {
+        Self {
+            worker: Some(worker),
+            ..Self::empty_for_test()
+        }
+    }
+
     pub(super) fn new(
         stream: Option<StreamInfo>,
         decoder: Option<Decoder>,
@@ -380,6 +390,12 @@ impl SubtitlePipeline {
         session_id: PlaybackSessionId,
         event_tx: &Sender<BackendEvent>,
     ) -> std::result::Result<bool, String> {
+        // A seek clears the tracked packets, but flush retries and acknowledgements
+        // must still advance before decoder backpressure can admit new packets.
+        if let Some(worker) = self.worker.as_mut() {
+            worker.service()?;
+        }
+
         let mut made_progress = false;
         loop {
             let Some(front_generation) = self.front_generation() else {

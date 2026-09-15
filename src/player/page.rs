@@ -39,6 +39,9 @@ mod state;
 mod subtitles;
 mod video_element;
 
+#[cfg(test)]
+mod mouse_tests;
+
 pub(crate) use request::playback_subtitle_track_at_position;
 pub use request::{
     EmbyPlaybackContext, PlaybackQueue, PlaybackQueueItem, PlaybackRequest,
@@ -64,7 +67,7 @@ use render::{
 use runtime::{PlaybackBackend, ShutdownOrder};
 use state::{
     FullscreenControlsState, PlaybackFrameState, PlaybackTimelineState, PlaybackVolumeState,
-    SubtitleOverlayState, TrackSelectState,
+    SubtitleOverlayState, TrackSelectState, WindowDragState,
 };
 use subtitles::defer_drop_subtitle;
 use video_element::VideoFrameElement;
@@ -95,7 +98,9 @@ pub struct PlaybackPage {
     download_speed: controls::DownloadSpeedDisplay,
     playback_details_visible: bool,
     fullscreen: FullscreenControlsState,
+    window_drag: WindowDragState,
     source_protocol: Option<String>,
+    source_url: String,
     content_length: Option<u64>,
     playback_file_info: Option<PlaybackFileInfo>,
     playback_info: Option<PlaybackVideoInfo>,
@@ -201,7 +206,9 @@ impl PlaybackPage {
             download_speed: controls::DownloadSpeedDisplay::default(),
             playback_details_visible: false,
             fullscreen: FullscreenControlsState::default(),
+            window_drag: WindowDragState::default(),
             source_protocol,
+            source_url: request.url,
             content_length,
             playback_file_info: None,
             playback_info: None,
@@ -276,6 +283,11 @@ impl PlaybackPage {
         if self.close_track_select(cx) {
             return;
         }
+        self.window_drag = if event.click_count == 1 && !window.is_fullscreen() {
+            WindowDragState::Pending
+        } else {
+            WindowDragState::Idle
+        };
         if event.click_count == 2 {
             self.toggle_playback_fullscreen(window, cx);
         }
@@ -316,7 +328,16 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !window.is_fullscreen() && event.dragging() {
+        if !event.dragging() {
+            self.window_drag = WindowDragState::Idle;
+        }
+        if self.window_drag == WindowDragState::Pending
+            && !window.is_fullscreen()
+            && event.dragging()
+            && self.timeline.progress_drag_position.is_none()
+        {
+            // The compositor may consume the release after taking the pointer.
+            self.window_drag = WindowDragState::Idle;
             cx.stop_propagation();
             window.start_window_move();
             return;
@@ -372,6 +393,55 @@ impl PlaybackPage {
     }
 
     fn render_mouse_capture(&self, cx: &Context<Self>) -> impl IntoElement {
+        let record_press = cx.listener(|page, in_playback: &bool, _, _| {
+            page.window_drag = if *in_playback {
+                WindowDragState::Blocked
+            } else {
+                WindowDragState::Idle
+            };
+        });
+        let reset_on_release = cx.listener(|page, event: &MouseUpEvent, _, _| {
+            if event.button == MouseButton::Left {
+                page.window_drag = WindowDragState::Idle;
+            }
+        });
+        let stop_control_drag = cx.listener(|page, _: &MouseMoveEvent, _, cx| {
+            if page.window_drag == WindowDragState::Blocked {
+                cx.stop_propagation();
+            }
+        });
+        let drag_observer = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                // Observe presses and releases before controls handle or occlude
+                // them. Only a subsequent surface press may arm a window move.
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase.capture() {
+                        record_press(
+                            &(event.button == MouseButton::Left
+                                && bounds.contains(&event.position)),
+                            window,
+                            cx,
+                        );
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                    if phase.capture() {
+                        reset_on_release(event, window, cx);
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    // A control press must not turn into the titlebar's own
+                    // window drag either. Child controls handle drags first.
+                    if phase.bubble() && event.dragging() && !bounds.contains(&event.position) {
+                        stop_control_drag(event, window, cx);
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full();
+
         div()
             .id("playback-mouse-capture")
             .absolute()
@@ -389,6 +459,7 @@ impl PlaybackPage {
             )
             .on_mouse_move(cx.listener(Self::handle_surface_mouse_move))
             .on_scroll_wheel(cx.listener(Self::handle_surface_scroll_wheel))
+            .child(drag_observer)
     }
 }
 
@@ -503,9 +574,6 @@ impl Render for PlaybackPage {
             })
             .child(viewport_observer)
             .child(self.render_mouse_capture(cx))
-            .when(self.playback_details_visible, |this| {
-                this.child(self.render_playback_details_overlay(window, cx))
-            })
             .child(self.render_subtitle_overlay())
             .when(self.volume.indicator_visible, |this| {
                 this.child(self.render_volume_indicator(cx))
@@ -530,6 +598,10 @@ impl Render for PlaybackPage {
             )
             .when(self.episode_list.open, |this| {
                 this.child(deferred(self.render_episode_list(window, cx)).with_priority(2))
+            })
+            .when(self.playback_details_visible, |this| {
+                // Keep stats above subtitles, controls, and deferred playback menus.
+                this.child(deferred(self.render_playback_details_overlay(window)).with_priority(3))
             })
     }
 }

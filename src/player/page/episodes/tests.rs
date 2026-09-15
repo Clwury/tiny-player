@@ -31,7 +31,9 @@ fn episode(index: usize) -> PlaybackQueueItem {
     }
 }
 
-fn playback_window(cx: &mut TestAppContext) -> (Entity<PlaybackPage>, &mut VisualTestContext) {
+pub(in crate::player::page) fn playback_window(
+    cx: &mut TestAppContext,
+) -> (Entity<PlaybackPage>, &mut VisualTestContext) {
     cx.update(theme::init);
     let (page, cx) = cx.add_window_view(|_, cx| {
         let emby = EmbyPlaybackContext {
@@ -69,7 +71,9 @@ fn playback_window(cx: &mut TestAppContext) -> (Entity<PlaybackPage>, &mut Visua
                 cursor_visible: true,
                 ..Default::default()
             },
+            window_drag: WindowDragState::default(),
             source_protocol: None,
+            source_url: "episode.mkv".to_string(),
             content_length: None,
             playback_file_info: None,
             playback_info: None,
@@ -285,42 +289,6 @@ fn unavailable_episode_restores_current_playback_and_shows_error(cx: &mut TestAp
     });
     assert!(cx.debug_bounds("playback-queue-switch-error").is_some());
     assert!(cx.debug_bounds("playback-progress").is_some());
-}
-
-#[gpui::test]
-fn episode_image_label_and_overview_start_switching_on_mouse_down(cx: &mut TestAppContext) {
-    let (page, cx) = playback_window(cx);
-    // Resolve locally to an error after checking the synchronous selection, so
-    // each target can be pressed independently without starting a decoder.
-    page.update(cx, |page, _| page.queue.items[2].media_sources.clear());
-    for selector in [
-        "playback-episode-image-2",
-        "playback-episode-label-2",
-        "playback-episode-overview-2",
-    ] {
-        click(cx, "playback-episodes-button");
-        let position = cx.debug_bounds(selector).unwrap().center();
-        cx.simulate_mouse_move(position, None, Modifiers::default());
-        cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_secs(1));
-        cx.run_until_parked();
-        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
-        page.read_with(cx, |page, _| {
-            assert!(
-                !page.episode_list.open,
-                "{selector} must select on mouse down"
-            );
-            assert!(page.queue_switch.loading);
-            assert!(page.timeline.user_paused);
-        });
-        cx.run_until_parked();
-        cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::default());
-        cx.run_until_parked();
-        page.read_with(cx, |page, _| {
-            assert!(!page.queue_switch.loading);
-            assert!(!page.timeline.user_paused);
-        });
-    }
 }
 
 #[gpui::test]

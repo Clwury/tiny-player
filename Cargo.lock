@@ -6022,6 +6022,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "image",
+ "percent-encoding",
  "pkg-config",
  "reqwest",
  "serde",
