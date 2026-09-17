@@ -1,6 +1,12 @@
+use std::collections::HashMap;
+
 use gpui::{ScrollHandle, point, px};
 
 use crate::emby::{MediaItem, MediaItems, MediaSource, ResumeItem, UserItem, UserItems};
+use crate::player::{
+    PlaybackTrack, PlaybackTrackPreferenceKey, PlaybackTrackPreferences, SavedTrackChoice,
+    SavedTrackChoices,
+};
 
 use super::super::{LoadState, video_version::VideoVersion};
 
@@ -67,8 +73,7 @@ pub(crate) struct SeriesDetailState {
     preferred_season_id_hint: Option<String>,
     pub(crate) selected_media_source_index: Option<usize>,
     manual_video_version: Option<VideoVersion>,
-    /// Explicit selection only; automatic choices follow the current language preference.
-    pub(crate) selected_subtitle_index: Option<usize>,
+    pub(super) pending_subtitle_choices: HashMap<PlaybackTrackPreferenceKey, SavedTrackChoice>,
     pub(crate) open_select: Option<SeriesDetailSelectKind>,
     pub(crate) action_menu_focus: Option<gpui::FocusHandle>,
     pub(crate) scroll_handle: ScrollHandle,
@@ -244,7 +249,7 @@ impl SeriesDetailState {
             preferred_season_id_hint: None,
             selected_media_source_index: None,
             manual_video_version: None,
-            selected_subtitle_index: None,
+            pending_subtitle_choices: HashMap::new(),
             open_select: None,
             action_menu_focus: None,
             scroll_handle: ScrollHandle::new(),
@@ -596,7 +601,6 @@ impl SeriesDetailState {
         };
         self.manual_video_version = Some(VideoVersion::from_source(source));
         self.selected_media_source_index = Some(index);
-        self.selected_subtitle_index = None;
         self.subtitle_scroll_handle
             .set_offset(point(px(0.0), px(0.0)));
         self.open_select = None;
@@ -607,16 +611,55 @@ impl SeriesDetailState {
     pub(crate) fn selected_subtitle_index(
         &self,
         language: crate::player::TrackLanguage,
+        preference: Option<&SavedTrackChoice>,
     ) -> Option<usize> {
         let source = self.selected_media_source()?;
-        let subtitle_count = source.subtitle_streams().len();
-        if subtitle_count == 0 {
-            return None;
+        let streams = source.subtitle_streams();
+        if let Some(preference) = preference {
+            let tracks = streams
+                .iter()
+                .enumerate()
+                .filter_map(|(index, stream)| PlaybackTrack::from_subtitle_stream(stream, index))
+                .collect::<Vec<_>>();
+            if let Some(track) = preference.resolve(&tracks) {
+                return track.and_then(|track| {
+                    streams.iter().position(|stream| {
+                        stream.index.and_then(|index| usize::try_from(index).ok())
+                            == Some(track.stream_index)
+                    })
+                });
+            }
         }
+        language.preferred_subtitle_stream_position(source)
+    }
 
-        self.selected_subtitle_index
-            .filter(|index| *index < subtitle_count)
-            .or_else(|| language.preferred_subtitle_stream_position(source))
+    pub(crate) fn track_preference_key(&self) -> Option<PlaybackTrackPreferenceKey> {
+        let item = self.selected_playback_item()?;
+        let source = self.selected_media_source()?;
+        Some(PlaybackTrackPreferenceKey {
+            item_id: source.playback_item_id(&item.id).to_string(),
+            media_source_id: source.id.clone()?,
+        })
+    }
+
+    pub(crate) fn pending_subtitle_choice(&self) -> Option<&SavedTrackChoice> {
+        self.pending_subtitle_choices
+            .get(&self.track_preference_key()?)
+    }
+
+    pub(crate) fn selected_track_choices(
+        &self,
+        server: &crate::server::CachedServer,
+        cx: &gpui::App,
+    ) -> SavedTrackChoices {
+        let mut choices = self
+            .track_preference_key()
+            .map(|key| PlaybackTrackPreferences::get(server, &key, cx))
+            .unwrap_or_default();
+        if let Some(subtitle) = self.pending_subtitle_choice() {
+            choices.subtitle = Some(subtitle.clone());
+        }
+        choices
     }
 
     pub(crate) fn selected_media_source_label(&self) -> String {
@@ -635,12 +678,22 @@ impl SeriesDetailState {
             .unwrap_or_else(|| "暂无视频源".to_string())
     }
 
-    pub(crate) fn selected_subtitle_label(&self, language: crate::player::TrackLanguage) -> String {
+    pub(crate) fn selected_subtitle_label(
+        &self,
+        language: crate::player::TrackLanguage,
+        preference: Option<&SavedTrackChoice>,
+    ) -> String {
         let Some(source) = self.selected_media_source() else {
             return "无字幕".to_string();
         };
         let subtitles = source.subtitle_streams();
-        let Some(index) = self.selected_subtitle_index(language) else {
+        if subtitles.is_empty() {
+            return "无字幕".to_string();
+        }
+        if preference == Some(&SavedTrackChoice::Off) {
+            return "Off".to_string();
+        }
+        let Some(index) = self.selected_subtitle_index(language, preference) else {
             return "无字幕".to_string();
         };
         subtitles
@@ -706,7 +759,6 @@ impl SeriesDetailState {
             self.selected_episode_id = episode_id;
             self.selected_media_source_index = None;
             self.manual_video_version = None;
-            self.selected_subtitle_index = None;
             self.open_select = None;
             self.reset_select_scroll_offsets();
             self.reset_playback_request();
@@ -723,7 +775,6 @@ impl SeriesDetailState {
         self.selected_episode_id = None;
         self.selected_media_source_index = None;
         self.manual_video_version = None;
-        self.selected_subtitle_index = None;
         self.open_select = None;
         self.reset_select_scroll_offsets();
         self.episodes_carousel = Default::default();
@@ -768,14 +819,8 @@ impl SeriesDetailState {
         let selected_media_source_index = self.selected_media_source_index();
         if selected_media_source_index.is_none() {
             self.selected_media_source_index = None;
-            self.selected_subtitle_index = None;
             self.open_select = None;
             return;
-        }
-        if self.selected_media_source_index != selected_media_source_index
-            && self.manual_video_version.is_none()
-        {
-            self.selected_subtitle_index = None;
         }
         self.selected_media_source_index = selected_media_source_index;
         if let Some(resume_item_id) = self.resume_media_item_id.as_deref() {
@@ -794,16 +839,8 @@ impl SeriesDetailState {
             .selected_media_source()
             .map(|source| source.subtitle_streams().len())
             .unwrap_or(0);
-        if subtitle_count == 0 {
-            self.selected_subtitle_index = None;
-            if self.open_select == Some(SeriesDetailSelectKind::Subtitle) {
-                self.open_select = None;
-            }
-        } else if self
-            .selected_subtitle_index
-            .is_some_and(|index| index >= subtitle_count)
-        {
-            self.selected_subtitle_index = None;
+        if subtitle_count == 0 && self.open_select == Some(SeriesDetailSelectKind::Subtitle) {
+            self.open_select = None;
         }
     }
 }
@@ -960,7 +997,7 @@ mod tests {
             preferred_season_id_hint: None,
             selected_media_source_index: None,
             manual_video_version: None,
-            selected_subtitle_index: None,
+            pending_subtitle_choices: HashMap::new(),
             open_select: None,
             action_menu_focus: None,
             scroll_handle: ScrollHandle::new(),
@@ -1010,6 +1047,8 @@ mod tests {
             path: None,
             source_type: None,
             container: None,
+            size: None,
+            bitrate: None,
             media_streams: None,
             default_subtitle_stream_index: None,
         }
@@ -1050,9 +1089,12 @@ mod tests {
         detail.sync_media_source_selection();
 
         assert_eq!(detail.selected_media_source_index(), Some(1));
-        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(1));
         assert_eq!(
-            detail.selected_subtitle_label(Default::default()),
+            detail.selected_subtitle_index(Default::default(), None),
+            Some(1)
+        );
+        assert_eq!(
+            detail.selected_subtitle_label(Default::default(), None),
             "简体中文"
         );
     }
@@ -1067,6 +1109,7 @@ mod tests {
         detail.resume_video_version = Some(VideoVersion {
             source_id: "resumed-source".into(),
             name: Some("Resumed version".into()),
+            ..Default::default()
         });
         let mut item = media_item("movie-1", "Movie");
         item.media_sources = Some(serde_json::from_value(serde_json::json!([
@@ -1084,7 +1127,7 @@ mod tests {
         assert_eq!(detail.selected_media_source_index(), Some(1));
         assert_eq!(detail.selected_media_source_label(), "Resumed version");
         assert_eq!(
-            detail.selected_subtitle_label(Default::default()),
+            detail.selected_subtitle_label(Default::default(), None),
             "简体中文"
         );
 
@@ -1116,6 +1159,7 @@ mod tests {
         detail.resume_video_version = Some(VideoVersion {
             source_id: "resumed-source".into(),
             name: None,
+            ..Default::default()
         });
         let mut item = media_item("movie-1", "Movie");
         item.media_sources = Some(vec![media_source("default-source", "Default")]);
@@ -1183,6 +1227,7 @@ mod tests {
             detail.resume_video_version = Some(VideoVersion {
                 source_id: "mediasource_episode-2".into(),
                 name: None,
+                ..Default::default()
             });
             let mut item = media_item("episode-2", "Second");
             let mut default = media_source("default-source", "Default");
@@ -1269,7 +1314,10 @@ mod tests {
         detail.sync_media_source_selection();
 
         assert_eq!(detail.selected_media_source_index(), Some(1));
-        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(1));
+        assert_eq!(
+            detail.selected_subtitle_index(Default::default(), None),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1297,9 +1345,12 @@ mod tests {
 
         detail.sync_media_source_selection();
 
-        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(1));
         assert_eq!(
-            detail.selected_subtitle_label(Default::default()),
+            detail.selected_subtitle_index(Default::default(), None),
+            Some(1)
+        );
+        assert_eq!(
+            detail.selected_subtitle_label(Default::default(), None),
             "强制字幕"
         );
     }
@@ -1327,16 +1378,21 @@ mod tests {
         );
         detail.item = Some(item);
 
-        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(0));
         assert_eq!(
-            detail.selected_subtitle_label(Default::default()),
+            detail.selected_subtitle_index(Default::default(), None),
+            Some(0)
+        );
+        assert_eq!(
+            detail.selected_subtitle_label(Default::default(), None),
             "第一字幕"
         );
 
         detail.sync_media_source_selection();
 
-        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(0));
-        assert_eq!(detail.selected_subtitle_index, None);
+        assert_eq!(
+            detail.selected_subtitle_index(Default::default(), None),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1366,9 +1422,12 @@ mod tests {
         detail.sync_media_source_selection();
 
         assert_eq!(detail.selected_media_source_index(), Some(0));
-        assert_eq!(detail.selected_subtitle_index(Default::default()), Some(1));
         assert_eq!(
-            detail.selected_subtitle_label(Default::default()),
+            detail.selected_subtitle_index(Default::default(), None),
+            Some(1)
+        );
+        assert_eq!(
+            detail.selected_subtitle_label(Default::default(), None),
             "简体中文"
         );
     }

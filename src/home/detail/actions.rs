@@ -17,6 +17,9 @@ pub(in crate::home) struct PlayedRequest {
     season_id: Option<String>,
     episode_id: Option<String>,
     detail_generation: u64,
+    user_data: Option<UserItemData>,
+    notification_scope: NotificationScope,
+    notification_key: SharedString,
 }
 
 struct PlayedResponse {
@@ -115,12 +118,50 @@ impl HomeContent {
             season_id: detail.selected_season_id.clone(),
             episode_id: detail.selected_episode().map(|episode| episode.id.clone()),
             detail_generation: self.detail_generation,
+            user_data: self
+                .effective_user_data(&item.id, item.user_data.as_ref())
+                .cloned(),
+            notification_scope: NotificationScope::Detail,
+            notification_key: "detail:played".into(),
         };
+        self.start_played_request(request, cx);
+    }
+
+    pub(in crate::home) fn mark_user_item_played(&mut self, item_id: &str, cx: &mut Context<Self>) {
+        if self.detail_user_data_pending() {
+            return;
+        }
+        let Some(item) = self.user_item_by_id(item_id) else {
+            return;
+        };
+        let whole_series = item.item_type.as_deref() == Some("Series");
+        let (notification_scope, notification_key) =
+            self.item_action_notification(item_id, "played");
+        let request = PlayedRequest {
+            item_id: item.id,
+            series_id: if whole_series {
+                Some(item_id.to_string())
+            } else {
+                item.series_id
+            },
+            whole_series,
+            played: true,
+            season_id: None,
+            episode_id: None,
+            detail_generation: self.detail_generation,
+            user_data: item.user_data,
+            notification_scope,
+            notification_key,
+        };
+        self.start_played_request(request, cx);
+    }
+
+    fn start_played_request(&mut self, request: PlayedRequest, cx: &mut Context<Self>) {
         self.played_request = Some(request.clone());
         if let Some(detail) = self.series_detail.as_mut() {
             detail.open_select = None;
         }
-        self.clear_notification(NotificationScope::Detail, "detail:played");
+        self.clear_notification(request.notification_scope, &request.notification_key);
         cx.notify();
 
         let identity = self.request_identity();
@@ -191,8 +232,8 @@ impl HomeContent {
             Ok(response) => response,
             Err(error) => {
                 self.push_error_notification(
-                    NotificationScope::Detail,
-                    "detail:played",
+                    request.notification_scope,
+                    request.notification_key.clone(),
                     format!("更新观看状态失败：{error}"),
                     cx,
                 );
@@ -202,7 +243,9 @@ impl HomeContent {
         };
         self.invalidate_pending_home_snapshot_save();
         let mut affected = self.loaded_detail_user_data(&request);
-        affected.entry(request.item_id.clone()).or_default();
+        affected
+            .entry(request.item_id.clone())
+            .or_insert_with(|| request.user_data.clone());
         for (id, fallback) in affected {
             let previous = self.effective_user_data(&id, fallback.as_ref()).cloned();
             let data = if id == request.item_id {
@@ -240,8 +283,8 @@ impl HomeContent {
             }
             Some(Err(error)) => {
                 self.push_error_notification(
-                    NotificationScope::Detail,
-                    "detail:played",
+                    request.notification_scope,
+                    request.notification_key.clone(),
                     format!("观看状态已更新，刷新整部剧状态失败：{error}"),
                     cx,
                 );
@@ -353,8 +396,8 @@ impl HomeContent {
         }
         if !errors.is_empty() {
             self.push_error_notification(
-                NotificationScope::Detail,
-                "detail:played",
+                request.notification_scope,
+                request.notification_key.clone(),
                 format!("观看状态已更新，刷新失败（{}）", errors.join("；")),
                 cx,
             );

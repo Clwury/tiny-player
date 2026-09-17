@@ -26,6 +26,8 @@ use super::{
 pub(crate) struct FavoriteRollback {
     previous_override: Option<UserItemData>,
     removed: Option<(VideoItemType, usize, UserItem)>,
+    notification_scope: NotificationScope,
+    notification_key: SharedString,
 }
 
 struct FavoritesRequest {
@@ -52,6 +54,7 @@ impl HomeContent {
     }
 
     pub(super) fn open_favorite_items(&mut self, item_type: VideoItemType, cx: &mut Context<Self>) {
+        self.item_context_menu = None;
         self.favorites.sync_previous_offsets();
         self.navigation.push_favorite_items(item_type);
         self.enter_favorites_if_needed(cx);
@@ -263,7 +266,7 @@ impl HomeContent {
         fallback: Option<UserItemData>,
         cx: &mut Context<Self>,
     ) {
-        if self.detail_user_data_pending() {
+        if item_id.trim().is_empty() || self.detail_user_data_pending() {
             return;
         }
         if let Some(detail) = self.series_detail.as_mut() {
@@ -285,18 +288,19 @@ impl HomeContent {
             None
         };
         self.favorites.mark_dirty();
+        let (notification_scope, notification_key) =
+            self.item_action_notification(&item_id, "favorite");
+        self.clear_notification(notification_scope, &notification_key);
         self.favorite_rollbacks.insert(
             item_id.clone(),
             FavoriteRollback {
                 previous_override,
                 removed,
+                notification_scope,
+                notification_key,
             },
         );
         self.favorite_requests.insert(item_id.clone());
-        self.clear_notification(
-            NotificationScope::Detail,
-            &format!("detail:favorite:{item_id}"),
-        );
         cx.notify();
 
         let server = self.current_server.clone();
@@ -345,19 +349,10 @@ impl HomeContent {
                     if let Some((item_type, index, item)) = rollback.removed {
                         self.favorites.restore_item(item_type, index, item);
                     }
-                }
-                let message: SharedString = format!("更新收藏失败：{error}").into();
-                let is_detail = self.series_detail.as_ref().is_some_and(|detail| {
-                    detail.series_id == item_id
-                        || detail.episodes.as_ref().is_some_and(|episodes| {
-                            episodes.items.iter().any(|item| item.id == item_id)
-                        })
-                });
-                if is_detail {
                     self.push_error_notification(
-                        NotificationScope::Detail,
-                        format!("detail:favorite:{item_id}"),
-                        message,
+                        rollback.notification_scope,
+                        rollback.notification_key,
+                        format!("更新收藏失败：{error}"),
                         cx,
                     );
                 }

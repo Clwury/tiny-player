@@ -1,9 +1,9 @@
 use std::ops::Range;
 
 use gpui::{
-    App, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    ScrollHandle, StatefulInteractiveElement, Styled, Window, canvas, deferred, div, point,
-    prelude::FluentBuilder, px, svg,
+    App, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, Window, canvas, deferred, div,
+    point, prelude::FluentBuilder, px, svg,
 };
 
 use crate::{
@@ -23,6 +23,7 @@ use super::{
         user_item_card_with_favorite_badge,
     },
     favorites::{favorite_section_title, render::favorite_action},
+    item_context_menu::ItemContextMenuSource,
     library::{LibraryState, available_library_sorts},
     navigation::HomeRoute,
     paged_items::PagedItemsState,
@@ -624,21 +625,29 @@ impl HomeContent {
         let open = cx.listener(move |page, _, _, cx| {
             page.open_user_item_grid_index(source, index, item_fingerprint, cx);
         });
+        let open_context_menu = cx.listener(move |page, event: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            if let Some(item_id) = page.user_item_grid_id(source, index, item_fingerprint) {
+                page.open_item_context_menu(
+                    item_id,
+                    ItemContextMenuSource::UserItem,
+                    event.position,
+                    cx,
+                );
+            }
+        });
         // Keep element identity stable for an item without cloning its ID into
         // every resize-built listener. The fingerprint is also checked by the
         // click handler so a late event from a removed/reordered result cannot
         // open the wrong item.
         let item_id = gpui::ElementId::from((id_prefix, item_fingerprint));
-        if item.item_type.as_deref() == Some("Episode") {
+        let card = if item.item_type.as_deref() == Some("Episode") {
             let card = if matches!(source, UserItemGridSource::Favorites(_)) {
                 favorite_episode_card(&item, self.image_path_for_favorite_episode(&item), cx)
             } else {
                 user_episode_card(&item, self.image_path_for_episode_user_item(&item), cx)
             };
             card.id(item_id)
-                .debug_selector(|| format!("{id_prefix}-{}", item.id))
-                .cursor_pointer()
-                .on_click(open)
         } else {
             let image_path = self.image_path_for_user_item(&item);
             user_item_card_with_favorite_badge(
@@ -648,9 +657,11 @@ impl HomeContent {
                 cx,
             )
             .id(item_id)
+        };
+        card.debug_selector(|| format!("{id_prefix}-{}", item.id))
             .cursor_pointer()
             .on_click(open)
-        }
+            .on_mouse_down(MouseButton::Right, open_context_menu)
     }
 
     fn open_user_item_grid_index(
@@ -660,17 +671,25 @@ impl HomeContent {
         expected_fingerprint: u64,
         cx: &mut Context<Self>,
     ) {
-        let item_id = match source {
+        if let Some(item_id) = self.user_item_grid_id(source, index, expected_fingerprint) {
+            self.open_media_detail_by_id(item_id, cx);
+        }
+    }
+
+    fn user_item_grid_id(
+        &self,
+        source: UserItemGridSource,
+        index: usize,
+        expected_fingerprint: u64,
+    ) -> Option<String> {
+        match source {
             UserItemGridSource::Favorites(item_type) => {
                 self.favorites[item_type].paged.items.get(index)
             }
             UserItemGridSource::Search => self.search.items.get(index),
         }
         .filter(|item| user_item_id_fingerprint(&item.id) == expected_fingerprint)
-        .map(|item| item.id.clone());
-        if let Some(item_id) = item_id {
-            self.open_media_detail_by_id(item_id, cx);
-        }
+        .map(|item| item.id.clone())
     }
 
     fn render_user_item_card(
@@ -682,22 +701,32 @@ impl HomeContent {
         let item = self.effective_user_item(item);
         let item_id = item.id.clone();
         let open_item_id = item_id.clone();
+        let context_item_id = item_id.clone();
+        let open_context_menu = cx.listener(move |page, event: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            page.open_item_context_menu(
+                context_item_id.clone(),
+                ItemContextMenuSource::UserItem,
+                event.position,
+                cx,
+            );
+        });
         let open = cx.listener(move |page, _, _, cx| {
             page.open_media_detail_by_id(open_item_id.clone(), cx);
         });
-        if item.item_type.as_deref() == Some("Episode") {
+        let card = if item.item_type.as_deref() == Some("Episode") {
             let image_path = self.image_path_for_episode_user_item(&item);
             user_episode_card(&item, image_path, cx)
-                .id((gpui::ElementId::from(id_prefix), item_id))
-                .cursor_pointer()
-                .on_click(open)
+                .id((gpui::ElementId::from(id_prefix), item_id.clone()))
         } else {
             let image_path = self.image_path_for_user_item(&item);
             user_item_card(&item, image_path, cx)
-                .id((gpui::ElementId::from(id_prefix), item_id))
-                .cursor_pointer()
-                .on_click(open)
-        }
+                .id((gpui::ElementId::from(id_prefix), item_id.clone()))
+        };
+        card.debug_selector(move || format!("{id_prefix}-{item_id}"))
+            .cursor_pointer()
+            .on_click(open)
+            .on_mouse_down(MouseButton::Right, open_context_menu)
     }
 
     fn render_library_paged_footer(

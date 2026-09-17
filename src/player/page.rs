@@ -42,7 +42,6 @@ mod video_element;
 #[cfg(test)]
 mod mouse_tests;
 
-pub(crate) use request::playback_subtitle_track_at_position;
 pub use request::{
     EmbyPlaybackContext, PlaybackQueue, PlaybackQueueItem, PlaybackRequest,
     playback_initial_position_seconds,
@@ -111,6 +110,8 @@ pub struct PlaybackPage {
     reporting: session::PlaybackReportingState,
     queue_switch: queue::PlaybackQueueSwitchState,
     tracks: TrackSelectState,
+    track_preference_key: super::PlaybackTrackPreferenceKey,
+    remember_subtitle_on_start: bool,
     subtitle: SubtitleOverlayState,
     volume: PlaybackVolumeState,
     rate: rate::PlaybackRateState,
@@ -223,6 +224,8 @@ impl PlaybackPage {
                 request.subtitle_tracks,
                 request.selected_tracks,
             ),
+            track_preference_key: request.track_preference_key,
+            remember_subtitle_on_start: request.remember_subtitle_on_start,
             subtitle: SubtitleOverlayState::default(),
             volume,
             rate: rate::PlaybackRateState::default(),

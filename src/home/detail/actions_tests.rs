@@ -9,11 +9,20 @@ use std::{
     time::Duration,
 };
 
-use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
+use gpui::{Entity, Modifiers, MouseButton, TestAppContext, VisualTestContext, px, size};
 use serde_json::json;
 
 use super::*;
-use crate::{emby::EmbyClient, theme};
+use crate::{
+    emby::{EmbyClient, SortOrder, UserItemsSort, VideoItemType},
+    home::{
+        UserViewItemsRow, library::LibraryState, navigation::HomeRoot, paged_items::PagedItemsState,
+    },
+    theme,
+};
+
+#[path = "workspace_menu_tests.rs"]
+mod workspace_menu_tests;
 
 struct MockEmby {
     port: u16,
@@ -26,6 +35,10 @@ struct MockEmby {
 
 impl MockEmby {
     fn new() -> Self {
+        Self::with_favorites(false)
+    }
+
+    fn with_favorites(is_favorite: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -40,9 +53,17 @@ impl MockEmby {
             let stop = stop.clone();
             move || {
                 let mut data: HashMap<String, UserItemData> =
-                    ["series-1", "episode-1", "episode-2"]
+                    ["series-1", "episode-1", "episode-2", "movie-1"]
                         .into_iter()
-                        .map(|id| (id.into(), UserItemData::default()))
+                        .map(|id| {
+                            (
+                                id.into(),
+                                UserItemData {
+                                    is_favorite,
+                                    ..UserItemData::default()
+                                },
+                            )
+                        })
                         .collect();
                 while !stop.load(Ordering::Relaxed) {
                     let (mut stream, _) = match listener.accept() {
@@ -96,7 +117,9 @@ impl MockEmby {
                     } else if path.contains("/PlayedItems/") {
                         let played = method == "POST";
                         if id == "series-1" {
-                            for value in data.values_mut() {
+                            for (_, value) in
+                                data.iter_mut().filter(|(key, _)| key.as_str() != "movie-1")
+                            {
                                 value.played = played;
                                 value.played_percentage = None;
                                 value.playback_position_ticks = Some(0);
@@ -110,6 +133,28 @@ impl MockEmby {
                                 data["episode-1"].played && data["episode-2"].played;
                         }
                         ("200 OK", serde_json::to_string(&data[id]).unwrap())
+                    } else if path.ends_with("/HideFromResume?Hide=true") {
+                        ("204 No Content", String::new())
+                    } else if method == "GET"
+                        && path.starts_with("/emby/Users/user-1/Items?")
+                        && path.contains("Filters=IsFavorite")
+                    {
+                        let url = url::Url::parse(&format!("http://localhost{path}")).unwrap();
+                        let item_type = url
+                            .query_pairs()
+                            .find(|(key, _)| key == "IncludeItemTypes")
+                            .unwrap()
+                            .1;
+                        let items: Vec<_> = [
+                            ("movie-1", "Movie"), ("series-1", "Series"),
+                            ("episode-1", "Episode"), ("episode-2", "Episode"),
+                        ].into_iter().filter(|(id, kind)| *kind == item_type && data[*id].is_favorite)
+                            .map(|(id, kind)| json!({"Id":id,"Name":id,"Type":kind,"SeriesId":(kind == "Episode").then_some("series-1"),"UserData":data[id]}))
+                            .collect();
+                        (
+                            "200 OK",
+                            json!({"TotalRecordCount":items.len(),"Items":items}).to_string(),
+                        )
                     } else if method == "GET" && path.ends_with("/Items/series-1") {
                         ("200 OK", json!({"Id":"series-1", "Name":"Series", "Type":"Series", "UserData":data["series-1"]}).to_string())
                     } else if method == "GET" && path.starts_with("/emby/Shows/series-1/Episodes?")
@@ -195,6 +240,273 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
         .unwrap_or_else(|| panic!("missing {selector}"));
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
+}
+
+fn home_menu_window<'a>(
+    cx: &'a mut TestAppContext,
+    server: &MockEmby,
+) -> (Entity<HomeContent>, &'a mut VisualTestContext) {
+    let (page, cx) = detail_window(cx, server);
+    page.update(cx, |page, cx| {
+        page.navigation.select_root(HomeRoot::Home);
+        page.series_detail = None;
+        page.user_views = Some(serde_json::from_value(json!({"Items": [
+            {"Id": "videos", "Name": "Videos", "CollectionType": "movies"}
+        ], "TotalRecordCount": 1})).unwrap());
+        let items = json!([
+            {"Id":"movie-1", "Name":"Movie", "Type":"Movie", "UserData":{"Played":false,"IsFavorite":false}},
+            {"Id":"series-1", "Name":"Series", "Type":"Series", "UserData":{"Played":false,"IsFavorite":false}},
+            {"Id":"episode-1", "Name":"First", "Type":"Episode", "SeriesId":"series-1", "UserData":{"Played":false,"IsFavorite":false}},
+            {"Id":"episode-2", "Name":"Second", "Type":"Episode", "SeriesId":"series-1", "UserData":{"Played":false,"IsFavorite":false}}
+        ]);
+        page.user_view_items_rows.insert("videos".into(), UserViewItemsRow {
+            items: Some(serde_json::from_value(json!({"Items": items, "TotalRecordCount":4})).unwrap()),
+            ..UserViewItemsRow::default()
+        });
+        page.resume_items = Some(serde_json::from_value(json!({
+            "Items": [items[0].clone(), items[2].clone(), items[3].clone()], "TotalRecordCount": 3
+        })).unwrap());
+        cx.notify();
+    });
+    cx.simulate_resize(size(px(1200.0), px(1100.0)));
+    cx.run_until_parked();
+    (page, cx)
+}
+
+fn right_click(cx: &mut VisualTestContext, selector: &'static str) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("missing {selector}"));
+    cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+    cx.simulate_mouse_down(bounds.center(), MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(bounds.center(), MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn cover_and_resume_menus_toggle_the_clicked_item_favorite_without_removing_it(
+    cx: &mut TestAppContext,
+) {
+    let server = MockEmby::new();
+    let (page, cx) = home_menu_window(cx, &server);
+    for (card, option, desired) in [
+        (
+            "user-view-item-card-movie-1",
+            "user-view-item-favorite",
+            true,
+        ),
+        (
+            "user-view-item-card-movie-1",
+            "user-view-item-favorite",
+            false,
+        ),
+        ("resume-item-card-episode-1", "resume-item-favorite", true),
+        ("resume-item-card-episode-1", "resume-item-favorite", false),
+    ] {
+        right_click(cx, card);
+        click(cx, option);
+        page.read_with(cx, |page, _| {
+            let id = if card.ends_with("movie-1") {
+                "movie-1"
+            } else {
+                "episode-1"
+            };
+            assert_eq!(page.user_item_by_id(id).unwrap().is_favorite(), desired);
+            assert_eq!(
+                page.resume_item_by_id(id)
+                    .unwrap()
+                    .user_data
+                    .unwrap()
+                    .is_favorite,
+                desired
+            );
+            assert!(page.item_context_menu.is_none());
+            assert!(page.favorite_requests.is_empty());
+            assert_eq!(page.resume_items.as_ref().unwrap().total_record_count, 3);
+            assert!(page.favorites[VideoItemType::Movie].paged.dirty);
+        });
+    }
+    assert_eq!(
+        server.mutations(),
+        [
+            "POST /emby/Users/user-1/FavoriteItems/movie-1 HTTP/1.1",
+            "DELETE /emby/Users/user-1/FavoriteItems/movie-1 HTTP/1.1",
+            "POST /emby/Users/user-1/FavoriteItems/episode-1 HTTP/1.1",
+            "DELETE /emby/Users/user-1/FavoriteItems/episode-1 HTTP/1.1",
+        ]
+    );
+}
+
+#[gpui::test]
+fn cover_menu_marks_movies_episodes_and_whole_series_played_and_updates_resume(
+    cx: &mut TestAppContext,
+) {
+    let server = MockEmby::new();
+    let (page, cx) = home_menu_window(cx, &server);
+    right_click(cx, "user-view-item-card-episode-1");
+    click(cx, "user-view-item-favorite");
+    for (id, card, remaining) in [
+        ("movie-1", "user-view-item-card-movie-1", 2),
+        ("movie-1", "user-view-item-card-movie-1", 2),
+        ("episode-1", "user-view-item-card-episode-1", 1),
+        ("series-1", "user-view-item-card-series-1", 0),
+    ] {
+        right_click(cx, card);
+        click(cx, "user-view-item-mark-played");
+        page.read_with(cx, |page, _| {
+            assert!(page.user_data_overrides[id].played);
+            assert!(page.user_item_by_id(id).unwrap().user_data.unwrap().played);
+            assert_eq!(page.resume_items.as_ref().unwrap().items.len(), remaining);
+            assert_eq!(
+                page.resume_items.as_ref().unwrap().total_record_count as usize,
+                remaining
+            );
+            assert!(page.played_request.is_none());
+            assert!(page.user_data_overrides["episode-1"].is_favorite);
+        });
+    }
+    page.read_with(cx, |page, _| {
+        assert!(page.user_data_overrides["episode-2"].played);
+        assert!(page.series_user_data_revisions.contains_key("series-1"));
+        let snapshot = page.home_snapshot();
+        assert!(snapshot.resume_items.unwrap().data.items.is_empty());
+    });
+    assert_eq!(
+        server.mutations(),
+        [
+            "POST /emby/Users/user-1/FavoriteItems/episode-1 HTTP/1.1",
+            "POST /emby/Users/user-1/PlayedItems/movie-1 HTTP/1.1",
+            "POST /emby/Users/user-1/PlayedItems/movie-1 HTTP/1.1",
+            "POST /emby/Users/user-1/PlayedItems/episode-1 HTTP/1.1",
+            "POST /emby/Users/user-1/PlayedItems/series-1 HTTP/1.1",
+        ]
+    );
+}
+
+#[gpui::test]
+fn resume_menu_keeps_played_and_hide_actions_after_favoriting(cx: &mut TestAppContext) {
+    let server = MockEmby::new();
+    let (page, cx) = home_menu_window(cx, &server);
+    right_click(cx, "resume-item-card-movie-1");
+    click(cx, "resume-item-favorite");
+    right_click(cx, "resume-item-card-movie-1");
+    assert!(cx.debug_bounds("resume-item-favorite-取消收藏").is_some());
+    click(cx, "resume-item-mark-played");
+    right_click(cx, "resume-item-card-episode-1");
+    click(cx, "resume-item-hide-from-resume");
+    page.read_with(cx, |page, _| {
+        let data = &page.user_data_overrides["movie-1"];
+        assert!(data.is_favorite && data.played);
+        assert_eq!(data.playback_position_ticks, Some(0));
+        let resume = page.resume_items.as_ref().unwrap();
+        assert_eq!(resume.items.len(), 1);
+        assert_eq!(resume.total_record_count, 1);
+        assert_eq!(resume.items[0].id, "episode-2");
+        assert!(
+            !page
+                .user_item_by_id("episode-1")
+                .unwrap()
+                .user_data
+                .unwrap()
+                .played
+        );
+    });
+    assert_eq!(
+        server.mutations(),
+        [
+            "POST /emby/Users/user-1/FavoriteItems/movie-1 HTTP/1.1",
+            "POST /emby/Users/user-1/PlayedItems/movie-1 HTTP/1.1",
+            "POST /emby/Users/user-1/Items/episode-1/HideFromResume?Hide=true HTTP/1.1",
+        ]
+    );
+}
+
+#[gpui::test]
+fn card_menu_failures_restore_favorites_and_keep_resume_items_with_visible_errors(
+    cx: &mut TestAppContext,
+) {
+    let server = MockEmby::new();
+    let (page, cx) = home_menu_window(cx, &server);
+    right_click(cx, "resume-item-card-movie-1");
+    click(cx, "resume-item-favorite");
+    for (card, option, id, favorite) in [
+        (
+            "resume-item-card-movie-1",
+            "resume-item-favorite",
+            "movie-1",
+            true,
+        ),
+        (
+            "user-view-item-card-episode-1",
+            "user-view-item-favorite",
+            "episode-1",
+            false,
+        ),
+        (
+            "user-view-item-card-episode-1",
+            "user-view-item-mark-played",
+            "episode-1",
+            false,
+        ),
+    ] {
+        server.fail_next.store(true, Ordering::SeqCst);
+        right_click(cx, card);
+        click(cx, option);
+        page.update(cx, |page, _| {
+            let data = page.user_item_by_id(id).unwrap().user_data.unwrap();
+            assert_eq!(data.is_favorite, favorite);
+            assert!(!data.played);
+            assert_eq!(page.resume_items.as_ref().unwrap().items.len(), 3);
+            assert!(page.has_visible_notifications());
+            assert!(!page.detail_user_data_pending());
+            page.clear_all_notifications();
+        });
+    }
+}
+
+#[gpui::test]
+fn library_cover_menu_uses_library_item_and_shows_failure_in_that_library(cx: &mut TestAppContext) {
+    let server = MockEmby::new();
+    let (page, cx) = home_menu_window(cx, &server);
+    page.update(cx, |page, cx| {
+        let view = page.user_views.as_ref().unwrap().items[0].clone();
+        let items = page.user_view_items_rows["videos"]
+            .items
+            .as_ref()
+            .unwrap()
+            .items
+            .clone();
+        let mut paged = PagedItemsState::default();
+        paged.items = items;
+        paged.initial = LoadState::Loaded;
+        paged.exhausted = true;
+        page.libraries.insert(
+            "videos".into(),
+            LibraryState {
+                title: "Videos".into(),
+                item_types: vec![VideoItemType::Movie],
+                sort_by: UserItemsSort::SortName,
+                sort_order: SortOrder::Ascending,
+                sort_menu_open: false,
+                paged,
+            },
+        );
+        page.open_library_for_view(&view, cx);
+    });
+    cx.run_until_parked();
+    right_click(cx, "library-grid-item-movie-1");
+    click(cx, "user-view-item-favorite");
+    page.read_with(cx, |page, _| {
+        assert!(page.user_item_by_id("movie-1").unwrap().is_favorite())
+    });
+    server.fail_next.store(true, Ordering::SeqCst);
+    right_click(cx, "library-grid-item-movie-1");
+    click(cx, "user-view-item-mark-played");
+    page.read_with(cx, |page, _| {
+        assert!(page.has_visible_notifications());
+        assert!(!page.user_data_overrides["movie-1"].played);
+        assert_eq!(page.resume_items.as_ref().unwrap().items.len(), 3);
+    });
 }
 
 #[gpui::test]
@@ -429,6 +741,8 @@ fn a_series_refresh_does_not_replace_a_newly_selected_season(cx: &mut TestAppCon
             item_id: "series-1".into(), series_id: Some("series-1".into()),
             whole_series: true, played: true, season_id: Some("season-1".into()),
             episode_id: Some("episode-1".into()), detail_generation: page.detail_generation,
+            user_data: None, notification_scope: NotificationScope::Detail,
+            notification_key: "detail:played".into(),
         };
         let detail = page.series_detail.as_mut().unwrap();
         detail.selected_season_id = Some("season-2".into());

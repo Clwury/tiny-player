@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
-use gpui::{AppContext, Context, SharedString, point, px};
+use gpui::{App, AppContext, Context, SharedString, Task, point, px};
 
 use crate::{
     emby::{
@@ -65,7 +65,7 @@ impl HomeContent {
         match result {
             Ok(Some(snapshot)) => {
                 self.home_effects.home_snapshot = super::LoadState::Loaded;
-                self.hydrate_home_snapshot(snapshot);
+                self.hydrate_home_snapshot(snapshot, cx);
                 self.schedule_cached_home_images_ensure(cx);
                 self.schedule_home_network_refresh(cx);
             }
@@ -80,13 +80,40 @@ impl HomeContent {
             }
         }
 
+        if self.sync_track_preferences(cx) {
+            self.schedule_home_snapshot_save(cx);
+        }
+
         cx.notify();
     }
 
-    pub(super) fn hydrate_home_snapshot(&mut self, snapshot: home_cache::HomeSnapshot) {
+    pub(super) fn hydrate_home_snapshot(
+        &mut self,
+        snapshot: home_cache::HomeSnapshot,
+        cx: &mut Context<Self>,
+    ) {
         for (item_id, version) in snapshot.played_video_versions {
-            self.played_video_versions.entry(item_id).or_insert(version);
+            match self.played_video_versions.entry(item_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(version);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let current = entry.get_mut();
+                    if current.source_id.is_empty() {
+                        current.source_id = version.source_id;
+                        current.name = version.name;
+                    }
+                    for (source_id, saved) in version.track_preferences {
+                        current
+                            .track_preferences
+                            .entry(source_id)
+                            .or_default()
+                            .fill_missing(&saved);
+                    }
+                }
+            }
         }
+        self.restore_track_preferences(cx);
         if let Some(section) = snapshot.user_views
             && self.user_views.is_none()
         {
@@ -179,7 +206,7 @@ impl HomeContent {
         self.user_views_carousel = Default::default();
         self.resume_items = None;
         self.resume_items_failed = None;
-        self.resume_item_context_menu = None;
+        self.item_context_menu = None;
         self.resume_items_carousel = Default::default();
         self.user_view_items_rows.clear();
         self.latest_queue.clear();
@@ -664,6 +691,7 @@ impl HomeContent {
     }
 
     pub(super) fn schedule_home_snapshot_save(&mut self, cx: &mut Context<Self>) {
+        self.snapshot_save_pending = true;
         self.snapshot_save_generation = self.snapshot_save_generation.wrapping_add(1);
         if !self.favorite_requests.is_empty() {
             return;
@@ -691,18 +719,45 @@ impl HomeContent {
             return;
         }
 
+        self.queue_home_snapshot_save(cx);
+    }
+
+    fn queue_home_snapshot_save(&mut self, cx: &mut App) {
+        self.snapshot_save_pending = false;
+        #[cfg(test)]
+        if self.snapshot_save_path.is_none() {
+            return;
+        }
+        #[cfg(test)]
+        let path = self.snapshot_save_path.clone();
+        #[cfg(not(test))]
+        let path: Option<std::path::PathBuf> = None;
         let server = self.current_server.clone();
         let snapshot = self.home_snapshot();
-        let task =
-            cx.background_spawn(async move { home_cache::save_snapshot(&server, &snapshot) });
-
-        cx.spawn(async move |_, _| {
-            let result = task.await;
+        let previous = std::mem::replace(&mut self.snapshot_save_task, Task::ready(()));
+        self.snapshot_save_task = cx.background_spawn(async move {
+            // Serialize writes, including the final flush, so an older save cannot win.
+            previous.await;
+            let result = if let Some(path) = path {
+                home_cache::save_snapshot_to(&path, &snapshot)
+            } else {
+                home_cache::save_snapshot(&server, &snapshot)
+            };
             if let Err(error) = result {
                 tracing::debug!(%error, "failed to save Home snapshot");
             }
-        })
-        .detach();
+        });
+    }
+
+    pub(super) fn finish_home_snapshot_saves(&mut self, cx: &mut App) -> Task<()> {
+        if self.sync_track_preferences(cx) {
+            self.snapshot_save_pending = true;
+        }
+        self.invalidate_pending_home_snapshot_save();
+        if self.snapshot_save_pending {
+            self.queue_home_snapshot_save(cx);
+        }
+        std::mem::replace(&mut self.snapshot_save_task, Task::ready(()))
     }
 
     pub(super) fn home_snapshot(&self) -> home_cache::HomeSnapshot {

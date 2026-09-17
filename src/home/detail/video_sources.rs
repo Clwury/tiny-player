@@ -63,7 +63,6 @@ impl HomeContent {
                     .and_then(|source| source.id.as_ref())
                     != previous_source_id.as_ref()
                 {
-                    detail.selected_subtitle_index = None;
                     detail.reset_playback_request();
                 }
                 detail.sync_media_source_selection();

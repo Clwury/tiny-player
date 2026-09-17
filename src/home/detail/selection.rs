@@ -98,9 +98,10 @@ impl HomeContent {
 
         let opening = detail.open_select != Some(SeriesDetailSelectKind::MediaSource);
         if opening {
-            detail
-                .media_source_scroll_handle
-                .scroll_to_item(detail.selected_media_source_index().unwrap_or(0));
+            render::reveal_two_line_option(
+                &detail.media_source_scroll_handle,
+                detail.selected_media_source_index().unwrap_or(0),
+            );
         }
         detail.open_select = opening.then_some(SeriesDetailSelectKind::MediaSource);
         cx.notify();
@@ -115,19 +116,25 @@ impl HomeContent {
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
-        let subtitle_count = detail
-            .selected_media_source()
-            .map(|source| source.subtitle_streams().len())
-            .unwrap_or(0);
-        if subtitle_count == 0 {
+        if detail.video_sources_loading()
+            || detail
+                .selected_media_source()
+                .is_none_or(|source| source.subtitle_streams().is_empty())
+        {
             return;
         }
 
         let opening = detail.open_select != Some(SeriesDetailSelectKind::Subtitle);
         if opening {
-            detail.subtitle_scroll_handle.scroll_to_item(
+            let saved_tracks = detail.selected_track_choices(&self.current_server, cx);
+            render::reveal_two_line_option(
+                &detail.subtitle_scroll_handle,
                 detail
-                    .selected_subtitle_index(PlaybackLanguagePreferences::get(cx).subtitle)
+                    .selected_subtitle_index(
+                        PlaybackLanguagePreferences::get(cx).subtitle,
+                        saved_tracks.subtitle.as_ref(),
+                    )
+                    .map(|index| index + 1)
                     .unwrap_or(0),
             );
         }
@@ -149,22 +156,35 @@ impl HomeContent {
 
     pub(in super::super) fn select_series_subtitle(
         &mut self,
-        index: usize,
+        index: Option<usize>,
         cx: &mut Context<Self>,
     ) {
         let Some(detail) = self.series_detail.as_mut() else {
             return;
         };
-        let subtitle_count = detail
-            .selected_media_source()
-            .map(|source| source.subtitle_streams().len())
-            .unwrap_or(0);
-        if index >= subtitle_count {
+        let Some(key) = detail.track_preference_key() else {
             return;
-        }
+        };
+        let track = match index {
+            Some(index) => {
+                let Some(track) = detail.selected_media_source().and_then(|source| {
+                    source
+                        .subtitle_streams()
+                        .get(index)
+                        .and_then(|stream| PlaybackTrack::from_subtitle_stream(stream, index))
+                }) else {
+                    return;
+                };
+                Some(track)
+            }
+            None => None,
+        };
 
-        detail.selected_subtitle_index = Some(index);
         detail.open_select = None;
+        detail.pending_subtitle_choices.insert(
+            key,
+            crate::player::SavedTrackChoice::from_track(track.as_ref()),
+        );
         cx.notify();
     }
 }

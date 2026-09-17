@@ -346,8 +346,8 @@ pub(super) fn server_card_menu(
                 .w(px(128.0))
                 .rounded(px(8.0))
                 .border_1()
-                .border_color(theme.input_border_focused)
-                .bg(theme.dialog_background)
+                .border_color(theme.context_menu.border)
+                .bg(theme.context_menu.background)
                 .shadow_lg()
                 .p(px(4.0))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -402,7 +402,12 @@ fn menu_item(
     action: impl Fn(&mut Window, &mut App) + 'static,
     cx: &Context<TinyApp>,
 ) -> impl IntoElement {
-    let theme = theme::get(cx);
+    let colors = &theme::get(cx).context_menu;
+    let hover_background = if destructive {
+        colors.destructive_hover_background
+    } else {
+        colors.hover_background
+    };
 
     div()
         .id(id)
@@ -415,11 +420,11 @@ fn menu_item(
         .px_2()
         .text_sm()
         .text_color(if destructive {
-            theme.error
+            colors.destructive_foreground
         } else {
-            theme.foreground
+            colors.foreground
         })
-        .hover(move |style| style.bg(theme.secondary_hover))
+        .hover(move |style| style.bg(hover_background))
         .child(label)
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             cx.stop_propagation();

@@ -1,5 +1,5 @@
 use super::*;
-use crate::player::PlaybackLanguagePreferences;
+use crate::player::{PlaybackLanguagePreferences, track_metadata_label};
 
 fn detail_icon_button(
     id: &'static str,
@@ -41,7 +41,7 @@ impl HomeContent {
         detail: &SeriesDetailState,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
+        let colors = &theme::get(cx).context_menu;
         let data = self.effective_user_data(
             &detail.series_id,
             detail
@@ -52,6 +52,11 @@ impl HomeContent {
         let favorite = data.is_some_and(|data| data.is_favorite);
         let played = data.is_some_and(|data| data.played);
         let enabled = !self.detail_user_data_pending();
+        let foreground = if enabled {
+            colors.foreground
+        } else {
+            colors.disabled_foreground
+        };
         div()
             .id("series-detail-actions-menu")
             .debug_selector(|| "series-detail-actions-menu".into())
@@ -65,8 +70,8 @@ impl HomeContent {
             .gap_1()
             .rounded_md()
             .border_1()
-            .border_color(theme.input_border)
-            .bg(theme.dialog_background)
+            .border_color(colors.border)
+            .bg(colors.background)
             .shadow_lg()
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -128,18 +133,18 @@ impl HomeContent {
                         .gap_2()
                         .rounded_md()
                         .text_sm()
-                        .text_color(theme.foreground)
+                        .text_color(foreground)
                         .child(
                             svg()
                                 .path(icon)
                                 .size(px(16.0))
                                 .flex_none()
-                                .text_color(theme.foreground),
+                                .text_color(foreground),
                         )
                         .child(label)
                         .when(enabled, |this| {
                             this.cursor_pointer()
-                                .hover(move |style| style.bg(theme.secondary_hover))
+                                .hover(move |style| style.bg(colors.hover_background))
                                 .on_click(cx.listener(move |page, _, window, cx| {
                                     cx.stop_propagation();
                                     window.blur(cx);
@@ -150,7 +155,7 @@ impl HomeContent {
                                     }
                                 }))
                         })
-                        .when(!enabled, |this| this.opacity(0.55))
+                        .when(!enabled, |this| this.cursor_default())
                 }),
             )
     }
@@ -163,7 +168,9 @@ impl HomeContent {
         let theme = theme::get(cx);
         let video_label = detail.selected_media_source_label();
         let subtitle_language = PlaybackLanguagePreferences::get(cx).subtitle;
-        let subtitle_label = detail.selected_subtitle_label(subtitle_language);
+        let saved_tracks = detail.selected_track_choices(&self.current_server, cx);
+        let subtitle_label =
+            detail.selected_subtitle_label(subtitle_language, saved_tracks.subtitle.as_ref());
         let play = cx.listener(Self::play_selected_media);
         let toggle_video = cx.listener(Self::toggle_series_media_source_select);
         let toggle_subtitle = cx.listener(Self::toggle_series_subtitle_select);
@@ -182,11 +189,13 @@ impl HomeContent {
             .map(|source| source.subtitle_streams())
             .unwrap_or_default();
         let subtitle_count = subtitle_streams.len();
-        let selected_subtitle_index = detail.selected_subtitle_index(subtitle_language);
+        let subtitle_select_enabled = subtitle_count > 0 && !detail.video_sources_loading();
+        let selected_subtitle_index =
+            detail.selected_subtitle_index(subtitle_language, saved_tracks.subtitle.as_ref());
         let media_source_select_open =
             detail.open_select == Some(SeriesDetailSelectKind::MediaSource) && source_count > 0;
         let subtitle_select_open =
-            detail.open_select == Some(SeriesDetailSelectKind::Subtitle) && subtitle_count > 0;
+            detail.open_select == Some(SeriesDetailSelectKind::Subtitle) && subtitle_select_enabled;
         let can_play = !detail.playback_loading
             && !detail.video_sources_loading()
             && detail.selected_playback_item().is_some()
@@ -320,6 +329,7 @@ impl HomeContent {
                                         cx,
                                     )
                                     .id("series-detail-video-select")
+                                    .debug_selector(|| "series-detail-video-select".into())
                                     .on_click(toggle_video),
                                 )
                                 .when(media_source_select_open, |this| {
@@ -328,11 +338,16 @@ impl HomeContent {
                                             "series-detail-video-menu",
                                             source_count,
                                             DETAIL_SELECT_WIDTH_PX,
+                                            DETAIL_TWO_LINE_OPTION_HEIGHT_PX,
                                             &detail.media_source_scroll_handle,
                                             cx,
                                             media_sources.iter().enumerate().map(
                                                 |(index, source)| {
                                                     let label = source.name_label(index);
+                                                    let subtitle =
+                                                        video_metadata::video_metadata_label(
+                                                            source,
+                                                        );
                                                     let selected =
                                                         selected_source_index == Some(index);
                                                     let on_click = cx.listener(
@@ -343,14 +358,12 @@ impl HomeContent {
                                                         },
                                                     );
 
-                                                    detail_select_option(
+                                                    detail_select_option_with_subtitle(
                                                         label,
+                                                        subtitle.as_deref(),
                                                         selected,
-                                                        (
-                                                            gpui::ElementId::from(
-                                                                "series-detail-video-option",
-                                                            ),
-                                                            index.to_string(),
+                                                        format!(
+                                                            "series-detail-video-option-{index}"
                                                         ),
                                                         cx,
                                                     )
@@ -369,44 +382,68 @@ impl HomeContent {
                                     detail_select_box(
                                         "字幕",
                                         subtitle_label,
-                                        subtitle_count > 0,
+                                        subtitle_select_enabled,
                                         cx,
                                     )
                                     .id("series-detail-subtitle-select")
+                                    .debug_selector(|| "series-detail-subtitle-select".into())
                                     .on_click(toggle_subtitle),
                                 )
                                 .when(subtitle_select_open, |this| {
                                     this.child(
                                         deferred(detail_select_menu(
                                             "series-detail-subtitle-menu",
-                                            subtitle_count,
+                                            subtitle_count + 1,
                                             DETAIL_SELECT_WIDTH_PX,
+                                            DETAIL_TWO_LINE_OPTION_HEIGHT_PX,
                                             &detail.subtitle_scroll_handle,
                                             cx,
-                                            subtitle_streams.iter().enumerate().map(
-                                                |(index, stream)| {
-                                                    let label = stream.display_title_label(index);
-                                                    let selected =
-                                                        selected_subtitle_index == Some(index);
-                                                    let on_click = cx.listener(
+                                            std::iter::once(
+                                                detail_select_option_with_subtitle(
+                                                    "Off".into(),
+                                                    Some("off"),
+                                                    selected_subtitle_index.is_none(),
+                                                    "series-detail-subtitle-off-option".into(),
+                                                    cx,
+                                                )
+                                                .on_click(cx.listener(
+                                                    |page: &mut HomeContent, _, _, cx| {
+                                                        page.select_series_subtitle(None, cx);
+                                                    },
+                                                )),
+                                            )
+                                            .chain(
+                                                subtitle_streams.iter().enumerate().map(
+                                                    |(index, stream)| {
+                                                        let label =
+                                                            stream.display_title_label(index);
+                                                        let subtitle = track_metadata_label(
+                                                            stream.language.as_deref(),
+                                                            stream.title.as_deref(),
+                                                        );
+                                                        let selected =
+                                                            selected_subtitle_index == Some(index);
+                                                        let on_click = cx.listener(
                                                         move |page: &mut HomeContent, _, _, cx| {
-                                                            page.select_series_subtitle(index, cx);
+                                                            page.select_series_subtitle(
+                                                                Some(index),
+                                                                cx,
+                                                            );
                                                         },
                                                     );
 
-                                                    detail_select_option(
+                                                        detail_select_option_with_subtitle(
                                                         label,
+                                                        Some(&subtitle),
                                                         selected,
-                                                        (
-                                                            gpui::ElementId::from(
-                                                                "series-detail-subtitle-option",
-                                                            ),
-                                                            index.to_string(),
+                                                        format!(
+                                                            "series-detail-subtitle-option-{index}"
                                                         ),
                                                         cx,
                                                     )
                                                     .on_click(on_click)
-                                                },
+                                                    },
+                                                ),
                                             ),
                                         ))
                                         .with_priority(1),
@@ -453,6 +490,7 @@ impl HomeContent {
                         "series-detail-season-menu",
                         season_count,
                         select_width,
+                        DETAIL_SELECT_OPTION_HEIGHT_PX,
                         &detail.season_scroll_handle,
                         cx,
                         seasons.items.iter().enumerate().map(|(index, season)| {

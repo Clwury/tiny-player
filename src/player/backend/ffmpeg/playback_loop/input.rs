@@ -7,7 +7,8 @@ use std::{
 use ffmpeg_sys_next as ffi;
 
 use crate::player::{
-    backend::{BackendEvent, BackendSubtitleCue},
+    PlaybackTrack,
+    backend::{BackendEvent, BackendEventKind, BackendSubtitleCue},
     render_host::RenderSize,
 };
 
@@ -72,10 +73,31 @@ impl StreamCatalog {
         }
         Ok(stream)
     }
+
+    fn tracks(&self, media_type: ffi::AVMediaType) -> Vec<PlaybackTrack> {
+        self.streams
+            .iter()
+            .filter_map(|stream| {
+                let index = usize::try_from(stream.index).ok()?;
+                self.stream_by_index(index, media_type).ok()?;
+                let codec = ffmpeg_codec_name(stream.codec_id);
+                let title = stream_metadata(*stream, c"title");
+                let mut track = PlaybackTrack::new(
+                    index,
+                    title.clone().unwrap_or_else(|| codec.to_uppercase()),
+                    false,
+                );
+                track.language = stream_metadata(*stream, c"language");
+                track.title = title;
+                track.codec = Some(codec);
+                Some(track)
+            })
+            .collect()
+    }
 }
 
 pub(super) fn open_playback_input_with_fallback(
-    source: &FfmpegPlaybackInput,
+    source: &mut FfmpegPlaybackInput,
     control: Arc<FfmpegControl>,
     event_tx: &Sender<BackendEvent>,
 ) -> std::result::Result<OpenedPlaybackInput, String> {
@@ -164,7 +186,84 @@ pub(super) fn open_playback_input_with_fallback(
     let mut probed = probed;
     probed.input.shutdown_cached_io_on_drop();
     cached_source.release();
-    open_decoders_for_probed_input(probed)
+    let opened = open_decoders_for_probed_input(probed)?;
+    reconcile_input_selection(source, &opened, event_tx);
+    let start_position_seconds = initial_position_for_duration(
+        source.start_position_seconds,
+        opened.input.duration_seconds(),
+    );
+    if start_position_seconds != source.start_position_seconds {
+        tracing::warn!(
+            requested_position_seconds = source.start_position_seconds,
+            duration_seconds = ?opened.input.duration_seconds(),
+            "FFmpeg resume position exceeds actual media duration; starting from the beginning"
+        );
+        source.start_position_seconds = start_position_seconds;
+        let _ = event_tx.send(BackendEvent::new(
+            source.session_id,
+            BackendEventKind::PositionChanged(start_position_seconds),
+        ));
+    }
+    Ok(opened)
+}
+
+fn initial_position_for_duration(position: f64, duration: Option<f64>) -> f64 {
+    if !position.is_finite()
+        || position < 0.0
+        || duration
+            .is_some_and(|duration| duration.is_finite() && duration > 0.0 && position >= duration)
+    {
+        0.0
+    } else {
+        position
+    }
+}
+
+fn reconcile_input_selection(
+    source: &mut FfmpegPlaybackInput,
+    opened: &OpenedPlaybackInput,
+    event_tx: &Sender<BackendEvent>,
+) {
+    let mut selected = source.selected_tracks.clone();
+    selected.audio_stream_index = opened
+        .audio_stream
+        .and_then(|stream| usize::try_from(stream.index).ok());
+    if selected.audio_stream_index != source.selected_tracks.audio_stream_index {
+        selected.default_audio_stream_index = selected.audio_stream_index;
+    }
+    if selected.subtitle_external_url.is_none() && opened.subtitle_stream.is_none() {
+        selected.set_subtitle_track(None);
+    }
+    if selected == source.selected_tracks {
+        return;
+    }
+
+    // The response can be a server warning clip with an entirely different
+    // stream layout. Future track switches must use the resolved selection too.
+    source.selected_tracks = selected.clone();
+    let _ = event_tx.send(BackendEvent::new(
+        source.session_id,
+        BackendEventKind::PlaybackTracksChanged {
+            audio: opened
+                .stream_catalog
+                .tracks(ffi::AVMediaType::AVMEDIA_TYPE_AUDIO),
+            subtitles: opened
+                .stream_catalog
+                .tracks(ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE),
+            selected,
+        },
+    ));
+}
+
+fn stream_metadata(stream: StreamInfo, key: &CStr) -> Option<String> {
+    let entry =
+        unsafe { ffi::av_dict_get((*stream.stream).metadata, key.as_ptr(), std::ptr::null(), 0) };
+    if entry.is_null() || unsafe { (*entry).value.is_null() } {
+        return None;
+    }
+    let value = unsafe { CStr::from_ptr((*entry).value) }.to_string_lossy();
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 pub(in crate::player::backend::ffmpeg) fn initial_probe_profile(
@@ -239,7 +338,7 @@ fn probe_playback_input(
     cached_source: &CachedInputSource,
     control: Arc<FfmpegControl>,
     probe_profile: InputProbeProfile,
-    allow_audio_decoder_failure: bool,
+    allow_track_fallback: bool,
 ) -> std::result::Result<ProbedPlaybackInput, String> {
     let mut input = FormatContext::open(
         &source.url,
@@ -254,8 +353,8 @@ fn probe_playback_input(
     let video_stream = input
         .best_stream(ffi::AVMediaType::AVMEDIA_TYPE_VIDEO)?
         .ok_or_else(|| "FFmpeg 未找到可解码视频流".to_string())?;
-    let audio_stream = select_audio_stream(source, &input, allow_audio_decoder_failure)?;
-    let subtitle_stream = select_subtitle_stream(source, &input)?;
+    let audio_stream = select_audio_stream(source, &input, allow_track_fallback)?;
+    let subtitle_stream = select_subtitle_stream(source, &input, allow_track_fallback)?;
 
     Ok(ProbedPlaybackInput {
         input,
@@ -263,7 +362,7 @@ fn probe_playback_input(
         video_stream,
         audio_stream,
         subtitle_stream,
-        allow_audio_decoder_failure,
+        allow_audio_decoder_failure: allow_track_fallback,
     })
 }
 
@@ -298,15 +397,15 @@ fn open_decoders_for_probed_input(
 fn select_audio_stream(
     source: &FfmpegPlaybackInput,
     input: &FormatContext,
-    allow_audio_decoder_failure: bool,
+    allow_track_fallback: bool,
 ) -> std::result::Result<Option<StreamInfo>, String> {
-    select_audio_stream_for_selection(&source.selected_tracks, input, allow_audio_decoder_failure)
+    select_audio_stream_for_selection(&source.selected_tracks, input, allow_track_fallback)
 }
 
 fn select_audio_stream_for_selection(
     selected_tracks: &crate::player::PlaybackTrackSelection,
     input: &FormatContext,
-    allow_audio_decoder_failure: bool,
+    allow_track_fallback: bool,
 ) -> std::result::Result<Option<StreamInfo>, String> {
     let Some(stream_index) = selected_tracks.audio_stream_index else {
         return Ok(None);
@@ -318,9 +417,18 @@ fn select_audio_stream_for_selection(
             Some(stream)
         })
         .or_else(|error| {
-            if allow_audio_decoder_failure {
-                tracing::warn!(%error, "FFmpeg selected audio stream unavailable");
-                Ok(None)
+            if allow_track_fallback {
+                let stream = input.best_stream(ffi::AVMediaType::AVMEDIA_TYPE_AUDIO)?;
+                tracing::warn!(
+                    %error,
+                    requested_audio_stream_index = stream_index,
+                    actual_audio_stream_index = ?stream.map(|stream| stream.index),
+                    "FFmpeg selected audio stream unavailable; using actual media audio"
+                );
+                if let Some(stream) = stream {
+                    log_selected_audio_stream(selected_tracks, stream);
+                }
+                Ok(stream)
             } else {
                 Err(format!("FFmpeg 选择指定音频流失败：{error}"))
             }
@@ -396,13 +504,15 @@ fn stream_audio_params(stream: StreamInfo) -> (Option<c_int>, Option<c_int>) {
 fn select_subtitle_stream(
     source: &FfmpegPlaybackInput,
     input: &FormatContext,
+    allow_missing_track: bool,
 ) -> std::result::Result<Option<StreamInfo>, String> {
-    select_subtitle_stream_for_selection(&source.selected_tracks, input)
+    select_subtitle_stream_for_selection(&source.selected_tracks, input, allow_missing_track)
 }
 
 fn select_subtitle_stream_for_selection(
     selected_tracks: &crate::player::PlaybackTrackSelection,
     input: &FormatContext,
+    allow_missing_track: bool,
 ) -> std::result::Result<Option<StreamInfo>, String> {
     if selected_tracks.subtitle_external_url.is_some() {
         return Ok(None);
@@ -416,7 +526,18 @@ fn select_subtitle_stream_for_selection(
             log_selected_subtitle_stream(selected_tracks, stream);
             Some(stream)
         })
-        .map_err(|error| format!("FFmpeg 选择指定字幕流失败：{error}"))
+        .or_else(|error| {
+            if allow_missing_track {
+                tracing::warn!(
+                    %error,
+                    requested_subtitle_stream_index = stream_index,
+                    "FFmpeg selected subtitle stream unavailable; continuing without subtitles"
+                );
+                Ok(None)
+            } else {
+                Err(format!("FFmpeg 选择指定字幕流失败：{error}"))
+            }
+        })
 }
 
 pub(super) fn select_subtitle_stream_for_selection_from_catalog(
@@ -500,4 +621,27 @@ pub(super) fn load_external_subtitle_cue_list(
         })
         .transpose()
         .map(|cues| cues.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initial_position_for_duration;
+
+    #[test]
+    fn resume_is_reset_only_when_invalid_or_outside_known_duration() {
+        for (position, duration, expected) in [
+            (10.0, Some(10.0), 0.0),
+            (1200.0, Some(10.0), 0.0),
+            (9.5, Some(10.0), 9.5),
+            (1200.0, None, 1200.0),
+            (1200.0, Some(0.0), 1200.0),
+            (1200.0, Some(f64::NAN), 1200.0),
+            (0.0, Some(10.0), 0.0),
+            (-1.0, Some(10.0), 0.0),
+            (f64::NAN, Some(10.0), 0.0),
+            (f64::INFINITY, Some(10.0), 0.0),
+        ] {
+            assert_eq!(initial_position_for_duration(position, duration), expected);
+        }
+    }
 }

@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn resolved_input_tracks_replace_request_selection_and_ignore_stale_sessions() {
+    use crate::player::{PlaybackTrackSelection, backend::BackendLoadRequest};
+
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(2);
+    let requested = PlaybackTrackSelection {
+        audio_stream_index: Some(5),
+        subtitle_stream_index: Some(7),
+        ..Default::default()
+    };
+    backend.current_request = Some(BackendLoadRequest {
+        url: "file:///fixture.mkv".into(),
+        http_headers: Vec::new(),
+        content_length: None,
+        start_position_seconds: 0.0,
+        selected_tracks: requested.clone(),
+        cache_config: PlaybackCacheConfig::default(),
+    });
+    let resolved = PlaybackTrackSelection {
+        audio_stream_index: Some(1),
+        ..Default::default()
+    };
+    for session in [1, 2] {
+        backend
+            .event_tx
+            .send(BackendEvent::new(
+                PlaybackSessionId(session),
+                BackendEventKind::PlaybackTracksChanged {
+                    audio: Vec::new(),
+                    subtitles: Vec::new(),
+                    selected: resolved.clone(),
+                },
+            ))
+            .unwrap();
+        let events = backend.poll_events();
+        assert_eq!(events.len(), usize::from(session == 2));
+        assert_eq!(
+            backend.current_request.as_ref().unwrap().selected_tracks,
+            if session == 2 {
+                resolved.clone()
+            } else {
+                requested.clone()
+            }
+        );
+    }
+}
+
+#[test]
 fn ffmpeg_backend_maps_http_raw_input_rate_into_unified_cache_state() {
     let mut backend = FfmpegBackend::new().unwrap();
     backend.current_session_id = PlaybackSessionId(1);

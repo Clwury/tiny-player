@@ -33,13 +33,22 @@ use super::{SeriesDetailSelectKind, SeriesDetailState};
 
 const DETAIL_SELECT_MAX_VISIBLE_OPTIONS: usize = 5;
 const DETAIL_SELECT_OPTION_HEIGHT_PX: f32 = 28.0;
-const DETAIL_SELECT_MENU_MAX_HEIGHT_PX: f32 =
-    DETAIL_SELECT_OPTION_HEIGHT_PX * 5.0 + 4.0 * 4.0 + 6.0 * 2.0;
+const DETAIL_TWO_LINE_OPTION_HEIGHT_PX: f32 = 48.0;
 const DETAIL_SELECT_WIDTH_PX: f32 = 250.0;
 const DETAIL_SELECT_TOOLTIP_WIDTH_UNITS: usize = 30;
 const SEASON_SELECT_MIN_WIDTH_PX: f32 = 100.0;
 const SEASON_SELECT_MAX_WIDTH_PX: f32 = 320.0;
 const SEASON_SELECT_HORIZONTAL_PADDING_PX: f32 = 8.0;
+
+pub(super) fn reveal_two_line_option(scroll_handle: &ScrollHandle, option_index: usize) {
+    // On first open, GPUI's scroll_to_item has no previous viewport to inspect.
+    // Seed the offset from our fixed row heights; layout clamps it to the content.
+    let first_visible = option_index.saturating_sub(DETAIL_SELECT_MAX_VISIBLE_OPTIONS - 1);
+    scroll_handle.set_offset(gpui::point(
+        px(0.0),
+        px(-(first_visible as f32) * (DETAIL_TWO_LINE_OPTION_HEIGHT_PX + 4.0)),
+    ));
+}
 
 #[path = "render/controls.rs"]
 mod controls;
@@ -51,6 +60,8 @@ mod hero;
 mod people;
 #[path = "render/similar.rs"]
 mod similar;
+#[path = "render/video_metadata.rs"]
+mod video_metadata;
 
 fn has_studios(item: &MediaItem) -> bool {
     item.studios
@@ -226,6 +237,7 @@ fn detail_select_menu<T, I, E>(
     id: &'static str,
     option_count: usize,
     width: f32,
+    option_height: f32,
     scroll_handle: &ScrollHandle,
     cx: &Context<T>,
     children: I,
@@ -241,6 +253,7 @@ where
 
     div()
         .id(id)
+        .debug_selector(move || id.into())
         .absolute()
         .top(px(40.0))
         .left_0()
@@ -249,7 +262,9 @@ where
         .w(px(width))
         .max_w_full()
         .when(scrollable, |this| {
-            this.h(px(DETAIL_SELECT_MENU_MAX_HEIGHT_PX))
+            this.h(px(option_height * DETAIL_SELECT_MAX_VISIBLE_OPTIONS as f32
+                + 4.0 * 4.0
+                + 6.0 * 2.0))
         })
         .overflow_hidden()
         .rounded(px(8.0))
@@ -270,6 +285,7 @@ where
                 .p(px(4.0))
                 .when(scrollable, |this| {
                     this.size_full()
+                        .min_h_0()
                         .overflow_y_scroll()
                         .scrollbar_width(px(SCROLLBAR_WIDTH_PX))
                         .track_scroll(&content_scroll_handle)
@@ -291,10 +307,22 @@ fn detail_select_option<T>(
     id: impl Into<gpui::ElementId>,
     cx: &Context<T>,
 ) -> gpui::Stateful<gpui::Div> {
-    let theme = theme::get(cx);
     let show_tooltip = detail_select_label_needs_tooltip(&label);
     let tooltip_label = label.clone();
 
+    detail_select_option_container(selected, id, cx)
+        .when(show_tooltip, |this| {
+            this.tooltip(move |_, cx| text_tooltip(tooltip_label.clone(), cx))
+        })
+        .child(div().flex_1().min_w_0().truncate().child(label))
+}
+
+fn detail_select_option_container<T>(
+    selected: bool,
+    id: impl Into<gpui::ElementId>,
+    cx: &Context<T>,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = theme::get(cx);
     div()
         .id(id)
         .flex()
@@ -326,10 +354,62 @@ fn detail_select_option<T>(
                 theme.secondary_hover
             })
         })
+}
+
+fn detail_select_option_with_subtitle<T>(
+    label: String,
+    subtitle: Option<&str>,
+    selected: bool,
+    id: String,
+    cx: &Context<T>,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = theme::get(cx);
+    let subtitle = subtitle.map(str::trim).filter(|title| !title.is_empty());
+    let show_tooltip = detail_select_label_needs_tooltip(&label)
+        || subtitle.is_some_and(detail_select_label_needs_tooltip);
+    let tooltip_label = subtitle.map_or_else(|| label.clone(), |title| format!("{label}\n{title}"));
+    let label_id = format!("{id}-label");
+    let subtitle_id = format!("{id}-title");
+
+    detail_select_option_container(selected, id.clone(), cx)
+        .debug_selector(move || id.clone())
+        .h(px(DETAIL_TWO_LINE_OPTION_HEIGHT_PX))
+        .px_2()
+        .cursor_pointer()
         .when(show_tooltip, |this| {
             this.tooltip(move |_, cx| text_tooltip(tooltip_label.clone(), cx))
         })
-        .child(div().flex_1().min_w_0().truncate().child(label))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .debug_selector(move || label_id.clone())
+                        .truncate()
+                        .line_height(px(18.0))
+                        .child(label),
+                )
+                .when_some(subtitle, |this, subtitle| {
+                    this.child(
+                        div()
+                            .debug_selector(move || subtitle_id.clone())
+                            .truncate()
+                            .text_xs()
+                            .line_height(px(14.0))
+                            .font_weight(gpui::FontWeight::NORMAL)
+                            .text_color(if selected {
+                                theme.accent_text
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .child(subtitle.to_string()),
+                    )
+                }),
+        )
 }
 
 fn detail_select_label_needs_tooltip(label: &str) -> bool {

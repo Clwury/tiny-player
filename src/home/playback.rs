@@ -25,13 +25,13 @@ impl HomeContent {
         let user_data = playback_user_data_after_update(previous, &update);
 
         if !update.failed && update.position_ticks > 0 && !update.media_source_id.is_empty() {
-            let version = super::video_version::VideoVersion {
-                source_id: update.media_source_id.clone(),
-                name: update.media_source_name.clone(),
-            };
             for item_id in [&update.item_id, &update.list_item_id] {
-                self.played_video_versions
-                    .insert(item_id.clone(), version.clone());
+                let version = self
+                    .played_video_versions
+                    .entry(item_id.clone())
+                    .or_default();
+                version.source_id = update.media_source_id.clone();
+                version.name = update.media_source_name.clone();
             }
         }
 

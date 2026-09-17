@@ -298,6 +298,8 @@ pub struct MediaSource {
     #[serde(rename = "Type")]
     pub source_type: Option<String>,
     pub container: Option<String>,
+    pub size: Option<u64>,
+    pub bitrate: Option<u64>,
     pub media_streams: Option<Vec<MediaStream>>,
     pub default_subtitle_stream_index: Option<i32>,
 }
@@ -654,6 +656,8 @@ mod tests {
                         {
                             "Id": "source-1",
                             "Name": "1080p - 8 Mbps",
+                            "Size": 13249974108,
+                            "Bitrate": 38543210,
                             "MediaStreams": [
                                 { "Index": 0, "Type": "Video", "DisplayTitle": "1080p HEVC" },
                                 { "Index": 1, "Type": "Subtitle", "DisplayTitle": "简体中文" }
@@ -678,6 +682,8 @@ mod tests {
         assert_eq!(episode.primary_image_tag(), Some("episode-primary"));
         assert_eq!(source.display_name(0), "1080p - 8 Mbps");
         assert_eq!(source.name_label(0), "1080p - 8 Mbps");
+        assert_eq!(source.size, Some(13_249_974_108));
+        assert_eq!(source.bitrate, Some(38_543_210));
         assert_eq!(subtitles[0].display_label(0), "简体中文");
         assert_eq!(subtitles[0].display_title_label(0), "简体中文");
     }

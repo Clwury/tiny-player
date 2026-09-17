@@ -16,7 +16,8 @@ use crate::{
     },
     player::{
         EmbyPlaybackContext, PlaybackLanguagePreferences, PlaybackQueue, PlaybackQueueItem,
-        PlaybackRequest, PlaybackTrack, PlaybackTrackSelection, playback_initial_position_seconds,
+        PlaybackRequest, PlaybackTrack, PlaybackTrackPreferenceKey, PlaybackTrackSelection,
+        SavedTrackChoices, playback_initial_position_seconds,
     },
     server::CachedServer,
 };
@@ -42,6 +43,7 @@ struct SelectedPlayback {
     audio_tracks: Vec<PlaybackTrack>,
     subtitle_tracks: Vec<PlaybackTrack>,
     selected_tracks: PlaybackTrackSelection,
+    remember_subtitle_on_start: bool,
     run_time_ticks: Option<u64>,
     playback_position_ticks: Option<u64>,
     queue: PlaybackQueue,
@@ -69,10 +71,15 @@ mod navigation;
 #[path = "detail/selection.rs"]
 mod selection;
 
+#[cfg(test)]
+#[path = "detail/track_preferences_tests.rs"]
+mod track_preferences_tests;
+
 fn selected_playback(
     detail: &SeriesDetailState,
     server: &CachedServer,
     languages: PlaybackLanguagePreferences,
+    saved_tracks: &SavedTrackChoices,
 ) -> Result<SelectedPlayback, String> {
     let item = detail
         .selected_playback_item()
@@ -101,7 +108,12 @@ fn selected_playback(
     let audio_tracks = playback_audio_tracks(source);
     let item_id = source.playback_item_id(&item.id);
     let subtitle_tracks = playback_subtitle_tracks(source, server, item_id, &media_source_id);
-    let selected_tracks = playback_track_selection(detail, source, &subtitle_tracks, languages);
+    let mut selected_tracks =
+        crate::player::preferred_playback_track_selection(source, &subtitle_tracks, languages);
+    saved_tracks.apply(&audio_tracks, &subtitle_tracks, &mut selected_tracks);
+    let remember_subtitle_on_start = detail
+        .pending_subtitle_choice()
+        .is_some_and(|choice| choice.resolve(&subtitle_tracks).is_some());
     let playback_position_ticks = detail.playback_position_ticks();
     let mut queue = playback_queue(detail, item, &title);
     if let Some(current) = queue.items.get_mut(queue.current_index) {
@@ -118,6 +130,7 @@ fn selected_playback(
         audio_tracks,
         subtitle_tracks,
         selected_tracks,
+        remember_subtitle_on_start,
         run_time_ticks: item.run_time_ticks,
         playback_position_ticks,
         queue,
@@ -218,6 +231,7 @@ fn playback_queue_item(
         primary_image_tag: item.primary_image_tag().map(str::to_string),
         series_id,
         season_id,
+        premiere_date: item.premiere_date.clone(),
         run_time_ticks: item.run_time_ticks,
         playback_position_ticks: item.playback_position_ticks(),
         media_sources: item.media_sources.clone().unwrap_or_default(),
@@ -246,29 +260,6 @@ fn playback_subtitle_tracks(
     media_source_id: &str,
 ) -> Vec<PlaybackTrack> {
     crate::player::playback_subtitle_tracks_for_source(source, server, item_id, media_source_id)
-}
-
-fn playback_track_selection(
-    detail: &SeriesDetailState,
-    source: &crate::emby::MediaSource,
-    subtitle_tracks: &[PlaybackTrack],
-    languages: PlaybackLanguagePreferences,
-) -> PlaybackTrackSelection {
-    let mut selection =
-        crate::player::preferred_playback_track_selection(source, subtitle_tracks, languages);
-    let selected_subtitle =
-        detail
-            .selected_subtitle_index(languages.subtitle)
-            .and_then(|position| {
-                crate::player::playback_subtitle_track_at_position(
-                    source,
-                    subtitle_tracks,
-                    position,
-                )
-            });
-
-    selection.set_subtitle_track(selected_subtitle);
-    selection
 }
 
 #[cfg(test)]
@@ -326,10 +317,12 @@ mod tests {
                         "ParentIndexNumber": 1,
                         "IndexNumber": 1,
                         "Overview": "First episode overview",
+                        "PremiereDate": "1998-04-03T00:00:00.0000000Z",
+                        "RunTimeTicks": 14_550_000_000_u64,
                         "ImageTags": {"Primary": "first-cover"},
                         "Type": "Episode",
                         "SeasonId": "season-1",
-                        "MediaSources": [{ "Id": "source-1" }]
+                        "MediaSources": [{ "Id": "source-1", "Size": 1320702444 }]
                     },
                     {
                         "Id": "episode-next-season",
@@ -368,6 +361,12 @@ mod tests {
         assert_eq!(current.episode_label.as_ref(), "S1E1: First");
         assert_eq!(current.overview.as_deref(), Some("First episode overview"));
         assert_eq!(current.primary_image_tag.as_deref(), Some("first-cover"));
+        assert_eq!(
+            current.premiere_date.as_deref(),
+            Some("1998-04-03T00:00:00.0000000Z")
+        );
+        assert_eq!(current.run_time_ticks, Some(14_550_000_000));
+        assert_eq!(current.media_sources[0].size, Some(1_320_702_444));
     }
 
     #[test]
@@ -389,7 +388,7 @@ mod tests {
         })).unwrap());
         detail.sync_media_source_selection();
         assert_eq!(
-            detail.selected_subtitle_label(TrackLanguage::Default),
+            detail.selected_subtitle_label(TrackLanguage::Default, None),
             "English"
         );
         let languages = PlaybackLanguagePreferences {
@@ -397,20 +396,27 @@ mod tests {
             subtitle: TrackLanguage::ChineseSimplified,
         };
         assert_eq!(
-            detail.selected_subtitle_label(languages.subtitle),
+            detail.selected_subtitle_label(languages.subtitle, None),
             "简体中文"
         );
-        let selected = selected_playback(&detail, &server(), languages).unwrap();
+        let selected =
+            selected_playback(&detail, &server(), languages, &SavedTrackChoices::default())
+                .unwrap();
         assert_eq!(selected.selected_tracks.audio_stream_index, Some(3));
         assert_eq!(selected.selected_tracks.subtitle_stream_index, Some(7));
 
-        detail.selected_subtitle_index = Some(0);
+        let saved = SavedTrackChoices {
+            subtitle: Some(crate::player::SavedTrackChoice::from_track(
+                selected.subtitle_tracks.first(),
+            )),
+            ..Default::default()
+        };
         detail.sync_media_source_selection();
         assert_eq!(
-            detail.selected_subtitle_label(languages.subtitle),
+            detail.selected_subtitle_label(languages.subtitle, saved.subtitle.as_ref()),
             "English"
         );
-        let selected = selected_playback(&detail, &server(), languages).unwrap();
+        let selected = selected_playback(&detail, &server(), languages, &saved).unwrap();
         assert_eq!(selected.selected_tracks.subtitle_stream_index, Some(4));
     }
 
@@ -423,6 +429,8 @@ mod tests {
             path: None,
             source_type: None,
             container: None,
+            size: None,
+            bitrate: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(3),
                 stream_type: Some("Subtitle".to_string()),
@@ -467,6 +475,8 @@ mod tests {
             path: None,
             source_type: None,
             container: None,
+            size: None,
+            bitrate: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(3),
                 stream_type: Some("Subtitle".to_string()),
@@ -506,6 +516,8 @@ mod tests {
             path: None,
             source_type: None,
             container: None,
+            size: None,
+            bitrate: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(2),
                 stream_type: Some("Subtitle".to_string()),
@@ -542,6 +554,8 @@ mod tests {
             path: None,
             source_type: None,
             container: None,
+            size: None,
+            bitrate: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(2),
                 stream_type: Some("Subtitle".to_string()),

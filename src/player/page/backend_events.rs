@@ -102,6 +102,26 @@ impl PlaybackPage {
             BackendEventKind::PlaybackAudioInfoChanged(info) => {
                 self.playback_audio_info = info;
             }
+            BackendEventKind::PlaybackTracksChanged {
+                audio,
+                mut subtitles,
+                selected,
+            } => {
+                // Do not save an automatic subtitle fallback as the user's
+                // preference. An unchanged valid detail selection still saves
+                // normally when playback starts.
+                if selected.subtitle_stream_index != self.tracks.selected_subtitle_stream_index {
+                    self.remember_subtitle_on_start = false;
+                }
+                subtitles.extend(
+                    self.tracks
+                        .subtitles
+                        .iter()
+                        .filter(|track| track.is_external)
+                        .cloned(),
+                );
+                self.tracks = TrackSelectState::new(audio, subtitles, selected);
+            }
             BackendEventKind::SubtitleChanged(cue) => {
                 if self.subtitle.active != cue {
                     defer_drop_subtitle(self.subtitle.active.take(), window);
@@ -392,12 +412,283 @@ mod tests {
     use crate::player::backend::{
         ByteCacheState, DemuxCacheState, PlaybackCacheState, PlaybackCacheTimeRange,
     };
+    use crate::player::{
+        PlaybackTrack, PlaybackTrackKind, PlaybackTrackPreferences, SavedTrackChoice,
+    };
 
     use super::{
-        apply_cache_buffering_to_timeline, apply_paused_for_cache_to_timeline,
-        apply_playback_restart_to_timeline, cache_state_needs_poll,
+        BackendEvent, BackendEventKind, apply_cache_buffering_to_timeline,
+        apply_paused_for_cache_to_timeline, apply_playback_restart_to_timeline,
+        cache_state_needs_poll,
     };
     use crate::player::page::state::PlaybackTimelineState;
+
+    #[gpui::test]
+    fn resolved_stream_tracks_update_menus_without_saving_automatic_subtitle_off(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        cx.update(|window, cx| {
+            page.update(cx, |page, cx| {
+                let original_subtitle = PlaybackTrack::new(7, "Chinese Simplified (ASS)", false);
+                let external = PlaybackTrack::new(8, "External subtitle", true)
+                    .with_external_url(Some("https://example.invalid/sub.srt".into()));
+                page.tracks.audio = vec![PlaybackTrack::new(5, "Original audio", false)];
+                page.tracks.subtitles = vec![original_subtitle.clone(), external.clone()];
+                page.tracks.selected_audio_stream_index = Some(5);
+                page.tracks.selected_subtitle_stream_index = Some(7);
+                page.remember_subtitle_on_start = true;
+                PlaybackTrackPreferences::remember(
+                    &page.emby.server,
+                    std::slice::from_ref(&page.track_preference_key),
+                    PlaybackTrackKind::Subtitle,
+                    Some(&original_subtitle),
+                    cx,
+                );
+                let saved = PlaybackTrackPreferences::get(
+                    &page.emby.server,
+                    &page.track_preference_key,
+                    cx,
+                )
+                .subtitle;
+                let audio = vec![PlaybackTrack::new(1, "Warning audio", false)];
+                page.apply_backend_event(
+                    BackendEvent::new(
+                        Default::default(),
+                        BackendEventKind::PlaybackTracksChanged {
+                            audio: audio.clone(),
+                            subtitles: Vec::new(),
+                            selected: crate::player::PlaybackTrackSelection {
+                                audio_stream_index: Some(1),
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    window,
+                    cx,
+                );
+                assert_eq!(page.tracks.audio, audio);
+                assert_eq!(page.tracks.subtitles, vec![external]);
+                assert_eq!(page.tracks.selected_audio_stream_index, Some(1));
+                assert!(page.tracks.selected_subtitle_stream_index.is_none());
+                assert!(!page.remember_subtitle_on_start);
+                page.apply_backend_event(
+                    BackendEvent::new(Default::default(), BackendEventKind::PlaybackRestart),
+                    window,
+                    cx,
+                );
+                assert!(page.timeline.loaded);
+                assert!(page.error_message.is_none());
+                assert_eq!(
+                    PlaybackTrackPreferences::get(
+                        &page.emby.server,
+                        &page.track_preference_key,
+                        cx,
+                    )
+                    .subtitle,
+                    saved
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn audio_fallback_keeps_valid_detail_subtitle_pending_until_playback_starts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        cx.update(|window, cx| {
+            page.update(cx, |page, cx| {
+                let subtitle = PlaybackTrack::new(7, "Chinese Simplified (ASS)", false);
+                page.tracks.subtitles = vec![subtitle.clone()];
+                page.tracks.selected_subtitle_stream_index = Some(7);
+                page.remember_subtitle_on_start = true;
+                page.apply_backend_event(
+                    BackendEvent::new(
+                        Default::default(),
+                        BackendEventKind::PlaybackTracksChanged {
+                            audio: vec![PlaybackTrack::new(1, "Audio", false)],
+                            subtitles: vec![subtitle.clone()],
+                            selected: crate::player::PlaybackTrackSelection {
+                                audio_stream_index: Some(1),
+                                subtitle_stream_index: Some(7),
+                                ..Default::default()
+                            },
+                        },
+                    ),
+                    window,
+                    cx,
+                );
+                assert!(page.remember_subtitle_on_start);
+                page.apply_backend_event(
+                    BackendEvent::new(Default::default(), BackendEventKind::PlaybackRestart),
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    PlaybackTrackPreferences::get(
+                        &page.emby.server,
+                        &page.track_preference_key,
+                        cx,
+                    )
+                    .subtitle,
+                    Some(SavedTrackChoice::from_track(Some(&subtitle)))
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn detail_subtitle_is_saved_only_after_backend_start(cx: &mut gpui::TestAppContext) {
+        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        cx.update(|window, cx| {
+            page.update(cx, |page, cx| {
+                page.timeline.loaded = false;
+                page.tracks.subtitles =
+                    vec![PlaybackTrack::new(9, "Chinese Simplified (ASS)", false)];
+                page.tracks.selected_subtitle_stream_index = Some(9);
+                page.remember_subtitle_on_start = true;
+                PlaybackTrackPreferences::remember(
+                    &page.emby.server,
+                    std::slice::from_ref(&page.track_preference_key),
+                    PlaybackTrackKind::Subtitle,
+                    None,
+                    cx,
+                );
+                page.apply_backend_event(
+                    BackendEvent::new(Default::default(), BackendEventKind::PositionChanged(1.0)),
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    PlaybackTrackPreferences::get(
+                        &page.emby.server,
+                        &page.track_preference_key,
+                        cx
+                    )
+                    .subtitle,
+                    Some(SavedTrackChoice::Off)
+                );
+
+                page.apply_backend_event(
+                    BackendEvent::new(Default::default(), BackendEventKind::PlaybackRestart),
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    PlaybackTrackPreferences::get(
+                        &page.emby.server,
+                        &page.track_preference_key,
+                        cx
+                    )
+                    .subtitle,
+                    Some(SavedTrackChoice::from_track(page.tracks.subtitles.first()))
+                );
+                assert!(!page.remember_subtitle_on_start);
+
+                // A later player change must not be replaced by the consumed detail draft.
+                PlaybackTrackPreferences::remember(
+                    &page.emby.server,
+                    std::slice::from_ref(&page.track_preference_key),
+                    PlaybackTrackKind::Subtitle,
+                    None,
+                    cx,
+                );
+                page.apply_backend_event(
+                    BackendEvent::new(Default::default(), BackendEventKind::PlaybackRestart),
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    PlaybackTrackPreferences::get(
+                        &page.emby.server,
+                        &page.track_preference_key,
+                        cx
+                    )
+                    .subtitle,
+                    Some(SavedTrackChoice::Off)
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn failed_or_aborted_playback_does_not_save_detail_subtitle(cx: &mut gpui::TestAppContext) {
+        for failure in [
+            Some(BackendEventKind::LoadFailed("unavailable".into())),
+            Some(BackendEventKind::Fatal("decoder failed".into())),
+            None,
+        ] {
+            let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+            cx.update(|window, cx| {
+                page.update(cx, |page, cx| {
+                    page.timeline.loaded = false;
+                    page.tracks.subtitles =
+                        vec![PlaybackTrack::new(9, "Chinese Simplified (ASS)", false)];
+                    page.tracks.selected_subtitle_stream_index = Some(9);
+                    page.remember_subtitle_on_start = true;
+                    PlaybackTrackPreferences::remember(
+                        &page.emby.server,
+                        std::slice::from_ref(&page.track_preference_key),
+                        PlaybackTrackKind::Subtitle,
+                        None,
+                        cx,
+                    );
+                    if let Some(failure) = failure {
+                        page.apply_backend_event(
+                            BackendEvent::new(Default::default(), failure),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        page.close_playback_reporting(false, false);
+                    }
+                    page.apply_backend_event(
+                        BackendEvent::new(Default::default(), BackendEventKind::PlaybackRestart),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        PlaybackTrackPreferences::get(
+                            &page.emby.server,
+                            &page.track_preference_key,
+                            cx
+                        )
+                        .subtitle,
+                        Some(SavedTrackChoice::Off)
+                    );
+                });
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn starting_automatic_subtitle_does_not_create_an_explicit_preference(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        cx.update(|window, cx| {
+            page.update(cx, |page, cx| {
+                page.tracks.subtitles =
+                    vec![PlaybackTrack::new(10, "Chinese Simplified (ASS)", false)];
+                page.tracks.selected_subtitle_stream_index = Some(10);
+                page.apply_backend_event(
+                    BackendEvent::new(Default::default(), BackendEventKind::PlaybackRestart),
+                    window,
+                    cx,
+                );
+                assert!(
+                    PlaybackTrackPreferences::get(
+                        &page.emby.server,
+                        &page.track_preference_key,
+                        cx
+                    )
+                    .subtitle
+                    .is_none()
+                );
+            });
+        });
+    }
 
     fn byte_cache_state(idle: bool, download_fraction: Option<f64>) -> ByteCacheState {
         ByteCacheState {

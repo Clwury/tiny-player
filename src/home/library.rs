@@ -76,6 +76,7 @@ impl HomeContent {
         let Some(item_types) = library_item_types(view.collection_type.as_deref()) else {
             return;
         };
+        self.item_context_menu = None;
         let (should_load, clear_items) = {
             let state = self
                 .libraries

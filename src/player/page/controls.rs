@@ -271,10 +271,16 @@ fn format_cache_bytes(bytes: u64) -> String {
 
 pub(super) fn track_select_option(
     label: impl Into<SharedString>,
+    metadata: impl Into<SharedString>,
     selected: bool,
+    id: String,
     cx: &Context<PlaybackPage>,
-) -> gpui::Div {
+) -> gpui::Stateful<gpui::Div> {
     let theme = theme::media_overlay(cx);
+    let label = label.into();
+    let metadata = metadata.into();
+    let label_id = format!("{id}-label");
+    let metadata_id = format!("{id}-metadata");
     let hover_background = if selected {
         theme.input_border_focused.opacity(0.34)
     } else {
@@ -282,13 +288,15 @@ pub(super) fn track_select_option(
     };
 
     div()
+        .id(id.clone())
+        .debug_selector(move || id.clone())
         .flex()
         .flex_none()
-        .h(px(32.0))
-        .min_h(px(32.0))
+        .h(px(48.0))
+        .min_h(px(48.0))
         .items_center()
         .rounded(px(6.0))
-        .px_1()
+        .px_2()
         .text_sm()
         .font_weight(if selected {
             gpui::FontWeight::SEMIBOLD
@@ -307,7 +315,31 @@ pub(super) fn track_select_option(
         })
         .cursor_pointer()
         .hover(move |style| style.bg(hover_background))
-        .child(div().flex_1().min_w_0().truncate().child(label.into()))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .debug_selector(move || label_id.clone())
+                        .truncate()
+                        .line_height(px(18.0))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .debug_selector(move || metadata_id.clone())
+                        .truncate()
+                        .text_xs()
+                        .line_height(px(14.0))
+                        .font_weight(gpui::FontWeight::NORMAL)
+                        .text_color(theme.foreground.opacity(if selected { 0.9 } else { 0.72 }))
+                        .child(metadata),
+                ),
+        )
 }
 
 pub(super) fn valid_frame_rate(frame_rate: f64) -> Option<f64> {

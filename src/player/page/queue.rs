@@ -149,8 +149,17 @@ impl PlaybackPage {
         let mut queue = self.queue.clone();
         queue.current_index = target_index;
         let languages = crate::player::PlaybackLanguagePreferences::get(cx);
+        let saved_tracks = preferred_playback_media_source(&target.media_sources)
+            .and_then(|source| {
+                Some(crate::player::PlaybackTrackPreferenceKey {
+                    item_id: source.playback_item_id(&target.item_id).to_string(),
+                    media_source_id: source.id.clone()?,
+                })
+            })
+            .map(|key| crate::player::PlaybackTrackPreferences::get(&server, &key, cx))
+            .unwrap_or_default();
         let task = cx.background_spawn(async move {
-            resolve_queue_playback_request(client, server, queue, target, languages)
+            resolve_queue_playback_request(client, server, queue, target, languages, saved_tracks)
         });
         cx.spawn(async move |page, cx| {
             let result = task.await;
@@ -264,6 +273,7 @@ fn resolve_queue_playback_request(
     queue: PlaybackQueue,
     item: PlaybackQueueItem,
     languages: crate::player::PlaybackLanguagePreferences,
+    saved_tracks: crate::player::SavedTrackChoices,
 ) -> Result<PlaybackRequest> {
     let source = preferred_playback_media_source(&item.media_sources)
         .ok_or_else(|| anyhow!("目标单集没有可用视频源"))?;
@@ -294,7 +304,13 @@ fn resolve_queue_playback_request(
     let audio_tracks = playback_audio_tracks_for_source(source);
     let subtitle_tracks =
         playback_subtitle_tracks_for_source(source, &server, &playback_item_id, &media_source_id);
-    let selected_tracks = preferred_playback_track_selection(source, &subtitle_tracks, languages);
+    let mut selected_tracks =
+        preferred_playback_track_selection(source, &subtitle_tracks, languages);
+    saved_tracks.apply(&audio_tracks, &subtitle_tracks, &mut selected_tracks);
+    let track_preference_key = crate::player::PlaybackTrackPreferenceKey {
+        item_id: requested_item_id.to_string(),
+        media_source_id: selected_media_source_id,
+    };
     let initial_position_seconds =
         playback_initial_position_seconds(item.playback_position_ticks, item.run_time_ticks);
 
@@ -306,6 +322,8 @@ fn resolve_queue_playback_request(
         audio_tracks,
         subtitle_tracks,
         selected_tracks,
+        track_preference_key,
+        remember_subtitle_on_start: false,
         initial_position_seconds,
         queue,
         emby: EmbyPlaybackContext {
@@ -371,6 +389,7 @@ mod tests {
             primary_image_tag: None,
             series_id: Some("series-1".to_string()),
             season_id: Some("season-1".to_string()),
+            premiere_date: None,
             run_time_ticks: None,
             playback_position_ticks: None,
             media_sources: Vec::new(),
@@ -385,6 +404,8 @@ mod tests {
             path: None,
             source_type: source_type.map(ToString::to_string),
             container: None,
+            size: None,
+            bitrate: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(0),
                 stream_type: Some("Video".to_string()),

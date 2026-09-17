@@ -68,7 +68,7 @@ impl HomeContent {
         self.open_resume_item_detail(&item, cx);
     }
 
-    fn user_item_by_id(&self, item_id: &str) -> Option<UserItem> {
+    pub(in crate::home) fn user_item_by_id(&self, item_id: &str) -> Option<UserItem> {
         let current_route_item = match self.navigation.current() {
             HomeRoute::Root(HomeRoot::Favorites) | HomeRoute::FavoriteItems { .. } => {
                 self.favorites.items().find(|item| item.id == item_id)
@@ -108,7 +108,7 @@ impl HomeContent {
         Some(self.effective_user_item(item).into_owned())
     }
 
-    fn resume_item_by_id(&self, item_id: &str) -> Option<ResumeItem> {
+    pub(in crate::home) fn resume_item_by_id(&self, item_id: &str) -> Option<ResumeItem> {
         let item = self
             .resume_items
             .as_ref()?
@@ -127,7 +127,7 @@ impl HomeContent {
             .resume_media_item_id()
             .and_then(|id| self.played_video_versions.get(id))
             .cloned();
-        self.resume_item_context_menu = None;
+        self.item_context_menu = None;
         self.clear_all_notifications();
         if let Some(current) = self.series_detail.take() {
             self.detail_history.push(current);
@@ -209,6 +209,7 @@ impl HomeContent {
             detail,
             &self.current_server,
             PlaybackLanguagePreferences::get(cx),
+            &detail.selected_track_choices(&self.current_server, cx),
         ) {
             Ok(selected) => selected,
             Err(error) => {
@@ -293,6 +294,15 @@ impl HomeContent {
         match result {
             Ok(playback) => {
                 detail.playback_failed = None;
+                let track_preference_key = PlaybackTrackPreferenceKey {
+                    item_id: selected.item_id,
+                    media_source_id: selected.media_source_id,
+                };
+                // The request now owns the draft. Returning from playback should
+                // reflect the player's latest choice, not the old detail draft.
+                detail
+                    .pending_subtitle_choices
+                    .remove(&track_preference_key);
                 let initial_position_seconds = playback_initial_position_seconds(
                     selected.playback_position_ticks,
                     selected.run_time_ticks,
@@ -305,6 +315,8 @@ impl HomeContent {
                     audio_tracks: selected.audio_tracks,
                     subtitle_tracks: selected.subtitle_tracks,
                     selected_tracks: selected.selected_tracks,
+                    track_preference_key,
+                    remember_subtitle_on_start: selected.remember_subtitle_on_start,
                     initial_position_seconds,
                     queue: selected.queue,
                     emby: EmbyPlaybackContext {

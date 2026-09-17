@@ -267,6 +267,9 @@ impl PlaybackPage {
         report.playlist_index = playlist_index;
 
         self.reporting.phase = PlaybackReportingPhase::Started;
+        if std::mem::take(&mut self.remember_subtitle_on_start) {
+            self.remember_track_choice(PlaybackTrackKind::Subtitle, cx);
+        }
         self.reporting.last_progress_snapshot = Some(snapshot);
         let _ = self
             .reporting

@@ -98,6 +98,7 @@ impl PlaybackPage {
             .fold(
                 div()
                     .id(id)
+                    .debug_selector(move || id.to_string())
                     .absolute()
                     .right_0()
                     .bottom(px(32.0))
@@ -119,9 +120,14 @@ impl PlaybackPage {
                         cx.stop_propagation();
                     })
                     .child(
-                        track_select_option("Off", off_selected, cx)
-                            .id("playback-track-off-option")
-                            .on_mouse_down(MouseButton::Left, off_mouse_down),
+                        track_select_option(
+                            "Off",
+                            "off",
+                            off_selected,
+                            "playback-track-off-option".into(),
+                            cx,
+                        )
+                        .on_mouse_down(MouseButton::Left, off_mouse_down),
                     ),
                 |this, (index, track)| {
                     let track = track.clone();
@@ -132,6 +138,7 @@ impl PlaybackPage {
                     } else {
                         track.label.to_string()
                     };
+                    let metadata = track.metadata_label();
                     let on_mouse_down =
                         cx.listener(move |page: &mut PlaybackPage, _, window, cx| {
                             cx.stop_propagation();
@@ -145,12 +152,14 @@ impl PlaybackPage {
                             }
                         });
                     this.child(
-                        track_select_option(label, selected, cx)
-                            .id((
-                                gpui::ElementId::from("playback-track-option"),
-                                index.to_string(),
-                            ))
-                            .on_mouse_down(MouseButton::Left, on_mouse_down),
+                        track_select_option(
+                            label,
+                            metadata,
+                            selected,
+                            format!("playback-track-option-{index}"),
+                            cx,
+                        )
+                        .on_mouse_down(MouseButton::Left, on_mouse_down),
                     )
                 },
             )
@@ -605,9 +614,21 @@ impl PlaybackPage {
             // Reserve space inside the panel for the time below the progress track.
             .pb(px(8.0))
             .shadow_lg()
-            // Leave blank space and labels inert without passing input through
+            // Blank space and labels dismiss popups without passing input through
             // to the video. Buttons and the progress track handle their own input.
             .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(Self::close_track_select_on_mouse_down),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(Self::close_track_select_on_mouse_down),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(Self::close_track_select_on_mouse_down),
+            )
             // Hover still keeps the controls and cursor visible.
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .text_xs()

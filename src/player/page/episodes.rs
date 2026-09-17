@@ -8,6 +8,9 @@ use crate::{
 
 use super::*;
 
+mod metadata;
+use metadata::episode_metadata_label;
+
 const EPISODE_LIST_WIDTH_PX: f32 = 420.0;
 const EPISODE_ROW_HEIGHT_PX: f32 = 120.0;
 // Match the detail page's cached episode covers.
@@ -245,11 +248,35 @@ impl PlaybackPage {
             )
     }
 
+    fn episode_file_size(&self, index: usize) -> Option<u64> {
+        let item = self.queue.items.get(index)?;
+        if index == self.queue.current_index {
+            return self.content_length.filter(|size| *size > 0).or_else(|| {
+                [
+                    &self.emby.media_source_id,
+                    &self.track_preference_key.media_source_id,
+                ]
+                .into_iter()
+                .find_map(|source_id| {
+                    item.media_sources
+                        .iter()
+                        .find(|source| source.id.as_ref() == Some(source_id))
+                        .and_then(|source| source.size)
+                        .filter(|size| *size > 0)
+                })
+            });
+        }
+        request::preferred_playback_media_source(&item.media_sources)
+            .and_then(|source| source.size)
+            .filter(|size| *size > 0)
+    }
+
     fn render_episode_card(&self, index: usize, cx: &Context<Self>) -> gpui::Div {
         let theme = theme::media_overlay(cx);
         let item = &self.queue.items[index];
         let selected = index == self.queue.current_index;
         let label = item.episode_label.clone();
+        let metadata = episode_metadata_label(item, self.episode_file_size(index));
         let overview = item
             .overview
             .as_deref()
@@ -351,6 +378,19 @@ impl PlaybackPage {
                                 .child(label.clone())
                                 .tooltip(move |_, cx| text_tooltip(label.clone(), cx)),
                         )
+                        .when_some(metadata, |this, metadata| {
+                            this.child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("playback-episode-metadata-{index}")
+                                    })
+                                    .truncate()
+                                    .text_xs()
+                                    .line_height(px(16.0))
+                                    .text_color(theme.muted_foreground)
+                                    .child(metadata),
+                            )
+                        })
                         .when_some(overview, |this, overview| {
                             this.child(
                                 div()

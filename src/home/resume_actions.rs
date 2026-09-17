@@ -1,4 +1,4 @@
-use gpui::{AppContext as _, Context, MouseDownEvent, Pixels, Point, Window};
+use gpui::{AppContext as _, Context};
 
 use crate::emby::{ResumeItems, UserItemData};
 
@@ -6,12 +6,6 @@ use super::{
     HomeContent, WorkspaceIdentity,
     notification::{HOME_RESUME_ACTION_NOTIFICATION_KEY, NotificationScope},
 };
-
-#[derive(Clone, Debug)]
-pub(super) struct ResumeItemContextMenu {
-    pub(super) item_id: String,
-    pub(super) position: Point<Pixels>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ResumeItemAction {
@@ -34,35 +28,6 @@ enum ResumeItemActionResponse {
 }
 
 impl HomeContent {
-    pub(super) fn open_resume_item_context_menu(
-        &mut self,
-        item_id: String,
-        position: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
-        if item_id.trim().is_empty()
-            || self
-                .resume_items
-                .as_ref()
-                .is_none_or(|items| !items.items.iter().any(|item| item.id == item_id))
-        {
-            return;
-        }
-        self.resume_item_context_menu = Some(ResumeItemContextMenu { item_id, position });
-        cx.notify();
-    }
-
-    pub(super) fn close_resume_item_context_menu(
-        &mut self,
-        _: &MouseDownEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.resume_item_context_menu.take().is_some() {
-            cx.notify();
-        }
-    }
-
     pub(super) fn start_resume_item_action(
         &mut self,
         item_id: String,
@@ -81,7 +46,7 @@ impl HomeContent {
             return;
         }
 
-        self.resume_item_context_menu = None;
+        self.item_context_menu = None;
         self.clear_notification(NotificationScope::Home, HOME_RESUME_ACTION_NOTIFICATION_KEY);
         self.resume_item_requests.insert(item_id.clone());
         cx.notify();

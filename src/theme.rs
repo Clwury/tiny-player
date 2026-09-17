@@ -52,6 +52,17 @@ impl ColorTheme {
 }
 
 #[derive(Debug, PartialEq)]
+pub struct ContextMenuColors {
+    pub background: Hsla,
+    pub border: Hsla,
+    pub foreground: Hsla,
+    pub hover_background: Hsla,
+    pub disabled_foreground: Hsla,
+    pub destructive_foreground: Hsla,
+    pub destructive_hover_background: Hsla,
+}
+
+#[derive(Debug, PartialEq)]
 pub struct TinyTheme {
     pub selection: ColorTheme,
     pub background: Hsla,
@@ -74,6 +85,7 @@ pub struct TinyTheme {
     pub muted_foreground: Hsla,
     pub placeholder_foreground: Hsla,
     pub dialog_background: Hsla,
+    pub context_menu: ContextMenuColors,
     pub overlay: Hsla,
     pub warning: Hsla,
     pub error: Hsla,
@@ -230,6 +242,21 @@ impl TinyTheme {
         } else {
             palette.title_bar
         };
+        let error = if light {
+            palette.error.blend(black.opacity(0.25))
+        } else {
+            palette.error
+        };
+        let menu_background = background.blend(if light {
+            white.opacity(0.90)
+        } else {
+            foreground.opacity(0.08)
+        });
+        let menu_foreground = foreground.blend(if light {
+            black.opacity(0.08)
+        } else {
+            white.opacity(0.08)
+        });
 
         Self {
             selection,
@@ -245,6 +272,33 @@ impl TinyTheme {
             } else {
                 foreground.opacity(0.04)
             }),
+            // Menus overlay artwork as well as panels. Composite every fill on
+            // their own opaque surface so hover and text contrast stay stable.
+            context_menu: ContextMenuColors {
+                background: menu_background,
+                border: menu_background.blend(foreground.opacity(0.26)),
+                foreground: menu_foreground,
+                hover_background: menu_background.blend(accent.opacity(if light {
+                    0.16
+                } else {
+                    0.22
+                })),
+                disabled_foreground: menu_background.blend(menu_foreground.opacity(if light {
+                    0.78
+                } else {
+                    0.68
+                })),
+                destructive_foreground: error.blend(if light {
+                    black.opacity(0.06)
+                } else {
+                    white.opacity(0.30)
+                }),
+                destructive_hover_background: menu_background.blend(error.opacity(if light {
+                    0.14
+                } else {
+                    0.18
+                })),
+            },
             // Opaque, composited fills keep hover/selection consistent on every surface.
             secondary_hover: background.blend(foreground.opacity(if light { 0.16 } else { 0.08 })),
             element_selected: background.blend(accent.opacity(if light { 0.10 } else { 0.16 })),
@@ -283,11 +337,7 @@ impl TinyTheme {
             } else {
                 palette.warning
             },
-            error: if light {
-                palette.error.blend(black.opacity(0.25))
-            } else {
-                palette.error
-            },
+            error,
             scrollbar_track: background.opacity(0.0),
             scrollbar_thumb: palette.scrollbar_thumb.blend(foreground.opacity(0.18)),
             scrollbar_thumb_hover: palette.scrollbar_thumb.blend(foreground.opacity(0.46)),
@@ -528,6 +578,34 @@ mod tests {
             ] {
                 assert!(contrast_ratio(text, surface) >= 4.5, "{selection:?}");
             }
+            let menu = &theme.context_menu;
+            for (text, surface) in [
+                (menu.foreground, menu.background),
+                (menu.foreground, menu.hover_background),
+                (menu.disabled_foreground, menu.background),
+                (menu.destructive_foreground, menu.background),
+                (
+                    menu.destructive_foreground,
+                    menu.destructive_hover_background,
+                ),
+            ] {
+                assert_eq!(surface.a, 1.0, "{selection:?} menu surface must be opaque");
+                assert_eq!(text.a, 1.0, "{selection:?} menu text must be opaque");
+                assert!(
+                    contrast_ratio(text, surface) >= 4.5,
+                    "{selection:?} menu text"
+                );
+            }
+            for hover in [menu.hover_background, menu.destructive_hover_background] {
+                assert!(
+                    contrast_ratio(hover, menu.background) >= 1.2,
+                    "{selection:?} menu hover"
+                );
+            }
+            assert!(
+                contrast_ratio(menu.border, menu.background) >= 1.4,
+                "{selection:?} menu border"
+            );
             assert_ne!(theme.background, theme.panel_background);
             assert_ne!(theme.background, theme.dialog_background);
             assert_ne!(theme.secondary_hover, theme.element_selected);

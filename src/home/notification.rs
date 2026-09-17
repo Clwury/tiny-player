@@ -57,6 +57,26 @@ impl HomeNotificationKey {
 }
 
 impl HomeContent {
+    pub(super) fn item_action_notification(
+        &self,
+        item_id: &str,
+        action: &str,
+    ) -> (NotificationScope, SharedString) {
+        let prefix = match self.navigation.current() {
+            HomeRoute::Library { view_id, .. } => format!("library:{view_id}"),
+            HomeRoute::FavoriteItems { item_type } => format!("favorites:{}", item_type.as_str()),
+            HomeRoute::Root(HomeRoot::Favorites) => "favorites".into(),
+            HomeRoute::Root(HomeRoot::Search) => "search".into(),
+            HomeRoute::Root(HomeRoot::Home) => "home".into(),
+            HomeRoute::Detail { .. } => "detail".into(),
+        };
+        (
+            self.current_notification_scope()
+                .unwrap_or(NotificationScope::Home),
+            format!("{prefix}:{action}:{item_id}").into(),
+        )
+    }
+
     pub(super) fn push_error_notification(
         &mut self,
         scope: NotificationScope,

@@ -125,6 +125,53 @@ mod tests {
     }
 
     #[gpui::test]
+    fn track_choices_do_not_write_application_settings(cx: &mut TestAppContext) {
+        use crate::player::{
+            PlaybackTrackKind, PlaybackTrackPreferenceKey, PlaybackTrackPreferences,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let server = serde_json::from_value(serde_json::json!({
+            "id": "local", "user_id": "user",
+            "endpoint": {"protocol": "Https", "address": "example.com", "port": 443, "path": ""},
+            "username": "test", "password": "", "added_at_unix": 0
+        }))
+        .unwrap();
+        cx.update(theme::init);
+        let (app, cx) = cx.add_window_view(|_, cx| {
+            let mut app = TinyApp::new(ServerCache::empty(), None, cx);
+            app.cache_save_path = Some(path.clone());
+            app.window_persistence_enabled = false;
+            app
+        });
+        cx.update(|_, cx| {
+            PlaybackTrackPreferences::remember(
+                &server,
+                &[PlaybackTrackPreferenceKey {
+                    item_id: "episode".into(),
+                    media_source_id: "source".into(),
+                }],
+                PlaybackTrackKind::Subtitle,
+                None,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(CACHE_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        assert!(!path.exists());
+        app.update(cx, |app, _| {
+            assert!(app.pending_cache_save_error_prefix.is_none());
+            app.save_cache().unwrap();
+        });
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(json.get("track_preferences").is_none());
+        assert!(json.get("track_languages").is_some());
+    }
+
+    #[gpui::test]
     fn settings_window_changes_reach_disk_and_survive_reopening(cx: &mut TestAppContext) {
         use crate::player::{PlaybackLanguagePreferences, TrackLanguage};
         use crate::ui::settings_dialog::SettingsDialogMode;

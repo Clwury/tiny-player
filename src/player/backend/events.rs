@@ -513,6 +513,11 @@ pub enum BackendEventKind {
     PlaybackInfoChanged(Option<PlaybackVideoInfo>),
     PlaybackFileInfoChanged(PlaybackFileInfo),
     PlaybackAudioInfoChanged(Option<PlaybackAudioInfo>),
+    PlaybackTracksChanged {
+        audio: Vec<crate::player::PlaybackTrack>,
+        subtitles: Vec<crate::player::PlaybackTrack>,
+        selected: crate::player::PlaybackTrackSelection,
+    },
     VideoSizeChanged(Option<RenderSize>),
     Buffering(bool),
     PositionChanged(f64),

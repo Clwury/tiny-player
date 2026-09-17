@@ -282,8 +282,7 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
     command_rx: Receiver<FfmpegCommand>,
     frame_presented: Arc<AtomicBool>,
 ) -> std::result::Result<(), String> {
-    let mut session = PlaybackSession::new(source.session_id, source.start_position_seconds);
-    control.set_session_id(session.id());
+    control.set_session_id(source.session_id);
     let OpenedPlaybackInput {
         mut input,
         stream_catalog,
@@ -293,7 +292,8 @@ pub(in crate::player::backend::ffmpeg) fn run_ffmpeg_playback(
         audio_decoder: opened_audio_decoder,
         subtitle_stream,
         subtitle_decoder,
-    } = open_playback_input_with_fallback(&source, Arc::clone(&control), &event_tx)?;
+    } = open_playback_input_with_fallback(&mut source, Arc::clone(&control), &event_tx)?;
+    let mut session = PlaybackSession::new(source.session_id, source.start_position_seconds);
     let initial_playback_file_info = input.playback_file_info();
     let mut video_decode_pipeline = VideoDecodePipeline::spawn(video_decoder)?;
     video_decode_pipeline.set_decoder_framedrop(source.cache_config.decoder_framedrop);

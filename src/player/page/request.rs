@@ -11,6 +11,7 @@ pub struct PlaybackQueueItem {
     pub primary_image_tag: Option<String>,
     pub series_id: Option<String>,
     pub season_id: Option<String>,
+    pub premiere_date: Option<String>,
     pub run_time_ticks: Option<u64>,
     pub playback_position_ticks: Option<u64>,
     pub media_sources: Vec<crate::emby::MediaSource>,
@@ -120,6 +121,9 @@ pub struct PlaybackRequest {
     pub audio_tracks: Vec<PlaybackTrack>,
     pub subtitle_tracks: Vec<PlaybackTrack>,
     pub selected_tracks: PlaybackTrackSelection,
+    pub track_preference_key: crate::player::PlaybackTrackPreferenceKey,
+    /// Commit a subtitle chosen in detail only after playback actually starts.
+    pub remember_subtitle_on_start: bool,
     pub initial_position_seconds: f64,
     pub queue: PlaybackQueue,
     pub emby: EmbyPlaybackContext,
@@ -183,14 +187,7 @@ pub(crate) fn playback_audio_tracks_for_source(
         .audio_streams()
         .into_iter()
         .enumerate()
-        .filter_map(|(index, stream)| {
-            let stream_index = usize::try_from(stream.index?).ok()?;
-            Some(PlaybackTrack::new(
-                stream_index,
-                stream.audio_label(index),
-                stream.is_external.unwrap_or(false),
-            ))
-        })
+        .filter_map(|(index, stream)| PlaybackTrack::from_audio_stream(stream, index))
         .collect()
 }
 
@@ -205,17 +202,10 @@ pub(crate) fn playback_subtitle_tracks_for_source(
         .into_iter()
         .enumerate()
         .filter_map(|(index, stream)| {
-            let stream_index = usize::try_from(stream.index?).ok()?;
             let external_url =
                 playback_subtitle_external_url(stream, server, item_id, media_source_id);
             Some(
-                PlaybackTrack::new(
-                    stream_index,
-                    stream.display_title_label(index),
-                    stream.is_external.unwrap_or(false),
-                )
-                .with_external_url(external_url)
-                .with_codec(stream.codec.clone()),
+                PlaybackTrack::from_subtitle_stream(stream, index)?.with_external_url(external_url),
             )
         })
         .collect()
@@ -401,14 +391,28 @@ mod tests {
             "MediaStreams": [
                 {"Index": 1, "Type": "Audio", "Language": "eng", "IsDefault": true},
                 {"Type": "Audio", "Language": "jpn", "IsDefault": true},
-                {"Index": 4, "Type": "Audio", "Language": "jpn"},
+                {"Index": 4, "Type": "Audio", "Language": "jpn", "DisplayTitle": "Japanese AAC stereo", "Title": "原声音轨", "Codec": "aac"},
                 {"Index": 5, "Type": "Subtitle", "Language": "eng"},
                 {"Type": "Subtitle", "Language": "chs"},
-                {"Index": 9, "Type": "Subtitle", "Language": "zho", "DisplayTitle": "简体中文", "IsExternal": true, "Codec": "ass"}
+                {"Index": 9, "Type": "Subtitle", "Language": "zho", "DisplayTitle": "简体中文", "Title": "简体双语字幕", "IsExternal": true, "Codec": "ass"}
             ]
         })).unwrap();
         let tracks =
             playback_subtitle_tracks_for_source(&source, &debug_server(), "episode-1", "source-1");
+        let audio = playback_audio_tracks_for_source(&source);
+        assert_eq!(audio.len(), 2);
+        assert_eq!(audio[0].metadata_label(), "英语");
+        assert_eq!(audio[1].label.as_ref(), "Japanese AAC stereo");
+        assert_eq!(audio[1].language.as_deref(), Some("jpn"));
+        assert_eq!(audio[1].title.as_deref(), Some("原声音轨"));
+        assert_eq!(audio[1].codec.as_deref(), Some("aac"));
+        assert_eq!(audio[1].metadata_label(), "日语 [原声音轨]");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].metadata_label(), "英语");
+        assert_eq!(tracks[1].label.as_ref(), "简体中文");
+        assert_eq!(tracks[1].language.as_deref(), Some("zho"));
+        assert_eq!(tracks[1].title.as_deref(), Some("简体双语字幕"));
+        assert_eq!(tracks[1].metadata_label(), "中文 [简体双语字幕]");
         let languages = PlaybackLanguagePreferences {
             audio: TrackLanguage::Japanese,
             subtitle: TrackLanguage::ChineseSimplified,
@@ -457,7 +461,12 @@ mod tests {
             audio_tracks: Vec::new(),
             subtitle_tracks: Vec::new(),
             selected_tracks,
+            track_preference_key: crate::player::PlaybackTrackPreferenceKey {
+                item_id: "episode-1".into(),
+                media_source_id: "source-1".into(),
+            },
             initial_position_seconds: 12.0,
+            remember_subtitle_on_start: false,
             queue: PlaybackQueue::new(vec![queue_item("episode-1")], 0),
             emby: EmbyPlaybackContext {
                 client: crate::emby::EmbyClient::new("device-1".to_string()).unwrap(),
@@ -508,6 +517,8 @@ mod tests {
             path: None,
             source_type: None,
             container: None,
+            size: None,
+            bitrate: None,
             media_streams: Some(vec![
                 MediaStream {
                     index: None,
@@ -559,6 +570,7 @@ mod tests {
             primary_image_tag: None,
             series_id: Some("series-1".to_string()),
             season_id: Some("season-1".to_string()),
+            premiere_date: None,
             run_time_ticks: None,
             playback_position_ticks: None,
             media_sources: Vec::new(),

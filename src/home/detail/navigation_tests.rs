@@ -373,6 +373,7 @@ fn resume_restores_played_version_when_server_keeps_returning_group_id(cx: &mut 
             page.series_detail.as_ref().unwrap(),
             &page.current_server,
             PlaybackLanguagePreferences::get(cx),
+            &SavedTrackChoices::default(),
         )
         .unwrap();
         assert_eq!(selected.item_id, "1193754");
@@ -439,7 +440,7 @@ fn resume_restores_played_version_when_server_keeps_returning_group_id(cx: &mut 
         let snapshot =
             serde_json::from_slice(&serde_json::to_vec(&page.home_snapshot()).unwrap()).unwrap();
         page.played_video_versions.clear();
-        page.hydrate_home_snapshot(snapshot);
+        page.hydrate_home_snapshot(snapshot, cx);
         let episodes = page.series_detail.as_ref().unwrap().episodes.clone();
         page.open_resume_item_detail_by_id("824018".into(), cx);
         let detail = page.series_detail.as_mut().unwrap();

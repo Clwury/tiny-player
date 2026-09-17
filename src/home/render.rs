@@ -3,8 +3,7 @@ use std::time::Duration;
 use gpui::{
     Animation, AnimationExt as _, App, Context, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
-    StyleRefinement, Styled, Window, anchored, deferred, div, ease_in_out, point,
-    prelude::FluentBuilder, px,
+    StyleRefinement, Styled, Window, deferred, div, ease_in_out, prelude::FluentBuilder, px,
 };
 
 use crate::{
@@ -27,8 +26,8 @@ use super::{
         carousel_button, home_section_more_button, home_section_title, home_section_title_text,
         resume_item_card, user_episode_card, user_item_card, user_view_card,
     },
+    item_context_menu::ItemContextMenuSource,
     navigation::{HomeRoot, HomeRoute},
-    resume_actions::{ResumeItemAction, ResumeItemContextMenu},
     visible_row::VisibleRow,
 };
 
@@ -230,77 +229,12 @@ impl HomeContent {
                         .right_inset(scrollbar_right_inset),
                 )
             })
-            .when_some(self.resume_item_context_menu.clone(), |this, menu| {
-                this.child(
-                    deferred(self.render_resume_item_context_menu(menu, cx)).with_priority(2),
-                )
+            .when_some(self.item_context_menu.clone(), |this, menu| {
+                this.child(deferred(self.render_item_context_menu(menu, cx)).with_priority(2))
             })
             .when(
                 !has_authentication_error && self.has_visible_notifications(),
                 |this| this.child(deferred(self.render_notification_layer(cx)).with_priority(3)),
-            )
-    }
-
-    fn render_resume_item_context_menu(
-        &self,
-        menu: ResumeItemContextMenu,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let theme = theme::get(cx);
-        let pending = self.resume_item_requests.contains(&menu.item_id);
-        let mark_item_id = menu.item_id.clone();
-        let hide_item_id = menu.item_id;
-        let mark_played = cx.listener(move |page: &mut HomeContent, _: &MouseDownEvent, _, cx| {
-            cx.stop_propagation();
-            page.start_resume_item_action(mark_item_id.clone(), ResumeItemAction::MarkPlayed, cx);
-        });
-        let hide_from_resume =
-            cx.listener(move |page: &mut HomeContent, _: &MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-                page.start_resume_item_action(
-                    hide_item_id.clone(),
-                    ResumeItemAction::HideFromResume,
-                    cx,
-                );
-            });
-
-        anchored()
-            .position(menu.position)
-            .offset(point(px(4.0), px(4.0)))
-            .snap_to_window_with_margin(px(8.0))
-            .child(
-                div()
-                    .id("resume-item-context-menu")
-                    .debug_selector(|| "resume-item-context-menu".into())
-                    .occlude()
-                    .flex()
-                    .flex_col()
-                    .min_w(px(176.0))
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(theme.input_border_focused)
-                    .bg(theme.dialog_background)
-                    .shadow_lg()
-                    .p(px(4.0))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                    .on_mouse_down_out(cx.listener(Self::close_resume_item_context_menu))
-                    .child(resume_item_context_menu_option(
-                        "resume-item-mark-played",
-                        ResumeItemAction::MarkPlayed.label(),
-                        false,
-                        pending,
-                        mark_played,
-                        cx,
-                    ))
-                    .child(resume_item_context_menu_option(
-                        "resume-item-hide-from-resume",
-                        ResumeItemAction::HideFromResume.label(),
-                        true,
-                        pending,
-                        hide_from_resume,
-                        cx,
-                    )),
             )
     }
 
@@ -643,12 +577,14 @@ impl HomeContent {
                                 let item_id = item.id.clone();
                                 let context_item_id = item_id.clone();
                                 let card_item_id = item_id.clone();
-                                let pending = self.resume_item_requests.contains(&item_id);
+                                let pending = self.resume_item_requests.contains(&item_id)
+                                    || self.favorite_requests.contains(&item_id);
                                 let open_context_menu = cx.listener(
                                     move |page: &mut HomeContent, event: &MouseDownEvent, _, cx| {
                                         cx.stop_propagation();
-                                        page.open_resume_item_context_menu(
+                                        page.open_item_context_menu(
                                             context_item_id.clone(),
+                                            ItemContextMenuSource::Resume,
                                             event.position,
                                             cx,
                                         );
@@ -921,26 +857,41 @@ impl HomeContent {
                                 let item = self.effective_user_item(item);
                                 let item_id = item.id.clone();
                                 let open_item_id = item_id.clone();
+                                let context_item_id = item_id.clone();
+                                let open_context_menu = cx.listener(
+                                    move |page: &mut HomeContent, event: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        page.open_item_context_menu(
+                                            context_item_id.clone(),
+                                            ItemContextMenuSource::UserItem,
+                                            event.position,
+                                            cx,
+                                        );
+                                    },
+                                );
                                 let on_click =
                                     cx.listener(move |page: &mut HomeContent, _, _, cx| {
                                         page.open_media_detail_by_id(open_item_id.clone(), cx);
                                     });
-                                if item.item_type.as_deref() == Some("Episode") {
+                                let card = if item.item_type.as_deref() == Some("Episode") {
                                     let image_path = self.image_path_for_episode_user_item(&item);
-                                    user_episode_card(&item, image_path, cx)
-                                        .id((
-                                            gpui::ElementId::from("user-view-episode-card"),
-                                            item_id,
-                                        ))
-                                        .cursor_pointer()
-                                        .on_click(on_click)
+                                    user_episode_card(&item, image_path, cx).id((
+                                        gpui::ElementId::from("user-view-episode-card"),
+                                        item_id.clone(),
+                                    ))
                                 } else {
                                     let image_path = self.image_path_for_user_item(&item);
-                                    user_item_card(&item, image_path, cx)
-                                        .id((gpui::ElementId::from("user-view-item-card"), item_id))
-                                        .cursor_pointer()
-                                        .on_click(on_click)
-                                }
+                                    user_item_card(&item, image_path, cx).id((
+                                        gpui::ElementId::from("user-view-item-card"),
+                                        item_id.clone(),
+                                    ))
+                                };
+                                card.debug_selector(move || {
+                                    format!("user-view-item-card-{item_id}")
+                                })
+                                .cursor_pointer()
+                                .on_click(on_click)
+                                .on_mouse_down(MouseButton::Right, open_context_menu)
                             }),
                     )
                     .when(visible_range.trailing_width > 0.0, |this| {
@@ -973,39 +924,6 @@ impl HomeContent {
                 ))
             })
     }
-}
-
-fn resume_item_context_menu_option(
-    id: &'static str,
-    label: &'static str,
-    destructive: bool,
-    disabled: bool,
-    on_mouse_down: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    cx: &Context<HomeContent>,
-) -> impl IntoElement {
-    let theme = theme::get(cx);
-
-    div()
-        .id(id)
-        .debug_selector(move || id.to_string())
-        .flex()
-        .h(px(32.0))
-        .items_center()
-        .rounded(px(6.0))
-        .px_2()
-        .text_sm()
-        .text_color(if destructive {
-            theme.error
-        } else {
-            theme.foreground
-        })
-        .when(disabled, |this| this.cursor_default().opacity(0.52))
-        .when(!disabled, |this| {
-            this.cursor_pointer()
-                .hover(move |style| style.bg(theme.secondary_hover))
-                .on_mouse_down(MouseButton::Left, on_mouse_down)
-        })
-        .child(label)
 }
 
 impl Render for HomeContent {

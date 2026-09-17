@@ -1,11 +1,17 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::emby::MediaSource;
+use crate::player::SavedTrackChoices;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VideoVersion {
     pub(crate) source_id: String,
     pub(crate) name: Option<String>,
+    /// Track choices belong to each source, independently of the last played version.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) track_preferences: HashMap<String, SavedTrackChoices>,
 }
 
 impl VideoVersion {
@@ -13,6 +19,7 @@ impl VideoVersion {
         Self {
             source_id: source.id.clone().unwrap_or_default(),
             name: source.name.clone(),
+            track_preferences: HashMap::new(),
         }
     }
 
@@ -52,6 +59,7 @@ mod tests {
         let version = VideoVersion {
             source_id: "old-source".into(),
             name: Some("S01E07.2160p.BDRip.H.265.FLAC".into()),
+            ..Default::default()
         };
         let sources: Vec<MediaSource> = serde_json::from_value(serde_json::json!([
             {"Id": "1080", "Name": "S01E07 - 1080p"},
@@ -72,6 +80,7 @@ mod tests {
         let version = VideoVersion {
             source_id: "played".into(),
             name: Some("Same label".into()),
+            ..Default::default()
         };
         assert_eq!(version.find_source(&sources), Some(1));
     }

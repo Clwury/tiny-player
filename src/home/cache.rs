@@ -106,7 +106,10 @@ fn snapshot_path(server: &CachedServer) -> Result<PathBuf> {
         .join("snapshot.json"))
 }
 
-fn load_snapshot_from(path: &Path, server: &CachedServer) -> Result<Option<HomeSnapshot>> {
+pub(super) fn load_snapshot_from(
+    path: &Path,
+    server: &CachedServer,
+) -> Result<Option<HomeSnapshot>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -122,7 +125,7 @@ fn load_snapshot_from(path: &Path, server: &CachedServer) -> Result<Option<HomeS
     }
 }
 
-fn save_snapshot_to(path: &Path, snapshot: &HomeSnapshot) -> Result<()> {
+pub(super) fn save_snapshot_to(path: &Path, snapshot: &HomeSnapshot) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建首页缓存目录失败：{}", parent.display()))?;
@@ -302,6 +305,26 @@ mod tests {
         let loaded = load_snapshot_from(&path, &server).unwrap().unwrap();
         assert!(loaded.user_views.is_none());
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn older_video_versions_load_without_track_choices() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("snapshot.json");
+        let server = server("server-local", Some("user-1"));
+        let mut json =
+            serde_json::to_value(HomeSnapshot::new(&server, None, None, HashMap::new())).unwrap();
+        json["played_video_versions"] = serde_json::json!({
+            "episode": {"source_id": "1080", "name": "1080p"}
+        });
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let snapshot = load_snapshot_from(&path, &server).unwrap().unwrap();
+        assert_eq!(snapshot.played_video_versions["episode"].source_id, "1080");
+        assert!(
+            snapshot.played_video_versions["episode"]
+                .track_preferences
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]

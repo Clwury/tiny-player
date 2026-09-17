@@ -301,8 +301,7 @@ impl FfmpegBackend {
         Ok(())
     }
 
-    pub fn poll_events(&mut self) -> Vec<BackendEvent> {
-        let mut events = Vec::new();
+    fn drain_worker_events(&mut self, events: &mut Vec<BackendEvent>) {
         while let Ok(event) = self.event_rx.try_recv() {
             if event.session_id != self.current_session_id {
                 continue;
@@ -322,6 +321,11 @@ impl FfmpegBackend {
                 BackendEventKind::PlaybackEnded => {
                     self.paused = true;
                 }
+                BackendEventKind::PlaybackTracksChanged { selected, .. } => {
+                    if let Some(request) = self.current_request.as_mut() {
+                        request.selected_tracks = selected.clone();
+                    }
+                }
                 _ => {}
             }
             if forward_original {
@@ -334,11 +338,19 @@ impl FfmpegBackend {
                 ));
             }
         }
+    }
 
+    pub fn poll_events(&mut self) -> Vec<BackendEvent> {
+        let mut events = Vec::new();
+        self.drain_worker_events(&mut events);
         if let Some((session_id, size)) = self.video_output_queue.take_size_change() {
             if session_id != self.current_session_id {
                 return events;
             }
+            // Input metadata is sent before the first frame, but can arrive
+            // between the event drain and this size notification. Apply it
+            // before PlaybackRestart starts reporting or saves preferences.
+            self.drain_worker_events(&mut events);
             if !self.loaded {
                 self.loaded = true;
                 let effective_paused = self

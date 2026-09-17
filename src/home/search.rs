@@ -126,6 +126,7 @@ impl HomeContent {
         if self.search.query == query {
             return;
         }
+        self.item_context_menu = None;
         self.search.reset_for_query(query);
         self.clear_notifications_for_scope(NotificationScope::Search);
         cx.notify();
@@ -135,6 +136,7 @@ impl HomeContent {
         let query = self.search_input.read(cx).value().trim().to_string();
         if query.is_empty() {
             if !self.search.query.is_empty() || !self.search.items.is_empty() {
+                self.item_context_menu = None;
                 self.search.reset_for_query(String::new());
                 self.clear_notifications_for_scope(NotificationScope::Search);
                 cx.notify();
@@ -144,6 +146,7 @@ impl HomeContent {
         if self.search.query == query && self.search.initial == LoadState::Loading {
             return;
         }
+        self.item_context_menu = None;
         let generation = self.search.reset_for_query(query.clone());
         self.start_search_initial(query, generation, cx);
     }

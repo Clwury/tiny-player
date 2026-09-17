@@ -4,6 +4,7 @@ mod components;
 mod data;
 mod detail;
 mod favorites;
+mod item_context_menu;
 mod library;
 mod navigation;
 mod notification;
@@ -13,6 +14,7 @@ mod render;
 mod resume_actions;
 mod search;
 mod sidebar;
+mod track_preferences;
 mod video_version;
 mod visible_row;
 mod workspace_render;
@@ -25,16 +27,16 @@ use std::{
 use crate::{
     emby::{EmbyClient, ResumeItems, UserItemData, UserItems, UserViews},
     images::loader::ImageLoader,
-    player::PlaybackRequest,
+    player::{PlaybackRequest, PlaybackTrackPreferences},
     server::CachedServer,
     ui::editor::Editor,
 };
 use carousel::CarouselState;
 use favorites::{FavoriteRollback, FavoritesState};
+use item_context_menu::ItemContextMenu;
 use library::LibraryState;
 use navigation::{HomeNavigation, HomeRoot, HomeRoute};
 use notification::HomeNotificationQueue;
-use resume_actions::ResumeItemContextMenu;
 use search::SearchState;
 
 pub(crate) use detail::SeriesDetailState;
@@ -125,7 +127,7 @@ struct HomeContent {
     resume_items: Option<ResumeItems>,
     resume_items_failed: Option<gpui::SharedString>,
     resume_items_carousel: CarouselState,
-    resume_item_context_menu: Option<ResumeItemContextMenu>,
+    item_context_menu: Option<ItemContextMenu>,
     resume_item_requests: HashSet<String>,
     user_view_items_rows: HashMap<String, UserViewItemsRow>,
     latest_queue: VecDeque<String>,
@@ -149,6 +151,10 @@ struct HomeContent {
     home_scroll_handle: ScrollHandle,
     image_loader: ImageLoader,
     snapshot_save_generation: u64,
+    snapshot_save_pending: bool,
+    snapshot_save_task: Task<()>,
+    #[cfg(test)]
+    snapshot_save_path: Option<std::path::PathBuf>,
     playback_refresh_generation: u64,
 }
 
@@ -170,6 +176,17 @@ impl EventEmitter<HomeContentEvent> for HomeContent {}
 
 impl HomeContent {
     fn new(current_server: CachedServer, emby_client: EmbyClient, cx: &mut Context<Self>) -> Self {
+        cx.observe_global::<PlaybackTrackPreferences>(|page, cx| {
+            if page.sync_track_preferences(cx) {
+                page.schedule_home_snapshot_save(cx);
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.on_app_quit(|page, cx| page.finish_home_snapshot_saves(cx))
+            .detach();
+        cx.on_release(|page, cx| page.finish_home_snapshot_saves(cx).detach())
+            .detach();
         let search_input = cx.new(|cx| Editor::new("搜索电影或剧集", cx).clearable());
         cx.subscribe(&search_input, |page, _, event, cx| {
             page.on_search_input_event(event, cx);
@@ -221,7 +238,7 @@ impl HomeContent {
             resume_items: None,
             resume_items_failed: None,
             resume_items_carousel: CarouselState::default(),
-            resume_item_context_menu: None,
+            item_context_menu: None,
             resume_item_requests: HashSet::new(),
             user_view_items_rows: HashMap::new(),
             latest_queue: VecDeque::new(),
@@ -245,6 +262,10 @@ impl HomeContent {
             home_scroll_handle: ScrollHandle::new(),
             image_loader: ImageLoader::new(),
             snapshot_save_generation: 0,
+            snapshot_save_pending: false,
+            snapshot_save_task: Task::ready(()),
+            #[cfg(test)]
+            snapshot_save_path: None,
             playback_refresh_generation: 0,
         }
     }
@@ -303,7 +324,7 @@ impl HomeContent {
             });
         }
         self.clear_all_notifications();
-        self.resume_item_context_menu = None;
+        self.item_context_menu = None;
         match root {
             HomeRoot::Home => self.start_effects(cx),
             HomeRoot::Favorites if self.authentication_error.is_none() => {

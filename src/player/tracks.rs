@@ -10,16 +10,48 @@ pub enum PlaybackTrackKind {
 pub struct PlaybackTrack {
     pub stream_index: usize,
     pub label: SharedString,
+    pub language: Option<String>,
+    pub title: Option<String>,
     pub is_external: bool,
     pub external_url: Option<String>,
     pub codec: Option<String>,
 }
 
 impl PlaybackTrack {
+    pub(crate) fn from_audio_stream(
+        stream: &crate::emby::MediaStream,
+        index: usize,
+    ) -> Option<Self> {
+        Some(
+            Self::new(
+                usize::try_from(stream.index?).ok()?,
+                stream.audio_label(index),
+                stream.is_external.unwrap_or(false),
+            )
+            .with_stream_metadata(stream),
+        )
+    }
+
+    pub(crate) fn from_subtitle_stream(
+        stream: &crate::emby::MediaStream,
+        index: usize,
+    ) -> Option<Self> {
+        Some(
+            Self::new(
+                usize::try_from(stream.index?).ok()?,
+                stream.display_title_label(index),
+                stream.is_external.unwrap_or(false),
+            )
+            .with_stream_metadata(stream),
+        )
+    }
+
     pub fn new(stream_index: usize, label: impl Into<SharedString>, is_external: bool) -> Self {
         Self {
             stream_index,
             label: label.into(),
+            language: None,
+            title: None,
             is_external,
             external_url: None,
             codec: None,
@@ -34,6 +66,16 @@ impl PlaybackTrack {
     pub fn with_codec(mut self, codec: Option<String>) -> Self {
         self.codec = codec;
         self
+    }
+
+    fn with_stream_metadata(mut self, stream: &crate::emby::MediaStream) -> Self {
+        self.language = stream.language.clone();
+        self.title = stream.title.clone();
+        self.with_codec(stream.codec.clone())
+    }
+
+    pub(crate) fn metadata_label(&self) -> String {
+        super::track_metadata_label(self.language.as_deref(), self.title.as_deref())
     }
 }
 
