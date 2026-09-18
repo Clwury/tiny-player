@@ -70,9 +70,6 @@ fn latte_hero_uses_local_dark_scrims_without_fallback_names(cx: &mut TestAppCont
                 );
                 let media = theme::media_overlay(cx);
                 assert!(quads.iter().any(|quad| {
-                    quad.background == media.dialog_background.opacity(0.94).into()
-                }));
-                assert!(quads.iter().any(|quad| {
                     quad.background == media.dialog_background.opacity(0.86).into()
                 }));
                 assert_eq!(

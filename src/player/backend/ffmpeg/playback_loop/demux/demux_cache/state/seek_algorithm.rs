@@ -40,6 +40,7 @@ pub(super) struct CachedSeekPacketRangeContext<'a> {
     pub(super) range_id: super::RangeId,
     pub(super) timeline_anchor_stream_index: c_int,
     pub(super) cached_seek_preroll_nsecs: u64,
+    pub(super) safe_anchor_only: bool,
     pub(super) precise: bool,
     pub(super) recovery_point_stream_index: Option<c_int>,
     pub(super) required_stream_indices: &'a [c_int],
@@ -69,6 +70,7 @@ impl DemuxPacketCacheState {
             range_id,
             timeline_anchor_stream_index,
             cached_seek_preroll_nsecs,
+            safe_anchor_only,
             precise,
             recovery_point_stream_index,
             required_stream_indices,
@@ -88,26 +90,31 @@ impl DemuxPacketCacheState {
         let recovery_index = stream_recovery_point_index
             .get(&timeline_anchor_stream_index)
             .ok_or(CachedSeekMissReason::MissingPrerollAnchor)?;
+        // Like mpv's find_seek_target(), choose the nearest recovery point at
+        // or before target - preroll. An old IDR must not force a normal seek
+        // to replay the entire cached prefix when a closed CRA is available.
         let recovery_anchor_packet_id = Self::latest_indexed_packet_at_or_before(
             packets,
             recovery_index,
             anchor_queue,
             anchor_search_nsecs,
             |_| true,
-        );
-        let safe_anchor_packet_id = Self::latest_indexed_packet_at_or_before(
-            packets,
-            recovery_index,
-            anchor_queue,
-            anchor_search_nsecs,
-            |packet| packet.safe_seek_point,
-        );
-        // IDR/BLA are closed-GOP safe points and remain preferred. Other demux
-        // keyframes (including H.264 non-IDR and HEVC CRA) can start a cached
-        // seek when the closed interval and its preroll are resident.
-        let anchor_packet_id = safe_anchor_packet_id
-            .or(recovery_anchor_packet_id)
-            .ok_or(CachedSeekMissReason::MissingPrerollAnchor)?;
+        )
+        .ok_or(CachedSeekMissReason::MissingPrerollAnchor)?;
+        // Decoder recovery may explicitly require a closed-GOP IDR/BLA. Apply
+        // that policy during lookup so a nearer CRA cannot hide an older IDR.
+        let anchor_packet_id = if safe_anchor_only {
+            Self::latest_indexed_packet_at_or_before(
+                packets,
+                recovery_index,
+                anchor_queue,
+                anchor_search_nsecs,
+                |packet| packet.safe_seek_point,
+            )
+            .ok_or(CachedSeekMissReason::SafeAnchorRequired)?
+        } else {
+            recovery_anchor_packet_id
+        };
         let anchor_packet = packets
             .get(&anchor_packet_id)
             .ok_or(CachedSeekMissReason::AnchorTrimmed)?;

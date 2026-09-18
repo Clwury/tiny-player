@@ -238,7 +238,7 @@ fn demux_packet_cache_state_precise_hevc_cached_seek_uses_latest_safe_point_befo
 }
 
 #[test]
-fn hevc_cached_seek_keeps_idr_and_bla_priority_over_later_cra() {
+fn hevc_cached_seek_uses_nearest_recovery_point_with_required_preroll() {
     for safe_kind in [VideoRecoveryPointKind::Idr, VideoRecoveryPointKind::Bla] {
         let mut state = DemuxPacketCacheState::new(
             0,
@@ -278,18 +278,90 @@ fn hevc_cached_seek_keeps_idr_and_bla_priority_over_later_cra() {
             5_000_000_000,
         ));
 
-        let hit = state
-            .seek_cached_with_generation_hit(
-                3_500_000_000,
-                PlaybackSeekMode::Precise,
-                PlaybackSessionId(2),
-                0,
-            )
-            .expect("closed HEVC range supports cached seek");
-        assert_eq!(hit.anchor_kind, safe_kind);
-        assert!(hit.anchor_is_safe_seek_point);
-        assert_eq!(hit.anchor_nsecs, 0);
+        for (target, mode, expected_anchor) in [
+            (3_500_000_000, PlaybackSeekMode::Precise, 2_000_000_000),
+            (2_400_000_000, PlaybackSeekMode::Precise, 0),
+            (2_500_000_000, PlaybackSeekMode::Precise, 2_000_000_000),
+            (2_400_000_000, PlaybackSeekMode::Fast, 2_000_000_000),
+        ] {
+            let hit = state
+                .seek_cached_with_generation_hit(target, mode, PlaybackSessionId(2), 0)
+                .expect("closed HEVC range supports cached seek");
+            assert_eq!(hit.anchor_nsecs, expected_anchor);
+            assert_eq!(hit.anchor_is_safe_seek_point, expected_anchor == 0);
+            assert_eq!(
+                hit.anchor_kind,
+                if expected_anchor == 0 {
+                    safe_kind
+                } else {
+                    VideoRecoveryPointKind::Cra
+                }
+            );
+        }
     }
+}
+
+#[test]
+fn hevc_cached_seek_at_94_seconds_uses_86_second_cra_instead_of_initial_idr() {
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.set_selected_streams(DemuxSelectedStreams {
+        audio_stream: Some(stream_info_for_test(1, ffi::AVCodecID::AV_CODEC_ID_AC3)),
+        subtitle_stream: None,
+    });
+    let anchors = [0, 56_320, 66_320, 76_320, 86_320, 96_320];
+    for (index, start_ms) in anchors.into_iter().enumerate() {
+        state.append_packet(cached_video_recovery_packet(
+            if index == 0 {
+                VideoRecoveryPointKind::Idr
+            } else {
+                VideoRecoveryPointKind::Cra
+            },
+            index == 0,
+            start_ms * 1_000_000,
+            (start_ms + 20) * 1_000_000,
+        ));
+        if let Some(next_ms) = anchors.get(index + 1) {
+            state.append_packet(cached_packet(
+                0,
+                true,
+                Some((next_ms - 100) * 1_000_000),
+                Some((next_ms - 80) * 1_000_000),
+            ));
+        }
+    }
+    for start_ms in (0..97_000).step_by(32) {
+        state.append_packet(cached_packet(
+            1,
+            false,
+            Some(start_ms * 1_000_000),
+            Some((start_ms + 32) * 1_000_000),
+        ));
+    }
+
+    let hit = state
+        .seek_cached_with_generation_hit(
+            93_886_876_244,
+            PlaybackSeekMode::Precise,
+            PlaybackSessionId(4),
+            3,
+        )
+        .expect("recorded target lies in a closed cached interval");
+
+    assert_eq!(hit.anchor_kind, VideoRecoveryPointKind::Cra);
+    assert_eq!(hit.anchor_nsecs, 86_320_000_000);
+    assert_eq!(hit.target_nsecs - hit.anchor_nsecs, 7_566_876_244);
+    assert!(hit.requires_precise_trim);
+    assert_eq!(
+        state.stream_reader_head_timeline(1).unwrap().1,
+        Some(86_304_000_000)
+    );
+    assert_eq!(state.low_level_seeks, 0);
 }
 
 #[test]

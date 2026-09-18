@@ -137,6 +137,65 @@ fn cra_cached_seek_exact_output_gate_drops_every_frame_before_target() {
 }
 
 #[test]
+fn cached_seek_from_zero_keeps_video_and_audio_on_the_original_timeline() {
+    let target_nsecs = 54_585_421_272;
+    let time_base = ffi::AVRational { num: 1, den: 1_000 };
+    let mut video_clock = TimestampMapper::new(Some(0), target_nsecs, Some(20_000_000));
+    let mut audio_clock = TimestampMapper::new(Some(0), target_nsecs, None);
+    let mut recovery = VideoDecodeRecovery::default();
+    recovery.reset_for_timeline_start(ffi::AVCodecID::AV_CODEC_ID_HEVC, target_nsecs);
+    recovery.enable_hevc_cached_recovery_point(3, target_nsecs);
+
+    // The logged cached seek replays the IDR at zero, with 50 fps video and
+    // 32 ms AC-3 frames. No replay frame may be relabeled as the seek target.
+    let mut preroll_frames = 0;
+    let mut first_video_nsecs = None;
+    for raw_timestamp in (0..=54_600).step_by(20) {
+        let mapped = video_clock.map(raw_timestamp, time_base);
+        let action = decoded_video_frame_start_action(
+            mapped.timeline_nsecs,
+            target_nsecs,
+            false,
+            recovery.requires_exact_seek_output(),
+        );
+        if action == DecodedVideoFrameStartAction::DropBeforeStart {
+            recovery
+                .observe_seek_preroll_frame(mapped.timeline_nsecs)
+                .expect("pre-target frame belongs to the seek transaction");
+            preroll_frames += 1;
+        } else {
+            first_video_nsecs = Some(mapped.timeline_nsecs);
+            recovery
+                .finish_seek_bootstrap_after_target_frame(mapped.timeline_nsecs)
+                .expect("target frame completes the seek");
+            break;
+        }
+    }
+    assert_eq!(preroll_frames, 2730);
+    assert_eq!(first_video_nsecs, Some(54_600_000_000));
+
+    let mut first_audio_nsecs = None;
+    for raw_timestamp in (0..=54_592).step_by(32) {
+        let mapped = audio_clock.map_contiguous(
+            raw_timestamp,
+            time_base,
+            32_000_000,
+            PENDING_AUDIO_CONTINUITY_TOLERANCE,
+        );
+        if mapped.timeline_nsecs >= target_nsecs {
+            first_audio_nsecs = Some(mapped.timeline_nsecs);
+            break;
+        }
+    }
+    assert_eq!(first_audio_nsecs, Some(54_592_000_000));
+    let completion = recovery
+        .take_exact_seek_completion()
+        .expect("seek records the actual first eligible video frame");
+    assert_eq!(completion.first_eligible_frame_nsecs, 54_600_000_000);
+    assert_eq!(completion.first_eligible_delta_nsecs, 14_578_728);
+}
+
+#[test]
 fn video_decode_recovery_has_bounded_wait_for_recovery_point() {
     let mut recovery = VideoDecodeRecovery::default();
     let delta_packet = AvPacket::new().expect("packet allocates");

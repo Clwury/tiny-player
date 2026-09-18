@@ -66,7 +66,7 @@ impl DemuxPacketCacheState {
         session_id: PlaybackSessionId,
         seek_generation: u64,
     ) -> Result<DemuxCachedSeekHit, CachedSeekMiss> {
-        let plan = match self.resolve_cached_seek_plan_attempt(target_nsecs, mode) {
+        let plan = match self.resolve_cached_seek_plan_attempt(target_nsecs, mode, false) {
             Ok(plan) => plan,
             Err(miss) => {
                 self.record_cached_seek_rejection(miss);
@@ -80,6 +80,7 @@ impl DemuxPacketCacheState {
         &self,
         target_nsecs: u64,
         mode: PlaybackSeekMode,
+        safe_anchor_only: bool,
     ) -> Result<DemuxCachedSeekPlan, CachedSeekMiss> {
         let detached_append_range_id = self.detached_append_range_id();
         let mut ordered_ranges = vec![(self.read_range_id, CachedSeekRangeLocation::Current)];
@@ -108,7 +109,8 @@ impl DemuxPacketCacheState {
             if self.range_cached_seek_target(range, target_nsecs).is_none() {
                 continue;
             }
-            match self.seek_cached_in_range_diagnostic(range, target_nsecs, mode) {
+            match self.seek_cached_in_range_diagnostic(range, target_nsecs, mode, safe_anchor_only)
+            {
                 Ok(hit) => {
                     let _ = location;
                     return Ok(DemuxCachedSeekPlan {
@@ -298,6 +300,7 @@ impl DemuxPacketCacheState {
         range: &DemuxCachedRange,
         target_nsecs: u64,
         mode: PlaybackSeekMode,
+        safe_anchor_only: bool,
     ) -> Result<DemuxCachedSeekHit, CachedSeekMiss> {
         let seek_target =
             self.range_cached_seek_target(range, target_nsecs)
@@ -325,6 +328,7 @@ impl DemuxPacketCacheState {
                 range_id: range.id,
                 timeline_anchor_stream_index: self.timeline_anchor_stream_index,
                 cached_seek_preroll_nsecs,
+                safe_anchor_only,
                 precise: mode == PlaybackSeekMode::Precise,
                 recovery_point_stream_index: self.recovery_point_stream_index(),
                 required_stream_indices: &required_stream_indices,
@@ -374,6 +378,9 @@ impl DemuxPacketCacheState {
         mode: PlaybackSeekMode,
         reason: CachedSeekMissReason,
     ) -> CachedSeekMissReason {
+        if reason == CachedSeekMissReason::SafeAnchorRequired {
+            return reason;
+        }
         let next_generation = self.generation.saturating_add(1);
         let has_next_generation_block = range.global_order.iter().any(|packet_id| {
             self.low_level_append_blocked_packet_generations
@@ -387,6 +394,7 @@ impl DemuxPacketCacheState {
                     range_id: range.id,
                     timeline_anchor_stream_index: self.timeline_anchor_stream_index,
                     cached_seek_preroll_nsecs,
+                    safe_anchor_only: false,
                     precise: mode == PlaybackSeekMode::Precise,
                     recovery_point_stream_index: self.recovery_point_stream_index(),
                     required_stream_indices,

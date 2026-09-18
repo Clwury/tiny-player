@@ -160,6 +160,9 @@ fn playback_queue(
         .map(|item| item.name.as_str())
         .unwrap_or(detail.title.as_str());
     let selected_season_id = detail.selected_season_id.clone();
+    // The response is already scoped to this season and checked when loaded.
+    // Grouped versions can carry other physical SeasonIds, so do not filter
+    // those episodes out of the playback queue.
     let mut items = detail
         .episodes
         .as_ref()
@@ -167,21 +170,16 @@ fn playback_queue(
             episodes
                 .items
                 .iter()
-                .filter(|episode| {
-                    playback_queue_episode_is_valid(episode)
-                        && episode.season_id.as_deref().is_none_or(|season_id| {
-                            Some(season_id) == selected_season_id.as_deref()
-                        })
-                })
+                .filter(|episode| playback_queue_episode_is_valid(episode))
                 .map(|episode| {
                     playback_queue_item(
                         episode,
                         format!("{series_name} {}", episode.episode_label()).into(),
                         Some(detail.series_id.clone()),
-                        episode
-                            .season_id
+                        // Playback updates must retain the detail's season context.
+                        selected_season_id
                             .clone()
-                            .or_else(|| selected_season_id.clone()),
+                            .or_else(|| episode.season_id.clone()),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -199,7 +197,7 @@ fn playback_queue(
         selected_item,
         selected_title.to_string().into(),
         Some(detail.series_id.clone()),
-        selected_item.season_id.clone().or(selected_season_id),
+        selected_season_id.or_else(|| selected_item.season_id.clone()),
     ));
     PlaybackQueue::new(items, 0)
 }
@@ -292,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn playback_queue_keeps_server_order_and_current_season_only() {
+    fn playback_queue_keeps_server_order_across_grouped_season_ids() {
         let series: UserItem = serde_json::from_value(serde_json::json!({
             "Id": "series-1",
             "Name": "Series",
@@ -325,10 +323,10 @@ mod tests {
                         "MediaSources": [{ "Id": "source-1", "Size": 1320702444 }]
                     },
                     {
-                        "Id": "episode-next-season",
-                        "Name": "Next Season",
+                        "Id": "episode-3",
+                        "Name": "Third",
                         "Type": "Episode",
-                        "SeasonId": "season-2",
+                        "SeasonId": "alternate-season-1",
                         "MediaSources": [{ "Id": "source-3" }]
                     },
                     {
@@ -353,10 +351,16 @@ mod tests {
                 .iter()
                 .map(|item| item.item_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["episode-2", "episode-1"]
+            vec!["episode-2", "episode-1", "episode-3"]
         );
         assert_eq!(queue.current_index, 1);
-        assert_eq!(queue.next_index(), None);
+        assert_eq!(queue.next_index(), Some(2));
+        assert!(
+            queue
+                .items
+                .iter()
+                .all(|item| item.season_id.as_deref() == Some("season-1"))
+        );
         let current = queue.current().unwrap();
         assert_eq!(current.episode_label.as_ref(), "S1E1: First");
         assert_eq!(current.overview.as_deref(), Some("First episode overview"));
@@ -367,6 +371,168 @@ mod tests {
         );
         assert_eq!(current.run_time_ticks, Some(14_550_000_000));
         assert_eq!(current.media_sources[0].size, Some(1_320_702_444));
+    }
+
+    #[test]
+    fn grouped_season_playback_keeps_all_episodes_and_syncs_detail_selection() {
+        let series = serde_json::from_value(serde_json::json!({
+            "Id": "series-1", "Name": "Series", "Type": "Series"
+        }))
+        .unwrap();
+        let mut detail = SeriesDetailState::new_series(&series);
+        detail.selected_season_id = Some("season-1".into());
+        detail.episodes_request_season_id = Some("season-1".into());
+        detail.episodes = Some(MediaItems {
+            items: (1..=20)
+                .map(|number| {
+                    serde_json::from_value(serde_json::json!({
+                        "Id": format!("episode-{number}"),
+                        "Name": format!("Episode {number}"),
+                        "Type": "Episode",
+                        "SeasonId": "alternate-season-1",
+                        "ParentIndexNumber": 1,
+                        "IndexNumber": number,
+                        "MediaSources": [{"Id": format!("source-{number}")}]
+                    }))
+                    .unwrap()
+                })
+                .collect(),
+            total_record_count: 20,
+        });
+        detail.selected_episode_id = Some("episode-7".into());
+        let playback = selected_playback(
+            &detail,
+            &server(),
+            PlaybackLanguagePreferences::default(),
+            &SavedTrackChoices::default(),
+        )
+        .unwrap();
+        let queue = playback.queue;
+
+        assert_eq!(
+            queue
+                .items
+                .iter()
+                .map(|item| item.item_id.clone())
+                .collect::<Vec<_>>(),
+            (1..=20)
+                .map(|number| format!("episode-{number}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(queue.current_index, 6);
+        assert_eq!(queue.previous_index(), Some(5));
+        assert_eq!(queue.next_index(), Some(7));
+        assert!(
+            queue
+                .items
+                .iter()
+                .all(|item| item.season_id.as_deref() == Some("season-1"))
+        );
+        let current = queue.current().unwrap();
+        let update = crate::player::PlaybackStateUpdate {
+            item_id: playback.item_id,
+            list_item_id: current.item_id.clone(),
+            media_source_id: playback.media_source_id,
+            media_source_name: None,
+            series_id: current.series_id.clone(),
+            season_id: current.season_id.clone(),
+            position_ticks: 250,
+            run_time_ticks: Some(1_000),
+            ended: false,
+            failed: false,
+            selected_item_id: Some("episode-20".into()),
+            stop_completion: None,
+        };
+        detail.apply_playback_update(&update, &crate::emby::UserItemData::default());
+
+        assert_eq!(detail.selected_episode_id.as_deref(), Some("episode-20"));
+        assert_eq!(detail.selected_season_id.as_deref(), Some("season-1"));
+        let queue = playback_queue(&detail, detail.selected_episode().unwrap(), "Series S1E20");
+        assert_eq!(queue.items.len(), 20);
+        assert_eq!(queue.current_index, 19);
+        assert_eq!(queue.next_index(), None);
+    }
+
+    #[test]
+    fn single_episode_fallback_keeps_the_selected_season_context() {
+        let series = serde_json::from_value(serde_json::json!({
+            "Id": "series-1", "Name": "Series", "Type": "Series"
+        }))
+        .unwrap();
+        let mut detail = SeriesDetailState::new_series(&series);
+        detail.selected_season_id = Some("season-1".into());
+        let episode = serde_json::from_value(serde_json::json!({
+            "Id": "episode-1", "Name": "First", "Type": "Episode",
+            "SeasonId": "alternate-season-1", "MediaSources": [{"Id": "source-1"}]
+        }))
+        .unwrap();
+
+        let queue = playback_queue(&detail, &episode, "Series S1E1");
+
+        assert_eq!(queue.items.len(), 1);
+        assert_eq!(
+            queue.current().unwrap().season_id.as_deref(),
+            Some("season-1")
+        );
+        assert_eq!(queue.current().unwrap().item_id, "episode-1");
+    }
+
+    #[gpui::test]
+    fn playback_queue_uses_only_the_current_season_response(cx: &mut gpui::TestAppContext) {
+        let page = cx.new(|cx| {
+            HomeContent::new(
+                server(),
+                crate::emby::EmbyClient::new("test".into()).unwrap(),
+                cx,
+            )
+        });
+        page.update(cx, |page, cx| {
+            let series = serde_json::from_value(serde_json::json!({
+                "Id": "series-1", "Name": "Series", "Type": "Series"
+            }))
+            .unwrap();
+            let mut detail = SeriesDetailState::new_series(&series);
+            detail.selected_season_id = Some("season-2".into());
+            detail.episodes_request_season_id = Some("season-2".into());
+            detail.effects.episodes = LoadState::Loading;
+            page.series_detail = Some(detail);
+
+            for season_id in ["season-1", "season-2", "season-1"] {
+                let response = serde_json::from_value(serde_json::json!({
+                    "Items": [{
+                        "Id": format!("{season_id}-episode"), "Name": "Episode", "Type": "Episode",
+                        "SeasonId": format!("alternate-{season_id}"),
+                        "MediaSources": [{"Id": "source"}]
+                    }],
+                    "TotalRecordCount": 1
+                }))
+                .unwrap();
+                page.finish_series_episodes(
+                    page.request_identity(),
+                    DetailRequestRevisions {
+                        detail: page.detail_generation,
+                        user_data: page.user_data_request_revision(),
+                    },
+                    "series-1".into(),
+                    season_id.into(),
+                    Ok(response),
+                    cx,
+                );
+                let detail = page.series_detail.as_ref().unwrap();
+                if let Some(selected) = detail.selected_episode() {
+                    let queue = playback_queue(detail, selected, "Series S2E1");
+                    assert_eq!(queue.items.len(), 1);
+                    assert_eq!(queue.current().unwrap().item_id, "season-2-episode");
+                    assert_eq!(
+                        queue.current().unwrap().season_id.as_deref(),
+                        Some("season-2")
+                    );
+                } else {
+                    assert_eq!(season_id, "season-1");
+                    assert_eq!(detail.effects.episodes, LoadState::Loading);
+                }
+            }
+        });
     }
 
     #[test]

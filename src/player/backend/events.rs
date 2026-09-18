@@ -423,6 +423,7 @@ pub struct CacheStorageState {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DemuxCacheState {
+    /// Forward audio/video cache endpoint, independent of sparse subtitle cues.
     pub cache_end: Option<f64>,
     pub reader_pts: Option<f64>,
     pub cache_duration: Option<f64>,

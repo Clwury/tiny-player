@@ -122,12 +122,12 @@ impl HomeContent {
                     .gap_3()
                     .bg(theme.background)
                     .px_4()
-                    .pt_4()
+                    .pt_3()
                     .child(library_back_button(back, cx))
                     .child(
                         div()
                             .flex()
-                            .h(px(32.0))
+                            .h(px(36.0))
                             .flex_1()
                             .min_w_0()
                             .items_center()
@@ -338,7 +338,8 @@ impl HomeContent {
                     .items_center()
                     .gap_3()
                     .px_4()
-                    .py_4()
+                    .pt_3()
+                    .pb_4()
                     .child(library_back_button(
                         cx.listener(Self::close_series_detail),
                         cx,
@@ -946,6 +947,8 @@ fn library_back_button(
         .debug_selector(|| "home-library-back-button".into())
         .flex()
         .size(px(32.0))
+        // Match the sidebar's 32px button centered in a 36px title row.
+        .my(px(2.0))
         .flex_none()
         .items_center()
         .justify_center()

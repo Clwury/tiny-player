@@ -1,6 +1,46 @@
 use super::*;
 
 #[test]
+fn demux_packet_cache_monitor_returns_cached_snapshot_while_state_is_locked() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let (shared, _event_rx) = shared_with_config_for_test(control, cache_config_for_test());
+    let cache = Arc::new(DemuxPacketCache {
+        shared: Arc::new(shared),
+        handle: None,
+    });
+    cache.shared.append_packet(cached_anchor(0, 1_000_000_000));
+    let (before, before_watermark, unavailable) = cache.monitor_snapshot();
+    assert!(!unavailable);
+    assert_eq!(before.total_packets, 1);
+
+    let mut guard = cache.shared.state.lock().expect("hold demux state");
+    guard.append_packet(cached_anchor(1_000_000_000, 2_000_000_000));
+    let (tx, rx) = mpsc::channel();
+    let reader_cache = Arc::clone(&cache);
+    let reader = thread::spawn(move || {
+        tx.send(reader_cache.monitor_snapshot())
+            .expect("send diagnostic snapshot");
+    });
+    // Release the lock even on failure so this regression fails rather than
+    // deadlocking the test suite if diagnostics start taking a blocking lock.
+    let result = rx.recv_timeout(Duration::from_secs(1));
+    drop(guard);
+    reader.join().expect("diagnostic reader exits");
+    let (cached, watermark, unavailable) = result.expect("diagnostics must not wait for demux");
+    assert!(unavailable);
+    assert_eq!(cached.total_packets, before.total_packets);
+    assert_eq!(
+        watermark.selected_min_forward_nsecs,
+        before_watermark.selected_min_forward_nsecs
+    );
+
+    let (fresh, watermark, unavailable) = cache.monitor_snapshot();
+    assert!(!unavailable);
+    assert_eq!(fresh.total_packets, 2);
+    assert_eq!(watermark.selected_min_forward_nsecs, Some(2_000_000_000));
+}
+
+#[test]
 fn demux_packet_cache_coalesces_nonforced_append_cache_state_until_report_due() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let mut config = cache_config_for_test();

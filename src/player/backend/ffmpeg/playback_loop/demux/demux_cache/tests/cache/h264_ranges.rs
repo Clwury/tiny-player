@@ -184,7 +184,7 @@ fn h264_non_key_non_idr_packets_do_not_advertise_cached_seek_range() {
     );
     assert!(
         state
-            .resolve_cached_seek_plan_attempt(638_500_000_000, PlaybackSeekMode::Precise,)
+            .resolve_cached_seek_plan_attempt(638_500_000_000, PlaybackSeekMode::Precise, false)
             .is_err()
     );
 }

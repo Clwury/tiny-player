@@ -114,7 +114,7 @@ fn audio_restart_low_level_seek_replaces_prefetch_with_missing_audio() {
         close_seek_range(&mut state, 10_000_000_000);
         assert!(
             state
-                .resolve_cached_seek_plan_attempt(500_000_000, PlaybackSeekMode::Precise)
+                .resolve_cached_seek_plan_attempt(500_000_000, PlaybackSeekMode::Precise, false)
                 .is_ok(),
             "a cached seek can hit before the later audio gap"
         );
@@ -185,7 +185,7 @@ fn cached_seek_plan_resolve_does_not_move_readers_before_atomic_commit() {
     let read_range_before = state.read_range_id;
 
     let plan = state
-        .resolve_cached_seek_plan_attempt(1_500_000_000, PlaybackSeekMode::Precise)
+        .resolve_cached_seek_plan_attempt(1_500_000_000, PlaybackSeekMode::Precise, false)
         .expect("closed cached range resolves");
 
     assert_eq!(state.generation, generation_before);
@@ -214,7 +214,7 @@ fn cached_seek_plan_rejects_stale_seekability_revision_without_moving_readers() 
     state.append_packet(cached_anchor(0, 1_000_000_000));
     close_seek_range(&mut state, 3_000_000_000);
     let plan = state
-        .resolve_cached_seek_plan_attempt(500_000_000, PlaybackSeekMode::Precise)
+        .resolve_cached_seek_plan_attempt(500_000_000, PlaybackSeekMode::Precise, false)
         .expect("closed cached range resolves");
     let generation_before = state.generation;
     let reader_heads_before = state.reader_heads.clone();
@@ -377,6 +377,58 @@ fn demux_packet_cache_cache_only_seek_uses_closed_cra_interval() {
     let guard = shared.state.lock().expect("cache state");
     assert_eq!(guard.cached_seeks, 1);
     assert_eq!(guard.low_level_seeks, 0);
+}
+
+#[test]
+fn demux_packet_cache_safe_only_seek_can_use_older_idr_when_nearest_anchor_is_cra() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let (shared, _event_rx) = shared_with_codec_and_config_for_test(
+        control,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        cache_config_for_test(),
+    );
+    {
+        let mut guard = shared.state.lock().expect("cache state");
+        guard.append_packet(cached_video_recovery_packet(
+            VideoRecoveryPointKind::Idr,
+            true,
+            0,
+            1_000_000_000,
+        ));
+        guard.append_packet(cached_video_recovery_packet(
+            VideoRecoveryPointKind::Cra,
+            false,
+            2_000_000_000,
+            3_000_000_000,
+        ));
+        guard.append_packet(cached_packet(
+            0,
+            true,
+            Some(3_000_000_000),
+            Some(4_000_000_000),
+        ));
+        close_seek_range(&mut guard, 4_000_000_000);
+    }
+    let cache = DemuxPacketCache {
+        shared: Arc::new(shared),
+        handle: None,
+    };
+
+    assert!(matches!(
+        cache.seek_cached_only(3.5, PlaybackSeekMode::Precise, PlaybackSessionId(2), 1),
+        DemuxSeekResult::Cached(info)
+            if info.anchor_kind == VideoRecoveryPointKind::Cra
+                && info.anchor_nsecs == 2_000_000_000
+    ));
+    assert!(matches!(
+        cache.seek_cached_safe_only(3.5, PlaybackSeekMode::Precise, PlaybackSessionId(3), 2),
+        DemuxSeekResult::Cached(info)
+            if info.anchor_kind == VideoRecoveryPointKind::Idr && info.anchor_nsecs == 0
+    ));
+    let guard = cache.shared.state.lock().expect("cache state");
+    assert_eq!(guard.cached_seeks, 2);
+    assert_eq!(guard.low_level_seeks, 0);
+    assert!(guard.rejected_cached_seek_ranges.is_empty());
 }
 
 #[test]

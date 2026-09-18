@@ -200,17 +200,9 @@ impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cache_pause_forward_duration_nsecs(
         &self,
     ) -> u64 {
-        let windows = self.active_stream_forward_windows();
-        let has_non_subtitle = windows
-            .iter()
-            .any(|window| !matches!(window.kind, StreamCacheKind::Subtitle));
-        windows
+        self.active_stream_forward_windows()
             .into_iter()
-            .filter(|window| {
-                !(has_non_subtitle
-                    && matches!(window.kind, StreamCacheKind::Subtitle)
-                    && window.duration_nsecs() == 0)
-            })
+            .filter(|window| matches!(window.kind, StreamCacheKind::Video | StreamCacheKind::Audio))
             .map(|window| {
                 window
                     .end_nsecs

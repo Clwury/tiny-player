@@ -133,6 +133,13 @@ fn demux_packet_cache_pause_requires_audio_to_cover_exact_seek_target() {
         audio_stream: Some(stream_info_for_test(1, ffi::AVCodecID::AV_CODEC_ID_AAC)),
         subtitle_stream: None,
     });
+    state.set_stream_kind(2, StreamCacheKind::Subtitle);
+    state.append_packet(cached_packet(
+        2,
+        false,
+        Some(179_900_000_000),
+        Some(180_900_000_000),
+    ));
     state.append_packet(cached_anchor(179_900_000_000, 186_000_000_000));
     state.append_packet(cached_packet(
         1,

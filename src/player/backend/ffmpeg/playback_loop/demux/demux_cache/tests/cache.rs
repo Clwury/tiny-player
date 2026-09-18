@@ -2,6 +2,8 @@
 mod archived_seek;
 #[path = "cache/config.rs"]
 mod config;
+#[path = "cache/forward_cache.rs"]
+mod forward_cache;
 #[path = "cache/h264_ranges.rs"]
 mod h264_ranges;
 #[path = "cache/hevc_ranges.rs"]

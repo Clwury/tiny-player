@@ -21,12 +21,22 @@ fn packet_timestamp_mapping_uses_stream_origin_without_advancing_decoded_clock()
 }
 
 #[test]
-fn packet_timestamp_mapping_rejects_zero_that_would_be_synthesized_after_seek() {
-    let mut mapper = TimestampMapper::new(Some(0), 20_000_000_000, Some(40_000_000));
+fn packet_timestamp_mapping_preserves_zero_origin_after_seek() {
     let time_base = ffi::AVRational { num: 1, den: 1_000 };
-    assert_eq!(mapper.map_known_timestamp(0, time_base), None);
-    assert_eq!(mapper.map(0, time_base).timeline_nsecs, 20_000_000_000);
-    assert_eq!(mapper.map_known_timestamp(0, time_base), None);
+    for origin_ms in [0, 10_000] {
+        let mut mapper = TimestampMapper::new(
+            Some(origin_ms as u64 * 1_000_000),
+            20_000_000_000,
+            Some(40_000_000),
+        );
+        assert_eq!(mapper.map_known_timestamp(origin_ms, time_base), Some(0));
+        assert_eq!(mapper.map(origin_ms, time_base).timeline_nsecs, 0);
+        assert_eq!(mapper.map_known_timestamp(origin_ms, time_base), Some(0));
+        assert_eq!(
+            mapper.map(origin_ms + 40, time_base).timeline_nsecs,
+            40_000_000
+        );
+    }
 }
 
 #[test]
@@ -120,6 +130,19 @@ fn timestamp_mapper_preserves_authoritative_decoder_replay_pts() {
 }
 
 #[test]
+fn timestamp_mapper_preserves_zero_during_authoritative_decoder_replay() {
+    let mut mapper = TimestampMapper::new(Some(0), 54_585_421_272, Some(20_000_000));
+    let time_base = ffi::AVRational { num: 1, den: 1_000 };
+    mapper.map(55_000, time_base);
+
+    assert_eq!(mapper.map_authoritative(0, time_base).timeline_nsecs, 0);
+    assert_eq!(
+        mapper.map_authoritative(20, time_base).timeline_nsecs,
+        20_000_000
+    );
+}
+
+#[test]
 fn timestamp_mapper_keeps_aac_millisecond_timestamps_sample_contiguous() {
     let mut mapper = TimestampMapper::new(Some(0), 0, None);
     let time_base = ffi::AVRational { num: 1, den: 1_000 };
@@ -203,7 +226,7 @@ fn timestamp_mapper_keeps_missing_timestamps_at_seek_target() {
         }
     );
     assert_eq!(
-        mapper.map(0, time_base),
+        mapper.map(ffi::AV_NOPTS_VALUE, time_base),
         MappedTimestamp {
             timeline_nsecs: 10_040_000_000,
             sink_nsecs: 40_000_000,

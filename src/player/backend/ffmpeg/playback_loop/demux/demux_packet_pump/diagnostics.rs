@@ -142,6 +142,9 @@ impl DemuxPacketPump {
         demux_cache_timing: DemuxPacketCacheReadTiming,
         demux_read_result: &DemuxReadResult,
     ) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
         let result = match demux_read_result {
             DemuxReadResult::Packet(_) => "packet",
             DemuxReadResult::Eof => "eof",
@@ -149,7 +152,8 @@ impl DemuxPacketPump {
             DemuxReadResult::Interrupted => "interrupted",
             DemuxReadResult::Error(_) => "error",
         };
-        let demux_packet_snapshot = context.demux_cache.packet_queue_snapshot();
+        let (demux_packet_snapshot, _, demux_snapshot_unavailable) =
+            context.demux_cache.monitor_snapshot();
         let demux_packet_queue_full = demux_packet_snapshot.prefetch_queue_full()
             && !demux_packet_snapshot.consumer_drainable();
         let video_decode_snapshot = context.decoder_input.video_decode_snapshot;
@@ -212,6 +216,7 @@ impl DemuxPacketPump {
             should_wait_for_demux = context.should_wait_for_demux,
             demux_streams = ?demux_streams,
             demux_packet_queued = demux_packet_snapshot.total_packets,
+            demux_snapshot_unavailable,
             demux_packet_bytes = demux_packet_snapshot.total_bytes,
             demux_packet_queue_full,
             demux_packet_streams = ?demux_packet_snapshot.streams,
@@ -343,6 +348,9 @@ impl DemuxPacketPump {
         made_progress: bool,
         returned_result: &DemuxPacketPumpResult,
     ) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
         let output_snapshot = context.video_admission_pressure.output_snapshot;
         let empty_startup_or_rebuffer = output_snapshot.queued_video_frames == 0
             && (output_snapshot.first_video_frame_pending || output_snapshot.rebuffering);
@@ -357,8 +365,10 @@ impl DemuxPacketPump {
 
         let elapsed_before_diagnostic = started_at.elapsed();
         let diagnostic_snapshot_started_at = Instant::now();
-        let demux_watermark = context.demux_cache.cached_reader_watermark();
-        let demux_packet_snapshot = context.demux_cache.packet_queue_snapshot();
+        // Diagnostics must not turn a bounded read timeout into an unbounded
+        // wait for the same cache lock. Reuse the published snapshot if busy.
+        let (demux_packet_snapshot, demux_watermark, demux_snapshot_unavailable) =
+            context.demux_cache.monitor_snapshot();
         let diagnostic_snapshot_wait = diagnostic_snapshot_started_at.elapsed();
         let decoder_input = context
             .pipeline
@@ -374,6 +384,7 @@ impl DemuxPacketPump {
             elapsed_before_diagnostic_ms =
                 elapsed_before_diagnostic.as_secs_f64() * 1000.0,
             diagnostic_snapshot_wait_ms = diagnostic_snapshot_wait.as_secs_f64() * 1000.0,
+            demux_snapshot_unavailable,
             should_wait_for_demux = context.should_wait_for_demux,
             video_output_waiting_for_demux = context.video_output_waiting_for_demux,
             output_state = ?output_snapshot.state,

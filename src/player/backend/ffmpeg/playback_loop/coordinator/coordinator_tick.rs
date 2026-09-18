@@ -1212,8 +1212,11 @@ fn log_ready_tick_empty_output_diagnostic(
         return;
     }
 
-    let demux_watermark = demux_cache.cached_reader_watermark();
-    let demux_packet_snapshot = demux_cache.packet_queue_snapshot();
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let (demux_packet_snapshot, demux_watermark, demux_snapshot_unavailable) =
+        demux_cache.monitor_snapshot();
     let decoder_input =
         pipeline.decoder_input_snapshot(output_gate_status.output_resource_pressure);
     let video_decode_snapshot = decoder_input.video_decode_snapshot;
@@ -1236,6 +1239,7 @@ fn log_ready_tick_empty_output_diagnostic(
         output_rebuffer_anchor = ?output_snapshot.video_output_rebuffer_anchor,
         pending_start_audio_ms = output_snapshot.pending_start_audio_nsecs as f64 / 1_000_000.0,
         demux_packet_queued = demux_packet_snapshot.total_packets,
+        demux_snapshot_unavailable,
         demux_packet_bytes = demux_packet_snapshot.total_bytes,
         demux_packet_streams = ?demux_packet_snapshot.streams,
         demux_min_forward_ms = ?demux_watermark

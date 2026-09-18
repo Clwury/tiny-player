@@ -304,8 +304,11 @@ fn log_decoder_input_empty_output_diagnostic(
         return;
     }
 
-    let demux_watermark = context.demux_cache.cached_reader_watermark();
-    let demux_packet_snapshot = context.demux_cache.packet_queue_snapshot();
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let (demux_packet_snapshot, demux_watermark, demux_snapshot_unavailable) =
+        context.demux_cache.monitor_snapshot();
     let decoder_input = context
         .pipeline
         .decoder_input_snapshot(context.video_admission_pressure.output_resource_pressure);
@@ -329,6 +332,7 @@ fn log_decoder_input_empty_output_diagnostic(
             .queued_video_forward_nsecs
             .map(|duration| duration as f64 / 1_000_000.0),
         demux_packet_queued = demux_packet_snapshot.total_packets,
+        demux_snapshot_unavailable,
         demux_packet_bytes = demux_packet_snapshot.total_bytes,
         demux_packet_streams = ?demux_packet_snapshot.streams,
         demux_min_forward_ms = ?demux_watermark

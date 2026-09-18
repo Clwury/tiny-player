@@ -172,7 +172,7 @@ impl HomeContent {
     }
 
     pub(crate) fn render_series_detail_back_button(&self, cx: &Context<Self>) -> impl IntoElement {
-        let theme = theme::media_overlay(cx);
+        let theme = theme::get(cx);
         let close_detail = cx.listener(Self::close_series_detail);
 
         div()
@@ -180,15 +180,14 @@ impl HomeContent {
             .debug_selector(|| "series-detail-back-button".to_string())
             .absolute()
             .left_4()
-            .top_4()
+            // Match sidebar p_3 and its 32px button centered in a 36px title row.
+            .top_3()
+            .mt(px(2.0))
             .flex()
             .size(px(32.0))
             .items_center()
             .justify_center()
             .rounded_md()
-            .bg(theme.dialog_background.opacity(0.94))
-            .border_1()
-            .border_color(theme.input_border)
             .cursor_pointer()
             .occlude()
             .hover(move |style| style.bg(theme.secondary_hover))

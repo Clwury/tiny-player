@@ -1,27 +1,11 @@
 use std::time::Instant;
 
 use super::{
-    BackendEvent, BackendEventKind, CachedSeekMiss, CachedSeekMissReason,
-    DEMUX_PACKET_CACHE_STALL_LOG_AFTER, DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL,
-    DEMUX_PACKET_CACHE_WAIT_INTERVAL, DemuxCachedSeekInfo, DemuxCachedSeekPlan, DemuxPacketCache,
-    DemuxSeekResult, PlaybackCacheConfig, PlaybackSeekMode, PlaybackSessionId, nsecs_to_seconds,
-    seconds_to_nsecs,
+    BackendEvent, BackendEventKind, CachedSeekMissReason, DEMUX_PACKET_CACHE_STALL_LOG_AFTER,
+    DEMUX_PACKET_CACHE_STALL_LOG_INTERVAL, DEMUX_PACKET_CACHE_WAIT_INTERVAL, DemuxCachedSeekInfo,
+    DemuxPacketCache, DemuxSeekResult, PlaybackCacheConfig, PlaybackSeekMode, PlaybackSessionId,
+    nsecs_to_seconds, seconds_to_nsecs,
 };
-
-fn require_safe_cached_seek_anchor(
-    resolved: Result<DemuxCachedSeekPlan, CachedSeekMiss>,
-    safe_anchor_only: bool,
-) -> Result<DemuxCachedSeekPlan, CachedSeekMiss> {
-    let plan = resolved?;
-    if safe_anchor_only && !plan.hit.anchor_is_safe_seek_point {
-        return Err(CachedSeekMiss {
-            range_id: Some(plan.hit.range_id),
-            target_nsecs: plan.hit.target_nsecs,
-            reason: CachedSeekMissReason::SafeAnchorRequired,
-        });
-    }
-    Ok(plan)
-}
 
 impl DemuxPacketCache {
     pub(in crate::player::backend::ffmpeg::playback_loop) fn set_playback_recovery_demand(
@@ -107,10 +91,7 @@ impl DemuxPacketCache {
         let resolved_seekability_revision = guard.seekability_revision();
         let resolved_cache_generation = guard.generation;
         let lookup_started_at = Instant::now();
-        let resolved = require_safe_cached_seek_anchor(
-            guard.resolve_cached_seek_plan_attempt(target_nsecs, mode),
-            safe_anchor_only,
-        );
+        let resolved = guard.resolve_cached_seek_plan_attempt(target_nsecs, mode, safe_anchor_only);
         let mut lookup = lookup_started_at.elapsed();
         drop(guard);
 
@@ -162,10 +143,8 @@ impl DemuxPacketCache {
                 || guard.generation != resolved_cache_generation;
             let resolved = if state_changed {
                 let retry_lookup_started_at = Instant::now();
-                let resolved = require_safe_cached_seek_anchor(
-                    guard.resolve_cached_seek_plan_attempt(target_nsecs, mode),
-                    safe_anchor_only,
-                );
+                let resolved =
+                    guard.resolve_cached_seek_plan_attempt(target_nsecs, mode, safe_anchor_only);
                 lookup += retry_lookup_started_at.elapsed();
                 resolved
             } else {
@@ -177,8 +156,9 @@ impl DemuxPacketCache {
                         Ok(hit) => Ok(hit),
                         Err(_) => {
                             let retry_lookup_started_at = Instant::now();
-                            let retry = require_safe_cached_seek_anchor(
-                                guard.resolve_cached_seek_plan_attempt(target_nsecs, mode),
+                            let retry = guard.resolve_cached_seek_plan_attempt(
+                                target_nsecs,
+                                mode,
                                 safe_anchor_only,
                             );
                             lookup += retry_lookup_started_at.elapsed();
@@ -233,6 +213,7 @@ impl DemuxPacketCache {
                         anchor_is_recovery_point = hit.anchor_is_recovery_point,
                         anchor_is_safe_seek_point = hit.anchor_is_safe_seek_point,
                         cached_seek_preroll_nsecs = hit.preroll_nsecs,
+                        actual_preroll_nsecs = hit.target_nsecs.saturating_sub(hit.anchor_nsecs),
                         requires_precise_trim = hit.requires_precise_trim,
                         seek_generation,
                         buffered_until,

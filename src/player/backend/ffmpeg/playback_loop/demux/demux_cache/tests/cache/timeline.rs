@@ -116,6 +116,47 @@ fn demux_packet_timeline_absolute_end_matches_next_packet_start() {
 }
 
 #[test]
+fn demux_packet_timeline_preserves_zero_pts_after_seek_reset() {
+    let mut video_stream = stream_info_for_test(0, ffi::AVCodecID::AV_CODEC_ID_HEVC);
+    video_stream.start_nsecs = Some(0);
+    video_stream.frame_duration_nsecs = Some(20_000_000);
+    let mut audio_stream = stream_info_for_test(1, ffi::AVCodecID::AV_CODEC_ID_AC3);
+    audio_stream.start_nsecs = Some(0);
+    let mut timeline = DemuxPacketTimeline::new(
+        video_stream,
+        Some(audio_stream),
+        None,
+        121.16,
+        PlaybackSessionId(1),
+    );
+    let (event_tx, _event_rx) = mpsc::channel();
+
+    for (generation, target) in [(2, 2.183480826), (3, 54.585421272)] {
+        timeline.reset(target, PlaybackSessionId(generation), &event_tx);
+        for (stream_index, duration_ms) in [(0, 20), (1, 32)] {
+            for pts in [0, duration_ms, 1180] {
+                let mut packet = demux_packet_for_stream(stream_index);
+                unsafe {
+                    (*packet.as_mut_ptr()).pts = pts;
+                    (*packet.as_mut_ptr()).dts = pts;
+                    (*packet.as_mut_ptr()).duration = duration_ms;
+                }
+                let cached = timeline
+                    .cache_packet(&packet, &event_tx)
+                    .expect("packet maps after reset")
+                    .expect("selected media packet is cached");
+                assert_eq!(cached.start_nsecs, Some(pts as u64 * 1_000_000));
+                assert_eq!(cached.seek_timestamp_nsecs, cached.start_nsecs);
+                assert_eq!(
+                    cached.end_nsecs,
+                    Some((pts + duration_ms) as u64 * 1_000_000)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn demux_packet_timeline_seek_timestamps_preserve_pts_reordering_and_missing_values() {
     let mut video_stream = stream_info_for_test(0, ffi::AVCodecID::AV_CODEC_ID_HEVC);
     video_stream.time_base = ffi::AVRational { num: 1, den: 1_000 };

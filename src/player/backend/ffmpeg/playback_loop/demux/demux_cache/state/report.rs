@@ -394,20 +394,12 @@ impl DemuxPacketCacheState {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn selected_forward_timeline_window(
         &self,
     ) -> Option<StreamForwardWindow> {
-        let mut windows = self.active_stream_forward_windows();
-        if windows.is_empty() {
-            return None;
-        }
-        let has_non_subtitle = windows
-            .iter()
-            .any(|window| !matches!(window.kind, StreamCacheKind::Subtitle));
-        windows
-            .drain(..)
-            .filter(|window| {
-                !(has_non_subtitle
-                    && matches!(window.kind, StreamCacheKind::Subtitle)
-                    && window.duration_nsecs() == 0)
-            })
+        // Sparse subtitle cues do not bound continuous playback coverage. Keep
+        // them in per-stream reports, but use audio/video for the aggregate
+        // cache endpoint and readahead control, including after demux EOF.
+        self.active_stream_forward_windows()
+            .into_iter()
+            .filter(|window| matches!(window.kind, StreamCacheKind::Video | StreamCacheKind::Audio))
             .min_by_key(|window| window.duration_nsecs())
     }
 

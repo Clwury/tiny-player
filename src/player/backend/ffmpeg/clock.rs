@@ -350,10 +350,7 @@ impl TimestampMapper {
     ) -> Option<u64> {
         let nsecs = timestamp_to_nsecs(timestamp, time_base)?;
         if let Some(start_nsecs) = self.start_nsecs {
-            let timeline_nsecs = nsecs.saturating_sub(start_nsecs);
-            // The decoded-frame path synthesizes zero timestamps after a
-            // seek. A raw zero therefore cannot prove that a packet is late.
-            (self.start_position_nsecs == 0 || timeline_nsecs > 0).then_some(timeline_nsecs)
+            Some(nsecs.saturating_sub(start_nsecs))
         } else {
             // Before the learned anchor the synthetic playback mapping is
             // ambiguous. Such packets cannot safely drive decoder dropping.
@@ -380,13 +377,14 @@ impl TimestampMapper {
         time_base: ffi::AVRational,
         enforce_monotonicity: bool,
     ) -> MappedTimestamp {
+        // Zero is a valid PTS, including a seek landing at the stream origin.
+        // Rebasing it to the target makes the monotonic fallback relabel all
+        // following preroll frames as playable. Only missing/invalid PTS use
+        // the synthetic seek-relative timeline.
         let mut timeline_nsecs = timestamp_to_nsecs(timestamp, time_base)
             .map(|nsecs| self.timeline_from_timestamp(nsecs))
             .unwrap_or_else(|| self.next_synthetic_timeline());
 
-        if self.start_position_nsecs > 0 && timeline_nsecs == 0 {
-            timeline_nsecs = self.next_synthetic_timeline();
-        }
         if enforce_monotonicity
             && let Some(last_timeline_nsecs) = self.last_timeline_nsecs
             && timeline_nsecs <= last_timeline_nsecs
