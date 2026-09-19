@@ -116,7 +116,7 @@ pub(super) fn rect_for_size(size: RenderSize) -> ffi::pl_rect2df {
 }
 
 pub(super) fn swap_red_blue_channels(pixels: &mut [u8]) {
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
 }

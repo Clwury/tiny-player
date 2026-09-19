@@ -6018,6 +6018,7 @@ dependencies = [
  "cpal",
  "directories",
  "dolby_vision",
+ "embed-resource",
  "ffmpeg-sys-next",
  "gpui",
  "gpui_platform",

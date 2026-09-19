@@ -74,7 +74,7 @@ fn load_cover_image(source: CoverImageSource) -> Result<Arc<RenderImage>> {
     let mut resized =
         image::imageops::resize(&cropped, source.width, source.height, FilterType::Lanczos3);
 
-    for pixel in resized.chunks_exact_mut(4) {
+    for pixel in resized.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
 

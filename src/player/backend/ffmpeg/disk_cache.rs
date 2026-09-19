@@ -2,9 +2,12 @@ use std::{
     collections::BTreeMap,
     fs::File,
     io,
-    os::unix::fs::FileExt,
     sync::{Arc, Mutex},
 };
+
+mod positioned_io;
+pub(super) use positioned_io::read_at;
+use positioned_io::write_all_at;
 
 /// A file with reusable extents. Readers retain their allocation until the I/O
 /// completes, so eviction can never overwrite a packet already handed out.
@@ -174,7 +177,7 @@ impl DiskBlock {
                 "disk allocation length mismatch",
             ));
         }
-        let result = self.file.write_all_at(data, self.offset);
+        let result = write_all_at(&self.file, data, self.offset);
         let actual_len = result
             .as_ref()
             .err()
@@ -194,8 +197,7 @@ impl DiskBlock {
         let len = output
             .len()
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
-        self.file
-            .read_at(&mut output[..len], self.offset + relative)
+        read_at(&self.file, &mut output[..len], self.offset + relative)
     }
 }
 

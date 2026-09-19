@@ -35,3 +35,6 @@ tempfile = "3.13"
 [build-dependencies]
 bindgen = "0.72"
 pkg-config = "0.3.33"
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.9"

@@ -48,10 +48,14 @@ mod tests {
 
     #[test]
     fn desktop_entry_matches_application_metadata() {
-        assert!(DESKTOP_ENTRY.contains(&format!("Name={APP_NAME}\n")));
-        assert!(DESKTOP_ENTRY.contains(&format!("Icon={APP_ID}\n")));
-        assert!(DESKTOP_ENTRY.contains(&format!("StartupWMClass={APP_ID}\n")));
-        assert!(DESKTOP_ENTRY.contains(&format!("Exec={APP_ID}\n")));
+        for expected in [
+            format!("Name={APP_NAME}"),
+            format!("Icon={APP_ID}"),
+            format!("StartupWMClass={APP_ID}"),
+            format!("Exec={APP_ID}"),
+        ] {
+            assert!(DESKTOP_ENTRY.lines().any(|line| line == expected));
+        }
     }
 
     #[test]

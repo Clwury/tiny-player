@@ -12,6 +12,8 @@ const LIBAVUTIL_MIN_VERSION: &str = "60.26.100";
 const LIBAVUTIL_MAX_VERSION: &str = "62";
 
 fn main() {
+    #[cfg(windows)]
+    embed_windows_resources();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_LIBDIR");
@@ -82,6 +84,59 @@ fn main() {
     .expect("failed to write FFmpeg Vulkan bindings");
 }
 
+#[cfg(windows)]
+fn embed_windows_resources() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    println!("cargo:rerun-if-changed=packaging/windows/app.ico");
+    let version = env::var("CARGO_PKG_VERSION").unwrap();
+    let major = env::var("CARGO_PKG_VERSION_MAJOR").unwrap();
+    let minor = env::var("CARGO_PKG_VERSION_MINOR").unwrap();
+    let patch = env::var("CARGO_PKG_VERSION_PATCH").unwrap();
+    let icon = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("packaging/windows/app.ico")
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let resource = PathBuf::from(env::var("OUT_DIR").unwrap()).join("tiny-player.rc");
+    fs::write(
+        &resource,
+        format!(
+            r#"
+1 ICON "{icon}"
+1 VERSIONINFO
+FILEVERSION {major},{minor},{patch},0
+PRODUCTVERSION {major},{minor},{patch},0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "Tiny Player"
+            VALUE "FileVersion", "{version}"
+            VALUE "ProductName", "Tiny Player"
+            VALUE "ProductVersion", "{version}"
+            VALUE "OriginalFilename", "tiny-player.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+"#
+        ),
+    )
+    .expect("failed to write Windows resource file");
+    // GPUI supplies the DPI/UAC manifest; only add our icon and version here.
+    embed_resource::compile_for(resource, ["tiny-player"], embed_resource::NONE)
+        .manifest_required()
+        .expect("failed to compile Windows resources");
+}
+
 fn add_pkg_config_include_args(
     mut builder: bindgen::Builder,
     library: &pkg_config::Library,
@@ -94,6 +149,13 @@ fn add_pkg_config_include_args(
 
 fn write_bindings_file(out_path: &Path, file_name: &str, bindings: &bindgen::Bindings) {
     let text = bindings_text(bindings, file_name);
+    // MSVC needs dllimport semantics for exported data as well as functions.
+    // Cargo's link search/library directives alone do not attach that information
+    // to bindgen's extern blocks (e.g. pl_render_default_params).
+    let text = text.replace(
+        "unsafe extern \"C\" {",
+        "#[cfg_attr(windows, link(name = \"placebo\", kind = \"dylib\"))]\nunsafe extern \"C\" {",
+    );
     fs::write(out_path.join(file_name), text).expect("failed to write generated bindings");
 }
 

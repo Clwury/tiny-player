@@ -64,7 +64,20 @@ pub(crate) fn init() -> Option<NonBlockingLogGuard> {
 }
 
 fn log_file_path_from_env() -> Option<PathBuf> {
-    std::env::var_os(LOG_FILE_ENV).and_then(log_file_path_from_value)
+    if let Some(value) = std::env::var_os(LOG_FILE_ENV) {
+        return log_file_path_from_value(value);
+    }
+    // A release Windows GUI has no console. Keep diagnostics accessible without
+    // requiring the portable application directory to be writable.
+    #[cfg(windows)]
+    {
+        directories::BaseDirs::new().map(|dirs| {
+            dirs.data_local_dir()
+                .join("tiny-player/logs/tiny-player.log")
+        })
+    }
+    #[cfg(not(windows))]
+    None
 }
 
 fn log_file_path_from_value(value: OsString) -> Option<PathBuf> {

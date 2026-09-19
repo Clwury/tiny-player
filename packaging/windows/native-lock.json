@@ -1,0 +1,122 @@
+{
+  "schema": 1,
+  "target": "x86_64-pc-windows-msvc",
+  "python": "3.12",
+  "tools": [
+    {
+      "name": "libclang",
+      "version": "18.1.1",
+      "url": "https://files.pythonhosted.org/packages/0b/2d/3f480b1e1d31eb3d6de5e3ef641954e5c67430d5ac93b7fa7e07589576c7/libclang-18.1.1-py2.py3-none-win_amd64.whl",
+      "sha256": "4dd2d3b82fab35e2bf9ca717d7b63ac990a3519c7e312f19fa8e86dcc712f7fb",
+      "filename": "libclang-18.1.1-py2.py3-none-win_amd64.whl"
+    },
+    {
+      "name": "zstandard",
+      "version": "0.25.0",
+      "url": "https://files.pythonhosted.org/packages/79/3b/fa54d9015f945330510cb5d0b0501e8253c127cca7ebe8ba46a965df18c5/zstandard-0.25.0-cp312-cp312-win_amd64.whl",
+      "sha256": "ffef5a74088f1e09947aecf91011136665152e0b4b359c42be3373897fb39b01",
+      "filename": "zstandard-0.25.0-cp312-cp312-win_amd64.whl"
+    },
+    {
+      "name": "pefile",
+      "version": "2024.8.26",
+      "url": "https://files.pythonhosted.org/packages/54/16/12b82f791c7f50ddec566873d5bdd245baa1491bac11d15ffb98aecc8f8b/pefile-2024.8.26-py3-none-any.whl",
+      "sha256": "76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f",
+      "filename": "pefile-2024.8.26-py3-none-any.whl"
+    }
+  ],
+  "ffmpeg": {
+    "name": "ffmpeg",
+    "version": "n9.0.1-84-g946fcce07b",
+    "filename": "ffmpeg-n9.0.1-84-g946fcce07b-win64-lgpl-shared-9.0.zip",
+    "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-18-13-22/ffmpeg-n9.0.1-84-g946fcce07b-win64-lgpl-shared-9.0.zip",
+    "sha256": "a2a50423b631cb51e91c2668c16a4807197c50d1f5fc56dd4516ca188a0d731f",
+    "build_source": "https://github.com/BtbN/FFmpeg-Builds/tree/autobuild-2026-09-18-13-22"
+  },
+  "packages": [
+    {
+      "name": "gcc-libs",
+      "version": "16.2.0-3",
+      "filename": "mingw-w64-ucrt-x86_64-gcc-libs-16.2.0-3-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-gcc-libs-16.2.0-3-any.pkg.tar.zst",
+      "sha256": "5763fabf86fa13a4449ee765006d3446384ed66af7bf827459710eb777e0b11c"
+    },
+    {
+      "name": "glslang",
+      "version": "16.3.0-1",
+      "filename": "mingw-w64-ucrt-x86_64-glslang-16.3.0-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-glslang-16.3.0-1-any.pkg.tar.zst",
+      "sha256": "5a90c8ae45b42b500fa03669aa1a94d154dcd13e0bb254f86df004b903826c03"
+    },
+    {
+      "name": "lcms2",
+      "version": "2.19.1-1",
+      "filename": "mingw-w64-ucrt-x86_64-lcms2-2.19.1-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-lcms2-2.19.1-1-any.pkg.tar.zst",
+      "sha256": "144518cc80679f7bcc1d31b5dd7ec92e8737a1d8162014e30c8c1c181f47a156"
+    },
+    {
+      "name": "libdovi",
+      "version": "3.4.0-1",
+      "filename": "mingw-w64-ucrt-x86_64-libdovi-3.4.0-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-libdovi-3.4.0-1-any.pkg.tar.zst",
+      "sha256": "fd683eb03572f56db2cbdf0ffc2131bb93a21a0edbbda44862e3ef7eb98ebf00"
+    },
+    {
+      "name": "libplacebo",
+      "version": "7.360.1-2",
+      "filename": "mingw-w64-ucrt-x86_64-libplacebo-7.360.1-2-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-libplacebo-7.360.1-2-any.pkg.tar.zst",
+      "sha256": "ef183923c29475320d75a3b06fff5729172fcfdcefc45b660ed28c41107d4de4"
+    },
+    {
+      "name": "libwinpthread",
+      "version": "14.0.0.r375.g9c1abbbf5-1",
+      "filename": "mingw-w64-ucrt-x86_64-libwinpthread-14.0.0.r375.g9c1abbbf5-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-libwinpthread-14.0.0.r375.g9c1abbbf5-1-any.pkg.tar.zst",
+      "sha256": "61d340fe8eebc77ee821badca246827fe90545e99685e503bdea16a8d25df512"
+    },
+    {
+      "name": "pkgconf",
+      "version": "1~3.0.7-1",
+      "filename": "mingw-w64-ucrt-x86_64-pkgconf-1~3.0.7-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-pkgconf-1~3.0.7-1-any.pkg.tar.zst",
+      "sha256": "74b6fe685d84ec6ea19b9ee285d752d122e31b6b93038f933627b05324d8f2a3"
+    },
+    {
+      "name": "shaderc",
+      "version": "2026.3-1",
+      "filename": "mingw-w64-ucrt-x86_64-shaderc-2026.3-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-shaderc-2026.3-1-any.pkg.tar.zst",
+      "sha256": "0af3be0981f194806859a521c8ea944e084a69bb720d59aae2adedfd88c14adc"
+    },
+    {
+      "name": "spirv-cross",
+      "version": "1~1.4.357.0-1",
+      "filename": "mingw-w64-ucrt-x86_64-spirv-cross-1~1.4.357.0-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-spirv-cross-1~1.4.357.0-1-any.pkg.tar.zst",
+      "sha256": "78f74990ac05623ebbefea310cb9ab96f4058f5c88d68255fc102b89077503d9"
+    },
+    {
+      "name": "spirv-tools",
+      "version": "3~1.4.357.0-1",
+      "filename": "mingw-w64-ucrt-x86_64-spirv-tools-3~1.4.357.0-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-spirv-tools-3~1.4.357.0-1-any.pkg.tar.zst",
+      "sha256": "ba11b4bad606f6ececc5bf5910f97077071624851c81a25fafc6b0ec88c58b84"
+    },
+    {
+      "name": "vulkan-headers",
+      "version": "1~1.4.357.0-1",
+      "filename": "mingw-w64-ucrt-x86_64-vulkan-headers-1~1.4.357.0-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-vulkan-headers-1~1.4.357.0-1-any.pkg.tar.zst",
+      "sha256": "96749e9c3c10bd7dd6624530006b4ed5c165c0f1bc37125522e046c63aed649c"
+    },
+    {
+      "name": "vulkan-loader",
+      "version": "1~1.4.357.0-1",
+      "filename": "mingw-w64-ucrt-x86_64-vulkan-loader-1~1.4.357.0-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-vulkan-loader-1~1.4.357.0-1-any.pkg.tar.zst",
+      "sha256": "4d34983aea34116582700b285279df21cd0ee8519025330e7ac0650bb02f138f"
+    }
+  ]
+}

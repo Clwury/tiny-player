@@ -74,6 +74,9 @@ impl MockEmby {
                         }
                         Err(error) => panic!("accept failed: {error}"),
                     };
+                    // Winsock inherits the listener's nonblocking mode; these
+                    // request/response reads use a blocking socket with a timeout.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();

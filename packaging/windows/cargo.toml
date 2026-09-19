@@ -1,0 +1,4 @@
+# Rust/MSVC runtime is static; FFmpeg and libplacebo remain replaceable DLLs.
+# Always pass --target so this flag does not apply to host proc macros.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -432,7 +432,9 @@ fn strip_utf16be_bom(bytes: &[u8]) -> &[u8] {
 
 fn decode_utf16_units(bytes: &[u8], little_endian: bool) -> String {
     let units = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
             if little_endian {
                 u16::from_le_bytes([chunk[0], chunk[1]])

@@ -1,7 +1,6 @@
 use std::{
     env,
     fs::{File, OpenOptions},
-    os::unix::fs::FileExt,
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -11,7 +10,7 @@ use std::{
 use super::AvPacket;
 use super::{CacheUnlinkPolicy, PlaybackCacheConfig};
 use crate::app_metadata::default_playback_cache_dir;
-use crate::player::backend::ffmpeg::disk_cache::{BoundedDiskFile, DiskBlock};
+use crate::player::backend::ffmpeg::disk_cache::{BoundedDiskFile, DiskBlock, read_at};
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxPacketDiskCache {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) path: PathBuf,
@@ -164,8 +163,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn read_demux
     let mut data = vec![0; len];
     let mut read = 0;
     while read < data.len() {
-        let read_now = file
-            .read_at(&mut data[read..], offset.saturating_add(read as u64))
+        let read_now = read_at(file, &mut data[read..], offset.saturating_add(read as u64))
             .map_err(|error| format!("读取 FFmpeg demux packet disk cache 失败：{error}"))?;
         if read_now == 0 {
             return Err("读取 FFmpeg demux packet disk cache 返回 0 字节".to_string());

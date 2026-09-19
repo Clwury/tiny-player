@@ -467,6 +467,8 @@ fn clicking_non_adjacent_episode_resolves_playback_and_preserves_resume_position
                 Err(error) => panic!("{error}"),
             }
         };
+        // Accepted sockets inherit nonblocking mode on Windows.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();

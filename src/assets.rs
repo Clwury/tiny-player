@@ -30,11 +30,12 @@ impl ProjectAssets {
             .or_else(|| {
                 // current_exe resolves the ~/.local/bin symlink on Linux, so
                 // this also works after installing or moving a portable bundle.
-                executable?
-                    .parent()?
-                    .parent()
+                let directory = executable?.parent()?;
+                [Some(directory), directory.parent()]
+                    .into_iter()
+                    .flatten()
                     .map(|root| root.join("share/tiny-player/assets"))
-                    .filter(|assets| assets.is_dir())
+                    .find(|assets| assets.is_dir())
             })
             .unwrap_or_else(|| PathBuf::from(manifest_dir).join("assets"));
         Self { base }
@@ -122,5 +123,26 @@ mod tests {
         );
 
         assert_eq!(assets.base, PathBuf::from("/checkout/tiny-player/assets"));
+    }
+
+    #[test]
+    fn portable_windows_assets_load_next_to_the_executable_after_moving() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let moved = temp.path().join("移动后的播放器");
+        let icons = original.join("share/tiny-player/assets/icons");
+        fs::create_dir_all(&icons).unwrap();
+        fs::write(icons.join("play.svg"), b"<svg/>").unwrap();
+        fs::rename(&original, &moved).unwrap();
+
+        let assets = ProjectAssets::from_roots(
+            None,
+            Some(&moved.join("tiny-player.exe")),
+            "/unavailable/build/checkout",
+        );
+        assert_eq!(
+            assets.load("icons/play.svg").unwrap().unwrap().as_ref(),
+            b"<svg/>"
+        );
     }
 }

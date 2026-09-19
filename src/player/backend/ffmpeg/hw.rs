@@ -263,12 +263,14 @@ fn select_decode_queues(
     })
 }
 
+// bindgen represents these C enums as i32 on MSVC and u32 on GNU targets.
+#[allow(clippy::unnecessary_cast)]
 fn find_queue(
     queue_families: &[vulkan_ffi::AVVulkanDeviceQueueFamily],
     flag: u32,
 ) -> Option<VulkanDecodeQueue> {
     queue_families.iter().find_map(|queue| {
-        let flags = queue.flags;
+        let flags = queue.flags as u32;
         if queue.idx < 0 || queue.num <= 0 || flags & flag == 0 {
             return None;
         }
@@ -304,6 +306,7 @@ pub(super) struct VulkanFrameImages {
     pub(super) planes: Vec<VulkanVideoPlane>,
 }
 
+#[allow(clippy::unnecessary_cast)]
 pub(super) fn vulkan_frame_planes(
     frame: *const ffi::AVFrame,
     raw_format: RawVideoFormat,
@@ -338,8 +341,8 @@ pub(super) fn vulkan_frame_planes(
         }
         planes.push(VulkanVideoPlane {
             image,
-            format: vk_frames.format[plane_index],
-            layout: vk_frame.layout[plane_index],
+            format: vk_frames.format[plane_index] as u32,
+            layout: vk_frame.layout[plane_index] as u32,
             queue_family: vk_frame.queue_family[plane_index],
             semaphore: vk_frame.sem[plane_index] as usize,
             semaphore_value: vk_frame.sem_value[plane_index],
@@ -353,7 +356,7 @@ pub(super) fn vulkan_frame_planes(
         planes.truncate(raw_format.plane_count());
     }
     Ok(VulkanFrameImages {
-        usage: vk_frames.usage,
+        usage: vk_frames.usage as u32,
         planes,
     })
 }

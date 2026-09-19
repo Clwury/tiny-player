@@ -367,7 +367,7 @@ mod tests {
                             "{rate}: {start} != {previous_end}"
                         );
                         previous_end = start + audio.duration_nsecs;
-                        samples.extend(audio.samples.chunks_exact(2).map(|frame| {
+                        samples.extend(audio.samples.as_chunks::<2>().0.iter().map(|frame| {
                             assert_eq!(frame[0], frame[1]);
                             frame[0]
                         }));
@@ -423,13 +423,22 @@ mod tests {
                 assert!(
                     audio
                         .samples
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .all(|frame| frame[0] == frame[1])
                 );
                 let start = timestamp_to_nsecs(pts, tempo_time_base()).unwrap();
                 assert!(start.abs_diff(timeline_end) < 50_000);
                 timeline_end = start + audio.duration_nsecs;
-                result.extend(audio.samples.chunks_exact(2).map(|frame| frame[0]));
+                result.extend(
+                    audio
+                        .samples
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|frame| frame[0]),
+                );
                 Ok(())
             };
             for start in (0..192_000).step_by(960) {
