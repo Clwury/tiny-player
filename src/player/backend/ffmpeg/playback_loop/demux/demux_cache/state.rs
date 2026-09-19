@@ -20,11 +20,11 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::{
     PacketId, PlaybackCacheConfig, PlaybackCacheMode, PlaybackCacheTimeRange, PlaybackSeekMode,
     PlaybackSessionId, PreparedSeekableRangeReport, RangeId, SeekableRangeValidationStats,
     SeekableTimelineSummary, StreamCacheKind, StreamCacheRangeState, StreamCacheState,
-    StreamForwardState, StreamForwardWindow, StreamRangeBoundary, VideoRecoveryPointKind,
-    audio_codec_requires_recovery_point, demux_packet_cache_hysteresis_nsecs,
-    demux_packet_cache_readahead_nsecs, demux_packet_disk_cache_enabled, nsecs_to_seconds,
-    optional_buffered_value_changed, ordered_duration_seconds, seconds_to_nsecs,
-    video_cached_seek_preroll_nsecs,
+    StreamForwardState, StreamForwardWindow, StreamRangeBoundary, StreamResumePosition,
+    VideoRecoveryPointKind, audio_codec_requires_recovery_point,
+    demux_packet_cache_hysteresis_nsecs, demux_packet_cache_readahead_nsecs,
+    demux_packet_disk_cache_enabled, nsecs_to_seconds, optional_buffered_value_changed,
+    ordered_duration_seconds, seconds_to_nsecs, video_cached_seek_preroll_nsecs,
 };
 
 #[path = "state/append.rs"]

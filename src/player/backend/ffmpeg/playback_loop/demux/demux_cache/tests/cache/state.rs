@@ -233,7 +233,7 @@ fn demux_packet_cache_state_clears_last_demux_timestamp_on_low_level_seek() {
 }
 
 #[test]
-fn demux_packet_cache_state_counts_blocked_overlap_in_raw_input_rate() {
+fn demux_packet_cache_state_counts_discarded_overlap_in_raw_input_rate() {
     let mut state = DemuxPacketCacheState::new(
         0,
         0,
@@ -241,14 +241,20 @@ fn demux_packet_cache_state_counts_blocked_overlap_in_raw_input_rate() {
         PlaybackSessionId(1),
         cache_config_for_test(),
     );
-    state.resume_append_skip_until_nsecs = Some(2_000_000_000);
+    state.refreshing_streams.insert(
+        0,
+        super::super::super::model::StreamResumePosition::new(&cached_anchor(
+            1_000_000_000,
+            2_000_000_000,
+        )),
+    );
     let mut packet = cached_anchor(0, 1_000_000_000);
     packet.byte_len = 4096;
 
     let outcome = state.append_packet(packet);
 
-    assert!(outcome.appended);
-    assert_eq!(state.cached_bytes, 4096);
+    assert!(!outcome.appended);
+    assert_eq!(state.cached_bytes, 0);
     assert_eq!(state.next_packet_id_for_stream(0), None);
     assert_eq!(state.forward_bytes(), 0);
     assert_eq!(

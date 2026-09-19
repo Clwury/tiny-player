@@ -1,6 +1,57 @@
 use super::*;
 
 #[test]
+fn reader_head_probe_and_packet_retry_return_while_storage_holds_cache_lock() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
+    let (shared, _event_rx) = shared_with_config_for_test(control, cache_config_for_test());
+    let cache = Arc::new(DemuxPacketCache {
+        shared: Arc::new(shared),
+        handle: None,
+    });
+    cache.shared.append_packet(cached_anchor(0, 1_000_000_000));
+    cache
+        .shared
+        .append_packet(cached_anchor(1_000_000_000, 2_000_000_000));
+    assert_eq!(cache.try_stream_reader_head_timeline(0).unwrap().1, Some(0));
+
+    let mut guard = cache.shared.state.lock().unwrap();
+    set_reader_head_for_stream_time(&mut guard, 0, 1_000_000_000);
+    let (tx, rx) = mpsc::channel();
+    let reader_cache = Arc::clone(&cache);
+    let reader = thread::spawn(move || {
+        let head = reader_cache.try_stream_reader_head_timeline(0);
+        let (packet, _, timing) = reader_cache
+            .read_available_packet_round_robin_with_cache_pause_signal_and_timing(
+                &[0],
+                Duration::from_millis(2),
+                false,
+            );
+        tx.send((
+            head,
+            matches!(packet, DemuxReadResult::WouldBlock),
+            timing.lock_timed_out,
+        ))
+        .unwrap();
+    });
+    // Release even on failure, so a regression reports a failure without
+    // leaving a permanently blocked thread in the full test suite.
+    let result = rx.recv_timeout(Duration::from_secs(1));
+    drop(guard);
+    reader.join().unwrap();
+    let (head, would_block, timed_out) = result.expect("coordinator must not wait for storage");
+    assert_eq!(
+        head, None,
+        "an optional probe must not use a stale reader head"
+    );
+    assert!(would_block && timed_out);
+    assert_eq!(
+        cache.try_stream_reader_head_timeline(0).unwrap().1,
+        Some(1_000_000_000)
+    );
+    assert!(matches!(cache.poll_packet(0), DemuxReadResult::Packet(_)));
+}
+
+#[test]
 fn demux_packet_cache_monitor_returns_cached_snapshot_while_state_is_locked() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let (shared, _event_rx) = shared_with_config_for_test(control, cache_config_for_test());

@@ -11,6 +11,8 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use super::{
 mod packet;
 #[path = "model/range.rs"]
 mod range;
+#[path = "model/resume.rs"]
+mod resume;
 #[path = "model/seekable.rs"]
 mod seekable;
 #[path = "model/stream_window.rs"]
@@ -27,9 +29,10 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use packet::{
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use range::{
     ArchivedStreamPruneCandidate, CachedSeekMiss, CachedSeekMissReason, DemuxCachedRange,
     DemuxCachedSeekHit, DemuxCachedSeekPlan, DemuxPacketRangeView, InternalPacketTimestampHole,
-    PreparedSeekableRangeReport, SeekableRangeValidationStats, SeekableTimelineSummary,
-    StreamRangeBoundary,
+    PreparedSeekableRangeReport, RangeForwardStats, SeekableRangeValidationStats,
+    SeekableTimelineSummary, StreamRangeBoundary,
 };
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use resume::StreamResumePosition;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use seekable::ordered_duration_seconds;
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) use stream_window::{
     StreamCacheRangeState, StreamForwardState, StreamForwardWindow,

@@ -48,7 +48,6 @@ pub(in crate::player::backend::ffmpeg::playback_loop) enum DemuxReadResult {
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) enum DemuxCacheLockWait {
     None,
     Bounded(Duration),
-    Unbounded,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

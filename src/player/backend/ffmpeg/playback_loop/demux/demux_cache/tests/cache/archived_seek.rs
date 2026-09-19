@@ -670,7 +670,7 @@ fn demux_packet_cache_state_indexes_archived_ranges_by_range_id() {
     );
 
     assert_eq!(state.read_range_id, 0);
-    assert_ne!(state.read_range_id, state.append_range_id);
+    assert_eq!(state.read_range_id, state.append_range_id);
     assert_eq!(
         state
             .ranges
@@ -686,7 +686,7 @@ fn demux_packet_cache_state_indexes_archived_ranges_by_range_id() {
             .ranges
             .get(&state.append_range_id)
             .map(|range| range.global_order.len()),
-        Some(0)
+        Some(2)
     );
 }
 
@@ -712,14 +712,14 @@ fn demux_packet_cache_state_seeks_inside_archived_range_after_low_level_seek() {
     assert_eq!(state.session_id, PlaybackSessionId(3));
     assert_eq!(state.read_index, 0);
     assert!(!state.demux_position_detached);
-    assert_eq!(state.resume_append_skip_until_nsecs, Some(1_000_000_000));
-    assert_ne!(state.read_range_id, state.append_range_id);
+    assert!(state.refreshing_streams.contains_key(&0));
+    assert_eq!(state.read_range_id, state.append_range_id);
     assert_eq!(
         state
             .ranges
             .get(&state.append_range_id)
             .map(|range| (range.id, range.global_order.len())),
-        Some((state.append_range_id, 0))
+        Some((state.append_range_id, 2))
     );
     assert_eq!(state.archived_bytes(), 1024);
     assert_eq!(state.cached_seeks, 1);
@@ -755,28 +755,10 @@ fn demux_packet_cache_state_skips_resume_overlap_packets_after_archived_seek() {
     );
     assert_eq!(state.read_range().global_order.len(), 2);
 
-    state.append_packet(cached_anchor(500_000_000, 1_000_000_000));
+    let duplicate = state.append_packet(cached_anchor(0, 1_000_000_000));
+    assert!(!duplicate.appended);
 
     assert_eq!(state.read_range().global_order.len(), 2);
-    assert_eq!(
-        state
-            .ranges
-            .get(&state.append_range_id)
-            .map(|range| range.global_order.len()),
-        Some(1)
-    );
-    assert_eq!(state.cached_bytes, 3 * 1024);
-    assert_eq!(state.resume_append_skip_until_nsecs, Some(1_000_000_000));
-    assert_eq!(
-        state.low_level_append_guard_target_nsecs,
-        Some(1_000_000_000)
-    );
-    let request = state.seek_request.expect("resume seek is queued");
-    assert_eq!(request.seek_generation, 7);
-
-    state.seek_request = None;
-    let blocked_far_ahead = state.append_packet(cached_anchor(237_000_000_000, 238_000_000_000));
-    assert!(blocked_far_ahead.appended);
     assert_eq!(
         state
             .ranges
@@ -784,16 +766,17 @@ fn demux_packet_cache_state_skips_resume_overlap_packets_after_archived_seek() {
             .map(|range| range.global_order.len()),
         Some(2)
     );
-    assert_eq!(state.cached_bytes, 4 * 1024);
-    assert_eq!(
-        state.low_level_append_guard_target_nsecs,
-        Some(1_000_000_000)
-    );
+    assert_eq!(state.cached_bytes, 2 * 1024);
+    assert!(state.refreshing_streams.is_empty());
+    assert_eq!(state.low_level_append_guard_target_nsecs, None);
+    let request = state.seek_request.expect("resume seek is queued");
+    assert_eq!(request.seek_generation, 7);
 
+    state.seek_request = None;
     state.append_packet(cached_anchor(1_000_000_000, 2_000_000_000));
     close_seek_range(&mut state, 2_000_000_000);
 
-    assert_eq!(state.read_range().global_order.len(), 2);
+    assert_eq!(state.read_range().global_order.len(), 4);
     assert_eq!(
         state
             .ranges
@@ -801,17 +784,13 @@ fn demux_packet_cache_state_skips_resume_overlap_packets_after_archived_seek() {
             .map(|range| range.global_order.len()),
         Some(4)
     );
-    assert_eq!(state.cached_bytes, 5 * 1024);
+    assert_eq!(state.cached_bytes, 3 * 1024);
     assert_eq!(state.forward_bytes(), 2 * 1024);
     assert_eq!(
         state.playback_cache_state(false).demux.seekable_ranges,
         vec![
             PlaybackCacheTimeRange {
                 start: 0.0,
-                end: 1.0
-            },
-            PlaybackCacheTimeRange {
-                start: 1.0,
                 end: 2.0
             },
             PlaybackCacheTimeRange {
@@ -820,10 +799,10 @@ fn demux_packet_cache_state_skips_resume_overlap_packets_after_archived_seek() {
             },
         ]
     );
-    assert_eq!(state.resume_append_skip_until_nsecs, None);
+    assert!(state.refreshing_streams.is_empty());
 
     state.set_read_index_for_test(state.read_range().global_order.len());
-    assert!(state.activate_detached_append_range());
+    assert!(!state.activate_detached_append_range());
     assert_eq!(state.read_range_id, state.append_range_id);
     assert_eq!(state.read_range().global_order.len(), 4);
     assert!(state.detached_append_range().is_none());

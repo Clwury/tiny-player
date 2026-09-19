@@ -96,7 +96,7 @@ impl DemuxPacketPump {
         };
         let reader_head = context
             .demux_cache
-            .stream_reader_head_timeline(audio_stream_index);
+            .try_stream_reader_head_timeline(audio_stream_index);
         let reader_head_far_ahead = reader_head
             .and_then(|(_, start_nsecs, _)| start_nsecs)
             .is_some_and(|start_nsecs| {

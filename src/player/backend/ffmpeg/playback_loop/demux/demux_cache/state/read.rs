@@ -800,12 +800,11 @@ impl DemuxPacketCacheState {
             .unwrap_or_default();
         let detached_count = self
             .detached_append_range()
-            .and_then(|range| range.stream_queues.get(&stream_index))
-            .map(|queue| {
-                queue
-                    .iter()
-                    .filter(|packet_id| self.packets.contains_key(packet_id))
-                    .count()
+            .map(|range| {
+                self.range_forward_stats(range)
+                    .stored
+                    .get(&stream_index)
+                    .map_or(0, |stream| stream.packet_count)
             })
             .unwrap_or_default();
         active_count + detached_count
@@ -875,12 +874,13 @@ impl DemuxPacketCacheState {
             .unwrap_or_default();
         let detached_bytes: usize = self
             .detached_append_range()
-            .and_then(|range| range.stream_queues.get(&stream_index))
-            .into_iter()
-            .flat_map(|queue| queue.iter())
-            .filter_map(|packet_id| self.packets.get(packet_id))
-            .map(|packet| packet.byte_len)
-            .sum();
+            .map(|range| {
+                self.range_forward_stats(range)
+                    .stored
+                    .get(&stream_index)
+                    .map_or(0, |stream| stream.bytes)
+            })
+            .unwrap_or_default();
         active_bytes + detached_bytes
     }
 }

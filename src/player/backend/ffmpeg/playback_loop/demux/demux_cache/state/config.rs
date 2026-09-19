@@ -109,7 +109,7 @@ impl DemuxPacketCacheState {
             session_id,
             seek_request: None,
             demux_position_detached: false,
-            resume_append_skip_until_nsecs: None,
+            refreshing_streams: BTreeMap::new(),
             low_level_append_guard_target_nsecs: None,
             low_level_append_blocked_packet_generations: HashMap::new(),
             seeking: false,
@@ -182,6 +182,8 @@ impl DemuxPacketCacheState {
         if let Some(subtitle_stream) = selected_streams.subtitle_stream {
             self.set_stream_kind(subtitle_stream.index, StreamCacheKind::Subtitle);
         }
+        self.refreshing_streams
+            .retain(|stream_index, _| self.stream_kinds.contains_key(stream_index));
         self.reader_heads
             .retain(|stream_index, _| self.stream_kinds.contains_key(stream_index));
         self.reader_head_positions

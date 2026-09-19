@@ -6,7 +6,9 @@ use std::{
 };
 
 use super::types::{PacketId, RangeId};
-use super::{PlaybackCacheTimeRange, VideoRecoveryPointKind};
+use super::{
+    PlaybackCacheTimeRange, StreamForwardState, StreamResumePosition, VideoRecoveryPointKind,
+};
 
 const MAX_INTERNAL_PACKET_TIMESTAMP_HOLE_DETAILS: usize = 16;
 
@@ -30,8 +32,15 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxC
         BTreeMap<c_int, BTreeMap<(u64, PacketId), PacketId>>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_boundaries:
         BTreeMap<c_int, StreamRangeBoundary>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stream_resume_positions:
+        BTreeMap<c_int, StreamResumePosition>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) report_stats:
         RefCell<RangeReportStats>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) forward_stats:
+        RefCell<Option<RangeForwardStats>>,
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) forward_stats_rebuilds:
+        std::cell::Cell<usize>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) is_bof: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) is_eof: bool,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) last_used_generation: u64,
@@ -51,7 +60,14 @@ impl DemuxCachedRange {
             stream_pts_index: BTreeMap::new(),
             stream_recovery_point_index: BTreeMap::new(),
             stream_boundaries: BTreeMap::new(),
+            stream_resume_positions: BTreeMap::new(),
             report_stats: RefCell::new(RangeReportStats::default()),
+            forward_stats: RefCell::new(Some(RangeForwardStats {
+                generation: last_used_generation,
+                ..RangeForwardStats::default()
+            })),
+            #[cfg(test)]
+            forward_stats_rebuilds: std::cell::Cell::new(0),
             is_bof,
             is_eof: false,
             last_used_generation,
@@ -215,6 +231,19 @@ impl DemuxCachedRange {
             .internal_packet_timestamp_holes
             .clone()
     }
+}
+
+/// Appending updates these aggregates in place. Trimming invalidates them and
+/// a generation change rebuilds the readable view once, never per packet read
+/// or disk residency change. Stored counts retain blocked overlap packets for
+/// queue diagnostics; only readable packets contribute to forward coverage.
+#[derive(Default)]
+pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct RangeForwardStats {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) generation: u64,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) stored:
+        BTreeMap<c_int, StreamForwardState>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) readable:
+        BTreeMap<c_int, StreamForwardState>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -390,6 +419,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) enum CachedSe
     GenerationBlocked,
     AnchorTrimmed,
     SafeAnchorRequired,
+    UnresumableStream,
 }
 
 impl CachedSeekMissReason {
@@ -403,6 +433,7 @@ impl CachedSeekMissReason {
             Self::GenerationBlocked => "generation_blocked",
             Self::AnchorTrimmed => "anchor_trimmed",
             Self::SafeAnchorRequired => "safe_anchor_required",
+            Self::UnresumableStream => "unresumable_stream",
         }
     }
 }

@@ -109,10 +109,20 @@ impl DemuxPacketCacheState {
             if self.range_cached_seek_target(range, target_nsecs).is_none() {
                 continue;
             }
+            if location == CachedSeekRangeLocation::Archived
+                && !range.is_eof
+                && !self.range_can_resume(range)
+            {
+                first_rejection.get_or_insert(CachedSeekMiss {
+                    range_id: Some(range_id),
+                    target_nsecs,
+                    reason: CachedSeekMissReason::UnresumableStream,
+                });
+                continue;
+            }
             match self.seek_cached_in_range_diagnostic(range, target_nsecs, mode, safe_anchor_only)
             {
                 Ok(hit) => {
-                    let _ = location;
                     return Ok(DemuxCachedSeekPlan {
                         hit,
                         seekability_revision: self.seekability_revision(),
@@ -201,6 +211,13 @@ impl DemuxPacketCacheState {
         {
             return false;
         }
+        if range.id != self.read_range_id
+            && range.id != self.append_range_id
+            && !range.is_eof
+            && !self.range_can_resume(range)
+        {
+            return false;
+        }
         plan.hit
             .reader_heads
             .iter()
@@ -236,11 +253,20 @@ impl DemuxPacketCacheState {
         self.reader_nsecs = hit.anchor_nsecs;
         self.exact_seek_target_nsecs = hit.target_nsecs;
         self.session_id = session_id;
-        self.seek_request = None;
-        self.seeking = false;
-        self.resume_append_skip_until_nsecs = None;
-        self.low_level_append_guard_target_nsecs = None;
-        if location == CachedSeekRangeLocation::Archived && !self.read_range_eof() {
+        // A second cached seek must not cancel the producer's unfinished
+        // refresh. Reissue it with the current seek generation so an in-flight
+        // low-level seek cannot be discarded without resetting its timeline.
+        let resume_pending =
+            location == CachedSeekRangeLocation::Current && !self.refreshing_streams.is_empty();
+        if location != CachedSeekRangeLocation::Current {
+            self.seek_request = None;
+            self.seeking = false;
+            self.refreshing_streams.clear();
+            self.low_level_append_guard_target_nsecs = None;
+        }
+        if (location == CachedSeekRangeLocation::Archived || resume_pending)
+            && !self.read_range_eof()
+        {
             self.queue_resume_seek_after_cached_range(buffered_until_nsecs, seek_generation);
         }
         // A seek commit is latency-sensitive. Do at most one bounded trim
@@ -507,9 +533,17 @@ impl DemuxPacketCacheState {
             seek_generation,
         });
         self.demux_position_detached = false;
-        self.resume_append_skip_until_nsecs = Some(buffered_until_nsecs);
-        self.low_level_append_guard_target_nsecs = Some(buffered_until_nsecs);
-        self.start_detached_append_range();
+        self.low_level_append_guard_target_nsecs = None;
+        // Like mpv, extend the range being read. Each stream refreshes past
+        // its own old tail without moving any existing reader head.
+        self.append_range_id = self.read_range_id;
+        self.refreshing_streams = self
+            .read_range()
+            .stream_resume_positions
+            .iter()
+            .filter(|(stream_index, _)| self.stream_kinds.contains_key(stream_index))
+            .map(|(stream_index, position)| (*stream_index, *position))
+            .collect();
         self.seeking = true;
         self.low_level_seeks = self.low_level_seeks.saturating_add(1);
         self.demux_ts_nsecs = None;
@@ -549,7 +583,7 @@ impl DemuxPacketCacheState {
             seek_generation,
         });
         self.demux_position_detached = false;
-        self.resume_append_skip_until_nsecs = None;
+        self.refreshing_streams.clear();
         self.low_level_append_guard_target_nsecs = Some(target_nsecs);
         self.demux_input_generation = self.demux_input_generation.saturating_add(1);
         self.generation = self.generation.saturating_add(1);
@@ -579,7 +613,7 @@ impl DemuxPacketCacheState {
             seek_generation,
         });
         self.demux_position_detached = false;
-        self.resume_append_skip_until_nsecs = None;
+        self.refreshing_streams.clear();
         self.low_level_append_guard_target_nsecs = Some(self.reader_nsecs);
         self.demux_input_generation = self.demux_input_generation.saturating_add(1);
         self.generation = self.generation.saturating_add(1);

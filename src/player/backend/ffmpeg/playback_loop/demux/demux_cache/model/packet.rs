@@ -28,6 +28,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct Cached
         Option<u64>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) raw_pts: Option<i64>,
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) raw_dts: Option<i64>,
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) raw_pos: Option<i64>,
     /// Monotonic packet window retained for forward-buffer accounting and
     /// playback scheduling. It must not define OSC seekable ranges.
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) start_nsecs: Option<u64>,
@@ -268,6 +269,7 @@ impl CachedDemuxPacket {
             seek_timestamp_nsecs,
             raw_pts: packet.pts(),
             raw_dts: packet.dts(),
+            raw_pos: packet.position(),
             start_nsecs,
             end_nsecs,
             byte_len: packet.byte_len(),

@@ -3,9 +3,21 @@ use std::{
     os::raw::c_int,
 };
 
-use super::{DemuxCachedRange, DemuxPacketCacheState, RangeId};
+use super::{DemuxCachedRange, DemuxPacketCacheState, RangeId, StreamCacheKind};
 
 impl DemuxPacketCacheState {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn range_can_resume(
+        &self,
+        range: &DemuxCachedRange,
+    ) -> bool {
+        self.stream_kinds.keys().all(|stream_index| {
+            range
+                .stream_resume_positions
+                .get(stream_index)
+                .is_none_or(|position| position.resumable())
+        })
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn next_range_id(
         &mut self,
     ) -> RangeId {
@@ -51,6 +63,19 @@ impl DemuxPacketCacheState {
         &self,
     ) -> bool {
         self.read_range().is_eof
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn read_range_eager_streams_exhausted(
+        &self,
+    ) -> bool {
+        // A read may request only a sparse subtitle stream or one A/V stream
+        // while the other decoders are backpressured. Its empty queue says
+        // nothing about the remaining A/V in this range. Cold disk packets
+        // still count, even before the storage worker receives a read request.
+        self.stream_kinds
+            .iter()
+            .filter(|(_, kind)| matches!(kind, StreamCacheKind::Video | StreamCacheKind::Audio))
+            .all(|(stream_index, _)| self.next_packet_id_for_stream(*stream_index).is_none())
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn current_generation_range_view(
@@ -130,6 +155,7 @@ impl DemuxPacketCacheState {
         self.enforce_cached_range_limit();
     }
 
+    #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn start_detached_append_range(
         &mut self,
     ) {
@@ -238,6 +264,9 @@ impl DemuxPacketCacheState {
         let Some(range_id) = self.detached_append_range_id() else {
             return false;
         };
+        if !self.read_range_eager_streams_exhausted() {
+            return false;
+        }
         let Some(range) = self.ranges.get(&range_id) else {
             self.append_range_id = self.read_range_id;
             return false;
@@ -245,9 +274,18 @@ impl DemuxPacketCacheState {
         if range.global_order.is_empty() && !range.is_eof {
             return false;
         }
+        let previous_read_range_id = self.read_range_id;
         self.preserve_current_range();
         self.activate_range_for_read(range_id, 0);
         self.enforce_cached_range_limit();
+        tracing::debug!(
+            session_id = ?self.session_id,
+            previous_read_range_id,
+            read_range_id = self.read_range_id,
+            reader_nsecs = self.reader_nsecs,
+            generation = self.generation,
+            "FFmpeg demux packet cache continued into appended range after audio/video exhaustion"
+        );
         true
     }
 

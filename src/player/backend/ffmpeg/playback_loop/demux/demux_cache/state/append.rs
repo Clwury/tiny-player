@@ -7,7 +7,7 @@ use super::seek_algorithm::DEMUX_PACKET_TIMESTAMP_ROUNDING_TOLERANCE_NSECS;
 use super::{
     CachedDemuxPacket, DEMUX_PACKET_APPEND_MAINTENANCE_INTERVAL, DemuxInputRateSample,
     DemuxPacketAppendOutcome, DemuxPacketAppendTiming, DemuxPacketCacheState,
-    InternalPacketTimestampHole, PacketId, StreamCacheKind,
+    InternalPacketTimestampHole, PacketId, StreamCacheKind, StreamResumePosition,
 };
 
 const LOW_LEVEL_SEEK_APPEND_MAX_INITIAL_LEAD_NSECS: u64 = 2_000_000_000;
@@ -78,6 +78,13 @@ impl DemuxPacketCacheState {
         let packet_forward_end_nsecs = packet.end_nsecs.or(packet.start_nsecs);
         let blocked_for_current_read =
             self.mark_low_level_seek_noncurrent_packet_if_needed(packet_id, &packet);
+        if !blocked_for_current_read && packet.byte_len > 0 {
+            self.append_range_mut()
+                .stream_resume_positions
+                .entry(stream_index)
+                .and_modify(|position| position.observe(&packet))
+                .or_insert_with(|| StreamResumePosition::new(&packet));
+        }
         timing.packet_index += packet_index_started_at.elapsed();
         let cleared_seek = self.seeking;
         let queue_insert_started_at = Instant::now();
@@ -106,6 +113,7 @@ impl DemuxPacketCacheState {
             seek_timestamp_nsecs,
             cached_seek_anchor,
         );
+        self.update_range_forward_stats_after_append(packet_id);
         self.record_internal_packet_timestamp_gap(
             self.append_range_id,
             stream_index,
@@ -396,21 +404,29 @@ impl DemuxPacketCacheState {
     }
 
     fn should_skip_resume_overlap_packet(&mut self, packet: &CachedDemuxPacket) -> bool {
-        let Some(skip_until_nsecs) = self.resume_append_skip_until_nsecs else {
+        let Some(tail) = self.refreshing_streams.get(&packet.stream_index).copied() else {
             return false;
         };
-        let packet_end_nsecs = packet.end_nsecs.or(packet.start_nsecs);
-        if packet_end_nsecs.is_some_and(|end_nsecs| end_nsecs <= skip_until_nsecs) {
-            return false;
+        let ordering = tail.compare(packet);
+        if matches!(
+            ordering,
+            Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+        ) {
+            self.refreshing_streams.remove(&packet.stream_index);
+            tracing::debug!(
+                session_id = ?self.session_id,
+                range_id = self.append_range_id,
+                stream_index = packet.stream_index,
+                ?tail,
+                raw_dts = ?packet.raw_dts,
+                raw_pos = ?packet.raw_pos,
+                "FFmpeg demux cached stream resumed after its cached tail"
+            );
         }
-        if packet
-            .start_nsecs
-            .is_some_and(|start_nsecs| start_nsecs >= skip_until_nsecs)
-            || packet_end_nsecs.is_none()
-        {
-            self.resume_append_skip_until_nsecs = None;
-        }
-        false
+        // PTS and the mapped forward window are unsuitable here: B-frames
+        // reorder PTS, and a closed seekable interval can end before the tail.
+        // Keep filtering this stream until its demux-order boundary is reached.
+        ordering != Some(std::cmp::Ordering::Greater)
     }
 
     fn mark_low_level_seek_noncurrent_packet_if_needed(
@@ -418,31 +434,6 @@ impl DemuxPacketCacheState {
         packet_id: PacketId,
         packet: &CachedDemuxPacket,
     ) -> bool {
-        if let Some(skip_until_nsecs) = self.resume_append_skip_until_nsecs {
-            let packet_end_nsecs = packet.end_nsecs.or(packet.start_nsecs);
-            if packet_end_nsecs.is_some_and(|end_nsecs| end_nsecs <= skip_until_nsecs) {
-                self.low_level_append_blocked_packet_generations
-                    .insert(packet_id, self.generation);
-                self.consumed_packet_ids.insert(packet_id);
-                tracing::debug!(
-                    session_id = ?self.session_id,
-                    skip_until_nsecs,
-                    packet_start_nsecs = ?packet.start_nsecs,
-                    packet_end_nsecs = ?packet.end_nsecs,
-                    stream_index = packet.stream_index,
-                    "appending repeated FFmpeg demux packet outside current reader head after cached-range low-level resume"
-                );
-                return true;
-            }
-            if packet
-                .start_nsecs
-                .is_some_and(|start_nsecs| start_nsecs >= skip_until_nsecs)
-                || packet_end_nsecs.is_none()
-            {
-                self.resume_append_skip_until_nsecs = None;
-            }
-        }
-
         let Some(target_nsecs) = self.low_level_append_guard_target_nsecs else {
             return false;
         };

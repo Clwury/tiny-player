@@ -306,7 +306,7 @@ fn demux_packet_cache_state_preserves_eof_flag_on_archived_range() {
     );
     assert!(state.read_range_eof());
     assert!(state.seek_request.is_none());
-    assert_eq!(state.resume_append_skip_until_nsecs, None);
+    assert!(state.refreshing_streams.is_empty());
     assert_eq!(state.low_level_seeks, 1);
 }
 

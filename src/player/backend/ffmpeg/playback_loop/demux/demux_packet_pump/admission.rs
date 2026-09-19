@@ -26,7 +26,7 @@ impl DemuxPacketPump {
             }
             let Some((_, Some(reader_head_start_nsecs), _)) = context
                 .demux_cache
-                .stream_reader_head_timeline(*stream_index)
+                .try_stream_reader_head_timeline(*stream_index)
             else {
                 return true;
             };
@@ -259,7 +259,7 @@ impl DemuxPacketPump {
         };
         let Some((_, Some(reader_head_start_nsecs), _)) = context
             .demux_cache
-            .stream_reader_head_timeline(audio_stream_index)
+            .try_stream_reader_head_timeline(audio_stream_index)
         else {
             return;
         };

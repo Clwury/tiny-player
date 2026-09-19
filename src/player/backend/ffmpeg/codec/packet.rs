@@ -95,6 +95,11 @@ impl AvPacket {
         (dts != ffi::AV_NOPTS_VALUE).then_some(dts)
     }
 
+    pub(in super::super) fn position(&self) -> Option<i64> {
+        let position = unsafe { (*self.ptr).pos };
+        (position >= 0).then_some(position)
+    }
+
     pub(in super::super) fn best_timestamp(&self) -> Option<i64> {
         unsafe {
             if (*self.ptr).pts != ffi::AV_NOPTS_VALUE {

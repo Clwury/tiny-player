@@ -114,19 +114,6 @@ impl DemuxPacketCache {
         )
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop) fn drain_available_packet_round_robin_with_unbounded_lock_and_timing(
-        &self,
-        stream_indices: &[c_int],
-        cache_pause_signal: bool,
-    ) -> (DemuxReadResult, Option<usize>, DemuxPacketCacheReadTiming) {
-        self.read_packet_round_robin_inner(
-            stream_indices,
-            false,
-            DemuxCacheLockWait::Unbounded,
-            cache_pause_signal,
-        )
-    }
-
     pub(in crate::player::backend::ffmpeg::playback_loop) fn packet_queue_snapshot(
         &self,
     ) -> DemuxPacketQueueSnapshot {
@@ -168,15 +155,14 @@ impl DemuxPacketCache {
         repaired
     }
 
-    pub(in crate::player::backend::ffmpeg::playback_loop) fn stream_reader_head_timeline(
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn try_stream_reader_head_timeline(
         &self,
         stream_index: c_int,
     ) -> Option<(u64, Option<u64>, Option<u64>)> {
-        let guard = self
-            .shared
-            .state
-            .lock()
-            .expect("FFmpeg demux packet cache poisoned");
+        // Lead throttling, optional realignment and diagnostics run before
+        // the timed packet read. Never let these probes park the coordinator
+        // behind disk-cache maintenance or reuse a stale head after a seek.
+        let guard = self.try_lock_state(DemuxCacheLockWait::None)?;
         guard.stream_reader_head_timeline(stream_index)
     }
 
@@ -401,10 +387,11 @@ impl DemuxPacketCache {
                 guard = next_guard;
                 continue;
             }
-            if guard.read_range_eof() {
+            let eager_streams_exhausted = guard.read_range_eager_streams_exhausted();
+            if eager_streams_exhausted && guard.read_range_eof() {
                 return (DemuxReadResult::Eof, None, timing);
             }
-            if guard.demux_position_detached {
+            if eager_streams_exhausted && guard.demux_position_detached {
                 let session_id = guard.session_id;
                 let seek_generation = self.shared.control.seek_generation();
                 let continuation_seconds = nsecs_to_seconds(guard.reader_nsecs);
@@ -414,7 +401,7 @@ impl DemuxPacketCache {
                     position_seconds = continuation_seconds,
                     seek_generation,
                     generation = guard.generation,
-                    "FFmpeg demux packet cache exhausted selected stream queues; requested low-level continuation seek"
+                    "FFmpeg demux packet cache exhausted selected audio/video queues; requested low-level continuation seek"
                 );
                 let emit = self.shared.prepare_cache_state_emit(&mut guard);
                 self.shared.notify_ready();
@@ -577,11 +564,6 @@ impl DemuxPacketCache {
                     }
                     thread::yield_now();
                 }
-            }
-            DemuxCacheLockWait::Unbounded => {
-                let (guard, lock_timing) = self.lock_state_unbounded_with_timing();
-                timing.lock_wait = lock_timing.lock_wait;
-                (Some(guard), timing)
             }
         }
     }

@@ -27,6 +27,20 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct Stream
 }
 
 impl StreamForwardState {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn merge(
+        &mut self,
+        other: Self,
+    ) {
+        self.packet_count = self.packet_count.saturating_add(other.packet_count);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        if let Some(start) = other.reader_nsecs {
+            self.reader_nsecs = Some(self.reader_nsecs.unwrap_or(start).min(start));
+        }
+        if let Some(end) = other.end_nsecs {
+            self.end_nsecs = Some(self.end_nsecs.unwrap_or(end).max(end));
+        }
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn push_packet(
         &mut self,
         packet: &CachedDemuxPacket,

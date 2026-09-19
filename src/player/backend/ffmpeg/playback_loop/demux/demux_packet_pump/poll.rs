@@ -95,22 +95,8 @@ impl DemuxPacketPump {
                     stream_offset = retry_stream_offset;
                     timing = combine_demux_read_timing(timing, retry_timing);
                 }
-                if matches!(result, DemuxReadResult::WouldBlock) && timing.lock_timed_out {
-                    // The decoder is starving with readable packets available;
-                    // bounded try-lock spins lose to long append/trim holds, so
-                    // park on the mutex and drain as soon as it is released.
-                    force_consumer_drain_retry_count =
-                        force_consumer_drain_retry_count.saturating_add(1);
-                    let (drain_result, drain_stream_offset, drain_timing) = context
-                        .demux_cache
-                        .drain_available_packet_round_robin_with_unbounded_lock_and_timing(
-                            &demux_streams,
-                            demux_cache_pause_signal(&context),
-                        );
-                    result = drain_result;
-                    stream_offset = drain_stream_offset;
-                    timing = combine_demux_read_timing(timing, drain_timing);
-                }
+                // Cached input does not justify an unbounded mutex wait:
+                // service decoded audio/video again when this tick expires.
                 (result, stream_offset, timing)
             } else if let Some(lock_wait) = demux_pump_cache_lock_wait(
                 context.should_wait_for_demux,

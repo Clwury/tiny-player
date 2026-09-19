@@ -302,11 +302,14 @@ impl DemuxPacketCacheState {
         self.reader_forward_bytes.saturating_add(
             self.detached_append_range()
                 .map(|range| {
-                    if self.range_has_current_generation_blocked_packet(range) {
-                        self.range_bytes(range)
-                    } else {
-                        range.report_bytes()
+                    if self.low_level_append_blocked_packet_generations.is_empty() {
+                        return range.report_bytes();
                     }
+                    self.range_forward_stats(range)
+                        .readable
+                        .values()
+                        .map(|stream| stream.bytes)
+                        .sum()
                 })
                 .unwrap_or_default(),
         )
@@ -316,16 +319,6 @@ impl DemuxPacketCacheState {
         &self,
     ) -> usize {
         self.reader_forward_bytes
-    }
-
-    fn range_bytes(&self, range: &DemuxCachedRange) -> usize {
-        range
-            .global_order
-            .iter()
-            .filter(|packet_id| !self.packet_blocked_for_current_generation(**packet_id))
-            .filter_map(|packet_id| self.packets.get(packet_id))
-            .map(|packet| packet.byte_len)
-            .sum()
     }
 
     /// Keep media time and forward bytes as independent limits, like mpv's
@@ -367,10 +360,13 @@ impl DemuxPacketCacheState {
         if self.low_level_append_blocked_packet_generations.is_empty() {
             return false;
         }
-        range.global_order.iter().any(|packet_id| {
-            self.low_level_append_blocked_packet_generations
-                .get(packet_id)
-                .is_some_and(|generation| *generation <= self.generation)
+        let stats = self.range_forward_stats(range);
+        stats.stored.iter().any(|(stream_index, stored)| {
+            stats
+                .readable
+                .get(stream_index)
+                .map_or(0, |stream| stream.packet_count)
+                < stored.packet_count
         })
     }
 
@@ -474,9 +470,10 @@ impl DemuxPacketCacheState {
     }
 
     fn stream_forward_windows(&self, include_detached: bool) -> Vec<StreamForwardWindow> {
-        let detached_append_range = include_detached
+        let detached_stats = include_detached
             .then(|| self.detached_append_range())
-            .flatten();
+            .flatten()
+            .map(|range| self.range_forward_stats(range));
 
         let mut windows = Vec::new();
         for (stream_index, kind) in &self.stream_kinds {
@@ -485,18 +482,11 @@ impl DemuxPacketCacheState {
                 .get(stream_index)
                 .copied()
                 .unwrap_or_default();
-            if let Some(queue) =
-                detached_append_range.and_then(|range| range.stream_queues.get(stream_index))
+            if let Some(detached) = detached_stats
+                .as_ref()
+                .and_then(|stats| stats.readable.get(stream_index))
             {
-                for packet_id in queue {
-                    if self.packet_blocked_for_current_generation(*packet_id) {
-                        continue;
-                    }
-                    let Some(packet) = self.packets.get(packet_id) else {
-                        continue;
-                    };
-                    state.push_packet(packet);
-                }
+                state.merge(*detached);
             }
 
             match state.reader_nsecs.zip(state.end_nsecs) {
@@ -609,6 +599,10 @@ impl DemuxPacketCacheState {
     ) {
         if self.failed_cached_seek_ranges.contains_key(&range.id)
             || self.rejected_cached_seek_ranges.contains_key(&range.id)
+            || (range.id != self.read_range_id
+                && range.id != self.append_range_id
+                && !range.is_eof
+                && !self.range_can_resume(range))
         {
             return;
         }

@@ -28,7 +28,10 @@ fn fixture(
 }
 
 fn payload_packet(index: u8) -> CachedDemuxPacket {
-    let packet = demux_packet_with_data_for_stream(0, &vec![index; PACKET_BYTES]);
+    let mut packet = demux_packet_with_data_for_stream(0, &vec![index; PACKET_BYTES]);
+    unsafe {
+        (*packet.as_mut_ptr()).pos = i64::from(index) * PACKET_BYTES as i64;
+    }
     CachedDemuxPacket::from_packet(
         &packet,
         0,
@@ -195,6 +198,152 @@ fn cold_cached_seek_waits_without_advancing_and_supplies_a_memory_reference() {
         "decoder supply must not synchronously read the file"
     );
     assert_accounting(&shared.state.lock().unwrap());
+}
+
+#[test]
+fn cold_cached_seek_keeps_supplying_packets_while_disk_appends_a_detached_range() {
+    let (_dir, _, shared) = fixture(true);
+    append_packets(&shared, 20);
+    settle(&shared);
+    let detached_id = {
+        let mut state = shared.state.lock().unwrap();
+        assert!(
+            state
+                .seek_cached(10_000_000_000, PlaybackSessionId(2))
+                .is_some()
+        );
+        state.start_detached_append_range();
+        for index in 20..24 {
+            state.append_packet_fast(payload_packet(index));
+        }
+        state.append_range_id
+    };
+    let cache = DemuxPacketCache {
+        shared: Arc::clone(&shared),
+        handle: None,
+    };
+    for index in 10..16 {
+        settle(&shared);
+        let (result, _, timing) = cache.poll_packet_round_robin_with_timing(&[0]);
+        let DemuxReadResult::Packet(packet) = result else {
+            panic!("disk worker must supply the next cached packet");
+        };
+        assert_eq!(packet.data().unwrap(), vec![index; PACKET_BYTES]);
+        assert_eq!(timing.disk_reads, 0);
+        assert!(!timing.lock_timed_out);
+        let state = shared.state.lock().unwrap();
+        assert_accounting(&state);
+        assert!(state.resident_bytes <= state.resident_limit_bytes());
+        assert_eq!(
+            state.ranges[&detached_id].forward_stats_rebuilds.get(),
+            0,
+            "disk reads, writes and hot-copy eviction must reuse forward aggregates"
+        );
+    }
+}
+
+#[test]
+fn dry_subtitle_poll_preserves_range_with_a_cold_video_head() {
+    let (_dir, _, shared) = fixture(true);
+    append_packets(&shared, 20);
+    settle(&shared);
+    let (read_range_id, head) = {
+        let mut state = shared.state.lock().unwrap();
+        state.set_stream_kind(4, StreamCacheKind::Subtitle);
+        assert!(
+            state
+                .seek_cached(10_000_000_000, PlaybackSessionId(2))
+                .is_some()
+        );
+        let head = state.reader_heads[&0];
+        assert!(state.packets[&head].memory_packet().is_none());
+        assert!(state.disk_read_requests.is_empty());
+        state.start_detached_append_range();
+        state.append_packet_fast(payload_packet(20));
+        (state.read_range_id, head)
+    };
+    let cache = DemuxPacketCache {
+        shared: Arc::clone(&shared),
+        handle: None,
+    };
+    assert!(matches!(cache.poll_packet(4), DemuxReadResult::WouldBlock));
+    {
+        let state = shared.state.lock().unwrap();
+        assert_eq!(state.read_range_id, read_range_id);
+        assert_eq!(state.reader_heads[&0], head);
+        assert!(state.disk_read_requests.is_empty());
+    }
+    assert!(matches!(cache.poll_packet(0), DemuxReadResult::WouldBlock));
+    settle(&shared);
+    let (result, _, timing) = cache.poll_packet_round_robin_with_timing(&[0]);
+    let DemuxReadResult::Packet(packet) = result else {
+        panic!("disk worker must restore the original cached video head");
+    };
+    assert_eq!(packet.data().unwrap(), vec![10; PACKET_BYTES]);
+    assert_eq!(
+        packet.read_diagnostic().unwrap().read_range_id,
+        read_range_id
+    );
+    assert_eq!(timing.disk_reads, 0);
+}
+
+#[test]
+fn cold_archived_seek_resumes_in_the_same_range_without_replaying_disk_packets() {
+    let (_dir, _, shared) = fixture(true);
+    append_packets(&shared, 20);
+    settle(&shared);
+    let (range_id, head_is_cold, duplicate_count, first_new_id) = {
+        let mut state = shared.state.lock().unwrap();
+        // Keep the whole old range archived while retaining a bounded hot set.
+        state.backbuffer_limit_bytes = 96 * 1024;
+        state.request_seek(100.0, PlaybackSessionId(2), 1, 100_000_000_000);
+        for index in 100..103 {
+            state.append_packet_fast(payload_packet(index));
+        }
+        assert!(
+            state
+                .seek_cached(10_000_000_000, PlaybackSessionId(3))
+                .is_some()
+        );
+        state.take_seek_request().unwrap();
+        let head = state.reader_heads[&0];
+        let head_is_cold = state.packets[&head].memory_packet().is_none();
+        let first_new_id = state.next_packet_id;
+        let mut duplicate_count = 0;
+        for index in 17..24 {
+            if !state.append_packet_fast(payload_packet(index)).appended {
+                duplicate_count += 1;
+            }
+        }
+        (
+            state.read_range_id,
+            head_is_cold,
+            duplicate_count,
+            first_new_id,
+        )
+    };
+    assert!(head_is_cold);
+    assert_eq!(duplicate_count, 3);
+    {
+        let state = shared.state.lock().unwrap();
+        assert_eq!(state.read_range_id, state.append_range_id);
+        assert_eq!(state.next_packet_id, first_new_id + 4);
+    }
+    let cache = DemuxPacketCache {
+        shared: Arc::clone(&shared),
+        handle: None,
+    };
+    for index in 10..24 {
+        settle(&shared);
+        let (result, _, timing) = cache.poll_packet_round_robin_with_timing(&[0]);
+        let DemuxReadResult::Packet(packet) = result else {
+            panic!("storage worker must supply continuous cached and resumed packets");
+        };
+        assert_eq!(packet.data().unwrap(), vec![index; PACKET_BYTES]);
+        assert_eq!(packet.read_diagnostic().unwrap().read_range_id, range_id);
+        assert_eq!(timing.disk_reads, 0);
+        assert_accounting(&shared.state.lock().unwrap());
+    }
 }
 
 #[test]

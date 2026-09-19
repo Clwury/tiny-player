@@ -751,6 +751,7 @@ impl DemuxPacketCacheState {
         if removed.is_empty() {
             return;
         }
+        *range.forward_stats.get_mut() = None;
         let removed_packet_count = removed.len();
         if let Some(last_removed_packet_id) = removed.last().copied()
             && let Some(boundaries) = range.stream_seek_boundaries.get_mut(&stream_index)

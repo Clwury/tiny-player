@@ -64,7 +64,8 @@ use model::{
     DemuxSeekRequest, DemuxSelectedStreams, DemuxStreamReaderRealignResult,
     InternalPacketTimestampHole, PacketId, PreparedSeekableRangeReport, RangeId,
     SeekableRangeValidationStats, SeekableTimelineSummary, StreamCacheRangeState,
-    StreamForwardState, StreamForwardWindow, StreamRangeBoundary, ordered_duration_seconds,
+    StreamForwardState, StreamForwardWindow, StreamRangeBoundary, StreamResumePosition,
+    ordered_duration_seconds,
 };
 pub(super) use model::{
     DemuxCachedSeekInfo, DemuxPacketCacheInput, DemuxReadResult, DemuxSeekResult,
@@ -167,7 +168,7 @@ struct DemuxPacketCacheState {
     session_id: PlaybackSessionId,
     seek_request: Option<DemuxSeekRequest>,
     demux_position_detached: bool,
-    resume_append_skip_until_nsecs: Option<u64>,
+    refreshing_streams: BTreeMap<c_int, StreamResumePosition>,
     low_level_append_guard_target_nsecs: Option<u64>,
     low_level_append_blocked_packet_generations: HashMap<PacketId, u64>,
     seeking: bool,

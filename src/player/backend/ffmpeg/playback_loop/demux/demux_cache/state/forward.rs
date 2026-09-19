@@ -1,11 +1,91 @@
 use std::{
+    cell::Ref,
     collections::{BTreeMap, HashMap},
     os::raw::c_int,
 };
 
-use super::{DemuxPacketCacheState, PacketId, StreamForwardState};
+use super::super::model::RangeForwardStats;
+use super::{DemuxCachedRange, DemuxPacketCacheState, PacketId, StreamForwardState};
 
 impl DemuxPacketCacheState {
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn range_forward_stats<
+        'a,
+    >(
+        &self,
+        range: &'a DemuxCachedRange,
+    ) -> Ref<'a, RangeForwardStats> {
+        let current = range
+            .forward_stats
+            .borrow()
+            .as_ref()
+            .is_some_and(|stats| stats.generation == self.generation);
+        if !current {
+            let mut stats = RangeForwardStats {
+                generation: self.generation,
+                ..RangeForwardStats::default()
+            };
+            for (stream_index, queue) in &range.stream_queues {
+                for id in queue {
+                    let Some(packet) = self.packets.get(id) else {
+                        continue;
+                    };
+                    stats
+                        .stored
+                        .entry(*stream_index)
+                        .or_default()
+                        .push_packet(packet);
+                    if !self.packet_blocked_for_current_generation(*id) {
+                        stats
+                            .readable
+                            .entry(*stream_index)
+                            .or_default()
+                            .push_packet(packet);
+                    }
+                }
+            }
+            *range.forward_stats.borrow_mut() = Some(stats);
+            #[cfg(test)]
+            range
+                .forward_stats_rebuilds
+                .set(range.forward_stats_rebuilds.get() + 1);
+        }
+        Ref::map(range.forward_stats.borrow(), |stats| {
+            stats.as_ref().expect("range forward statistics prepared")
+        })
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn update_range_forward_stats_after_append(
+        &self,
+        packet_id: PacketId,
+    ) {
+        let Some(range) = self.ranges.get(&self.append_range_id) else {
+            return;
+        };
+        let mut stats = range.forward_stats.borrow_mut();
+        let Some(stats) = stats
+            .as_mut()
+            .filter(|stats| stats.generation == self.generation)
+        else {
+            // A trim or seek will rebuild from the current queues on demand.
+            return;
+        };
+        let Some(packet) = self.packets.get(&packet_id) else {
+            return;
+        };
+        stats
+            .stored
+            .entry(packet.stream_index)
+            .or_default()
+            .push_packet(packet);
+        if !self.packet_blocked_for_current_generation(packet_id) {
+            stats
+                .readable
+                .entry(packet.stream_index)
+                .or_default()
+                .push_packet(packet);
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn active_packet_is_forward(
         &self,

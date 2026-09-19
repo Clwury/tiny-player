@@ -12,8 +12,12 @@ mod hevc_ranges;
 mod pause_read;
 #[path = "cache/pruning_storage.rs"]
 mod pruning_storage;
+#[path = "cache/range_handoff.rs"]
+mod range_handoff;
 #[path = "cache/range_reporting.rs"]
 mod range_reporting;
+#[path = "cache/range_resume.rs"]
+mod range_resume;
 #[path = "cache/reporting_reader.rs"]
 mod reporting_reader;
 #[path = "cache/seek.rs"]
@@ -233,6 +237,7 @@ fn cached_packet_with_keyframe(
         seek_timestamp_nsecs: start_nsecs,
         raw_pts: None,
         raw_dts: None,
+        raw_pos: start_nsecs.and_then(|value| i64::try_from(value).ok()),
         start_nsecs,
         end_nsecs,
         byte_len: 1024,

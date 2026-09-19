@@ -16,6 +16,11 @@ impl DemuxPacketCacheState {
         {
             return true;
         }
+        // A cached resume must read through the overlap even when the time
+        // target is already covered. Keep the existing byte/storage limits.
+        if !self.refreshing_streams.is_empty() {
+            return false;
+        }
         let forward_duration = self.forward_duration_nsecs();
         let readahead_nsecs = self.effective_readahead_nsecs();
         if forward_duration >= readahead_nsecs {
@@ -257,6 +262,7 @@ impl DemuxPacketCacheState {
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn mark_eof(&mut self) {
         self.seeking = false;
+        self.refreshing_streams.clear();
         if let Some(range_id) = self.detached_append_range_id() {
             self.set_range_eof(range_id, true);
         } else {
