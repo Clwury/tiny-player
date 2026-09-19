@@ -13,7 +13,7 @@ use super::{
         server_card_menu,
     },
     server_reorder::animated_card,
-    window::window_border,
+    window::{window_border, window_has_rounded_corners},
 };
 
 impl TinyApp {
@@ -174,6 +174,8 @@ impl TinyApp {
 
 impl Render for TinyApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(target_os = "windows")]
+        super::window::windows::sync_window_theme(window, cx);
         self.observe_window_bounds_once(window, cx);
         if self.server_reorder.is_some() && !cx.has_active_drag() {
             self.finish_server_reorder(false, window, cx);
@@ -183,7 +185,7 @@ impl Render for TinyApp {
         let title = self.title(cx);
         let playback_fullscreen =
             window.is_fullscreen() && matches!(self.page, Page::Playback { .. });
-        let rounded_window = !window.is_maximized() && !window.is_fullscreen();
+        let rounded_window = window_has_rounded_corners(window);
         let close_dialog = cx.listener(Self::close_add_server_dialog);
         let close_menu = cx.listener(Self::close_server_menu);
         let submit_dialog = cx.listener(Self::submit_add_server_dialog);

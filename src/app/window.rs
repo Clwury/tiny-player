@@ -11,6 +11,14 @@ use crate::{
 
 use super::{Page, TinyApp};
 
+#[cfg(target_os = "windows")]
+pub(super) mod windows;
+
+/// Windows owns the outer frame; other platforms retain our rounded client decorations.
+pub(crate) fn window_has_rounded_corners(window: &Window) -> bool {
+    !cfg!(target_os = "windows") && !window.is_maximized() && !window.is_fullscreen()
+}
+
 pub(super) fn window_border(cx: &App) -> impl IntoElement {
     let theme = theme::get(cx);
     let radius = theme.radius_lg;
@@ -40,8 +48,16 @@ pub(crate) fn app_window_options(
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(minimum_size),
-        window_decorations: Some(WindowDecorations::Client),
-        window_background: WindowBackgroundAppearance::Transparent,
+        window_decorations: Some(if cfg!(target_os = "windows") {
+            WindowDecorations::Server
+        } else {
+            WindowDecorations::Client
+        }),
+        window_background: if cfg!(target_os = "windows") {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            WindowBackgroundAppearance::Transparent
+        },
         titlebar: Some(TitlebarOptions {
             title: Some(title),
             appears_transparent: true,
@@ -105,6 +121,31 @@ mod tests {
     use crate::{storage::ServerCache, theme::ColorTheme};
     use gpui::{Corners, Edges, ScaledPixels, TestAppContext, VisualTestContext, point, px, size};
 
+    #[test]
+    fn window_options_use_platform_decorations_with_a_themed_titlebar() {
+        let bounds = Bounds::new(point(px(100.0), px(80.0)), size(px(1100.0), px(720.0)));
+        let minimum = size(px(900.0), px(600.0));
+        let options = app_window_options(APP_NAME.into(), bounds, minimum);
+        assert_eq!(options.window_min_size, Some(minimum));
+        assert_eq!(options.window_bounds, Some(WindowBounds::Windowed(bounds)));
+        let titlebar = options.titlebar.unwrap();
+        assert_eq!(titlebar.title.as_deref(), Some(APP_NAME));
+        assert!(titlebar.appears_transparent);
+        if cfg!(target_os = "windows") {
+            assert_eq!(options.window_decorations, Some(WindowDecorations::Server));
+            assert_eq!(
+                options.window_background,
+                WindowBackgroundAppearance::Opaque
+            );
+        } else {
+            assert_eq!(options.window_decorations, Some(WindowDecorations::Client));
+            assert_eq!(
+                options.window_background,
+                WindowBackgroundAppearance::Transparent
+            );
+        }
+    }
+
     fn assert_border(cx: &mut VisualTestContext, width: f32, height: f32, visible: bool) {
         cx.run_until_parked();
         cx.update(|window, cx| {
@@ -161,11 +202,11 @@ mod tests {
         let settings = app.read_with(main_cx, |app, _| app.settings_window.unwrap());
         let mut settings_cx = VisualTestContext::from_window(settings.into(), &main_cx.cx);
         for cx in [main_cx, &mut settings_cx] {
-            for selection in [ColorTheme::Mocha, ColorTheme::Latte] {
+            for selection in ColorTheme::ALL {
                 cx.update(|_, cx| theme::set(selection, cx));
                 for (width, height) in [(900.0, 600.0), (1100.0, 720.0)] {
                     cx.simulate_resize(size(px(width), px(height)));
-                    assert_border(cx, width, height, true);
+                    assert_border(cx, width, height, !cfg!(target_os = "windows"));
                     cx.update(|window, _| {
                         window.toggle_fullscreen();
                         window.refresh();
@@ -175,7 +216,7 @@ mod tests {
                         window.toggle_fullscreen();
                         window.refresh();
                     });
-                    assert_border(cx, width, height, true);
+                    assert_border(cx, width, height, !cfg!(target_os = "windows"));
                 }
             }
         }

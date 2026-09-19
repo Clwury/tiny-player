@@ -19,7 +19,7 @@ use std::{
 use gpui::{Context, Entity, SharedString, Task, WindowHandle};
 
 pub(crate) use resize::WINDOW_RESIZE_EDGE_WIDTH_PX;
-pub(crate) use window::app_window_options;
+pub(crate) use window::{app_window_options, window_has_rounded_corners};
 
 use crate::{
     emby::{EmbyClient, ItemCounts},

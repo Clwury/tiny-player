@@ -69,11 +69,17 @@ fn settings_window_with_config(
 fn click(cx: &mut VisualTestContext, selector: &'static str) {
     let bounds = cx.debug_bounds(selector).expect(selector);
     if selector == "window-control-close" {
-        cx.simulate_mouse_down(
-            bounds.center(),
-            gpui::MouseButton::Left,
-            Modifiers::default(),
-        );
+        if cfg!(target_os = "windows") {
+            // The test platform doesn't dispatch Win32 non-client messages.
+            // Exercise the same window removal that GPUI's backend performs.
+            cx.update(|window, _| window.remove_window());
+        } else {
+            cx.simulate_mouse_down(
+                bounds.center(),
+                gpui::MouseButton::Left,
+                Modifiers::default(),
+            );
+        }
         cx.run_until_parked();
         return;
     }

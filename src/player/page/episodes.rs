@@ -177,7 +177,7 @@ impl PlaybackPage {
             .max_w(relative(0.8))
             .flex()
             .flex_col()
-            .when(!window.is_maximized() && !window.is_fullscreen(), |this| {
+            .when(window_has_rounded_corners(window), |this| {
                 this.rounded_br(theme.radius_lg)
             })
             .border_l_1()

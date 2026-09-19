@@ -9,6 +9,7 @@ use gpui::{
 };
 
 use crate::{
+    app::window_has_rounded_corners,
     app_metadata::default_playback_cache_dir,
     player::{
         CacheUnlinkPolicy, PlaybackCacheConfig, PlaybackCacheMode, PlaybackLanguagePreferences,
@@ -204,7 +205,7 @@ impl EventEmitter<SettingsChanged> for PlaybackSettingsDialogState {}
 
 impl Render for PlaybackSettingsDialogState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rounded_window = !window.is_maximized() && !window.is_fullscreen();
+        let rounded_window = window_has_rounded_corners(window);
         self.render_content(cx.entity(), rounded_window, cx)
     }
 }

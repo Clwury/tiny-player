@@ -6025,6 +6025,7 @@ dependencies = [
  "image",
  "percent-encoding",
  "pkg-config",
+ "raw-window-handle",
  "reqwest",
  "serde",
  "serde_json",
@@ -6036,6 +6037,7 @@ dependencies = [
  "unicode-segmentation",
  "url",
  "uuid",
+ "windows 0.61.3",
 ]
 
 [[package]]

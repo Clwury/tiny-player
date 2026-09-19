@@ -1,6 +1,235 @@
-use gpui::{Modifiers, TestAppContext, point};
+use gpui::{
+    DispatchEventResult, Modifiers, PlatformInput, TestAppContext, VisualTestContext, point,
+};
 
 use super::*;
+
+struct PlaybackWithTitlebar(gpui::Entity<PlaybackPage>);
+
+impl Render for PlaybackWithTitlebar {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(crate::ui::titlebar::app_titlebar(
+                window,
+                cx,
+                "Playback".into(),
+            ))
+            .child(div().flex_1().min_h_0().child(self.0.clone()))
+    }
+}
+
+fn playback_with_titlebar(
+    cx: &mut TestAppContext,
+) -> (gpui::Entity<PlaybackPage>, &mut VisualTestContext) {
+    let (page, cx) = episodes::tests::playback_window(cx);
+    cx.update(|window, cx| window.replace_root(cx, |_, _| PlaybackWithTitlebar(page.clone())));
+    cx.run_until_parked();
+    (page, cx)
+}
+
+fn dispatch_mouse_press(
+    cx: &mut VisualTestContext,
+    position: Point<Pixels>,
+    button: MouseButton,
+    click_count: usize,
+) -> DispatchEventResult {
+    cx.simulate_mouse_move(position, None, Modifiers::default());
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            PlatformInput::MouseDown(MouseDownEvent {
+                position,
+                button,
+                click_count,
+                modifiers: Modifiers::default(),
+                first_mouse: false,
+            }),
+            cx,
+        )
+    })
+}
+
+fn dispatch_left_release(
+    cx: &mut VisualTestContext,
+    position: Point<Pixels>,
+) -> DispatchEventResult {
+    cx.update(|window, cx| {
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                click_count: 1,
+                modifiers: Modifiers::default(),
+            }),
+            cx,
+        )
+    })
+}
+
+#[cfg(target_os = "windows")]
+#[gpui::test]
+fn playback_controls_do_not_consume_native_caption_clicks(cx: &mut TestAppContext) {
+    let (page, cx) = playback_with_titlebar(cx);
+    for controls_visible in [false, true, false, true] {
+        page.update(cx, |page, cx| {
+            page.fullscreen.controls_visible = controls_visible;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.debug_bounds("playback-progress").is_some(),
+            controls_visible
+        );
+        for selector in [
+            "window-control-minimize",
+            "window-control-maximize",
+            "window-control-close",
+        ] {
+            let position = cx.debug_bounds(selector).unwrap().center();
+            // GPUI runs native caption actions only when both events propagate.
+            // TestPlatform doesn't execute the actual Windows system commands.
+            assert!(
+                dispatch_mouse_press(cx, position, MouseButton::Left, 1).propagate,
+                "{selector} press"
+            );
+            assert!(
+                dispatch_left_release(cx, position).propagate,
+                "{selector} release with controls visible: {controls_visible}"
+            );
+            page.read_with(cx, |page, _| {
+                assert!(page.timeline.progress_drag_position.is_none());
+                assert!(!page.timeline.user_paused);
+            });
+        }
+    }
+}
+
+#[gpui::test]
+fn progress_drag_consumes_its_own_release_outside_the_track_only(cx: &mut TestAppContext) {
+    let (page, cx) = playback_with_titlebar(cx);
+    cx.update(|window, cx| window.simulate_next_frame(cx));
+    let track = cx.debug_bounds("playback-progress-track").unwrap();
+    let caption = cx.debug_bounds("window-control-maximize").unwrap().center();
+    let video = point(px(1060.0), px(400.0));
+    for end in [caption, video] {
+        assert!(!dispatch_mouse_press(cx, track.center(), MouseButton::Left, 1).propagate);
+        assert!(page.read_with(cx, |page, _| page.timeline.progress_drag_position.is_some()));
+        // Releasing a seek over a caption button must finish the seek without
+        // accidentally activating the button; subsequent releases must pass.
+        assert!(!dispatch_left_release(cx, end).propagate);
+        assert!(page.read_with(cx, |page, _| page.timeline.progress_drag_position.is_none()));
+        assert!(dispatch_left_release(cx, end).propagate);
+    }
+}
+
+#[gpui::test]
+fn surface_drag_press_reaches_windows_but_menu_dismissal_does_not(cx: &mut TestAppContext) {
+    let (page, cx) = episodes::tests::playback_window(cx);
+    cx.simulate_keystrokes("i");
+    let file = cx.debug_bounds("playback-stats-File").unwrap();
+    let video = point(px(1060.0), px(400.0));
+
+    for origin in [video, file.origin + point(px(12.0), px(10.0))] {
+        let result = dispatch_mouse_press(cx, origin, MouseButton::Left, 1);
+        // Windows enters its native move loop only if the press is unhandled.
+        // Linux consumes the press and starts a compositor move on motion.
+        assert_eq!(result.propagate, cfg!(target_os = "windows"));
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.window_drag, WindowDragState::Pending);
+            assert!(!page.timeline.user_paused);
+            assert!(page.timeline.progress_drag_position.is_none());
+        });
+        assert!(!cx.update(|window, _| window.is_fullscreen()));
+        cx.simulate_mouse_up(origin, MouseButton::Left, Modifiers::default());
+
+        page.update(cx, |page, cx| {
+            page.tracks.open = Some(PlaybackTrackKind::Audio);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(!dispatch_mouse_press(cx, origin, MouseButton::Left, 1).propagate);
+        page.read_with(cx, |page, _| {
+            assert!(page.tracks.open.is_none());
+            assert_ne!(page.window_drag, WindowDragState::Pending);
+        });
+        cx.simulate_mouse_up(origin, MouseButton::Left, Modifiers::default());
+    }
+}
+
+#[gpui::test]
+fn surface_double_click_keeps_fullscreen_and_blocks_native_maximize(cx: &mut TestAppContext) {
+    let (page, cx) = episodes::tests::playback_window(cx);
+    let video = point(px(1060.0), px(400.0));
+    for was_fullscreen in [false, true] {
+        assert_eq!(
+            cx.update(|window, _| window.is_fullscreen()),
+            was_fullscreen
+        );
+        let first_press = dispatch_mouse_press(cx, video, MouseButton::Left, 1);
+        assert_eq!(
+            first_press.propagate,
+            cfg!(target_os = "windows") && !was_fullscreen
+        );
+        if was_fullscreen {
+            assert_eq!(
+                page.read_with(cx, |page, _| page.window_drag),
+                WindowDragState::Idle
+            );
+        }
+        cx.simulate_mouse_up(video, MouseButton::Left, Modifiers::default());
+
+        assert!(!dispatch_mouse_press(cx, video, MouseButton::Left, 2).propagate);
+        assert_eq!(
+            cx.update(|window, _| window.is_fullscreen()),
+            !was_fullscreen
+        );
+        assert_eq!(
+            page.read_with(cx, |page, _| page.window_drag),
+            WindowDragState::Idle
+        );
+        cx.simulate_mouse_up(video, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[gpui::test]
+fn native_surface_suppresses_system_menu_and_preserves_volume_scroll(cx: &mut TestAppContext) {
+    let (page, cx) = episodes::tests::playback_window(cx);
+    cx.simulate_keystrokes("i");
+    let file = cx.debug_bounds("playback-stats-File").unwrap();
+    let video = point(px(1060.0), px(400.0));
+    for origin in [video, file.origin + point(px(12.0), px(10.0))] {
+        assert!(!dispatch_mouse_press(cx, origin, MouseButton::Right, 1).propagate);
+        let release = cx.update(|window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    position: origin,
+                    button: MouseButton::Right,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            )
+        });
+        assert!(
+            !release.propagate,
+            "right release must not open the Windows system menu"
+        );
+    }
+
+    let initial_volume = page.read_with(cx, |page, _| page.volume.level);
+    cx.simulate_event(ScrollWheelEvent {
+        position: video,
+        delta: ScrollDelta::Lines(point(0.0, -3.0)),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    let actual_volume = page.read_with(cx, |page, _| page.volume.level);
+    assert!((actual_volume - (initial_volume - PLAYBACK_VOLUME_STEP)).abs() < f32::EPSILON);
+}
 
 #[gpui::test]
 fn control_panel_background_closes_track_menus_without_playback_side_effects(
@@ -228,27 +457,8 @@ fn track_menus_show_metadata_below_labels_and_scroll_to_select_last_track(cx: &m
 
 #[gpui::test]
 fn control_panel_presses_do_not_become_window_drags_outside_the_panel(cx: &mut TestAppContext) {
-    struct PlaybackWithTitlebar(gpui::Entity<PlaybackPage>);
-
-    impl Render for PlaybackWithTitlebar {
-        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .flex()
-                .flex_col()
-                .size_full()
-                .child(crate::ui::titlebar::app_titlebar(
-                    window,
-                    cx,
-                    "Playback".into(),
-                ))
-                .child(div().flex_1().min_h_0().child(self.0.clone()))
-        }
-    }
-
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = playback_with_titlebar(cx);
     cx.simulate_keystrokes("i");
-    cx.update(|window, cx| window.replace_root(cx, |_, _| PlaybackWithTitlebar(page.clone())));
-    cx.run_until_parked();
     let panel = cx.debug_bounds("playback-progress").unwrap();
     let track = cx.debug_bounds("playback-progress-track").unwrap();
     let file = cx.debug_bounds("playback-stats-File").unwrap();
@@ -264,8 +474,7 @@ fn control_panel_presses_do_not_become_window_drags_outside_the_panel(cx: &mut T
     let video = point(px(1060.0), px(400.0));
 
     for start in starts {
-        cx.simulate_mouse_move(start, None, Modifiers::default());
-        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        assert!(!dispatch_mouse_press(cx, start, MouseButton::Left, 1).propagate);
         // The test platform panics on a native window move, so these crossings
         // exercise the actual playback surface rather than just a bounds helper.
         for position in [stats, video, point(px(550.0), px(10.0)), start, stats] {

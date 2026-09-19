@@ -11,7 +11,11 @@ use crate::{
     },
 };
 
-use super::{TinyApp, app_window_options, resize::resize_handles, window::window_border};
+use super::{
+    TinyApp, app_window_options,
+    resize::resize_handles,
+    window::{window_border, window_has_rounded_corners},
+};
 
 pub(super) struct SettingsWindow {
     pub(super) settings: Entity<SettingsDialogState>,
@@ -75,8 +79,10 @@ impl TinyApp {
 
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(target_os = "windows")]
+        super::window::windows::sync_window_theme(window, cx);
         let theme = theme::get(cx);
-        let rounded_window = !window.is_maximized() && !window.is_fullscreen();
+        let rounded_window = window_has_rounded_corners(window);
         let title = self.settings.read(cx).mode().title();
         div()
             .relative()
@@ -128,7 +134,7 @@ mod tests {
                     .new(|cx| SettingsDialogState::new(&PlaybackCacheConfig::default(), mode, cx));
                 cx.notify();
             });
-            for selection in [ColorTheme::Mocha, ColorTheme::Latte] {
+            for selection in ColorTheme::ALL {
                 cx.update(|_, cx| theme::set(selection, cx));
                 for (width, height) in [(900.0, 600.0), (1100.0, 720.0)] {
                     cx.simulate_resize(size(px(width), px(height)));
@@ -136,7 +142,11 @@ mod tests {
                     cx.update(|window, cx| {
                         let theme = theme::get(cx);
                         let scale = window.scale_factor();
-                        let radius = ScaledPixels(f32::from(theme.radius_lg) * scale);
+                        let radius = ScaledPixels(if cfg!(target_os = "windows") {
+                            0.0
+                        } else {
+                            f32::from(theme.radius_lg) * scale
+                        });
                         let mut bottom_left = false;
                         let mut bottom_right = false;
                         let mut sidebar_background = false;

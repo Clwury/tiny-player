@@ -293,6 +293,15 @@ fn episode_drawer_hides_controls_and_restores_them_when_dismissed(cx: &mut TestA
             assert_eq!(panel_fill.border_widths.bottom, gpui::ScaledPixels(0.0));
             assert_eq!(panel_fill.corner_radii.top_left, gpui::ScaledPixels(0.0));
             assert_eq!(panel_fill.corner_radii.top_right, gpui::ScaledPixels(0.0));
+            let bottom_radius = if cfg!(target_os = "windows") {
+                0.0
+            } else {
+                f32::from(theme.radius_lg) * window.scale_factor()
+            };
+            assert_eq!(
+                panel_fill.corner_radii.bottom_right,
+                gpui::ScaledPixels(bottom_radius)
+            );
         });
         assert!(cx.debug_bounds("playback-progress").is_none());
         assert!(cx.debug_bounds("playback-episodes-button").is_none());

@@ -36,5 +36,9 @@ tempfile = "3.13"
 bindgen = "0.72"
 pkg-config = "0.3.33"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.9"

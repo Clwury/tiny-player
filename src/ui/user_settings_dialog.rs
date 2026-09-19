@@ -9,6 +9,7 @@ use gpui::{
 };
 
 use crate::{
+    app::window_has_rounded_corners,
     player::{PlaybackCacheConfig, PlaybackLanguagePreferences, TrackLanguage},
     theme::{self, ColorTheme},
 };
@@ -275,7 +276,7 @@ impl Render for UserSettingsDialogState {
             .size_full()
             .min_h_0()
             .overflow_hidden()
-            .child(self.render_sidebar(!window.is_maximized() && !window.is_fullscreen(), cx))
+            .child(self.render_sidebar(window_has_rounded_corners(window), cx))
             .child(
                 div()
                     .relative()

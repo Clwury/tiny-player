@@ -7,7 +7,7 @@ use gpui::{
 };
 
 use crate::{
-    app::WINDOW_RESIZE_EDGE_WIDTH_PX,
+    app::{WINDOW_RESIZE_EDGE_WIDTH_PX, window_has_rounded_corners},
     emby::{ResumeItems, UserItem, UserItems, UserView, UserViews},
     theme,
     ui::scrollbar::Scrollbar,
@@ -111,7 +111,7 @@ impl HomeContent {
 
     fn render_main_content(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let theme = theme::get(cx);
-        let rounded_window = !window.is_maximized() && !window.is_fullscreen();
+        let rounded_window = window_has_rounded_corners(window);
         let scrollbar_right_inset = if rounded_window {
             px(WINDOW_RESIZE_EDGE_WIDTH_PX)
         } else {
@@ -1130,7 +1130,7 @@ impl HomePage {
 impl Render for HomePage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme::get(cx);
-        let rounded_window = !window.is_maximized() && !window.is_fullscreen();
+        let rounded_window = window_has_rounded_corners(window);
         let on_back = cx.listener(Self::back_to_servers);
         let on_home = cx.listener(Self::select_home_section);
         let on_favorites = cx.listener(Self::select_favorites_section);

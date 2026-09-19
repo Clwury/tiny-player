@@ -8,7 +8,7 @@ use gpui::{
     rgb, rgba, svg,
 };
 
-use crate::theme;
+use crate::{app::window_has_rounded_corners, theme};
 
 use super::{
     backend::{
@@ -282,8 +282,8 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        cx.stop_propagation();
         if self.close_track_select(cx) {
+            cx.stop_propagation();
             return;
         }
         self.window_drag = if event.click_count == 1 && !window.is_fullscreen() {
@@ -291,6 +291,13 @@ impl PlaybackPage {
         } else {
             WindowDragState::Idle
         };
+        // GPUI's Windows backend starts native moves from an unhandled
+        // non-client press. Its start_window_move() implementation is a no-op.
+        // Keep double clicks and menu dismissal in the player instead of
+        // letting Windows maximize the window or start a move.
+        if !cfg!(target_os = "windows") || self.window_drag != WindowDragState::Pending {
+            cx.stop_propagation();
+        }
         if event.click_count == 2 {
             self.toggle_playback_fullscreen(window, cx);
         }
@@ -334,7 +341,8 @@ impl PlaybackPage {
         if !event.dragging() {
             self.window_drag = WindowDragState::Idle;
         }
-        if self.window_drag == WindowDragState::Pending
+        if !cfg!(target_os = "windows")
+            && self.window_drag == WindowDragState::Pending
             && !window.is_fullscreen()
             && event.dragging()
             && self.timeline.progress_drag_position.is_none()
@@ -395,7 +403,7 @@ impl PlaybackPage {
         cx.notify();
     }
 
-    fn render_mouse_capture(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_mouse_capture(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let record_press = cx.listener(|page, in_playback: &bool, _, _| {
             page.window_drag = if *in_playback {
                 WindowDragState::Blocked
@@ -452,6 +460,17 @@ impl PlaybackPage {
             .right_0()
             .bottom_0()
             .left_0()
+            .when(
+                cfg!(target_os = "windows") && !window.is_fullscreen(),
+                |this| {
+                    // Use the same native hit testing as the titlebar. Controls
+                    // above this surface occlude it and keep their own gestures.
+                    this.window_control_area(gpui::WindowControlArea::Drag)
+                        // WM_NCRBUTTONUP would otherwise open the system menu
+                        // after our right-button press toggles playback pause.
+                        .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                },
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(Self::handle_surface_left_mouse_down),
@@ -568,7 +587,7 @@ impl Render for PlaybackPage {
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_scroll_wheel(cx.listener(Self::handle_surface_scroll_wheel))
-            .when(!window.is_maximized() && !is_fullscreen, |this| {
+            .when(window_has_rounded_corners(window), |this| {
                 this.rounded_b(theme.radius_lg).overflow_hidden()
             })
             .when_some(current_video_frame, |this, frame| this.child(frame))
@@ -576,7 +595,7 @@ impl Render for PlaybackPage {
                 this.child(render_playback_status(status, cx))
             })
             .child(viewport_observer)
-            .child(self.render_mouse_capture(cx))
+            .child(self.render_mouse_capture(window, cx))
             .child(self.render_subtitle_overlay())
             .when(self.volume.indicator_visible, |this| {
                 this.child(self.render_volume_indicator(cx))

@@ -109,6 +109,12 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The outside-release listener runs even for clicks on the titlebar.
+        // Only consume a release belonging to an active seek; Windows caption
+        // buttons need their mouse-up event to reach the native backend.
+        if self.timeline.progress_drag_position.is_none() {
+            return;
+        }
         self.commit_progress_drag(window, cx);
         cx.stop_propagation();
     }

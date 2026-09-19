@@ -61,7 +61,7 @@ impl gpui::Element for VideoFrameElement {
         };
 
         let mut corner_radii = gpui::Corners::default();
-        if !window.is_maximized() && !window.is_fullscreen() {
+        if window_has_rounded_corners(window) {
             // GPUI's parent overflow mask is rectangular, so the video sprite
             // must also respect the playback viewport's bottom corners.
             let radius = theme::get(cx)
