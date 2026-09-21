@@ -58,9 +58,6 @@ const AUDIO_REALIGN_TARGET_TOLERANCE_NSECS: u64 = 500_000_000;
 pub(super) const AUDIO_DECODE_RECOVERY_STALL_WARN_AFTER: Duration = Duration::from_millis(500);
 pub(super) const AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER: Duration = Duration::from_secs(2);
 const AUDIO_REALIGN_MAX_WALL_TIME: Duration = Duration::from_secs(5);
-const AUDIO_REALIGN_MAX_OBSERVATIONS: u64 = 64;
-const AUDIO_REALIGN_FALLBACK_AFTER_OBSERVATIONS: u64 = 32;
-const AUDIO_REALIGN_MAX_PTS_SPAN_NSECS: u64 = 5_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CachedSeekRecoveryFallbackReason {
@@ -244,9 +241,6 @@ pub(super) struct AudioRealignTransaction {
     pub(super) phase: AudioRealignPhase,
     pub(super) coverage_nsecs: u64,
     pub(super) coverage_target_nsecs: u64,
-    observations: u64,
-    first_observed_pts_nsecs: Option<u64>,
-    last_observed_pts_nsecs: Option<u64>,
     last_progress_at: Instant,
     warning_emitted: bool,
     fallback_exhausted_logged: bool,
@@ -258,7 +252,7 @@ pub(super) enum AudioRealignPhase {
     AwaitingCoverage,
     Covered,
     FallbackUsed,
-    MediaGap,
+    Exhausted,
 }
 
 impl AudioRealignPhase {
@@ -268,7 +262,7 @@ impl AudioRealignPhase {
             Self::AwaitingCoverage => "awaiting_coverage",
             Self::Covered => "covered",
             Self::FallbackUsed => "fallback_used",
-            Self::MediaGap => "media_gap",
+            Self::Exhausted => "exhausted",
         }
     }
 }
@@ -352,11 +346,7 @@ fn observe_audio_realign_request(
             transaction: *current,
             reason: AudioRealignCoalesceReason::LowLevelFallbackAlreadyUsed,
         },
-        AudioRealignPhase::MediaGap => AudioRealignRequestAction::Coalesce {
-            transaction: *current,
-            reason: AudioRealignCoalesceReason::CoverageSatisfied,
-        },
-        AudioRealignPhase::Covered => {
+        AudioRealignPhase::Covered | AudioRealignPhase::Exhausted => {
             if audio_realign_target_matches(
                 current.target_timeline_nsecs,
                 request.target_timeline_nsecs,
@@ -364,7 +354,11 @@ fn observe_audio_realign_request(
                 current.request = request;
                 return AudioRealignRequestAction::Coalesce {
                     transaction: *current,
-                    reason: AudioRealignCoalesceReason::CoverageSatisfied,
+                    reason: if current.phase == AudioRealignPhase::Exhausted {
+                        AudioRealignCoalesceReason::LowLevelFallbackAlreadyUsed
+                    } else {
+                        AudioRealignCoalesceReason::CoverageSatisfied
+                    },
                 };
             }
             *transaction = None;
@@ -379,16 +373,6 @@ fn update_audio_realign_progress(
     coverage: AudioRealignCoverage,
     now: Instant,
 ) {
-    transaction.observations = transaction.observations.saturating_add(1);
-    if let Some(accepted_start_nsecs) = coverage.audio_accepted_start_timeline_nsecs {
-        transaction
-            .first_observed_pts_nsecs
-            .get_or_insert(accepted_start_nsecs);
-        transaction.last_observed_pts_nsecs = Some(
-            accepted_start_nsecs
-                .saturating_add(coverage.contiguous_coverage_nsecs.unwrap_or_default()),
-        );
-    }
     if transaction.phase == AudioRealignPhase::Flushing
         && worker.state != AudioDecodeWorkerState::Recovering
     {
@@ -407,7 +391,7 @@ fn update_audio_realign_progress(
         transaction.coverage_nsecs = coverage_nsecs;
         transaction.last_progress_at = now;
     }
-    if coverage.ready && transaction.phase != AudioRealignPhase::MediaGap {
+    if coverage.ready {
         transaction.phase = AudioRealignPhase::Covered;
         transaction.last_progress_at = now;
     }
@@ -441,31 +425,22 @@ fn poll_audio_recovery_watchdog(
 ) -> Option<AudioRecoveryWatchdogAction> {
     if matches!(
         transaction.phase,
-        AudioRealignPhase::Covered | AudioRealignPhase::MediaGap
+        AudioRealignPhase::Covered | AudioRealignPhase::Exhausted
     ) {
         return None;
     }
     let stalled_for = now.saturating_duration_since(transaction.last_progress_at);
-    let observed_pts_span_nsecs = transaction
-        .first_observed_pts_nsecs
-        .zip(transaction.last_observed_pts_nsecs)
-        .map(|(first, last)| first.abs_diff(last))
-        .unwrap_or_default();
     let absolute_wall_time_exhausted =
         now.saturating_duration_since(transaction.started_at) >= AUDIO_REALIGN_MAX_WALL_TIME;
-    let absolute_observation_bound_exhausted =
-        transaction.observations >= AUDIO_REALIGN_MAX_OBSERVATIONS;
-    let first_attempt_bound_exhausted = transaction.observations
-        >= AUDIO_REALIGN_FALLBACK_AFTER_OBSERVATIONS
-        || observed_pts_span_nsecs >= AUDIO_REALIGN_MAX_PTS_SPAN_NSECS;
+    // Coordinator polling frequency and decoded PTS distance do not measure
+    // a stall. Only actual elapsed time can exhaust a recovery attempt.
     let attempt_stalled = stalled_for >= AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER;
     let terminal_bound_exhausted = absolute_wall_time_exhausted
-        || absolute_observation_bound_exhausted
         || (transaction.phase == AudioRealignPhase::FallbackUsed && attempt_stalled);
     let recovery_bound_exhausted = if transaction.phase == AudioRealignPhase::FallbackUsed {
         terminal_bound_exhausted
     } else {
-        attempt_stalled || first_attempt_bound_exhausted || terminal_bound_exhausted
+        attempt_stalled || terminal_bound_exhausted
     };
     if recovery_bound_exhausted {
         if transaction.phase != AudioRealignPhase::FallbackUsed {
@@ -796,10 +771,10 @@ mod tests {
     };
     use super::{
         AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER, AUDIO_DECODE_RECOVERY_STALL_WARN_AFTER,
-        AUDIO_REALIGN_FALLBACK_AFTER_OBSERVATIONS, AUDIO_REALIGN_MAX_OBSERVATIONS,
-        AUDIO_REALIGN_TARGET_TOLERANCE_NSECS, AudioDecodeWorkerSnapshot, AudioDecodeWorkerState,
-        AudioRealignCoalesceReason, AudioRealignCoverage, AudioRealignPhase,
-        AudioRealignRequestAction, AudioRealignTransaction, AudioRecoveryWatchdogAction,
+        AUDIO_REALIGN_MAX_WALL_TIME, AUDIO_REALIGN_TARGET_TOLERANCE_NSECS,
+        AudioDecodeWorkerSnapshot, AudioDecodeWorkerState, AudioRealignCoalesceReason,
+        AudioRealignCoverage, AudioRealignPhase, AudioRealignRequestAction,
+        AudioRealignTransaction, AudioRecoveryWatchdogAction,
         CACHED_SEEK_FIRST_VIDEO_FRAME_TIMEOUT, CACHED_SEEK_STARTUP_MAX_VIDEO_PACKETS,
         CachedSeekRecoveryAttempt, CachedSeekRecoveryFallbackAction,
         CachedSeekRecoveryFallbackReason, CachedSeekRecoveryProgress, CachedSeekRecoveryWatchdog,
@@ -838,9 +813,6 @@ mod tests {
             phase: AudioRealignPhase::Flushing,
             coverage_nsecs: 0,
             coverage_target_nsecs: 850_000_000,
-            observations: 0,
-            first_observed_pts_nsecs: None,
-            last_observed_pts_nsecs: None,
             last_progress_at: started_at,
             warning_emitted: false,
             fallback_exhausted_logged: false,
@@ -1099,40 +1071,113 @@ mod tests {
     }
 
     #[test]
-    fn audio_realign_observation_bounds_force_one_fallback_then_terminal_gap() {
+    fn repeated_audio_realign_polls_do_not_exhaust_recovery_before_timeout() {
         let target = 18_060_000_000;
-        let now = Instant::now();
         let mut transaction = audio_realign_transaction(target);
+        let now = transaction.started_at;
         transaction.phase = AudioRealignPhase::AwaitingCoverage;
         let no_coverage = AudioRealignCoverage {
             protected_target_nsecs: 850_000_000,
             ..AudioRealignCoverage::default()
         };
 
-        for _ in 0..AUDIO_REALIGN_FALLBACK_AFTER_OBSERVATIONS {
+        for _ in 0..10_000 {
             update_audio_realign_progress(
                 &mut transaction,
                 idle_audio_snapshot(),
                 no_coverage,
                 now,
             );
+            assert!(
+                poll_audio_recovery_watchdog(&mut transaction, idle_audio_snapshot(), now)
+                    .is_none()
+            );
         }
+        let fallback_at = now + AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER;
         assert!(matches!(
-            poll_audio_recovery_watchdog(&mut transaction, idle_audio_snapshot(), now),
+            poll_audio_recovery_watchdog(&mut transaction, idle_audio_snapshot(), fallback_at),
             Some(AudioRecoveryWatchdogAction::LowLevelFallback { .. })
         ));
 
-        for _ in AUDIO_REALIGN_FALLBACK_AFTER_OBSERVATIONS..AUDIO_REALIGN_MAX_OBSERVATIONS {
+        for _ in 0..10_000 {
             update_audio_realign_progress(
                 &mut transaction,
                 idle_audio_snapshot(),
                 no_coverage,
-                now,
+                fallback_at,
+            );
+            assert!(
+                poll_audio_recovery_watchdog(&mut transaction, idle_audio_snapshot(), fallback_at)
+                    .is_none()
             );
         }
         assert!(matches!(
-            poll_audio_recovery_watchdog(&mut transaction, idle_audio_snapshot(), now),
+            poll_audio_recovery_watchdog(
+                &mut transaction,
+                idle_audio_snapshot(),
+                fallback_at + AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER,
+            ),
             Some(AudioRecoveryWatchdogAction::FallbackExhausted { .. })
+        ));
+    }
+
+    #[test]
+    fn audio_realign_decoder_progress_defers_stall_but_preserves_wall_time_bound() {
+        let mut transaction = audio_realign_transaction(18_060_000_000);
+        transaction.phase = AudioRealignPhase::AwaitingCoverage;
+        let now = transaction.started_at + AUDIO_DECODE_RECOVERY_STALL_FALLBACK_AFTER;
+        let mut worker = idle_audio_snapshot();
+        worker.state = AudioDecodeWorkerState::Recovering;
+        worker.last_result_progress_elapsed = Some(Duration::from_millis(10));
+        update_audio_realign_progress(
+            &mut transaction,
+            worker,
+            AudioRealignCoverage::default(),
+            now,
+        );
+        assert!(poll_audio_recovery_watchdog(&mut transaction, worker, now).is_none());
+
+        let deadline = transaction.started_at + AUDIO_REALIGN_MAX_WALL_TIME;
+        update_audio_realign_progress(
+            &mut transaction,
+            worker,
+            AudioRealignCoverage::default(),
+            deadline,
+        );
+        assert!(matches!(
+            poll_audio_recovery_watchdog(&mut transaction, worker, deadline),
+            Some(AudioRecoveryWatchdogAction::LowLevelFallback { .. })
+        ));
+    }
+
+    #[test]
+    fn exhausted_audio_realign_coalesces_same_target_but_allows_a_new_target() {
+        let target = 1_400_584_044_444;
+        let mut transaction = Some(audio_realign_transaction(target));
+        transaction.as_mut().unwrap().phase = AudioRealignPhase::Exhausted;
+        for _ in 0..8 {
+            assert!(matches!(
+                observe_audio_realign_request(&mut transaction, audio_realign_request(target)),
+                AudioRealignRequestAction::Coalesce {
+                    reason: AudioRealignCoalesceReason::LowLevelFallbackAlreadyUsed,
+                    ..
+                }
+            ));
+        }
+        assert!(
+            poll_audio_recovery_watchdog(
+                transaction.as_mut().unwrap(),
+                idle_audio_snapshot(),
+                Instant::now() + Duration::from_secs(10),
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            observe_audio_realign_request(
+                &mut transaction,
+                audio_realign_request(target + AUDIO_REALIGN_TARGET_TOLERANCE_NSECS + 1),
+            ),
+            AudioRealignRequestAction::Start
         ));
     }
 

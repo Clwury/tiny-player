@@ -59,6 +59,9 @@ pub(super) const VIDEO_OUTPUT_START_PREBUFFER_FRAMES: usize = 20;
 pub(super) const AUDIO_OUTPUT_VIDEO_LEAD_DURATION: Duration = Duration::from_millis(500);
 pub(super) const AUDIO_VIDEO_REBUFFER_DRIFT_RESET_THRESHOLD: Duration = Duration::from_millis(500);
 pub(super) const PENDING_AUDIO_CONTINUITY_TOLERANCE: Duration = Duration::from_millis(5);
+// mpv keeps feeding PCM across small PTS differences without resetting playback.
+// This bounds output admission, not timestamp correction or missing-media fill.
+pub(super) const AUDIO_OUTPUT_PTS_GAP_TOLERANCE: Duration = Duration::from_millis(100);
 pub(super) const DECODE_PACKET_SLOW_LOG_AFTER: Duration = Duration::from_millis(20);
 pub(super) const PLAYBACK_COORDINATOR_TICK_TIMING_LOG_AFTER: Duration = Duration::from_millis(5);
 pub(super) const PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER: Duration = Duration::from_millis(3);

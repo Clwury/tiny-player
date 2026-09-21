@@ -530,6 +530,138 @@ fn near_complete_pending_audio_prevents_reader_realign_and_clear() {
 }
 
 #[test]
+fn audio_realign_combines_output_and_pending_coverage_after_transfer() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    let target = 1_400_584_044_444;
+    let transferred_until = target + 600_000_000;
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 4],
+            duration_nsecs: 300_000_000,
+        },
+        transferred_until,
+        transferred_until + 300_000_000,
+    );
+    let coverage = scheduler.audio_realign_coverage(
+        target,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+        Some(audio_snapshot(target, 600_000_000)),
+    );
+    assert_eq!(coverage.contiguous_coverage_nsecs, Some(900_000_000));
+    assert!(coverage.ready);
+}
+
+#[test]
+fn playing_audio_completes_realign_below_original_resume_waterline() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    let target = 1_400_584_044_444;
+    let mut output = audio_snapshot(target, 597_324_248);
+    let waterline = duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
+    assert!(
+        !scheduler
+            .audio_realign_coverage(target, waterline, Some(output))
+            .ready
+    );
+
+    scheduler.set_state(PlaybackOutputState::Playing);
+    let coverage = scheduler.audio_realign_coverage(target, waterline, Some(output));
+    assert_eq!(coverage.contiguous_coverage_nsecs, Some(597_324_248));
+    assert!(
+        coverage.ready,
+        "submitted audio must complete recovery even after pending audio was drained"
+    );
+
+    output = audio_snapshot(target + 300_000_000, 297_324_248);
+    assert!(
+        scheduler
+            .audio_realign_coverage(target, waterline, Some(output))
+            .ready,
+        "playback progress must not be checked against the old start point"
+    );
+}
+
+#[test]
+fn audio_realign_does_not_invent_coverage_from_empty_or_far_ahead_output() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+    let target = 1_400_584_044_444;
+    let waterline = duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION);
+    let mut output = audio_snapshot(target, 900_000_000);
+    output.payload_range_nsecs = None;
+    assert!(
+        !scheduler
+            .audio_realign_coverage(target, waterline, Some(output))
+            .ready
+    );
+    output.payload_range_nsecs = Some((target + 2_000_000_000, target + 2_900_000_000));
+    assert!(
+        !scheduler
+            .audio_realign_coverage(target, waterline, Some(output))
+            .ready
+    );
+    output = audio_snapshot(target, 0);
+    assert!(
+        !scheduler
+            .audio_realign_coverage(target, waterline, Some(output))
+            .ready
+    );
+}
+
+#[test]
+fn exhausted_audio_realign_preserves_video_and_admits_deferred_audio_until_seek() {
+    let session = PlaybackSessionId(12);
+    let control = FfmpegControl::new(session);
+    let mut scheduler = PlaybackOutputScheduler::new();
+    let target = 1_400_584_044_444;
+    let deferred_frame = 1_402_602_050_707;
+    for index in 0..21 {
+        scheduler.push_decoded_video_for_test(test_queued_video_frame(
+            target + index * DEFAULT_VIDEO_FRAME_DURATION_NSECS,
+        ));
+    }
+    let video_frames = scheduler.snapshot().queued_video_frames;
+    scheduler.resume_after_exhausted_audio_realign(target, deferred_frame, &control, session);
+    assert_eq!(scheduler.snapshot().queued_video_frames, video_frames);
+    assert!(scheduler.audio_realign_exhausted_for(target, deferred_frame));
+    assert!(scheduler.audio_realign_exhausted_for(target - 22_000_000, deferred_frame));
+    assert!(!scheduler.audio_realign_exhausted_for(target, deferred_frame + 1_000_000_000));
+    assert!(!scheduler.audio_realign_exhausted_for(deferred_frame + 1, deferred_frame + 1));
+
+    scheduler.set_state(PlaybackOutputState::Rebuffering);
+    for _ in 0..8 {
+        assert!(
+            scheduler
+                .observe_rebuffer_far_ahead_audio_frame(
+                    deferred_frame,
+                    target,
+                    Some(0),
+                    true,
+                    session,
+                    "test_exhausted_realign",
+                )
+                .is_none()
+        );
+    }
+    assert!(scheduler.take_rebuffer_audio_realign_request().is_none());
+
+    scheduler.reset_for_session(&control, PlaybackSessionId(13));
+    assert!(!scheduler.audio_realign_exhausted_for(target, deferred_frame));
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(target));
+    assert!(
+        scheduler
+            .observe_rebuffer_far_ahead_audio_frame(
+                deferred_frame,
+                target,
+                Some(0),
+                true,
+                PlaybackSessionId(13),
+                "test_new_seek",
+            )
+            .is_some()
+    );
+}
+
+#[test]
 fn delayed_audio_within_av_tolerance_and_protected_waterline_does_not_realign() {
     let mut scheduler = PlaybackOutputScheduler::new();
     let resume_nsecs = 62_521_000_000;
@@ -547,6 +679,7 @@ fn delayed_audio_within_av_tolerance_and_protected_waterline_does_not_realign() 
     let coverage = scheduler.audio_realign_coverage(
         resume_nsecs,
         duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+        None,
     );
 
     assert!(coverage.ready);
@@ -596,6 +729,7 @@ fn delayed_audio_beyond_av_tolerance_requires_a_stalled_gap_before_realign() {
     let coverage = scheduler.audio_realign_coverage(
         resume_nsecs,
         duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+        None,
     );
     assert!(!coverage.ready);
     assert_eq!(coverage.audio_accepted_start_timeline_nsecs, None);
@@ -648,6 +782,7 @@ fn delayed_audio_with_partial_resume_coverage_does_not_realign_from_reader_head(
     let coverage = scheduler.audio_realign_coverage(
         resume_nsecs,
         duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+        None,
     );
 
     assert!(!coverage.ready);
@@ -709,6 +844,21 @@ fn startup_reader_head_gap_requests_realign_before_playback_resume() {
         "reader packets represented by queued/in-flight decode work are not a continuity gap"
     );
 
+    assert!(
+        scheduler
+            .request_output_wait_audio_reader_head_realign_if_needed(
+                212_021_405_896,
+                waterline,
+                202_549_751_669,
+                PlaybackSessionId(1),
+            )
+            .is_none(),
+        "reader PTS distance alone must not exhaust a recovery deadline"
+    );
+    scheduler.expire_audio_reader_gap_watchdog_for_test();
+    let watchdog = scheduler.audio_reader_gap_watchdog.as_mut().unwrap();
+    watchdog.started_at = watchdog.last_progress_at;
+
     let request = scheduler
         .request_output_wait_audio_reader_head_realign_if_needed(
             212_021_405_896,
@@ -716,7 +866,7 @@ fn startup_reader_head_gap_requests_realign_before_playback_resume() {
             202_549_751_669,
             PlaybackSessionId(1),
         )
-        .expect("reader PTS span bound requests realign despite stuck in-flight work");
+        .expect("stalled in-flight work requests realign after the time bound expires");
 
     assert_eq!(request.reason, "output_wait_audio_reader_continuity_gap");
     assert_eq!(request.target_timeline_nsecs, 202_550_000_000);

@@ -162,9 +162,6 @@ pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) struct AudioR
     started_at: Instant,
     last_progress_nsecs: u64,
     last_progress_at: Instant,
-    observations: u64,
-    first_observed_pts_nsecs: Option<u64>,
-    last_observed_pts_nsecs: Option<u64>,
     request_issued: bool,
 }
 
@@ -516,6 +513,7 @@ pub(in crate::player::backend::ffmpeg) struct PlaybackOutputScheduler {
     rebuffer_far_ahead_audio_observation_count: u8,
     audio_gap_recovery_until: Option<Instant>,
     audio_gap_recovery_target_nsecs: Option<u64>,
+    audio_realign_exhausted_range_nsecs: Option<(u64, u64)>,
     initial_delayed_audio_start_timeline_nsecs: Option<u64>,
     initial_audio_gap_at_video_start_timeline_nsecs: Option<u64>,
     initial_av_start_transaction: Option<InitialAvStartTransaction>,

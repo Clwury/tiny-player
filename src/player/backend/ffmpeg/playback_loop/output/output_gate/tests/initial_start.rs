@@ -341,7 +341,7 @@ fn playing_audio_activity_watchdog_releases_seek_then_runs_one_bounded_reanchor(
     };
 
     assert_eq!(
-        scheduler.observe_audio_output_activity(started_at, frozen, true, true),
+        scheduler.observe_audio_output_activity(started_at, frozen, true, true, false),
         None
     );
     assert_eq!(
@@ -350,6 +350,7 @@ fn playing_audio_activity_watchdog_releases_seek_then_runs_one_bounded_reanchor(
             frozen,
             true,
             true,
+            false,
         ),
         None
     );
@@ -363,6 +364,7 @@ fn playing_audio_activity_watchdog_releases_seek_then_runs_one_bounded_reanchor(
             },
             true,
             true,
+            false,
         )
         .expect("seek transition release");
     assert_eq!(
@@ -381,6 +383,7 @@ fn playing_audio_activity_watchdog_releases_seek_then_runs_one_bounded_reanchor(
             },
             true,
             false,
+            false,
         )
         .expect("bounded re-anchor");
     assert_eq!(
@@ -398,6 +401,7 @@ fn playing_audio_activity_watchdog_releases_seek_then_runs_one_bounded_reanchor(
                 ..frozen
             },
             true,
+            false,
             false,
         ),
         None
@@ -419,11 +423,12 @@ fn user_cache_or_rebuffer_pause_disarms_playing_audio_watchdog() {
         silenced_callback_count: 1,
         underrun_count: 0,
     };
-    scheduler.observe_audio_output_activity(now, frozen, true, false);
+    scheduler.observe_audio_output_activity(now, frozen, true, false, false);
     assert_eq!(
         scheduler.observe_audio_output_activity(
             now + AUDIO_OUTPUT_ACTIVITY_RECOVERY_AFTER,
             frozen,
+            false,
             false,
             false,
         ),
@@ -458,7 +463,7 @@ fn playing_audio_watchdog_recovers_empty_output_with_pending_audio() {
             );
         }
         assert_eq!(
-            scheduler.observe_audio_output_activity(now, frozen, true, false),
+            scheduler.observe_audio_output_activity(now, frozen, true, false, false),
             None
         );
         let warning = scheduler
@@ -466,6 +471,7 @@ fn playing_audio_watchdog_recovers_empty_output_with_pending_audio() {
                 now + AUDIO_OUTPUT_ACTIVITY_STALL_AFTER,
                 frozen,
                 true,
+                false,
                 false,
             )
             .expect("pending decoded audio must arm the empty-output watchdog");
@@ -478,6 +484,7 @@ fn playing_audio_watchdog_recovers_empty_output_with_pending_audio() {
                 now + AUDIO_OUTPUT_ACTIVITY_RECOVERY_AFTER,
                 frozen,
                 true,
+                false,
                 false,
             )
             .expect("frozen empty output must receive bounded recovery");
@@ -492,11 +499,106 @@ fn playing_audio_watchdog_recovers_empty_output_with_pending_audio() {
                 frozen,
                 true,
                 false,
+                false,
             ),
             None,
             "recovery must stay bounded while the clock is frozen"
         );
     }
+}
+
+#[test]
+fn underrun_prefill_watchdog_waits_for_data_then_recovers_a_frozen_partial_buffer_once() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+    let now = Instant::now();
+    let frozen = AudioOutputActivitySnapshot {
+        played_timeline_nsecs: 1_301_797_375_331,
+        shared_buffer_pending_nsecs: 149_319_724,
+        queue_pending_nsecs: 0,
+        callback_count: 1,
+        consumed_callback_count: 0,
+        silenced_callback_count: 1,
+        underrun_count: 1,
+    };
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(1_301_835_055_556));
+    for elapsed in [Duration::ZERO, AUDIO_OUTPUT_ACTIVITY_RECOVERY_AFTER] {
+        assert_eq!(
+            scheduler.observe_audio_output_activity(now + elapsed, frozen, true, false, true),
+            None
+        );
+        assert!(!scheduler.audio_output_clock_stall_fallback_active());
+    }
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.25; 19_200],
+            duration_nsecs: 200_000_000,
+        },
+        1_301_997_062_500,
+        1_302_197_062_500,
+    );
+    // Paused playback remains exempt even with sufficient data to prefill.
+    assert_eq!(
+        scheduler.observe_audio_output_activity(now, frozen, false, false, true),
+        None
+    );
+    assert_eq!(
+        scheduler.observe_audio_output_activity(now, frozen, true, false, true),
+        None
+    );
+    let warning = scheduler
+        .observe_audio_output_activity(
+            now + AUDIO_OUTPUT_ACTIVITY_STALL_AFTER,
+            frozen,
+            true,
+            false,
+            true,
+        )
+        .expect("enough decoded audio must expose a stuck underrun prefill");
+    assert_eq!(
+        warning.action,
+        AudioOutputActivityWatchdogAction::WarnFrozenClock
+    );
+    let recovery = scheduler
+        .observe_audio_output_activity(
+            now + AUDIO_OUTPUT_ACTIVITY_RECOVERY_AFTER,
+            frozen,
+            true,
+            false,
+            true,
+        )
+        .expect("underrun must not disable the recovery deadline after its warning");
+    assert_eq!(
+        recovery.action,
+        AudioOutputActivityWatchdogAction::RecoverAndReanchor
+    );
+    assert_eq!(
+        scheduler.observe_audio_output_activity(
+            now + AUDIO_OUTPUT_ACTIVITY_RECOVERY_AFTER + Duration::from_secs(1),
+            frozen,
+            true,
+            false,
+            true,
+        ),
+        None
+    );
+    let resumed = AudioOutputActivitySnapshot {
+        played_timeline_nsecs: frozen.played_timeline_nsecs + 20_000_000,
+        callback_count: 2,
+        consumed_callback_count: 1,
+        ..frozen
+    };
+    assert_eq!(
+        scheduler.observe_audio_output_activity(
+            now + AUDIO_OUTPUT_ACTIVITY_RECOVERY_AFTER + Duration::from_secs(2),
+            resumed,
+            true,
+            false,
+            false,
+        ),
+        None
+    );
+    assert!(!scheduler.audio_output_clock_stall_fallback_active());
 }
 
 #[test]
@@ -519,7 +621,7 @@ fn playing_audio_watchdog_waits_for_data_when_all_audio_queues_are_empty() {
         AUDIO_OUTPUT_ACTIVITY_RECOVERY_AFTER,
     ] {
         assert_eq!(
-            scheduler.observe_audio_output_activity(now + elapsed, empty, true, false),
+            scheduler.observe_audio_output_activity(now + elapsed, empty, true, false, false),
             None
         );
         assert!(!scheduler.audio_output_clock_stall_fallback_active());
@@ -1148,6 +1250,134 @@ fn cache_pause_video_184_700_audio_184_714739_commits_to_playing() {
     assert!(snapshot.first_frame_presented);
     assert!(snapshot.output_clock_running);
     assert!(!control.is_cache_paused());
+}
+
+#[test]
+fn seek_prefill_appends_across_logged_short_pts_gap_without_losing_pcm() {
+    const VIDEO_TARGET: u64 = 1_301_795_055_556;
+    const AUDIO_TARGET: u64 = 1_301_797_375_331;
+    const PREFIX_END: u64 = 1_301_946_695_055;
+    const NEXT_AUDIO: u64 = 1_301_997_062_500;
+    const PREFIX_FRAMES: u64 = 7;
+    const TAIL_FRAMES: u64 = 10;
+
+    let session_id = PlaybackSessionId(1302);
+    let control = Arc::new(FfmpegControl::new(session_id));
+    let seek_generation = control.request_seek();
+    control.finish_seek(seek_generation);
+    control.set_audio_output_lifecycle(AudioOutputLifecycle::Ready);
+    let output = AudioOutput::stopped_for_test(Arc::clone(&control), 96_000, 48_000, 2);
+    output.reset_clock(AUDIO_TARGET);
+    let epoch = output.audio_epoch();
+    let mut output_scheduler = PlaybackOutputScheduler::new();
+    for index in 0..36 {
+        output_scheduler.push_decoded_video_for_test(test_queued_video_frame(
+            VIDEO_TARGET + index * 40_000_000,
+        ));
+    }
+    for index in 0..PREFIX_FRAMES {
+        let start = AUDIO_TARGET + (PREFIX_END - AUDIO_TARGET) * index / PREFIX_FRAMES;
+        let end = AUDIO_TARGET + (PREFIX_END - AUDIO_TARGET) * (index + 1) / PREFIX_FRAMES;
+        output_scheduler.push_pending_start_audio_for_test(
+            DecodedAudio {
+                samples: vec![0.25; 2048],
+                duration_nsecs: end - start,
+            },
+            start,
+            end,
+        );
+    }
+    output_scheduler.begin_initial_av_start_transaction_for_generations(
+        VIDEO_TARGET,
+        AUDIO_TARGET,
+        seek_generation,
+        Instant::now() - Duration::from_millis(100),
+    );
+    let vo_queue = VideoOutputQueue::default();
+    vo_queue.begin_session(session_id);
+    let frame_presented = AtomicBool::new(false);
+    let mut position = PositionReporter::default();
+    let (event_tx, event_rx) = mpsc::channel();
+    let mut subtitles = SubtitlePipeline::empty_for_test();
+    let mut buffered = BufferedReporter::new_with_events(true, false);
+    let mut start_position = VIDEO_TARGET;
+    let mut scheduler = PlaybackScheduler::new(VIDEO_TARGET);
+    let mut service = |output_scheduler: &mut PlaybackOutputScheduler| {
+        service_initial_video_clock_until_audio_start(
+            output_scheduler,
+            &output,
+            None,
+            AUDIO_TARGET,
+            Some(0),
+            &control,
+            session_id,
+            &vo_queue,
+            &frame_presented,
+            &mut position,
+            &event_tx,
+            &mut subtitles,
+            &mut buffered,
+            &mut start_position,
+            &mut scheduler,
+        )
+        .unwrap()
+    };
+    for _ in 0..100 {
+        assert!(matches!(
+            service(&mut output_scheduler),
+            OutputGateResumeStatus::Waiting | OutputGateResumeStatus::WaitingForDecodedAudio
+        ));
+        if output_scheduler.pending_start_audio.is_empty() {
+            break;
+        }
+    }
+    assert!(output_scheduler.pending_start_audio.is_empty());
+    assert!(!frame_presented.load(Ordering::Acquire));
+    assert_eq!(
+        output.snapshot().unwrap().payload_range_nsecs,
+        Some((AUDIO_TARGET, PREFIX_END))
+    );
+
+    for index in 0..TAIL_FRAMES {
+        let start = NEXT_AUDIO + index * 20_000_000;
+        output_scheduler.push_pending_start_audio_for_test(
+            DecodedAudio {
+                samples: vec![0.5; 1920],
+                duration_nsecs: 20_000_000,
+            },
+            start,
+            start + 20_000_000,
+        );
+    }
+    assert_eq!(
+        retry_initial_prefill(|| service(&mut output_scheduler)),
+        OutputGateResumeStatus::Resumed
+    );
+    assert_eq!(output.audio_epoch(), epoch);
+    assert_eq!(
+        output_scheduler.snapshot().state,
+        PlaybackOutputState::Playing
+    );
+    assert!(output_scheduler.pending_start_audio.is_empty());
+    transfer_prefilled_audio(&output);
+    let prefix_samples = PREFIX_FRAMES as usize * 2048;
+    let mut pcm = vec![0.0; prefix_samples + TAIL_FRAMES as usize * 1920];
+    for chunk in pcm.chunks_mut(960) {
+        output.invoke_callback_for_test(chunk);
+    }
+    assert!(pcm[..prefix_samples].iter().all(|sample| *sample == 0.25));
+    assert!(pcm[prefix_samples..].iter().all(|sample| *sample == 0.5));
+    assert!(output.snapshot().unwrap().played_timeline_nsecs > PREFIX_END);
+    assert_eq!(
+        output.activity_snapshot().unwrap().consumed_callback_count,
+        pcm.len().div_ceil(960) as u64
+    );
+    assert!(!event_rx.try_iter().any(|event| matches!(
+        event.kind,
+        BackendEventKind::Diagnostic(diagnostic)
+            if diagnostic.code == "ffmpeg_initial_audio_stage_no_payload_terminal"
+                || diagnostic.code == "ffmpeg_initial_audio_stage_timeline_gap"
+    )));
 }
 
 #[test]
@@ -2504,7 +2734,7 @@ fn production_stage_stops_before_a_real_audio_timeline_gap() {
     let mut state = ProductionInitialAudioState::new(50, 0);
     let first_end_nsecs =
         PRODUCTION_STAGE_TARGET_NSECS.saturating_add(PRODUCTION_STAGE_FRAME_NSECS);
-    let second_start_nsecs = first_end_nsecs.saturating_add(40_000_000);
+    let second_start_nsecs = first_end_nsecs.saturating_add(150_000_000);
     let second_end_nsecs = second_start_nsecs.saturating_add(PRODUCTION_STAGE_FRAME_NSECS);
     for (start_timeline_nsecs, end_timeline_nsecs) in [
         (PRODUCTION_STAGE_TARGET_NSECS, first_end_nsecs),
@@ -2523,6 +2753,10 @@ fn production_stage_stops_before_a_real_audio_timeline_gap() {
 
     let result = state.stage_until(second_end_nsecs, |_| {});
     assert_eq!(result.staged_frames, 1);
+    assert_eq!(
+        result.timeline_gap_nsecs,
+        Some((first_end_nsecs, second_start_nsecs))
+    );
     assert_eq!(
         result.staged_range_nsecs,
         Some((PRODUCTION_STAGE_TARGET_NSECS, first_end_nsecs))

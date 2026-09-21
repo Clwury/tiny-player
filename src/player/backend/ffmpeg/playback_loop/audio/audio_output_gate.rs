@@ -13,10 +13,11 @@ use super::playback_block::PlaybackBlockReason;
 use super::scheduled_video_queue::ScheduledVideoQueue;
 use super::video_output_gate::{AudioClockedVideoDrainStatus, admit_decoded_video_frame_to_vo};
 use super::{
-    AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION, AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AudioClockMode,
-    AudioOutput, AudioOutputPushResult, BufferedReporter, DecodedAudio, FfmpegControl,
-    PENDING_AUDIO_CONTINUITY_TOLERANCE, PositionReporter, SubtitlePipeline,
-    audio_elements_for_frames, audio_frames_for_duration_round, duration_nsecs,
+    AUDIO_OUTPUT_PTS_GAP_TOLERANCE, AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION,
+    AUDIO_OUTPUT_VIDEO_LEAD_DURATION, AudioClockMode, AudioOutput, AudioOutputPushResult,
+    BufferedReporter, DecodedAudio, FfmpegControl, PENDING_AUDIO_CONTINUITY_TOLERANCE,
+    PositionReporter, SubtitlePipeline, audio_elements_for_frames, audio_frames_for_duration_round,
+    duration_nsecs,
 };
 
 const AUDIO_STAGE_SERVICE_BUDGET: Duration = Duration::from_millis(2);
@@ -53,6 +54,7 @@ pub(in crate::player::backend::ffmpeg) struct AudioStageResult {
     pub(in crate::player::backend::ffmpeg) staged_range_nsecs: Option<(u64, u64)>,
     pub(in crate::player::backend::ffmpeg) interrupted: bool,
     pub(in crate::player::backend::ffmpeg) would_block: bool,
+    pub(in crate::player::backend::ffmpeg) timeline_gap_nsecs: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,7 +83,8 @@ impl AudioStageResult {
 pub(in crate::player::backend::ffmpeg) fn pending_audio_underrun_recovery_plan(
     pending_audio: &PendingStartAudio,
     played_timeline_nsecs: u64,
-    output_pending_nsecs: u64,
+    output_payload_nsecs: u64,
+    output_buffered_until_nsecs: u64,
     video_start_timeline_nsecs: Option<u64>,
     video_buffered_until_nsecs: Option<u64>,
 ) -> Option<PendingAudioUnderrunRecoveryPlan> {
@@ -92,28 +95,31 @@ pub(in crate::player::backend::ffmpeg) fn pending_audio_underrun_recovery_plan(
     let video_start_timeline_nsecs = video_start_timeline_nsecs?;
     let video_buffered_until_nsecs = video_buffered_until_nsecs?;
     let recovery_nsecs = duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION);
-    if output_pending_nsecs > 0 && video_start_timeline_nsecs > played_timeline_nsecs {
-        return None;
-    }
-    let mut audio_start_timeline_nsecs = played_timeline_nsecs.max(video_start_timeline_nsecs);
-    let mut reset_audio_to_timeline_nsecs =
-        (audio_start_timeline_nsecs != played_timeline_nsecs).then_some(audio_start_timeline_nsecs);
-    let mut pending_buffered_until_nsecs =
-        pending_audio.buffered_until_from(audio_start_timeline_nsecs);
+    // During underrun the callback retains its short tail instead of consuming
+    // it. Append from that tail; waiting for it to drain would deadlock prefill.
+    let mut audio_start_timeline_nsecs = if output_payload_nsecs > 0 {
+        output_buffered_until_nsecs.max(played_timeline_nsecs)
+    } else {
+        played_timeline_nsecs.max(video_start_timeline_nsecs)
+    };
+    let mut reset_audio_to_timeline_nsecs = (output_payload_nsecs == 0
+        && audio_start_timeline_nsecs != played_timeline_nsecs)
+        .then_some(audio_start_timeline_nsecs);
+    let mut coverage =
+        pending_audio.stageable_coverage_between(audio_start_timeline_nsecs, u64::MAX);
 
-    if pending_buffered_until_nsecs.is_none() {
-        if output_pending_nsecs > 0 {
+    if coverage.is_none() {
+        if output_payload_nsecs > 0 {
             return None;
         }
         let next_audio_start_nsecs =
             pending_audio.first_start_at_or_after(audio_start_timeline_nsecs)?;
         audio_start_timeline_nsecs = next_audio_start_nsecs;
         reset_audio_to_timeline_nsecs = Some(next_audio_start_nsecs);
-        pending_buffered_until_nsecs =
-            pending_audio.buffered_until_from(audio_start_timeline_nsecs);
+        coverage = pending_audio.stageable_coverage_between(audio_start_timeline_nsecs, u64::MAX);
     }
 
-    let pending_buffered_until_nsecs = pending_buffered_until_nsecs?;
+    let pending_buffered_until_nsecs = coverage?.until_nsecs;
     if pending_buffered_until_nsecs <= audio_start_timeline_nsecs {
         return None;
     }
@@ -123,7 +129,9 @@ pub(in crate::player::backend::ffmpeg) fn pending_audio_underrun_recovery_plan(
         return None;
     }
 
-    let minimum_flush_until_nsecs = audio_start_timeline_nsecs.saturating_add(recovery_nsecs);
+    let remaining_prefill_nsecs = recovery_nsecs.saturating_sub(output_payload_nsecs);
+    let minimum_flush_until_nsecs =
+        audio_start_timeline_nsecs.saturating_add(remaining_prefill_nsecs);
     if video_buffered_until_nsecs < minimum_flush_until_nsecs {
         return None;
     }
@@ -134,13 +142,14 @@ pub(in crate::player::backend::ffmpeg) fn pending_audio_underrun_recovery_plan(
     }
     let audio_flush_until_timeline_nsecs = video_lead_until_nsecs.min(pending_buffered_until_nsecs);
 
-    (audio_flush_until_timeline_nsecs >= minimum_flush_until_nsecs).then_some(
-        PendingAudioUnderrunRecoveryPlan {
-            audio_start_timeline_nsecs,
-            audio_flush_until_timeline_nsecs,
-            reset_audio_to_timeline_nsecs,
-        },
-    )
+    let staged_payload_nsecs = pending_audio
+        .stageable_coverage_between(audio_start_timeline_nsecs, audio_flush_until_timeline_nsecs)?
+        .payload_nsecs;
+    (staged_payload_nsecs >= remaining_prefill_nsecs).then_some(PendingAudioUnderrunRecoveryPlan {
+        audio_start_timeline_nsecs,
+        audio_flush_until_timeline_nsecs,
+        reset_audio_to_timeline_nsecs,
+    })
 }
 
 pub(in crate::player::backend::ffmpeg) fn discard_stale_pending_audio_before_recovery_start(
@@ -334,8 +343,10 @@ pub(in crate::player::backend::ffmpeg) fn stage_pending_audio_with_checkpoint(
         popped_audio_frames = popped_audio_frames.saturating_add(1);
         if frame.start_timeline_nsecs
             > queued_audio_until_nsecs
-                .saturating_add(duration_nsecs(PENDING_AUDIO_CONTINUITY_TOLERANCE))
+                .saturating_add(duration_nsecs(AUDIO_OUTPUT_PTS_GAP_TOLERANCE))
         {
+            result.timeline_gap_nsecs =
+                Some((queued_audio_until_nsecs, frame.start_timeline_nsecs));
             pending_audio.push_front_frame(frame);
             break;
         }
@@ -581,7 +592,10 @@ pub(in crate::player::backend::ffmpeg) fn recover_pending_start_audio_after_unde
     let Some(plan) = pending_audio_underrun_recovery_plan(
         pending_audio,
         audio_snapshot.played_timeline_nsecs,
-        audio_snapshot.total_pending_nsecs,
+        audio_snapshot
+            .total_pending_nsecs
+            .saturating_sub(audio_snapshot.driver_delay_nsecs),
+        audio_snapshot.buffered_until_timeline_nsecs,
         queued_video_range_nsecs.map(|(start, _)| start),
         queued_video_range_nsecs.map(|(_, end)| end),
     ) else {

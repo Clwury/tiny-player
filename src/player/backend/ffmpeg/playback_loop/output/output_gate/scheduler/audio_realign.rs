@@ -20,6 +20,9 @@ impl PlaybackOutputScheduler {
 
         let (target_timeline_nsecs, anchor_timeline_nsecs, first_video_timeline_nsecs) =
             self.rebuffer_audio_realign_target(current_start_position_nsecs)?;
+        if self.audio_realign_exhausted_for(target_timeline_nsecs, far_ahead_audio_timeline_nsecs) {
+            return None;
+        }
         let queued_video_range_nsecs = self.scheduled_video_queue.range_nsecs();
         let queued_video_covers_target = self
             .scheduled_video_queue
@@ -86,7 +89,6 @@ impl PlaybackOutputScheduler {
                 progress_nsecs,
                 has_resume_coverage: pending_audio_continuous || audio_output_continuous,
                 input_can_fill_gap: false,
-                observed_pts_nsecs: Some(far_ahead_audio_timeline_nsecs),
                 force_immediate_realign,
                 now: Instant::now(),
             },
@@ -271,7 +273,6 @@ impl PlaybackOutputScheduler {
                 progress_nsecs,
                 has_resume_coverage,
                 input_can_fill_gap,
-                observed_pts_nsecs: Some(reader_head_start_nsecs),
                 force_immediate_realign: false,
                 now: Instant::now(),
             },
@@ -624,13 +625,34 @@ impl PlaybackOutputScheduler {
         );
     }
 
-    pub(in crate::player::backend::ffmpeg) fn resume_after_confirmed_audio_media_gap(
+    pub(in crate::player::backend::ffmpeg) fn audio_realign_exhausted_for(
+        &self,
+        target_timeline_nsecs: u64,
+        frame_timeline_nsecs: u64,
+    ) -> bool {
+        self.audio_realign_exhausted_range_nsecs
+            .is_some_and(|(start, end)| {
+                let tolerance = duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE);
+                target_timeline_nsecs.saturating_add(tolerance) >= start
+                    && target_timeline_nsecs <= end
+                    && frame_timeline_nsecs <= end.saturating_add(tolerance)
+            })
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn resume_after_exhausted_audio_realign(
         &mut self,
         target_timeline_nsecs: u64,
         far_ahead_audio_timeline_nsecs: u64,
         control: &FfmpegControl,
         session_id: PlaybackSessionId,
     ) -> u64 {
+        // A bounded recovery failure is not proof of missing media. Remember
+        // the attempted interval until the next timeline reset, and admit its
+        // deferred audio instead of starting the same destructive seek again.
+        self.audio_realign_exhausted_range_nsecs = Some((
+            target_timeline_nsecs,
+            far_ahead_audio_timeline_nsecs.max(target_timeline_nsecs),
+        ));
         let first_video_timeline_nsecs = self
             .scheduled_video_queue
             .range_nsecs()
@@ -651,11 +673,11 @@ impl PlaybackOutputScheduler {
             resume_timeline_nsecs,
             Instant::now(),
             session_id,
-            "bounded_audio_realign_confirmed_media_gap",
+            "bounded_audio_realign_exhausted",
         );
         self.clear_rebuffer_far_ahead_audio_observation(
             session_id,
-            "bounded_audio_realign_confirmed_media_gap",
+            "bounded_audio_realign_exhausted",
         );
         tracing::warn!(
             session_id = ?session_id,
@@ -663,11 +685,11 @@ impl PlaybackOutputScheduler {
             first_video_timeline_nsecs,
             resume_timeline_nsecs,
             far_ahead_audio_timeline_nsecs,
-            confirmed_audio_gap_ms = far_ahead_audio_timeline_nsecs
+            far_ahead_audio_delta_ms = far_ahead_audio_timeline_nsecs
                 .saturating_sub(target_timeline_nsecs) as f64
                 / 1_000_000.0,
             video_clock_anchor_valid = self.video_clock_anchor_valid(),
-            "resumed FFmpeg video clock after bounded audio realign confirmed a media gap"
+            "resumed FFmpeg video clock after bounded audio realign was exhausted"
         );
         resume_timeline_nsecs
     }

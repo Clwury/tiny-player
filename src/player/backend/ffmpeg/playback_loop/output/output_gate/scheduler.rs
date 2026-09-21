@@ -42,8 +42,6 @@ const REBUFFER_AUDIO_REALIGN_AFTER_FAR_AHEAD_OBSERVATIONS: u8 = 3;
 const AUDIO_GAP_RECOVERY_SUPPRESS_REBUFFER_FOR: Duration = Duration::from_secs(2);
 const DECODE_RECOVERY_REJECTION_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const AUDIO_READER_GAP_WATCHDOG_MAX_WALL_TIME: Duration = Duration::from_secs(2);
-const AUDIO_READER_GAP_WATCHDOG_MAX_OBSERVATIONS: u64 = 64;
-const AUDIO_READER_GAP_WATCHDOG_MAX_PTS_SPAN_NSECS: u64 = 5_000_000_000;
 const AUDIO_CONTINUITY_REJECTION_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const AUDIO_SYNC_DROP_LOG_SUMMARY_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -81,7 +79,6 @@ struct AudioReaderGapWatchdogObservation {
     progress_nsecs: u64,
     has_resume_coverage: bool,
     input_can_fill_gap: bool,
-    observed_pts_nsecs: Option<u64>,
     force_immediate_realign: bool,
     now: Instant,
 }
@@ -89,7 +86,7 @@ struct AudioReaderGapWatchdogObservation {
 #[cfg(test)]
 mod audio_gap_watchdog_tests {
     use super::{
-        AUDIO_READER_GAP_WATCHDOG_MAX_OBSERVATIONS, AudioReaderGapWatchdogDecision, Instant,
+        AUDIO_READER_GAP_WATCHDOG_MAX_WALL_TIME, AudioReaderGapWatchdogDecision, Instant,
         observe_audio_reader_gap_watchdog,
     };
 
@@ -104,7 +101,6 @@ mod audio_gap_watchdog_tests {
                     progress_nsecs: 0,
                     has_resume_coverage: true,
                     input_can_fill_gap: true,
-                    observed_pts_nsecs: Some(8_000_000_000),
                     force_immediate_realign: true,
                     now: Instant::now(),
                 },
@@ -114,10 +110,10 @@ mod audio_gap_watchdog_tests {
     }
 
     #[test]
-    fn moving_target_cannot_reset_absolute_observation_bound() {
+    fn repeated_reader_polls_do_not_expire_watchdog_or_reset_wall_time_bound() {
         let mut watchdog = None;
         let now = Instant::now();
-        for observation in 0..AUDIO_READER_GAP_WATCHDOG_MAX_OBSERVATIONS - 1 {
+        for observation in 0..10_000 {
             assert_eq!(
                 observe_audio_reader_gap_watchdog(
                     &mut watchdog,
@@ -126,7 +122,6 @@ mod audio_gap_watchdog_tests {
                         progress_nsecs: 0,
                         has_resume_coverage: false,
                         input_can_fill_gap: true,
-                        observed_pts_nsecs: Some(8_000_000_000),
                         force_immediate_realign: false,
                         now,
                     },
@@ -142,9 +137,8 @@ mod audio_gap_watchdog_tests {
                     progress_nsecs: 0,
                     has_resume_coverage: false,
                     input_can_fill_gap: true,
-                    observed_pts_nsecs: Some(8_000_000_000),
                     force_immediate_realign: false,
-                    now,
+                    now: now + AUDIO_READER_GAP_WATCHDOG_MAX_WALL_TIME,
                 },
             ),
             AudioReaderGapWatchdogDecision::Request
@@ -161,7 +155,6 @@ fn observe_audio_reader_gap_watchdog(
         progress_nsecs,
         has_resume_coverage,
         input_can_fill_gap,
-        observed_pts_nsecs,
         force_immediate_realign,
         now,
     } = observation;
@@ -174,9 +167,6 @@ fn observe_audio_reader_gap_watchdog(
         started_at: now,
         last_progress_nsecs: progress_nsecs,
         last_progress_at: now,
-        observations: 0,
-        first_observed_pts_nsecs: observed_pts_nsecs,
-        last_observed_pts_nsecs: observed_pts_nsecs,
         request_issued: false,
     });
     if current.target_timeline_nsecs != target_timeline_nsecs {
@@ -188,25 +178,11 @@ fn observe_audio_reader_gap_watchdog(
         current.last_progress_at = now;
         current.request_issued = false;
     }
-    current.observations = current.observations.saturating_add(1);
-    if let Some(observed_pts_nsecs) = observed_pts_nsecs {
-        current
-            .first_observed_pts_nsecs
-            .get_or_insert(observed_pts_nsecs);
-        current.last_observed_pts_nsecs = Some(observed_pts_nsecs);
-    }
     if current.request_issued {
         return AudioReaderGapWatchdogDecision::RequestAlreadyIssued;
     }
-    let observed_pts_span_nsecs = current
-        .first_observed_pts_nsecs
-        .zip(current.last_observed_pts_nsecs)
-        .map(|(first, last)| first.abs_diff(last))
-        .unwrap_or_default();
     let absolute_bound_exhausted = now.saturating_duration_since(current.started_at)
-        >= AUDIO_READER_GAP_WATCHDOG_MAX_WALL_TIME
-        || current.observations >= AUDIO_READER_GAP_WATCHDOG_MAX_OBSERVATIONS
-        || observed_pts_span_nsecs >= AUDIO_READER_GAP_WATCHDOG_MAX_PTS_SPAN_NSECS;
+        >= AUDIO_READER_GAP_WATCHDOG_MAX_WALL_TIME;
     if input_can_fill_gap && !force_immediate_realign && !absolute_bound_exhausted {
         return AudioReaderGapWatchdogDecision::InputPending;
     }

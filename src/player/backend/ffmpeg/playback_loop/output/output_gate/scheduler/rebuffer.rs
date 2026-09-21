@@ -174,9 +174,27 @@ impl PlaybackOutputScheduler {
         &mut self,
         now: Instant,
         activity: AudioOutputActivitySnapshot,
-        eligible: bool,
+        supervision_enabled: bool,
         seek_transition_paused: bool,
+        underrun_active: bool,
     ) -> Option<AudioOutputActivityWatchdogEvent> {
+        let prefill_available = !self.scheduled_video_queue.is_empty()
+            && activity
+                .shared_buffer_pending_nsecs
+                .saturating_add(activity.queue_pending_nsecs)
+                .saturating_add(duration_nsecs(self.pending_start_audio.buffered_duration()))
+                >= duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION);
+        let eligible = supervision_enabled && (!underrun_active || prefill_available);
+        if supervision_enabled
+            && underrun_active
+            && !prefill_available
+            && self.audio_output_clock_stall_fallback_active
+        {
+            // After a bounded re-anchor, keep the video-clock escape hatch
+            // until data arrives. With enough PCM, continue observing the
+            // underrun so a frozen prefill still reaches its recovery deadline.
+            return None;
+        }
         // A rolled-back start can leave callbacks stopped with audio still
         // waiting upstream. An empty callback buffer must not hide that stall.
         let audio_pending = activity.shared_buffer_pending_nsecs > 0

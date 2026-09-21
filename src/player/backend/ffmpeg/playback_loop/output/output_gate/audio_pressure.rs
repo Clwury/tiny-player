@@ -537,7 +537,10 @@ impl PlaybackOutputScheduler {
         if pending_audio_underrun_recovery_plan(
             &self.pending_start_audio,
             audio_snapshot.played_timeline_nsecs,
-            audio_snapshot.total_pending_nsecs,
+            audio_snapshot
+                .total_pending_nsecs
+                .saturating_sub(audio_snapshot.driver_delay_nsecs),
+            audio_snapshot.buffered_until_timeline_nsecs,
             queued_video_range_nsecs.map(|(start, _)| start),
             queued_video_range_nsecs.map(|(_, end)| end),
         )
@@ -560,8 +563,11 @@ impl PlaybackOutputScheduler {
         audio_flush_until_timeline_nsecs > audio_start_timeline_nsecs
             && self
                 .pending_start_audio
-                .buffered_until_from(audio_start_timeline_nsecs)
-                .is_some_and(|buffered_until| buffered_until > audio_start_timeline_nsecs)
+                .stageable_coverage_between(
+                    audio_start_timeline_nsecs,
+                    audio_flush_until_timeline_nsecs,
+                )
+                .is_some()
     }
 
     #[allow(clippy::too_many_arguments)]

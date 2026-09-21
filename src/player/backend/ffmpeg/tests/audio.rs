@@ -211,7 +211,7 @@ fn pending_audio_underrun_recovery_waits_for_video_window() {
     );
 
     assert_eq!(
-        pending_audio_underrun_recovery_plan(&pending, 1_000_000_000, 0, None, None),
+        pending_audio_underrun_recovery_plan(&pending, 1_000_000_000, 0, 1_000_000_000, None, None),
         None
     );
 }
@@ -233,6 +233,7 @@ fn pending_audio_underrun_recovery_resets_to_next_audio_with_video_window() {
             &pending,
             1_000_000_000,
             0,
+            1_000_000_000,
             Some(1_400_000_000),
             Some(1_900_000_000)
         ),
@@ -261,6 +262,7 @@ fn pending_audio_underrun_recovery_waits_for_existing_audio_before_clock_reset()
             &pending,
             1_000_000_000,
             50_000_000,
+            1_050_000_000,
             Some(1_400_000_000),
             Some(1_900_000_000)
         ),
@@ -271,20 +273,24 @@ fn pending_audio_underrun_recovery_waits_for_existing_audio_before_clock_reset()
 #[test]
 fn pending_audio_underrun_recovery_uses_video_lead_when_available() {
     let mut pending = PendingStartAudio::default();
-    pending.push(
-        DecodedAudio {
-            samples: vec![0.0; 4],
-            duration_nsecs: 900_000_000,
-        },
-        1_000_000_000,
-        1_900_000_000,
-    );
+    for index in 0..9 {
+        let start = 1_000_000_000 + index * 100_000_000;
+        pending.push(
+            DecodedAudio {
+                samples: vec![0.0; 4],
+                duration_nsecs: 100_000_000,
+            },
+            start,
+            start + 100_000_000,
+        );
+    }
 
     assert_eq!(
         pending_audio_underrun_recovery_plan(
             &pending,
             1_000_000_000,
             0,
+            1_000_000_000,
             Some(1_000_000_000),
             Some(1_300_000_000),
         ),
@@ -293,6 +299,62 @@ fn pending_audio_underrun_recovery_uses_video_lead_when_available() {
             audio_flush_until_timeline_nsecs: 1_800_000_000,
             reset_audio_to_timeline_nsecs: None,
         })
+    );
+}
+
+#[test]
+fn pending_audio_underrun_prefill_counts_payload_instead_of_pts_span() {
+    const PLAYED: u64 = 1_301_797_375_331;
+    const PREFIX_NSECS: u64 = 149_319_724;
+    const AUDIO_END: u64 = PLAYED + PREFIX_NSECS;
+    const NEXT_AUDIO: u64 = 1_301_997_062_500;
+    for (tail_nsecs, ready) in [(100_000_000, false), (120_000_000, true)] {
+        let mut pending = PendingStartAudio::default();
+        pending.push(
+            DecodedAudio {
+                samples: vec![0.25; 4],
+                duration_nsecs: tail_nsecs,
+            },
+            NEXT_AUDIO,
+            NEXT_AUDIO + tail_nsecs,
+        );
+        let plan = pending_audio_underrun_recovery_plan(
+            &pending,
+            PLAYED,
+            PREFIX_NSECS,
+            AUDIO_END,
+            Some(PLAYED + 40_000_000),
+            Some(PLAYED + 1_000_000_000),
+        );
+        assert_eq!(plan.is_some(), ready);
+        if let Some(plan) = plan {
+            assert_eq!(plan.audio_start_timeline_nsecs, AUDIO_END);
+            assert_eq!(plan.reset_audio_to_timeline_nsecs, None);
+        }
+    }
+}
+
+#[test]
+fn pending_audio_underrun_prefill_waits_for_a_frame_to_fit_the_video_limit() {
+    let mut pending = PendingStartAudio::default();
+    pending.push(
+        DecodedAudio {
+            samples: vec![0.25; 4],
+            duration_nsecs: 900_000_000,
+        },
+        1_000_000_000,
+        1_900_000_000,
+    );
+    assert_eq!(
+        pending_audio_underrun_recovery_plan(
+            &pending,
+            1_000_000_000,
+            0,
+            1_000_000_000,
+            Some(1_000_000_000),
+            Some(1_300_000_000),
+        ),
+        None
     );
 }
 
@@ -313,6 +375,7 @@ fn pending_audio_underrun_recovery_resets_to_video_start_when_audio_leads_video(
             &pending,
             1_000_000_000,
             0,
+            1_000_000_000,
             Some(1_400_000_000),
             Some(1_900_000_000),
         ),
@@ -341,6 +404,7 @@ fn pending_audio_underrun_recovery_waits_for_actual_video_window() {
             &pending,
             1_000_000_000,
             0,
+            1_000_000_000,
             Some(1_000_000_000),
             Some(1_040_000_000),
         ),

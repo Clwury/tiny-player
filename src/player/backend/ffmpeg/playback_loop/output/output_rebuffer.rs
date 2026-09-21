@@ -1031,17 +1031,15 @@ fn pending_audio_rebuffer_recovery_forward_from(
     resume_timeline_nsecs: u64,
 ) -> Option<DelayedStartDecodedAudioForward> {
     let first_audio_start_nsecs = pending_audio.first_start_timeline_nsecs()?;
-    let pending_duration_nsecs = duration_nsecs(pending_audio.buffered_duration());
-    if pending_duration_nsecs == 0 {
-        return None;
-    }
     let gap_nsecs = first_audio_start_nsecs.saturating_sub(resume_timeline_nsecs);
     if gap_nsecs > duration_nsecs(AUDIO_OUTPUT_VIDEO_LEAD_DURATION) {
         return None;
     }
-    let skipped_before_resume_nsecs = resume_timeline_nsecs.saturating_sub(first_audio_start_nsecs);
-    let forward_nsecs = gap_nsecs
-        .saturating_add(pending_duration_nsecs.saturating_sub(skipped_before_resume_nsecs));
+    let coverage = pending_audio
+        .stageable_coverage_between(resume_timeline_nsecs.max(first_audio_start_nsecs), u64::MAX)?;
+    // Match output admission: large internal holes stop prefill. Only an
+    // explicitly delayed start can contribute the silence staged at its head.
+    let forward_nsecs = gap_nsecs.saturating_add(coverage.payload_nsecs);
     (forward_nsecs > 0).then_some(DelayedStartDecodedAudioForward {
         forward_nsecs,
         gap_nsecs,
@@ -2067,6 +2065,50 @@ mod tests {
             waterline.decoded_output.delayed_audio_start_gap_nsecs,
             Some(first_audio_nsecs - first_video_nsecs)
         );
+    }
+
+    #[test]
+    fn rebuffer_waterline_counts_stageable_pcm_without_crossing_large_internal_gaps() {
+        const START: u64 = 1_301_797_375_331;
+        const PREFIX_NSECS: u64 = 149_319_724;
+        const TAIL_NSECS: u64 = 3_136_008_992;
+        let video = queued_video_window(START, 4_000_000_000);
+        for (gap, expected_payload, ready) in [
+            (50_367_445, PREFIX_NSECS + TAIL_NSECS, true),
+            (150_000_000, PREFIX_NSECS, false),
+        ] {
+            let mut pending = PendingStartAudio::default();
+            for (start, duration) in [
+                (START, PREFIX_NSECS),
+                (START + PREFIX_NSECS + gap, TAIL_NSECS),
+            ] {
+                pending.push(
+                    DecodedAudio {
+                        samples: vec![0.25; 4],
+                        duration_nsecs: duration,
+                    },
+                    start,
+                    start + duration,
+                );
+            }
+            let waterline = playback_resume_waterline_with_target(
+                &video,
+                &pending,
+                START,
+                ready_demux_watermark(10_000_000_000),
+                1_000_000_000,
+                true,
+                PlaybackResumeWaterlineOptions {
+                    allow_delayed_audio_start: true,
+                    ..PlaybackResumeWaterlineOptions::default()
+                },
+            );
+            assert_eq!(
+                waterline.decoded_output.audio_forward_nsecs,
+                Some(expected_payload)
+            );
+            assert_eq!(waterline.ready(), ready);
+        }
     }
 
     #[test]

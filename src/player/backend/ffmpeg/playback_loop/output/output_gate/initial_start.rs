@@ -1472,24 +1472,45 @@ pub(in crate::player::backend::ffmpeg::playback_loop) fn service_initial_video_c
             stage_guard.preserve_for_retry(InitialAudioTransientRetry::AudioStageWouldBlock);
             return Ok(OutputGateResumeStatus::Waiting);
         }
-        tracing::error!(
-            session_id = ?session_id,
-            transaction_id = transaction.transaction_id,
-            retention_anchor_nsecs = retention_plan.anchor_timeline_nsecs,
-            retention_anchor_source = retention_plan.source.as_str(),
-            bounded_delayed_audio_start_nsecs,
-            pending_audio_range_nsecs = ?stage_guard
-                .scheduler()
-                .pending_start_audio
-                .range_nsecs(),
-            audio_flush_start_timeline_nsecs,
-            audio_flush_until_timeline_nsecs,
-            "initial audio staging produced no payload from a non-transient input state"
-        );
+        let (diagnostic_code, failure_reason) = if let Some((from_nsecs, to_nsecs)) =
+            stage_result.timeline_gap_nsecs
+        {
+            tracing::warn!(
+                session_id = ?session_id,
+                transaction_id = transaction.transaction_id,
+                from_nsecs,
+                to_nsecs,
+                gap_ms = to_nsecs.saturating_sub(from_nsecs) as f64 / 1_000_000.0,
+                "initial audio prefill reached a timeline discontinuity; retaining audio for rebuffer"
+            );
+            (
+                "ffmpeg_initial_audio_stage_timeline_gap",
+                "initial_audio_stage_timeline_gap",
+            )
+        } else {
+            tracing::error!(
+                session_id = ?session_id,
+                transaction_id = transaction.transaction_id,
+                retention_anchor_nsecs = retention_plan.anchor_timeline_nsecs,
+                retention_anchor_source = retention_plan.source.as_str(),
+                bounded_delayed_audio_start_nsecs,
+                pending_audio_range_nsecs = ?stage_guard
+                    .scheduler()
+                    .pending_start_audio
+                    .range_nsecs(),
+                audio_flush_start_timeline_nsecs,
+                audio_flush_until_timeline_nsecs,
+                "initial audio staging produced no payload from a non-transient input state"
+            );
+            (
+                "ffmpeg_initial_audio_stage_no_payload_terminal",
+                "initial_audio_stage_no_payload_terminal",
+            )
+        };
         let _ = event_tx.send(BackendEvent::new(
             session_id,
             BackendEventKind::Diagnostic(BackendDiagnostic {
-                code: "ffmpeg_initial_audio_stage_no_payload_terminal",
+                code: diagnostic_code,
                 message: format!(
                     "transaction={} target={} pending={:?} action=rebuffer",
                     transaction.transaction_id,
@@ -1498,12 +1519,12 @@ pub(in crate::player::backend::ffmpeg::playback_loop) fn service_initial_video_c
                 ),
             }),
         ));
-        stage_guard.abort("initial_audio_stage_no_payload_terminal");
+        stage_guard.abort(failure_reason);
         drop(stage_guard);
         output_scheduler.fail_initial_av_start_transaction_at_anchor(
             control,
             session_id,
-            "initial_audio_stage_no_payload_terminal",
+            failure_reason,
             transaction.audio_start_target_nsecs,
         );
         return Ok(OutputGateResumeStatus::Rebuffering);

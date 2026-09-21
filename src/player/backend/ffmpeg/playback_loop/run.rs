@@ -76,14 +76,14 @@ use super::{
     PlaybackOutputSnapshot, PlaybackPipelineServices, PlaybackPipelineState,
     PlaybackRecoveryRequest, PlaybackRecoverySource, PlaybackScheduler, PlaybackSession,
     PlaybackTickContext, PlaybackTickStatus, PositionReporter, RebufferAudioRealignRequest,
-    SubtitlePipeline, TimestampMapper, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-    VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, VideoDecodePipeline, VideoDecodeRecovery,
-    VideoFramePrepareWorker, audio_codec_requires_recovery_point, duration_nsecs,
-    expire_initial_av_start_hard_deadline, nsecs_to_seconds, open_playback_input_with_fallback,
-    playback_audio_info_from_stream, playback_video_info_from_worker,
-    preroll_seek_position_seconds, seconds_to_nsecs, service_hevc_startup_stall_watchdog_if_due,
-    service_playback_commands, service_playback_eof_drain, service_playback_tick,
-    should_cache_http_url, video_seek_preroll_nsecs,
+    SubtitlePipeline, TimestampMapper, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, VideoDecodePipeline,
+    VideoDecodeRecovery, VideoFramePrepareWorker, audio_codec_requires_recovery_point,
+    duration_nsecs, expire_initial_av_start_hard_deadline, nsecs_to_seconds,
+    open_playback_input_with_fallback, playback_audio_info_from_stream,
+    playback_video_info_from_worker, preroll_seek_position_seconds, seconds_to_nsecs,
+    service_hevc_startup_stall_watchdog_if_due, service_playback_commands,
+    service_playback_eof_drain, service_playback_tick, should_cache_http_url,
+    video_seek_preroll_nsecs,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1021,6 +1021,7 @@ mod tests {
         internal_recovery_seek_buffering_policy, rebuffer_audio_realign_can_preserve_video_queue,
         rebuffer_audio_realign_requires_low_level_seek, take_next_recovery_fallback,
     };
+    use crate::player::backend::ffmpeg::AudioOutputSnapshot;
     use crate::player::backend::ffmpeg::playback_loop::PlaybackOutputState;
     use crate::player::render_host::PlaybackSessionId;
 
@@ -1174,21 +1175,20 @@ mod tests {
         };
 
         assert_eq!(
-            audio_realign_execution_decision(target_nsecs, pending_coverage, None, 0).0,
+            audio_realign_execution_decision(pending_coverage, 0),
             AudioRealignExecutionDecision::CoverageSatisfied
         );
     }
 
     #[test]
     fn queued_audio_realign_waits_while_decoder_input_can_fill_gap() {
-        let target_nsecs = 237_237_000_000;
         let missing_coverage = AudioRealignCoverage {
             protected_target_nsecs: 850_000_000,
             ..AudioRealignCoverage::default()
         };
 
         assert_eq!(
-            audio_realign_execution_decision(target_nsecs, missing_coverage, None, 1).0,
+            audio_realign_execution_decision(missing_coverage, 1),
             AudioRealignExecutionDecision::InputPending
         );
     }
@@ -1196,20 +1196,24 @@ mod tests {
     #[test]
     fn queued_audio_realign_is_cancelled_when_audio_output_covers_target() {
         let target_nsecs = 237_237_000_000;
-        let missing_pending_coverage = AudioRealignCoverage {
-            protected_target_nsecs: 850_000_000,
-            ..AudioRealignCoverage::default()
-        };
-
-        let (decision, output_coverage_nsecs) = audio_realign_execution_decision(
+        let scheduler = super::PlaybackOutputScheduler::new();
+        let coverage = scheduler.audio_realign_coverage(
             target_nsecs,
-            missing_pending_coverage,
-            Some((target_nsecs, target_nsecs + 938_999_996)),
-            0,
+            1_000_000_000,
+            Some(AudioOutputSnapshot {
+                played_timeline_nsecs: target_nsecs,
+                buffered_until_timeline_nsecs: target_nsecs + 938_999_996,
+                total_pending_nsecs: 938_999_996,
+                payload_range_nsecs: Some((target_nsecs, target_nsecs + 938_999_996)),
+                ..AudioOutputSnapshot::default()
+            }),
         );
 
-        assert_eq!(decision, AudioRealignExecutionDecision::CoverageSatisfied);
-        assert_eq!(output_coverage_nsecs, Some(938_999_996));
+        assert_eq!(
+            audio_realign_execution_decision(coverage, 0),
+            AudioRealignExecutionDecision::CoverageSatisfied
+        );
+        assert_eq!(coverage.contiguous_coverage_nsecs, Some(938_999_996));
     }
 
     #[test]

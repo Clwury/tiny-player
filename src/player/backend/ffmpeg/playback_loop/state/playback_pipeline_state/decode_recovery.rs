@@ -205,7 +205,7 @@ impl PlaybackPipelineState {
         let transaction = self.audio_realign_transaction?;
         if matches!(
             transaction.phase,
-            AudioRealignPhase::Covered | AudioRealignPhase::MediaGap
+            AudioRealignPhase::Covered | AudioRealignPhase::Exhausted
         ) || transaction.fallback_exhausted_logged
         {
             return None;

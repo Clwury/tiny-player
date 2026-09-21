@@ -13,7 +13,7 @@ use crate::player::{
 use super::audio_decode_pipeline::AudioDecodePipeline;
 use super::audio_decode_worker::{AudioDecodePacketResult, AudioDecodedFrame};
 use super::{
-    AudioOutput, BufferedReporter, DECODE_PACKET_SLOW_LOG_AFTER,
+    AUDIO_OUTPUT_PTS_GAP_TOLERANCE, AudioOutput, BufferedReporter, DECODE_PACKET_SLOW_LOG_AFTER,
     DECODE_PIPELINE_INTERNAL_STAGE_TIMING_LOG_AFTER, DecodedAudioAdmission, FfmpegControl,
     PENDING_AUDIO_CONTINUITY_TOLERANCE, PlaybackOutputScheduler, PositionReporter,
     SubtitlePipeline, TimestampMapper, duration_nsecs,
@@ -43,9 +43,20 @@ fn commit_audio_timestamp_mapping_if_accepted(
 fn far_ahead_audio_frame_is_contiguous(
     frame_start_nsecs: u64,
     far_ahead_reference_nsecs: u64,
+    previous_decoded_end_nsecs: Option<u64>,
     pending_audio_range_nsecs: Option<(u64, u64)>,
     audio_output_buffered_until_nsecs: u64,
 ) -> bool {
+    // A short gap inside the pending queue must not make every later frame
+    // look discontinuous with its prefix. The committed decoder clock tracks
+    // accepted frames only, so an adjacent frame can continue past that gap.
+    if previous_decoded_end_nsecs.is_some_and(|previous_end| {
+        previous_end >= far_ahead_reference_nsecs
+            && frame_start_nsecs.abs_diff(previous_end)
+                <= duration_nsecs(AUDIO_OUTPUT_PTS_GAP_TOLERANCE)
+    }) {
+        return true;
+    }
     let pending_audio_until_nsecs = pending_audio_range_nsecs
         .filter(|(start_nsecs, _)| {
             *start_nsecs <= far_ahead_reference_nsecs.saturating_add(MAX_SEEK_AUDIO_LEAD_NSECS)
@@ -139,10 +150,13 @@ fn service_decoded_audio_frame(
         && (output_snapshot.first_video_frame_pending || output_snapshot.rebuffering)
         && timestamp.timeline_nsecs
             > far_ahead_reference_nsecs.saturating_add(MAX_SEEK_AUDIO_LEAD_NSECS)
+        && !output_scheduler
+            .audio_realign_exhausted_for(far_ahead_reference_nsecs, timestamp.timeline_nsecs)
     {
         let frame_is_contiguous = far_ahead_audio_frame_is_contiguous(
             timestamp.timeline_nsecs,
             far_ahead_reference_nsecs,
+            audio_clock.last_contiguous_end_nsecs(),
             output_scheduler.pending_audio_contiguous_range_nsecs(),
             audio_snapshot.buffered_until_timeline_nsecs,
         );
@@ -621,7 +635,7 @@ pub(super) fn process_audio_decode_drain_result(
 
 #[cfg(test)]
 mod tests {
-    use super::super::DecodedAudio;
+    use super::super::{DecodedAudio, PendingStartAudio};
     use super::{
         AudioDecodeOutputDrainWorker, DecodedAudioAdmission, PENDING_AUDIO_CONTINUITY_TOLERANCE,
         TimestampMapper, commit_audio_timestamp_mapping_if_accepted,
@@ -709,6 +723,7 @@ mod tests {
         assert!(far_ahead_audio_frame_is_contiguous(
             204_567_800_334,
             202_549_751_669,
+            None,
             Some((202_570_884_290, 204_567_800_334)),
             202_549_751_669,
         ));
@@ -720,7 +735,88 @@ mod tests {
             210_535_328_512,
             204_583_333_333,
             None,
+            None,
             204_567_800_334,
+        ));
+    }
+
+    #[test]
+    fn audio_at_2321_continues_after_gap_in_pending_prefix_without_realign() {
+        let target = 1_400_584_044_444;
+        let before_gap = 1_401_341_012_036;
+        let after_gap = 1_401_386_041_667;
+        let next_frame = 1_402_602_050_707;
+        let mut pending = PendingStartAudio::default();
+        for (start, end) in [(target, before_gap), (after_gap, next_frame)] {
+            pending.push(
+                DecodedAudio {
+                    samples: vec![0.0; 4],
+                    duration_nsecs: end - start,
+                },
+                start,
+                end,
+            );
+        }
+        assert_eq!(pending.first_gap_nsecs(), Some((before_gap, after_gap)));
+        assert_eq!(pending.contiguous_range_nsecs(), Some((target, before_gap)));
+        assert!(far_ahead_audio_frame_is_contiguous(
+            next_frame,
+            target,
+            Some(next_frame),
+            pending.contiguous_range_nsecs(),
+            target,
+        ));
+    }
+
+    #[test]
+    fn small_audio_pts_gap_at_seek_lead_limit_preserves_timestamp_without_realign() {
+        let target = 1_400_000_000_000;
+        let previous_end = target + 2_000_000_000;
+        let frame_start = previous_end + 45_000_000;
+        let mut clock = TimestampMapper::new(Some(0), target, None);
+        let time_base = ffi::AVRational {
+            num: 1,
+            den: 1_000_000_000,
+        };
+        clock.map_contiguous(
+            (previous_end - 20_000_000) as i64,
+            time_base,
+            20_000_000,
+            PENDING_AUDIO_CONTINUITY_TOLERANCE,
+        );
+        let previous_end = clock.last_contiguous_end_nsecs();
+        let mapped = clock.map_contiguous(
+            frame_start as i64,
+            time_base,
+            20_000_000,
+            PENDING_AUDIO_CONTINUITY_TOLERANCE,
+        );
+        assert_eq!(mapped.timeline_nsecs, frame_start);
+        assert!(far_ahead_audio_frame_is_contiguous(
+            mapped.timeline_nsecs,
+            target,
+            previous_end,
+            None,
+            target,
+        ));
+    }
+
+    #[test]
+    fn audio_timestamp_jump_and_preroll_clock_do_not_bypass_realign() {
+        let target = 1_400_000_000_000;
+        assert!(!far_ahead_audio_frame_is_contiguous(
+            target + 2_200_000_000,
+            target,
+            Some(target + 2_000_000_000),
+            None,
+            target,
+        ));
+        assert!(!far_ahead_audio_frame_is_contiguous(
+            target + 2_200_000_000,
+            target,
+            Some(target - 20_000_000),
+            None,
+            target,
         ));
     }
 

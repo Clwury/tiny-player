@@ -737,7 +737,7 @@ impl PlaybackOutputScheduler {
                             / 1_000_000.0
                     })
             }),
-            "initial A/V start transaction exhausted its wall-time bound"
+            "initial A/V start transaction failed; entering rebuffer at the retained anchor"
         );
         self.set_state(PlaybackOutputState::Rebuffering);
         self.rebuffer_started_at = Some(Instant::now());

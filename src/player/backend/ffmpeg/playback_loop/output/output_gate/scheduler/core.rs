@@ -13,6 +13,7 @@ impl PlaybackOutputScheduler {
         &self,
         resume_timeline_nsecs: u64,
         target_nsecs: u64,
+        audio_snapshot: Option<AudioOutputSnapshot>,
     ) -> AudioRealignCoverage {
         let protected_target_nsecs =
             target_nsecs.saturating_sub(duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN));
@@ -31,22 +32,57 @@ impl PlaybackOutputScheduler {
                     })
             })
             .flatten();
-        let audio_accepted_start_timeline_nsecs = direct_until_nsecs
+        let mut audio_accepted_start_timeline_nsecs = direct_until_nsecs
             .map(|_| resume_timeline_nsecs)
             .or_else(|| delayed_range.map(|(start_nsecs, _)| start_nsecs));
-        let contiguous_coverage_nsecs = direct_until_nsecs
+        let mut contiguous_coverage_nsecs = direct_until_nsecs
             .map(|end_nsecs| end_nsecs.saturating_sub(resume_timeline_nsecs))
             .or_else(|| {
                 delayed_range.map(|(start_nsecs, end_nsecs)| end_nsecs.saturating_sub(start_nsecs))
             });
+        let mut output_resumed = false;
+        if let Some(snapshot) = audio_snapshot
+            && snapshot.total_pending_nsecs > 0
+            && let Some((payload_start, payload_end)) = snapshot.payload_range_nsecs
+        {
+            let reference = resume_timeline_nsecs.max(snapshot.played_timeline_nsecs);
+            let accepted_start = reference.max(payload_start);
+            if payload_start
+                <= reference.saturating_add(duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE))
+                && payload_end > accepted_start
+            {
+                // Samples transferred to AO still belong to this recovery.
+                // Bound the interval by real payload so a PTS hole or a reset
+                // clock alone cannot manufacture coverage.
+                let output_coverage = payload_end
+                    .saturating_sub(accepted_start)
+                    .min(snapshot.total_pending_nsecs);
+                let pending_extension = self
+                    .pending_start_audio
+                    .buffered_until_from(payload_end)
+                    .unwrap_or(payload_end)
+                    .saturating_sub(payload_end);
+                let coverage = output_coverage.saturating_add(pending_extension);
+                if coverage > contiguous_coverage_nsecs.unwrap_or_default() {
+                    audio_accepted_start_timeline_nsecs = Some(accepted_start);
+                    contiguous_coverage_nsecs = Some(coverage);
+                }
+                // Once the output gate has resumed with real audio, do not
+                // require it to refill the original startup waterline again.
+                output_resumed = self.playback_output_state == PlaybackOutputState::Playing
+                    && snapshot.played_timeline_nsecs >= resume_timeline_nsecs
+                    && output_coverage >= duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION);
+            }
+        }
         AudioRealignCoverage {
             audio_accepted_start_timeline_nsecs,
             start_gap_nsecs: audio_accepted_start_timeline_nsecs
                 .map(|accepted_start| accepted_start.saturating_sub(resume_timeline_nsecs)),
             contiguous_coverage_nsecs,
             protected_target_nsecs,
-            ready: contiguous_coverage_nsecs
-                .is_some_and(|coverage| coverage >= protected_target_nsecs),
+            ready: output_resumed
+                || contiguous_coverage_nsecs
+                    .is_some_and(|coverage| coverage >= protected_target_nsecs),
         }
     }
 
@@ -85,6 +121,7 @@ impl PlaybackOutputScheduler {
             rebuffer_far_ahead_audio_observation_count: 0,
             audio_gap_recovery_until: None,
             audio_gap_recovery_target_nsecs: None,
+            audio_realign_exhausted_range_nsecs: None,
             initial_delayed_audio_start_timeline_nsecs: None,
             initial_audio_gap_at_video_start_timeline_nsecs: None,
             initial_av_start_transaction: None,
@@ -169,6 +206,7 @@ impl PlaybackOutputScheduler {
         self.rebuffer_far_ahead_audio_observation_count = 0;
         self.audio_gap_recovery_until = None;
         self.audio_gap_recovery_target_nsecs = None;
+        self.audio_realign_exhausted_range_nsecs = None;
         self.recent_audio_output_underrun_window_started_at = None;
         self.recent_audio_output_underruns = 0;
         self.video_clock_anchor_valid = false;

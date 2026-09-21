@@ -1,8 +1,9 @@
 use std::{collections::VecDeque, os::raw::c_int, time::Duration};
 
 use super::{
-    AudioStagedFrame, DecodedAudio, PENDING_AUDIO_CONTINUITY_TOLERANCE,
-    VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, align_audio_elements_to_frame_boundary, duration_nsecs,
+    AUDIO_OUTPUT_PTS_GAP_TOLERANCE, AudioStagedFrame, DecodedAudio,
+    PENDING_AUDIO_CONTINUITY_TOLERANCE, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
+    align_audio_elements_to_frame_boundary, duration_nsecs,
 };
 
 #[derive(Default)]
@@ -17,6 +18,12 @@ pub(in crate::player::backend::ffmpeg) struct PendingStartAudioFrame {
     pub(in crate::player::backend::ffmpeg) samples: Vec<f32>,
     pub(in crate::player::backend::ffmpeg) start_timeline_nsecs: u64,
     pub(in crate::player::backend::ffmpeg) end_timeline_nsecs: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::player::backend::ffmpeg) struct PendingAudioStageCoverage {
+    pub(in crate::player::backend::ffmpeg) until_nsecs: u64,
+    pub(in crate::player::backend::ffmpeg) payload_nsecs: u64,
 }
 
 impl PendingStartAudioFrame {
@@ -250,6 +257,41 @@ impl PendingStartAudio {
             .map(|buffered_until| buffered_until.saturating_sub(timeline_nsecs))
     }
 
+    /// PCM reachable by the output staging loop. Short PTS gaps are passed
+    /// through with their timestamps intact, but never counted as samples.
+    pub(in crate::player::backend::ffmpeg) fn stageable_coverage_between(
+        &self,
+        start_nsecs: u64,
+        limit_nsecs: u64,
+    ) -> Option<PendingAudioStageCoverage> {
+        let mut until_nsecs = start_nsecs;
+        let mut payload_nsecs = 0_u64;
+        for frame in &self.frames {
+            if frame.end_timeline_nsecs <= until_nsecs {
+                continue;
+            }
+            // pop_front_until stages whole frames; a partial frame beyond the
+            // flush limit cannot contribute to the prefill promise.
+            if frame.end_timeline_nsecs > limit_nsecs
+                || frame.start_timeline_nsecs
+                    > until_nsecs.saturating_add(duration_nsecs(AUDIO_OUTPUT_PTS_GAP_TOLERANCE))
+            {
+                break;
+            }
+            let end = frame.end_timeline_nsecs;
+            payload_nsecs = payload_nsecs
+                .saturating_add(end.saturating_sub(frame.start_timeline_nsecs.max(until_nsecs)));
+            until_nsecs = end;
+            if until_nsecs >= limit_nsecs {
+                break;
+            }
+        }
+        (payload_nsecs > 0).then_some(PendingAudioStageCoverage {
+            until_nsecs,
+            payload_nsecs,
+        })
+    }
+
     pub(in crate::player::backend::ffmpeg) fn pop_front_until(
         &mut self,
         end_timeline_nsecs: u64,
@@ -378,6 +420,55 @@ mod tests {
         pending.push(decoded_audio(20_000_000), 1_024_000_000, 1_044_000_000);
 
         assert_eq!(pending.contiguous_duration().as_nanos(), 44_000_000);
+    }
+
+    #[test]
+    fn stageable_coverage_excludes_pts_holes_and_stops_at_large_gaps() {
+        for (gap, expected_payload) in [
+            (50_367_445, 249_319_724),
+            (100_000_000, 249_319_724),
+            (100_000_001, 149_319_724),
+        ] {
+            let start = 1_301_797_375_331;
+            let prefix_end = start + 149_319_724;
+            let next_start = prefix_end + gap;
+            let mut pending = PendingStartAudio::default();
+            pending.push(decoded_audio(149_319_724), start, prefix_end);
+            pending.push(
+                decoded_audio(100_000_000),
+                next_start,
+                next_start + 100_000_000,
+            );
+            let coverage = pending.stageable_coverage_between(start, u64::MAX).unwrap();
+            assert_eq!(coverage.payload_nsecs, expected_payload, "gap={gap}");
+            assert_eq!(
+                coverage.until_nsecs,
+                if gap <= 100_000_000 {
+                    next_start + 100_000_000
+                } else {
+                    prefix_end
+                }
+            );
+            assert_eq!(pending.forward_duration_from(start), Some(149_319_724));
+        }
+    }
+
+    #[test]
+    fn stageable_coverage_trims_overlaps_and_honors_the_flush_limit() {
+        let mut pending = PendingStartAudio::default();
+        pending.push(decoded_audio(100_000_000), 1_000_000_000, 1_100_000_000);
+        pending.push(decoded_audio(100_000_000), 1_080_000_000, 1_180_000_000);
+        pending.push(decoded_audio(100_000_000), 1_230_000_000, 1_330_000_000);
+        let coverage = pending
+            .stageable_coverage_between(1_050_000_000, 1_280_000_000)
+            .unwrap();
+        assert_eq!(coverage.until_nsecs, 1_180_000_000);
+        assert_eq!(coverage.payload_nsecs, 130_000_000);
+        assert!(
+            pending
+                .stageable_coverage_between(900_000_000, 950_000_000)
+                .is_none()
+        );
     }
 
     #[test]

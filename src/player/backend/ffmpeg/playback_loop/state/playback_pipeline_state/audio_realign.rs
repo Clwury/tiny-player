@@ -56,23 +56,12 @@ impl PlaybackPipelineState {
             && !output_state.externally_paused()
             && !control.has_pending_seek();
         let underrun_active = output.underrun_active();
-        if supervision_enabled
-            && underrun_active
-            && self
-                .output_scheduler
-                .audio_output_clock_stall_fallback_active()
-        {
-            // A bounded re-anchor can briefly expose an empty AO. Keep the
-            // video-clock escape hatch armed until the normal underrun refill
-            // path reports real callback progress.
-            return Ok(());
-        }
-        let eligible = supervision_enabled && !underrun_active;
         let Some(event) = self.output_scheduler.observe_audio_output_activity(
             now,
             activity,
-            eligible,
+            supervision_enabled,
             output_state.paused_by_seek_transition(),
+            underrun_active,
         ) else {
             return Ok(());
         };
@@ -281,9 +270,6 @@ impl PlaybackPipelineState {
             coverage_nsecs: 0,
             coverage_target_nsecs: duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
                 .saturating_sub(duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN)),
-            observations: 0,
-            first_observed_pts_nsecs: None,
-            last_observed_pts_nsecs: None,
             last_progress_at: started_at,
             warning_emitted: false,
             fallback_exhausted_logged: false,
@@ -383,31 +369,27 @@ impl PlaybackPipelineState {
         );
     }
 
-    pub(in super::super::super) fn finish_audio_realign_as_confirmed_media_gap(
+    pub(in super::super::super) fn finish_exhausted_audio_realign(
         &mut self,
         control: &FfmpegControl,
         session_id: PlaybackSessionId,
     ) -> Option<(AudioRealignTransaction, u64)> {
-        let mut transaction = self.audio_realign_transaction.take()?;
-        transaction.phase = AudioRealignPhase::MediaGap;
-        let resume_timeline_nsecs = self
-            .output_scheduler
-            .resume_after_confirmed_audio_media_gap(
-                transaction.target_timeline_nsecs,
-                transaction.request.far_ahead_audio_timeline_nsecs,
-                control,
-                session_id,
-            );
+        let mut transaction = self.audio_realign_transaction?;
+        transaction.phase = AudioRealignPhase::Exhausted;
+        self.audio_realign_transaction = Some(transaction);
+        let resume_timeline_nsecs = self.output_scheduler.resume_after_exhausted_audio_realign(
+            transaction.target_timeline_nsecs,
+            transaction.request.far_ahead_audio_timeline_nsecs,
+            control,
+            session_id,
+        );
         self.scheduler.reset(resume_timeline_nsecs);
         if let Some(audio_output) = self.audio_output.as_ref() {
             audio_output.reset_clock(resume_timeline_nsecs);
         }
         self.current_start_position_nsecs =
             self.current_start_position_nsecs.max(resume_timeline_nsecs);
-        self.discard_audio_retained_for_completed_realign(
-            session_id,
-            "audio_realign_confirmed_media_gap",
-        );
+        self.discard_audio_retained_for_completed_realign(session_id, "audio_realign_exhausted");
         Some((transaction, resume_timeline_nsecs))
     }
 
@@ -446,6 +428,9 @@ impl PlaybackPipelineState {
         let coverage = self.output_scheduler.audio_realign_coverage(
             transaction.target_timeline_nsecs,
             duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            self.audio_output
+                .as_ref()
+                .and_then(|output| output.snapshot().ok()),
         );
         if let Some(transaction) = self.audio_realign_transaction.as_mut() {
             let previous_phase = transaction.phase;

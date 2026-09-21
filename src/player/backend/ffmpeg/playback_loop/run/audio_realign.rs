@@ -16,42 +16,16 @@ pub(super) fn rebuffer_audio_realign_can_preserve_video_queue(
 }
 
 pub(super) fn audio_realign_execution_decision(
-    target_timeline_nsecs: u64,
-    pending_coverage: AudioRealignCoverage,
-    audio_output_range_nsecs: Option<(u64, u64)>,
+    coverage: AudioRealignCoverage,
     in_flight_packets: usize,
-) -> (AudioRealignExecutionDecision, Option<u64>) {
-    let audio_output_coverage_nsecs = audio_output_range_nsecs.and_then(
-        |(played_timeline_nsecs, buffered_until_timeline_nsecs)| {
-            let accepted_start_limit_nsecs = target_timeline_nsecs
-                .saturating_add(duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE));
-            (played_timeline_nsecs <= accepted_start_limit_nsecs
-                && buffered_until_timeline_nsecs > target_timeline_nsecs)
-                .then(|| {
-                    buffered_until_timeline_nsecs
-                        .saturating_sub(played_timeline_nsecs.max(target_timeline_nsecs))
-                })
-        },
-    );
-    if pending_coverage.ready
-        || audio_output_coverage_nsecs
-            .is_some_and(|coverage| coverage >= pending_coverage.protected_target_nsecs)
-    {
-        return (
-            AudioRealignExecutionDecision::CoverageSatisfied,
-            audio_output_coverage_nsecs,
-        );
+) -> AudioRealignExecutionDecision {
+    if coverage.ready {
+        return AudioRealignExecutionDecision::CoverageSatisfied;
     }
     if in_flight_packets > 0 {
-        return (
-            AudioRealignExecutionDecision::InputPending,
-            audio_output_coverage_nsecs,
-        );
+        return AudioRealignExecutionDecision::InputPending;
     }
-    (
-        AudioRealignExecutionDecision::Execute,
-        audio_output_coverage_nsecs,
-    )
+    AudioRealignExecutionDecision::Execute
 }
 
 pub(super) fn internal_recovery_seek_buffering_policy(
@@ -84,14 +58,15 @@ pub(super) fn service_rebuffer_audio_realign_seek_if_needed(
     else {
         return Ok(false);
     };
-    let pending_coverage = pipeline.output_scheduler.audio_realign_coverage(
-        request.target_timeline_nsecs,
-        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
-    );
     let audio_output_snapshot = pipeline
         .audio_output
         .as_ref()
         .and_then(|output| output.snapshot().ok());
+    let coverage = pipeline.output_scheduler.audio_realign_coverage(
+        request.target_timeline_nsecs,
+        duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+        audio_output_snapshot,
+    );
     let audio_decode_snapshot = pipeline
         .audio_decode_pipeline
         .as_ref()
@@ -100,29 +75,16 @@ pub(super) fn service_rebuffer_audio_realign_seek_if_needed(
         .audio_decode_pipeline
         .as_ref()
         .is_some_and(AudioDecodePipeline::has_deferred_output_frame);
-    let (arbitrated_execution_decision, audio_output_coverage_nsecs) =
-        audio_realign_execution_decision(
-            request.target_timeline_nsecs,
-            pending_coverage,
-            audio_output_snapshot.map(|snapshot| {
-                (
-                    snapshot.played_timeline_nsecs,
-                    snapshot.buffered_until_timeline_nsecs,
-                )
-            }),
-            if retained_far_ahead_frame {
-                0
-            } else {
-                audio_decode_snapshot
-                    .map(|snapshot| snapshot.in_flight_packets)
-                    .unwrap_or_default()
-            },
-        );
-    let execution_decision = if retained_far_ahead_frame {
-        AudioRealignExecutionDecision::Execute
-    } else {
-        arbitrated_execution_decision
-    };
+    let execution_decision = audio_realign_execution_decision(
+        coverage,
+        if retained_far_ahead_frame {
+            0
+        } else {
+            audio_decode_snapshot
+                .map(|snapshot| snapshot.in_flight_packets)
+                .unwrap_or_default()
+        },
+    );
     if execution_decision != AudioRealignExecutionDecision::Execute {
         if execution_decision == AudioRealignExecutionDecision::InputPending {
             pipeline
@@ -138,16 +100,16 @@ pub(super) fn service_rebuffer_audio_realign_seek_if_needed(
             target_timeline_nsecs = request.target_timeline_nsecs,
             reason = request.reason,
             arbitration_outcome = execution_decision.as_str(),
-            audio_accepted_start = ?pending_coverage.audio_accepted_start_timeline_nsecs,
-            start_gap_ms = ?pending_coverage
+            audio_accepted_start = ?coverage.audio_accepted_start_timeline_nsecs,
+            start_gap_ms = ?coverage
                 .start_gap_nsecs
                 .map(|gap| gap as f64 / 1_000_000.0),
-            contiguous_coverage_ms = ?pending_coverage
+            contiguous_coverage_ms = ?coverage
                 .contiguous_coverage_nsecs
                 .map(|coverage| coverage as f64 / 1_000_000.0),
-            audio_output_coverage_ms = ?audio_output_coverage_nsecs
-                .map(|coverage| coverage as f64 / 1_000_000.0),
-            coverage_target_ms = pending_coverage.protected_target_nsecs as f64 / 1_000_000.0,
+            audio_output_pending_ms = ?audio_output_snapshot
+                .map(|snapshot| snapshot.total_pending_nsecs as f64 / 1_000_000.0),
+            coverage_target_ms = coverage.protected_target_nsecs as f64 / 1_000_000.0,
             audio_decode_pending_input_packets = ?audio_decode_snapshot
                 .map(|snapshot| snapshot.pending_input_packets),
             audio_decode_in_flight_packets = ?audio_decode_snapshot
@@ -485,7 +447,7 @@ pub(super) fn service_audio_realign_recovery_watchdog_if_needed(
             transaction_phase = transaction.phase.as_str(),
             coverage_ms = transaction.coverage_nsecs as f64 / 1_000_000.0,
             coverage_target_ms = transaction.coverage_target_nsecs as f64 / 1_000_000.0,
-            "cleared FFmpeg audio realign transaction after contiguous playback resumed"
+            "cleared FFmpeg audio realign transaction after audio output resumed"
         );
         return Ok(false);
     }
@@ -597,7 +559,7 @@ pub(super) fn service_audio_realign_recovery_watchdog_if_needed(
                 "FFmpeg audio decoder recovery remained stalled after bounded fallback"
             );
             let Some((terminal_transaction, resume_timeline_nsecs)) =
-                pipeline.finish_audio_realign_as_confirmed_media_gap(control, session.id())
+                pipeline.finish_exhausted_audio_realign(control, session.id())
             else {
                 return Err(
                     "FFmpeg audio realign fallback exhausted without an active transaction"
@@ -616,7 +578,7 @@ pub(super) fn service_audio_realign_recovery_watchdog_if_needed(
                     terminal_transaction.started_at.elapsed().as_secs_f64() * 1000.0,
                 attempts = terminal_transaction.attempts,
                 transaction_phase = terminal_transaction.phase.as_str(),
-                "committed bounded FFmpeg audio realign as a confirmed media gap"
+                "exhausted bounded FFmpeg audio realign; continuing without another seek"
             );
             Ok(true)
         }
