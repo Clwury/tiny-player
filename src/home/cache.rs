@@ -218,7 +218,9 @@ mod tests {
             user_id: user_id.map(ToString::to_string),
             server_id: Some("remote-server-1".to_string()),
             server_name: Some("Home".to_string()),
+            icon_url: None,
             access_token: Some("token".to_string()),
+            needs_auth_refresh: false,
             item_counts: None,
             added_at_unix: 123,
         }

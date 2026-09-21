@@ -4,10 +4,10 @@ use gpui::{
     Animation, AnimationExt as _, App, AppContext as _, Context, ElementId, EntityId, FocusHandle,
     Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels,
     Point, Render, SharedString, StatefulInteractiveElement, Styled, Transformation, Window,
-    anchored, div, percentage, point, prelude::FluentBuilder, px, rgb, svg,
+    anchored, div, percentage, point, prelude::FluentBuilder, px, svg,
 };
 
-use crate::{emby::ItemCounts, server::CachedServer, theme};
+use crate::{emby::ItemCounts, server::CachedServer, theme, ui::server_icon::server_icon};
 
 use super::TinyApp;
 
@@ -40,6 +40,7 @@ pub(super) struct DraggedServer {
     pub(super) owner: EntityId,
     server_id: String,
     title: String,
+    icon_url: Option<String>,
     counts: Option<ItemCounts>,
     auto_start: bool,
 }
@@ -59,6 +60,7 @@ impl Render for DraggedServer {
             .opacity(0.9)
             .child(server_card_content(
                 self.title.clone(),
+                self.icon_url.as_deref(),
                 self.counts.clone(),
                 None,
                 self.auto_start,
@@ -141,6 +143,7 @@ where
         owner,
         server_id: server.id.clone(),
         title: title.clone(),
+        icon_url: server.icon_url.clone(),
         counts: counts.clone(),
         auto_start,
     };
@@ -188,6 +191,7 @@ where
         })
         .child(server_card_content(
             title,
+            server.icon_url.as_deref(),
             counts,
             loader_server_id,
             auto_start,
@@ -197,6 +201,7 @@ where
 
 fn server_card_content(
     title: String,
+    icon_url: Option<&str>,
     counts: Option<ItemCounts>,
     loading_server_id: Option<String>,
     auto_start: bool,
@@ -221,13 +226,7 @@ fn server_card_content(
                 .text_lg()
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme.foreground)
-                .child(
-                    svg()
-                        .path("icons/emby.svg")
-                        .size(px(32.0))
-                        .flex_none()
-                        .text_color(Hsla::from(rgb(0x53b34c))),
-                )
+                .child(server_icon(icon_url, 32.0))
                 .child(div().flex_1().min_w_0().text_ellipsis().child(title)),
         )
         .child(

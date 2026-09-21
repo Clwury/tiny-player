@@ -90,7 +90,7 @@ impl TinyApp {
         }
     }
 
-    fn save_cache(&self) -> anyhow::Result<()> {
+    pub(super) fn save_cache(&self) -> anyhow::Result<()> {
         #[cfg(test)]
         if let Some(path) = &self.cache_save_path {
             return storage::save_to(&self.cache, path);

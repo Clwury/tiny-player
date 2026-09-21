@@ -3,6 +3,7 @@ pub(crate) mod editor;
 pub(crate) mod notification;
 pub(crate) mod playback_settings_dialog;
 pub(crate) mod scrollbar;
+pub(crate) mod server_icon;
 pub(crate) mod settings_controls;
 pub(crate) mod settings_dialog;
 pub(crate) mod text_input;

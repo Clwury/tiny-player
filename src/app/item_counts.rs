@@ -11,6 +11,13 @@ use crate::{
 use super::TinyApp;
 
 impl TinyApp {
+    pub(super) fn refresh_saved_server_counts(&mut self, server_id: &str, cx: &mut Context<Self>) {
+        self.item_counts_loading.remove(server_id);
+        self.item_counts_failed.remove(server_id);
+        self.item_counts_refreshed.remove(server_id);
+        self.load_item_counts_for_server_id(server_id, cx);
+    }
+
     pub(super) fn load_item_counts_for_server_id(
         &mut self,
         server_id: &str,
@@ -31,7 +38,7 @@ impl TinyApp {
         else {
             return;
         };
-        if !has_cached_auth(&server) {
+        if !server.can_reuse_auth() {
             return;
         }
 
@@ -44,12 +51,13 @@ impl TinyApp {
         let server_id = server.id.clone();
         self.item_counts_loading.insert(server_id.clone());
 
-        let task = cx.background_spawn(async move { client.item_counts(&server) });
+        let request_server = server.clone();
+        let task = cx.background_spawn(async move { client.item_counts(&request_server) });
 
         cx.spawn(async move |app, cx| {
             let result = task.await;
             app.update(cx, |app, cx| {
-                app.finish_item_counts(server_id, result, cx);
+                app.finish_item_counts(server, result, cx);
             })
             .ok();
         })
@@ -58,10 +66,23 @@ impl TinyApp {
 
     fn finish_item_counts(
         &mut self,
-        server_id: String,
+        server: CachedServer,
         result: Result<ItemCounts>,
         cx: &mut Context<Self>,
     ) {
+        // Ignore requests started before an edit changed the endpoint or login.
+        if !self.servers.iter().any(|current| {
+            current.id == server.id
+                && current.can_reuse_auth()
+                && current.endpoint == server.endpoint
+                && current.username == server.username
+                && current.password == server.password
+                && current.user_id == server.user_id
+                && current.access_token == server.access_token
+        }) {
+            return;
+        }
+        let server_id = server.id;
         self.item_counts_loading.remove(&server_id);
 
         match result {
@@ -111,15 +132,15 @@ impl TinyApp {
     }
 
     pub(super) fn retain_item_count_state(&mut self) {
+        self.item_counts
+            .retain(|server_id, _| self.servers.iter().any(|server| &server.id == server_id));
         let authenticated_ids = self
             .servers
             .iter()
-            .filter(|server| has_cached_auth(server))
+            .filter(|server| server.can_reuse_auth())
             .map(|server| server.id.clone())
             .collect::<HashSet<_>>();
 
-        self.item_counts
-            .retain(|server_id, _| authenticated_ids.contains(server_id));
         self.item_counts_loading
             .retain(|server_id| authenticated_ids.contains(server_id));
         self.item_counts_failed
@@ -127,17 +148,6 @@ impl TinyApp {
         self.item_counts_refreshed
             .retain(|server_id| authenticated_ids.contains(server_id));
     }
-}
-
-fn has_cached_auth(server: &CachedServer) -> bool {
-    server
-        .user_id
-        .as_deref()
-        .is_some_and(|user_id| !user_id.is_empty())
-        && server
-            .access_token
-            .as_deref()
-            .is_some_and(|access_token| !access_token.is_empty())
 }
 
 pub(super) fn cached_item_counts_by_server(
@@ -152,4 +162,92 @@ pub(super) fn cached_item_counts_by_server(
                 .map(|counts| (server.id.clone(), ItemCounts::from(counts)))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{storage::ServerCache, theme};
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn stale_count_responses_cannot_replace_counts_after_an_edit(cx: &mut TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        cx.update(theme::init);
+        let server: CachedServer = serde_json::from_value(serde_json::json!({
+            "id": "server", "endpoint": {"protocol": "Https", "address": "example.com", "port": 443, "path": ""},
+            "username": "new-user", "password": "", "user_id": "new-user", "access_token": "new-token", "added_at_unix": 0
+        })).unwrap();
+        let app = cx.new(|cx| {
+            let mut cache = ServerCache::empty();
+            cache.servers.push(server.clone());
+            let mut app = TinyApp::new(cache, None, cx);
+            app.cache_save_path = Some(temp.path().join("servers.json"));
+            app
+        });
+        app.update(cx, |app, cx| {
+            app.item_counts_loading.insert(server.id.clone());
+            let mut previous = server.clone();
+            previous.access_token = Some("old-token".into());
+            app.finish_item_counts(
+                previous,
+                Ok(ItemCounts {
+                    movie_count: 999,
+                    series_count: 999,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            assert!(app.item_counts_loading.contains(&server.id));
+            assert!(!app.item_counts.contains_key(&server.id));
+            assert!(app.cache.servers[0].item_counts.is_none());
+
+            app.finish_item_counts(
+                server.clone(),
+                Ok(ItemCounts {
+                    movie_count: 12,
+                    series_count: 34,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            assert!(!app.item_counts_loading.contains(&server.id));
+            assert_eq!(app.item_counts[&server.id].movie_count, 12);
+            assert_eq!(
+                app.cache.servers[0]
+                    .item_counts
+                    .as_ref()
+                    .unwrap()
+                    .series_count,
+                34
+            );
+
+            // Saving an edit keeps the old display, even when credentials
+            // are unchanged, but prevents using that login for new requests.
+            app.servers[0].needs_auth_refresh = true;
+            app.cache.servers[0].needs_auth_refresh = true;
+            app.retain_item_count_state();
+            app.load_item_counts_for_server_id(&server.id, cx);
+            assert!(!app.item_counts_loading.contains(&server.id));
+            assert!(!app.item_counts_refreshed.contains(&server.id));
+            app.finish_item_counts(
+                server.clone(),
+                Ok(ItemCounts {
+                    movie_count: 999,
+                    series_count: 999,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            assert_eq!(app.item_counts[&server.id].movie_count, 12);
+            assert_eq!(
+                app.cache.servers[0]
+                    .item_counts
+                    .as_ref()
+                    .unwrap()
+                    .series_count,
+                34
+            );
+        });
+    }
 }

@@ -374,11 +374,7 @@ impl AuthSession {
         self.user
             .as_ref()
             .and_then(|user| user.server_name.clone())
-            .or_else(|| {
-                self.session_info
-                    .as_ref()
-                    .and_then(|session| session.id.clone())
-            })
+            .filter(|name| !name.trim().is_empty())
     }
 }
 

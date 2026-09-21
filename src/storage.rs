@@ -85,7 +85,7 @@ pub fn save(cache: &ServerCache) -> Result<()> {
     save_to(cache, &cache_path()?)
 }
 
-pub fn upsert_server(cache: &mut ServerCache, mut server: CachedServer) {
+pub fn upsert_server(cache: &mut ServerCache, mut server: CachedServer) -> String {
     if let Some(existing) = cache
         .servers
         .iter_mut()
@@ -93,8 +93,11 @@ pub fn upsert_server(cache: &mut ServerCache, mut server: CachedServer) {
     {
         server.id = existing.id.clone();
         *existing = server;
+        existing.id.clone()
     } else {
+        let id = server.id.clone();
         cache.servers.push(server);
+        id
     }
 }
 
@@ -221,7 +224,9 @@ mod tests {
             user_id: Some("user-1".to_string()),
             server_id: Some("server-1".to_string()),
             server_name: Some("Home".to_string()),
+            icon_url: None,
             access_token: Some(token.to_string()),
+            needs_auth_refresh: false,
             item_counts: None,
             added_at_unix: 123,
         }

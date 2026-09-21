@@ -1,13 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
-use gpui::{Context, Entity, Window};
+use anyhow::{Result, anyhow, ensure};
+use gpui::{Context, Entity, Task, Window};
 use uuid::Uuid;
 
 use crate::{
-    emby::{EmbyClient, PublicSystemInfo},
+    emby::EmbyClient,
     server::{AddServerSubmission, CachedServer},
-    storage::{self, ServerCache},
+    storage,
     ui::add_server_dialog::AddServerDialogState,
 };
 
@@ -105,115 +105,169 @@ impl TinyApp {
         cx.notify();
     }
 
-    pub(super) fn finish_add_server(
+    pub(super) fn finish_save_server(
         &mut self,
         dialog: Entity<AddServerDialogState>,
-        result: Result<(ServerCache, CachedServer, AddServerSubmission)>,
+        result: Result<CachedServer>,
         cx: &mut Context<Self>,
     ) {
+        let editing = dialog.read(cx).edit_server_id().is_some();
+        let result = result.and_then(|server| {
+            let server = if editing {
+                let current = self
+                    .cache
+                    .servers
+                    .iter()
+                    .find(|current| current.id == server.id)
+                    .ok_or_else(|| anyhow!("服务器不存在"))?;
+                // Only settings are edited; keep even cache updates received
+                // while the dialog was open or its save was pending.
+                CachedServer {
+                    endpoint: server.endpoint,
+                    username: server.username,
+                    password: server.password,
+                    needs_auth_refresh: true,
+                    ..current.clone()
+                }
+            } else {
+                server
+            };
+            self.save_server(server, editing)
+        });
         match result {
-            Ok((cache, _, _)) => {
-                self.servers = cache.servers.clone();
-                self.cache = cache;
+            Ok(_) => {
+                self.servers = self.cache.servers.clone();
                 self.retain_item_count_state();
                 self.clear_app_notifications();
+                self.clear_server_notifications();
                 self.add_server_dialog = None;
+                self.selecting_server_id = None;
+                self.select_server_task = Task::ready(());
                 self.page = Page::Servers;
             }
             Err(error) => {
                 dialog.update(cx, |dialog, cx| {
                     dialog.set_submitting(false, cx);
-                    dialog.push_error_notification(format!("添加服务器失败：{error}"), cx);
+                    let action = if editing { "保存" } else { "添加" };
+                    dialog.push_error_notification(format!("{action}服务器失败：{error}"), cx);
                 });
             }
         }
-
         cx.notify();
     }
 
-    pub(super) fn finish_edit_server(
-        &mut self,
-        dialog: Entity<AddServerDialogState>,
-        result: Result<(ServerCache, CachedServer)>,
-        cx: &mut Context<Self>,
-    ) {
-        match result {
-            Ok((cache, _)) => {
-                self.servers = cache.servers.clone();
-                self.cache = cache;
-                self.retain_item_count_state();
-                self.clear_app_notifications();
-                self.add_server_dialog = None;
-            }
-            Err(error) => {
-                dialog.update(cx, |dialog, cx| {
-                    dialog.set_submitting(false, cx);
-                    dialog.push_error_notification(format!("保存服务器失败：{error}"), cx);
-                });
-            }
+    pub(super) fn save_server(&mut self, server: CachedServer, editing: bool) -> Result<String> {
+        // Apply network results to the latest cache so concurrent count refreshes
+        // or application settings changes are preserved.
+        let mut cache = self.cache.clone();
+        let server_id = if editing {
+            let id = server.id.clone();
+            ensure!(
+                storage::update_server_by_id(&mut cache, server),
+                "服务器不存在"
+            );
+            id
+        } else {
+            storage::upsert_server(&mut cache, server)
+        };
+        let previous = std::mem::replace(&mut self.cache, cache);
+        if let Err(error) = self.save_cache() {
+            self.cache = previous;
+            return Err(error);
         }
-
-        cx.notify();
+        Ok(server_id)
     }
 }
 
-pub(super) fn fetch_public_info_and_cache(
-    client: EmbyClient,
-    mut cache: ServerCache,
-    submission: AddServerSubmission,
-) -> Result<(ServerCache, CachedServer, AddServerSubmission)> {
-    let info = client.public_system_info(&submission)?;
-    let server = public_info_to_cached_server(
-        Uuid::new_v4().to_string(),
-        &submission,
-        info,
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-    );
-    storage::upsert_server(&mut cache, server.clone());
-    storage::save(&cache)?;
-
-    Ok((cache, server, submission))
-}
-
-pub(super) fn fetch_public_info_and_update_cache(
-    client: EmbyClient,
-    mut cache: ServerCache,
-    server_id: String,
-    submission: AddServerSubmission,
-) -> Result<(ServerCache, CachedServer)> {
-    let existing = cache
-        .servers
-        .iter()
-        .find(|server| server.id == server_id)
-        .cloned()
-        .ok_or_else(|| anyhow!("服务器不存在"))?;
-    let info = client.public_system_info(&submission)?;
-    let server =
-        public_info_to_cached_server(existing.id, &submission, info, existing.added_at_unix);
-    if !storage::update_server_by_id(&mut cache, server.clone()) {
-        return Err(anyhow!("服务器不存在"));
-    }
-    storage::save(&cache)?;
-
-    Ok((cache, server))
-}
-
-fn public_info_to_cached_server(
-    id: String,
+pub(super) fn prepare_server(
+    client: &EmbyClient,
     submission: &AddServerSubmission,
-    info: PublicSystemInfo,
-    added_at_unix: u64,
-) -> CachedServer {
-    CachedServer {
-        id,
+    existing: Option<&CachedServer>,
+) -> Result<CachedServer> {
+    if let Some(existing) = existing {
+        return Ok(CachedServer {
+            endpoint: submission.endpoint.clone(),
+            username: submission.username.clone(),
+            password: submission.password.clone(),
+            needs_auth_refresh: true,
+            ..existing.clone()
+        });
+    }
+    let info = client.public_system_info(submission)?;
+    let icon_url = info
+        .server_name
+        .as_deref()
+        .and_then(crate::server::icon::match_icon_url)
+        .map(str::to_owned);
+    Ok(CachedServer {
+        id: Uuid::new_v4().to_string(),
         endpoint: submission.endpoint.clone(),
         username: submission.username.clone(),
         password: submission.password.clone(),
         user_id: None,
         server_id: info.id,
         server_name: info.server_name,
+        icon_url,
         access_token: None,
+        needs_auth_refresh: false,
         item_counts: None,
-        added_at_unix,
-    }
+        added_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    })
 }
+
+pub(super) fn authenticate_server(
+    client: &EmbyClient,
+    server: &CachedServer,
+) -> Result<CachedServer> {
+    let submission = AddServerSubmission {
+        endpoint: server.endpoint.clone(),
+        username: server.username.clone(),
+        password: server.password.clone(),
+    };
+    let session = client.authenticate_by_name(&submission)?;
+    let user_id = session
+        .user_id()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| anyhow!("Emby 认证响应缺少用户 ID"))?;
+    ensure!(
+        !session.access_token.trim().is_empty(),
+        "Emby 认证响应缺少访问令牌"
+    );
+
+    // Public metadata fetched on add is reusable. After edits it may describe
+    // a different endpoint, so refresh it on entry when authentication omits it.
+    let server_name = session.server_name().or_else(|| {
+        server
+            .server_name
+            .clone()
+            .filter(|name| !server.needs_auth_refresh && !name.trim().is_empty())
+    });
+    let info = if server_name.is_none() {
+        client.public_system_info(&submission).ok()
+    } else {
+        None
+    };
+    let server_name = server_name
+        .or_else(|| info.as_ref().and_then(|info| info.server_name.clone()))
+        .or_else(|| server.server_name.clone());
+    let icon_url = server_name
+        .as_deref()
+        .and_then(crate::server::icon::match_icon_url)
+        .map(str::to_owned);
+
+    Ok(CachedServer {
+        user_id: Some(user_id),
+        server_id: session
+            .server_id()
+            .or_else(|| info.and_then(|info| info.id))
+            .or_else(|| server.server_id.clone()),
+        server_name,
+        icon_url,
+        access_token: Some(session.access_token),
+        needs_auth_refresh: false,
+        ..server.clone()
+    })
+}
+
+#[cfg(test)]
+mod tests;

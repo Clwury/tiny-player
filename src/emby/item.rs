@@ -20,7 +20,8 @@ impl EmbyClient {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+// Servers may omit counts for media types they do not expose.
+#[serde(default, rename_all = "PascalCase")]
 pub struct ItemCounts {
     pub movie_count: u32,
     pub series_count: u32,
@@ -94,5 +95,33 @@ mod tests {
         assert_eq!(counts.movie_count, 16417);
         assert_eq!(counts.series_count, 16395);
         assert_eq!(counts.episode_count, 245139);
+    }
+
+    #[test]
+    fn parses_item_counts_when_server_omits_media_types() {
+        let json = r#"
+        {
+            "AlbumCount": 0,
+            "ArtistCount": 0,
+            "EpisodeCount": 414623,
+            "MovieCount": 15296,
+            "ProgramCount": 0,
+            "SeriesCount": 13625,
+            "SongCount": 0,
+            "TrailerCount": 0
+        }
+        "#;
+
+        let counts: ItemCounts = serde_json::from_str(json).unwrap();
+
+        assert_eq!(counts.movie_count, 15296);
+        assert_eq!(counts.series_count, 13625);
+        assert_eq!(counts.episode_count, 414623);
+        assert_eq!(counts.game_count, 0);
+        assert_eq!(counts.game_system_count, 0);
+        assert_eq!(counts.music_video_count, 0);
+        assert_eq!(counts.box_set_count, 0);
+        assert_eq!(counts.book_count, 0);
+        assert_eq!(counts.item_count, 0);
     }
 }

@@ -1,9 +1,9 @@
 use gpui::{
     App, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, rgb, svg,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, svg,
 };
 
-use crate::{app_metadata::APP_NAME, server::CachedServer, theme};
+use crate::{app_metadata::APP_NAME, server::CachedServer, theme, ui::server_icon::server_icon};
 
 use super::{HomePage, carousel::HOME_SIDEBAR_WIDTH_PX, navigation::HomeRoot};
 
@@ -222,13 +222,7 @@ fn server_list_item(
             })
         })
         .cursor_pointer()
-        .child(
-            svg()
-                .path("icons/emby.svg")
-                .size(px(18.0))
-                .flex_none()
-                .text_color(rgb(0x53b34c)),
-        )
+        .child(server_icon(server.icon_url.as_deref(), 18.0))
         .child(
             div()
                 .min_w_0()

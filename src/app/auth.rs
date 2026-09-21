@@ -1,20 +1,19 @@
 use anyhow::Result;
-use gpui::{AppContext as _, Context, Entity, Window};
+use gpui::{AppContext as _, Context, Entity, Task, Window};
 
 use crate::{
-    emby::AuthSession,
     home::{HomeEvent, HomePage},
     player::{PlaybackEvent, PlaybackRequest},
-    server::{AddServerSubmission, CachedServer},
-    storage,
+    server::CachedServer,
 };
 
-use super::{Page, TinyApp};
+use super::{Page, TinyApp, server_cache::authenticate_server};
 
 impl TinyApp {
     pub(super) fn show_servers_page_from_home(&mut self, cx: &mut Context<Self>) {
         self.open_server_menu = None;
         self.selecting_server_id = None;
+        self.select_server_task = Task::ready(());
         self.page = Page::Servers;
         cx.notify();
     }
@@ -29,139 +28,88 @@ impl TinyApp {
     }
 
     pub(super) fn begin_select_server(&mut self, server: &CachedServer, cx: &mut Context<Self>) {
+        // Cards and sidebar items can hold snapshots from before a server edit.
+        let Some(server) = self
+            .servers
+            .iter()
+            .find(|current| current.id == server.id)
+            .cloned()
+        else {
+            return;
+        };
+        if self.selecting_server_id.as_deref() == Some(&server.id) {
+            return;
+        }
         self.open_server_menu = None;
         self.clear_app_notifications();
         self.clear_server_notifications();
 
         let server_id = server.id.clone();
-        if has_cached_auth(server) {
+        if server.can_reuse_auth() {
             self.selecting_server_id = None;
+            self.select_server_task = Task::ready(());
             self.open_home_for_server(server.clone(), cx);
             self.load_item_counts_for_server_id(&server_id, cx);
             cx.notify();
             return;
         }
 
-        if self.is_selecting_server(&server_id) {
-            cx.notify();
-            return;
-        }
-
         let Some(client) = self.emby_client.clone() else {
-            self.selecting_server_id = None;
             self.push_server_error_notification("Emby HTTP 客户端不可用", cx);
             cx.notify();
             return;
         };
-
-        self.selecting_server_id = Some(server_id.clone());
+        self.selecting_server_id = Some(server_id);
         self.page = Page::Servers;
         cx.notify();
 
-        let submission = AddServerSubmission {
-            endpoint: server.endpoint.clone(),
-            username: server.username.clone(),
-            password: server.password.clone(),
-        };
-        let task = cx.background_spawn(async move { client.authenticate_by_name(&submission) });
-
-        cx.spawn(async move |app, cx| {
+        let request = server.clone();
+        let task = cx.background_spawn(async move { authenticate_server(&client, &request) });
+        self.select_server_task = cx.spawn(async move |app, cx| {
             let result = task.await;
-            app.update(cx, |app, cx| {
-                app.finish_select_server(server_id, result, cx)
-            })
-            .ok();
-        })
-        .detach();
+            app.update(cx, |app, cx| app.finish_select_server(server, result, cx))
+                .ok();
+        });
     }
 
     fn finish_select_server(
         &mut self,
-        server_id: String,
-        result: Result<AuthSession>,
+        requested: CachedServer,
+        result: Result<CachedServer>,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_selecting_server(&server_id) {
+        if self.selecting_server_id.as_deref() != Some(&requested.id) {
+            return;
+        }
+        self.selecting_server_id = None;
+        // An edit or deletion while the request was running invalidates its result.
+        if !self.servers.iter().any(|current| {
+            current.id == requested.id
+                && current.endpoint == requested.endpoint
+                && current.username == requested.username
+                && current.password == requested.password
+                && current.needs_auth_refresh == requested.needs_auth_refresh
+        }) {
+            cx.notify();
             return;
         }
 
+        let result = result.and_then(|server| {
+            self.save_server(server.clone(), true)?;
+            Ok(server)
+        });
         match result {
-            Ok(session) => {
-                self.finish_authenticated_server(server_id.clone(), session, cx);
+            Ok(server) => {
+                self.servers = self.cache.servers.clone();
+                self.refresh_saved_server_counts(&server.id, cx);
+                self.open_home_for_server(server, cx);
             }
             Err(error) => {
-                self.selecting_server_id = None;
                 self.push_server_error_notification(format!("登录服务器失败：{error}"), cx);
                 self.page = Page::Servers;
             }
         }
-
         cx.notify();
-    }
-
-    fn finish_authenticated_server(
-        &mut self,
-        server_id: String,
-        session: AuthSession,
-        cx: &mut Context<Self>,
-    ) {
-        let user_id = session.user_id();
-        let access_token = session.access_token;
-        let mut updated_cache = false;
-        let mut home_server = None;
-
-        if let Some(server) = self
-            .servers
-            .iter_mut()
-            .find(|server| server.id == server_id)
-        {
-            server.user_id = user_id.clone();
-            server.access_token = Some(access_token.clone());
-            home_server = Some(server.clone());
-        }
-
-        let Some(home_server) = home_server else {
-            self.selecting_server_id = None;
-            self.push_server_error_notification("登录服务器失败：服务器不存在", cx);
-            self.page = Page::Servers;
-            return;
-        };
-
-        if let Some(server) = self
-            .cache
-            .servers
-            .iter_mut()
-            .find(|server| server.id == server_id)
-        {
-            server.user_id = user_id;
-            server.access_token = Some(access_token);
-            updated_cache = true;
-        }
-
-        if !updated_cache {
-            self.selecting_server_id = None;
-            self.push_server_error_notification("保存登录信息失败：服务器不存在", cx);
-            self.page = Page::Servers;
-            return;
-        }
-
-        self.open_home_for_server(home_server, cx);
-
-        self.item_counts_loading.remove(&server_id);
-        self.item_counts_failed.remove(&server_id);
-        self.item_counts_refreshed.remove(&server_id);
-
-        match storage::save(&self.cache) {
-            Ok(()) => {
-                self.clear_app_notifications();
-                self.clear_server_notifications();
-                self.item_counts_failed.remove(&server_id);
-                self.load_item_counts_for_server_id(&server_id, cx);
-            }
-            Err(error) => {
-                self.push_app_error_notification(format!("保存登录信息失败：{error}"), cx);
-            }
-        }
     }
 
     fn open_home_for_server(&mut self, server: CachedServer, cx: &mut Context<Self>) {
@@ -282,21 +230,6 @@ impl TinyApp {
         });
         self.open_playback_page(return_to, request, cx);
     }
-
-    fn is_selecting_server(&self, server_id: &str) -> bool {
-        self.selecting_server_id.as_deref() == Some(server_id)
-    }
-}
-
-fn has_cached_auth(server: &CachedServer) -> bool {
-    server
-        .user_id
-        .as_deref()
-        .is_some_and(|user_id| !user_id.is_empty())
-        && server
-            .access_token
-            .as_deref()
-            .is_some_and(|access_token| !access_token.is_empty())
 }
 
 #[cfg(test)]
@@ -306,7 +239,44 @@ mod tests {
     use gpui::{Modifiers, TestAppContext, px, size};
 
     #[gpui::test]
-    fn sidebar_switches_servers_and_uses_the_existing_login_flow(cx: &mut TestAppContext) {
+    fn late_authentication_cannot_overwrite_edited_credentials(cx: &mut TestAppContext) {
+        cx.update(theme::init);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let requested: CachedServer = serde_json::from_value(serde_json::json!({
+            "id": "server", "endpoint": {"protocol": "Https", "address": "example.com", "port": 443, "path": ""},
+            "username": "user", "password": "old-password", "added_at_unix": 0
+        })).unwrap();
+        let edited = CachedServer {
+            password: "edited-password".into(),
+            ..requested.clone()
+        };
+        let app = cx.new(|cx| {
+            let mut cache = ServerCache::empty();
+            cache.servers.push(edited);
+            let mut app = TinyApp::new(cache, None, cx);
+            app.cache_save_path = Some(path.clone());
+            app
+        });
+        app.update(cx, |app, cx| {
+            app.selecting_server_id = Some(requested.id.clone());
+            let response = CachedServer {
+                user_id: Some("user-id".into()),
+                access_token: Some("old-login-token".into()),
+                ..requested.clone()
+            };
+            app.finish_select_server(requested, Ok(response), cx);
+            assert!(matches!(app.page, Page::Servers));
+            assert!(app.selecting_server_id.is_none());
+            assert_eq!(app.servers[0].password, "edited-password");
+            assert!(app.servers[0].access_token.is_none());
+            assert!(app.cache.servers[0].access_token.is_none());
+        });
+        assert!(!path.exists(), "a stale response must not write the cache");
+    }
+
+    #[gpui::test]
+    fn sidebar_switches_with_cached_auth_and_authenticates_without_it(cx: &mut TestAppContext) {
         cx.update(theme::init);
         let (app, cx) = cx.add_window_view(|_, cx| {
             let mut cache = ServerCache::empty();

@@ -283,7 +283,9 @@ mod tests {
             user_id: Some("user-1".to_string()),
             server_id: Some("server-1".to_string()),
             server_name: Some("Home".to_string()),
+            icon_url: None,
             access_token: Some("token".to_string()),
+            needs_auth_refresh: false,
             item_counts: None,
             added_at_unix: 123,
         }

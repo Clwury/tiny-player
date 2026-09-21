@@ -2,11 +2,7 @@ use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, Pixels, Point, 
 
 use crate::{server::CachedServer, ui::add_server_dialog::AddServerDialogState};
 
-use super::{
-    TinyApp,
-    server_cache::{fetch_public_info_and_cache, fetch_public_info_and_update_cache},
-    server_card::ServerContextMenu,
-};
+use super::{TinyApp, server_cache::prepare_server, server_card::ServerContextMenu};
 
 impl TinyApp {
     pub(super) fn open_add_server_dialog(
@@ -78,30 +74,29 @@ impl TinyApp {
             });
             return;
         };
-        let cache = self.cache.clone();
-        if let Some(server_id) = dialog.read(cx).edit_server_id() {
-            let task = cx.background_spawn(async move {
-                fetch_public_info_and_update_cache(client, cache, server_id, submission)
-            });
-
-            cx.spawn(async move |app, cx| {
-                let result = task.await;
-                app.update(cx, |app, cx| app.finish_edit_server(dialog, result, cx))
-                    .ok();
-            })
-            .detach();
+        let existing = if let Some(server_id) = dialog.read(cx).edit_server_id() {
+            let Some(server) = self.servers.iter().find(|server| server.id == server_id) else {
+                dialog.update(cx, |dialog, cx| {
+                    dialog.set_submitting(false, cx);
+                    dialog.push_error_notification("服务器不存在", cx);
+                });
+                return;
+            };
+            Some(server.clone())
         } else {
-            let task = cx.background_spawn(async move {
-                fetch_public_info_and_cache(client, cache, submission)
-            });
+            None
+        };
+        let task =
+            cx.background_spawn(
+                async move { prepare_server(&client, &submission, existing.as_ref()) },
+            );
 
-            cx.spawn(async move |app, cx| {
-                let result = task.await;
-                app.update(cx, |app, cx| app.finish_add_server(dialog, result, cx))
-                    .ok();
-            })
-            .detach();
-        }
+        cx.spawn(async move |app, cx| {
+            let result = task.await;
+            app.update(cx, |app, cx| app.finish_save_server(dialog, result, cx))
+                .ok();
+        })
+        .detach();
     }
 
     pub(super) fn open_server_context_menu(

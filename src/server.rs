@@ -4,6 +4,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+pub(crate) mod icon;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
     Http,
@@ -185,10 +187,29 @@ pub struct CachedServer {
     pub user_id: Option<String>,
     pub server_id: Option<String>,
     pub server_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
     pub access_token: Option<String>,
+    /// Keep cached display data after edits, but refresh authentication before reuse.
+    #[serde(default)]
+    pub needs_auth_refresh: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_counts: Option<CachedItemCounts>,
     pub added_at_unix: u64,
+}
+
+impl CachedServer {
+    pub(crate) fn can_reuse_auth(&self) -> bool {
+        !self.needs_auth_refresh
+            && self
+                .user_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
+            && self
+                .access_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
