@@ -645,6 +645,16 @@ impl DemuxPacketCacheState {
         maximum_prune_count: usize,
         preserve_last_boundary: bool,
     ) -> usize {
+        if matches!(
+            self.stream_kinds.get(&stream_index),
+            Some(StreamCacheKind::Subtitle)
+        ) {
+            // Like mpv's prune_old_packets(), prune one sparse seek boundary
+            // at a time and then compare stream timestamps again. A subtitle
+            // reader can be far ahead of playback after predecode; batching
+            // its consumed packets would discard still-seekable future cues.
+            return prune_count;
+        }
         if self.stream_requires_recovery_point(stream_index) {
             // A recovery block is atomic for seekability, like mpv's keyframe run.
             return prune_count;
@@ -783,7 +793,17 @@ impl DemuxPacketCacheState {
             boundary.pruned_packet_count = boundary
                 .pruned_packet_count
                 .saturating_add(u64::try_from(removed.len()).unwrap_or(u64::MAX));
-            let last_pruned_nsecs = old_seek_start_nsecs.or(pruned_until_nsecs);
+            let last_pruned_nsecs = if matches!(
+                self.stream_kinds.get(&stream_index),
+                Some(StreamCacheKind::Subtitle)
+            ) {
+                // A sparse range must exclude every removed cue, as if mpv
+                // had updated last_pruned after each individual boundary.
+                // Recording only the old start hides holes after a bulk trim.
+                pruned_until_nsecs.or(old_seek_start_nsecs)
+            } else {
+                old_seek_start_nsecs.or(pruned_until_nsecs)
+            };
             if let Some(last_pruned_nsecs) = last_pruned_nsecs {
                 boundary.last_pruned_nsecs = Some(
                     boundary

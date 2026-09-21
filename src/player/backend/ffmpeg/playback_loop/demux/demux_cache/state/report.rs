@@ -688,6 +688,10 @@ impl DemuxPacketCacheState {
             let boundary = range.stream_boundary(*stream_index);
             if let Some(last_pruned_nsecs) = boundary.last_pruned_nsecs {
                 seek_start = seek_start.max(last_pruned_nsecs.saturating_add(100_000_000));
+                // A/V may still include BOF after sparse packets were pruned.
+                // Do not let the BOF seek exception bypass this new lower bound
+                // and silently skip missing subtitles instead of seeking input.
+                is_bof = false;
             }
         }
 

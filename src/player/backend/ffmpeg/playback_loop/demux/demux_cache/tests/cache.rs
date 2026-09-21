@@ -28,6 +28,8 @@ mod state;
 mod storage_worker;
 #[path = "cache/stream_alignment.rs"]
 mod stream_alignment;
+#[path = "cache/subtitle_seek.rs"]
+mod subtitle_seek;
 #[path = "cache/timeline.rs"]
 mod timeline;
 #[path = "cache/trim.rs"]
