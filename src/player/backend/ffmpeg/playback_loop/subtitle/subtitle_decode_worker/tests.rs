@@ -57,6 +57,55 @@ fn completed_packet(generation: u64, text: &str) -> SubtitleDecodeResult {
 }
 
 #[test]
+fn subtitle_off_disconnects_full_result_and_command_queues_before_join() {
+    let (mut worker, result_tx, command_rx) = worker_with_channels();
+    for _ in 0..SUBTITLE_DECODE_COMMAND_QUEUE_CAPACITY {
+        worker
+            .command_tx
+            .try_send(SubtitleDecodeCommand::FlushBuffers { generation: 1 })
+            .unwrap();
+    }
+    for _ in 0..SUBTITLE_DECODE_RESULT_QUEUE_CAPACITY {
+        result_tx
+            .try_send(completed_packet(1, "queued cue"))
+            .unwrap();
+    }
+    worker.handle = Some(std::thread::spawn(move || {
+        assert!(result_tx.send(completed_packet(1, "blocked cue")).is_err());
+        drop(command_rx);
+    }));
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        drop(worker);
+        done_tx.send(()).unwrap();
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("subtitle shutdown must unblock both queues");
+}
+
+#[test]
+fn subtitle_off_discards_queued_worker_output_and_stops_prefetch() {
+    let (worker, result_tx, _commands) = worker_with_channels();
+    let mut pipeline = SubtitlePipeline::with_worker_for_test(worker);
+    let session = PlaybackSessionId(1);
+    let (event_tx, event_rx) = mpsc::channel();
+    result_tx.send(completed_packet(1, "stale cue")).unwrap();
+    pipeline.disable(session, &event_tx);
+    assert_eq!(pipeline.stream_index(), None);
+    assert!(pipeline.snapshot().is_none());
+    assert!(!pipeline.needs_prefetch());
+    pipeline.update_overlay(212_000_000_000, session, &event_tx);
+    let events = event_rx.try_iter().collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0].kind,
+        BackendEventKind::SubtitleChanged(None)
+    ));
+    assert!(result_tx.send(completed_packet(1, "late cue")).is_err());
+}
+
+#[test]
 fn subtitle_output_drain_recovers_full_queue_after_seek_and_emits_new_cues() {
     let (worker, result_tx, command_rx) = worker_with_channels();
     let mut pipeline = SubtitlePipeline::with_worker_for_test(worker);

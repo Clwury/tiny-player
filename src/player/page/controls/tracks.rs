@@ -56,7 +56,9 @@ impl PlaybackPage {
         let previous_audio = self.tracks.selected_audio_stream_index;
         self.tracks.selected_audio_stream_index = track_index;
         self.tracks.open = None;
-        self.timeline.buffering = self.timeline.loaded;
+        if track_index.is_some() {
+            self.timeline.buffering = self.timeline.loaded;
+        }
 
         let command_succeeded = if let Some(backend) = self.video.owner_mut() {
             match backend.command(BackendCommand::SetAudioTrack {
@@ -99,7 +101,9 @@ impl PlaybackPage {
         let mut previous_active_subtitle = self.subtitle.active.take();
         self.tracks.selected_subtitle_stream_index = track.as_ref().map(|track| track.stream_index);
         self.tracks.open = None;
-        self.timeline.buffering = self.timeline.loaded;
+        if track.is_some() {
+            self.timeline.buffering = self.timeline.loaded;
+        }
 
         let command_succeeded = if let Some(backend) = self.video.owner_mut() {
             match backend.command(BackendCommand::SetSubtitleTrack {

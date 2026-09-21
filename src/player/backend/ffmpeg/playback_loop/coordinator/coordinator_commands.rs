@@ -17,7 +17,10 @@ use super::playback_reset_service::{
     PlaybackSeekBufferingPolicy, PlaybackSeekResetContext, service_playback_generation_seek,
     service_playback_position_state_reset, service_playback_seek_reset,
 };
-use super::track_switch::{TrackSwitchPipelineState, service_track_switch_pipelines};
+use super::track_switch::{
+    TrackSwitchPipelineState, service_audio_disable_command, service_subtitle_disable_command,
+    service_track_switch_pipelines,
+};
 use super::{
     AudioOutput, DemuxPacketCache, FfmpegCommand, FfmpegControl, FfmpegPlaybackInput,
     HttpRingCache, PlaybackSession, StreamCatalog, drain_playback_commands,
@@ -107,6 +110,13 @@ pub(super) fn service_playback_commands(
             context.http_cache,
             cache_config,
         );
+    }
+
+    if drained_commands.disable_audio && drained_commands.pending_track_selection.is_none() {
+        service_audio_disable_command(&mut context)?;
+    }
+    if drained_commands.disable_subtitles && drained_commands.pending_track_selection.is_none() {
+        service_subtitle_disable_command(&mut context);
     }
 
     if let Some(pending_track_selection) = drained_commands.pending_track_selection {
@@ -206,6 +216,8 @@ fn service_track_selection_command(
     let selected_tracks = pending_track_selection.selected_tracks.clone();
     let low_level_seek_reason =
         track_selection_low_level_seek_reason(&context.source.selected_tracks, &selected_tracks);
+    let refresh_demux_cache =
+        internal_subtitle_track_changed(&context.source.selected_tracks, &selected_tracks);
     let demux_audio_stream = select_audio_stream_for_selection_from_catalog(
         &selected_tracks,
         context.stream_catalog,
@@ -226,6 +238,7 @@ fn service_track_selection_command(
         seek_mode: PlaybackSeekMode::Precise,
         seek_generation: pending_track_selection.generation,
         force_low_level_seek: low_level_seek_reason.is_some(),
+        refresh_demux_cache,
         cache_only: false,
         require_safe_cached_anchor: false,
         preserve_hevc_same_hardware_recovery: false,
@@ -329,14 +342,19 @@ fn track_selection_low_level_seek_reason(
         return Some(AUDIO_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON);
     }
 
-    let previous_internal_subtitle = internal_subtitle_stream_index(previous);
-    let next_internal_subtitle = internal_subtitle_stream_index(next);
-
     // The demux cache only indexes the currently selected subtitle stream. A cached seek after
     // selecting another internal stream therefore has no historical packets for the new track and
     // would resume that stream from the demuxer's already-prefetched append position instead.
-    (next_internal_subtitle.is_some() && next_internal_subtitle != previous_internal_subtitle)
+    internal_subtitle_track_changed(previous, next)
         .then_some(SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON)
+}
+
+fn internal_subtitle_track_changed(
+    previous: &PlaybackTrackSelection,
+    next: &PlaybackTrackSelection,
+) -> bool {
+    let next_subtitle = internal_subtitle_stream_index(next);
+    next_subtitle.is_some() && next_subtitle != internal_subtitle_stream_index(previous)
 }
 
 fn internal_subtitle_stream_index(selection: &PlaybackTrackSelection) -> Option<usize> {
@@ -357,6 +375,37 @@ mod tests {
         FfmpegControl, PendingSeek, SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON,
         pending_seek_is_latest_generation, track_selection_low_level_seek_reason,
     };
+
+    #[test]
+    fn subtitle_cache_refresh_only_applies_to_new_internal_tracks() {
+        let off = PlaybackTrackSelection {
+            audio_stream_index: Some(1),
+            ..Default::default()
+        };
+        let internal = PlaybackTrackSelection {
+            subtitle_stream_index: Some(2),
+            ..off.clone()
+        };
+        let other_internal = PlaybackTrackSelection {
+            subtitle_stream_index: Some(3),
+            ..internal.clone()
+        };
+        let external = PlaybackTrackSelection {
+            subtitle_external_url: Some("file:///fixture.srt".into()),
+            ..internal.clone()
+        };
+        assert!(super::internal_subtitle_track_changed(&off, &internal));
+        assert!(super::internal_subtitle_track_changed(
+            &internal,
+            &other_internal
+        ));
+        assert!(super::internal_subtitle_track_changed(&external, &internal));
+        assert!(!super::internal_subtitle_track_changed(&internal, &off));
+        assert!(!super::internal_subtitle_track_changed(
+            &internal, &internal
+        ));
+        assert!(!super::internal_subtitle_track_changed(&off, &external));
+    }
 
     fn pending_seek(generation: u64, position_seconds: f64) -> PendingSeek {
         PendingSeek {

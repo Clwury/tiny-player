@@ -119,11 +119,15 @@ impl CachedDemuxPacket {
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn is_cached_seek_anchor(
         &self,
     ) -> bool {
-        // Like mpv's demux keyframe runs, cached video seeks also accept
-        // AV_PKT_FLAG_KEY on open-GOP/non-IDR packets. Keep decoder recovery
-        // metadata strict: those packets cannot reset a broken reference chain.
+        // Like mpv's demux keyframe runs, cached video seek anchors require
+        // AV_PKT_FLAG_KEY, including open-GOP/non-IDR packets. Bitstream recovery
+        // classification alone must not promote non-key packets into the index.
         // Audio still requires its codec-specific recovery point (e.g. TrueHD).
-        self.recovery_point || (self.timeline_anchor && self.demux_keyframe)
+        if self.timeline_anchor {
+            self.demux_keyframe
+        } else {
+            self.recovery_point
+        }
     }
 
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn cached_seek_anchor_kind(

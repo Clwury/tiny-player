@@ -1,6 +1,346 @@
 use super::*;
 
 #[test]
+fn disabling_subtitles_keeps_audio_video_session_pause_and_pending_events() {
+    use crate::player::backend::{BackendControl, BackendLoadRequest};
+    for paused in [false, true] {
+        let mut backend = FfmpegBackend::new().unwrap();
+        let session_id = backend.current_session_id;
+        let control = Arc::new(FfmpegControl::new(session_id));
+        control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing);
+        control.set_user_paused(paused);
+        let before_audio = control.audio_output_control_snapshot();
+        let (worker, commands) =
+            super::super::FfmpegWorker::command_queue_for_test(Arc::clone(&control));
+        backend.worker = Some(worker);
+        backend.current_request = Some(BackendLoadRequest {
+            url: "file:///fixture.mkv".into(),
+            http_headers: Vec::new(),
+            content_length: None,
+            start_position_seconds: 0.0,
+            selected_tracks: crate::player::PlaybackTrackSelection {
+                audio_stream_index: Some(1),
+                subtitle_stream_index: Some(2),
+                subtitle_external_url: Some("file:///fixture.srt".into()),
+                subtitle_codec: Some("subrip".into()),
+                ..Default::default()
+            },
+            cache_config: PlaybackCacheConfig::default(),
+        });
+        backend.loaded = true;
+        backend.paused = paused;
+        backend.user_paused = paused;
+        backend.position_seconds = Some(409.108);
+        backend.video_output_queue.begin_session(session_id);
+        backend
+            .video_output_queue
+            .push(session_id, test_queued_video_frame(409_108_000_000).frame);
+        let before_video = backend.video_output_queue.snapshot();
+        backend
+            .event_tx
+            .send(BackendEvent::new(
+                session_id,
+                BackendEventKind::PositionChanged(409.108),
+            ))
+            .unwrap();
+
+        backend.set_subtitle_track(None, 400.0).unwrap();
+
+        let drained = drain_playback_commands(&commands, &control);
+        assert!(drained.disable_subtitles);
+        assert!(!drained.disable_audio);
+        assert!(drained.pending_seek.is_none());
+        assert!(drained.pending_track_selection.is_none());
+        assert_eq!(control.seek_generation(), 0);
+        assert_eq!(control.audio_output_control_snapshot(), before_audio);
+        assert_eq!(backend.current_session_id, session_id);
+        assert_eq!(backend.video_output_queue.snapshot(), before_video);
+        assert!(backend.loaded);
+        assert_eq!(backend.paused, paused);
+        assert_eq!(backend.user_paused, paused);
+        assert_eq!(backend.position_seconds, Some(409.108));
+        let selected = &backend.current_request.as_ref().unwrap().selected_tracks;
+        assert_eq!(selected.audio_stream_index, Some(1));
+        assert_eq!(selected.subtitle_stream_index, None);
+        assert_eq!(selected.subtitle_external_url, None);
+        assert_eq!(selected.subtitle_codec, None);
+        assert!(matches!(
+            backend.event_rx.try_recv().unwrap().kind,
+            BackendEventKind::PositionChanged(409.108)
+        ));
+        assert!(
+            backend.event_rx.try_recv().is_err(),
+            "Off must not start loading or reset position"
+        );
+    }
+}
+
+#[test]
+fn subtitle_off_rejects_queued_cues_and_track_resolution_until_reenabled() {
+    use crate::player::backend::{BackendControl, BackendLoadRequest};
+    let mut backend = FfmpegBackend::new().unwrap();
+    let session = backend.current_session_id;
+    let control = Arc::new(FfmpegControl::new(session));
+    let (worker, _commands) = super::super::FfmpegWorker::command_queue_for_test(control);
+    backend.worker = Some(worker);
+    let selected = crate::player::PlaybackTrackSelection {
+        audio_stream_index: Some(1),
+        subtitle_stream_index: Some(2),
+        ..Default::default()
+    };
+    backend.current_request = Some(BackendLoadRequest {
+        url: "file:///fixture.mkv".into(),
+        http_headers: Vec::new(),
+        content_length: None,
+        start_position_seconds: 0.0,
+        selected_tracks: selected.clone(),
+        cache_config: Default::default(),
+    });
+    let cue = BackendSubtitleCue {
+        text: "old cue".into(),
+        bitmaps: Vec::new(),
+        start_nsecs: 0,
+        end_nsecs: 10_000_000_000,
+    };
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            session,
+            BackendEventKind::PlaybackTracksChanged {
+                audio: Vec::new(),
+                subtitles: Vec::new(),
+                selected: selected.clone(),
+            },
+        ))
+        .unwrap();
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            session,
+            BackendEventKind::SubtitleChanged(Some(cue.clone())),
+        ))
+        .unwrap();
+    backend.set_subtitle_track(None, 1.0).unwrap();
+    let events = backend.poll_events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, BackendEventKind::SubtitleChanged(Some(_))))
+    );
+    assert!(events.iter().any(
+        |e| matches!(&e.kind, BackendEventKind::PlaybackTracksChanged { selected, .. }
+        if selected.subtitle_stream_index.is_none() && selected.audio_stream_index == Some(1))
+    ));
+    assert!(
+        backend
+            .current_request
+            .as_ref()
+            .unwrap()
+            .selected_tracks
+            .subtitle_stream_index
+            .is_none()
+    );
+
+    backend
+        .set_subtitle_track(
+            Some(crate::player::PlaybackTrack::new(2, "Subtitle", false)),
+            1.0,
+        )
+        .unwrap();
+    assert_ne!(backend.current_session_id, session);
+    backend
+        .event_tx
+        .send(BackendEvent::new(
+            backend.current_session_id,
+            BackendEventKind::SubtitleChanged(Some(cue)),
+        ))
+        .unwrap();
+    assert!(
+        backend
+            .poll_events()
+            .iter()
+            .any(|e| matches!(e.kind, BackendEventKind::SubtitleChanged(Some(_))))
+    );
+}
+
+#[test]
+fn subtitle_off_coalesces_with_track_switches_without_losing_seek_or_audio_off() {
+    let control = FfmpegControl::new(PlaybackSessionId(1));
+    let (tx, rx) = mpsc::channel();
+    let generation = control.request_seek();
+    let select = || FfmpegCommand::SetTrackSelection {
+        session_id: PlaybackSessionId(2),
+        selected_tracks: crate::player::PlaybackTrackSelection {
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(2),
+            subtitle_external_url: Some("file:///fixture.srt".into()),
+            subtitle_codec: Some("subrip".into()),
+            ..Default::default()
+        },
+        position_seconds: 25.0,
+        generation,
+        pause_after_switch: false,
+    };
+    tx.send(select()).unwrap();
+    tx.send(FfmpegCommand::DisableSubtitles).unwrap();
+    tx.send(FfmpegCommand::DisableAudio).unwrap();
+    let drained = drain_playback_commands(&rx, &control);
+    let selected = drained.pending_track_selection.unwrap().selected_tracks;
+    assert_eq!(selected.audio_stream_index, None);
+    assert_eq!(selected.subtitle_stream_index, None);
+    assert_eq!(selected.subtitle_external_url, None);
+    assert_eq!(selected.subtitle_codec, None);
+
+    tx.send(FfmpegCommand::DisableSubtitles).unwrap();
+    tx.send(select()).unwrap();
+    let drained = drain_playback_commands(&rx, &control);
+    assert!(!drained.disable_subtitles);
+    assert_eq!(
+        drained
+            .pending_track_selection
+            .unwrap()
+            .selected_tracks
+            .subtitle_stream_index,
+        Some(2)
+    );
+
+    tx.send(FfmpegCommand::DisableSubtitles).unwrap();
+    tx.send(FfmpegCommand::Seek {
+        session_id: PlaybackSessionId(2),
+        position_seconds: 25.0,
+        mode: PlaybackSeekMode::Precise,
+        generation,
+        queued_at: Instant::now(),
+    })
+    .unwrap();
+    let drained = drain_playback_commands(&rx, &control);
+    assert!(drained.disable_subtitles);
+    assert_eq!(drained.pending_seek.unwrap().position_seconds, 25.0);
+}
+
+#[test]
+fn disabling_audio_keeps_video_session_loaded_pause_and_pending_events() {
+    use crate::player::backend::{BackendControl, BackendLoadRequest};
+
+    for paused in [false, true] {
+        let mut backend = FfmpegBackend::new().unwrap();
+        let session_id = backend.current_session_id;
+        let control = Arc::new(FfmpegControl::new(session_id));
+        control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing);
+        control.set_user_paused(paused);
+        let before_output = control.audio_output_control_snapshot();
+        let (worker, commands) =
+            super::super::FfmpegWorker::command_queue_for_test(Arc::clone(&control));
+        backend.worker = Some(worker);
+        backend.current_request = Some(BackendLoadRequest {
+            url: "file:///fixture.mkv".into(),
+            http_headers: Vec::new(),
+            content_length: None,
+            start_position_seconds: 0.0,
+            selected_tracks: crate::player::PlaybackTrackSelection {
+                audio_stream_index: Some(1),
+                subtitle_stream_index: Some(2),
+                ..Default::default()
+            },
+            cache_config: PlaybackCacheConfig::default(),
+        });
+        backend.loaded = true;
+        backend.paused = paused;
+        backend.user_paused = paused;
+        backend.position_seconds = Some(401.276);
+        backend.video_output_queue.begin_session(session_id);
+        backend
+            .video_output_queue
+            .push(session_id, test_queued_video_frame(401_276_000_000).frame);
+        let before_video = backend.video_output_queue.snapshot();
+        backend
+            .event_tx
+            .send(BackendEvent::new(
+                session_id,
+                BackendEventKind::PositionChanged(401.276),
+            ))
+            .unwrap();
+
+        backend.set_audio_track(None, 400.0).unwrap();
+
+        let drained = drain_playback_commands(&commands, &control);
+        assert!(drained.disable_audio);
+        assert!(drained.pending_seek.is_none());
+        assert!(drained.pending_track_selection.is_none());
+        assert_eq!(control.seek_generation(), 0);
+        assert_eq!(control.audio_output_control_snapshot(), before_output);
+        assert_eq!(backend.current_session_id, session_id);
+        assert_eq!(backend.video_output_queue.snapshot(), before_video);
+        assert!(backend.loaded);
+        assert_eq!(backend.paused, paused);
+        assert_eq!(backend.user_paused, paused);
+        assert_eq!(backend.position_seconds, Some(401.276));
+        let selected = &backend.current_request.as_ref().unwrap().selected_tracks;
+        assert_eq!(selected.audio_stream_index, None);
+        assert_eq!(selected.subtitle_stream_index, Some(2));
+        assert!(matches!(
+            backend.event_rx.try_recv().unwrap().kind,
+            BackendEventKind::PositionChanged(401.276)
+        ));
+        assert!(
+            backend.event_rx.try_recv().is_err(),
+            "Off must not enqueue a loading or position reset"
+        );
+    }
+}
+
+#[test]
+fn disabling_audio_coalesces_with_track_switches_without_losing_seeks() {
+    let control = FfmpegControl::new(PlaybackSessionId(1));
+    let (tx, rx) = mpsc::channel();
+    tx.send(FfmpegCommand::DisableAudio).unwrap();
+    let generation = control.request_seek();
+    tx.send(FfmpegCommand::Seek {
+        session_id: PlaybackSessionId(2),
+        position_seconds: 25.0,
+        mode: PlaybackSeekMode::Precise,
+        generation,
+        queued_at: Instant::now(),
+    })
+    .unwrap();
+    let drained = drain_playback_commands(&rx, &control);
+    assert!(drained.disable_audio);
+    assert_eq!(drained.pending_seek.unwrap().position_seconds, 25.0);
+
+    let select_audio = || FfmpegCommand::SetTrackSelection {
+        session_id: PlaybackSessionId(3),
+        selected_tracks: crate::player::PlaybackTrackSelection {
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(2),
+            ..Default::default()
+        },
+        position_seconds: 25.0,
+        generation,
+        pause_after_switch: false,
+    };
+    tx.send(select_audio()).unwrap();
+    tx.send(FfmpegCommand::DisableAudio).unwrap();
+    let drained = drain_playback_commands(&rx, &control);
+    assert!(drained.disable_audio);
+    let selected = drained.pending_track_selection.unwrap().selected_tracks;
+    assert_eq!(selected.audio_stream_index, None);
+    assert_eq!(selected.subtitle_stream_index, Some(2));
+
+    tx.send(FfmpegCommand::DisableAudio).unwrap();
+    tx.send(select_audio()).unwrap();
+    let drained = drain_playback_commands(&rx, &control);
+    assert!(!drained.disable_audio);
+    assert_eq!(
+        drained
+            .pending_track_selection
+            .unwrap()
+            .selected_tracks
+            .audio_stream_index,
+        Some(1)
+    );
+}
+
+#[test]
 fn timestamp_mapper_uses_stream_start_when_available() {
     let mut mapper = TimestampMapper::new(Some(1_000_000_000), 0, None);
     let time_base = ffi::AVRational { num: 1, den: 1_000 };

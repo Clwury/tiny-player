@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn hevc_cached_seek_at_649_ignores_non_key_recovery_packets() {
+    let mut state = DemuxPacketCacheState::new(
+        407_000_000_000,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        PlaybackSessionId(1),
+        cache_config_for_test(),
+    );
+    state.append_packet(cached_video_recovery_packet(
+        VideoRecoveryPointKind::Cra,
+        false,
+        407_198_000_000,
+        407_240_000_000,
+    ));
+    let mut non_key = cached_video_recovery_packet(
+        VideoRecoveryPointKind::Bla,
+        false,
+        407_240_000_000,
+        407_282_000_000,
+    );
+    non_key.demux_keyframe = false;
+    state.append_packet(non_key);
+    state.append_packet(cached_packet(
+        0,
+        true,
+        Some(409_117_000_000),
+        Some(409_159_000_000),
+    ));
+    state.append_packet(cached_video_recovery_packet(
+        VideoRecoveryPointKind::Cra,
+        false,
+        419_502_000_000,
+        419_544_000_000,
+    ));
+    let hit = state
+        .seek_cached_with_generation_hit(
+            409_108_164_263,
+            PlaybackSeekMode::Precise,
+            PlaybackSessionId(2),
+            0,
+        )
+        .expect("cached CRA seek hits");
+    assert_eq!(hit.anchor_kind, VideoRecoveryPointKind::Cra);
+    assert_eq!(hit.anchor_nsecs, 407_198_000_000);
+    assert_eq!(hit.target_nsecs, 409_108_164_263);
+}
+
+#[test]
 fn demux_packet_cache_state_seeks_from_nearest_previous_keyframe() {
     let mut state = DemuxPacketCacheState::new(
         0,

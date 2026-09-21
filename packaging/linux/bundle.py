@@ -165,7 +165,7 @@ def build_bundle(binary, output):
             icons = root / "share/icons/hicolor" / size / "apps"
             icons.mkdir(parents=True)
             shutil.copy2(repo / f"assets/icons/tiny-player.{extension}", icons)
-        shutil.copy2(repo / "LICENSE", root / "licenses/tiny-player-MIT.txt")
+        shutil.copy2(repo / "LICENSE", root / "licenses/tiny-player-GPL-3.0-only.txt")
         shutil.copytree("/opt/tiny-player/share/licenses", root / "licenses/native", dirs_exist_ok=True)
         shutil.copytree("/opt/tiny-player/share/build-info", root / "build-info")
         shutil.copy2(repo / "Cargo.lock", root / "build-info/Cargo.lock")

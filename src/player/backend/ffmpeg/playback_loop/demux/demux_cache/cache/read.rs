@@ -294,8 +294,11 @@ impl DemuxPacketCache {
             audio_stream,
             subtitle_stream,
         });
+        let emit = self.shared.prepare_cache_state_emit(&mut guard);
         self.shared.refresh_monitor_snapshot(&guard);
+        drop(guard);
         self.shared.notify_ready();
+        self.shared.send_cache_state_emit(emit.into_emit());
     }
 
     fn read_packet_round_robin_inner(

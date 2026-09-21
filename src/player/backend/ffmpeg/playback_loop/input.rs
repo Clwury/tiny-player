@@ -44,6 +44,13 @@ pub(super) struct StreamCatalog {
 }
 
 impl StreamCatalog {
+    #[cfg(test)]
+    pub(super) fn empty_for_test() -> Self {
+        Self {
+            streams: Vec::new(),
+        }
+    }
+
     fn from_input(input: &FormatContext) -> std::result::Result<Self, String> {
         Ok(Self {
             streams: input.streams()?,
@@ -74,7 +81,7 @@ impl StreamCatalog {
         Ok(stream)
     }
 
-    fn tracks(&self, media_type: ffi::AVMediaType) -> Vec<PlaybackTrack> {
+    pub(super) fn tracks(&self, media_type: ffi::AVMediaType) -> Vec<PlaybackTrack> {
         self.streams
             .iter()
             .filter_map(|stream| {

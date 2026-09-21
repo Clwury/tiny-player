@@ -513,6 +513,8 @@ pub(super) enum FfmpegCommand {
         session_id: PlaybackSessionId,
     },
     Stop,
+    DisableAudio,
+    DisableSubtitles,
     SetTrackSelection {
         session_id: PlaybackSessionId,
         selected_tracks: crate::player::PlaybackTrackSelection,
@@ -566,6 +568,8 @@ pub(super) struct PendingTrackSelection {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct DrainedFfmpegCommands {
+    pub(super) disable_audio: bool,
+    pub(super) disable_subtitles: bool,
     pub(super) pending_seek: Option<PendingSeek>,
     pub(super) pending_track_selection: Option<PendingTrackSelection>,
     pub(super) cache_config: Option<PlaybackCacheConfig>,
@@ -735,6 +739,22 @@ impl FfmpegWorker {
         send_playback_command(&self.command_tx, &self.control, command)
             .map_err(|_| BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string()))?;
         Ok(())
+    }
+
+    pub(super) fn disable_audio(&self) -> Result<()> {
+        // Deselecting audio needs no seek generation, AO start gate, or video
+        // reset. Wake the coordinator without interrupting the current frame.
+        send_playback_command(&self.command_tx, &self.control, FfmpegCommand::DisableAudio)
+            .map_err(|_| BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string()))
+    }
+
+    pub(super) fn disable_subtitles(&self) -> Result<()> {
+        send_playback_command(
+            &self.command_tx,
+            &self.control,
+            FfmpegCommand::DisableSubtitles,
+        )
+        .map_err(|_| BackendError::Ffmpeg("FFmpeg 解码线程已停止".to_string()))
     }
 
     pub(super) fn set_track_selection(
@@ -911,6 +931,18 @@ fn apply_playback_command(
         FfmpegCommand::Stop => {
             control.shutdown();
         }
+        FfmpegCommand::DisableAudio => {
+            drained.disable_audio = true;
+            if let Some(pending) = drained.pending_track_selection.as_mut() {
+                pending.selected_tracks.audio_stream_index = None;
+            }
+        }
+        FfmpegCommand::DisableSubtitles => {
+            drained.disable_subtitles = true;
+            if let Some(pending) = drained.pending_track_selection.as_mut() {
+                pending.selected_tracks.set_subtitle_track(None);
+            }
+        }
         FfmpegCommand::SetTrackSelection {
             session_id,
             selected_tracks,
@@ -918,6 +950,8 @@ fn apply_playback_command(
             generation,
             pause_after_switch,
         } => {
+            drained.disable_audio = false;
+            drained.disable_subtitles = false;
             drained.pending_seek = None;
             drained.pending_track_selection = Some(PendingTrackSelection {
                 session_id,

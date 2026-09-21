@@ -3,7 +3,7 @@ name = "tiny-player"
 version = "0.1.0"
 edition = "2024"
 description = "Native Emby desktop client with FFmpeg and Vulkan playback"
-license = "MIT"
+license = "GPL-3.0-only"
 homepage = "https://github.com/Clwury/tiny-player"
 repository = "https://github.com/Clwury/tiny-player"
 
@@ -21,6 +21,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strsim = "0.11.1"
+sysinfo = { version = "0.31.4", default-features = false, features = ["system"] }
 tracing = "0.1"
 tokio = { version = "1", features = ["rt", "time"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

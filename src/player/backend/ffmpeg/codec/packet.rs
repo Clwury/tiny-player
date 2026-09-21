@@ -9,6 +9,7 @@ impl AvPacket {
         Ok(Self {
             ptr,
             read_diagnostic: None,
+            nal_format: None,
         })
     }
 
@@ -19,6 +20,7 @@ impl AvPacket {
             return Err(format!("FFmpeg 复制 packet 失败：{}", ffmpeg_error(result)));
         }
         clone.read_diagnostic = packet.read_diagnostic.clone();
+        clone.nal_format = packet.nal_format;
         Ok(clone)
     }
 
@@ -35,6 +37,7 @@ impl AvPacket {
             (*props.ptr).stream_index = (*packet.ptr).stream_index;
         }
         props.read_diagnostic = packet.read_diagnostic.clone();
+        props.nal_format = packet.nal_format;
         Ok(props)
     }
 
@@ -70,6 +73,7 @@ impl AvPacket {
             (*packet.ptr).stream_index = (*props.ptr).stream_index;
         }
         packet.read_diagnostic = props.read_diagnostic.clone();
+        packet.nal_format = props.nal_format;
         Ok(packet)
     }
 
@@ -133,6 +137,10 @@ impl AvPacket {
         self.read_diagnostic = Some(Arc::new(diagnostic));
     }
 
+    pub(in super::super) fn set_nal_format(&mut self, format: Option<NalPacketFormat>) {
+        self.nal_format = format;
+    }
+
     pub(in super::super) fn size(&self) -> Option<u64> {
         let size = unsafe { (*self.ptr).size };
         (size > 0).then_some(size as u64)
@@ -172,5 +180,6 @@ impl AvPacket {
     pub(in super::super) fn unref(&mut self) {
         unsafe { ffi::av_packet_unref(self.ptr) };
         self.read_diagnostic = None;
+        self.nal_format = None;
     }
 }

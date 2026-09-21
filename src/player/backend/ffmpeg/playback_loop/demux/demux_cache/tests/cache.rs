@@ -1,5 +1,7 @@
 #[path = "cache/archived_seek.rs"]
 mod archived_seek;
+#[path = "cache/audio_selection.rs"]
+mod audio_selection;
 #[path = "cache/config.rs"]
 mod config;
 #[path = "cache/forward_cache.rs"]
@@ -30,6 +32,8 @@ mod storage_worker;
 mod stream_alignment;
 #[path = "cache/subtitle_seek.rs"]
 mod subtitle_seek;
+#[path = "cache/subtitle_selection.rs"]
+mod subtitle_selection;
 #[path = "cache/timeline.rs"]
 mod timeline;
 #[path = "cache/trim.rs"]

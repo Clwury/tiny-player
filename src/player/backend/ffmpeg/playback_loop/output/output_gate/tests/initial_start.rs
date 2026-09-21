@@ -2358,6 +2358,7 @@ fn primed_state_accepts_ordinary_audio_without_cancelling_initial_transaction() 
             },
             start_timeline_nsecs,
             start_timeline_nsecs + PRODUCTION_STAGE_FRAME_NSECS,
+            PRODUCTION_STAGE_TARGET_NSECS,
             state.session_id,
             &vo_queue,
             &frame_presented,

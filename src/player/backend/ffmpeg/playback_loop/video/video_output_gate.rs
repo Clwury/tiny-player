@@ -821,8 +821,6 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
     current_start_position_nsecs: &mut u64,
     decoded_video_frame_count: u64,
 ) -> DecodedVideoAdmissionStatus {
-    subtitle_pipeline.update_overlay(timeline_nsecs, session_id, event_tx);
-
     if output_scheduler.restart_pending() {
         scheduler.reset(timeline_nsecs);
         output_scheduler.mark_video_clock_anchor_valid();
@@ -857,6 +855,7 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
             output_scheduler.mark_first_frame_presentation_failed();
             return DecodedVideoAdmissionStatus::Stop;
         }
+        subtitle_pipeline.update_overlay(timeline_nsecs, session_id, event_tx);
         let first_present_elapsed = output_scheduler.mark_first_frame_presented();
         tracing::debug!(
             session_id = ?session_id,
@@ -869,6 +868,8 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
         return DecodedVideoAdmissionStatus::Stop;
     }
     output_scheduler.set_state(PlaybackOutputState::Playing);
+    // Decoding can run ahead of playback. Update subtitles when queued frames
+    // become due, so future frames cannot show or expire cues prematurely.
     queue_decoded_video_frame(
         output_scheduler,
         frame,
@@ -894,6 +895,10 @@ pub(in crate::player::backend::ffmpeg) fn service_video_clocked_decoded_video_fr
     );
     DecodedVideoAdmissionStatus::Continue
 }
+
+#[cfg(test)]
+#[path = "video_output_gate_subtitle_tests.rs"]
+mod subtitle_tests;
 
 #[cfg(test)]
 mod tests {

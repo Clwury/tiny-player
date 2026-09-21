@@ -582,7 +582,13 @@ impl AudioDecodeWorker {
 
 impl Drop for AudioDecodeWorker {
     fn drop(&mut self) {
-        let _ = self.command_tx.send(AudioDecodeCommand::Shutdown);
+        // A track can be disabled with both bounded queues full. Disconnect
+        // results first so the decoder cannot block while we wait for shutdown.
+        let (_, disconnected_rx) = mpsc::channel();
+        drop(std::mem::replace(&mut self.result_rx, disconnected_rx));
+        let _ = self.command_tx.try_send(AudioDecodeCommand::Shutdown);
+        let (disconnected_tx, _) = mpsc::sync_channel(0);
+        drop(std::mem::replace(&mut self.command_tx, disconnected_tx));
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -761,6 +767,34 @@ mod tests {
             result_tx,
             command_rx,
         )
+    }
+
+    #[test]
+    fn disabling_audio_disconnects_full_result_and_command_queues_before_join() {
+        let (mut worker, result_tx, command_rx) = worker_with_channels(1, 1);
+        worker
+            .command_tx
+            .try_send(AudioDecodeCommand::FlushBuffers { generation: 1 })
+            .unwrap();
+        result_tx
+            .try_send(AudioDecodeResult::Flushed { generation: 1 })
+            .unwrap();
+        worker.handle = Some(std::thread::spawn(move || {
+            assert!(
+                result_tx
+                    .send(AudioDecodeResult::Flushed { generation: 2 })
+                    .is_err()
+            );
+            drop(command_rx);
+        }));
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(worker);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("audio shutdown must unblock both full queues");
     }
 
     #[test]

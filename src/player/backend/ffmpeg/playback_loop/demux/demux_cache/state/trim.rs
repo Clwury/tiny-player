@@ -740,6 +740,27 @@ impl DemuxPacketCacheState {
         self.ranges.insert(range_id, range);
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn discard_stream_packets(
+        &mut self,
+        stream_index: c_int,
+    ) {
+        self.remove_reader_head(stream_index);
+        self.last_packet_reads.remove(&stream_index);
+        self.refreshing_streams.remove(&stream_index);
+        let range_ids = self.ranges.keys().copied().collect::<Vec<_>>();
+        for range_id in range_ids {
+            let mut range = self.ranges.remove(&range_id).expect("cached range");
+            let is_bof = range.is_bof;
+            self.remove_range_stream_prefix_packets(&mut range, stream_index, usize::MAX);
+            // Deselecting a stream is not pruning the retained video prefix.
+            range.is_bof = is_bof;
+            range.stream_boundaries.remove(&stream_index);
+            range.stream_resume_positions.remove(&stream_index);
+            range.mark_seekable_dirty();
+            self.ranges.insert(range_id, range);
+        }
+    }
+
     fn remove_range_stream_prefix_packets(
         &mut self,
         range: &mut DemuxCachedRange,

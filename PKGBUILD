@@ -17,7 +17,7 @@ pkgrel=1
 pkgdesc='Native Emby desktop client with FFmpeg and Vulkan playback'
 arch=('x86_64')
 url='https://github.com/Clwury/tiny-player'
-license=('MIT')
+license=('GPL-3.0-only')
 # ring builds a native GCC archive that rust-lld cannot consume as GCC LTO.
 options=('!lto')
 depends=(

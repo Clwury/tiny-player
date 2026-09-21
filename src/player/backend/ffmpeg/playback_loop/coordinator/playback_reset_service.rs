@@ -35,6 +35,7 @@ pub(super) struct PlaybackGenerationFlushContext<'a> {
     pub(super) seek_mode: PlaybackSeekMode,
     pub(super) seek_generation: u64,
     pub(super) force_low_level_seek: bool,
+    pub(super) refresh_demux_cache: bool,
     pub(super) cache_only: bool,
     pub(super) require_safe_cached_anchor: bool,
     pub(super) preserve_hevc_same_hardware_recovery: bool,
@@ -107,6 +108,7 @@ fn flush_playback_generation_for_position_reset(
             context
                 .low_level_seek_reason
                 .unwrap_or("forced_low_level_seek"),
+            context.refresh_demux_cache,
         )
     } else if context.cache_only && context.require_safe_cached_anchor {
         context.demux_cache.seek_cached_safe_only(
@@ -348,6 +350,7 @@ pub(super) fn service_playback_seek_reset(
         seek_mode,
         seek_generation,
         force_low_level_seek,
+        refresh_demux_cache: false,
         cache_only,
         require_safe_cached_anchor,
         preserve_hevc_same_hardware_recovery,

@@ -50,6 +50,11 @@ impl DemuxPacketCacheShared {
             .state
             .lock()
             .expect("FFmpeg demux packet cache poisoned");
+        // Stream selection can change while av_read_frame is in flight. Do
+        // not recreate a deselected queue from the producer's older snapshot.
+        if !guard.stream_kinds.contains_key(&packet_stream_index) {
+            return;
+        }
         let append_lock_wait = lock_wait_started_at.elapsed();
         let append_lock_hold_started_at = Instant::now();
         let session_id = guard.session_id;

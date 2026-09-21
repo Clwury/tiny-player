@@ -173,6 +173,51 @@ impl DemuxPacketCacheState {
         &mut self,
         selected_streams: DemuxSelectedStreams,
     ) {
+        // Like mpv's update_stream_selection_state, discard queues for streams
+        // that stop being selected. Keeping them would advertise old coverage
+        // across the missing packets when the track is enabled again.
+        for (previous, next) in [
+            (
+                self.selected_streams.audio_stream,
+                selected_streams.audio_stream,
+            ),
+            (
+                self.selected_streams.subtitle_stream,
+                selected_streams.subtitle_stream,
+            ),
+        ] {
+            if let Some(previous) = previous
+                && next.is_none_or(|next| next.index != previous.index)
+            {
+                self.discard_stream_packets(previous.index);
+            }
+        }
+        for (previous, next) in [
+            (
+                self.selected_streams.audio_stream,
+                selected_streams.audio_stream,
+            ),
+            (
+                self.selected_streams.subtitle_stream,
+                selected_streams.subtitle_stream,
+            ),
+        ] {
+            if let Some(next) = next
+                && previous.is_none_or(|previous| previous.index != next.index)
+            {
+                for range in self.ranges.values_mut() {
+                    if !range.global_order.is_empty()
+                        && !range.stream_queues.contains_key(&next.index)
+                    {
+                        // This track was not read with the retained video. Its
+                        // missing prefix/suffix is not a natural BOF/EOF gap.
+                        let boundary = range.ensure_stream_boundary(next.index);
+                        boundary.is_bof = false;
+                        boundary.is_eof = false;
+                    }
+                }
+            }
+        }
         self.selected_streams = selected_streams;
         self.stream_kinds
             .retain(|_, kind| !matches!(kind, StreamCacheKind::Audio | StreamCacheKind::Subtitle));

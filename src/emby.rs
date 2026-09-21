@@ -34,13 +34,13 @@ pub use user::{
     UserItemsSort, UserView, UserViewImageTags, UserViews, VideoItemType,
 };
 
-pub(super) const CLIENT_NAME: &str = "Lenna";
-pub(super) const DEVICE_NAME: &str = "iPad";
-pub(super) const VERSION: &str = "1.0.13";
+pub(super) const CLIENT_NAME: &str = "Tiny Player";
+pub(super) const VERSION: &str = "0.1.0";
 
 #[derive(Clone, Debug)]
 pub struct EmbyClient {
     device_id: String,
+    device_name: String,
     http: Client,
 }
 
@@ -51,7 +51,11 @@ impl EmbyClient {
             .build()
             .context("创建 Emby HTTP 客户端失败")?;
 
-        Ok(Self { device_id, http })
+        Ok(Self {
+            device_id,
+            device_name: device_name_from_system_name(sysinfo::System::name().as_deref()),
+            http,
+        })
     }
 
     fn send_authenticated_request(
@@ -367,17 +371,31 @@ impl EmbyClient {
 
     fn authorization_header(&self) -> String {
         format!(
-            "Emby UserId=\"\", Client=\"{CLIENT_NAME}\", Device=\"{DEVICE_NAME}\", DeviceId=\"{}\", Version=\"{VERSION}\", Token=\"\"",
-            self.device_id
+            "Emby UserId=\"\", Client=\"{CLIENT_NAME}\", Device=\"{}\", DeviceId=\"{}\", Version=\"{VERSION}\", Token=\"\"",
+            self.device_name, self.device_id
         )
     }
 
     fn authenticated_authorization_header(&self, access_token: &str, user_id: &str) -> String {
         format!(
-            "MediaBrowser Token=\"{access_token}\", UserId=\"{user_id}\", Client=\"{CLIENT_NAME}\", Device=\"{DEVICE_NAME}\", DeviceId=\"{}\", Version=\"{VERSION}\"",
-            self.device_id
+            "MediaBrowser Token=\"{access_token}\", UserId=\"{user_id}\", Client=\"{CLIENT_NAME}\", Device=\"{}\", DeviceId=\"{}\", Version=\"{VERSION}\"",
+            self.device_name, self.device_id
         )
     }
+}
+
+fn device_name_from_system_name(system_name: Option<&str>) -> String {
+    system_name
+        .map(str::trim)
+        .filter(|name| {
+            // Device is a quoted value in the comma-separated authorization header.
+            !name.is_empty()
+                && !name.chars().any(|character| {
+                    character.is_control() || matches!(character, '"' | '\\' | ',')
+                })
+        })
+        .unwrap_or(std::env::consts::OS)
+        .to_owned()
 }
 
 fn content_type_header(headers: &HeaderMap) -> Option<String> {
@@ -442,6 +460,37 @@ fn api_url(endpoint: &ServerEndpoint, path_segments: &[&str]) -> Result<url::Url
         .extend(path_segments);
 
     Ok(url)
+}
+
+#[cfg(test)]
+mod device_name_tests {
+    use super::device_name_from_system_name;
+
+    #[test]
+    fn device_name_preserves_runtime_system_names() {
+        for name in ["Arch Linux", "Windows", "macOS", "Debian GNU/Linux"] {
+            assert_eq!(device_name_from_system_name(Some(name)), name);
+        }
+        assert_eq!(
+            device_name_from_system_name(Some("  Arch Linux  ")),
+            "Arch Linux"
+        );
+    }
+
+    #[test]
+    fn device_name_falls_back_when_system_name_is_missing_or_invalid() {
+        for name in [
+            None,
+            Some(""),
+            Some(" \t "),
+            Some("Linux\r\nOther: value"),
+            Some("Linux\""),
+            Some("Linux\\"),
+            Some("Linux,Unix"),
+        ] {
+            assert_eq!(device_name_from_system_name(name), std::env::consts::OS);
+        }
+    }
 }
 
 #[cfg(test)]

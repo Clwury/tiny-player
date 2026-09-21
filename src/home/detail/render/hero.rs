@@ -92,19 +92,9 @@ impl HomeContent {
                                             .as_ref()
                                             .and_then(hero_metadata::movie_overview),
                                         |this, overview| {
-                                            this.child(
-                                                div()
-                                                    .debug_selector(|| {
-                                                        "movie-detail-overview".into()
-                                                    })
-                                                    .w_full()
-                                                    .text_sm()
-                                                    .line_height(px(22.0))
-                                                    .text_color(theme.muted_foreground)
-                                                    .text_ellipsis()
-                                                    .line_clamp(3)
-                                                    .child(overview),
-                                            )
+                                            this.child(self.render_movie_overview_preview(
+                                                detail, overview, cx,
+                                            ))
                                         },
                                     )
                                 })

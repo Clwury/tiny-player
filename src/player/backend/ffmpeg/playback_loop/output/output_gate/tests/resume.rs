@@ -133,6 +133,72 @@ fn startup_audio_input_backpressure_uses_first_contiguous_run() {
 }
 
 #[test]
+fn startup_audio_at_649_with_unfillable_head_gap_stops_input_and_realigns() {
+    let target = 419_502_000_000;
+    let first_audio = 419_582_961_404;
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(target));
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.0; 192_000],
+            duration_nsecs: 2_000_000_000,
+        },
+        first_audio,
+        first_audio + 2_000_000_000,
+    );
+    assert!(scheduler.pending_start_audio_backpressured());
+    assert!(scheduler.output_wait_audio_input_backpressured());
+    assert!(scheduler.restart_fallback_deadline_armed());
+    let waterline = scheduler
+        .audio_resume_waterline_for_output_wait(
+            Some(audio_snapshot(target, 0)),
+            85_333_333,
+            1,
+            target,
+            duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION),
+            Some(100_000_000_000),
+            Some(1200),
+        )
+        .unwrap();
+    assert!(!waterline.ready);
+    let request = scheduler
+        .request_output_wait_audio_reader_head_realign_if_needed(
+            first_audio + 2_085_333_333,
+            waterline,
+            target,
+            PlaybackSessionId(1),
+        )
+        .expect("buffering later audio cannot fill the leading gap");
+    assert_eq!(request.target_timeline_nsecs, target);
+    assert_eq!(request.reason, "output_wait_audio_reader_continuity_gap");
+    assert_eq!(scheduler.pending_start_audio.queued_samples(), 192_000);
+}
+
+#[test]
+fn fragmented_resume_audio_is_bounded_even_without_contiguous_waterline() {
+    for rebuffer in [false, true] {
+        let mut scheduler = PlaybackOutputScheduler::new();
+        if rebuffer {
+            scheduler.set_state(PlaybackOutputState::Rebuffering);
+        }
+        for index in 0..4 {
+            let start = 10_000_000_000 + index * 1_000_000_000;
+            scheduler.push_pending_start_audio_for_test(
+                DecodedAudio {
+                    samples: vec![0.0; 48_000],
+                    duration_nsecs: 500_000_000,
+                },
+                start,
+                start + 500_000_000,
+            );
+        }
+        assert!(scheduler.pending_start_audio_backpressured());
+        assert!(scheduler.output_wait_audio_input_backpressured());
+        assert!(scheduler.restart_fallback_deadline_armed());
+    }
+}
+
+#[test]
 fn disconnected_startup_audio_does_not_fake_contiguous_backpressure() {
     let mut scheduler = PlaybackOutputScheduler::new();
     let short_run_nsecs = duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION) / 2;

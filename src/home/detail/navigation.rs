@@ -129,7 +129,8 @@ impl HomeContent {
             .cloned();
         self.item_context_menu = None;
         self.clear_all_notifications();
-        if let Some(current) = self.series_detail.take() {
+        if let Some(mut current) = self.series_detail.take() {
+            current.overview_overlay = None;
             self.detail_history.push(current);
         }
         self.navigation.push_detail(
@@ -146,9 +147,10 @@ impl HomeContent {
     pub(in super::super) fn close_series_detail(
         &mut self,
         _: &ClickEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.dismiss_movie_overview(window, cx);
         if !self.navigation.pop() {
             return;
         }

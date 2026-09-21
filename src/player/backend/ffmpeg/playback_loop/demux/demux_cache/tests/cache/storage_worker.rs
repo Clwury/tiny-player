@@ -31,6 +31,7 @@ fn payload_packet(index: u8) -> CachedDemuxPacket {
     let mut packet = demux_packet_with_data_for_stream(0, &vec![index; PACKET_BYTES]);
     unsafe {
         (*packet.as_mut_ptr()).pos = i64::from(index) * PACKET_BYTES as i64;
+        (*packet.as_mut_ptr()).flags = ffi::AV_PKT_FLAG_KEY;
     }
     CachedDemuxPacket::from_packet(
         &packet,

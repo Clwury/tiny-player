@@ -21,6 +21,11 @@ use super::{PENDING_START_AUDIO_BACKPRESSURE_DURATION, Sender};
 // 850ms -> 859ms admission overshoot does not generate a warning per session.
 const PLAYING_PENDING_AUDIO_WARN_ENTRY_FRAME_TOLERANCE: Duration = Duration::from_millis(24);
 
+// Missing coverage at the resume anchor cannot be filled by unbounded PCM
+// after the gap. Keep a bounded queue while the existing restart watchdog
+// realigns the reader, independently of the contiguous-coverage waterline.
+const PENDING_RESUME_AUDIO_LIMIT: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::player::backend::ffmpeg::playback_loop::output_gate) enum PendingAudioPressureContext
 {
@@ -302,6 +307,9 @@ impl PlaybackOutputScheduler {
     }
 
     pub(in crate::player::backend::ffmpeg) fn pending_start_audio_backpressured(&self) -> bool {
+        if self.pending_resume_audio_limit_reached() {
+            return true;
+        }
         if self.restart_pending() || self.startup_pending_audio_pressure_context_active {
             return self.pending_start_audio.contiguous_duration()
                 >= startup_pending_audio_backpressure_duration();
@@ -317,6 +325,9 @@ impl PlaybackOutputScheduler {
     }
 
     pub(in crate::player::backend::ffmpeg) fn output_wait_audio_input_backpressured(&self) -> bool {
+        if self.pending_resume_audio_limit_reached() && self.restart_fallback_deadline_armed() {
+            return true;
+        }
         if self.decode_recovery_active() {
             return false;
         }
@@ -347,6 +358,30 @@ impl PlaybackOutputScheduler {
         let suppression_threshold_nsecs = duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION)
             .saturating_add(duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN));
         effective_contiguous_coverage_nsecs >= suppression_threshold_nsecs
+    }
+
+    pub(in crate::player::backend::ffmpeg) fn pending_resume_audio_limit_reached(&self) -> bool {
+        self.waiting_for_output_resume()
+            && self.pending_start_audio.buffered_duration() >= PENDING_RESUME_AUDIO_LIMIT
+    }
+
+    fn buffer_audio_after_start(
+        &mut self,
+        audio: DecodedAudio,
+        start_timeline_nsecs: u64,
+        end_timeline_nsecs: u64,
+        trim_before_timeline_nsecs: u64,
+        output: &AudioOutput,
+    ) {
+        self.pending_start_audio
+            .push(audio, start_timeline_nsecs, end_timeline_nsecs);
+        // Like mpv's mp_aframe_clip_timestamps, trim the leading samples of a
+        // straddling frame rather than throwing away audio after the target.
+        self.pending_start_audio.trim_before(
+            trim_before_timeline_nsecs,
+            output.sample_rate(),
+            output.channels(),
+        );
     }
 
     pub(in crate::player::backend::ffmpeg) fn pending_audio_contiguous_range_nsecs(
@@ -578,6 +613,7 @@ impl PlaybackOutputScheduler {
         audio: DecodedAudio,
         start_timeline_nsecs: u64,
         end_timeline_nsecs: u64,
+        trim_before_timeline_nsecs: u64,
         session_id: PlaybackSessionId,
         vo_queue: &VideoOutputQueue,
         frame_presented: &AtomicBool,
@@ -591,20 +627,39 @@ impl PlaybackOutputScheduler {
         if !self.pending_start_audio_backpressured() {
             self.pending_audio_backpressure_log_state = None;
         }
+        if !decoder_drain && self.pending_resume_audio_limit_reached() {
+            return Ok(self.defer_decoded_audio_for_backpressure(
+                audio,
+                start_timeline_nsecs,
+                end_timeline_nsecs,
+                session_id,
+                "resume_audio_limit",
+            ));
+        }
         if self.restart_pending() {
             // Packet arrival only transfers decoded ownership into the pending
             // side of the active restart.  AO ownership is validated by the
             // transaction's prepare/commit path; ordinary packets are not a
             // discontinuity and must never abort or fence that transaction.
-            self.pending_start_audio
-                .push(audio, start_timeline_nsecs, end_timeline_nsecs);
+            self.buffer_audio_after_start(
+                audio,
+                start_timeline_nsecs,
+                end_timeline_nsecs,
+                trim_before_timeline_nsecs,
+                output,
+            );
             self.refresh_initial_bounded_delayed_audio_start_plan();
             return Ok(DecodedAudioAdmission::Accepted);
         }
         let mut audio_snapshot = output.snapshot()?;
         if decoder_drain {
-            self.pending_start_audio
-                .push(audio, start_timeline_nsecs, end_timeline_nsecs);
+            self.buffer_audio_after_start(
+                audio,
+                start_timeline_nsecs,
+                end_timeline_nsecs,
+                trim_before_timeline_nsecs,
+                output,
+            );
             self.report_playing_pending_start_audio_pressure(
                 session_id,
                 "decoder_drain_audio_buffered",
@@ -701,8 +756,13 @@ impl PlaybackOutputScheduler {
                 buffered_reporter,
             )?;
         } else {
-            self.pending_start_audio
-                .push(audio, start_timeline_nsecs, end_timeline_nsecs);
+            self.buffer_audio_after_start(
+                audio,
+                start_timeline_nsecs,
+                end_timeline_nsecs,
+                trim_before_timeline_nsecs,
+                output,
+            );
             self.report_playing_pending_start_audio_pressure(session_id, "decoded_audio_buffered");
             if self.recover_runaway_playing_pending_audio_if_needed(
                 output,

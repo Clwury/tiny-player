@@ -27,11 +27,11 @@ impl PlaybackPipelineState {
         let audio_output_low_water = audio_snapshot.is_some_and(|snapshot| {
             snapshot.total_pending_nsecs < duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION)
         });
-        let audio_input_suppressed = !self.output_scheduler.decode_recovery_active()
-            && (self
-                .output_scheduler
-                .output_wait_audio_input_backpressured()
-                || audio_input_suppressed_until_output_resume_state(
+        let audio_input_suppressed = self
+            .output_scheduler
+            .output_wait_audio_input_backpressured()
+            || (!self.output_scheduler.decode_recovery_active()
+                && audio_input_suppressed_until_output_resume_state(
                     self.audio_decode_pipeline.is_some(),
                     self.output_scheduler.waiting_for_output_resume(),
                     audio_resume_waterline,

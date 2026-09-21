@@ -251,9 +251,12 @@ impl PlaybackOutputScheduler {
             .is_some_and(|until| until > audio_waterline.resume_timeline_nsecs);
         let has_resume_coverage =
             pending_resume_coverage || decoded_resume_coverage || audio_output_resume_coverage;
-        let input_can_fill_gap = audio_waterline.audio_decode_in_flight_packets > 0;
+        let pending_limit_reached = self.pending_resume_audio_limit_reached();
+        let input_can_fill_gap =
+            audio_waterline.audio_decode_in_flight_packets > 0 && !pending_limit_reached;
         let progress_nsecs = audio_waterline
             .accepted_contiguous_coverage_nsecs
+            .filter(|_| accepted_start_within_tolerance)
             .unwrap_or_default()
             .max(
                 audio_waterline
@@ -273,7 +276,7 @@ impl PlaybackOutputScheduler {
                 progress_nsecs,
                 has_resume_coverage,
                 input_can_fill_gap,
-                force_immediate_realign: false,
+                force_immediate_realign: pending_limit_reached && !has_resume_coverage,
                 now: Instant::now(),
             },
         );
@@ -301,12 +304,7 @@ impl PlaybackOutputScheduler {
         let pending_contiguous_until_nsecs = self
             .pending_start_audio
             .contiguous_range_nsecs()
-            .filter(|(start_nsecs, _)| {
-                *start_nsecs
-                    <= audio_waterline
-                        .resume_timeline_nsecs
-                        .saturating_add(duration_nsecs(AUDIO_RESUME_INPUT_SUPPRESSION_MARGIN))
-            })
+            .filter(|_| pending_resume_coverage)
             .map(|(_, end_nsecs)| end_nsecs);
         let decoded_contiguous_until_nsecs = audio_waterline
             .decoded_audio_forward_nsecs
@@ -343,7 +341,7 @@ impl PlaybackOutputScheduler {
         } else {
             (
                 "output_wait_audio_reader_continuity_gap",
-                proactive_reader_limit_nsecs?,
+                proactive_reader_limit_nsecs.unwrap_or(blocked_rebuffer_reader_limit_nsecs),
             )
         };
         if reader_head_start_nsecs <= reader_limit_nsecs {

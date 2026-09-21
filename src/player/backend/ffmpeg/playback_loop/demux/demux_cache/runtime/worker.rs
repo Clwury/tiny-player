@@ -260,6 +260,7 @@ pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_
                     "FFmpeg demux producer recovered after bounded read retries"
                 );
             }
+            timeline.set_packet_format(&mut packet);
             match timeline.cache_packet(&packet, &shared.event_tx) {
                 Ok(Some(cached)) => {
                     if shared.should_discard_demux_read_result(demux_input_generation) {

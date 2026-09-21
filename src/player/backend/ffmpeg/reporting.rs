@@ -54,6 +54,12 @@ pub(super) struct BufferedReporter {
 }
 
 impl BufferedReporter {
+    pub(super) fn disable_audio(&mut self) {
+        self.needs_audio = false;
+        self.audio_buffered_until = None;
+        self.last_report = None;
+    }
+
     pub(super) fn new_with_events(needs_audio: bool, emit_events: bool) -> Self {
         Self {
             last_report: None,

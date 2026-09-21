@@ -69,7 +69,7 @@ fn demux_packet_cache_forced_low_level_seek_bypasses_cached_hit() {
     };
 
     assert_eq!(
-        cache.seek_low_level(0.5, PlaybackSessionId(9), 12, "test_forced_seek"),
+        cache.seek_low_level(0.5, PlaybackSessionId(9), 12, "test_forced_seek", false),
         DemuxSeekResult::Requested
     );
 
@@ -115,14 +115,14 @@ fn audio_restart_low_level_seek_replaces_prefetch_with_missing_audio() {
         assert!(
             state
                 .resolve_cached_seek_plan_attempt(500_000_000, PlaybackSeekMode::Precise, false)
-                .is_ok(),
-            "a cached seek can hit before the later audio gap"
+                .is_err(),
+            "reselecting audio must not reuse packets from before it was disabled"
         );
         let audio_starts = state.read_range().stream_queues[&1]
             .iter()
             .map(|packet_id| state.packets[packet_id].start_nsecs.unwrap() / 1_000_000_000)
             .collect::<Vec<_>>();
-        assert_eq!(audio_starts, vec![0, 1, 2, 3, 4, 8, 9]);
+        assert_eq!(audio_starts, vec![8, 9]);
         state.read_range_id
     };
     let cache = DemuxPacketCache {
@@ -131,7 +131,7 @@ fn audio_restart_low_level_seek_replaces_prefetch_with_missing_audio() {
     };
 
     assert_eq!(
-        cache.seek_low_level(0.5, PlaybackSessionId(2), 1, "audio_track_change"),
+        cache.seek_low_level(0.5, PlaybackSessionId(2), 1, "audio_track_change", false),
         DemuxSeekResult::Requested
     );
 

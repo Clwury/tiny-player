@@ -3,7 +3,7 @@ use std::{collections::VecDeque, os::raw::c_int, sync::mpsc::Sender};
 use ffmpeg_sys_next as ffi;
 
 use crate::player::{
-    backend::{BackendEvent, BackendSubtitleCue},
+    backend::{BackendEvent, BackendEventKind, BackendSubtitleCue},
     render_host::{PlaybackSessionId, RenderSize},
 };
 
@@ -64,6 +64,17 @@ impl SubtitlePipeline {
     ) -> Self {
         Self {
             worker: Some(worker),
+            ..Self::empty_for_test()
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn with_external_cues_for_test(
+        cues: Vec<BackendSubtitleCue>,
+    ) -> Self {
+        Self {
+            cues: subtitle_cue_queue_from_external(&cues, 0),
+            external_cues: cues,
             ..Self::empty_for_test()
         }
     }
@@ -129,6 +140,24 @@ impl SubtitlePipeline {
         self.worker
             .as_ref()
             .map(|worker| worker.info().stream_index)
+    }
+
+    pub(super) fn disable(
+        &mut self,
+        session_id: PlaybackSessionId,
+        event_tx: &Sender<BackendEvent>,
+    ) {
+        self.stream = None;
+        self.packets.clear();
+        self.external_cues.clear();
+        self.cues.clear();
+        self.active = None;
+        self.needs_prefetch = false;
+        let _ = event_tx.send(BackendEvent::new(
+            session_id,
+            BackendEventKind::SubtitleChanged(None),
+        ));
+        self.worker = None;
     }
 
     pub(super) fn needs_prefetch(&self) -> bool {
@@ -565,6 +594,28 @@ mod tests {
             start_nsecs: None,
             frame_duration_nsecs: None,
         }
+    }
+
+    #[test]
+    fn subtitle_off_clears_active_external_cues_without_reviving_them_after_seek() {
+        let active = cue("active", 0, 10_000_000_000);
+        let mut pipeline =
+            subtitle_pipeline(None, vec![active.clone()], VecDeque::from([active.clone()]));
+        pipeline.active = Some(active);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = super::PlaybackSessionId(1);
+        pipeline.disable(session, &tx);
+        assert!(pipeline.active.is_none());
+        assert!(pipeline.cues.is_empty());
+        assert!(pipeline.external_cues.is_empty());
+        pipeline.reset_cues_for_position(1_000_000_000);
+        pipeline.update_overlay(1_000_000_000, session, &tx);
+        let events = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].kind,
+            super::BackendEventKind::SubtitleChanged(None)
+        ));
     }
 
     fn snapshot(

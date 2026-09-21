@@ -236,6 +236,12 @@ impl HomeContent {
                 !has_authentication_error && self.has_visible_notifications(),
                 |this| this.child(deferred(self.render_notification_layer(cx)).with_priority(3)),
             )
+            .when(is_detail && !has_authentication_error, |this| {
+                this.children(
+                    self.render_movie_overview_overlay(window, cx)
+                        .map(|overlay| deferred(overlay).with_priority(4)),
+                )
+            })
     }
 
     fn render_workspace_layer(

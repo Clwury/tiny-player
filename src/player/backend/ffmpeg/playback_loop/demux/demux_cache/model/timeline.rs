@@ -1,5 +1,6 @@
 use std::{os::raw::c_int, sync::mpsc::Sender};
 
+use crate::player::backend::ffmpeg::codec::NalPacketFormat;
 use ffmpeg_sys_next as ffi;
 
 use crate::player::backend::ffmpeg::playback_loop::subtitle_cue_timeline_nsecs;
@@ -14,6 +15,7 @@ use super::{
 
 pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) struct DemuxPacketTimeline {
     video_stream: StreamInfo,
+    video_nal_format: Option<NalPacketFormat>,
     audio_stream: Option<StreamInfo>,
     subtitle_stream: Option<StreamInfo>,
     video_frame_duration_nsecs: u64,
@@ -43,6 +45,7 @@ impl DemuxPacketTimeline {
         let buffered_reporter = BufferedReporter::new_with_events(false, false);
         Self {
             video_stream,
+            video_nal_format: NalPacketFormat::for_stream(video_stream),
             audio_stream,
             subtitle_stream,
             video_frame_duration_nsecs,
@@ -67,6 +70,15 @@ impl DemuxPacketTimeline {
             ),
             buffered_reporter,
             session_id,
+        }
+    }
+
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn set_packet_format(
+        &self,
+        packet: &mut AvPacket,
+    ) {
+        if packet.stream_index() == self.video_stream.index {
+            packet.set_nal_format(self.video_nal_format);
         }
     }
 

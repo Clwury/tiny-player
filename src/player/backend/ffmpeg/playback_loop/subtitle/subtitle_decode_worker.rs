@@ -308,7 +308,13 @@ impl SubtitleDecodeWorker {
 
 impl Drop for SubtitleDecodeWorker {
     fn drop(&mut self) {
-        let _ = self.command_tx.send(SubtitleDecodeCommand::Shutdown);
+        // Off can arrive while both bounded channels are full. Release the
+        // result consumer before joining, then disconnect queued commands.
+        let (_, disconnected_rx) = mpsc::channel();
+        drop(std::mem::replace(&mut self.result_rx, disconnected_rx));
+        let _ = self.command_tx.try_send(SubtitleDecodeCommand::Shutdown);
+        let (disconnected_tx, _) = mpsc::sync_channel(0);
+        drop(std::mem::replace(&mut self.command_tx, disconnected_tx));
         if let Some(handle) = self.handle.take()
             && handle.join().is_err()
         {

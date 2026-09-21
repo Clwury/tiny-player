@@ -32,6 +32,7 @@ pub struct FfmpegBackend {
     pub(super) current_url: Option<String>,
     pub(super) current_request: Option<BackendLoadRequest>,
     pub(super) current_session_id: PlaybackSessionId,
+    subtitle_off_session: Option<PlaybackSessionId>,
     pub(super) loaded: bool,
     pub(super) user_paused: bool,
     pub(super) paused: bool,
@@ -58,6 +59,7 @@ impl FfmpegBackend {
             current_url: None,
             current_request: None,
             current_session_id: PlaybackSessionId::default(),
+            subtitle_off_session: None,
             loaded: false,
             user_paused: true,
             paused: true,
@@ -302,9 +304,20 @@ impl FfmpegBackend {
     }
 
     fn drain_worker_events(&mut self, events: &mut Vec<BackendEvent>) {
-        while let Ok(event) = self.event_rx.try_recv() {
+        while let Ok(mut event) = self.event_rx.try_recv() {
             if event.session_id != self.current_session_id {
                 continue;
+            }
+            if self.subtitle_off_session == Some(event.session_id) {
+                // Off keeps the playback session. An already queued cue or
+                // initial track-resolution event must not undo that choice.
+                match &mut event.kind {
+                    BackendEventKind::SubtitleChanged(Some(_)) => continue,
+                    BackendEventKind::PlaybackTracksChanged { selected, .. } => {
+                        selected.set_subtitle_track(None);
+                    }
+                    _ => {}
+                }
             }
             let forward_original = !matches!(&event.kind, BackendEventKind::CacheStateChanged(_));
             let cache_update = self.cache_update_for_event(&event);
@@ -556,6 +569,16 @@ impl BackendControl for FfmpegBackend {
     }
 
     fn set_audio_track(&mut self, track_index: Option<usize>, position_seconds: f64) -> Result<()> {
+        if track_index.is_none() {
+            let worker = self.worker.as_ref().ok_or_else(|| {
+                BackendError::Ffmpeg("FFmpeg 尚未加载可切换轨道的媒体".to_string())
+            })?;
+            worker.disable_audio()?;
+            if let Some(request) = self.current_request.as_mut() {
+                request.selected_tracks.audio_stream_index = None;
+            }
+            return Ok(());
+        }
         let mut selected_tracks = self
             .current_request
             .as_ref()
@@ -570,6 +593,17 @@ impl BackendControl for FfmpegBackend {
         track: Option<PlaybackTrack>,
         position_seconds: f64,
     ) -> Result<()> {
+        if track.is_none() {
+            let worker = self.worker.as_ref().ok_or_else(|| {
+                BackendError::Ffmpeg("FFmpeg 尚未加载可切换轨道的媒体".to_string())
+            })?;
+            worker.disable_subtitles()?;
+            self.subtitle_off_session = Some(self.current_session_id);
+            if let Some(request) = self.current_request.as_mut() {
+                request.selected_tracks.set_subtitle_track(None);
+            }
+            return Ok(());
+        }
         let mut selected_tracks = self
             .current_request
             .as_ref()

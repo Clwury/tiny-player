@@ -77,7 +77,11 @@ pub(super) fn service_rebuffer_audio_realign_seek_if_needed(
         .is_some_and(AudioDecodePipeline::has_deferred_output_frame);
     let execution_decision = audio_realign_execution_decision(
         coverage,
-        if retained_far_ahead_frame {
+        if retained_far_ahead_frame
+            || pipeline
+                .output_scheduler
+                .pending_resume_audio_limit_reached()
+        {
             0
         } else {
             audio_decode_snapshot

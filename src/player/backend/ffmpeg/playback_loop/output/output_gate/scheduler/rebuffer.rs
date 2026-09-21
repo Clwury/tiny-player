@@ -1,6 +1,38 @@
 use super::*;
 
 impl PlaybackOutputScheduler {
+    pub(in crate::player::backend::ffmpeg::playback_loop) fn disable_audio(
+        &mut self,
+        scheduler: &mut PlaybackScheduler,
+        timeline_nsecs: u64,
+        control: &FfmpegControl,
+    ) {
+        self.update_video_deadline_audio_clock(None);
+        control.set_audio_output_lifecycle(AudioOutputLifecycle::Syncing);
+        control.set_output_underrun_for_cache_pause(false);
+        self.pending_start_audio.clear();
+        self.audio_input_eof = false;
+        self.rebuffer_audio_realign_request = None;
+        self.audio_reader_gap_watchdog = None;
+        self.audio_gap_recovery_until = None;
+        self.audio_gap_recovery_target_nsecs = None;
+        self.audio_realign_exhausted_range_nsecs = None;
+        self.audio_sync_drop_before_timeline_nsecs = None;
+        self.audio_continuity_rejection_summary = None;
+        self.reset_audio_output_activity_watchdog();
+        self.initial_av_start_transaction = None;
+        self.initial_av_pair_started_at = None;
+        self.initial_delayed_audio_start_timeline_nsecs = None;
+        self.initial_audio_gap_at_video_start_timeline_nsecs = None;
+        if !self.restart_pending() {
+            self.clear_rebuffer(control);
+            self.set_state(PlaybackOutputState::Playing);
+        }
+        scheduler.reset(timeline_nsecs);
+        self.mark_video_clock_anchor_valid();
+        self.note_output_housekeeping_change();
+    }
+
     pub(in crate::player::backend::ffmpeg) fn clear_rebuffer(&mut self, control: &FfmpegControl) {
         clear_video_output_rebuffer(&mut self.playback_output_state, control);
         self.video_output_underrun_started_at = None;

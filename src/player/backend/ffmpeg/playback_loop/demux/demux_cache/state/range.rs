@@ -307,6 +307,29 @@ impl DemuxPacketCacheState {
         self.rejected_cached_seek_ranges.remove(&range_id);
     }
 
+    pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn discard_ranges_before_track_refresh(
+        &mut self,
+    ) {
+        // Called under the seek commit lock, after request_seek has fenced
+        // in-flight demux reads and created an empty range. Like mpv's refresh
+        // seek, discard retained packets that predate selecting this subtitle
+        // track. Sparse subtitles cannot bound A/V ranges by their cue times.
+        debug_assert!(self.read_range().global_order.is_empty());
+        debug_assert_eq!(self.read_range_id, self.append_range_id);
+        let stale_ranges = self
+            .ranges
+            .keys()
+            .copied()
+            .filter(|range_id| *range_id != self.read_range_id)
+            .collect::<Vec<_>>();
+        for range_id in stale_ranges {
+            if let Some(range) = self.ranges.remove(&range_id) {
+                self.remove_range_packets(range);
+            }
+        }
+        self.bump_seekability_revision();
+    }
+
     pub(in crate::player::backend::ffmpeg::playback_loop::demux_cache) fn mark_read_stream_bof(
         &mut self,
         stream_index: c_int,

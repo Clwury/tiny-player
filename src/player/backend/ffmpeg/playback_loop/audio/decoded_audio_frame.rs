@@ -203,7 +203,10 @@ fn service_decoded_audio_frame(
         session_id,
         "decoded_audio_continuity_restored",
     );
-    if timestamp.timeline_nsecs < current_start_position_nsecs {
+    // Keep the part of a PCM frame that covers the seek target. The pending
+    // queue clips its samples after accepting ownership, so a deferred frame
+    // can still be retried with its original timestamp and payload.
+    if buffered_until_nsecs <= current_start_position_nsecs {
         *dropped_audio_frames_before_start_count =
             (*dropped_audio_frames_before_start_count).saturating_add(1);
         if *dropped_audio_frames_before_start_count == 1 {
@@ -236,6 +239,11 @@ fn service_decoded_audio_frame(
         audio,
         timestamp.timeline_nsecs,
         buffered_until_nsecs,
+        current_start_position_nsecs.max(
+            output_scheduler
+                .audio_sync_drop_before_timeline_nsecs()
+                .unwrap_or_default(),
+        ),
         session_id,
         vo_queue,
         frame_presented,
@@ -637,13 +645,158 @@ pub(super) fn process_audio_decode_drain_result(
 mod tests {
     use super::super::{DecodedAudio, PendingStartAudio};
     use super::{
-        AudioDecodeOutputDrainWorker, DecodedAudioAdmission, PENDING_AUDIO_CONTINUITY_TOLERANCE,
-        TimestampMapper, commit_audio_timestamp_mapping_if_accepted,
+        AudioDecodeOutputDrainWorker, AudioDecodedFrame, AudioOutput, BufferedReporter,
+        DecodedAudioAdmission, DecodedAudioFrameServiceStatus, FfmpegControl,
+        PENDING_AUDIO_CONTINUITY_TOLERANCE, PlaybackOutputScheduler, PositionReporter,
+        SubtitlePipeline, TimestampMapper, commit_audio_timestamp_mapping_if_accepted,
         decoded_audio_frame_drops_before_rebuffer_audio_sync_drop_before as drops_before_sync_watermark,
         far_ahead_audio_frame_is_contiguous, keep_filling_audio_resume_waterline,
-        service_audio_worker_before_front_generation,
+        service_audio_worker_before_front_generation, service_decoded_audio_frame,
     };
+    use crate::player::render_host::{PlaybackSessionId, VideoOutputQueue};
     use ffmpeg_sys_next as ffi;
+    use std::sync::{Arc, atomic::AtomicBool, mpsc};
+
+    fn service_seek_audio_for_test(
+        frame: AudioDecodedFrame,
+        target: u64,
+        clock: &mut TimestampMapper,
+        scheduler: &mut PlaybackOutputScheduler,
+    ) -> DecodedAudioFrameServiceStatus {
+        let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
+        let output = AudioOutput::stopped_for_test(Arc::clone(&control), 96_000, 48_000, 2);
+        output.reset_clock(target);
+        let (event_tx, _event_rx) = mpsc::channel();
+        service_decoded_audio_frame(
+            frame,
+            false,
+            ffi::AVRational {
+                num: 1,
+                den: 1_000_000_000,
+            },
+            &control,
+            Some(&output),
+            clock,
+            target,
+            &mut 0,
+            scheduler,
+            PlaybackSessionId(1),
+            &VideoOutputQueue::default(),
+            &AtomicBool::new(false),
+            &mut PositionReporter::default(),
+            &event_tx,
+            &mut SubtitlePipeline::empty_for_test(),
+            &mut BufferedReporter::new_with_events(true, false),
+        )
+        .expect("decoded audio is admitted or deferred")
+    }
+
+    #[test]
+    fn seek_audio_retains_samples_crossing_649_recovery_target() {
+        let target = 419_502_000_000;
+        let start = 419_498_000_000;
+        let duration = 85_333_333;
+        let mut clock = TimestampMapper::new(Some(0), target, None);
+        let mut scheduler = PlaybackOutputScheduler::new();
+        let samples: Vec<f32> = (0..8192).map(|sample| sample as f32).collect();
+        let status = service_seek_audio_for_test(
+            AudioDecodedFrame {
+                raw_timestamp: start as i64,
+                audio: DecodedAudio {
+                    samples: samples.clone(),
+                    duration_nsecs: duration,
+                },
+            },
+            target,
+            &mut clock,
+            &mut scheduler,
+        );
+        assert!(matches!(
+            status,
+            DecodedAudioFrameServiceStatus::ContinueDrain
+        ));
+        assert_eq!(clock.last_contiguous_end_nsecs(), Some(start + duration));
+        assert_eq!(
+            scheduler.pending_audio_contiguous_range_nsecs(),
+            Some((target, start + duration))
+        );
+        assert_eq!(
+            scheduler.pending_start_audio.buffered_duration().as_nanos(),
+            81_333_333
+        );
+        let frame = scheduler
+            .pending_start_audio
+            .pop_front_until(u64::MAX)
+            .unwrap();
+        assert_eq!(frame.samples, samples[384..]); // 4ms * 48kHz * stereo
+    }
+
+    #[test]
+    fn seek_audio_drops_only_frames_ending_at_or_before_target() {
+        for end_offset in [0, 1] {
+            let target = 10_000_000_000;
+            let mut clock = TimestampMapper::new(Some(0), target, None);
+            let mut scheduler = PlaybackOutputScheduler::new();
+            service_seek_audio_for_test(
+                AudioDecodedFrame {
+                    raw_timestamp: (target - 20_000_000 - end_offset) as i64,
+                    audio: DecodedAudio {
+                        samples: vec![0.25; 1920],
+                        duration_nsecs: 20_000_000,
+                    },
+                },
+                target,
+                &mut clock,
+                &mut scheduler,
+            );
+            assert!(scheduler.pending_start_audio.is_empty());
+            assert_eq!(clock.last_contiguous_end_nsecs(), Some(target - end_offset));
+        }
+    }
+
+    #[test]
+    fn resume_audio_limit_defers_original_frame_without_advancing_clock() {
+        let target = 419_502_000_000;
+        let start = target - 4_000_000;
+        let duration = 85_333_333;
+        let mut clock = TimestampMapper::new(Some(0), target, None);
+        let mut scheduler = PlaybackOutputScheduler::new();
+        scheduler.pending_start_audio.push(
+            DecodedAudio {
+                samples: vec![0.0; 192_000],
+                duration_nsecs: 2_000_000_000,
+            },
+            target + 80_961_404,
+            target + 2_080_961_404,
+        );
+        let samples = vec![0.25; 8192];
+        let status = service_seek_audio_for_test(
+            AudioDecodedFrame {
+                raw_timestamp: start as i64,
+                audio: DecodedAudio {
+                    samples: samples.clone(),
+                    duration_nsecs: duration,
+                },
+            },
+            target,
+            &mut clock,
+            &mut scheduler,
+        );
+        let DecodedAudioFrameServiceStatus::Deferred(frame) = status else {
+            panic!("full resume queue must retain the decoded frame for retry");
+        };
+        assert_eq!(frame.raw_timestamp, start as i64);
+        assert_eq!(frame.audio.duration_nsecs, duration);
+        assert_eq!(frame.audio.samples, samples);
+        assert_eq!(clock.last_contiguous_end_nsecs(), None);
+        scheduler.pending_start_audio.clear();
+        service_seek_audio_for_test(frame, target, &mut clock, &mut scheduler);
+        assert_eq!(
+            scheduler.pending_audio_contiguous_range_nsecs(),
+            Some((target, start + duration))
+        );
+        assert_eq!(scheduler.pending_start_audio.queued_samples(), 8192 - 384);
+    }
 
     #[derive(Default)]
     struct RecoveringWorkerWithoutTrackedGeneration {

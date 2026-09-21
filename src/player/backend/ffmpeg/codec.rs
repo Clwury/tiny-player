@@ -109,6 +109,41 @@ pub(super) enum VideoRecoveryPointKind {
 #[path = "codec/recovery_points.rs"]
 mod recovery_points;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NalPacketFormat {
+    AnnexB,
+    LengthPrefixed { length_size: usize },
+}
+
+impl NalPacketFormat {
+    pub(super) fn for_stream(stream: StreamInfo) -> Option<Self> {
+        let parameters = unsafe { stream.stream.as_ref()?.codecpar.as_ref()? };
+        if parameters.extradata.is_null() || parameters.extradata_size <= 0 {
+            return None;
+        }
+        let data = unsafe {
+            slice::from_raw_parts(parameters.extradata, parameters.extradata_size as usize)
+        };
+        Self::from_extradata(stream.codec_id, data)
+    }
+
+    fn from_extradata(codec_id: ffi::AVCodecID, data: &[u8]) -> Option<Self> {
+        let length_size_byte = match codec_id {
+            ffi::AVCodecID::AV_CODEC_ID_H264 if data.len() >= 7 && data[0] == 1 => data[4],
+            ffi::AVCodecID::AV_CODEC_ID_HEVC if data.len() >= 23 && data[0] == 1 => data[21],
+            ffi::AVCodecID::AV_CODEC_ID_H264 | ffi::AVCodecID::AV_CODEC_ID_HEVC
+                if access_unit_starts_with_annex_b_start_code(data) =>
+            {
+                return Some(Self::AnnexB);
+            }
+            _ => return None,
+        };
+        Some(Self::LengthPrefixed {
+            length_size: usize::from(length_size_byte & 3) + 1,
+        })
+    }
+}
+
 pub(super) fn packet_video_recovery_point_kind(
     packet: &AvPacket,
     codec_id: ffi::AVCodecID,
@@ -117,7 +152,7 @@ pub(super) fn packet_video_recovery_point_kind(
         ffi::AVCodecID::AV_CODEC_ID_H264 => packet
             .data()
             .map(|data| {
-                h264_access_unit_recovery_state(data)
+                h264_access_unit_recovery_state(data, packet.nal_format)
                     .map(|recovery| {
                         if recovery {
                             VideoRecoveryPointKind::Idr
@@ -143,7 +178,7 @@ pub(super) fn packet_video_recovery_point_kind(
         ffi::AVCodecID::AV_CODEC_ID_HEVC => packet
             .data()
             .map(|data| {
-                hevc_access_unit_recovery_kind(data).unwrap_or_else(|| {
+                hevc_access_unit_recovery_kind(data, packet.nal_format).unwrap_or_else(|| {
                     if packet.is_key() {
                         VideoRecoveryPointKind::Keyframe
                     } else {
@@ -175,11 +210,11 @@ pub(super) fn packet_is_video_seek_point(packet: &AvPacket, codec_id: ffi::AVCod
     match codec_id {
         ffi::AVCodecID::AV_CODEC_ID_H264 => packet
             .data()
-            .map(|data| h264_access_unit_recovery_state(data).unwrap_or(true))
+            .map(|data| h264_access_unit_recovery_state(data, packet.nal_format).unwrap_or(true))
             .unwrap_or(true),
         ffi::AVCodecID::AV_CODEC_ID_HEVC => packet
             .data()
-            .map(|data| hevc_access_unit_seek_state(data).unwrap_or(false))
+            .map(|data| hevc_access_unit_seek_state(data, packet.nal_format).unwrap_or(false))
             .unwrap_or(false),
         _ => true,
     }
@@ -202,16 +237,19 @@ pub(super) fn packet_is_audio_recovery_point(packet: &AvPacket, codec_id: ffi::A
     })
 }
 
-fn h264_access_unit_recovery_state(data: &[u8]) -> Option<bool> {
-    access_unit_nal_recovery_state(data, |nal| {
+fn h264_access_unit_recovery_state(data: &[u8], format: Option<NalPacketFormat>) -> Option<bool> {
+    access_unit_nal_recovery_state(data, format, |nal| {
         nal.first()
             .is_some_and(|header| header & 0x1f == H264_NAL_IDR)
     })
 }
 
-fn hevc_access_unit_recovery_kind(data: &[u8]) -> Option<VideoRecoveryPointKind> {
+fn hevc_access_unit_recovery_kind(
+    data: &[u8],
+    format: Option<NalPacketFormat>,
+) -> Option<VideoRecoveryPointKind> {
     let mut recovery_kind = VideoRecoveryPointKind::None;
-    access_unit_nal_recovery_state(data, |nal| {
+    access_unit_nal_recovery_state(data, format, |nal| {
         let Some(header) = nal.first() else {
             return false;
         };
@@ -228,10 +266,10 @@ fn hevc_access_unit_recovery_kind(data: &[u8]) -> Option<VideoRecoveryPointKind>
     .map(|_| recovery_kind)
 }
 
-fn hevc_access_unit_seek_state(data: &[u8]) -> Option<bool> {
+fn hevc_access_unit_seek_state(data: &[u8], format: Option<NalPacketFormat>) -> Option<bool> {
     let mut found_safe_seek_vcl = false;
     let mut found_unsafe_vcl = false;
-    access_unit_nal_recovery_state(data, |nal| {
+    access_unit_nal_recovery_state(data, format, |nal| {
         if let Some(header) = nal.first() {
             let nal_type = hevc_nal_type(*header);
             if hevc_nal_is_vcl(nal_type) {
@@ -276,14 +314,22 @@ fn hevc_nal_is_safe_seek_point(nal_type: u8) -> bool {
 
 fn access_unit_nal_recovery_state(
     data: &[u8],
+    format: Option<NalPacketFormat>,
     mut matches_nal: impl FnMut(&[u8]) -> bool,
 ) -> Option<bool> {
-    if access_unit_starts_with_annex_b_start_code(data)
-        && let Some(result) = access_unit_has_annex_b_nal(data, &mut matches_nal)
-    {
-        return Some(result);
+    match format {
+        Some(NalPacketFormat::AnnexB) => {
+            return access_unit_has_annex_b_nal(data, &mut matches_nal);
+        }
+        Some(NalPacketFormat::LengthPrefixed { length_size }) => {
+            return access_unit_has_length_prefixed_nal(data, length_size, &mut matches_nal);
+        }
+        None => {}
     }
 
+    // A four-byte NAL length of 0x100..0x1ff also starts with 00 00 01.
+    // Without codec extradata, validate the entire length-prefixed access unit
+    // before considering Annex B. Never classify the length's last byte as a NAL.
     for length_size in [4, 3, 2, 1] {
         match access_unit_has_length_prefixed_nal(data, length_size, &mut matches_nal) {
             Some(result) => return Some(result),
@@ -291,11 +337,7 @@ fn access_unit_nal_recovery_state(
         }
     }
 
-    if !access_unit_starts_with_annex_b_start_code(data) {
-        return access_unit_has_annex_b_nal(data, &mut matches_nal);
-    }
-
-    None
+    access_unit_has_annex_b_nal(data, &mut matches_nal)
 }
 
 fn access_unit_has_annex_b_nal(
@@ -352,6 +394,8 @@ fn access_unit_has_length_prefixed_nal(
 ) -> Option<bool> {
     let mut cursor = 0;
     let mut found_nal = false;
+    // Validate first: a recovery NAL at the beginning must not hide a truncated
+    // later NAL, or mutate the classifier while probing the wrong length size.
     while cursor < data.len() {
         let len_end = cursor.checked_add(length_size)?;
         if len_end > data.len() {
@@ -367,6 +411,14 @@ fn access_unit_has_length_prefixed_nal(
             return None;
         }
         found_nal = true;
+        cursor = nal_end;
+    }
+    cursor = 0;
+    while cursor < data.len() {
+        let len_end = cursor + length_size;
+        let nal_len = read_be_nal_len(&data[cursor..len_end])?;
+        cursor = len_end;
+        let nal_end = cursor + nal_len;
         if matches_nal(&data[cursor..nal_end]) {
             return Some(true);
         }
@@ -484,6 +536,7 @@ pub(super) struct AvPacketReadDiagnostic {
 pub(super) struct AvPacket {
     ptr: *mut ffi::AVPacket,
     read_diagnostic: Option<Arc<AvPacketReadDiagnostic>>,
+    nal_format: Option<NalPacketFormat>,
 }
 
 #[path = "codec/packet.rs"]
@@ -565,9 +618,9 @@ mod tests {
     use ffmpeg_sys_next as ffi;
 
     use super::{
-        AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, VideoRecoveryPointKind,
-        audio_codec_requires_recovery_point, packet_is_audio_recovery_point,
-        packet_is_video_recovery_point, packet_is_video_seek_point,
+        AvPacket, AvPacketReadDiagnostic, AvPacketStorageKind, NalPacketFormat,
+        VideoRecoveryPointKind, audio_codec_requires_recovery_point,
+        packet_is_audio_recovery_point, packet_is_video_recovery_point, packet_is_video_seek_point,
         packet_video_recovery_point_kind, parse_vulkan_decode_thread_count,
         video_error_recognition, vulkan_decode_codec_needs_single_thread,
     };
@@ -694,6 +747,105 @@ mod tests {
             &packet,
             ffi::AVCodecID::AV_CODEC_ID_HEVC
         ));
+    }
+
+    #[test]
+    fn hevc_nal_lengths_resembling_start_codes_never_become_recovery_points() {
+        for nal_len in 256u32..512 {
+            let mut data = nal_len.to_be_bytes().to_vec();
+            data.extend_from_slice(&[0x02, 0x01]); // TRAIL_R
+            data.resize(nal_len as usize + 4, 0x55);
+            let mut packet = packet_from_data(&data);
+            for format in [
+                None,
+                Some(NalPacketFormat::LengthPrefixed { length_size: 4 }),
+            ] {
+                packet.set_nal_format(format);
+                assert_eq!(
+                    packet_video_recovery_point_kind(&packet, ffi::AVCodecID::AV_CODEC_ID_HEVC),
+                    VideoRecoveryPointKind::None,
+                    "NAL length {nal_len}, format {format:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hevc_explicit_packet_format_survives_disk_payload_rebuild() {
+        // The same bytes can be a BLA Annex-B NAL or a length-prefixed TRAIL_R.
+        let mut data = 288u32.to_be_bytes().to_vec();
+        data.extend_from_slice(&[0x02, 0x01]);
+        data.resize(292, 0x55);
+        for (format, expected) in [
+            (NalPacketFormat::AnnexB, VideoRecoveryPointKind::Bla),
+            (
+                NalPacketFormat::LengthPrefixed { length_size: 4 },
+                VideoRecoveryPointKind::None,
+            ),
+        ] {
+            let mut packet = packet_from_data(&data);
+            packet.set_nal_format(Some(format));
+            let cloned = AvPacket::ref_from(&packet).unwrap();
+            let props = AvPacket::props_from(&cloned).unwrap();
+            let mut restored = AvPacket::from_data_and_props(&data, &props).unwrap();
+            assert_eq!(restored.nal_format, Some(format));
+            assert_eq!(
+                packet_video_recovery_point_kind(&restored, ffi::AVCodecID::AV_CODEC_ID_HEVC),
+                expected,
+            );
+            restored.unref();
+            assert_eq!(restored.nal_format, None);
+        }
+    }
+
+    #[test]
+    fn video_nal_format_uses_avcc_and_hvcc_length_sizes() {
+        for length_size in 1..=4 {
+            let mut avcc = [0u8; 7];
+            avcc[0] = 1;
+            avcc[4] = 0xfc | (length_size - 1) as u8;
+            let mut hvcc = [0u8; 23];
+            hvcc[0] = 1;
+            hvcc[21] = 0xfc | (length_size - 1) as u8;
+            for (codec, data) in [
+                (ffi::AVCodecID::AV_CODEC_ID_H264, &avcc[..]),
+                (ffi::AVCodecID::AV_CODEC_ID_HEVC, &hvcc[..]),
+            ] {
+                assert_eq!(
+                    NalPacketFormat::from_extradata(codec, data),
+                    Some(NalPacketFormat::LengthPrefixed { length_size })
+                );
+                assert_eq!(NalPacketFormat::from_extradata(codec, &data[..4]), None);
+            }
+        }
+    }
+
+    #[test]
+    fn hevc_length_prefixed_recovery_rejects_truncated_access_unit_tail() {
+        let mut packet = packet_from_data(&[0, 0, 0, 3, 0x26, 0x01, 0xaa, 0, 0, 0, 4, 0x02]);
+        packet.set_nal_format(Some(NalPacketFormat::LengthPrefixed { length_size: 4 }));
+        assert!(!packet_is_video_recovery_point(
+            &packet,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC
+        ));
+    }
+
+    #[test]
+    fn hevc_real_irap_with_ambiguous_length_keeps_its_actual_kind() {
+        for (header, expected) in [
+            (0x2a, VideoRecoveryPointKind::Cra),
+            (0x26, VideoRecoveryPointKind::Idr),
+            (0x20, VideoRecoveryPointKind::Bla),
+        ] {
+            let mut data = 290u32.to_be_bytes().to_vec();
+            data.extend_from_slice(&[header, 0x01]);
+            data.resize(294, 0x55);
+            let packet = packet_from_data(&data);
+            assert_eq!(
+                packet_video_recovery_point_kind(&packet, ffi::AVCodecID::AV_CODEC_ID_HEVC),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -350,6 +350,7 @@ impl DemuxPacketCache {
         session_id: PlaybackSessionId,
         seek_generation: u64,
         reason: &'static str,
+        refresh_cached_ranges: bool,
     ) -> DemuxSeekResult {
         let position_seconds = position_seconds.max(0.0);
         let target_nsecs = seconds_to_nsecs(position_seconds);
@@ -373,8 +374,16 @@ impl DemuxPacketCache {
                 .state
                 .lock()
                 .expect("FFmpeg demux packet cache poisoned");
+            if self.shared.control.has_pending_seek()
+                && self.shared.control.seek_generation() != seek_generation
+            {
+                return DemuxSeekResult::Superseded;
+            }
             guard.error = None;
             guard.request_seek(position_seconds, session_id, seek_generation, target_nsecs);
+            if refresh_cached_ranges {
+                guard.discard_ranges_before_track_refresh();
+            }
             tracing::debug!(
                 ?session_id,
                 position_seconds,
@@ -382,6 +391,7 @@ impl DemuxPacketCache {
                 seek_generation,
                 reason,
                 generation = guard.generation,
+                refresh_cached_ranges,
                 "FFmpeg demux packet cache forced low-level seek"
             );
             let cache_snapshot = guard.cache_report_snapshot(self.shared.control.is_cache_paused());

@@ -9,6 +9,52 @@ use crate::player::backend::ffmpeg::{AudioOutputLifecycle, FfmpegControl};
 use crate::player::render_host::{PlaybackSessionId, VideoOutputQueue};
 
 #[test]
+fn disabling_audio_preserves_decoded_video_and_resumes_on_video_clock() {
+    use crate::player::backend::ffmpeg::PlaybackScheduler;
+
+    for paused in [false, true] {
+        let control = FfmpegControl::new(PlaybackSessionId(1));
+        control.set_user_paused(paused);
+        control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing);
+        let mut scheduler = PlaybackOutputScheduler::new();
+        scheduler.mark_first_frame_presented();
+        scheduler.set_state(PlaybackOutputState::Playing);
+        scheduler.push_decoded_video_for_test(test_queued_video_frame(401_300_000_000));
+        scheduler.push_pending_start_audio_for_test(
+            DecodedAudio {
+                samples: vec![0.5; 1920],
+                duration_nsecs: 20_000_000,
+            },
+            401_300_000_000,
+            401_320_000_000,
+        );
+        scheduler.set_state(PlaybackOutputState::Rebuffering);
+        control.set_output_rebuffer_paused(true);
+        control.set_output_underrun_for_cache_pause(true);
+        let before_video = scheduler.scheduled_video_queue.range_nsecs();
+        let mut clock = PlaybackScheduler::new(100_000_000_000);
+
+        scheduler.disable_audio(&mut clock, 401_276_000_000, &control);
+
+        assert_eq!(scheduler.scheduled_video_queue.range_nsecs(), before_video);
+        assert_eq!(scheduler.scheduled_video_queue.len(), 1);
+        assert!(scheduler.pending_start_audio.is_empty());
+        assert!(!scheduler.restart_pending());
+        assert!(!scheduler.rebuffering());
+        assert!(scheduler.video_clock_anchor_valid());
+        assert!(clock.ready_for(401_276_000_000));
+        assert!(
+            !clock.ready_for(410_000_000_000),
+            "use presentation time, not decode-ahead time"
+        );
+        assert_eq!(control.is_user_paused(), paused);
+        assert!(!control.is_output_rebuffer_paused());
+        assert!(!control.output_underrun_for_cache_pause());
+        assert_eq!(control.seek_generation(), 0);
+    }
+}
+
+#[test]
 fn underrun_preserves_logged_partial_prefill_and_appends_across_short_pts_gap() {
     const PLAYED: u64 = 1_301_797_375_331;
     const AUDIO_END: u64 = 1_301_946_695_055;
