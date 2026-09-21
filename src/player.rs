@@ -19,7 +19,7 @@ pub use backend::{
     CacheUnlinkPolicy, PlaybackCacheConfig, PlaybackCacheMode, PlaybackSeekableCacheMode,
 };
 pub(crate) use language::{PlaybackLanguagePreferences, TrackLanguage};
-pub(crate) use media_metadata::format_video_size;
+pub(crate) use media_metadata::{format_video_size, premiere_day};
 pub use page::{
     EmbyPlaybackContext, PlaybackEvent, PlaybackPage, PlaybackQueue, PlaybackQueueItem,
     PlaybackRequest, PlaybackStateUpdate, PlaybackStopCompletion, PlaybackStopResult,

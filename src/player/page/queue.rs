@@ -406,6 +406,7 @@ mod tests {
             container: None,
             size: None,
             bitrate: None,
+            run_time_ticks: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(0),
                 stream_type: Some("Video".to_string()),
@@ -420,6 +421,9 @@ mod tests {
                 is_forced: None,
                 is_text_subtitle_stream: None,
                 supports_external_stream: None,
+                width: None,
+                height: None,
+                video_range: None,
             }]),
             default_subtitle_stream_index: None,
         }

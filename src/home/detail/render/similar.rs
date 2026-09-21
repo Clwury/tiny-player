@@ -159,8 +159,7 @@ impl HomeContent {
         &self,
         item: &MediaItem,
         cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let theme = theme::get(cx);
+    ) -> Option<impl IntoElement> {
         let links = item
             .external_urls
             .as_deref()
@@ -168,15 +167,17 @@ impl HomeContent {
             .iter()
             .filter_map(|link| Some((link.name()?.to_string(), link.url()?.to_string())))
             .collect::<Vec<_>>();
-        let has_links = !links.is_empty();
+        if links.is_empty() {
+            return None;
+        }
 
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(home_section_title("链接", cx))
-            .when(has_links, |this| {
-                this.child(div().flex().flex_wrap().gap_2().children(
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(home_section_title("链接", cx))
+                .child(div().flex().flex_wrap().gap_2().children(
                     links.into_iter().enumerate().map(|(index, (name, url))| {
                         detail_tag(name.clone(), true, cx)
                             .id((
@@ -185,15 +186,7 @@ impl HomeContent {
                             ))
                             .on_click(move |_, _, cx| cx.open_url(&url))
                     }),
-                ))
-            })
-            .when(!has_links, |this| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("暂无外部链接"),
-                )
-            })
+                )),
+        )
     }
 }

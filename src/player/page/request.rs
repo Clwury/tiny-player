@@ -521,6 +521,7 @@ mod tests {
             container: None,
             size: None,
             bitrate: None,
+            run_time_ticks: None,
             media_streams: Some(vec![
                 MediaStream {
                     index: None,
@@ -536,6 +537,9 @@ mod tests {
                     is_forced: None,
                     is_text_subtitle_stream: None,
                     supports_external_stream: None,
+                    width: None,
+                    height: None,
+                    video_range: None,
                 },
                 MediaStream {
                     index: Some(7),
@@ -551,6 +555,9 @@ mod tests {
                     is_forced: Some(true),
                     is_text_subtitle_stream: None,
                     supports_external_stream: None,
+                    width: None,
+                    height: None,
+                    video_range: None,
                 },
             ]),
             default_subtitle_stream_index: None,

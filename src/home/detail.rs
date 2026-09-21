@@ -599,6 +599,7 @@ mod tests {
             container: None,
             size: None,
             bitrate: None,
+            run_time_ticks: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(3),
                 stream_type: Some("Subtitle".to_string()),
@@ -616,6 +617,9 @@ mod tests {
                 is_forced: Some(false),
                 is_text_subtitle_stream: Some(true),
                 supports_external_stream: Some(true),
+                width: None,
+                height: None,
+                video_range: None,
             }]),
             default_subtitle_stream_index: None,
         };
@@ -645,6 +649,7 @@ mod tests {
             container: None,
             size: None,
             bitrate: None,
+            run_time_ticks: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(3),
                 stream_type: Some("Subtitle".to_string()),
@@ -659,6 +664,9 @@ mod tests {
                 is_forced: Some(false),
                 is_text_subtitle_stream: Some(true),
                 supports_external_stream: Some(true),
+                width: None,
+                height: None,
+                video_range: None,
             }]),
             default_subtitle_stream_index: None,
         };
@@ -686,6 +694,7 @@ mod tests {
             container: None,
             size: None,
             bitrate: None,
+            run_time_ticks: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(2),
                 stream_type: Some("Subtitle".to_string()),
@@ -700,6 +709,9 @@ mod tests {
                 is_forced: Some(false),
                 is_text_subtitle_stream: Some(true),
                 supports_external_stream: Some(true),
+                width: None,
+                height: None,
+                video_range: None,
             }]),
             default_subtitle_stream_index: None,
         };
@@ -724,6 +736,7 @@ mod tests {
             container: None,
             size: None,
             bitrate: None,
+            run_time_ticks: None,
             media_streams: Some(vec![MediaStream {
                 index: Some(2),
                 stream_type: Some("Subtitle".to_string()),
@@ -738,6 +751,9 @@ mod tests {
                 is_forced: Some(false),
                 is_text_subtitle_stream: Some(true),
                 supports_external_stream: Some(true),
+                width: None,
+                height: None,
+                video_range: None,
             }]),
             default_subtitle_stream_index: None,
         };

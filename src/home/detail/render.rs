@@ -56,6 +56,8 @@ mod controls;
 mod episodes;
 #[path = "render/hero.rs"]
 mod hero;
+#[path = "render/hero_metadata.rs"]
+mod hero_metadata;
 #[path = "render/people.rs"]
 mod people;
 #[path = "render/similar.rs"]

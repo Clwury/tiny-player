@@ -245,6 +245,9 @@ fn user_view_card_image<T>(image_path: Option<Arc<Path>>, cx: &Context<T>) -> im
             this.flex()
                 .w(px(USER_VIEW_CARD_WIDTH_PX))
                 .h(px(USER_VIEW_CARD_IMAGE_HEIGHT_PX))
+                .rounded_lg()
+                .overflow_hidden()
+                .bg(theme.input_background)
                 .items_center()
                 .justify_center()
                 .child(
@@ -1199,7 +1202,7 @@ mod tests {
                 USER_VIEW_CARD_IMAGE_HEIGHT_PX as u32,
             )
             .unwrap(),
-            (0, 60, 160, 92)
+            (0, 61, 160, 90)
         );
     }
 

@@ -931,6 +931,7 @@ mod tests {
             parent_backdrop_image_tags: None,
             series_primary_image_tag: None,
             media_sources: None,
+            media_streams: None,
             people: None,
             studios: None,
             external_urls: None,
@@ -1049,6 +1050,7 @@ mod tests {
             container: None,
             size: None,
             bitrate: None,
+            run_time_ticks: None,
             media_streams: None,
             default_subtitle_stream_index: None,
         }
