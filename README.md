@@ -1,6 +1,6 @@
 # Tiny Player
 
-English | [简体中文](README.zh)
+English | [简体中文](README.zh.md)
 
 Tiny Player is a native Emby desktop client for Linux and Windows, built with Rust and GPUI. It uses FFmpeg for decoding, with Vulkan and libplacebo handling video rendering and color processing.
 
