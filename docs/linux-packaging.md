@@ -1,4 +1,4 @@
-# Linux 便携包
+# Linux 预编译包
 
 目标为 **x86_64 GNU/Linux、glibc 2.39 或更新版本**。整个程序及随包原生库在
 Ubuntu 24.04 容器中编译；不使用宿主机的 FFmpeg、libplacebo 或 glibc。
@@ -25,9 +25,9 @@ Ubuntu 安全更新随构建时的仓库更新，镜像不承诺逐字节可复�
 输出到 `dist/`：
 
 ```text
-tiny-player-0.1.0-linux-x86_64-glibc2.39.tar.gz
-tiny-player-0.1.0-linux-x86_64-glibc2.39.tar.gz.sha256
-tiny-player-0.1.0-linux-x86_64-glibc2.39.manifest.json
+tiny-player-0.1.0-linux-x86_64.tar.gz
+tiny-player-0.1.0-linux-x86_64.tar.gz.sha256
+tiny-player-0.1.0-linux-x86_64.manifest.json
 ```
 
 归档根目录为 `tiny-player/`，包含 `bin/`、`lib/`、`share/`、`licenses/`、
@@ -72,14 +72,18 @@ python3 -B -m unittest discover -s packaging/linux -p 'test_*.py' -v
 ## 运行与安装
 
 ```sh
-tar -xzf tiny-player-0.1.0-linux-x86_64-glibc2.39.tar.gz
+tar -xzf tiny-player-0.1.0-linux-x86_64.tar.gz
 ./tiny-player/bin/tiny-player
 ./tiny-player/install.sh
 ```
 
-安装脚本复制到 `~/.local/tiny-player.app`，创建 `~/.local/bin/tiny-player` 链接和
-桌面菜单项，无需 sudo。也可传入自定义安装前缀。已有目标目录时拒绝覆盖，更新前
-请先移走旧目录。应用配置和缓存仍使用原来的用户目录。
+安装位置固定为 `~/.local/tiny-player.app`，脚本创建 `~/.local/bin/tiny-player` 链接和
+桌面菜单项，无需 sudo，也无需传入参数。`--help` 可查看用法。
+
+更新时关闭应用，将新版解压到新目录，再直接运行其中的 `install.sh`。
+脚本先完整暂存新版，再替换应用目录、启动链接、桌面入口和
+图标，清除旧版应用目录中不再随包提供的文件；安装失败时恢复原安装。应用配置和缓存
+仍使用原来的用户目录。脚本拒绝覆盖无法识别的安装目录或已有的独立启动程序。
 
 图标从实际可执行文件附近的 `share/tiny-player/assets` 加载，移动整个目录后仍可
 运行。Arch 等系统包仍优先使用编译时的 `TINY_ASSET_DIR`；开发构建回退到源码资产。

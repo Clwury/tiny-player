@@ -1,4 +1,4 @@
-Tiny Player — Linux x86_64 portable bundle
+Tiny Player — Linux x86_64 prebuilt bundle
 
 Requirements
   * x86_64 GNU/Linux, glibc 2.39 or newer (not Alpine/musl).
@@ -16,9 +16,12 @@ Run
 Install (optional, no sudo)
   cd tiny-player
   ./install.sh
-  The application is copied to ~/.local/tiny-player.app and gets a desktop entry.
-  ./install.sh /custom/prefix also works. Existing installations are not deleted;
-  move the previous tiny-player.app directory aside before installing an update.
+  The application is installed at ~/.local/tiny-player.app and gets a desktop entry.
+  The installation location is fixed; no directory argument is accepted.
+  To update, close Tiny Player, extract the new bundle into a fresh directory,
+  and run its install.sh without arguments. The installer replaces the old
+  application and refreshes its launcher, desktop entry and icons. If installation
+  fails, it restores the previous version. User settings and caches are preserved.
 
 The bundle carries FFmpeg, libplacebo and their selected library dependencies.
 glibc, GPU drivers, audio plugins and font/keyboard configuration come from the

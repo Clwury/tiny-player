@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assemble and audit the portable Linux bundle; use only inside the builder."""
+"""Assemble and audit the Linux prebuilt bundle; use only inside the builder."""
 
 import argparse
 import hashlib
@@ -140,7 +140,7 @@ def build_bundle(binary, output):
         raise ValueError("Build inside the Ubuntu 24.04 / glibc 2.39 container")
     inspect_elf(binary)
     version = tomllib.loads((repo / "Cargo.toml").read_text())["package"]["version"]
-    artifact_name = f"tiny-player-{version}-linux-x86_64-glibc2.39"
+    artifact_name = f"tiny-player-{version}-linux-x86_64"
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="tiny-player-bundle-") as staging:
         root = Path(staging) / "tiny-player"

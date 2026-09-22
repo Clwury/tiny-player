@@ -8,11 +8,14 @@ if [[ -n ${startdir:-} && -n ${BUILDDIR:-} && \
     BUILDDIR="$startdir/.makepkg"
     if [[ -n ${SRCDEST:-} && $SRCDEST -ef $startdir ]]; then
         SRCDEST="$BUILDDIR/sources"
+        # makepkg validates directories before sourcing PKGBUILD, while its
+        # source downloader expects the redirected SRCDEST to already exist.
+        mkdir -p -- "$SRCDEST" || return 1
     fi
 fi
 
 pkgname=tiny-player-git
-pkgver=0.1.0.r85.g8df5055
+pkgver=0.1.0.r111.g33c484b
 pkgrel=1
 pkgdesc='Native Emby desktop client with FFmpeg and Vulkan playback'
 arch=('x86_64')
