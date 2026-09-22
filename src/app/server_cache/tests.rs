@@ -249,6 +249,25 @@ fn authenticating_refreshes_name_icon_and_token_and_preserves_identity() {
 }
 
 #[test]
+fn authenticating_and_editing_preserve_a_manually_selected_icon() {
+    let (submission, requests) = mock_server(vec![(200, auth_response("UHD", "new-token"))]);
+    let client = EmbyClient::new("test".into()).unwrap();
+    let selected = CachedServer {
+        icon_url: Some(crate::server::icon::all_icons()[0].url.clone()),
+        icon_is_custom: true,
+        ..pending_server(&submission)
+    };
+    let edited = prepare_server(&client, &submission, Some(&selected)).unwrap();
+    assert!(edited.icon_is_custom);
+    assert_eq!(edited.icon_url, selected.icon_url);
+    let authenticated = authenticate_server(&client, &edited).unwrap();
+    assert_eq!(authenticated.server_name.as_deref(), Some("UHD"));
+    assert_eq!(authenticated.icon_url, selected.icon_url);
+    assert!(authenticated.icon_is_custom);
+    assert_eq!(requests.join().unwrap().len(), 1);
+}
+
+#[test]
 fn missing_auth_server_name_uses_public_info_instead_of_session_id() {
     let (submission, requests) = mock_server(vec![
         (

@@ -189,6 +189,9 @@ pub struct CachedServer {
     pub server_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,
+    /// A manual choice survives server name and authentication refreshes.
+    #[serde(default)]
+    pub icon_is_custom: bool,
     pub access_token: Option<String>,
     /// Keep cached display data after edits, but refresh authentication before reuse.
     #[serde(default)]

@@ -11,6 +11,9 @@ impl TinyApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.server_icon_picker.is_some() {
+            return;
+        }
         self.open_server_menu = None;
         self.clear_server_notifications();
         if self.add_server_dialog.is_none() {
@@ -106,7 +109,9 @@ impl TinyApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.selecting_server_id.as_deref() == Some(server_id)
+        if self.server_icon_picker.is_some()
+            || self.add_server_dialog.is_some()
+            || self.selecting_server_id.as_deref() == Some(server_id)
             || !self.servers.iter().any(|server| server.id == server_id)
         {
             return;
@@ -132,6 +137,9 @@ impl TinyApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.server_icon_picker.is_some() {
+            return;
+        }
         self.open_server_menu = None;
         self.clear_server_notifications();
         if let Some(server) = self.servers.iter().find(|cached| cached.id == server.id) {

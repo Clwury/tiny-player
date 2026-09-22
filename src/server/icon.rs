@@ -7,23 +7,30 @@ struct Catalog {
     icons: Vec<Icon>,
 }
 
-#[derive(Deserialize)]
-struct Icon {
-    name: String,
-    url: String,
+#[derive(Clone, Deserialize)]
+pub(crate) struct Icon {
+    pub(crate) name: String,
+    pub(crate) url: String,
     #[serde(skip)]
     key: String,
 }
 
-fn catalog() -> &'static [Icon] {
+pub(crate) fn all_icons() -> &'static [Icon] {
     static ICONS: OnceLock<Vec<Icon>> = OnceLock::new();
     ICONS.get_or_init(|| {
-        let mut catalog: Catalog =
-            serde_json::from_str(include_str!("../../assets/lige-emby-icon.json"))
-                .expect("bundled Emby icon catalog must be valid");
+        serde_json::from_str::<Catalog>(include_str!("../../assets/lige-emby-icon.json"))
+            .expect("bundled Emby icon catalog must be valid")
+            .icons
+    })
+}
+
+fn catalog() -> &'static [Icon] {
+    static MATCHING_ICONS: OnceLock<Vec<Icon>> = OnceLock::new();
+    MATCHING_ICONS.get_or_init(|| {
+        let mut icons = all_icons().to_vec();
         // For the same normalized name, prefer Emby artwork first, then the
         // original icon over numbered variants.
-        catalog.icons.sort_by_key(|icon| {
+        icons.sort_by_key(|icon| {
             (
                 !icon.name.to_ascii_lowercase().contains("emby"),
                 icon.name.contains('('),
@@ -31,11 +38,11 @@ fn catalog() -> &'static [Icon] {
             )
         });
         let mut names = HashSet::new();
-        catalog.icons.retain_mut(|icon| {
+        icons.retain_mut(|icon| {
             icon.key = name_tokens(&icon.name).concat();
             !icon.key.is_empty() && names.insert(icon.key.clone())
         });
-        catalog.icons
+        icons
     })
 }
 
@@ -125,6 +132,24 @@ fn name_tokens(name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picker_catalog_preserves_every_icon_and_variant_in_source_order() {
+        let source: Catalog =
+            serde_json::from_str(include_str!("../../assets/lige-emby-icon.json")).unwrap();
+        assert_eq!(all_icons().len(), source.icons.len());
+        for (actual, expected) in all_icons().iter().zip(&source.icons) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.url, expected.url);
+        }
+        assert_eq!(all_icons()[0].name, "emby");
+        assert!(
+            all_icons()
+                .iter()
+                .any(|icon| icon.name == "chinamobilemcloud(1)")
+        );
+        assert!(all_icons().len() > catalog().len());
+    }
 
     fn icon_file(name: &str) -> Option<&str> {
         match_icon_url(name).and_then(|url| url.rsplit('/').next())

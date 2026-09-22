@@ -101,6 +101,7 @@ impl TinyApp {
         if !matches!(self.page, Page::Servers)
             || self.selecting_server_id.is_some()
             || self.add_server_dialog.is_some()
+            || self.server_icon_picker.is_some()
         {
             return;
         }

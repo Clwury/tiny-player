@@ -28,6 +28,9 @@ impl TinyApp {
     }
 
     pub(super) fn begin_select_server(&mut self, server: &CachedServer, cx: &mut Context<Self>) {
+        if self.server_icon_picker.is_some() {
+            return;
+        }
         // Cards and sidebar items can hold snapshots from before a server edit.
         let Some(server) = self
             .servers

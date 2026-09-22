@@ -296,6 +296,7 @@ mod tests {
             server_id: Some("server-1".to_string()),
             server_name: Some("Home".to_string()),
             icon_url: None,
+            icon_is_custom: false,
             access_token: Some("token".to_string()),
             needs_auth_refresh: false,
             item_counts: None,

@@ -7,6 +7,7 @@ mod render;
 mod resize;
 mod server_cache;
 mod server_card;
+mod server_icon_picker;
 mod server_reorder;
 mod settings_window;
 mod window;
@@ -36,6 +37,7 @@ pub struct TinyApp {
     add_server_dialog: Option<Entity<AddServerDialogState>>,
     settings_window: Option<WindowHandle<settings_window::SettingsWindow>>,
     open_server_menu: Option<ServerContextMenu>,
+    server_icon_picker: Option<server_icon_picker::ServerIconPicker>,
     server_reorder: Option<server_reorder::ServerReorder>,
     server_card_positions: HashMap<String, server_reorder::CardPosition>,
     cache: ServerCache,
@@ -85,6 +87,9 @@ impl TinyApp {
         };
         let initial_error = startup_error.or(emby_client_error);
         cx.on_release(|app, cx| {
+            if let Some(picker) = app.server_icon_picker.take() {
+                picker.clear_previews(cx);
+            }
             app.save_pending_cache_on_release();
             if let Some(settings) = app.settings_window.take() {
                 settings
@@ -117,6 +122,7 @@ impl TinyApp {
             add_server_dialog: None,
             settings_window: None,
             open_server_menu: None,
+            server_icon_picker: None,
             server_reorder: None,
             server_card_positions: HashMap::new(),
             cache,

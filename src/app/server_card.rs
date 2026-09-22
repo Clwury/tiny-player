@@ -324,9 +324,11 @@ pub(super) fn server_card_menu(
     let theme = theme::get(cx);
     let menu_id = ElementId::from(format!("server-card-menu-{}", server.id));
     let edit_server = server.clone();
+    let icon_server = server.clone();
     let auto_start_server = server.clone();
     let delete_server = server;
     let on_edit = cx.listener(TinyApp::open_edit_server_dialog);
+    let on_choose_icon = cx.listener(TinyApp::open_server_icon_picker);
     let on_delete = cx.listener(TinyApp::delete_server);
     let on_auto_start = cx.listener(TinyApp::toggle_server_auto_start);
 
@@ -366,6 +368,15 @@ pub(super) fn server_card_menu(
                     false,
                     move |window, cx| {
                         on_edit(&edit_server, window, cx);
+                    },
+                    cx,
+                ))
+                .child(menu_item(
+                    (menu_id.clone(), "choose-icon"),
+                    "选择图标",
+                    false,
+                    move |window, cx| {
+                        on_choose_icon(&icon_server, window, cx);
                     },
                     cx,
                 ))
@@ -899,7 +910,11 @@ mod tests {
             });
             let menu = cx.debug_bounds("server-context-menu").unwrap();
             assert_eq!(menu.origin, position + point(px(4.0), px(4.0)));
-            for item in ["server-context-menu-编辑", "server-context-menu-删除"] {
+            for item in [
+                "server-context-menu-编辑",
+                "server-context-menu-选择图标",
+                "server-context-menu-删除",
+            ] {
                 let bounds = cx.debug_bounds(item).unwrap();
                 assert!(menu.contains(&bounds.center()));
             }

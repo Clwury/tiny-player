@@ -23,6 +23,7 @@ impl TinyApp {
         self.dismiss_server_menu(window, cx);
         if !matches!(self.page, Page::Servers)
             || self.add_server_dialog.is_some()
+            || self.server_icon_picker.is_some()
             || !self
                 .cache
                 .servers
@@ -47,6 +48,7 @@ impl TinyApp {
         if !matches!(self.page, Page::Servers)
             || self.selecting_server_id.is_some()
             || self.add_server_dialog.is_some()
+            || self.server_icon_picker.is_some()
         {
             return;
         }
@@ -208,6 +210,7 @@ pub(super) fn prepare_server(
         server_id: info.id,
         server_name: info.server_name,
         icon_url,
+        icon_is_custom: false,
         access_token: None,
         needs_auth_refresh: false,
         item_counts: None,
@@ -250,10 +253,14 @@ pub(super) fn authenticate_server(
     let server_name = server_name
         .or_else(|| info.as_ref().and_then(|info| info.server_name.clone()))
         .or_else(|| server.server_name.clone());
-    let icon_url = server_name
-        .as_deref()
-        .and_then(crate::server::icon::match_icon_url)
-        .map(str::to_owned);
+    let icon_url = if server.icon_is_custom {
+        server.icon_url.clone()
+    } else {
+        server_name
+            .as_deref()
+            .and_then(crate::server::icon::match_icon_url)
+            .map(str::to_owned)
+    };
 
     Ok(CachedServer {
         user_id: Some(user_id),

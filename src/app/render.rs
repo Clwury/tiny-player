@@ -80,7 +80,9 @@ impl TinyApp {
 
     fn render_servers_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let add_server = cx.listener(Self::open_add_server_dialog);
-        let can_reorder = self.selecting_server_id.is_none() && self.add_server_dialog.is_none();
+        let can_reorder = self.selecting_server_id.is_none()
+            && self.add_server_dialog.is_none()
+            && self.server_icon_picker.is_none();
         let servers = self.preview_servers();
         self.server_card_positions
             .retain(|id, _| self.servers.iter().any(|server| &server.id == id));
@@ -190,7 +192,8 @@ impl Render for TinyApp {
         let close_menu = cx.listener(Self::close_server_menu);
         let submit_dialog = cx.listener(Self::submit_add_server_dialog);
         let dialog = self.add_server_dialog.clone();
-        let modal_open = dialog.is_some();
+        let icon_picker = self.render_server_icon_picker(window, cx);
+        let modal_open = dialog.is_some() || icon_picker.is_some();
 
         div()
             .relative()
@@ -229,6 +232,7 @@ impl Render for TinyApp {
                     cx,
                 ))
             })
+            .when_some(icon_picker, |this, picker| this.child(picker))
             .when(rounded_window && !modal_open, |this| {
                 this.children(resize_handles())
             })
