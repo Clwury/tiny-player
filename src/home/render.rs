@@ -1,13 +1,14 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, App, Context, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
-    StyleRefinement, Styled, Window, deferred, div, ease_in_out, prelude::FluentBuilder, px,
+    Animation, AnimationExt as _, App, Context, Corners, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Render, ScrollHandle,
+    StatefulInteractiveElement, StyleRefinement, Styled, Window, deferred, div, ease_in_out,
+    prelude::FluentBuilder, px,
 };
 
 use crate::{
-    app::{WINDOW_RESIZE_EDGE_WIDTH_PX, window_has_rounded_corners},
+    app::{WINDOW_RESIZE_EDGE_WIDTH_PX, window_corner_radii, window_has_rounded_corners},
     emby::{ResumeItems, UserItem, UserItems, UserView, UserViews},
     theme,
     ui::scrollbar::Scrollbar,
@@ -110,9 +111,8 @@ impl HomeContent {
     }
 
     fn render_main_content(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
-        let theme = theme::get(cx);
-        let rounded_window = window_has_rounded_corners(window);
-        let scrollbar_right_inset = if rounded_window {
+        let corners = window_corner_radii(window, cx);
+        let scrollbar_right_inset = if window_has_rounded_corners(window) {
             px(WINDOW_RESIZE_EDGE_WIDTH_PX)
         } else {
             px(0.0)
@@ -161,10 +161,8 @@ impl HomeContent {
         div()
             .relative()
             .size_full()
-            .bg(theme.background)
-            .when(rounded_window, |this| {
-                this.rounded_br(theme.radius_lg).overflow_hidden()
-            })
+            .rounded_br(corners.bottom_right)
+            .overflow_hidden()
             .when(mount_home_dashboard, |this| {
                 this.child(
                     // Match the live content area so padding and right-aligned
@@ -179,42 +177,42 @@ impl HomeContent {
             .when_some(self.authentication_error.clone(), |this, error| {
                 this.child(self.render_workspace_layer(
                     self.render_authentication_error(error, cx),
-                    rounded_window,
+                    corners,
                     cx,
                 ))
             })
             .when(is_detail && !has_authentication_error, |this| {
                 this.child(self.render_workspace_layer(
                     self.render_series_detail_scrollable_content(window, cx),
-                    rounded_window,
+                    corners,
                     cx,
                 ))
             })
             .when(is_favorites && !has_authentication_error, |this| {
                 this.child(self.render_workspace_layer(
                     self.render_favorites_scrollable_content(window, cx),
-                    rounded_window,
+                    corners,
                     cx,
                 ))
             })
             .when(is_favorite_items && !has_authentication_error, |this| {
                 this.child(self.render_workspace_layer(
                     self.render_favorite_items_content(window, cx),
-                    rounded_window,
+                    corners,
                     cx,
                 ))
             })
             .when(is_search && !has_authentication_error, |this| {
                 this.child(self.render_workspace_layer(
                     self.render_search_scrollable_content(window, cx),
-                    rounded_window,
+                    corners,
                     cx,
                 ))
             })
             .when(is_library && !has_authentication_error, |this| {
                 this.child(self.render_workspace_layer(
                     self.render_library_scrollable_content(cx),
-                    rounded_window,
+                    corners,
                     cx,
                 ))
             })
@@ -247,7 +245,7 @@ impl HomeContent {
     fn render_workspace_layer(
         &self,
         content: impl IntoElement,
-        rounded_window: bool,
+        corners: Corners<Pixels>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = theme::get(cx);
@@ -259,9 +257,8 @@ impl HomeContent {
             .left_0()
             .bg(theme.background)
             .occlude()
-            .when(rounded_window, |this| {
-                this.rounded_br(theme.radius_lg).overflow_hidden()
-            })
+            .rounded_br(corners.bottom_right)
+            .overflow_hidden()
             .child(content)
     }
 
@@ -1117,26 +1114,21 @@ fn main_scrollbar_is_visible(
 }
 
 impl HomePage {
-    fn render_content_area(&self, cx: &Context<Self>, rounded_window: bool) -> impl IntoElement {
-        let theme = theme::get(cx);
-
+    fn render_content_area(&self, corners: Corners<Pixels>) -> impl IntoElement {
         div()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .relative()
-            .bg(theme.background)
-            .when(rounded_window, |this| {
-                this.rounded_br(theme.radius_lg).overflow_hidden()
-            })
+            .rounded_br(corners.bottom_right)
+            .overflow_hidden()
             .child(self.home_content.clone())
     }
 }
 
 impl Render for HomePage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = theme::get(cx);
-        let rounded_window = window_has_rounded_corners(window);
+        let corners = window_corner_radii(window, cx);
         let on_back = cx.listener(Self::back_to_servers);
         let on_home = cx.listener(Self::select_home_section);
         let on_favorites = cx.listener(Self::select_favorites_section);
@@ -1148,20 +1140,19 @@ impl Render for HomePage {
             .flex_1()
             .min_h_0()
             .size_full()
-            .bg(theme.background)
-            .when(rounded_window, |this| {
-                this.rounded_b(theme.radius_lg).overflow_hidden()
-            })
+            .rounded_bl(corners.bottom_left)
+            .rounded_br(corners.bottom_right)
+            .overflow_hidden()
             .child(self.render_sidebar(
                 cx,
-                rounded_window,
+                corners,
                 on_back,
                 on_home,
                 on_favorites,
                 on_search,
                 on_settings,
             ))
-            .child(self.render_content_area(cx, rounded_window))
+            .child(self.render_content_area(corners))
     }
 }
 

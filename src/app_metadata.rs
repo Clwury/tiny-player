@@ -59,16 +59,23 @@ mod tests {
     }
 
     #[test]
-    fn raster_icon_preserves_transparent_rounded_corners() {
+    fn raster_icon_preserves_desktop_padding_and_rounded_corners() {
         let icon = image::load_from_memory(APP_ICON_BYTES)
             .unwrap()
             .into_rgba8();
 
-        assert_eq!(icon.dimensions(), (512, 512));
-        assert_eq!(icon.get_pixel(0, 0).0[3], 0);
-        assert_eq!(icon.get_pixel(511, 0).0[3], 0);
-        assert_eq!(icon.get_pixel(0, 511).0[3], 0);
-        assert_eq!(icon.get_pixel(511, 511).0[3], 0);
-        assert_eq!(icon.get_pixel(256, 256).0[3], 255);
+        assert_eq!(icon.dimensions(), (256, 256));
+        for (x, y, pixel) in icon.enumerate_pixels() {
+            if !(16..240).contains(&x) || !(16..240).contains(&y) {
+                assert_eq!(pixel.0[3], 0, "desktop padding at ({x}, {y})");
+            }
+        }
+        for (x, y) in [(16, 16), (239, 16), (16, 239), (239, 239)] {
+            assert_eq!(icon.get_pixel(x, y).0[3], 0);
+        }
+        for (x, y) in [(16, 128), (239, 128), (128, 16), (128, 239)] {
+            assert_eq!(icon.get_pixel(x, y).0[3], 255);
+        }
+        assert_eq!(icon.get_pixel(128, 128).0[3], 255);
     }
 }

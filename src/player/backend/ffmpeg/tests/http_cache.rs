@@ -19,13 +19,13 @@ fn dovi_packet_timeline_uses_first_packet_when_stream_start_is_missing() {
 fn ffmpeg_http_headers_formats_crlf_separated_headers() {
     let headers = ffmpeg_http_headers(&[
         ("X-Emby-Token".to_string(), "token".to_string()),
-        ("User-Agent".to_string(), "Tiny Player/0.1.0".to_string()),
+        ("User-Agent".to_string(), "Tiny Player/0.1.1".to_string()),
     ])
     .unwrap();
 
     assert_eq!(
         headers,
-        "X-Emby-Token: token\r\nUser-Agent: Tiny Player/0.1.0\r\n"
+        "X-Emby-Token: token\r\nUser-Agent: Tiny Player/0.1.1\r\n"
     );
 }
 
@@ -149,7 +149,7 @@ fn cached_input_source_skips_http_cache_when_cache_mode_is_disabled() {
 fn http_cache_request_header_log_redacts_credentials() {
     let headers = reqwest_header_pairs(&[
         ("X-Emby-Token".to_string(), "token".to_string()),
-        ("User-Agent".to_string(), "Tiny Player/0.1.0".to_string()),
+        ("User-Agent".to_string(), "Tiny Player/0.1.1".to_string()),
     ])
     .unwrap();
 
@@ -160,7 +160,7 @@ fn http_cache_request_header_log_redacts_credentials() {
             "connection: keep-alive".to_string(),
             "range: bytes=128-255".to_string(),
             "x-emby-token: <redacted>".to_string(),
-            "user-agent: Tiny Player/0.1.0".to_string(),
+            "user-agent: Tiny Player/0.1.1".to_string(),
         ]
     );
 }

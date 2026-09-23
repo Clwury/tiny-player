@@ -1,9 +1,9 @@
 [package]
 name = "tiny-player"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Native Emby desktop client with FFmpeg and Vulkan playback"
-license = "GPL-3.0-only"
+license = "GPL-3.0-or-later"
 homepage = "https://github.com/Clwury/tiny-player"
 repository = "https://github.com/Clwury/tiny-player"
 

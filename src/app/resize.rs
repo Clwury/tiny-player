@@ -47,11 +47,13 @@ pub(super) fn resize_handles() -> Vec<Div> {
 }
 
 fn resize_handle(edge: ResizeEdge, cursor: CursorStyle) -> Div {
-    div().absolute().flex_none().cursor(cursor).on_mouse_down(
-        MouseButton::Left,
-        move |_, window, cx| {
+    div()
+        .debug_selector(move || format!("window-resize-{edge:?}"))
+        .absolute()
+        .flex_none()
+        .cursor(cursor)
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             cx.stop_propagation();
             window.start_window_resize(edge);
-        },
-    )
+        })
 }

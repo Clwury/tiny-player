@@ -17,7 +17,10 @@ use super::{
 
 pub(crate) const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
-pub(crate) fn settings_sidebar(rounded_window: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn settings_sidebar(
+    bottom_left_radius: gpui::Pixels,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
     let theme = theme::get(cx);
     div()
         .id("settings-sidebar")
@@ -31,9 +34,8 @@ pub(crate) fn settings_sidebar(rounded_window: bool, cx: &App) -> gpui::Stateful
         .border_r_1()
         .border_color(theme.title_bar_border)
         .bg(theme.panel_background)
-        .when(rounded_window, |this| {
-            this.rounded_bl(theme.radius_lg).overflow_hidden()
-        })
+        .rounded_bl(bottom_left_radius)
+        .overflow_hidden()
 }
 
 pub(crate) fn settings_category_button(

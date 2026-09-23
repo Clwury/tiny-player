@@ -134,10 +134,17 @@ fn surface_drag_press_reaches_windows_but_menu_dismissal_does_not(cx: &mut TestA
     for origin in [video, file.origin + point(px(12.0), px(10.0))] {
         let result = dispatch_mouse_press(cx, origin, MouseButton::Left, 1);
         // Windows enters its native move loop only if the press is unhandled.
-        // Linux consumes the press and starts a compositor move on motion.
+        // Linux Server decorations leave moving the window to the WM.
         assert_eq!(result.propagate, cfg!(target_os = "windows"));
         page.read_with(cx, |page, _| {
-            assert_eq!(page.window_drag, WindowDragState::Pending);
+            assert_eq!(
+                page.window_drag,
+                if cfg!(target_os = "linux") {
+                    WindowDragState::Idle
+                } else {
+                    WindowDragState::Pending
+                }
+            );
             assert!(!page.timeline.user_paused);
             assert!(page.timeline.progress_drag_position.is_none());
         });
@@ -192,6 +199,23 @@ fn surface_double_click_keeps_fullscreen_and_blocks_native_maximize(cx: &mut Tes
         cx.simulate_mouse_up(video, MouseButton::Left, Modifiers::default());
         cx.run_until_parked();
     }
+}
+
+#[cfg(target_os = "linux")]
+#[gpui::test]
+fn server_decorations_discard_a_pending_playback_window_drag(cx: &mut TestAppContext) {
+    let (page, cx) = episodes::tests::playback_window(cx);
+    // Model a decoration-mode change after a client-side drag was armed.
+    page.update(cx, |page, _| page.window_drag = WindowDragState::Pending);
+    cx.simulate_mouse_move(
+        point(px(800.0), px(400.0)),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    assert_eq!(
+        page.read_with(cx, |page, _| page.window_drag),
+        WindowDragState::Idle
+    );
 }
 
 #[cfg(target_os = "windows")]
@@ -498,13 +522,18 @@ fn window_drag_origin_resets_on_release_or_a_new_control_press(cx: &mut TestAppC
         .unwrap()
         .center();
     let video = point(px(1060.0), px(400.0));
+    let after_surface_press = if cfg!(target_os = "linux") {
+        WindowDragState::Idle
+    } else {
+        WindowDragState::Pending
+    };
 
     for origin in [video, file.origin + point(px(12.0), px(10.0))] {
         cx.simulate_mouse_move(origin, None, Modifiers::default());
         cx.simulate_mouse_down(origin, MouseButton::Left, Modifiers::default());
         assert_eq!(
             page.read_with(cx, |page, _| page.window_drag),
-            WindowDragState::Pending
+            after_surface_press
         );
 
         // A release over the occluding controls must still clear the origin.
@@ -519,7 +548,7 @@ fn window_drag_origin_resets_on_release_or_a_new_control_press(cx: &mut TestAppC
         cx.simulate_mouse_down(origin, MouseButton::Left, Modifiers::default());
         assert_eq!(
             page.read_with(cx, |page, _| page.window_drag),
-            WindowDragState::Pending
+            after_surface_press
         );
         // Model a release consumed outside the window: a new press must discard
         // the previous origin even when a button handles that press itself.

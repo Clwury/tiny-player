@@ -110,17 +110,20 @@ mod tests {
     use gpui::{AppContext as _, Modifiers, TestAppContext, VisualTestContext, px, size};
 
     fn click(cx: &mut VisualTestContext, selector: &'static str) {
-        let position = cx.debug_bounds(selector).expect(selector).center();
         if selector == "window-control-close" {
-            if cfg!(target_os = "windows") {
-                // TestPlatform does not emulate native caption messages.
+            if cfg!(target_os = "windows")
+                || cx.update(|window, _| super::super::window_uses_system_decorations(window))
+            {
+                // TestPlatform does not emulate native caption/WM close messages.
                 cx.update(|window, _| window.remove_window());
             } else {
+                let position = cx.debug_bounds(selector).expect(selector).center();
                 cx.simulate_mouse_down(position, gpui::MouseButton::Left, Modifiers::default());
             }
             cx.run_until_parked();
             return;
         }
+        let position = cx.debug_bounds(selector).expect(selector).center();
         cx.simulate_click(position, Modifiers::default());
         cx.run_until_parked();
         for _ in 0..2 {

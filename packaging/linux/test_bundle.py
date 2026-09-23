@@ -82,7 +82,8 @@ class InstallerTests(unittest.TestCase):
 
     def make_bundle(self, version):
         source = self.root / f"source bundle {version}"
-        for folder in ("bin", "lib", "share/applications", "share/icons/hicolor/scalable/apps"):
+        for folder in ("bin", "lib", "share/applications", "share/icons/hicolor/scalable/apps",
+                       "share/icons/hicolor/256x256/apps"):
             (source / folder).mkdir(parents=True)
         executable = source / "bin/tiny-player"
         executable.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(version)}\n")
@@ -93,6 +94,10 @@ class InstallerTests(unittest.TestCase):
         )
         (source / "share/icons/hicolor/scalable/apps/tiny-player.svg").write_text(
             f'<svg xmlns="http://www.w3.org/2000/svg"><title>{version}</title></svg>\n'
+        )
+        shutil.copy2(
+            Path(__file__).resolve().parents[2] / "assets/icons/tiny-player.png",
+            source / "share/icons/hicolor/256x256/apps/tiny-player.png",
         )
         self.write_test_installer(source, self.prefix)
         return source
@@ -110,9 +115,12 @@ class InstallerTests(unittest.TestCase):
         (source / "install.sh").chmod(0o755)
 
     def install(self, source, *, args=(), env=None, check=True):
+        # Installer tests must never notify the user's live desktop session.
+        install_env = dict(os.environ if env is None else env)
+        install_env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={self.root}/no-session-bus"
         return subprocess.run(
             ["bash", str(source / "install.sh"), *map(str, args)],
-            env=env, check=check, capture_output=True, text=True, timeout=10,
+            env=install_env, check=check, capture_output=True, text=True, timeout=10,
         )
 
     def command_environment(self, command, body):
@@ -211,6 +219,69 @@ exit 73''')
         self.assertTrue((new_source / "lib/version-2.0.so").exists())
         self.assert_no_staging()
 
+    def test_update_removes_obsolete_icon_sizes_and_preserves_other_icons(self):
+        self.install(self.make_bundle("1.0"))
+        legacy = self.prefix / "share/icons/hicolor/512x512/apps/tiny-player.png"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"legacy icon left by an earlier installer")
+        unrelated = legacy.with_name("unrelated.png")
+        unrelated.write_bytes(b"another application's icon")
+        custom_icon = self.root / "custom.svg"
+        custom_icon.write_text("custom icon")
+        legacy_link = legacy.with_suffix(".svg")
+        legacy_link.symlink_to(custom_icon)
+        custom_theme_icon = self.prefix / "share/icons/custom/512x512/apps/tiny-player.png"
+        custom_theme_icon.parent.mkdir(parents=True)
+        custom_theme_icon.write_bytes(b"custom theme override")
+
+        source = self.make_bundle("2.0")
+        self.install(source)
+
+        self.assertFalse(legacy.exists())
+        self.assertFalse(legacy_link.is_symlink())
+        self.assertEqual(custom_icon.read_text(), "custom icon")
+        self.assertEqual(unrelated.read_bytes(), b"another application's icon")
+        self.assertEqual(custom_theme_icon.read_bytes(), b"custom theme override")
+        self.assertEqual(
+            (self.prefix / "share/icons/hicolor/256x256/apps/tiny-player.png").read_bytes(),
+            (source / "share/icons/hicolor/256x256/apps/tiny-player.png").read_bytes(),
+        )
+        self.assert_no_staging()
+
+    def test_kde_icon_reload_runs_after_icons_and_desktop_entry_are_installed(self):
+        source = self.make_bundle("1.0")
+        log = self.root / "icon-refresh.log"
+        env = self.command_environment("dbus-send", '''
+[[ -f $TINY_PLAYER_TEST_PREFIX/share/applications/tiny-player.desktop ]] || exit 73
+[[ -f $TINY_PLAYER_TEST_PREFIX/share/icons/hicolor/256x256/apps/tiny-player.png ]] || exit 73
+printf '%s\\n' "$@" > "$TINY_PLAYER_TEST_REFRESH_LOG"
+exit 0''')
+        env.update(XDG_CURRENT_DESKTOP="KDE:PLASMA", TINY_PLAYER_TEST_PREFIX=str(self.prefix),
+                   TINY_PLAYER_TEST_REFRESH_LOG=str(log))
+        self.install(source, env=env)
+        self.assertEqual(log.read_text().splitlines(), [
+            "--session", "--type=signal", "/KIconLoader", "org.kde.KIconLoader.iconChanged", "int32:0",
+        ])
+
+    def test_other_desktops_do_not_send_kde_icon_reload(self):
+        source = self.make_bundle("1.0")
+        log = self.root / "icon-refresh.log"
+        env = self.command_environment("dbus-send", '''
+printf 'unexpected KDE refresh' > "$TINY_PLAYER_TEST_REFRESH_LOG"
+exit 0''')
+        env.update(XDG_CURRENT_DESKTOP="GNOME", TINY_PLAYER_TEST_REFRESH_LOG=str(log))
+        self.install(source, env=env)
+        self.assertFalse(log.exists())
+
+    def test_failed_icon_reload_does_not_roll_back_a_successful_update(self):
+        self.install(self.make_bundle("1.0"))
+        env = self.command_environment("dbus-send", "exit 73")
+        env["XDG_CURRENT_DESKTOP"] = "KDE"
+        result = self.install(self.make_bundle("2.0"), env=env)
+        self.assertIn("Updated Tiny Player", result.stdout)
+        self.assertEqual(subprocess.check_output([str(self.prefix / "bin/tiny-player")], text=True), "2.0\n")
+        self.assert_no_staging()
+
     def test_reinstallation_and_running_installed_script_are_idempotent(self):
         source = self.make_bundle("1.0")
         self.install(source)
@@ -254,14 +325,24 @@ exit 73''')
 
     def test_failed_or_interrupted_desktop_update_restores_all_replaced_files(self):
         self.install(self.make_bundle("1.0"))
+        legacy = self.prefix / "share/icons/hicolor/512x512/apps/tiny-player.png"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"legacy icon")
+        legacy.with_suffix(".svg").symlink_to(self.root / "missing-icon.svg")
         original = self.installed_files()
         source = self.make_bundle("2.0")
+        log = self.root / "icon-refresh.log"
+        self.command_environment("dbus-send", '''
+printf 'unexpected refresh after a failed update' > "$TINY_PLAYER_TEST_REFRESH_LOG"
+exit 0''')
         for failure in ("exit 73", 'kill -TERM "$PPID"; exit 143'):
             with self.subTest(failure=failure):
                 env = self.command_environment("mv", f'if [[ ${{3:-}} == */desktop-entry ]]; then {failure}; fi')
+                env.update(XDG_CURRENT_DESKTOP="KDE", TINY_PLAYER_TEST_REFRESH_LOG=str(log))
                 result = self.install(source, env=env, check=False)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.installed_files(), original)
+                self.assertFalse(log.exists())
                 self.assert_no_staging()
 
     def test_failed_first_install_removes_new_application_and_integrations(self):

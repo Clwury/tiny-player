@@ -22,12 +22,12 @@ glibc 2.39 是发布基线，包内所有 ELF 的实际版本需求均不得高�
 FFmpeg 9.0.1、libplacebo 7.360.1、Vulkan-Headers 1.4.357；Rust 为 1.97.0。
 Ubuntu 安全更新随构建时的仓库更新，镜像不承诺逐字节可复现。
 
-输出到 `dist/`：
+输出到 `dist/`，其中 `<version>` 由 `Cargo.toml` 中的应用版本自动生成：
 
 ```text
-tiny-player-0.1.0-linux-x86_64.tar.gz
-tiny-player-0.1.0-linux-x86_64.tar.gz.sha256
-tiny-player-0.1.0-linux-x86_64.manifest.json
+tiny-player-<version>-linux-x86_64.tar.gz
+tiny-player-<version>-linux-x86_64.tar.gz.sha256
+tiny-player-<version>-linux-x86_64.manifest.json
 ```
 
 归档根目录为 `tiny-player/`，包含 `bin/`、`lib/`、`share/`、`licenses/`、
@@ -71,8 +71,10 @@ python3 -B -m unittest discover -s packaging/linux -p 'test_*.py' -v
 
 ## 运行与安装
 
+请将 `<version>` 替换为所下载包的实际版本号：
+
 ```sh
-tar -xzf tiny-player-0.1.0-linux-x86_64.tar.gz
+tar -xzf "tiny-player-<version>-linux-x86_64.tar.gz"
 ./tiny-player/bin/tiny-player
 ./tiny-player/install.sh
 ```

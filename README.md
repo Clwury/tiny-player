@@ -52,10 +52,10 @@ tiny-player
 
 ### Linux Prebuilt Bundle
 
-Extract the complete archive and run the application. The following example uses version `0.1.0`; replace the version number as needed:
+Extract the complete archive and run the application. Replace `<version>` with the version of the downloaded bundle:
 
 ```sh
-tar -xzf tiny-player-0.1.0-linux-x86_64.tar.gz
+tar -xzf "tiny-player-<version>-linux-x86_64.tar.gz"
 ./tiny-player/bin/tiny-player
 ```
 
@@ -77,7 +77,7 @@ The archive, checksum file, and build manifest are written to `dist/`. See the [
 
 ### Windows Portable Bundle
 
-Extract the complete `tiny-player-<version>-windows-x86_64.zip` archive and double-click `tiny-player.exe`. Keep the entire directory together when moving the application, including its DLLs and `share/` resources. Settings and caches are stored in your Windows user profile.
+Extract the complete `tiny-player-<version>-windows-x86_64.zip` archive (`<version>` is the downloaded bundle's version) and double-click `tiny-player.exe`. Keep the entire directory together when moving the application, including its DLLs and `share/` resources. Settings and caches are stored in your Windows user profile.
 
 Building the bundle requires the Rust MSVC toolchain, Visual Studio 2022 C++ x64 Build Tools, the Windows SDK, and 64-bit Python 3.12. Run the following in PowerShell from the repository root:
 
@@ -149,7 +149,7 @@ Mouse controls over the playback area:
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0 only (GPL-3.0-only)**. See [LICENSE](LICENSE) for the full terms. Third-party dependencies retain their respective licenses.
+This project is licensed under the **GNU General Public License v3.0 or later (GPL-3.0-or-later)**. See [LICENSE](LICENSE) for the full terms. Third-party dependencies retain their respective licenses.
 
 ## Acknowledgments
 

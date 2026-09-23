@@ -8,7 +8,10 @@ use gpui::{
     rgb, rgba, svg,
 };
 
-use crate::{app::window_has_rounded_corners, theme};
+use crate::{
+    app::{window_corner_radii, window_uses_system_decorations},
+    theme,
+};
 
 use super::{
     backend::{
@@ -38,6 +41,7 @@ mod shortcuts;
 mod state;
 mod subtitles;
 mod video_element;
+mod video_viewport;
 
 #[cfg(test)]
 mod mouse_tests;
@@ -70,6 +74,7 @@ use state::{
 };
 use subtitles::defer_drop_subtitle;
 use video_element::VideoFrameElement;
+use video_viewport::VideoViewport;
 
 #[derive(Clone, Debug)]
 pub enum PlaybackEvent {
@@ -286,7 +291,10 @@ impl PlaybackPage {
             cx.stop_propagation();
             return;
         }
-        self.window_drag = if event.click_count == 1 && !window.is_fullscreen() {
+        self.window_drag = if event.click_count == 1
+            && !window.is_fullscreen()
+            && !window_uses_system_decorations(window)
+        {
             WindowDragState::Pending
         } else {
             WindowDragState::Idle
@@ -338,7 +346,10 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !event.dragging() {
+        if !event.dragging()
+            || (window_uses_system_decorations(window)
+                && self.window_drag == WindowDragState::Pending)
+        {
             self.window_drag = WindowDragState::Idle;
         }
         if !cfg!(target_os = "windows")
@@ -530,7 +541,7 @@ impl Render for PlaybackPage {
         if progress_bar_visible {
             self.update_download_speed(cx);
         }
-        let theme = theme::get(cx);
+        let corners = window_corner_radii(window, cx);
         let is_fullscreen = window.is_fullscreen();
         if is_fullscreen && !self.fullscreen.cursor_visible {
             crate::hide_cursor_until_mouse_moves(cx);
@@ -582,21 +593,22 @@ impl Render for PlaybackPage {
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(rgb(0x000000))
             .text_color(rgb(0xe6edf3))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_scroll_wheel(cx.listener(Self::handle_surface_scroll_wheel))
-            .when(window_has_rounded_corners(window), |this| {
-                this.rounded_b(theme.radius_lg).overflow_hidden()
-            })
-            .when_some(current_video_frame, |this, frame| this.child(frame))
+            .child(VideoViewport::new(
+                self.frame.source_size,
+                corners,
+                div()
+                    .when_some(current_video_frame, |this, frame| this.child(frame))
+                    .child(viewport_observer)
+                    .child(self.render_subtitle_overlay()),
+            ))
             .when_some(status, |this, status| {
                 this.child(render_playback_status(status, cx))
             })
-            .child(viewport_observer)
             .child(self.render_mouse_capture(window, cx))
-            .child(self.render_subtitle_overlay())
             .when(self.volume.indicator_visible, |this| {
                 this.child(self.render_volume_indicator(cx))
             })

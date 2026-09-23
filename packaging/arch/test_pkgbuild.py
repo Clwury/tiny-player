@@ -19,7 +19,7 @@ class MakepkgSourceTests(unittest.TestCase):
         self.upstream = self.root / "upstream repository"
         self.upstream.mkdir()
         self.git("init", "--initial-branch=main")
-        (self.upstream / "Cargo.toml").write_text('[package]\nname = "tiny-player"\nversion = "0.1.0"\n')
+        (self.upstream / "Cargo.toml").write_text('[package]\nname = "tiny-player"\nversion = "0.1.1"\n')
         (self.upstream / "src").mkdir()
         (self.upstream / "src/main.rs").write_text("fn main() {}\n")
         self.git("add", ".")

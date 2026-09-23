@@ -20,8 +20,10 @@ Install (optional, no sudo)
   The installation location is fixed; no directory argument is accepted.
   To update, close Tiny Player, extract the new bundle into a fresh directory,
   and run its install.sh without arguments. The installer replaces the old
-  application and refreshes its launcher, desktop entry and icons. If installation
-  fails, it restores the previous version. User settings and caches are preserved.
+  application and refreshes its launcher, desktop entry and icons. Obsolete
+  Tiny Player icon sizes are removed, and KDE sessions are notified to reload icons.
+  If installation fails, it restores the previous version, including its icons.
+  User settings and caches are preserved.
 
 The bundle carries FFmpeg, libplacebo and their selected library dependencies.
 glibc, GPU drivers, audio plugins and font/keyboard configuration come from the

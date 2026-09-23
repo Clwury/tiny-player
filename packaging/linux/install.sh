@@ -75,13 +75,8 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-replace_path() {
-    local source=$1 target=$2 index=${#replaced_paths[@]}
-    [[ ! -d $target || -L $target || -d $source ]] || {
-        printf 'Refusing to replace a directory with a file: %s\n' "$target" >&2
-        return 1
-    }
-    mkdir -p -- "$(dirname -- "$target")"
+backup_path() {
+    local target=$1 index=${#replaced_paths[@]}
     replaced_paths+=("$target")
     if [[ -e $target || -L $target ]]; then
         had_original+=(1)
@@ -89,6 +84,16 @@ replace_path() {
     else
         had_original+=(0)
     fi
+}
+
+replace_path() {
+    local source=$1 target=$2
+    [[ ! -d $target || -L $target || -d $source ]] || {
+        printf 'Refusing to replace a directory with a file: %s\n' "$target" >&2
+        return 1
+    }
+    mkdir -p -- "$(dirname -- "$target")"
+    backup_path "$target"
     mv -T -- "$source" "$target"
 }
 
@@ -117,6 +122,14 @@ done < "$staged/new-app/share/applications/tiny-player.desktop" > "$staged/deskt
 
 replace_path "$staged/new-app" "$destination"
 replace_path "$staged/launcher" "$prefix/bin/tiny-player"
+# Retire icon sizes from earlier bundles, including leftovers from older
+# installers. Keep them in the transaction so failed updates restore them.
+for icon in "$prefix"/share/icons/hicolor/*/apps/tiny-player.{png,svg}; do
+    [[ -f $icon || -L $icon ]] || continue
+    relative_icon=${icon#"$prefix/share/icons/"}
+    [[ ! -e $staged/icons/$relative_icon && ! -L $staged/icons/$relative_icon ]] || continue
+    backup_path "$icon"
+done
 while IFS= read -r -d '' icon; do
     replace_path "$icon" "$prefix/share/icons/${icon#"$staged/icons/"}"
 done < "$staged/icon-files"
@@ -125,7 +138,12 @@ committed=1
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$prefix/share/applications" || true
 fi
+touch -c -- "$prefix/share/icons/hicolor" || true
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -q -f -t "$prefix/share/icons/hicolor" || true
+fi
+# GTK's on-disk cache does not refresh running KDE icon loaders.
+if [[ :${XDG_CURRENT_DESKTOP:-}: == *:KDE:* ]] && command -v dbus-send >/dev/null 2>&1; then
+    dbus-send --session --type=signal /KIconLoader org.kde.KIconLoader.iconChanged int32:0 || true
 fi
 printf '%s Tiny Player to %s\nLaunch: %s/bin/tiny-player\n' "$install_action" "$destination" "$prefix"

@@ -52,10 +52,10 @@ tiny-player
 
 ### Linux 预编译包
 
-解压完整归档后运行。以下文件名以 `0.1.0` 为例，使用其他版本时替换版本号：
+解压完整归档后运行。请将 `<version>` 替换为所下载包的实际版本号：
 
 ```sh
-tar -xzf tiny-player-0.1.0-linux-x86_64.tar.gz
+tar -xzf "tiny-player-<version>-linux-x86_64.tar.gz"
 ./tiny-player/bin/tiny-player
 ```
 
@@ -77,7 +77,7 @@ tar -xzf tiny-player-0.1.0-linux-x86_64.tar.gz
 
 ### Windows 便携包
 
-完整解压 `tiny-player-<版本>-windows-x86_64.zip`，双击目录中的 `tiny-player.exe`。移动应用时保留整个目录，包括 DLL 和 `share/` 资源。配置与缓存保存在 Windows 用户目录中。
+完整解压 `tiny-player-<version>-windows-x86_64.zip`（`<version>` 为所下载包的实际版本号），双击目录中的 `tiny-player.exe`。移动应用时保留整个目录，包括 DLL 和 `share/` 资源。配置与缓存保存在 Windows 用户目录中。
 
 自行构建需要 Rust MSVC 工具链、Visual Studio 2022 C++ x64 Build Tools、Windows SDK，以及 64 位 Python 3.12。在仓库根目录的 PowerShell 中运行：
 
@@ -149,7 +149,7 @@ cargo run --locked
 
 ## License
 
-本项目采用 **GNU General Public License v3.0 only（GPL-3.0-only）**，完整条款见 [LICENSE](LICENSE)。第三方依赖遵循各自的许可证。
+本项目采用 **GNU General Public License v3.0 或更新版本（GPL-3.0-or-later）**，完整条款见 [LICENSE](LICENSE)。第三方依赖遵循各自的许可证。
 
 ## 致谢
 

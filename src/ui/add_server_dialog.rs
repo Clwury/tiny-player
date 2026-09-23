@@ -213,7 +213,7 @@ impl AddServerDialogState {
     pub fn render_layer(
         &self,
         dialog: Entity<Self>,
-        rounded_window: bool,
+        corners: gpui::Corners<gpui::Pixels>,
         on_cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         on_submit: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         cx: &App,
@@ -237,9 +237,11 @@ impl AddServerDialogState {
             // Keep the modal layer from forwarding clicks or wheel events to
             // the page underneath its transparent backdrop.
             .occlude()
-            .when(rounded_window, |this| {
-                this.rounded(theme.radius_lg).overflow_hidden()
-            })
+            .rounded_tl(corners.top_left)
+            .rounded_tr(corners.top_right)
+            .rounded_bl(corners.bottom_left)
+            .rounded_br(corners.bottom_right)
+            .overflow_hidden()
             .child(
                 div()
                     .flex()

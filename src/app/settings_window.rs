@@ -14,7 +14,10 @@ use crate::{
 use super::{
     TinyApp, app_window_options,
     resize::resize_handles,
-    window::{window_border, window_has_rounded_corners},
+    window::{
+        WindowCornersExt, WindowFrameColors, sync_window_decorations, window_corner_radii,
+        window_frame, window_has_rounded_corners, window_uses_system_decorations,
+    },
 };
 
 pub(super) struct SettingsWindow {
@@ -81,30 +84,44 @@ impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(target_os = "windows")]
         super::window::windows::sync_window_theme(window, cx);
+        let title = self.settings.read(cx).mode().title();
+        sync_window_decorations(window, title.into(), cx);
         let theme = theme::get(cx);
         let rounded_window = window_has_rounded_corners(window);
-        let title = self.settings.read(cx).mode().title();
-        div()
+        let corners = window_corner_radii(window, cx);
+        let system_decorations = window_uses_system_decorations(window);
+        let content = div()
             .relative()
             .size_full()
-            .bg(theme.background)
             .when(rounded_window, |this| {
-                this.rounded(theme.radius_lg).overflow_hidden()
+                this.rounded_window_corners(corners).overflow_hidden()
             })
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .size_full()
-                    .child(
-                        div()
-                            .flex_none()
-                            .child(app_titlebar(window, cx, title.into())),
-                    )
+                    .when(!system_decorations, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .child(app_titlebar(window, cx, title.into())),
+                        )
+                    })
                     .child(div().flex_1().min_h_0().child(self.settings.clone())),
             )
-            .when(rounded_window, |this| this.children(resize_handles()))
-            .when(rounded_window, |this| this.child(window_border(cx)))
+            .when(rounded_window, |this| this.children(resize_handles()));
+
+        window_frame(
+            content,
+            WindowFrameColors {
+                background: theme.background,
+                top: theme.title_bar,
+                bottom_left: theme.panel_background,
+            },
+            window,
+            cx,
+        )
     }
 }
 
@@ -142,36 +159,51 @@ mod tests {
                     cx.update(|window, cx| {
                         let theme = theme::get(cx);
                         let scale = window.scale_factor();
-                        let radius = ScaledPixels(if cfg!(target_os = "windows") {
+                        // GPUI's TestWindow reports Server decorations.
+                        let inset = if cfg!(any(target_os = "windows", target_os = "linux")) {
                             0.0
                         } else {
-                            f32::from(theme.radius_lg) * scale
-                        });
+                            1.0
+                        };
+                        let radius = ScaledPixels(
+                            if cfg!(any(target_os = "windows", target_os = "linux")) {
+                                0.0
+                            } else {
+                                (f32::from(theme.radius_lg) - inset).max(0.0) * scale
+                            },
+                        );
                         let mut bottom_left = false;
-                        let mut bottom_right = false;
                         let mut sidebar_background = false;
                         assert_ne!(theme.title_bar, theme.background);
+                        // The frame now owns the page background; there is no
+                        // second full-size content quad at the inner arc.
+                        let frame_bounds =
+                            Bounds::new(gpui::point(px(0.0), px(0.0)), size(px(width), px(height)))
+                                .scale(scale);
+                        assert!(window.painted_quads().iter().any(|quad| {
+                            quad.bounds == frame_bounds
+                                && quad.background == theme.background.into()
+                        }));
                         for quad in window.painted_quads().iter().filter(|quad| {
                             (quad.background == theme.background.into()
                                 || quad.background == theme.title_bar.into())
-                                && quad.bounds.bottom() == ScaledPixels(height * scale)
+                                && quad.bounds.bottom() == ScaledPixels((height - inset) * scale)
                         }) {
-                            if quad.bounds.left() == ScaledPixels(0.0) {
+                            if quad.bounds.left() == ScaledPixels(inset * scale) {
                                 assert_eq!(quad.corner_radii.bottom_left, radius);
                                 bottom_left = true;
                             }
-                            if quad.bounds.right() == ScaledPixels(width * scale) {
+                            if quad.bounds.right() == ScaledPixels((width - inset) * scale) {
                                 assert_eq!(quad.corner_radii.bottom_right, radius);
-                                bottom_right = true;
                             }
                             if quad.background == theme.title_bar.into() {
-                                assert_eq!(quad.bounds.left(), ScaledPixels(0.0));
+                                assert_eq!(quad.bounds.left(), ScaledPixels(inset * scale));
                                 assert_eq!(quad.bounds.size.width, ScaledPixels(226.0 * scale));
                                 assert_eq!(quad.corner_radii.bottom_right, ScaledPixels(0.0));
                                 sidebar_background = true;
                             }
                         }
-                        assert!(bottom_left && bottom_right && sidebar_background);
+                        assert!(bottom_left && sidebar_background);
                     });
                 }
             }

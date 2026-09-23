@@ -177,9 +177,7 @@ impl PlaybackPage {
             .max_w(relative(0.8))
             .flex()
             .flex_col()
-            .when(window_has_rounded_corners(window), |this| {
-                this.rounded_br(theme.radius_lg)
-            })
+            .rounded_br(window_corner_radii(window, cx).bottom_right)
             .border_l_1()
             .border_color(theme.input_border.opacity(0.72))
             .bg(theme.panel_background)

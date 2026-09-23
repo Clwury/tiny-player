@@ -1,6 +1,7 @@
 pub(crate) mod add_server_dialog;
 pub(crate) mod editor;
 pub(crate) mod notification;
+pub(crate) mod paint;
 pub(crate) mod playback_settings_dialog;
 pub(crate) mod scrollbar;
 pub(crate) mod server_icon;

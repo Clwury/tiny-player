@@ -8,15 +8,17 @@ use gpui::svg;
 #[cfg(target_os = "windows")]
 use gpui::{StatefulInteractiveElement, rgb, white};
 
-use crate::{app::window_has_rounded_corners, app_metadata::APP_ICON_ASSET_PATH, theme};
+use crate::{app::window_corner_radii, app_metadata::APP_ICON_ASSET_PATH, theme};
 
 pub(crate) const APP_TITLEBAR_HEIGHT_PX: f32 = 35.0;
 
 pub fn app_titlebar(window: &Window, cx: &App, title: SharedString) -> impl IntoElement {
     let theme = theme::get(cx);
+    let corners = window_corner_radii(window, cx);
 
     div()
         .id("titlebar")
+        .debug_selector(|| "app-titlebar".into())
         .relative()
         .flex()
         .h(px(APP_TITLEBAR_HEIGHT_PX))
@@ -26,9 +28,8 @@ pub fn app_titlebar(window: &Window, cx: &App, title: SharedString) -> impl Into
         .border_b_1()
         .border_color(theme.title_bar_border)
         .bg(theme.title_bar)
-        .when(window_has_rounded_corners(window), |this| {
-            this.rounded_tl(theme.radius_lg).rounded_tr(theme.radius_lg)
-        })
+        .rounded_tl(corners.top_left)
+        .rounded_tr(corners.top_right)
         .when(!cfg!(target_os = "windows"), |this| {
             // Windows handles non-client dragging and double clicks in GPUI's
             // platform backend, including restoring a maximized window.

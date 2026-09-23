@@ -9,7 +9,7 @@ use gpui::{
 };
 
 use crate::{
-    app::window_has_rounded_corners,
+    app::window_corner_radii,
     app_metadata::default_playback_cache_dir,
     player::{
         CacheUnlinkPolicy, PlaybackCacheConfig, PlaybackCacheMode, PlaybackLanguagePreferences,
@@ -205,8 +205,8 @@ impl EventEmitter<SettingsChanged> for PlaybackSettingsDialogState {}
 
 impl Render for PlaybackSettingsDialogState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rounded_window = window_has_rounded_corners(window);
-        self.render_content(cx.entity(), rounded_window, cx)
+        let corners = window_corner_radii(window, cx);
+        self.render_content(cx.entity(), corners.bottom_left, cx)
     }
 }
 
@@ -402,7 +402,7 @@ impl PlaybackSettingsDialogState {
     fn render_content(
         &self,
         dialog: Entity<Self>,
-        rounded_window: bool,
+        bottom_left_radius: gpui::Pixels,
         cx: &App,
     ) -> impl IntoElement {
         let dropdown = self.dropdown.clone();
@@ -416,7 +416,7 @@ impl PlaybackSettingsDialogState {
             .min_h_0()
             .overflow_hidden()
             // Keep the panel transparent so the window supplies the rounded background.
-            .child(self.render_sidebar(dialog.clone(), searching, rounded_window, cx))
+            .child(self.render_sidebar(dialog.clone(), searching, bottom_left_radius, cx))
             .child(
                 div()
                     .relative()
@@ -453,11 +453,11 @@ impl PlaybackSettingsDialogState {
         &self,
         dialog: Entity<Self>,
         searching: bool,
-        rounded_window: bool,
+        bottom_left_radius: gpui::Pixels,
         cx: &App,
     ) -> impl IntoElement {
         let theme = theme::get(cx);
-        settings_sidebar(rounded_window, cx)
+        settings_sidebar(bottom_left_radius, cx)
             .child(
                 div()
                     .flex()

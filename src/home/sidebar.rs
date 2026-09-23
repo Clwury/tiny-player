@@ -1,6 +1,6 @@
 use gpui::{
-    App, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, svg,
+    App, ClickEvent, Context, Corners, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    Pixels, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, svg,
 };
 
 use crate::{app_metadata::APP_NAME, server::CachedServer, theme, ui::server_icon::server_icon};
@@ -12,7 +12,7 @@ impl HomePage {
     pub(super) fn render_sidebar(
         &self,
         cx: &Context<Self>,
-        rounded_window: bool,
+        corners: Corners<Pixels>,
         on_back: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
         on_home: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         on_favorites: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -31,9 +31,8 @@ impl HomePage {
             .border_r_1()
             .border_color(theme.title_bar_border)
             .bg(theme.panel_background)
-            .when(rounded_window, |this| {
-                this.rounded_bl(theme.radius_lg).overflow_hidden()
-            })
+            .rounded_bl(corners.bottom_left)
+            .overflow_hidden()
             .p_3()
             .child(self.render_title_row(cx, on_back))
             .child(div().h(px(12.0)).flex_none())

@@ -61,9 +61,11 @@ DLL 路径，不修改系统 PATH。不要只在主项目的 `build.rs` 里设�
 
 ## 输出
 
+以下路径中的 `<version>` 由 `Cargo.toml` 中的应用版本自动生成：
+
 ```text
 dist/
-  tiny-player-0.1.0-windows-x86_64/
+  tiny-player-<version>-windows-x86_64/
     tiny-player.exe
     *.dll
     share/tiny-player/assets/
@@ -71,8 +73,8 @@ dist/
     build-info/
     manifest.json
     README.txt
-  tiny-player-0.1.0-windows-x86_64.zip
-  tiny-player-0.1.0-windows-x86_64.zip.sha256
+  tiny-player-<version>-windows-x86_64.zip
+  tiny-player-<version>-windows-x86_64.zip.sha256
 ```
 
 重复打包会把旧目录重命名为 `.previous-时间戳`，ZIP 更新为新版本。
@@ -112,12 +114,12 @@ $env:TINY_TEST_LIBPLACEBO = '1' # 可选：在有 Vulkan 驱动的机器启用�
 日志默认写入 `%LOCALAPPDATA%\tiny-player\logs\tiny-player.log`，可通过
 `TINY_LOG_FILE` 修改；设为空字符串可关闭文件日志。
 
-校验已搬移的目录（包括 manifest 内每个文件的 SHA256）：
+校验已搬移的目录（包括 manifest 内每个文件的 SHA256），请将 `<version>` 替换为实际包版本号：
 
 ```powershell
 # 使用上次构建记录的实际解释器路径
 $native = Get-Content .\target\windows-x86_64\paths.json -Raw | ConvertFrom-Json
-& $native.python packaging\windows\bundle.py --verify "D:\播放器\tiny-player-0.1.0-windows-x86_64"
+& $native.python packaging\windows\bundle.py --verify "D:\播放器\tiny-player-<version>-windows-x86_64"
 ```
 
 此流程生成未签名的目录和 ZIP，不生成 installer。原生包版本、来源、构建元数据、

@@ -35,7 +35,7 @@ pub use user::{
 };
 
 pub(super) const CLIENT_NAME: &str = "Tiny Player";
-pub(super) const VERSION: &str = "0.1.0";
+pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug)]
 pub struct EmbyClient {

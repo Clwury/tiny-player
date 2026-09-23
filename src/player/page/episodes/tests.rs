@@ -293,10 +293,11 @@ fn episode_drawer_hides_controls_and_restores_them_when_dismissed(cx: &mut TestA
             assert_eq!(panel_fill.border_widths.bottom, gpui::ScaledPixels(0.0));
             assert_eq!(panel_fill.corner_radii.top_left, gpui::ScaledPixels(0.0));
             assert_eq!(panel_fill.corner_radii.top_right, gpui::ScaledPixels(0.0));
-            let bottom_radius = if cfg!(target_os = "windows") {
+            // TestWindow uses system decorations on Linux.
+            let bottom_radius = if cfg!(any(target_os = "windows", target_os = "linux")) {
                 0.0
             } else {
-                f32::from(theme.radius_lg) * window.scale_factor()
+                (f32::from(theme.radius_lg) - 1.0).max(0.0) * window.scale_factor()
             };
             assert_eq!(
                 panel_fill.corner_radii.bottom_right,

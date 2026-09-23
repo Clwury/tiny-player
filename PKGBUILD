@@ -15,12 +15,12 @@ if [[ -n ${startdir:-} && -n ${BUILDDIR:-} && \
 fi
 
 pkgname=tiny-player-git
-pkgver=0.1.0.r111.g33c484b
+pkgver=0.1.1.r115.gd85a323
 pkgrel=1
 pkgdesc='Native Emby desktop client with FFmpeg and Vulkan playback'
 arch=('x86_64')
 url='https://github.com/Clwury/tiny-player'
-license=('GPL-3.0-only')
+license=('GPL-3.0-or-later')
 # ring builds a native GCC archive that rust-lld cannot consume as GCC LTO.
 options=('!lto')
 depends=(
@@ -94,7 +94,7 @@ package() {
     install -Dm644 tiny-player.desktop \
         "$pkgdir/usr/share/applications/tiny-player.desktop"
     install -Dm644 assets/icons/tiny-player.png \
-        "$pkgdir/usr/share/icons/hicolor/512x512/apps/tiny-player.png"
+        "$pkgdir/usr/share/icons/hicolor/256x256/apps/tiny-player.png"
     install -Dm644 assets/icons/tiny-player.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/tiny-player.svg"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

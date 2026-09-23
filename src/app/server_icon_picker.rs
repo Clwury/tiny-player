@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-use super::{Page, TinyApp, window::window_has_rounded_corners};
+use super::{Page, TinyApp, WindowCornersExt, window_corner_radii};
 
 pub(super) struct ServerIconPicker {
     server_id: String,
@@ -358,9 +358,8 @@ impl TinyApp {
                 .items_center()
                 .justify_center()
                 .bg(theme.overlay)
-                .when(window_has_rounded_corners(window), |this| {
-                    this.rounded(theme.radius_lg).overflow_hidden()
-                })
+                .rounded_window_corners(window_corner_radii(window, cx))
+                .overflow_hidden()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|app, _, window, cx| {

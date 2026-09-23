@@ -192,23 +192,28 @@ fn context_menu_opens_a_scrollable_modal_and_dismissal_releases_previews(cx: &mu
         cx.update(|window, cx| {
             let theme = theme::get(cx);
             let scale = window.scale_factor();
+            // TestWindow uses system decorations on Linux.
+            let inset = if cfg!(any(target_os = "windows", target_os = "linux")) || fullscreen {
+                0.0
+            } else {
+                1.0
+            };
             let bounds = Bounds::new(
-                point(ScaledPixels(0.0), ScaledPixels(0.0)),
-                size(
-                    ScaledPixels(f32::from(window.viewport_size().width) * scale),
-                    ScaledPixels(f32::from(window.viewport_size().height) * scale),
-                ),
-            );
+                point(px(0.0), px(0.0)),
+                size(window.viewport_size().width, window.viewport_size().height),
+            )
+            .inset(px(inset))
+            .scale(scale);
             let quads = window.painted_quads();
             let backdrop = quads
                 .iter()
                 .filter(|quad| quad.bounds == bounds && quad.background == theme.overlay.into())
                 .collect::<Vec<_>>();
             assert!(!backdrop.is_empty());
-            let radius = if !cfg!(target_os = "windows") && !fullscreen {
-                f32::from(theme.radius_lg) * scale
-            } else {
+            let radius = if cfg!(any(target_os = "windows", target_os = "linux")) || fullscreen {
                 0.0
+            } else {
+                (f32::from(theme.radius_lg) - 1.0).max(0.0) * scale
             };
             for quad in backdrop {
                 assert_eq!(quad.corner_radii, Corners::all(ScaledPixels(radius)));

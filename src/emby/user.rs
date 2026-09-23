@@ -677,6 +677,7 @@ mod tests {
     #[test]
     fn authorization_headers_use_runtime_system_name() {
         let client = EmbyClient::new("device-1".to_string()).unwrap();
+        let version = env!("CARGO_PKG_VERSION");
         let device_name =
             crate::emby::device_name_from_system_name(sysinfo::System::name().as_deref());
 
@@ -684,14 +685,14 @@ mod tests {
         assert_eq!(
             client.authorization_header(),
             format!(
-                "Emby UserId=\"\", Client=\"Tiny Player\", Device=\"{device_name}\", DeviceId=\"device-1\", Version=\"0.1.0\", Token=\"\""
+                "Emby UserId=\"\", Client=\"Tiny Player\", Device=\"{device_name}\", DeviceId=\"device-1\", Version=\"{version}\", Token=\"\""
             )
         );
 
         assert_eq!(
             client.authenticated_authorization_header("token-1", "user-1"),
             format!(
-                "MediaBrowser Token=\"token-1\", UserId=\"user-1\", Client=\"Tiny Player\", Device=\"{device_name}\", DeviceId=\"device-1\", Version=\"0.1.0\""
+                "MediaBrowser Token=\"token-1\", UserId=\"user-1\", Client=\"Tiny Player\", Device=\"{device_name}\", DeviceId=\"device-1\", Version=\"{version}\""
             )
         );
     }

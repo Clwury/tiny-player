@@ -139,7 +139,8 @@ def build_bundle(binary, output):
     if run("getconf", "GNU_LIBC_VERSION").strip() != "glibc 2.39":
         raise ValueError("Build inside the Ubuntu 24.04 / glibc 2.39 container")
     inspect_elf(binary)
-    version = tomllib.loads((repo / "Cargo.toml").read_text())["package"]["version"]
+    package = tomllib.loads((repo / "Cargo.toml").read_text())["package"]
+    version = package["version"]
     artifact_name = f"tiny-player-{version}-linux-x86_64"
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="tiny-player-bundle-") as staging:
@@ -161,11 +162,11 @@ def build_bundle(binary, output):
         ], check=True)
         shutil.copytree(repo / "assets", root / "share/tiny-player/assets")
         shutil.copy2(repo / "tiny-player.desktop", root / "share/applications")
-        for size, extension in (("512x512", "png"), ("scalable", "svg")):
+        for size, extension in (("256x256", "png"), ("scalable", "svg")):
             icons = root / "share/icons/hicolor" / size / "apps"
             icons.mkdir(parents=True)
             shutil.copy2(repo / f"assets/icons/tiny-player.{extension}", icons)
-        shutil.copy2(repo / "LICENSE", root / "licenses/tiny-player-GPL-3.0-only.txt")
+        shutil.copy2(repo / "LICENSE", root / f"licenses/tiny-player-{package['license']}.txt")
         shutil.copytree("/opt/tiny-player/share/licenses", root / "licenses/native", dirs_exist_ok=True)
         shutil.copytree("/opt/tiny-player/share/build-info", root / "build-info")
         shutil.copy2(repo / "Cargo.lock", root / "build-info/Cargo.lock")

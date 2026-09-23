@@ -1,11 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Tiny Player icon">
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 512 512" role="img" aria-label="Tiny Player icon">
   <defs>
     <clipPath id="icon-clip">
       <rect x="0" y="0" width="512" height="512" rx="104" ry="104"/>
     </clipPath>
   </defs>
 
-  <g clip-path="url(#icon-clip)" shape-rendering="geometricPrecision">
+  <!-- Leave a 4 px transparent inset on the 64 px canvas for desktop icon alignment. -->
+  <g transform="translate(32 32) scale(0.875)" clip-path="url(#icon-clip)" shape-rendering="geometricPrecision">
     <rect x="0" y="0" width="512" height="512" fill="#082760"/>
 
     <path d="M0 422 C68 394 138 352 212 365 C292 384 362 438 512 438 L512 512 L0 512 Z" fill="#1E4A8C"/>

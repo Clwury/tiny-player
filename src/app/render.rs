@@ -13,15 +13,14 @@ use super::{
         server_card_menu,
     },
     server_reorder::animated_card,
-    window::{window_border, window_has_rounded_corners},
+    window::{
+        WindowCornersExt, WindowFrameColors, sync_window_decorations, window_corner_radii,
+        window_frame, window_has_rounded_corners, window_uses_system_decorations,
+    },
 };
 
 impl TinyApp {
-    fn render_content(
-        &mut self,
-        _rounded_window: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_content(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let close_menu = cx.listener(Self::close_server_menu);
         let home_page = match &self.page {
             Page::Home(page) => Some(page.clone()),
@@ -183,11 +182,32 @@ impl Render for TinyApp {
             self.finish_server_reorder(false, window, cx);
         }
 
-        let theme = theme::get(cx);
         let title = self.title(cx);
+        sync_window_decorations(window, title.clone(), cx);
+        let theme = theme::get(cx);
+        let system_decorations = window_uses_system_decorations(window);
         let playback_fullscreen =
             window.is_fullscreen() && matches!(self.page, Page::Playback { .. });
+        let background = if matches!(self.page, Page::Playback { .. }) {
+            gpui::black()
+        } else {
+            theme.background
+        };
+        let frame_colors = WindowFrameColors {
+            background,
+            top: if !playback_fullscreen && !system_decorations {
+                theme.title_bar
+            } else {
+                background
+            },
+            bottom_left: if matches!(self.page, Page::Home(_)) {
+                theme.panel_background
+            } else {
+                background
+            },
+        };
         let rounded_window = window_has_rounded_corners(window);
+        let corners = window_corner_radii(window, cx);
         let close_dialog = cx.listener(Self::close_add_server_dialog);
         let close_menu = cx.listener(Self::close_server_menu);
         let submit_dialog = cx.listener(Self::submit_add_server_dialog);
@@ -195,22 +215,21 @@ impl Render for TinyApp {
         let icon_picker = self.render_server_icon_picker(window, cx);
         let modal_open = dialog.is_some() || icon_picker.is_some();
 
-        div()
+        let content = div()
             .relative()
             .size_full()
             .when(rounded_window, |this| {
-                this.rounded(theme.radius_lg).overflow_hidden()
+                this.rounded_window_corners(corners).overflow_hidden()
             })
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .size_full()
-                    .bg(theme.background)
                     .when(rounded_window, |this| {
-                        this.rounded(theme.radius_lg).overflow_hidden()
+                        this.rounded_window_corners(corners).overflow_hidden()
                     })
-                    .when(!playback_fullscreen, |this| {
+                    .when(!playback_fullscreen && !system_decorations, |this| {
                         this.child(
                             div()
                                 .on_mouse_down(MouseButton::Left, close_menu)
@@ -221,12 +240,12 @@ impl Render for TinyApp {
                                 .child(app_titlebar(window, cx, title)),
                         )
                     })
-                    .child(self.render_content(rounded_window, cx)),
+                    .child(self.render_content(cx)),
             )
             .when_some(dialog, |this, dialog| {
                 this.child(dialog.read(cx).render_layer(
                     dialog.clone(),
-                    rounded_window,
+                    corners,
                     close_dialog,
                     submit_dialog,
                     cx,
@@ -235,7 +254,8 @@ impl Render for TinyApp {
             .when_some(icon_picker, |this, picker| this.child(picker))
             .when(rounded_window && !modal_open, |this| {
                 this.children(resize_handles())
-            })
-            .when(rounded_window, |this| this.child(window_border(cx)))
+            });
+
+        window_frame(content, frame_colors, window, cx)
     }
 }

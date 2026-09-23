@@ -9,7 +9,7 @@ use gpui::{
 };
 
 use crate::{
-    app::window_has_rounded_corners,
+    app::window_corner_radii,
     player::{PlaybackCacheConfig, PlaybackLanguagePreferences, TrackLanguage},
     theme::{self, ColorTheme},
 };
@@ -246,8 +246,12 @@ impl UserSettingsDialogState {
         }
     }
 
-    fn render_sidebar(&self, rounded_window: bool, cx: &Context<Self>) -> impl IntoElement {
-        settings_sidebar(rounded_window, cx).child(div().flex().flex_col().gap_1().children(
+    fn render_sidebar(
+        &self,
+        bottom_left_radius: gpui::Pixels,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        settings_sidebar(bottom_left_radius, cx).child(div().flex().flex_col().gap_1().children(
             SettingsCategory::ALL.map(|category| {
                 let dialog = cx.entity();
                 settings_category_button(category.title(), self.category == category, cx).on_click(
@@ -276,7 +280,7 @@ impl Render for UserSettingsDialogState {
             .size_full()
             .min_h_0()
             .overflow_hidden()
-            .child(self.render_sidebar(window_has_rounded_corners(window), cx))
+            .child(self.render_sidebar(window_corner_radii(window, cx).bottom_left, cx))
             .child(
                 div()
                     .relative()

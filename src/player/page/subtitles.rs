@@ -27,8 +27,8 @@ impl PlaybackPage {
                 .id("playback-subtitle-overlay-empty")
                 .into_any_element();
         };
-        // Canvas observations are window-relative, while absolute children below
-        // are laid out relative to the playback view.
+        // Canvas observations are window-relative; subtitle children are laid
+        // out inside the same adaptive video viewport as the image.
         let video_bounds = local_video_viewport_bounds(observed_video_bounds);
         let Some(source_size) = self.frame.source_size else {
             return div()
