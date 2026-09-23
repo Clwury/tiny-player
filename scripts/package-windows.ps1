@@ -104,6 +104,7 @@ try {
     }
     $cargoArgs += @('--locked', '--target', 'x86_64-pc-windows-msvc')
     if ($Mode -eq 'Package') { $cargoArgs += '--release' }
+    else { $cargoArgs += '--workspace' }
     if ($Offline) { $cargoArgs += '--offline' }
     if ($Mode -eq 'Clippy') { $cargoArgs += @('--all-targets', '--', '-D', 'warnings') }
     if ($TestFilter) {

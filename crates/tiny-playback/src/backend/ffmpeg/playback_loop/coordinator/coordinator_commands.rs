@@ -1,0 +1,552 @@
+use std::sync::{
+    Arc,
+    mpsc::{Receiver, Sender},
+};
+use std::time::Instant;
+
+use crate::{
+    PlaybackTrackSelection,
+    backend::{BackendEvent, BackendEventKind, PlaybackCacheConfig, PlaybackSeekMode},
+    render_host::VideoOutputQueue,
+};
+
+use super::commands::{begin_seek, begin_track_switch};
+use super::playback_pipeline_state::PlaybackPipelineState;
+use super::playback_reset_service::{
+    PlaybackGenerationFlushContext, PlaybackPositionResetKind, PlaybackPositionStateResetContext,
+    PlaybackSeekBufferingPolicy, PlaybackSeekResetContext, service_playback_generation_seek,
+    service_playback_position_state_reset, service_playback_seek_reset,
+};
+use super::track_switch::{
+    TrackSwitchPipelineState, service_audio_disable_command, service_subtitle_disable_command,
+    service_track_switch_pipelines,
+};
+use super::{
+    AudioOutput, DemuxPacketCache, FfmpegCommand, FfmpegControl, FfmpegPlaybackInput,
+    HttpRingCache, PlaybackSession, StreamCatalog, drain_playback_commands,
+    playback_audio_info_from_stream, select_audio_stream_for_selection_from_catalog,
+    select_subtitle_stream_for_selection_from_catalog, should_cache_http_url,
+};
+use crate::backend::ffmpeg::worker::{PendingSeek, PendingTrackSelection};
+
+const AUDIO_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON: &str = "audio_track_change";
+const SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON: &str = "internal_subtitle_track_change";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlaybackCommandServiceStatus {
+    Idle,
+    Continue,
+    Stopped,
+}
+
+pub(super) struct PlaybackCommandContext<'a> {
+    pub(super) source: &'a mut FfmpegPlaybackInput,
+    pub(super) session: &'a mut PlaybackSession,
+    pub(super) control: &'a Arc<FfmpegControl>,
+    pub(super) command_rx: &'a Receiver<FfmpegCommand>,
+    pub(super) http_cache: Option<&'a HttpRingCache>,
+    pub(super) stream_catalog: &'a StreamCatalog,
+    pub(super) demux_cache: &'a DemuxPacketCache,
+    pub(super) vo_queue: &'a VideoOutputQueue,
+    pub(super) pipeline: &'a mut PlaybackPipelineState,
+    pub(super) emit_playback_buffered_events: bool,
+    pub(super) event_tx: &'a Sender<BackendEvent>,
+}
+
+fn pending_seek_is_latest_generation(pending_seek: &PendingSeek, control: &FfmpegControl) -> bool {
+    pending_seek.generation == control.seek_generation()
+}
+
+fn log_superseded_seek(
+    pending_seek: &PendingSeek,
+    control: &FfmpegControl,
+    checkpoint: &'static str,
+) {
+    tracing::debug!(
+        session_id = ?pending_seek.session_id,
+        position_seconds = pending_seek.position_seconds,
+        seek_mode = ?pending_seek.mode,
+        seek_generation = pending_seek.generation,
+        latest_seek_generation = control.seek_generation(),
+        checkpoint,
+        "skipping superseded FFmpeg seek before playback reset"
+    );
+}
+
+pub(super) fn service_playback_commands(
+    mut context: PlaybackCommandContext<'_>,
+) -> std::result::Result<PlaybackCommandServiceStatus, String> {
+    // Drain only commands that have already arrived. A single seek therefore
+    // executes in this coordinator tick, while a burst naturally collapses to
+    // its final target without ever blocking playback/VO for a quiet period.
+    let drained_commands = drain_playback_commands(context.command_rx, context.control);
+    if context.control.should_stop() {
+        return Ok(PlaybackCommandServiceStatus::Stopped);
+    }
+
+    if drained_commands.playback_rate.is_some() {
+        // The UI publishes the latest request to AO directly, including at
+        // EOF. Do not overwrite a newer request with an older drained command.
+        let rate = context.control.playback_rate();
+        context.pipeline.scheduler.set_playback_rate(rate);
+        context
+            .pipeline
+            .output_scheduler
+            .note_output_housekeeping_change();
+        tracing::debug!(
+            rate,
+            "updated FFmpeg playback rate without resetting playback"
+        );
+    }
+
+    if let Some(cache_config) = drained_commands.cache_config {
+        context
+            .pipeline
+            .video_decode_pipeline
+            .set_decoder_framedrop(cache_config.decoder_framedrop);
+        apply_playback_cache_config(
+            context.source,
+            context.demux_cache,
+            context.http_cache,
+            cache_config,
+        );
+    }
+
+    if drained_commands.disable_audio && drained_commands.pending_track_selection.is_none() {
+        service_audio_disable_command(&mut context)?;
+    }
+    if drained_commands.disable_subtitles && drained_commands.pending_track_selection.is_none() {
+        service_subtitle_disable_command(&mut context);
+    }
+
+    if let Some(pending_track_selection) = drained_commands.pending_track_selection {
+        context
+            .pipeline
+            .video_decode_pipeline
+            .reset_hevc_decode_chain_recovery_transaction();
+        context.pipeline.clear_cached_seek_recovery_watchdog();
+        let position_seconds =
+            begin_track_switch(context.session, context.control, &pending_track_selection);
+        context.pipeline.clear_audio_realign_transaction();
+        let switch_result = service_track_selection_command(
+            &mut context,
+            position_seconds,
+            pending_track_selection,
+        );
+        if context.control.has_pending_seek() {
+            return Ok(PlaybackCommandServiceStatus::Continue);
+        }
+        switch_result?;
+        return Ok(PlaybackCommandServiceStatus::Continue);
+    }
+
+    if let Some(pending_seek) = drained_commands.pending_seek {
+        if !pending_seek_is_latest_generation(&pending_seek, context.control) {
+            log_superseded_seek(&pending_seek, context.control, "before_begin_seek");
+            return Ok(PlaybackCommandServiceStatus::Continue);
+        }
+        context
+            .pipeline
+            .video_decode_pipeline
+            .reset_hevc_decode_chain_recovery_transaction();
+        context.pipeline.clear_cached_seek_recovery_watchdog();
+        let position_seconds = begin_seek(context.session, context.control, &pending_seek);
+        context.pipeline.current_start_position_nsecs = context.session.start_position_nsecs();
+        context.pipeline.clear_audio_realign_transaction();
+        tracing::debug!(
+            session_id = ?pending_seek.session_id,
+            position_seconds = pending_seek.position_seconds,
+            seek_mode = ?pending_seek.mode,
+            seek_generation = pending_seek.generation,
+            command_wait_ms = Instant::now()
+                .saturating_duration_since(pending_seek.queued_at)
+                .as_secs_f64()
+                * 1_000.0,
+            "servicing queued FFmpeg seek without a blocking coalesce window"
+        );
+        if !pending_seek_is_latest_generation(&pending_seek, context.control) {
+            log_superseded_seek(&pending_seek, context.control, "before_seek_reset");
+            return Ok(PlaybackCommandServiceStatus::Continue);
+        }
+        service_playback_seek_reset(PlaybackSeekResetContext {
+            position_seconds,
+            seek_mode: pending_seek.mode,
+            seek_generation: pending_seek.generation,
+            force_low_level_seek: false,
+            cache_only: false,
+            require_safe_cached_anchor: false,
+            preserve_hevc_same_hardware_recovery: false,
+            recovery_transaction_id: None,
+            low_level_seek_reason: None,
+            session_id: context.session.id(),
+            vo_queue: context.vo_queue,
+            demux_cache: context.demux_cache,
+            pipeline: context.pipeline,
+            emit_playback_buffered_events: context.emit_playback_buffered_events,
+            buffering_policy: PlaybackSeekBufferingPolicy::Emit,
+            control: context.control,
+            event_tx: context.event_tx,
+        })?;
+        return Ok(PlaybackCommandServiceStatus::Continue);
+    }
+
+    Ok(PlaybackCommandServiceStatus::Idle)
+}
+
+fn apply_playback_cache_config(
+    source: &mut FfmpegPlaybackInput,
+    demux_cache: &DemuxPacketCache,
+    http_cache: Option<&HttpRingCache>,
+    cache_config: PlaybackCacheConfig,
+) {
+    source.cache_config = cache_config.clone();
+    let resolved_cache_config =
+        cache_config.resolved_for_cacheable_input(should_cache_http_url(&source.url));
+    demux_cache.apply_cache_config(resolved_cache_config.clone());
+    if let Some(cache) = http_cache {
+        cache.apply_cache_config(&resolved_cache_config);
+    }
+}
+
+fn service_track_selection_command(
+    context: &mut PlaybackCommandContext<'_>,
+    position_seconds: f64,
+    pending_track_selection: PendingTrackSelection,
+) -> std::result::Result<(), String> {
+    let selected_tracks = pending_track_selection.selected_tracks.clone();
+    let low_level_seek_reason =
+        track_selection_low_level_seek_reason(&context.source.selected_tracks, &selected_tracks);
+    let refresh_demux_cache =
+        internal_subtitle_track_changed(&context.source.selected_tracks, &selected_tracks);
+    let demux_audio_stream = select_audio_stream_for_selection_from_catalog(
+        &selected_tracks,
+        context.stream_catalog,
+        false,
+    )?;
+    let demux_subtitle_stream = select_subtitle_stream_for_selection_from_catalog(
+        &selected_tracks,
+        context.stream_catalog,
+    )?;
+    context
+        .demux_cache
+        .set_selected_streams(demux_audio_stream, demux_subtitle_stream);
+
+    context.pipeline.current_start_position_nsecs = context.session.start_position_nsecs();
+    let flush_result = service_playback_generation_seek(PlaybackGenerationFlushContext {
+        kind: PlaybackPositionResetKind::TrackSelection,
+        position_seconds,
+        seek_mode: PlaybackSeekMode::Precise,
+        seek_generation: pending_track_selection.generation,
+        force_low_level_seek: low_level_seek_reason.is_some(),
+        refresh_demux_cache,
+        cache_only: false,
+        require_safe_cached_anchor: false,
+        preserve_hevc_same_hardware_recovery: false,
+        low_level_seek_reason,
+        session_id: context.session.id(),
+        vo_queue: context.vo_queue,
+        demux_cache: context.demux_cache,
+        pipeline: context.pipeline,
+        selected_tracks: Some(&selected_tracks),
+        control: context.control,
+    })?;
+    if !flush_result.flushed {
+        return Ok(());
+    }
+    context.pipeline.clear_cached_seek_recovery_watchdog();
+
+    context.pipeline.audio_decode_pipeline = None;
+    let track_switch_pipeline_state = service_track_switch_pipelines(
+        context.source,
+        selected_tracks,
+        context.stream_catalog,
+        context.pipeline.audio_output.take(),
+        Arc::clone(context.control),
+        context.pipeline.video_decode_pipeline.info().size,
+        context.pipeline.current_start_position_nsecs,
+        &mut context.pipeline.subtitle_pipeline,
+    )?;
+    let TrackSwitchPipelineState {
+        audio_stream: next_audio_stream,
+        audio_output: next_audio_output,
+        audio_decode_pipeline: next_audio_decode_pipeline,
+    } = track_switch_pipeline_state;
+    context.pipeline.audio_stream = next_audio_stream;
+    context.pipeline.audio_output = next_audio_output;
+    context.pipeline.audio_decode_pipeline = next_audio_decode_pipeline;
+    context
+        .pipeline
+        .output_scheduler
+        .update_video_deadline_audio_clock(
+            context
+                .pipeline
+                .audio_output
+                .as_ref()
+                .map(AudioOutput::clock_handle),
+        );
+    if context.pipeline.audio_output.is_none() {
+        context.control.finish_seek_audio_pause();
+    }
+    let playback_audio_info = playback_audio_info_from_stream(
+        context.pipeline.audio_stream,
+        context.pipeline.audio_output.as_ref(),
+    );
+    let _ = context.event_tx.send(BackendEvent::new(
+        context.session.id(),
+        BackendEventKind::PlaybackAudioInfoChanged(playback_audio_info),
+    ));
+
+    service_playback_position_state_reset(PlaybackPositionStateResetContext {
+        position_seconds,
+        session_id: context.session.id(),
+        pipeline: context.pipeline,
+        emit_playback_buffered_events: context.emit_playback_buffered_events,
+        control: context.control,
+        event_tx: context.event_tx,
+    });
+
+    if pending_track_selection.pause_after_switch {
+        context.control.set_user_paused(true);
+        context.pipeline.subtitle_pipeline.update_overlay(
+            context.pipeline.current_start_position_nsecs,
+            context.session.id(),
+            context.event_tx,
+        );
+        let _ = context.event_tx.send(BackendEvent::new(
+            context.session.id(),
+            BackendEventKind::Pause(true),
+        ));
+        let _ = context.event_tx.send(BackendEvent::new(
+            context.session.id(),
+            BackendEventKind::Buffering(false),
+        ));
+    } else {
+        let _ = context.event_tx.send(BackendEvent::new(
+            context.session.id(),
+            BackendEventKind::Buffering(true),
+        ));
+    }
+
+    Ok(())
+}
+
+fn track_selection_low_level_seek_reason(
+    previous: &PlaybackTrackSelection,
+    next: &PlaybackTrackSelection,
+) -> Option<&'static str> {
+    // Unselected audio packets are dropped during prefetch. Even when a reselected track has
+    // cached packets at the playback position, its later packets can have a hole covering the
+    // time it was disabled. Re-read from the current position into a fresh range so that video
+    // waiting for the audio clock cannot deadlock with audio waiting for future video coverage.
+    if next.audio_stream_index.is_some() && next.audio_stream_index != previous.audio_stream_index {
+        return Some(AUDIO_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON);
+    }
+
+    // The demux cache only indexes the currently selected subtitle stream. A cached seek after
+    // selecting another internal stream therefore has no historical packets for the new track and
+    // would resume that stream from the demuxer's already-prefetched append position instead.
+    internal_subtitle_track_changed(previous, next)
+        .then_some(SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON)
+}
+
+fn internal_subtitle_track_changed(
+    previous: &PlaybackTrackSelection,
+    next: &PlaybackTrackSelection,
+) -> bool {
+    let next_subtitle = internal_subtitle_stream_index(next);
+    next_subtitle.is_some() && next_subtitle != internal_subtitle_stream_index(previous)
+}
+
+fn internal_subtitle_stream_index(selection: &PlaybackTrackSelection) -> Option<usize> {
+    if selection.subtitle_external_url.is_some() {
+        None
+    } else {
+        selection.subtitle_stream_index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        PlaybackTrackSelection, backend::PlaybackSeekMode, render_host::PlaybackSessionId,
+    };
+
+    use super::{
+        FfmpegControl, PendingSeek, SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON,
+        pending_seek_is_latest_generation, track_selection_low_level_seek_reason,
+    };
+
+    #[test]
+    fn subtitle_cache_refresh_only_applies_to_new_internal_tracks() {
+        let off = PlaybackTrackSelection {
+            audio_stream_index: Some(1),
+            ..Default::default()
+        };
+        let internal = PlaybackTrackSelection {
+            subtitle_stream_index: Some(2),
+            ..off.clone()
+        };
+        let other_internal = PlaybackTrackSelection {
+            subtitle_stream_index: Some(3),
+            ..internal.clone()
+        };
+        let external = PlaybackTrackSelection {
+            subtitle_external_url: Some("file:///fixture.srt".into()),
+            ..internal.clone()
+        };
+        assert!(super::internal_subtitle_track_changed(&off, &internal));
+        assert!(super::internal_subtitle_track_changed(
+            &internal,
+            &other_internal
+        ));
+        assert!(super::internal_subtitle_track_changed(&external, &internal));
+        assert!(!super::internal_subtitle_track_changed(&internal, &off));
+        assert!(!super::internal_subtitle_track_changed(
+            &internal, &internal
+        ));
+        assert!(!super::internal_subtitle_track_changed(&off, &external));
+    }
+
+    fn pending_seek(generation: u64, position_seconds: f64) -> PendingSeek {
+        PendingSeek {
+            session_id: PlaybackSessionId(1),
+            position_seconds,
+            mode: PlaybackSeekMode::Fast,
+            generation,
+            queued_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn continuous_seek_generations_only_reset_latest_target() {
+        let control = FfmpegControl::new(PlaybackSessionId(1));
+        let first = pending_seek(control.request_seek(), 75.0);
+        assert!(pending_seek_is_latest_generation(&first, &control));
+
+        let second = pending_seek(control.request_seek(), 77.0);
+        let latest = pending_seek(control.request_seek(), 79.0);
+
+        assert!(!pending_seek_is_latest_generation(&first, &control));
+        assert!(!pending_seek_is_latest_generation(&second, &control));
+        assert!(pending_seek_is_latest_generation(&latest, &control));
+        assert_eq!(latest.position_seconds, 79.0);
+    }
+
+    #[test]
+    fn changing_internal_subtitle_track_forces_low_level_seek() {
+        let previous = PlaybackTrackSelection {
+            subtitle_stream_index: Some(2),
+            subtitle_codec: Some("subrip".to_string()),
+            ..PlaybackTrackSelection::default()
+        };
+        let next = PlaybackTrackSelection {
+            subtitle_stream_index: Some(4),
+            subtitle_codec: Some("subrip".to_string()),
+            ..PlaybackTrackSelection::default()
+        };
+
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &next),
+            Some(SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON)
+        );
+    }
+
+    #[test]
+    fn enabling_internal_subtitle_track_forces_low_level_seek() {
+        let previous = PlaybackTrackSelection::default();
+        let next = PlaybackTrackSelection {
+            subtitle_stream_index: Some(4),
+            subtitle_codec: Some("subrip".to_string()),
+            ..PlaybackTrackSelection::default()
+        };
+
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &next),
+            Some(SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON)
+        );
+    }
+
+    #[test]
+    fn reenabling_audio_track_forces_low_level_seek() {
+        let previous = PlaybackTrackSelection {
+            audio_stream_index: None,
+            default_audio_stream_index: Some(1),
+            ..PlaybackTrackSelection::default()
+        };
+        let next = PlaybackTrackSelection {
+            audio_stream_index: Some(1),
+            ..previous.clone()
+        };
+
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &next),
+            Some("audio_track_change"),
+            "packets cached before disabling audio do not cover the disabled interval"
+        );
+    }
+
+    #[test]
+    fn changing_audio_track_forces_low_level_seek() {
+        let previous = PlaybackTrackSelection {
+            audio_stream_index: Some(1),
+            ..PlaybackTrackSelection::default()
+        };
+        let next = PlaybackTrackSelection {
+            audio_stream_index: Some(5),
+            ..previous.clone()
+        };
+
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &next),
+            Some("audio_track_change")
+        );
+        assert_eq!(
+            track_selection_low_level_seek_reason(&next, &previous),
+            Some("audio_track_change"),
+            "switching back must not reuse incomplete packets from the previously selected track"
+        );
+    }
+
+    #[test]
+    fn disabling_tracks_or_external_subtitle_changes_keep_cached_seek() {
+        let previous = PlaybackTrackSelection {
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(4),
+            subtitle_codec: Some("subrip".to_string()),
+            ..PlaybackTrackSelection::default()
+        };
+        let audio_off = PlaybackTrackSelection {
+            audio_stream_index: None,
+            ..previous.clone()
+        };
+        let external_subtitle = PlaybackTrackSelection {
+            subtitle_stream_index: Some(7),
+            subtitle_external_url: Some("https://example.com/subtitle.ass".to_string()),
+            subtitle_codec: Some("ass".to_string()),
+            ..previous.clone()
+        };
+        let subtitles_off = PlaybackTrackSelection {
+            subtitle_stream_index: None,
+            subtitle_external_url: None,
+            subtitle_codec: None,
+            ..previous.clone()
+        };
+
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &previous),
+            None
+        );
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &audio_off),
+            None
+        );
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &external_subtitle),
+            None
+        );
+        assert_eq!(
+            track_selection_low_level_seek_reason(&previous, &subtitles_off),
+            None
+        );
+    }
+}

@@ -1,19 +1,13 @@
-mod backend;
-mod dovi;
-mod ffmpeg_dovi;
-mod ffmpeg_vulkan;
+mod cache;
 mod language;
-mod libplacebo;
 mod media_metadata;
 mod page;
 mod profile;
-mod rate;
-mod render_host;
 mod track_metadata;
 mod track_preferences;
 mod tracks;
-mod video_presenter;
-mod volume;
+
+pub(crate) use tiny_playback::{backend, rate, render_host, video_presenter, volume};
 
 pub use backend::{
     CacheUnlinkPolicy, PlaybackCacheConfig, PlaybackCacheMode, PlaybackSeekableCacheMode,
@@ -33,5 +27,6 @@ pub use profile::{DeviceProfileConfig, device_profile};
 pub(crate) use track_metadata::track_metadata_label;
 pub use track_preferences::PlaybackTrackPreferenceKey;
 pub(crate) use track_preferences::{PlaybackTrackPreferences, SavedTrackChoice, SavedTrackChoices};
+pub(crate) use tracks::PlaybackTrackExt;
 pub use tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection};
 pub use volume::PlaybackVolumeSettings;

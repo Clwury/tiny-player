@@ -35,7 +35,7 @@
 Rust 应用仍使用 MSVC。对原生 DLL 的 C ABI，脚本从导出表生成 `.def`，再通过
 MSVC `lib.exe` 生成导入库，并正确标记数据导出；不链接 MinGW 静态库，也不引入
 MinGW CRT 头文件。FFmpeg 的头文件和 DLL 来自同一归档。生成的 pkg-config 文件
-指向项目内 SDK，满足 `build.rs` 的版本检查。
+指向项目内 SDK，满足 `crates/tiny-playback/build.rs` 的版本检查。
 
 ## 使用 cargo run 开发
 
@@ -47,7 +47,8 @@ cargo run
 ```
 
 已经下载过依赖时可用 `-Mode Prepare -Offline`。打包脚本的其他模式也会完成此准备。
-准备后可在新的 PowerShell 窗口直接执行 `cargo run`、`cargo check`、`cargo test`。
+准备后可在新的 PowerShell 窗口直接执行 `cargo run`、`cargo check --workspace`、
+`cargo test --workspace --locked`。脚本的 Check、Test 和 Clippy 模式均检查两个 crate。
 
 准备流程生成未纳入 Git 的 `.cargo/config.toml`，让 Cargo 在编译依赖之前就获得
 `FFMPEG_DIR`、pkg-config、libclang 和头文件搜索路径，避免 `ffmpeg-sys-next`

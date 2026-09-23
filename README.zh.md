@@ -52,6 +52,8 @@ tiny-player
 
 ### Linux 预编译包
 
+适用于 **x86_64（64 位 Intel/AMD）GNU/Linux，要求 glibc 2.39 或更新版本**。前往 [GitHub 最新发布页](https://github.com/Clwury/tiny-player/releases/latest)下载 `tiny-player-<version>-linux-x86_64.tar.gz`。
+
 解压完整归档后运行。请将 `<version>` 替换为所下载包的实际版本号：
 
 ```sh
@@ -77,6 +79,8 @@ tar -xzf "tiny-player-<version>-linux-x86_64.tar.gz"
 
 ### Windows 便携包
 
+适用于 **Windows 10 22H2 / Windows 11 x64（64 位 Intel/AMD）**。前往 [GitHub 最新发布页](https://github.com/Clwury/tiny-player/releases/latest)下载 `tiny-player-<version>-windows-x86_64.zip`。
+
 完整解压 `tiny-player-<version>-windows-x86_64.zip`（`<version>` 为所下载包的实际版本号），双击目录中的 `tiny-player.exe`。移动应用时保留整个目录，包括 DLL 和 `share/` 资源。配置与缓存保存在 Windows 用户目录中。
 
 自行构建需要 Rust MSVC 工具链、Visual Studio 2022 C++ x64 Build Tools、Windows SDK，以及 64 位 Python 3.12。在仓库根目录的 PowerShell 中运行：
@@ -88,6 +92,11 @@ tar -xzf "tiny-player-<version>-linux-x86_64.tar.gz"
 脚本准备原生依赖并生成 `dist/` 下的应用目录与 ZIP。详细环境准备、离线构建与检查方法见 [Windows 打包说明](docs/windows-packaging.md)。
 
 ### 从源码运行
+
+工作空间包含根包 `tiny-player` 应用和 [`tiny-playback` 播放引擎](crates/tiny-playback)。
+播放页面与 Emby 集成保留在应用中，模块归属与构建细节见[播放引擎边界](docs/playback-engine.md)。
+运行 `cargo test --workspace --locked` 测试两个 crate，或使用
+`cargo test -p tiny-playback --locked` 单独测试引擎。
 
 克隆仓库后，Linux 开发环境需要：
 

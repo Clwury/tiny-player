@@ -13,6 +13,8 @@ pub(super) enum PlaybackBackend {
 
 impl BackendControl for PlaybackBackend {
     fn load(&mut self, request: BackendLoadRequest) -> Result<()> {
+        let mut request = request;
+        request.cache_config = super::super::cache::engine_cache_config(request.cache_config);
         match self {
             Self::Ffmpeg(backend) => backend.load(request),
         }
@@ -71,6 +73,7 @@ impl BackendControl for PlaybackBackend {
     }
 
     fn set_cache_config(&mut self, config: PlaybackCacheConfig) -> Result<()> {
+        let config = super::super::cache::engine_cache_config(config);
         match self {
             Self::Ffmpeg(backend) => backend.set_cache_config(config),
         }

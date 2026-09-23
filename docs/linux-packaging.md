@@ -64,8 +64,8 @@ Dolby Vision 元数据解析继续由项目的 Rust `dolby_vision` 依赖完成�
 
 ```sh
 cargo fmt --all -- --check
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+cargo test --workspace --locked
+cargo clippy --workspace --locked --all-targets -- -D warnings
 python3 -B -m unittest discover -s packaging/linux -p 'test_*.py' -v
 ```
 

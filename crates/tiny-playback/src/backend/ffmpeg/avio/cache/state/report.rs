@@ -1,0 +1,193 @@
+use crate::backend::ByteCacheState;
+
+use super::{
+    HttpCacheRangeKind, HttpPlaybackBufferRange, HttpRingCacheState,
+    http_stream_cache_status_changed, merge_playback_buffer_ranges, merged_cached_byte_len,
+    playback_buffer_range,
+};
+
+impl HttpRingCacheState {
+    #[cfg(test)]
+    pub(in crate::backend::ffmpeg) fn stream_cache_status_for_test(&self) -> ByteCacheState {
+        self.stream_cache_status()
+    }
+
+    pub(in crate::backend::ffmpeg::avio::cache) fn stream_cache_status(&self) -> ByteCacheState {
+        let content_len = self.content_len;
+        let ranges = self.stream_buffer_ranges();
+        let reader_fraction = content_len
+            .filter(|content_len| *content_len > 0)
+            .map(|content_len| self.reader_offset.min(content_len) as f64 / content_len as f64);
+        let download_fraction = content_len
+            .filter(|content_len| *content_len > 0)
+            .map(|content_len| self.next_offset.min(content_len) as f64 / content_len as f64);
+        let raw_input_rate = self.raw_input_rate();
+        let active_forward_bytes = self.active_forward_bytes();
+        let target_readahead_bytes = self.target_readahead_bytes();
+        let resume_readahead_bytes = self.resume_readahead_bytes(target_readahead_bytes);
+        ByteCacheState {
+            ranges: ranges.into_iter().map(Into::into).collect(),
+            reader_fraction,
+            download_fraction,
+            cached_bytes: self.cached_bytes(),
+            content_length: content_len,
+            disk_cache_enabled: self.disk_cache_writable,
+            idle: self.cache_idle(),
+            raw_input_rate,
+            active_forward_bytes,
+            active_forward_est_seconds: self.active_forward_est_seconds(raw_input_rate),
+            range_request_bytes_effective: self.range_request_bytes_effective(),
+            byte_level_seeks: self.byte_level_seeks,
+            target_readahead_bytes,
+            resume_readahead_bytes,
+            memory_capacity_bytes: self.config.memory_capacity as u64,
+            retained_bytes: self.retained_memory_bytes() as u64,
+            prefetch_paused: self.prefetch_paused,
+            retained_range_count: self.retained_ranges.len(),
+            storage: crate::backend::CacheStorageState {
+                memory_bytes: (self.buffer.len() + self.retained_memory_bytes()) as u64,
+                memory_limit_bytes: self.config.memory_capacity as u64,
+                disk_bytes: self
+                    .disk_cache
+                    .as_ref()
+                    .map(|cache| cache.cached_bytes())
+                    .unwrap_or(0),
+                disk_file_bytes: self
+                    .disk_cache
+                    .as_ref()
+                    .map(|cache| cache.file_bytes())
+                    .unwrap_or(0),
+                disk_limit_bytes: self
+                    .disk_cache
+                    .as_ref()
+                    .map(|cache| cache.max_bytes)
+                    .unwrap_or(0),
+                disk_pending_bytes: self
+                    .disk_cache
+                    .as_ref()
+                    .map(|cache| cache.file_bytes().saturating_sub(cache.max_bytes))
+                    .unwrap_or(0),
+            },
+        }
+    }
+
+    pub(in crate::backend::ffmpeg::avio::cache) fn active_forward_bytes(&self) -> u64 {
+        if self.active_range_kind != HttpCacheRangeKind::Playback {
+            return 0;
+        }
+        self.next_offset.saturating_sub(self.reader_offset)
+    }
+
+    pub(in crate::backend::ffmpeg::avio::cache) fn active_forward_est_seconds(
+        &self,
+        raw_input_rate: Option<u64>,
+    ) -> Option<f64> {
+        let bytes_per_second = raw_input_rate
+            .filter(|rate| *rate > 0)
+            .or_else(|| self.media_bitrate_bytes_per_second());
+        bytes_per_second.map(|rate| self.active_forward_bytes() as f64 / rate as f64)
+    }
+
+    fn media_bitrate_bytes_per_second(&self) -> Option<u64> {
+        let (content_len, duration) = self.content_len.zip(self.duration_seconds)?;
+        let bytes_per_second = content_len as f64 / duration;
+        bytes_per_second
+            .is_finite()
+            .then(|| bytes_per_second.round() as u64)
+            .filter(|rate| *rate > 0)
+    }
+
+    pub(in crate::backend::ffmpeg::avio::cache) fn range_request_bytes_effective(&self) -> u64 {
+        let configured = self.config.range_request_bytes.max(1);
+        if !self.config.adaptive_range_request {
+            return configured;
+        }
+        let Some(rate) = self.adaptive_input_rate().filter(|rate| *rate > 0) else {
+            return configured;
+        };
+        // Request enough bytes for a bounded lead, then cap the adaptation to
+        // four configured requests. This avoids both tiny high-latency ranges
+        // and a single bitrate spike producing an oversized allocation.
+        let lead_seconds = self.config.readahead_seconds.clamp(1.0, 30.0);
+        let target = (rate as f64 * lead_seconds).round() as u64;
+        let memory_capacity = (self.config.memory_capacity as u64).max(1);
+        target
+            .max(self.config.chunk_size as u64)
+            .min(configured.saturating_mul(4).max(configured))
+            .min(memory_capacity)
+            .clamp(1, 128 * 1024 * 1024)
+    }
+
+    pub(in crate::backend::ffmpeg::avio::cache) fn cache_idle(&self) -> bool {
+        (self.prefetch_paused || self.eof)
+            && self.restart_request.is_none()
+            && self.side_download_requests.is_empty()
+            && self.side_download_active.is_empty()
+    }
+
+    pub(in crate::backend::ffmpeg::avio::cache) fn stream_buffer_ranges(
+        &self,
+    ) -> Vec<HttpPlaybackBufferRange> {
+        let Some(content_len) = self.content_len.filter(|content_len| *content_len > 0) else {
+            return Vec::new();
+        };
+        let mut ranges = Vec::new();
+        for range in &self.retained_ranges {
+            if let Some(range) =
+                playback_buffer_range(range.base_offset, range.next_offset, content_len)
+            {
+                ranges.push(range);
+            }
+        }
+        if let Some(range) = playback_buffer_range(self.base_offset, self.next_offset, content_len)
+        {
+            ranges.push(range);
+        }
+        if let Some(disk_cache) = &self.disk_cache {
+            ranges.extend(
+                disk_cache
+                    .ranges
+                    .iter()
+                    .filter_map(|range| playback_buffer_range(range.start, range.end, content_len)),
+            );
+        }
+        merge_playback_buffer_ranges(ranges)
+    }
+
+    pub(in crate::backend::ffmpeg::avio::cache) fn cached_bytes(&self) -> u64 {
+        let mut ranges = Vec::new();
+        if self.next_offset > self.base_offset {
+            ranges.push((self.base_offset, self.next_offset));
+        }
+        ranges.extend(
+            self.retained_ranges
+                .iter()
+                .filter(|range| range.next_offset > range.base_offset)
+                .map(|range| (range.base_offset, range.next_offset)),
+        );
+        if let Some(disk_cache) = &self.disk_cache {
+            ranges.extend(
+                disk_cache
+                    .ranges
+                    .iter()
+                    .map(|range| (range.start, range.end)),
+            );
+        }
+        merged_cached_byte_len(ranges)
+    }
+
+    pub(in crate::backend::ffmpeg::avio::cache) fn take_stream_cache_status_report(
+        &mut self,
+    ) -> Option<ByteCacheState> {
+        let status = self.stream_cache_status();
+        if !http_stream_cache_status_changed(
+            self.last_reported_status.as_ref(),
+            &status,
+            self.range_request_bytes_effective(),
+        ) {
+            return None;
+        }
+        self.last_reported_status = Some(status.clone());
+        Some(status)
+    }
+}

@@ -7,35 +7,44 @@ license = "GPL-3.0-or-later"
 homepage = "https://github.com/Clwury/tiny-player"
 repository = "https://github.com/Clwury/tiny-player"
 
-[dependencies]
+[workspace]
+members = ["crates/tiny-playback"]
+resolver = "3"
+
+[workspace.dependencies]
 anyhow = "1.0"
-directories = "5"
-cpal = "0.17.3"
-dolby_vision = { git = "https://github.com/quietvoid/dovi_tool", tag = "libdovi-3.4.0", package = "dolby_vision" }
 gpui = { git = "https://github.com/zed-industries/zed", branch = "main" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", branch = "main", features = ["wayland", "x11"] }
-ffmpeg-sys-next = { version = "9.0", default-features = false, features = ["avformat", "avfilter", "swscale", "swresample"] }
 image = "0.25"
-percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt", "time"] }
+tracing = "0.1"
+tempfile = "3.13"
+
+[dependencies]
+tiny-playback = { path = "crates/tiny-playback" }
+anyhow.workspace = true
+directories = "5"
+gpui.workspace = true
+gpui_platform = { git = "https://github.com/zed-industries/zed", branch = "main", features = ["wayland", "x11"] }
+image.workspace = true
+percent-encoding = "2"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 strsim = "0.11.1"
 sysinfo = { version = "0.31.4", default-features = false, features = ["system"] }
-tracing = "0.1"
-tokio = { version = "1", features = ["rt", "time"] }
+tracing.workspace = true
+tokio.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unicode-segmentation = "1.12"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", branch = "main", features = ["test-support"] }
-tempfile = "3.13"
-
-[build-dependencies]
-bindgen = "0.72"
-pkg-config = "0.3.33"
+gpui = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"

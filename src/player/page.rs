@@ -20,7 +20,7 @@ use super::{
         PlaybackCacheState, PlaybackFileInfo, PlaybackSeekMode, PlaybackVideoInfo, StreamCacheKind,
     },
     render_host::RenderSize,
-    tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection},
+    tracks::{PlaybackTrack, PlaybackTrackExt, PlaybackTrackKind, PlaybackTrackSelection},
     video_presenter::{VideoPresenter, VideoPresenterSnapshot},
     volume::{PlaybackVolumeSettings, clamp_playback_volume},
 };
@@ -170,7 +170,8 @@ impl PlaybackPage {
                             content_length: request.content_length,
                             start_position_seconds: request.initial_position_seconds,
                             selected_tracks: request.selected_tracks.clone(),
-                            cache_config: cache_config.clone().normalized(),
+                            cache_config: super::cache::engine_cache_config(cache_config.clone())
+                                .normalized(),
                         };
                         // Restore volume before loading so the first audio samples use it.
                         let load_result = backend

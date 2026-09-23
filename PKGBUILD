@@ -83,7 +83,7 @@ check() {
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
     export TINY_ASSET_DIR=/usr/share/tiny-player/assets
-    cargo test --frozen
+    cargo test --workspace --frozen
     desktop-file-validate tiny-player.desktop
 }
 

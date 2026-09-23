@@ -1,0 +1,28 @@
+[package]
+name = "tiny-playback"
+version = "0.1.1"
+edition = "2024"
+description = "FFmpeg playback engine with Vulkan and libplacebo rendering"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Clwury/tiny-player"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+cpal = "0.17.3"
+dolby_vision = { git = "https://github.com/quietvoid/dovi_tool", tag = "libdovi-3.4.0", package = "dolby_vision" }
+ffmpeg-sys-next = { version = "9.0", default-features = false, features = ["avformat", "avfilter", "swscale", "swresample"] }
+gpui.workspace = true
+image.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3.33"

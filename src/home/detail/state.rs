@@ -1,3 +1,4 @@
+use crate::player::PlaybackTrackExt;
 use std::collections::HashMap;
 
 use gpui::{ScrollHandle, point, px};

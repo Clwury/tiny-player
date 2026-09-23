@@ -52,6 +52,8 @@ tiny-player
 
 ### Linux Prebuilt Bundle
 
+For **x86_64 (64-bit Intel/AMD) GNU/Linux with glibc 2.39 or later**. Download `tiny-player-<version>-linux-x86_64.tar.gz` from [the latest GitHub release](https://github.com/Clwury/tiny-player/releases/latest).
+
 Extract the complete archive and run the application. Replace `<version>` with the version of the downloaded bundle:
 
 ```sh
@@ -77,6 +79,8 @@ The archive, checksum file, and build manifest are written to `dist/`. See the [
 
 ### Windows Portable Bundle
 
+For **Windows 10 22H2 / Windows 11 x64 (64-bit Intel/AMD)**. Download `tiny-player-<version>-windows-x86_64.zip` from [the latest GitHub release](https://github.com/Clwury/tiny-player/releases/latest).
+
 Extract the complete `tiny-player-<version>-windows-x86_64.zip` archive (`<version>` is the downloaded bundle's version) and double-click `tiny-player.exe`. Keep the entire directory together when moving the application, including its DLLs and `share/` resources. Settings and caches are stored in your Windows user profile.
 
 Building the bundle requires the Rust MSVC toolchain, Visual Studio 2022 C++ x64 Build Tools, the Windows SDK, and 64-bit Python 3.12. Run the following in PowerShell from the repository root:
@@ -88,6 +92,12 @@ Building the bundle requires the Rust MSVC toolchain, Visual Studio 2022 C++ x64
 The script prepares native dependencies and generates the application directory and ZIP in `dist/`. See the [Windows packaging guide](docs/windows-packaging.md) for environment setup, offline builds, and validation commands.
 
 ### Running from Source
+
+The workspace contains the root `tiny-player` application and the
+[`tiny-playback` engine](crates/tiny-playback). Playback pages and Emby integration
+stay in the application. See [the engine boundary](docs/playback-engine.md) for
+module ownership and build details. Run `cargo test --workspace --locked` to test
+both crates, or `cargo test -p tiny-playback --locked` for engine tests.
 
 After cloning the repository, prepare the following dependencies for Linux development:
 

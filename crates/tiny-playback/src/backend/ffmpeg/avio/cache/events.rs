@@ -1,0 +1,126 @@
+use crate::backend::{ByteCacheState, DemuxCacheState, PlaybackCacheByteRange, PlaybackCacheState};
+
+use super::HTTP_CACHE_PROGRESS_REPORT_THRESHOLD;
+
+fn http_stream_buffer_progress_changed(
+    previous: Option<PlaybackCacheByteRange>,
+    next: PlaybackCacheByteRange,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    (previous.start_fraction - next.start_fraction).abs() >= HTTP_CACHE_PROGRESS_REPORT_THRESHOLD
+        || (previous.end_fraction - next.end_fraction).abs() >= HTTP_CACHE_PROGRESS_REPORT_THRESHOLD
+        || (next.end_fraction >= 1.0 && previous.end_fraction < 1.0)
+}
+
+pub(in crate::backend::ffmpeg::avio::cache) fn playback_cache_state_from_http_status(
+    status: ByteCacheState,
+) -> PlaybackCacheState {
+    let raw_input_rate = status.raw_input_rate;
+    let byte_level_seeks = status.byte_level_seeks;
+    PlaybackCacheState {
+        demux: DemuxCacheState {
+            raw_input_rate,
+            byte_level_seeks,
+            ..DemuxCacheState::default()
+        },
+        byte: Some(status),
+        ..PlaybackCacheState::default()
+    }
+}
+
+pub(in crate::backend::ffmpeg::avio::cache) fn http_stream_cache_status_changed(
+    previous: Option<&ByteCacheState>,
+    next: &ByteCacheState,
+    cached_bytes_threshold: u64,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    if previous.storage.memory_limit_bytes != next.storage.memory_limit_bytes
+        || previous.storage.disk_limit_bytes != next.storage.disk_limit_bytes
+        || previous.storage.disk_pending_bytes != next.storage.disk_pending_bytes
+        || previous
+            .storage
+            .memory_bytes
+            .abs_diff(next.storage.memory_bytes)
+            >= cached_bytes_threshold
+        || previous
+            .storage
+            .disk_bytes
+            .abs_diff(next.storage.disk_bytes)
+            >= cached_bytes_threshold
+        || previous.disk_cache_enabled != next.disk_cache_enabled
+        || previous.idle != next.idle
+        || previous.content_length != next.content_length
+        || previous.ranges.len() != next.ranges.len()
+        || previous.raw_input_rate.is_some() != next.raw_input_rate.is_some()
+        || previous.active_forward_est_seconds.is_some()
+            != next.active_forward_est_seconds.is_some()
+        || previous.range_request_bytes_effective != next.range_request_bytes_effective
+        || previous.byte_level_seeks != next.byte_level_seeks
+        || previous.prefetch_paused != next.prefetch_paused
+        || previous.retained_range_count != next.retained_range_count
+        || previous.memory_capacity_bytes != next.memory_capacity_bytes
+    {
+        return true;
+    }
+    if previous
+        .reader_fraction
+        .zip(next.reader_fraction)
+        .is_some_and(|(previous, next)| {
+            (previous - next).abs() >= HTTP_CACHE_PROGRESS_REPORT_THRESHOLD
+        })
+    {
+        return true;
+    }
+    if previous
+        .download_fraction
+        .zip(next.download_fraction)
+        .is_some_and(|(previous, next)| {
+            (previous - next).abs() >= HTTP_CACHE_PROGRESS_REPORT_THRESHOLD
+        })
+    {
+        return true;
+    }
+    if previous
+        .raw_input_rate
+        .zip(next.raw_input_rate)
+        .is_some_and(|(previous, next)| previous.abs_diff(next) >= 64 * 1024)
+    {
+        return true;
+    }
+    if previous
+        .active_forward_est_seconds
+        .zip(next.active_forward_est_seconds)
+        .is_some_and(|(previous, next)| (previous - next).abs() >= 0.5)
+    {
+        return true;
+    }
+    if previous
+        .target_readahead_bytes
+        .abs_diff(next.target_readahead_bytes)
+        >= cached_bytes_threshold
+        || previous
+            .resume_readahead_bytes
+            .abs_diff(next.resume_readahead_bytes)
+            >= cached_bytes_threshold
+        || previous.retained_bytes.abs_diff(next.retained_bytes) >= cached_bytes_threshold
+    {
+        return true;
+    }
+    if previous
+        .active_forward_bytes
+        .abs_diff(next.active_forward_bytes)
+        >= cached_bytes_threshold
+    {
+        return true;
+    }
+    previous.cached_bytes.abs_diff(next.cached_bytes) >= cached_bytes_threshold
+        || previous
+            .ranges
+            .iter()
+            .zip(next.ranges.iter())
+            .any(|(previous, next)| http_stream_buffer_progress_changed(Some(*previous), *next))
+}

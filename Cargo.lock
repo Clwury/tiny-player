@@ -6010,21 +6010,36 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiny-player"
+name = "tiny-playback"
 version = "0.1.1"
 dependencies = [
  "anyhow",
  "bindgen 0.72.1",
  "cpal",
- "directories",
  "dolby_vision",
- "embed-resource",
  "ffmpeg-sys-next",
+ "gpui",
+ "image",
+ "pkg-config",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "tiny-player"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "directories",
+ "embed-resource",
  "gpui",
  "gpui_platform",
  "image",
  "percent-encoding",
- "pkg-config",
  "raw-window-handle",
  "reqwest",
  "serde",
@@ -6032,6 +6047,7 @@ dependencies = [
  "strsim",
  "sysinfo",
  "tempfile",
+ "tiny-playback",
  "tokio",
  "tracing",
  "tracing-subscriber",
