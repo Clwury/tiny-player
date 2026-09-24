@@ -1,6 +1,6 @@
 use crate::emby::MediaStream;
 
-pub use tiny_playback::tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection};
+pub use tiny_playback::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection};
 
 /// Application-side labels and Emby model conversion for engine tracks.
 pub(crate) trait PlaybackTrackExt: Sized {

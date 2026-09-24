@@ -163,7 +163,7 @@ impl PlaybackPage {
 mod tests {
     use gpui::{TestAppContext, point, size};
 
-    use crate::player::backend::{DemuxCacheState, PlaybackCacheTimeRange};
+    use tiny_playback::{DemuxCacheState, PlaybackCacheTimeRange};
 
     use super::*;
 

@@ -114,7 +114,7 @@ fn download_speed_indicator(label: Option<String>, cx: &gpui::App) -> impl IntoE
 mod tests {
     use gpui::{TestAppContext, point, size};
 
-    use crate::player::backend::ByteCacheState;
+    use tiny_playback::ByteCacheState;
 
     use super::*;
 

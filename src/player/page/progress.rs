@@ -172,7 +172,7 @@ pub(super) fn format_playback_time(seconds: f64) -> String {
 mod tests {
     use gpui::{Bounds, point, px, size};
 
-    use crate::player::backend::{
+    use tiny_playback::{
         ByteCacheState, DemuxCacheState, PlaybackCacheByteRange, PlaybackCacheState,
         PlaybackCacheTimeRange,
     };

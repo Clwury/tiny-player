@@ -72,8 +72,8 @@ impl FfmpegBackend {
         })
     }
 
-    pub fn video_output_queue(&self) -> VideoOutputQueue {
-        self.video_output_queue.clone()
+    pub fn video_output(&self) -> crate::VideoOutput {
+        crate::VideoOutput::new(self.video_output_queue.clone())
     }
 
     #[allow(dead_code)]
@@ -633,8 +633,8 @@ impl BackendControl for FfmpegBackend {
         FfmpegBackend::poll_events(self)
     }
 
-    fn video_output_queue(&self) -> VideoOutputQueue {
-        FfmpegBackend::video_output_queue(self)
+    fn video_output(&self) -> crate::VideoOutput {
+        FfmpegBackend::video_output(self)
     }
 }
 

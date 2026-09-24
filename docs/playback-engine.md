@@ -16,12 +16,44 @@
 
 `BackendLoadRequest` 传递媒体地址、请求头、初始位置、轨道选择及缓存配置。
 `BackendControl` / `BackendCommand` 控制播放，`BackendEvent` 返回状态与诊断信息，
-`VideoOutputQueue` 连接解码与 `VideoPresenter`。
+`BackendControl::video_output()` 返回不透明的 `VideoOutput`，用于创建
+`VideoPresenter`。应用无法访问内部队列、原始解码帧、FFmpeg 指针或 Vulkan 句柄。
 
-第一阶段保留 GPUI 的 `RenderImage` 和 `SharedString` 类型。引擎仍依赖 GPUI，
-但不依赖应用窗口、主题、Emby 客户端或用户配置存储，也不创建应用窗口。
+所有公开类型从 `tiny_playback` 根部导出；`backend`、`render_host`、
+`video_presenter` 等实现模块均为私有模块。公开接口的私有类型泄漏由编译器 lint
+检查，外部集成测试和编译失败文档测试验证接口可用性与封装。
+
+引擎的普通、构建和测试依赖均不包含 GPUI，也不直接依赖 `image`。
+轨道标签使用 `String`，图像接口只包含像素与尺寸，不依赖应用窗口、主题、
+Emby 客户端或用户配置存储。
 线程、队列、背压、会话代次与帧生命周期保持原来的实现；应用的
 `ShutdownOrder` 仍先释放 presenter，再释放 backend。
+
+最小接入示例见 `crates/tiny-playback/examples/headless.rs`：
+
+```sh
+cargo run -p tiny-playback --locked --example headless -- /path/to/video.avi
+```
+
+示例仅使用公开接口，在最多 30 秒内消费视频帧，不创建窗口。YUV/HDR 视频仍可能使用
+Vulkan/libplacebo；没有 GPU 的环境可使用 BGRA 等走软件转换路径的测试素材。
+
+## 图像与应用适配
+
+`VideoPresenter::render_if_needed` 返回 `Option<BgraImage>`。图像拥有紧密排列、
+自上而下的 BGRA8 字节，alpha 为非预乘形式；构造时校验非零尺寸、溢出和字节长度。
+像素尺寸可以小于视频源尺寸，布局与宽高比仍使用视频元数据。
+HDR/Dolby Vision 映射和 Vulkan 渲染继续在引擎线程内完成，现有 CPU 回读路径不变。
+
+`BgraImage` 不实现 `Clone`，应用通过 `into_bytes()` 接管像素分配。
+`src/player/presentation.rs` 将其包装为 GPUI `RenderImage`，视频适配不复制整帧。
+GPUI 使用的 `RgbaImage` 容器实际承载 BGRA 字节，适配时不交换颜色通道。
+
+位图字幕通过 `SharedBgraImage` 共享不可变像素，克隆不复制数据，相等性比较对象身份。
+引擎负责字幕时间轴、内容与画布坐标；应用负责文字排版、位置、缩放与叠加绘制。
+应用仅缓存当前字幕所需的 GPUI 图像：新图像首次显示时复制像素，重复事件和跨 cue
+复用同一对象时沿用缓存，绘制时不重建图像。退出、切轨成功、播放失败或页面释放时
+回收不再使用的缓存；切轨失败保留原字幕。图集清理保留两次帧回调的延迟。
 
 ## 缓存目录
 
@@ -50,6 +82,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --locked --all-targets -- -D warnings
 ```
 
-单独测试引擎仍需要 FFmpeg、libplacebo、音频和 GPUI 编译依赖。
+单独测试引擎仍需要 FFmpeg、libplacebo、Vulkan 和音频编译依赖，无需 GPUI。
+可使用 `cargo tree -p tiny-playback --locked --edges normal,build,dev`
+核对引擎依赖边界。根应用仍使用 GPUI。
 Arch 的检查步骤以及 Windows 脚本的 Check、Test、Clippy 模式覆盖整个工作空间。
 运行 `cargo run --locked` 仍启动根包应用；发布产物名称和资源目录不受拆分影响。

@@ -14,15 +14,15 @@ use crate::{
 };
 
 use super::{
-    backend::{
-        BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest,
-        BackendSubtitleBitmap, BackendSubtitleCue, FfmpegBackend, PlaybackAudioInfo,
-        PlaybackCacheState, PlaybackFileInfo, PlaybackSeekMode, PlaybackVideoInfo, StreamCacheKind,
-    },
-    render_host::RenderSize,
-    tracks::{PlaybackTrack, PlaybackTrackExt, PlaybackTrackKind, PlaybackTrackSelection},
-    video_presenter::{VideoPresenter, VideoPresenterSnapshot},
-    volume::{PlaybackVolumeSettings, clamp_playback_volume},
+    PlaybackTrackExt,
+    presentation::{SubtitleImages, defer_drop_frame, defer_drop_released_images, render_image},
+};
+use tiny_playback::{
+    BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest, BackendSubtitleBitmap,
+    BackendSubtitleCue, FfmpegBackend, PlaybackAudioInfo, PlaybackCacheState, PlaybackFileInfo,
+    PlaybackSeekMode, PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection, PlaybackVideoInfo,
+    PlaybackVolumeSettings, RenderSize, StreamCacheKind, VideoPresenter, VideoPresenterSnapshot,
+    clamp_playback_volume,
 };
 
 mod backend_events;
@@ -63,8 +63,8 @@ use progress::{
     valid_playback_time,
 };
 use render::{
-    AnimationFrameRequestState, aspect_fit_bounds, defer_drop_frame, normalize_video_viewport,
-    playback_status, render_output_size, render_playback_status, should_render_frame,
+    AnimationFrameRequestState, aspect_fit_bounds, normalize_video_viewport, playback_status,
+    render_output_size, render_playback_status, should_render_frame,
     should_request_animation_frame, viewport_changed,
 };
 use runtime::{PlaybackBackend, ShutdownOrder};
@@ -128,8 +128,8 @@ impl EventEmitter<PlaybackEvent> for PlaybackPage {}
 impl PlaybackPage {
     pub(crate) fn apply_playback_config(
         &mut self,
-        config: super::backend::PlaybackCacheConfig,
-    ) -> super::backend::Result<()> {
+        config: tiny_playback::PlaybackCacheConfig,
+    ) -> tiny_playback::Result<()> {
         if let Some(backend) = self.video.owner_mut() {
             backend.command(BackendCommand::SetCacheConfig(config))?;
         }
@@ -142,7 +142,7 @@ impl PlaybackPage {
 
     pub fn new_with_cache_config(
         request: PlaybackRequest,
-        cache_config: super::backend::PlaybackCacheConfig,
+        cache_config: tiny_playback::PlaybackCacheConfig,
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new_with_settings(request, cache_config, PlaybackVolumeSettings::default(), cx)
@@ -150,10 +150,11 @@ impl PlaybackPage {
 
     pub(crate) fn new_with_settings(
         request: PlaybackRequest,
-        cache_config: super::backend::PlaybackCacheConfig,
+        cache_config: tiny_playback::PlaybackCacheConfig,
         volume_settings: PlaybackVolumeSettings,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::register_image_cleanup(cx);
         let volume = PlaybackVolumeState::new(volume_settings);
         let mut error_message = None;
         let source_protocol = playback_protocol(&request.url);
@@ -162,7 +163,7 @@ impl PlaybackPage {
 
         let (backend, video_presenter) = match FfmpegBackend::new() {
             Ok(mut backend) => {
-                match VideoPresenter::new(BackendControl::video_output_queue(&backend)) {
+                match VideoPresenter::new(BackendControl::video_output(&backend)) {
                     Ok(video_presenter) => {
                         let load_request = BackendLoadRequest {
                             url: request.url.clone(),
@@ -243,6 +244,15 @@ impl PlaybackPage {
         page
     }
 
+    fn register_image_cleanup(cx: &Context<Self>) {
+        cx.on_release(|page, cx| {
+            let mut images = page.subtitle.images.update(None);
+            images.extend(page.frame.current.take());
+            defer_drop_released_images(images, cx);
+        })
+        .detach();
+    }
+
     pub fn title(&self) -> SharedString {
         self.title.clone()
     }
@@ -262,6 +272,7 @@ impl PlaybackPage {
         self.cancel_queue_switch();
         self.report_playback_progress(true);
         let update = self.close_playback_reporting(false, self.timeline.ended);
+        defer_drop_subtitle(&mut self.subtitle, window);
         self.clear_visible_frame(window, cx);
         cx.emit(PlaybackEvent::Back { update });
     }

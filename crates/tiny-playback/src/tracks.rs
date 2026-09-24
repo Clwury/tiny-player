@@ -1,5 +1,3 @@
-use gpui::SharedString;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaybackTrackKind {
     Audio,
@@ -9,7 +7,7 @@ pub enum PlaybackTrackKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaybackTrack {
     pub stream_index: usize,
-    pub label: SharedString,
+    pub label: String,
     pub language: Option<String>,
     pub title: Option<String>,
     pub is_external: bool,
@@ -18,7 +16,7 @@ pub struct PlaybackTrack {
 }
 
 impl PlaybackTrack {
-    pub fn new(stream_index: usize, label: impl Into<SharedString>, is_external: bool) -> Self {
+    pub fn new(stream_index: usize, label: impl Into<String>, is_external: bool) -> Self {
         Self {
             stream_index,
             label: label.into(),

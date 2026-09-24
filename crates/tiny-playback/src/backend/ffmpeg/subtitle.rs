@@ -3,8 +3,9 @@ use std::{collections::VecDeque, ffi::CStr, os::raw::c_char, slice, time::Durati
 use ffmpeg_sys_next as ffi;
 
 use crate::{
+    BgraImage, SharedBgraImage,
     backend::{BackendSubtitleBitmap, BackendSubtitleCue},
-    render_host::{RenderSize, render_image_from_bgra},
+    render_host::RenderSize,
 };
 
 use super::reqwest_header_pairs;
@@ -293,10 +294,10 @@ fn subtitle_rect_bitmap(
         return Ok(None);
     }
 
-    let image = render_image_from_bgra(bgra, width, height)
+    let image = BgraImage::new(bgra, width, height)
         .map_err(|error| format!("创建字幕 bitmap 图像失败：{error}"))?;
     Ok(Some(BackendSubtitleBitmap {
-        image,
+        image: SharedBgraImage::new(image),
         x,
         y,
         width,
@@ -779,7 +780,7 @@ mod tests {
         );
         assert_eq!((bitmap.canvas_width, bitmap.canvas_height), (1920, 1080));
         assert_eq!(
-            bitmap.image.as_bytes(0).unwrap(),
+            bitmap.image.image().bytes(),
             &[
                 0, 0, 0, 0, 0x33, 0x22, 0x11, 0xff, 0x33, 0x22, 0x11, 0xff, 0, 0, 0, 0
             ]

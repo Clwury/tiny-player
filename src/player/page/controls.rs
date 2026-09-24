@@ -351,10 +351,8 @@ pub(super) fn valid_frame_rate(frame_rate: f64) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use crate::player::{
-        backend::{ByteCacheState, DemuxCacheState, PlaybackCacheState, StreamCacheState},
-        page::state::user_pause_from_effective_pause_event,
-    };
+    use crate::player::page::state::user_pause_from_effective_pause_event;
+    use tiny_playback::{ByteCacheState, DemuxCacheState, PlaybackCacheState, StreamCacheState};
 
     use super::*;
 
@@ -364,7 +362,7 @@ mod tests {
             demux: DemuxCacheState {
                 cache_duration: Some(2.25),
                 idle: true,
-                storage: crate::player::backend::CacheStorageState {
+                storage: tiny_playback::CacheStorageState {
                     memory_bytes: 2 * 1024 * 1024,
                     memory_limit_bytes: 8 * 1024 * 1024,
                     disk_bytes: 3 * 1024 * 1024,

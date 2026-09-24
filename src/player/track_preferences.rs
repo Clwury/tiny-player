@@ -54,7 +54,7 @@ impl SavedTrackChoice {
             return Some(None);
         };
         let matches = |track: &&PlaybackTrack| {
-            track.label.as_ref() == label
+            track.label.as_str() == label
                 && track.codec == *codec
                 && track.is_external == *is_external
         };

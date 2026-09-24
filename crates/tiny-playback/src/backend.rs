@@ -1,7 +1,7 @@
 mod events;
 mod ffmpeg;
 
-use crate::render_host::VideoOutputQueue;
+use crate::VideoOutput;
 
 use super::tracks::{PlaybackTrack, PlaybackTrackSelection};
 #[allow(unused_imports)]
@@ -100,7 +100,7 @@ pub trait BackendControl {
         None
     }
     fn poll_events(&mut self) -> Vec<BackendEvent>;
-    fn video_output_queue(&self) -> VideoOutputQueue;
+    fn video_output(&self) -> VideoOutput;
 
     fn command(&mut self, command: BackendCommand) -> Result<()> {
         match command {

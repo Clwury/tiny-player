@@ -96,7 +96,8 @@ The script prepares native dependencies and generates the application directory 
 The workspace contains the root `tiny-player` application and the
 [`tiny-playback` engine](crates/tiny-playback). Playback pages and Emby integration
 stay in the application. See [the engine boundary](docs/playback-engine.md) for
-module ownership and build details. Run `cargo test --workspace --locked` to test
+module ownership and build details. The engine has no GPUI dependency; the application
+adapts its video and subtitle pixels for display. Run `cargo test --workspace --locked` to test
 both crates, or `cargo test -p tiny-playback --locked` for engine tests.
 
 After cloning the repository, prepare the following dependencies for Linux development:

@@ -109,16 +109,6 @@ pub(super) fn render_output_size(bounds: Bounds<Pixels>, source: RenderSize) -> 
     })
 }
 
-pub(super) fn defer_drop_frame(frame: Arc<RenderImage>, window: &mut Window) {
-    window.on_next_frame(move |window, _| {
-        window.on_next_frame(move |window, cx| {
-            cx.drop_image(frame, Some(window));
-        });
-        window.refresh();
-    });
-    window.refresh();
-}
-
 pub(super) fn viewport_changed(previous: Option<Bounds<Pixels>>, next: Bounds<Pixels>) -> bool {
     previous != Some(next)
 }
@@ -166,7 +156,7 @@ pub(super) fn should_request_animation_frame(state: AnimationFrameRequestState) 
 mod tests {
     use gpui::{Bounds, TestAppContext, point, px, size};
 
-    use crate::player::render_host::RenderSize;
+    use tiny_playback::RenderSize;
 
     use super::*;
 

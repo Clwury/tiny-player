@@ -1,8 +1,8 @@
-use std::{fmt, path::PathBuf, sync::Arc};
+use std::{fmt, path::PathBuf};
 
-use gpui::RenderImage;
 use serde::{Deserialize, Serialize};
 
+use crate::SharedBgraImage;
 use crate::render_host::{PlaybackSessionId, RenderSize};
 
 const CACHE_CHUNK_MIN_BYTES: u64 = 64 * 1024;
@@ -53,7 +53,7 @@ pub struct PlaybackAudioInfo {
 
 #[derive(Clone)]
 pub struct BackendSubtitleBitmap {
-    pub image: Arc<RenderImage>,
+    pub image: SharedBgraImage,
     pub x: u32,
     pub y: u32,
     pub width: u32,
@@ -66,7 +66,7 @@ impl fmt::Debug for BackendSubtitleBitmap {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("BackendSubtitleBitmap")
-            .field("image", &"<render-image>")
+            .field("image", &self.image)
             .field("x", &self.x)
             .field("y", &self.y)
             .field("width", &self.width)

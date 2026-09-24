@@ -1,5 +1,5 @@
 use super::*;
-use crate::player::rate::PlaybackRateChange;
+use tiny_playback::PlaybackRateChange;
 
 pub(super) struct PlaybackRateState {
     pub(super) value: f64,

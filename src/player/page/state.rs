@@ -113,6 +113,7 @@ impl TrackSelectState {
 #[derive(Default)]
 pub(super) struct SubtitleOverlayState {
     pub(super) active: Option<BackendSubtitleCue>,
+    pub(super) images: SubtitleImages,
     pub(super) vertical_offset_fraction: Option<f32>,
 }
 

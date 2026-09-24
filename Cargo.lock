@@ -6018,8 +6018,6 @@ dependencies = [
  "cpal",
  "dolby_vision",
  "ffmpeg-sys-next",
- "gpui",
- "image",
  "pkg-config",
  "reqwest",
  "serde",

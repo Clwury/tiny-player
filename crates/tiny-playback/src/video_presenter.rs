@@ -11,9 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::BgraImage;
 use anyhow::{Context, Result, anyhow};
 use ffmpeg_sys_next as ffi;
-use gpui::RenderImage;
 
 use super::{
     libplacebo::LibplaceboToneMapper,
@@ -21,7 +21,7 @@ use super::{
         DecodedFrame, FramePixels, FramePts, PlaybackSessionId, PooledBytes, RawVideoFormat,
         RawVideoFrame, RawVideoPlane, RawVideoPlanes, RenderBackpressure, RenderSize,
         VideoOutputQueue, VideoOutputQueueSnapshot, VulkanDecodeDevice, VulkanPrewarmTicket,
-        VulkanVideoFrame, render_image_from_bgra,
+        VulkanVideoFrame,
     },
 };
 
@@ -44,6 +44,28 @@ impl VideoPresenterSnapshot {
     }
 }
 
+/// Opaque connection from a playback backend to its video presenter.
+///
+/// The queue, native frames, GPU handles and scheduling operations are private.
+/// Obtain this handle from [`crate::BackendControl::video_output`].
+///
+/// Consumers cannot remove frames or change queue generations:
+/// ```compile_fail
+/// fn drain(output: tiny_playback::VideoOutput) {
+///     output.take_next_frame();
+/// }
+/// ```
+#[derive(Clone)]
+pub struct VideoOutput {
+    queue: VideoOutputQueue,
+}
+
+impl VideoOutput {
+    pub(crate) fn new(queue: VideoOutputQueue) -> Self {
+        Self { queue }
+    }
+}
+
 pub struct VideoPresenter {
     vo_queue: VideoOutputQueue,
     render_worker: VideoRenderWorker,
@@ -54,7 +76,8 @@ pub struct VideoPresenter {
 }
 
 impl VideoPresenter {
-    pub fn new(vo_queue: VideoOutputQueue) -> Result<Self> {
+    pub fn new(output: VideoOutput) -> Result<Self> {
+        let vo_queue = output.queue;
         let (last_seen_session_id, last_seen_presentation_generation) =
             vo_queue.presentation_identity();
         let render_worker = VideoRenderWorker::spawn(vo_queue.clone());
@@ -75,7 +98,7 @@ impl VideoPresenter {
         }
     }
 
-    pub fn render_if_needed(&mut self, size: RenderSize) -> Result<Option<Arc<RenderImage>>> {
+    pub fn render_if_needed(&mut self, size: RenderSize) -> Result<Option<BgraImage>> {
         self.sync_vo_queue_session();
         let mut ready_frame = self
             .render_worker
@@ -190,7 +213,7 @@ struct VideoRenderRequest {
 struct VideoRenderResult {
     generation: u64,
     pts: Option<FramePts>,
-    frame: std::result::Result<Arc<RenderImage>, String>,
+    frame: std::result::Result<BgraImage, String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -300,7 +323,7 @@ impl VideoRenderWorker {
     fn take_ready_frame(
         &self,
         latest_generation: u64,
-    ) -> Result<Option<(Arc<RenderImage>, Option<FramePts>)>> {
+    ) -> Result<Option<(BgraImage, Option<FramePts>)>> {
         let mut ready_frame = None;
         while let Ok(result) = self.results.try_recv() {
             self.state.consume_ready_result();
@@ -513,11 +536,11 @@ fn render_video_frame(
     tone_mapper: &mut Option<LibplaceboToneMapper>,
     vulkan_direct_fallback: &mut HashSet<VulkanDirectFallbackKey>,
     request: VideoRenderRequest,
-) -> Result<Arc<RenderImage>> {
+) -> Result<BgraImage> {
     let frame_pts = request.frame.pts;
 
     match request.frame.pixels {
-        FramePixels::Bgra8(pixels) => render_image_from_bgra(
+        FramePixels::Bgra8(pixels) => BgraImage::new(
             pixels.into_vec(),
             request.frame.size.width,
             request.frame.size.height,
@@ -535,7 +558,7 @@ fn render_video_frame(
                     Some(pts) => format!("渲染视频帧失败（PTS {}ns）", pts.nsecs),
                     None => "渲染视频帧失败".to_string(),
                 })?;
-            render_image_from_bgra(
+            BgraImage::new(
                 pixels,
                 request.output_size.width,
                 request.output_size.height,
@@ -562,7 +585,7 @@ fn render_vulkan_video_frame(
     source_size: RenderSize,
     output_size: RenderSize,
     frame_pts: Option<FramePts>,
-) -> Result<Arc<RenderImage>> {
+) -> Result<BgraImage> {
     let fallback_key = VulkanDirectFallbackKey::new(&vulkan);
     if !vulkan_direct_fallback.contains(&fallback_key) {
         let direct_result = (|| {
@@ -582,7 +605,7 @@ fn render_vulkan_video_frame(
 
         match direct_result {
             Ok(pixels) => {
-                return render_image_from_bgra(pixels, output_size.width, output_size.height);
+                return BgraImage::new(pixels, output_size.width, output_size.height);
             }
             Err(error) => {
                 tracing::warn!(
@@ -610,7 +633,7 @@ fn render_vulkan_download_fallback(
     vulkan: &VulkanVideoFrame,
     source_size: RenderSize,
     output_size: RenderSize,
-) -> Result<Arc<RenderImage>> {
+) -> Result<BgraImage> {
     let raw = download_vulkan_frame_to_raw(vulkan, source_size)?;
     if tone_mapper.is_none() {
         *tone_mapper = Some(LibplaceboToneMapper::new()?);
@@ -619,7 +642,7 @@ fn render_vulkan_download_fallback(
         .as_mut()
         .expect("tone mapper initialized")
         .tone_map_to_bgra8(&raw, source_size, output_size)?;
-    render_image_from_bgra(pixels, output_size.width, output_size.height)
+    BgraImage::new(pixels, output_size.width, output_size.height)
 }
 
 fn download_vulkan_frame_to_raw(
@@ -745,6 +768,29 @@ fn duration_to_nsecs(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bgra_render_transfers_source_pixels_without_copy_or_output_resize() {
+        let pixels = vec![1, 2, 3, 128, 5, 6, 7, 255];
+        let allocation = pixels.as_ptr();
+        let mut request = test_render_request(1);
+        request.frame.pixels = FramePixels::Bgra8(pixels.into());
+        request.output_size = RenderSize {
+            width: 1,
+            height: 1,
+        };
+        let image = render_video_frame(&mut None, &mut HashSet::new(), request).unwrap();
+        assert_eq!(
+            image.size(),
+            RenderSize {
+                width: 2,
+                height: 1
+            }
+        );
+        assert_eq!(image.bytes(), [1, 2, 3, 128, 5, 6, 7, 255]);
+        let pixels = image.into_bytes();
+        assert_eq!(pixels.as_ptr(), allocation);
+    }
+
     fn test_render_request(generation: u64) -> VideoRenderRequest {
         VideoRenderRequest {
             generation,
@@ -850,7 +896,7 @@ mod tests {
                 pts: Some(FramePts {
                     nsecs: 1_000_000_000,
                 }),
-                frame: Ok(render_image_from_bgra(vec![0; 8], 2, 1).unwrap()),
+                frame: Ok(BgraImage::new(vec![0; 8], 2, 1).unwrap()),
             })
             .unwrap();
         assert!(presenter.render_if_needed(size).unwrap().is_some());

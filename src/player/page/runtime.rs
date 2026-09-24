@@ -1,10 +1,6 @@
-use super::super::{
-    backend::{
-        BackendControl, BackendEvent, BackendLoadRequest, FfmpegBackend, PlaybackCacheConfig,
-        PlaybackCacheState, Result,
-    },
-    render_host::VideoOutputQueue,
-    tracks::PlaybackTrack,
+use tiny_playback::{
+    BackendControl, BackendEvent, BackendLoadRequest, FfmpegBackend, PlaybackCacheConfig,
+    PlaybackCacheState, PlaybackTrack, Result, VideoOutput,
 };
 
 pub(super) enum PlaybackBackend {
@@ -91,9 +87,9 @@ impl BackendControl for PlaybackBackend {
         }
     }
 
-    fn video_output_queue(&self) -> VideoOutputQueue {
+    fn video_output(&self) -> VideoOutput {
         match self {
-            Self::Ffmpeg(backend) => backend.video_output_queue(),
+            Self::Ffmpeg(backend) => backend.video_output(),
         }
     }
 }

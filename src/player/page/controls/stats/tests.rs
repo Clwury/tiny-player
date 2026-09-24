@@ -1,4 +1,4 @@
-use crate::player::backend::{ByteCacheState, DemuxCacheState};
+use tiny_playback::{ByteCacheState, DemuxCacheState};
 
 use super::*;
 

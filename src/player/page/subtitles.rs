@@ -78,7 +78,19 @@ impl PlaybackPage {
                 .top(bitmap_top)
                 .w(bitmap_bounds.size.width)
                 .h(bitmap_bounds.size.height),
-            |this, bitmap| this.child(render_subtitle_bitmap(bitmap, scale_x, scale_y)),
+            |this, bitmap| {
+                let image = self
+                    .subtitle
+                    .images
+                    .get(&bitmap.image)
+                    .expect("active subtitle images are prepared when the cue changes");
+                this.child(render_subtitle_bitmap(
+                    bitmap,
+                    image.clone(),
+                    scale_x,
+                    scale_y,
+                ))
+            },
         );
         let overlay = div()
             .id("playback-subtitle-overlay")
@@ -128,6 +140,7 @@ impl PlaybackPage {
 
 pub(super) fn render_subtitle_bitmap(
     bitmap: &BackendSubtitleBitmap,
+    image: Arc<RenderImage>,
     scale_x: f32,
     scale_y: f32,
 ) -> impl IntoElement {
@@ -137,9 +150,7 @@ pub(super) fn render_subtitle_bitmap(
         .top(px(bitmap.y as f32) * scale_y)
         .w(px(bitmap.width as f32) * scale_x)
         .h(px(bitmap.height as f32) * scale_y)
-        .child(SubtitleBitmapElement {
-            image: bitmap.image.clone(),
-        })
+        .child(SubtitleBitmapElement { image })
 }
 
 pub(super) fn local_video_viewport_bounds(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
@@ -266,11 +277,10 @@ pub(super) fn subtitle_bitmap_canvas_size(cue: &BackendSubtitleCue) -> Option<Re
         })
 }
 
-pub(super) fn defer_drop_subtitle(cue: Option<BackendSubtitleCue>, window: &mut Window) {
-    if let Some(cue) = cue {
-        for bitmap in cue.bitmaps {
-            defer_drop_frame(bitmap.image, window);
-        }
+pub(super) fn defer_drop_subtitle(subtitle: &mut SubtitleOverlayState, window: &mut Window) {
+    subtitle.active = None;
+    for image in subtitle.images.update(None) {
+        defer_drop_frame(image, window);
     }
 }
 
@@ -352,9 +362,8 @@ impl IntoElement for SubtitleBitmapElement {
 mod tests {
     use gpui::{Bounds, point, px, size};
 
-    use crate::player::{
-        backend::{BackendSubtitleBitmap, BackendSubtitleCue},
-        render_host::{RenderSize, render_image_from_bgra},
+    use tiny_playback::{
+        BackendSubtitleBitmap, BackendSubtitleCue, BgraImage, RenderSize, SharedBgraImage,
     };
 
     use super::*;
@@ -450,7 +459,7 @@ mod tests {
     #[test]
     fn subtitle_bitmap_overlay_offset_shifts_position_without_changing_default_limit() {
         let bitmap_bounds = Bounds::new(point(px(0.0), px(75.0)), size(px(800.0), px(450.0)));
-        let image = render_image_from_bgra(vec![0, 0, 0, 0], 1, 1).unwrap();
+        let image = SharedBgraImage::new(BgraImage::new(vec![0, 0, 0, 0], 1, 1).unwrap());
         let cue = BackendSubtitleCue {
             text: String::new(),
             bitmaps: vec![BackendSubtitleBitmap {
@@ -488,7 +497,7 @@ mod tests {
 
     #[test]
     fn subtitle_bitmap_bottom_offset_lifts_only_overlapping_bitmap_content() {
-        let image = render_image_from_bgra(vec![0, 0, 0, 0], 1, 1).unwrap();
+        let image = SharedBgraImage::new(BgraImage::new(vec![0, 0, 0, 0], 1, 1).unwrap());
         let cue = BackendSubtitleCue {
             text: String::new(),
             bitmaps: vec![BackendSubtitleBitmap {
@@ -517,7 +526,7 @@ mod tests {
 
     #[test]
     fn subtitle_bitmap_canvas_size_uses_largest_bitmap_canvas() {
-        let image = render_image_from_bgra(vec![0, 0, 0, 0], 1, 1).unwrap();
+        let image = SharedBgraImage::new(BgraImage::new(vec![0, 0, 0, 0], 1, 1).unwrap());
         let cue = BackendSubtitleCue {
             text: String::new(),
             bitmaps: vec![

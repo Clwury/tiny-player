@@ -1,6 +1,6 @@
 use super::subtitles::subtitle_vertical_adjust_step;
 use super::*;
-use crate::player::rate::PlaybackRateChange;
+use tiny_playback::PlaybackRateChange;
 
 const KEYBOARD_SEEK_STEP_SECONDS: i32 = 5;
 const KEYBOARD_LONG_SEEK_STEP_SECONDS: i32 = 60;

@@ -94,6 +94,7 @@ tar -xzf "tiny-player-<version>-linux-x86_64.tar.gz"
 ### 从源码运行
 
 工作空间包含根包 `tiny-player` 应用和 [`tiny-playback` 播放引擎](crates/tiny-playback)。
+引擎不依赖 GPUI，通过普通 Rust 类型输出视频与字幕像素；GPUI 图像适配留在应用中。
 播放页面与 Emby 集成保留在应用中，模块归属与构建细节见[播放引擎边界](docs/playback-engine.md)。
 运行 `cargo test --workspace --locked` 测试两个 crate，或使用
 `cargo test -p tiny-playback --locked` 单独测试引擎。

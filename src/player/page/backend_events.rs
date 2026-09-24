@@ -1,4 +1,4 @@
-use crate::player::backend::BackendEvent;
+use tiny_playback::BackendEvent;
 
 use super::state::{effective_playback_paused, user_pause_from_effective_pause_event};
 use super::*;
@@ -123,8 +123,8 @@ impl PlaybackPage {
                 self.tracks = TrackSelectState::new(audio, subtitles, selected);
             }
             BackendEventKind::SubtitleChanged(cue) => {
-                if self.subtitle.active != cue {
-                    defer_drop_subtitle(self.subtitle.active.take(), window);
+                for image in self.subtitle.images.update(cue.as_ref()) {
+                    defer_drop_frame(image, window);
                 }
                 self.subtitle.active = cue;
             }
@@ -243,7 +243,7 @@ impl PlaybackPage {
         self.tracks.open = None;
         self.timeline.user_paused = true;
         self.error_message = None;
-        defer_drop_subtitle(self.subtitle.active.take(), window);
+        defer_drop_subtitle(&mut self.subtitle, window);
         cx.notify();
     }
 
@@ -287,7 +287,7 @@ impl PlaybackPage {
         self.timeline.pending_seek_position = None;
         self.timeline.pending_seek_keeps_frame = false;
         self.timeline.progress_drag_position = None;
-        defer_drop_subtitle(self.subtitle.active.take(), window);
+        defer_drop_subtitle(&mut self.subtitle, window);
         self.clear_visible_frame(window, cx);
         self.error_message = Some(message);
     }
@@ -335,7 +335,7 @@ impl PlaybackPage {
 
             match render_result {
                 Ok(Some(frame)) => {
-                    self.replace_visible_frame(frame, window, cx);
+                    self.replace_visible_frame(render_image(frame), window, cx);
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -409,11 +409,11 @@ fn apply_cache_buffering_to_timeline(timeline: &mut PlaybackTimelineState, perce
 
 #[cfg(test)]
 mod tests {
-    use crate::player::backend::{
-        ByteCacheState, DemuxCacheState, PlaybackCacheState, PlaybackCacheTimeRange,
-    };
     use crate::player::{
         PlaybackTrack, PlaybackTrackKind, PlaybackTrackPreferences, SavedTrackChoice,
+    };
+    use tiny_playback::{
+        ByteCacheState, DemuxCacheState, PlaybackCacheState, PlaybackCacheTimeRange,
     };
 
     use super::{
@@ -422,6 +422,69 @@ mod tests {
         cache_state_needs_poll,
     };
     use crate::player::page::state::PlaybackTimelineState;
+
+    #[gpui::test]
+    fn subtitle_events_reuse_images_and_clear_them_after_failure(cx: &mut gpui::TestAppContext) {
+        use std::sync::Arc;
+        use tiny_playback::{
+            BackendSubtitleBitmap, BackendSubtitleCue, BgraImage, SharedBgraImage,
+        };
+
+        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        let image = SharedBgraImage::new(BgraImage::new(vec![1, 2, 3, 128], 1, 1).unwrap());
+        let cue = BackendSubtitleCue {
+            text: String::new(),
+            bitmaps: vec![BackendSubtitleBitmap {
+                image: image.clone(),
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                canvas_width: 1920,
+                canvas_height: 1080,
+            }],
+            start_nsecs: 0,
+            end_nsecs: 1_000_000_000,
+        };
+        cx.update(|window, cx| {
+            page.update(cx, |page, cx| {
+                for _ in 0..2 {
+                    page.apply_backend_event(
+                        BackendEvent::new(
+                            Default::default(),
+                            BackendEventKind::SubtitleChanged(Some(cue.clone())),
+                        ),
+                        window,
+                        cx,
+                    );
+                }
+                let rendered = page.subtitle.images.get(&image).unwrap().clone();
+                page.apply_backend_event(
+                    BackendEvent::new(
+                        Default::default(),
+                        BackendEventKind::SubtitleChanged(Some(cue.clone())),
+                    ),
+                    window,
+                    cx,
+                );
+                assert!(Arc::ptr_eq(
+                    &rendered,
+                    page.subtitle.images.get(&image).unwrap()
+                ));
+                assert_eq!(rendered.as_bytes(0).unwrap(), image.image().bytes());
+                page.apply_backend_event(
+                    BackendEvent::new(
+                        Default::default(),
+                        BackendEventKind::LoadFailed("test failure".into()),
+                    ),
+                    window,
+                    cx,
+                );
+                assert!(page.subtitle.active.is_none());
+                assert!(page.subtitle.images.get(&image).is_none());
+            });
+        });
+    }
 
     #[gpui::test]
     fn resolved_stream_tracks_update_menus_without_saving_automatic_subtitle_off(

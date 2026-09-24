@@ -82,6 +82,7 @@ pub(in crate::player::page) fn playback_window(
             run_time_ticks: Some(18_000_000_000),
         };
         // Exercise the real page and event flow without starting FFmpeg or Vulkan.
+        PlaybackPage::register_image_cleanup(cx);
         PlaybackPage {
             focus_handle: cx.focus_handle(),
             title: "Series S1E1".into(),

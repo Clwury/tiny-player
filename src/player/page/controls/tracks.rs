@@ -130,8 +130,8 @@ impl PlaybackPage {
         if command_succeeded {
             self.remember_track_choice(PlaybackTrackKind::Subtitle, cx);
             self.report_playback_progress(true);
+            defer_drop_subtitle(&mut self.subtitle, window);
         }
-        defer_drop_subtitle(previous_active_subtitle, window);
         cx.notify();
     }
 
@@ -249,11 +249,36 @@ mod tests {
                         );
                     }
                     let before = cx.global::<PlaybackTrackPreferences>().clone();
+                    let image = tiny_playback::SharedBgraImage::new(
+                        tiny_playback::BgraImage::new(vec![1, 2, 3, 128], 1, 1).unwrap(),
+                    );
+                    let cue = BackendSubtitleCue {
+                        text: String::new(),
+                        bitmaps: vec![BackendSubtitleBitmap {
+                            image: image.clone(),
+                            x: 0,
+                            y: 0,
+                            width: 1,
+                            height: 1,
+                            canvas_width: 1920,
+                            canvas_height: 1080,
+                        }],
+                        start_nsecs: 0,
+                        end_nsecs: 1_000_000_000,
+                    };
+                    page.subtitle.images.update(Some(&cue));
+                    page.subtitle.active = Some(cue.clone());
+                    let rendered = page.subtitle.images.get(&image).unwrap().clone();
                     page.select_audio_track(None, window, cx);
                     page.select_subtitle_track(None, window, cx);
                     assert_eq!(page.tracks.selected_audio_stream_index, Some(1));
                     assert_eq!(page.tracks.selected_subtitle_stream_index, Some(9));
                     assert_eq!(&before, cx.global::<PlaybackTrackPreferences>());
+                    assert_eq!(page.subtitle.active, Some(cue));
+                    assert!(Arc::ptr_eq(
+                        page.subtitle.images.get(&image).unwrap(),
+                        &rendered
+                    ));
                 });
             });
         }

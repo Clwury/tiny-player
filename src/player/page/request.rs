@@ -402,14 +402,14 @@ mod tests {
         let audio = playback_audio_tracks_for_source(&source);
         assert_eq!(audio.len(), 2);
         assert_eq!(audio[0].metadata_label(), "英语");
-        assert_eq!(audio[1].label.as_ref(), "Japanese AAC stereo");
+        assert_eq!(audio[1].label.as_str(), "Japanese AAC stereo");
         assert_eq!(audio[1].language.as_deref(), Some("jpn"));
         assert_eq!(audio[1].title.as_deref(), Some("原声音轨"));
         assert_eq!(audio[1].codec.as_deref(), Some("aac"));
         assert_eq!(audio[1].metadata_label(), "日语 [原声音轨]");
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0].metadata_label(), "英语");
-        assert_eq!(tracks[1].label.as_ref(), "简体中文");
+        assert_eq!(tracks[1].label.as_str(), "简体中文");
         assert_eq!(tracks[1].language.as_deref(), Some("zho"));
         assert_eq!(tracks[1].title.as_deref(), Some("简体双语字幕"));
         assert_eq!(tracks[1].metadata_label(), "中文 [简体双语字幕]");
