@@ -210,6 +210,7 @@ pub(super) struct PlaybackScheduler {
     start_instant: Instant,
     start_position_nsecs: u64,
     playback_rate: f64,
+    paused_at: Option<Instant>,
 }
 
 impl PlaybackScheduler {
@@ -218,25 +219,60 @@ impl PlaybackScheduler {
             start_instant: Instant::now(),
             start_position_nsecs,
             playback_rate: 1.0,
+            paused_at: None,
         }
     }
 
     pub(super) fn reset(&mut self, start_position_nsecs: u64) {
-        self.start_instant = Instant::now();
+        self.reset_at(start_position_nsecs, Instant::now());
+    }
+
+    fn reset_at(&mut self, start_position_nsecs: u64, now: Instant) {
+        self.start_instant = now;
         self.start_position_nsecs = start_position_nsecs;
+        if self.paused_at.is_some() {
+            self.paused_at = Some(now);
+        }
     }
 
     pub(super) fn set_playback_rate(&mut self, rate: f64) {
+        self.set_playback_rate_at(rate, Instant::now());
+    }
+
+    fn set_playback_rate_at(&mut self, rate: f64, now: Instant) {
         let rate = crate::rate::clamp_playback_rate(rate);
         if self.playback_rate == rate {
             return;
         }
-        let position = self.current_timeline_nsecs();
-        self.reset(position);
+        let position = self.current_timeline_at(now);
+        self.reset_at(position, now);
         self.playback_rate = rate;
     }
 
+    pub(super) fn set_paused(&mut self, paused: bool) {
+        self.set_paused_at(paused, Instant::now());
+    }
+
+    fn set_paused_at(&mut self, paused: bool, now: Instant) {
+        match (paused, self.paused_at) {
+            (true, None) => self.paused_at = Some(now),
+            (false, Some(paused_at)) => {
+                self.start_instant = self
+                    .start_instant
+                    .checked_add(now.saturating_duration_since(paused_at))
+                    .unwrap_or(self.start_instant);
+                self.paused_at = None;
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn delay_by(&mut self, duration: Duration) {
+        // A user pause freezes the entire coordinator interval, including
+        // snapshot/command work between waits. Do not count its sleeps twice.
+        if self.paused_at.is_some() {
+            return;
+        }
         self.start_instant = self
             .start_instant
             .checked_add(duration)
@@ -244,6 +280,9 @@ impl PlaybackScheduler {
     }
 
     pub(super) fn ready_for(&self, timeline_nsecs: u64) -> bool {
+        if self.paused_at.is_some() {
+            return false;
+        }
         let target_offset = (timeline_nsecs.saturating_sub(self.start_position_nsecs) as f64
             / self.playback_rate) as u64;
         let target = self
@@ -254,9 +293,18 @@ impl PlaybackScheduler {
     }
 
     pub(super) fn current_timeline_nsecs(&self) -> u64 {
+        self.current_timeline_at(Instant::now())
+    }
+
+    fn current_timeline_at(&self, now: Instant) -> u64 {
         self.start_position_nsecs.saturating_add(
-            (self.start_instant.elapsed().as_secs_f64() * self.playback_rate * 1_000_000_000.0)
-                as u64,
+            (self
+                .paused_at
+                .unwrap_or(now)
+                .saturating_duration_since(self.start_instant)
+                .as_secs_f64()
+                * self.playback_rate
+                * 1_000_000_000.0) as u64,
         )
     }
 
@@ -302,6 +350,78 @@ impl PlaybackScheduler {
             }
             thread::sleep((target - now).min(SCHEDULER_POLL_INTERVAL));
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduler_pause_tests {
+    use super::*;
+
+    #[test]
+    fn long_user_pause_excludes_coordinator_work_without_double_counting_waits() {
+        for rate in [0.5, 1.0, 2.0] {
+            let now = Instant::now();
+            let position = 3_989_999_400_984;
+            let mut scheduler = PlaybackScheduler::new(position);
+            scheduler.reset_at(position, now);
+            scheduler.set_playback_rate_at(rate, now);
+            scheduler.set_paused_at(true, now);
+
+            // The reported pause lasted 190.7 seconds. Accounting only for
+            // blocking waits leaves coordinator work in the media timeline.
+            scheduler.delay_by(Duration::from_secs(165));
+            let resumed_at = now + Duration::from_millis(190_700);
+            scheduler.set_paused_at(true, now + Duration::from_secs(100));
+            assert_eq!(scheduler.current_timeline_at(resumed_at), position);
+            assert!(!scheduler.ready_for(position));
+
+            scheduler.set_paused_at(false, resumed_at);
+            assert_eq!(scheduler.current_timeline_at(resumed_at), position);
+            assert_eq!(
+                scheduler.current_timeline_at(resumed_at + Duration::from_secs(1)),
+                position + (rate * 1_000_000_000.0) as u64,
+            );
+        }
+    }
+
+    #[test]
+    fn seek_and_rate_change_during_pause_preserve_the_new_frozen_position() {
+        let now = Instant::now();
+        let mut scheduler = PlaybackScheduler::new(0);
+        scheduler.reset_at(0, now);
+        scheduler.set_paused_at(true, now + Duration::from_secs(10));
+        scheduler.reset_at(4_000_000_000_000, now + Duration::from_secs(60));
+        scheduler.set_playback_rate_at(2.0, now + Duration::from_secs(90));
+        scheduler.delay_by(Duration::from_secs(30));
+        let resumed_at = now + Duration::from_secs(190);
+        assert_eq!(scheduler.current_timeline_at(resumed_at), 4_000_000_000_000);
+        scheduler.set_paused_at(false, resumed_at);
+        assert_eq!(scheduler.current_timeline_at(resumed_at), 4_000_000_000_000);
+        assert_eq!(
+            scheduler.current_timeline_at(resumed_at + Duration::from_secs(1)),
+            4_002_000_000_000,
+        );
+    }
+
+    #[test]
+    fn repeated_pauses_preserve_only_playing_time_and_rebuffer_delays() {
+        let now = Instant::now();
+        let mut scheduler = PlaybackScheduler::new(0);
+        scheduler.reset_at(0, now);
+        scheduler.set_paused_at(true, now + Duration::from_secs(2));
+        scheduler.set_paused_at(false, now + Duration::from_secs(192));
+        scheduler.set_paused_at(false, now + Duration::from_secs(193));
+        scheduler.set_paused_at(true, now + Duration::from_secs(195));
+        assert_eq!(
+            scheduler.current_timeline_at(now + Duration::from_secs(200)),
+            5_000_000_000
+        );
+        scheduler.set_paused_at(false, now + Duration::from_secs(255));
+        scheduler.delay_by(Duration::from_secs(1));
+        assert_eq!(
+            scheduler.current_timeline_at(now + Duration::from_secs(259)),
+            8_000_000_000
+        );
     }
 }
 

@@ -675,7 +675,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                     .coordinator_gate
                     .service(PlaybackCoordinatorGateContext {
                         control: &control,
-                        output_scheduler: &pipeline.output_scheduler,
+                        output_scheduler: &mut pipeline.output_scheduler,
                         scheduler: &mut pipeline.scheduler,
                         playback_wait: &pipeline_services.wait,
                         playback_loop_deadline,

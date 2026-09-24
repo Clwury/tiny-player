@@ -57,7 +57,7 @@ impl PlaybackCoordinatorGateStatus {
 
 pub(super) struct PlaybackCoordinatorGateContext<'a> {
     pub(super) control: &'a FfmpegControl,
-    pub(super) output_scheduler: &'a PlaybackOutputScheduler,
+    pub(super) output_scheduler: &'a mut PlaybackOutputScheduler,
     pub(super) scheduler: &'a mut PlaybackScheduler,
     pub(super) playback_wait: &'a PlaybackPipelineWaitService,
     pub(super) playback_loop_deadline: PlaybackLoopDeadline,
@@ -84,6 +84,16 @@ impl PlaybackCoordinatorGateService {
         &mut self,
         context: PlaybackCoordinatorGateContext<'_>,
     ) -> PlaybackCoordinatorGateStatus {
+        context
+            .scheduler
+            .set_paused(context.control.is_user_paused());
+        // Paused gates skip service_playback_tick, so its audio supervision
+        // cannot observe the pause and disarm itself before the first resume tick.
+        if context.control.is_paused() || context.control.has_pending_seek() {
+            context
+                .output_scheduler
+                .reset_audio_output_activity_watchdog();
+        }
         let status = coordinator_gate_status(
             context.control,
             context.output_service_demand,
@@ -125,6 +135,7 @@ impl PlaybackCoordinatorGateService {
                 gate_reason = status.reason(context.output_service_demand),
                 user_paused = context.control.is_user_paused(),
                 cache_paused = context.control.is_cache_paused(),
+                scheduler_timeline_nsecs = context.scheduler.current_timeline_nsecs(),
                 output_rebuffering = context.output_scheduler.rebuffering(),
                 initial_start_phase = context.output_scheduler.initial_start_phase(),
                 first_frame_presented = output_snapshot.first_frame_presented,
@@ -261,9 +272,136 @@ fn coordinator_gate_status(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use super::super::{AudioOutputActivitySnapshot, PlaybackOutputState};
     use super::super::{FfmpegControl, OutputServiceDemand};
-    use super::{PlaybackCoordinatorGateStatus, coordinator_gate_status};
+    use super::*;
     use crate::render_host::PlaybackSessionId;
+
+    fn service_gate(
+        gate: &mut PlaybackCoordinatorGateService,
+        control: &FfmpegControl,
+        output_scheduler: &mut PlaybackOutputScheduler,
+        scheduler: &mut PlaybackScheduler,
+        playback_wait: &PlaybackPipelineWaitService,
+    ) -> PlaybackCoordinatorGateStatus {
+        gate.service(PlaybackCoordinatorGateContext {
+            control,
+            output_scheduler,
+            scheduler,
+            playback_wait,
+            playback_loop_deadline: PlaybackLoopDeadline::default(),
+            actual_decode_work: false,
+            output_service_demand: OutputServiceDemand::None,
+            first_frame_input_demand: false,
+            cached_input_drainable: false,
+            cached_input_admissible: false,
+            output_lead_throttled: false,
+            output_transaction_blocked: false,
+            cache_generation: 0,
+            selected_streams: &[],
+            requested_streams: &[],
+            cached_streams: &[],
+            exact_seek_target_nsecs: 0,
+            actual_anchor_nsecs: None,
+            preroll_debt_nsecs: None,
+            cached_video_end_nsecs: None,
+            cached_video_drainable_packets: 0,
+        })
+    }
+
+    #[test]
+    fn paused_coordinator_disarms_audio_watchdog_before_resuming_without_a_callback() {
+        for user_pause in [true, false] {
+            let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
+            let playback_wait = PlaybackPipelineWaitService::new(Arc::clone(&control));
+            let mut gate = PlaybackCoordinatorGateService::default();
+            let mut scheduler = PlaybackScheduler::new(3_989_999_400_984);
+            let mut output = PlaybackOutputScheduler::new();
+            output.set_state(PlaybackOutputState::Playing);
+            let activity = AudioOutputActivitySnapshot {
+                played_timeline_nsecs: 3_989_999_400_984,
+                shared_buffer_pending_nsecs: 208_231_288,
+                queue_pending_nsecs: 351_995_456,
+                callback_count: 1_104,
+                consumed_callback_count: 1_104,
+                silenced_callback_count: 0,
+                underrun_count: 0,
+            };
+            output.observe_audio_output_activity(
+                Instant::now() - Duration::from_secs(191),
+                activity,
+                true,
+                false,
+                false,
+            );
+            if user_pause {
+                control.set_user_paused(true);
+            } else {
+                control.set_cache_paused(true);
+            }
+            assert_ne!(
+                service_gate(
+                    &mut gate,
+                    &control,
+                    &mut output,
+                    &mut scheduler,
+                    &playback_wait
+                ),
+                PlaybackCoordinatorGateStatus::Ready,
+            );
+            if user_pause {
+                let frozen_position = scheduler.current_timeline_nsecs();
+                scheduler.delay_by(Duration::from_secs(165));
+                assert_eq!(scheduler.current_timeline_nsecs(), frozen_position);
+                assert!(!scheduler.ready_for(frozen_position));
+            }
+            control.set_user_paused(false);
+            control.set_cache_paused(false);
+            assert_eq!(
+                service_gate(
+                    &mut gate,
+                    &control,
+                    &mut output,
+                    &mut scheduler,
+                    &playback_wait
+                ),
+                PlaybackCoordinatorGateStatus::Ready,
+            );
+            let resumed_at = Instant::now();
+            let resumed = AudioOutputActivitySnapshot {
+                callback_count: 17_832,
+                silenced_callback_count: 16_728,
+                ..activity
+            };
+            for elapsed in [Duration::ZERO, Duration::from_millis(1)] {
+                assert_eq!(
+                    output.observe_audio_output_activity(
+                        resumed_at + elapsed,
+                        resumed,
+                        true,
+                        false,
+                        false,
+                    ),
+                    None,
+                    "paused callbacks must not trigger a clock reset on resume",
+                );
+                assert!(!output.audio_output_clock_stall_fallback_active());
+            }
+            let stalled = output.observe_audio_output_activity(
+                resumed_at + Duration::from_secs(2),
+                resumed,
+                true,
+                false,
+                false,
+            );
+            assert!(
+                stalled.is_some(),
+                "real post-resume stalls must still be detected"
+            );
+        }
+    }
 
     #[test]
     fn coordinator_gate_status_names_all_modes() {
