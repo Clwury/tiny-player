@@ -5,6 +5,7 @@ use gpui::{
     prelude::FluentBuilder, px, svg,
 };
 
+use crate::ui::radius;
 use crate::{
     emby::{MediaItem, MediaItems, MediaPerson, UserItems},
     theme,
@@ -78,7 +79,7 @@ fn detail_tag<T>(label: String, clickable: bool, cx: &Context<T>) -> gpui::Div {
         .flex()
         .h(px(32.0))
         .items_center()
-        .rounded_full()
+        .rounded(radius::CONTROL)
         .border_1()
         .border_color(theme.input_border)
         .bg(theme.dialog_background.opacity(0.86))
@@ -86,6 +87,7 @@ fn detail_tag<T>(label: String, clickable: bool, cx: &Context<T>) -> gpui::Div {
         .text_sm()
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.foreground)
+        .cursor_default()
         .when(clickable, |this| {
             this.cursor_pointer()
                 .hover(move |style| style.bg(theme.secondary_hover))
@@ -127,7 +129,7 @@ fn detail_select_box_with_width<T>(
         .items_center()
         .justify_between()
         .gap_2()
-        .rounded(px(8.0))
+        .rounded(radius::CONTROL)
         .border_1()
         .border_color(if enabled {
             theme.input_border
@@ -142,8 +144,10 @@ fn detail_select_box_with_width<T>(
         } else {
             theme.muted_foreground
         })
+        .cursor_default()
         .when(enabled, |this| {
-            this.hover(move |style| style.bg(theme.secondary_hover))
+            this.cursor_pointer()
+                .hover(move |style| style.bg(theme.secondary_hover))
         })
         .when(!enabled, |this| this.opacity(0.62))
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -201,7 +205,7 @@ fn season_popup_menu_trigger<T>(
         .max_w_full()
         .items_center()
         .justify_center()
-        .rounded(px(8.0))
+        .rounded(radius::CONTROL)
         .border_1()
         .border_color(if enabled {
             theme.input_border
@@ -217,8 +221,10 @@ fn season_popup_menu_trigger<T>(
         } else {
             theme.muted_foreground
         })
+        .cursor_default()
         .when(enabled, |this| {
-            this.hover(move |style| style.bg(theme.secondary_hover))
+            this.cursor_pointer()
+                .hover(move |style| style.bg(theme.secondary_hover))
         })
         .when(!enabled, |this| this.opacity(0.62))
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -269,12 +275,13 @@ where
                 + 6.0 * 2.0))
         })
         .overflow_hidden()
-        .rounded(px(8.0))
+        .rounded(radius::SURFACE)
         .border_1()
         .border_color(theme.input_border_focused)
         .bg(theme.dialog_background)
         .shadow_lg()
         .occlude()
+        .cursor_default()
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
@@ -327,11 +334,12 @@ fn detail_select_option_container<T>(
     let theme = theme::get(cx);
     div()
         .id(id)
+        .cursor_pointer()
         .flex()
         .flex_none()
         .h(px(DETAIL_SELECT_OPTION_HEIGHT_PX))
         .items_center()
-        .rounded(px(6.0))
+        .rounded(radius::CONTROL)
         .px_1()
         .text_sm()
         .font_weight(if selected {
@@ -377,7 +385,6 @@ fn detail_select_option_with_subtitle<T>(
         .debug_selector(move || id.clone())
         .h(px(DETAIL_TWO_LINE_OPTION_HEIGHT_PX))
         .px_2()
-        .cursor_pointer()
         .when(show_tooltip, |this| {
             this.tooltip(move |_, cx| text_tooltip(tooltip_label.clone(), cx))
         })

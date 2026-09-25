@@ -305,6 +305,15 @@ impl SeriesDetailState {
         self.selected_episode().or_else(|| self.next_up_episode())
     }
 
+    pub(crate) fn hero_episode_index(&self) -> Option<usize> {
+        let episode_id = &self.hero_episode()?.id;
+        self.episodes
+            .as_ref()?
+            .items
+            .iter()
+            .position(|episode| &episode.id == episode_id)
+    }
+
     pub(crate) fn hero_line(&self) -> Option<String> {
         if self.is_movie() {
             None

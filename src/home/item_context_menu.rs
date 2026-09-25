@@ -3,6 +3,7 @@ use gpui::{
     Pixels, Point, Styled, Window, anchored, div, point, prelude::FluentBuilder, px,
 };
 
+use crate::ui::radius;
 use crate::{emby::UserItemData, theme};
 
 use super::{HomeContent, resume_actions::ResumeItemAction};
@@ -170,10 +171,11 @@ impl HomeContent {
                     .id(menu_id)
                     .debug_selector(move || menu_id.into())
                     .occlude()
+                    .cursor_default()
                     .flex()
                     .flex_col()
                     .min_w(px(176.0))
-                    .rounded(px(8.0))
+                    .rounded(radius::SURFACE)
                     .border_1()
                     .border_color(theme.context_menu.border)
                     .bg(theme.context_menu.background)
@@ -221,7 +223,7 @@ fn item_context_menu_option(
         .flex()
         .h(px(32.0))
         .items_center()
-        .rounded(px(6.0))
+        .rounded(radius::CONTROL)
         .px_2()
         .text_sm()
         .text_color(if disabled {

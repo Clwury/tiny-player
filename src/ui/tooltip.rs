@@ -4,6 +4,7 @@ use gpui::{
 };
 
 use crate::theme;
+use crate::ui::radius;
 
 pub(crate) fn text_tooltip(text: impl Into<SharedString>, cx: &mut App) -> AnyView {
     let text = text.into();
@@ -20,7 +21,7 @@ impl Render for TextTooltip {
 
         div()
             .max_w(px(420.0))
-            .rounded(px(6.0))
+            .rounded(radius::SURFACE)
             .border_1()
             .border_color(theme.input_border)
             .bg(theme.dialog_background)

@@ -6,6 +6,7 @@ use gpui::{
     point, prelude::FluentBuilder, px, svg,
 };
 
+use crate::ui::radius;
 use crate::{
     emby::{SortOrder, UserItem, UserItemsSort, VideoItemType},
     theme,
@@ -241,6 +242,7 @@ impl HomeContent {
                     deferred(
                         div()
                             .id("library-sort-menu")
+                            .cursor_default()
                             .absolute()
                             .top(px(40.0))
                             .right_0()
@@ -248,7 +250,7 @@ impl HomeContent {
                             .w(px(LIBRARY_SORT_SELECT_WIDTH_PX))
                             .flex_col()
                             .overflow_hidden()
-                            .rounded(px(8.0))
+                            .rounded(radius::SURFACE)
                             .border_1()
                             .border_color(theme.input_border_focused)
                             .bg(theme.dialog_background)
@@ -952,7 +954,7 @@ fn library_back_button(
         .flex_none()
         .items_center()
         .justify_center()
-        .rounded_md()
+        .rounded(radius::CONTROL)
         .occlude()
         .cursor_pointer()
         .hover(move |style| style.bg(theme.secondary_hover))
@@ -978,7 +980,7 @@ fn library_sort_trigger<T>(label: String, menu_open: bool, cx: &Context<T>) -> g
         .items_center()
         .justify_between()
         .gap_2()
-        .rounded(px(8.0))
+        .rounded(radius::CONTROL)
         .border_1()
         .border_color(if menu_open {
             theme.input_border_focused
@@ -1034,7 +1036,7 @@ fn library_sort_option<T>(
         .items_center()
         .justify_between()
         .gap_2()
-        .rounded(px(6.0))
+        .rounded(radius::CONTROL)
         .px_2()
         .text_sm()
         .font_weight(if selected {

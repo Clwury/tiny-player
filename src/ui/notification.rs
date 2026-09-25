@@ -7,6 +7,7 @@ use gpui::{
 };
 
 use crate::theme;
+use crate::ui::radius;
 
 /// The default amount of time an automatically managed notification remains visible.
 pub(crate) const NOTIFICATION_AUTOHIDE: Duration = Duration::from_secs(5);
@@ -115,7 +116,8 @@ pub(crate) fn error_notification(
         .w_full()
         .gap_3()
         .occlude()
-        .rounded(theme.radius_lg)
+        .cursor_default()
+        .rounded(radius::SURFACE)
         .border_1()
         .border_color(theme.input_border)
         .bg(theme.dialog_background)
@@ -157,7 +159,7 @@ pub(crate) fn error_notification(
                 .size(px(22.0))
                 .items_center()
                 .justify_center()
-                .rounded_md()
+                .rounded(radius::CONTROL)
                 .text_color(theme.muted_foreground)
                 .hover(move |style| style.bg(theme.secondary_hover).text_color(theme.foreground))
                 .cursor_pointer()

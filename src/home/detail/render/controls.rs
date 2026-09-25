@@ -1,5 +1,6 @@
 use super::*;
 use crate::player::{PlaybackLanguagePreferences, track_metadata_label};
+use crate::ui::radius;
 
 fn detail_icon_button(
     id: &'static str,
@@ -59,6 +60,7 @@ impl HomeContent {
         };
         div()
             .id("series-detail-actions-menu")
+            .cursor_default()
             .debug_selector(|| "series-detail-actions-menu".into())
             .absolute()
             .top(px(34.0))
@@ -68,7 +70,7 @@ impl HomeContent {
             .flex()
             .flex_col()
             .gap_1()
-            .rounded_md()
+            .rounded(radius::SURFACE)
             .border_1()
             .border_color(colors.border)
             .bg(colors.background)
@@ -131,7 +133,7 @@ impl HomeContent {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .rounded_md()
+                        .rounded(radius::CONTROL)
                         .text_sm()
                         .text_color(foreground)
                         .child(
@@ -221,7 +223,7 @@ impl HomeContent {
                         .justify_center()
                         .items_center()
                         .gap_2()
-                        .rounded(px(8.0))
+                        .rounded(radius::CONTROL)
                         .id("series-detail-play-button")
                         .border_1()
                         .border_color(theme.accent)

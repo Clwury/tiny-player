@@ -3,6 +3,7 @@ use gpui::{
     ParentElement, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
+use crate::ui::radius;
 use crate::{emby::VideoItemType, theme};
 
 use super::super::{
@@ -276,7 +277,7 @@ pub(in crate::home) fn favorite_action(
         .px_2()
         .items_center()
         .justify_center()
-        .rounded_md()
+        .rounded(radius::CONTROL)
         .text_sm()
         .text_color(theme.foreground)
         .hover(move |style| style.bg(theme.secondary_hover))

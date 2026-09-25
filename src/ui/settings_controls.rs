@@ -8,6 +8,7 @@ use gpui::{
     Subscription, Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px, svg,
 };
 
+use crate::ui::radius;
 use crate::{player::TrackLanguage, theme};
 
 use super::{
@@ -54,7 +55,7 @@ pub(crate) fn settings_category_button(
         .h(px(28.0))
         .px_2()
         .gap_2()
-        .rounded(px(4.0))
+        .rounded(radius::CONTROL)
         .cursor_pointer()
         .text_sm()
         .text_color(if selected {
@@ -365,7 +366,7 @@ impl RenderOnce for SettingsDropdown {
             .gap_1()
             .h(px(28.0))
             .px_2()
-            .rounded(px(6.0))
+            .rounded(radius::CONTROL)
             .border_1()
             .border_color(if open || focus.is_focused(window) {
                 focused_border
@@ -445,11 +446,12 @@ impl RenderOnce for SettingsDropdown {
                     .aria_label(self.label)
                     .track_focus(&self.state.read(cx).focus)
                     .occlude()
+                    .cursor_default()
                     .flex()
                     .flex_col()
                     .w(px(200.0))
                     .p_1()
-                    .rounded(px(8.0))
+                    .rounded(radius::SURFACE)
                     .border_1()
                     .border_color(border)
                     .bg(menu_background)
@@ -517,7 +519,7 @@ impl RenderOnce for SettingsDropdown {
                                 .justify_between()
                                 .h(px(24.0))
                                 .px_1p5()
-                                .rounded(px(4.0))
+                                .rounded(radius::CONTROL)
                                 .text_sm()
                                 .text_color(if index == selected {
                                     accent
@@ -672,19 +674,13 @@ impl NumberControl {
 }
 
 impl RenderOnce for NumberControl {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = theme::get(cx);
         let value = self
             .range
             .value(self.input.read(cx).value().as_ref(), self.fallback);
-        let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
-        // The three joined segments share one focus color so the input's
-        // vertical separators and the outer border stay continuous.
-        let border = if focused {
-            theme.input_border_focused
-        } else {
-            theme.input_border
-        };
+        // All three segments share the text editor's neutral border and surface.
+        let border = theme.window_border;
         let step_hint = if self.range.fractional {
             "每次加减 1；Shift 加减 10；Alt 加减 0.1"
         } else {
@@ -717,13 +713,14 @@ impl RenderOnce for NumberControl {
                 .flex_shrink_0()
                 .border_1()
                 .when(increment, |this| {
-                    this.rounded_tr(px(6.0)).rounded_br(px(6.0))
+                    this.rounded_tr(radius::INPUT).rounded_br(radius::INPUT)
                 })
                 .when(!increment, |this| {
-                    this.rounded_tl(px(6.0)).rounded_bl(px(6.0))
+                    this.rounded_tl(radius::INPUT).rounded_bl(radius::INPUT)
                 })
                 .border_color(border)
-                .bg(theme.input_background)
+                .bg(theme.editor_background)
+                .cursor_default()
                 .child(
                     svg()
                         .path(if increment {
@@ -784,7 +781,7 @@ impl RenderOnce for NumberControl {
                             .h(px(28.0))
                             .border_y_1()
                             .border_color(border)
-                            .bg(theme.input_background)
+                            .bg(theme.editor_background)
                             .overflow_hidden()
                             .child(self.input.clone()),
                     )

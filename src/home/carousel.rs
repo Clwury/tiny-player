@@ -619,6 +619,29 @@ impl HomeContent {
         self.set_series_episodes_scroll_offset(offset, window, cx);
     }
 
+    pub(super) fn reveal_series_hero_episode(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(detail) = self.series_detail.as_mut() else {
+            return;
+        };
+        let Some(index) = detail.hero_episode_index() else {
+            return;
+        };
+        let viewport_width = home_main_content_width(window);
+        let left = index as f32 * DETAIL_EPISODE_CARD_STEP_PX;
+        let right = left + DETAIL_EPISODE_CARD_OUTER_WIDTH_PX;
+        let offset = detail.episodes_carousel.scroll_offset(f32::INFINITY);
+        let offset = if left < offset || viewport_width < DETAIL_EPISODE_CARD_OUTER_WIDTH_PX {
+            left
+        } else if right > offset + viewport_width {
+            right - viewport_width
+        } else {
+            offset
+        };
+        detail.open_select = None;
+        self.set_series_episodes_scroll_offset(offset, window, cx);
+        cx.notify();
+    }
+
     pub(super) fn scroll_series_episodes_right(
         &mut self,
         _: &ClickEvent,

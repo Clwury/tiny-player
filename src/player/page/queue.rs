@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 
 use crate::emby::playback::resolve_direct_stream_url;
+use crate::ui::radius;
 
 use super::request::{
     playback_audio_tracks_for_source, playback_subtitle_tracks_for_source,
@@ -252,7 +253,7 @@ impl PlaybackPage {
             .left(relative(0.5))
             .ml(-px(180.0))
             .w(px(360.0))
-            .rounded(px(8.0))
+            .rounded(radius::SURFACE)
             .border_1()
             .border_color(theme.error.opacity(0.5))
             .bg(rgba(0x000000c8))

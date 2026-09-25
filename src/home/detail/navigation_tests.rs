@@ -1,6 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use gpui::{Modifiers, TestAppContext, px, size};
+use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, point, px, size};
 use serde_json::json;
 
 use super::*;
@@ -14,6 +14,198 @@ fn playback_sources() -> Vec<MediaSource> {
         {"Id": "source-2160", "ItemId": "1193754", "Name": "S01E07.2160p.BDRip.H.265.FLAC", "Type": "Grouping"},
         {"Id": "source-1080", "ItemId": "824018", "Name": "S01E07 - 1080p", "Type": "Default"}
     ])).unwrap()
+}
+
+fn episode_line_window(cx: &mut TestAppContext) -> (Entity<HomeContent>, &mut VisualTestContext) {
+    cx.update(|cx| {
+        theme::init(cx);
+        // Assert the final geometry without depending on wall-clock animation timing.
+        cx.set_reduce_motion(true);
+    });
+    cx.add_window_view(|_, cx| {
+        let server = serde_json::from_value(json!({
+            "id": "episode-line-test", "user_id": "test",
+            "endpoint": {"protocol": "Https", "address": "", "port": 443, "path": ""},
+            "username": "test", "password": "", "added_at_unix": 0
+        }))
+        .unwrap();
+        let mut page = HomeContent::new(server, EmbyClient::new("test".into()).unwrap(), cx);
+        let series = json!({"Id": "series-1", "Name": "Series", "Type": "Series"});
+        let mut detail =
+            SeriesDetailState::new_series(&serde_json::from_value(series.clone()).unwrap());
+        detail.item = Some(serde_json::from_value(series).unwrap());
+        let episodes: Vec<_> = (1..=30)
+            .map(|index| {
+                json!({
+                    "Id": format!("episode-{index}"), "Name": format!("Episode {index}"),
+                    "Type": "Episode", "SeasonId": "season-1", "ParentIndexNumber": 1,
+                    "IndexNumber": index, "Overview": "An episode overview. ".repeat(20)
+                })
+            })
+            .collect();
+        detail.episodes = Some(
+            serde_json::from_value(json!({"Items": episodes, "TotalRecordCount": 30})).unwrap(),
+        );
+        detail.effects.episodes = LoadState::Loaded;
+        detail.selected_episode_id = Some("episode-20".into());
+        page.navigation.push_detail("series-1".into(), None);
+        page.series_detail = Some(detail);
+        page
+    })
+}
+
+fn click_episode_line(cx: &mut VisualTestContext) {
+    let line = cx.debug_bounds("series-detail-episode-line-text").unwrap();
+    cx.simulate_click(line.center(), Modifiers::default());
+    cx.run_until_parked();
+    // Include deferred frame callbacks when checking that the page stays in place.
+    cx.update(|window, cx| window.simulate_next_frame(cx));
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn episode_line_only_responds_to_clicks_on_its_text(cx: &mut TestAppContext) {
+    let (page, cx) = episode_line_window(cx);
+    cx.simulate_resize(size(px(900.0), px(500.0)));
+    cx.run_until_parked();
+    let row = cx.debug_bounds("series-detail-episode-line").unwrap();
+    let text = cx.debug_bounds("series-detail-episode-line-text").unwrap();
+    assert!(text.size.width > px(0.0));
+    assert!(text.right() + px(10.0) < row.right());
+    let blank = point((text.right() + row.right()) / 2.0, row.center().y);
+    let scroll_before = page.read_with(cx, |page, _| {
+        page.series_detail.as_ref().unwrap().scroll_handle.offset()
+    });
+
+    cx.simulate_click(blank, Modifiers::default());
+    cx.run_until_parked();
+    page.read_with(cx, |page, _| {
+        let detail = page.series_detail.as_ref().unwrap();
+        assert_eq!(detail.episodes_carousel.scroll_offset(f32::INFINITY), 0.0);
+        assert_eq!(detail.scroll_handle.offset(), scroll_before);
+    });
+
+    click_episode_line(cx);
+    page.read_with(cx, |page, _| {
+        let detail = page.series_detail.as_ref().unwrap();
+        assert!(detail.episodes_carousel.scroll_offset(f32::INFINITY) > 0.0);
+        assert_eq!(detail.scroll_handle.offset(), scroll_before);
+    });
+}
+
+#[gpui::test]
+fn clicking_episode_line_reveals_the_card_horizontally_without_scrolling_the_page(
+    cx: &mut TestAppContext,
+) {
+    let (page, cx) = episode_line_window(cx);
+    for width in [550.0, 900.0, 1100.0] {
+        cx.simulate_resize(size(px(width), px(500.0)));
+        for (id, selector, initial_offset, initial_y) in [
+            (
+                "episode-20",
+                "series-detail-episode-card-episode-20",
+                0.0,
+                0.0,
+            ),
+            (
+                "episode-1",
+                "series-detail-episode-card-episode-1",
+                2500.0,
+                -64.0,
+            ),
+            (
+                "episode-30",
+                "series-detail-episode-card-episode-30",
+                0.0,
+                -64.0,
+            ),
+        ] {
+            page.update(cx, |page, cx| {
+                let detail = page.series_detail.as_mut().unwrap();
+                detail.selected_episode_id = Some(id.into());
+                detail
+                    .scroll_handle
+                    .set_offset(point(px(0.0), px(initial_y)));
+                detail
+                    .episodes_carousel
+                    .set_scroll_offset(initial_offset, f32::INFINITY);
+                detail.episodes_carousel.sync_previous_offset();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let (viewport, scroll_before) = page.read_with(cx, |page, _| {
+                let scroll = &page.series_detail.as_ref().unwrap().scroll_handle;
+                (scroll.bounds(), scroll.offset())
+            });
+            let row_before = cx.debug_bounds("series-detail-episodes-row").unwrap();
+            assert!(row_before.bottom() > viewport.bottom());
+
+            click_episode_line(cx);
+
+            let row = cx.debug_bounds("series-detail-episodes-row").unwrap();
+            let card = cx.debug_bounds(selector).unwrap();
+            assert!(
+                card.left() >= row.left() - px(0.5),
+                "{id}: {card:?}, {row:?}"
+            );
+            assert!(
+                card.right() <= row.right() + px(0.5),
+                "{id}: {card:?}, {row:?}"
+            );
+            assert_eq!(row.top(), row_before.top());
+            page.read_with(cx, |page, _| {
+                let detail = page.series_detail.as_ref().unwrap();
+                assert_eq!(detail.selected_episode_id.as_deref(), Some(id));
+                assert_eq!(detail.scroll_handle.offset(), scroll_before);
+                assert!(!detail.playback_loading);
+            });
+        }
+    }
+}
+
+#[gpui::test]
+fn clicking_episode_line_keeps_a_visible_card_at_its_horizontal_position(cx: &mut TestAppContext) {
+    let (page, cx) = episode_line_window(cx);
+    cx.simulate_resize(size(px(1100.0), px(800.0)));
+    page.update(cx, |page, cx| {
+        let detail = page.series_detail.as_mut().unwrap();
+        detail.selected_episode_id = Some("episode-3".into());
+        detail
+            .episodes_carousel
+            .set_scroll_offset(300.0, f32::INFINITY);
+        detail.episodes_carousel.sync_previous_offset();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    click_episode_line(cx);
+    page.read_with(cx, |page, _| {
+        let detail = page.series_detail.as_ref().unwrap();
+        assert_eq!(detail.episodes_carousel.scroll_offset(f32::INFINITY), 300.0);
+    });
+}
+
+#[gpui::test]
+fn episode_line_without_a_loaded_card_does_not_scroll(cx: &mut TestAppContext) {
+    let (page, cx) = episode_line_window(cx);
+    cx.simulate_resize(size(px(900.0), px(500.0)));
+    page.update(cx, |page, cx| {
+        let detail = page.series_detail.as_mut().unwrap();
+        detail.next_up = detail.episodes.take();
+        detail.effects.episodes = LoadState::Loading;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let before = page.read_with(cx, |page, _| {
+        let detail = page.series_detail.as_ref().unwrap();
+        assert!(detail.hero_line().is_some());
+        detail.scroll_handle.offset()
+    });
+    click_episode_line(cx);
+    page.read_with(cx, |page, _| {
+        let detail = page.series_detail.as_ref().unwrap();
+        assert_eq!(detail.scroll_handle.offset(), before);
+        assert_eq!(detail.episodes_carousel.scroll_offset(f32::INFINITY), 0.0);
+    });
 }
 
 #[gpui::test]
@@ -163,6 +355,120 @@ fn logos_adapt_to_aspect_ratio_and_stay_inside_small_heroes(cx: &mut TestAppCont
                 );
             }
             assert!(cx.debug_bounds("series-detail-title").is_none());
+        }
+    }
+}
+
+#[gpui::test]
+fn hero_image_and_scrims_share_device_edges_at_different_heights_and_scroll_offsets(
+    cx: &mut TestAppContext,
+) {
+    use crate::{
+        emby::{EmbyImageRequest, EmbyImageType},
+        images::cache::CachedImageKey,
+    };
+    use gpui::{ScaledPixels, black, linear_color_stop, linear_gradient};
+
+    let images = tempfile::tempdir().unwrap();
+    let backdrop_path = images.path().join("bright-backdrop.png");
+    image::RgbaImage::from_pixel(192, 108, image::Rgba([255, 255, 255, 255]))
+        .save(&backdrop_path)
+        .unwrap();
+    let (page, cx) = episode_line_window(cx);
+    page.update(cx, |page, cx| {
+        let item = page.series_detail.as_mut().unwrap().item.as_mut().unwrap();
+        item.backdrop_image_tags = Some(vec!["edge-test".into()]);
+        // Keep the page scrollable even at the tallest tested window size.
+        item.people = Some(
+            serde_json::from_value(json!([
+                {"Id": "person-1", "Name": "Actor"}
+            ]))
+            .unwrap(),
+        );
+        let request = EmbyImageRequest::new("series-1", EmbyImageType::Backdrop)
+            .with_tag(Some("edge-test".into()))
+            .with_max_width(1024);
+        let key = CachedImageKey::from_request(&page.current_server, &request).unwrap();
+        page.image_loader.finish_job(key, Ok(backdrop_path));
+        cx.notify();
+    });
+    let bottom_background = linear_gradient(
+        180.0,
+        linear_color_stop(black().opacity(0.0), 0.0),
+        linear_color_stop(black().opacity(0.72), 1.0),
+    );
+    let side_background = linear_gradient(
+        90.0,
+        linear_color_stop(black().opacity(0.72), 0.0),
+        linear_color_stop(black().opacity(0.0), 1.0),
+    );
+
+    for selection in [theme::ColorTheme::Latte, theme::ColorTheme::Mocha] {
+        cx.update(|_, cx| theme::set(selection, cx));
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            for height in [
+                433.0, 434.0, 599.0, 600.0, 601.0, 799.0, 800.0, 801.0, 900.0, 901.0,
+            ] {
+                cx.simulate_resize(size(px(1100.0), px(height)));
+                // Native resize restores the platform scale; override it afterwards.
+                cx.update(|window, _| window.set_scale_factor(scale));
+                for scroll in [0.0, 0.125, 0.25, 0.5, 0.75, 16.3, 64.5, 127.75] {
+                    page.update(cx, |page, cx| {
+                        page.series_detail
+                            .as_ref()
+                            .unwrap()
+                            .scroll_handle
+                            .set_offset(point(px(0.0), px(-scroll)));
+                        cx.notify();
+                    });
+                    cx.run_until_parked();
+                    page.read_with(cx, |page, _| {
+                        assert_eq!(
+                            page.series_detail
+                                .as_ref()
+                                .unwrap()
+                                .scroll_handle
+                                .offset()
+                                .y,
+                            px(-scroll)
+                        );
+                    });
+                    let hero = cx.debug_bounds("series-detail-hero").unwrap();
+                    let backdrop = cx.debug_bounds("series-detail-backdrop").unwrap();
+                    cx.update(|window, cx| {
+                        let hero_pixels = crate::ui::paint::device_bounds(window, hero);
+                        let image_pixels = crate::ui::paint::device_bounds(window, backdrop);
+                        assert_eq!(
+                            image_pixels, hero_pixels,
+                            "scale={scale}, height={height}, scroll={scroll}, image={backdrop:?}, hero={hero:?}"
+                        );
+                        let bottom = ScaledPixels(hero_pixels.bottom() as f32);
+                        let quads = window.painted_quads();
+                        for background in [side_background, bottom_background] {
+                            let quad = quads.iter().find(|quad| quad.background == background).unwrap();
+                            assert_eq!(
+                                quad.bounds.bottom(), bottom,
+                                "scale={scale}, height={height}, scroll={scroll}, hero={hero:?}, quad={quad:?}"
+                            );
+                            let last_pixel = point(
+                                ScaledPixels(image_pixels.center().x as f32 + 0.5),
+                                bottom - ScaledPixels(0.5),
+                            );
+                            assert!(quad.bounds.contains(&last_pixel));
+                            assert!(quad.content_mask.bounds.contains(&last_pixel));
+                        }
+                        // The image stops with its scrims. Only the page surface
+                        // may cover the very next physical pixel row.
+                        for x in [hero_pixels.left() + 8, hero_pixels.center().x, hero_pixels.right() - 8] {
+                            let pixel = point(ScaledPixels(x as f32 + 0.5), bottom + ScaledPixels(0.5));
+                            let covering = quads.iter().rev().find(|quad| {
+                                quad.bounds.contains(&pixel) && quad.content_mask.bounds.contains(&pixel)
+                            }).unwrap();
+                            assert_eq!(covering.background.as_solid(), Some(theme::get(cx).background));
+                        }
+                    });
+                }
+            }
         }
     }
 }

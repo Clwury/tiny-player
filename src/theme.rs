@@ -80,6 +80,7 @@ pub struct TinyTheme {
     pub accent_hover: Hsla,
     pub accent_foreground: Hsla,
     pub input_background: Hsla,
+    pub editor_background: Hsla,
     pub input_border: Hsla,
     pub input_border_focused: Hsla,
     pub muted_foreground: Hsla,
@@ -92,6 +93,7 @@ pub struct TinyTheme {
     pub scrollbar_track: Hsla,
     pub scrollbar_thumb: Hsla,
     pub scrollbar_thumb_hover: Hsla,
+    /// Fallback window decoration radius; component corners live in `ui::radius`.
     pub radius_lg: Pixels,
 }
 
@@ -150,12 +152,21 @@ struct ThemeConfig {
     #[serde(default, rename = "radius.lg")]
     radius_lg: Option<f32>,
     colors: ThemeColors,
+    #[serde(default)]
+    highlight: EditorThemeConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct EditorThemeConfig {
+    #[serde(rename = "editor.background")]
+    background: Option<String>,
 }
 
 // Source colors stay in the bundled JSON. UI roles are derived separately so
 // editor-oriented panel, selection and disabled-text colors do not leak into widgets.
 struct ThemePalette {
     background: Hsla,
+    editor_background: Hsla,
     foreground: Hsla,
     title_bar: Hsla,
     title_bar_border: Hsla,
@@ -170,6 +181,7 @@ impl ThemePalette {
     fn mocha_fallback() -> Self {
         Self {
             background: hex(0x181825),
+            editor_background: hex(0x181825),
             foreground: hex(0xcdd6f4),
             title_bar: hex(0x11111b),
             title_bar_border: hex(0x313244),
@@ -196,8 +208,17 @@ impl TinyTheme {
 
     fn from_theme_config(config: &ThemeConfig, selection: ColorTheme) -> Result<Self> {
         let fallback = ThemePalette::mocha_fallback();
+        let background = color_or_any(config, &["background"], fallback.background)?;
         let palette = ThemePalette {
-            background: color_or_any(config, &["background"], fallback.background)?,
+            background,
+            editor_background: config
+                .highlight
+                .background
+                .as_deref()
+                .map(parse_hex_color)
+                .transpose()
+                .context("解析输入框背景颜色失败")?
+                .unwrap_or(background),
             foreground: color_or_any(config, &["foreground"], fallback.foreground)?,
             title_bar: color_or_any(
                 config,
@@ -321,6 +342,7 @@ impl TinyTheme {
             }),
             accent_foreground: if light { white } else { background },
             input_background,
+            editor_background: palette.editor_background,
             input_border: background.blend(palette.input_border.opacity(0.7)),
             input_border_focused: accent,
             // Metadata must remain readable: the source `muted.foreground` is also
@@ -509,12 +531,35 @@ mod tests {
         assert_eq!(theme.background, parse_hex_color("#181825").unwrap());
         assert_eq!(theme.title_bar, parse_hex_color("#11111b").unwrap());
         assert_eq!(theme.input_background, parse_hex_color("#11111b").unwrap());
+        assert_eq!(theme.editor_background, parse_hex_color("#181825").unwrap());
         assert_eq!(
             theme.input_border_focused,
             parse_hex_color("#cba6f7").unwrap()
         );
         assert_eq!(theme.warning, parse_hex_color("#f9e2af").unwrap());
         assert_eq!(theme.error, parse_hex_color("#f38ba8").unwrap());
+    }
+
+    #[test]
+    fn editor_surface_reads_highlight_colors_without_parsing_syntax_as_colors() {
+        let mut config: ThemeConfig = serde_json::from_value(serde_json::json!({
+            "name": "Catppuccin Latte",
+            "colors": {"background": "#e5e9ef"},
+            "highlight": {
+                "editor.background": "#eff1f5",
+                "syntax": {"comment": {"color": "#9ca0b0", "font_style": "italic"}}
+            }
+        }))
+        .unwrap();
+        let theme = TinyTheme::from_theme_config(&config, ColorTheme::Latte).unwrap();
+        assert_eq!(theme.editor_background, parse_hex_color("#eff1f5").unwrap());
+
+        config.highlight.background = None;
+        let theme = TinyTheme::from_theme_config(&config, ColorTheme::Latte).unwrap();
+        assert_eq!(theme.editor_background, theme.background);
+
+        config.highlight.background = Some("invalid".into());
+        assert!(TinyTheme::from_theme_config(&config, ColorTheme::Latte).is_err());
     }
 
     #[test]

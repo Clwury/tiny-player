@@ -7,12 +7,13 @@ use gpui::{
     anchored, div, percentage, point, prelude::FluentBuilder, px, svg,
 };
 
+use crate::ui::radius;
 use crate::{emby::ItemCounts, server::CachedServer, theme, ui::server_icon::server_icon};
 
 use super::TinyApp;
 
-pub(super) const SERVER_CARD_WIDTH_PX: f32 = 220.0;
-pub(super) const SERVER_CARD_HEIGHT_PX: f32 = 110.0;
+pub(super) const SERVER_CARD_WIDTH_PX: f32 = 190.0;
+pub(super) const SERVER_CARD_HEIGHT_PX: f32 = 96.0;
 const SERVER_CARD_LOADER_ANIMATION_MS: u64 = 1800;
 
 #[derive(Clone)]
@@ -52,7 +53,7 @@ impl Render for DraggedServer {
         div()
             .w(px(SERVER_CARD_WIDTH_PX))
             .h(px(SERVER_CARD_HEIGHT_PX))
-            .rounded(px(12.0))
+            .rounded(radius::CARD)
             .border_1()
             .border_color(theme.accent)
             .bg(theme.dialog_background)
@@ -78,15 +79,17 @@ pub(super) fn add_server_card(
     div()
         .id("add-server-card")
         .flex()
+        .flex_none()
         .w(px(SERVER_CARD_WIDTH_PX))
         .h(px(SERVER_CARD_HEIGHT_PX))
         .items_center()
         .justify_center()
-        .rounded(px(12.0))
+        .rounded(radius::CARD)
         .border_1()
         .border_color(theme.input_border)
         .bg(theme.dialog_background)
         .text_color(theme.muted_foreground)
+        .cursor_pointer()
         .hover(move |style| {
             style
                 .bg(theme.secondary_hover)
@@ -96,7 +99,7 @@ pub(super) fn add_server_card(
         .child(
             svg()
                 .path("icons/plus.svg")
-                .size(px(30.0))
+                .size(px(24.0))
                 .text_color(theme.foreground),
         )
         .on_click(move |event, window, cx| {
@@ -155,7 +158,7 @@ where
         .flex_none()
         .w(px(SERVER_CARD_WIDTH_PX))
         .h(px(SERVER_CARD_HEIGHT_PX))
-        .rounded(px(12.0))
+        .rounded(radius::CARD)
         .border_1()
         .border_color(theme.input_border)
         .bg(theme.dialog_background)
@@ -164,7 +167,8 @@ where
                 .border_color(theme.accent)
                 .opacity(0.3)
         })
-        .cursor_pointer()
+        .cursor_default()
+        .when(!loading, |this| this.cursor_pointer())
         .hover(move |style| {
             style
                 .bg(theme.secondary_hover)
@@ -186,6 +190,10 @@ where
                     app.begin_server_reorder(&drag.server_id, window, cx)
                 })
                 .ok();
+                // GPUI installs the active drag after this callback returns.
+                window.defer(cx, |window, cx| {
+                    cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
+                });
                 cx.new(|_| drag.clone())
             })
         })
@@ -215,7 +223,7 @@ fn server_card_content(
         .flex_col()
         .size_full()
         .justify_between()
-        .p_4()
+        .p_3()
         .child(
             div()
                 .flex()
@@ -223,10 +231,10 @@ fn server_card_content(
                 .min_w_0()
                 .items_center()
                 .gap_2()
-                .text_lg()
+                .text_base()
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme.foreground)
-                .child(server_icon(icon_url, 32.0))
+                .child(server_icon(icon_url, 28.0))
                 .child(div().flex_1().min_w_0().text_ellipsis().child(title)),
         )
         .child(
@@ -234,7 +242,7 @@ fn server_card_content(
                 .flex()
                 .items_center()
                 .justify_between()
-                .h(px(26.0))
+                .h(px(20.0))
                 .gap_2()
                 .child(div().flex().min_w_0().when_some(counts, |this, counts| {
                     this.child(server_counts_row(counts, cx))
@@ -275,7 +283,7 @@ fn server_counts_row(counts: ItemCounts, cx: &App) -> impl IntoElement {
     div()
         .flex()
         .items_center()
-        .gap_3()
+        .gap_2()
         .text_xs()
         .text_color(theme.muted_foreground)
         .child(server_count_item(
@@ -342,10 +350,11 @@ pub(super) fn server_card_menu(
                 .debug_selector(|| "server-context-menu".into())
                 .track_focus(&menu.focus)
                 .occlude()
+                .cursor_default()
                 .flex()
                 .flex_col()
                 .w(px(128.0))
-                .rounded(px(8.0))
+                .rounded(radius::SURFACE)
                 .border_1()
                 .border_color(theme.context_menu.border)
                 .bg(theme.context_menu.background)
@@ -426,7 +435,7 @@ fn menu_item(
         .flex()
         .h(px(30.0))
         .items_center()
-        .rounded(px(6.0))
+        .rounded(radius::CONTROL)
         .px_2()
         .text_sm()
         .text_color(if destructive {
@@ -444,6 +453,8 @@ fn menu_item(
 
 #[cfg(test)]
 mod tests {
+    mod sidebar;
+
     use super::*;
     use crate::{
         app::Page,
@@ -893,7 +904,10 @@ mod tests {
         cx.run_until_parked();
         for (selector, offset) in [
             ("server-card-first", point(px(30.0), px(30.0))),
-            ("server-card-first", point(px(190.0), px(85.0))),
+            (
+                "server-card-first",
+                point(px(SERVER_CARD_WIDTH_PX - 10.0), px(85.0)),
+            ),
             ("server-card-second", point(px(100.0), px(30.0))),
         ] {
             let position = cx.debug_bounds(selector).unwrap().origin + offset;

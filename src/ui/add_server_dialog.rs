@@ -4,6 +4,7 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 
+use crate::ui::radius;
 use crate::{
     server::{AddServerSubmission, CachedServer, Protocol, ServerEndpoint},
     theme,
@@ -85,6 +86,7 @@ impl AddServerDialogState {
             Editor::new("服务器地址", cx)
                 .default_value(address)
                 .borderless()
+                .height(px(30.0))
         });
         let port_input = cx.new(|cx| {
             Editor::new("端口", cx)
@@ -237,6 +239,7 @@ impl AddServerDialogState {
             // Keep the modal layer from forwarding clicks or wheel events to
             // the page underneath its transparent backdrop.
             .occlude()
+            .cursor_default()
             .rounded_tl(corners.top_left)
             .rounded_tr(corners.top_right)
             .rounded_bl(corners.bottom_left)
@@ -248,7 +251,7 @@ impl AddServerDialogState {
                     .flex_col()
                     .w(px(560.0))
                     .gap_5()
-                    .rounded(theme.radius_lg)
+                    .rounded(radius::SURFACE)
                     .border_1()
                     .border_color(theme.input_border)
                     .bg(theme.dialog_background)
@@ -432,12 +435,15 @@ fn address_input(
     div()
         .flex()
         .items_center()
-        .h(px(34.0))
+        .h_8()
         .w_full()
-        .rounded(px(8.0))
+        .rounded(radius::INPUT)
         .border_1()
-        .border_color(theme.input_border)
-        .bg(theme.input_background)
+        .border_color(theme.window_border)
+        .bg(theme.editor_background)
+        .cursor_default()
+        .text_sm()
+        .line_height(gpui::relative(1.3))
         .px_2()
         .child(
             div()
@@ -463,9 +469,9 @@ fn protocol_selector(
 
     div()
         .flex()
-        .h(px(34.0))
+        .h_8()
         .w_full()
-        .rounded(px(8.0))
+        .rounded(radius::INPUT)
         .border_1()
         .border_color(theme.input_border)
         .bg(theme.input_background)
@@ -495,11 +501,12 @@ fn protocol_button(
 
     div()
         .id(protocol.label())
+        .cursor_pointer()
         .flex()
         .flex_1()
         .items_center()
         .justify_center()
-        .rounded(px(6.0))
+        .rounded(radius::CONTROL)
         .text_xs()
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.foreground)
@@ -535,7 +542,7 @@ fn dialog_button(
         .h(px(34.0))
         .items_center()
         .justify_center()
-        .rounded(px(8.0))
+        .rounded(radius::CONTROL)
         .px_4()
         .text_sm()
         .font_weight(gpui::FontWeight::MEDIUM)
@@ -555,6 +562,8 @@ fn dialog_button(
         } else {
             theme.input_background
         })
+        .cursor_default()
+        .when(!disabled, |this| this.cursor_pointer())
         .when(disabled, |this| this.opacity(0.65))
         .hover(move |style| {
             if disabled {

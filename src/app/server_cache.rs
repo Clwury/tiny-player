@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, ensure};
-use gpui::{Context, Entity, Task, Window};
+use gpui::{Context, Entity, Window};
 use uuid::Uuid;
 
 use crate::{
@@ -45,7 +45,7 @@ impl TinyApp {
         target_id: &str,
         cx: &mut Context<Self>,
     ) {
-        if !matches!(self.page, Page::Servers)
+        if !matches!(self.page, Page::Servers | Page::Home(_))
             || self.selecting_server_id.is_some()
             || self.add_server_dialog.is_some()
             || self.server_icon_picker.is_some()
@@ -76,8 +76,20 @@ impl TinyApp {
         let server = self.cache.servers.remove(source);
         self.cache.servers.insert(target, server);
         self.servers = self.cache.servers.clone();
+        self.sync_home_servers(cx);
         self.schedule_cache_save("保存服务器顺序失败", cx);
         cx.notify();
+    }
+
+    fn sync_home_servers(&self, cx: &mut Context<Self>) {
+        let home = match &self.page {
+            Page::Home(home)
+            | Page::Playback {
+                return_to: home, ..
+            } => home,
+            Page::Servers => return,
+        };
+        home.update(cx, |home, cx| home.set_servers(self.servers.clone(), cx));
     }
 
     pub(super) fn delete_server(
@@ -143,9 +155,12 @@ impl TinyApp {
                 self.clear_app_notifications();
                 self.clear_server_notifications();
                 self.add_server_dialog = None;
-                self.selecting_server_id = None;
-                self.select_server_task = Task::ready(());
-                self.page = Page::Servers;
+                self.cancel_server_selection(cx);
+                if editing {
+                    self.page = Page::Servers;
+                } else {
+                    self.sync_home_servers(cx);
+                }
             }
             Err(error) => {
                 dialog.update(cx, |dialog, cx| {

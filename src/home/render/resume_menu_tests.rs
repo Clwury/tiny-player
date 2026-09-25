@@ -66,6 +66,9 @@ fn resume_menu_window(cx: &mut TestAppContext) -> (Entity<HomeContent>, &mut Vis
             HomePage {
                 current_server: server.clone(),
                 servers: vec![server],
+                selecting_server_id: None,
+                sidebar_scroll_handle: gpui::ScrollHandle::new(),
+                sidebar_reorder: None,
                 home_content,
             }
         });

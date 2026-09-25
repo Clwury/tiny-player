@@ -1128,6 +1128,9 @@ impl HomePage {
 
 impl Render for HomePage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.sidebar_reorder.is_some() && !cx.has_active_drag() {
+            self.finish_sidebar_reorder(false, window, cx);
+        }
         let corners = window_corner_radii(window, cx);
         let on_back = cx.listener(Self::back_to_servers);
         let on_home = cx.listener(Self::select_home_section);

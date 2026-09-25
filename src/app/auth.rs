@@ -10,10 +10,34 @@ use crate::{
 use super::{Page, TinyApp, server_cache::authenticate_server};
 
 impl TinyApp {
+    fn set_selecting_server(&mut self, server_id: Option<String>, cx: &mut Context<Self>) {
+        self.selecting_server_id = server_id.clone();
+        if let Page::Home(home) = &self.page {
+            home.update(cx, |home, cx| home.set_selecting_server(server_id, cx));
+        }
+        cx.notify();
+    }
+
+    pub(super) fn cancel_server_selection(&mut self, cx: &mut Context<Self>) {
+        self.select_server_task = Task::ready(());
+        self.set_selecting_server(None, cx);
+    }
+
+    fn server_selection_error(
+        &mut self,
+        message: impl Into<gpui::SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.page, Page::Home(_)) {
+            self.push_app_error_notification(message, cx);
+        } else {
+            self.push_server_error_notification(message, cx);
+        }
+    }
+
     pub(super) fn show_servers_page_from_home(&mut self, cx: &mut Context<Self>) {
         self.open_server_menu = None;
-        self.selecting_server_id = None;
-        self.select_server_task = Task::ready(());
+        self.cancel_server_selection(cx);
         self.page = Page::Servers;
         cx.notify();
     }
@@ -31,6 +55,14 @@ impl TinyApp {
         if self.server_icon_picker.is_some() {
             return;
         }
+        // Clicking the current server cancels a pending sidebar switch without
+        // rebuilding its page or losing the current browsing position.
+        if let Page::Home(home) = &self.page
+            && home.read(cx).current_server_id() == server.id
+        {
+            self.cancel_server_selection(cx);
+            return;
+        }
         // Cards and sidebar items can hold snapshots from before a server edit.
         let Some(server) = self
             .servers
@@ -46,11 +78,10 @@ impl TinyApp {
         self.open_server_menu = None;
         self.clear_app_notifications();
         self.clear_server_notifications();
+        self.cancel_server_selection(cx);
 
         let server_id = server.id.clone();
         if server.can_reuse_auth() {
-            self.selecting_server_id = None;
-            self.select_server_task = Task::ready(());
             self.open_home_for_server(server.clone(), cx);
             self.load_item_counts_for_server_id(&server_id, cx);
             cx.notify();
@@ -58,12 +89,14 @@ impl TinyApp {
         }
 
         let Some(client) = self.emby_client.clone() else {
-            self.push_server_error_notification("Emby HTTP 客户端不可用", cx);
+            self.server_selection_error("Emby HTTP 客户端不可用", cx);
             cx.notify();
             return;
         };
-        self.selecting_server_id = Some(server_id);
-        self.page = Page::Servers;
+        self.set_selecting_server(Some(server_id), cx);
+        if !matches!(self.page, Page::Home(_)) {
+            self.page = Page::Servers;
+        }
         cx.notify();
 
         let request = server.clone();
@@ -84,7 +117,7 @@ impl TinyApp {
         if self.selecting_server_id.as_deref() != Some(&requested.id) {
             return;
         }
-        self.selecting_server_id = None;
+        self.set_selecting_server(None, cx);
         // An edit or deletion while the request was running invalidates its result.
         if !self.servers.iter().any(|current| {
             current.id == requested.id
@@ -108,8 +141,7 @@ impl TinyApp {
                 self.open_home_for_server(server, cx);
             }
             Err(error) => {
-                self.push_server_error_notification(format!("登录服务器失败：{error}"), cx);
-                self.page = Page::Servers;
+                self.server_selection_error(format!("登录服务器失败：{error}"), cx);
             }
         }
         cx.notify();
@@ -117,9 +149,8 @@ impl TinyApp {
 
     fn open_home_for_server(&mut self, server: CachedServer, cx: &mut Context<Self>) {
         let Some(client) = self.emby_client.clone() else {
-            self.selecting_server_id = None;
-            self.push_server_error_notification("Emby HTTP 客户端不可用", cx);
-            self.page = Page::Servers;
+            self.set_selecting_server(None, cx);
+            self.server_selection_error("Emby HTTP 客户端不可用", cx);
             return;
         };
 
@@ -132,6 +163,13 @@ impl TinyApp {
             &home_page,
             move |app: &mut TinyApp, _, event, cx| match event {
                 HomeEvent::BackToServers => app.show_servers_page_from_home(cx),
+                HomeEvent::AddServer => app.show_add_server_dialog(cx),
+                HomeEvent::ReorderServer {
+                    server_id,
+                    target_id,
+                } => {
+                    app.reorder_server(server_id, target_id, cx);
+                }
                 HomeEvent::SwitchServer(server_id) => {
                     if let Some(server) = app
                         .servers
@@ -159,6 +197,8 @@ impl TinyApp {
         request: PlaybackRequest,
         cx: &mut Context<Self>,
     ) {
+        // Playback on the retained page takes precedence over an in-flight switch.
+        self.cancel_server_selection(cx);
         let playback_cache_config = self.cache.playback.clone();
         let playback_volume = self.cache.playback_volume;
         let playback_page = cx.new(|cx| {
@@ -237,9 +277,11 @@ impl TinyApp {
 
 #[cfg(test)]
 mod tests {
+    mod sidebar_switch;
+
     use super::*;
     use crate::{storage::ServerCache, theme};
-    use gpui::{Modifiers, TestAppContext, px, size};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, px, size};
 
     #[gpui::test]
     fn late_authentication_cannot_overwrite_edited_credentials(cx: &mut TestAppContext) {
@@ -278,8 +320,7 @@ mod tests {
         assert!(!path.exists(), "a stale response must not write the cache");
     }
 
-    #[gpui::test]
-    fn sidebar_switches_with_cached_auth_and_authenticates_without_it(cx: &mut TestAppContext) {
+    fn sidebar_window(cx: &mut TestAppContext) -> (Entity<TinyApp>, &mut VisualTestContext) {
         cx.update(theme::init);
         let (app, cx) = cx.add_window_view(|_, cx| {
             let mut cache = ServerCache::empty();
@@ -304,6 +345,12 @@ mod tests {
         });
         cx.simulate_resize(size(px(1100.0), px(720.0)));
         cx.run_until_parked();
+        (app, cx)
+    }
+
+    #[gpui::test]
+    fn sidebar_switches_with_cached_auth_and_authenticates_without_it(cx: &mut TestAppContext) {
+        let (app, cx) = sidebar_window(cx);
         let original_home = app.read_with(cx, |app, _| match &app.page {
             Page::Home(home) => home.entity_id(),
             _ => panic!("expected initial home page"),
@@ -342,9 +389,9 @@ mod tests {
         cx.simulate_click(target.center(), Modifiers::default());
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
-            assert!(matches!(app.page, Page::Servers));
+            assert!(matches!(&app.page, Page::Home(home) if home.entity_id() == previous_home));
             assert!(app.selecting_server_id.is_none());
-            assert!(app.has_server_page_notifications());
+            assert!(app.has_app_notifications());
         });
     }
 }

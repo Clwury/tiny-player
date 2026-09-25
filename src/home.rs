@@ -50,6 +50,11 @@ use gpui::{
 pub enum HomeEvent {
     BackToServers,
     SwitchServer(String),
+    AddServer,
+    ReorderServer {
+        server_id: String,
+        target_id: String,
+    },
     SectionChanged,
     TitleChanged,
     OpenSettings,
@@ -99,6 +104,9 @@ struct UserViewItemsRow {
 pub struct HomePage {
     current_server: CachedServer,
     servers: Vec<CachedServer>,
+    selecting_server_id: Option<String>,
+    sidebar_scroll_handle: ScrollHandle,
+    sidebar_reorder: Option<sidebar::reorder::SidebarReorder>,
     home_content: Entity<HomeContent>,
 }
 
@@ -187,7 +195,7 @@ impl HomeContent {
             .detach();
         cx.on_release(|page, cx| page.finish_home_snapshot_saves(cx).detach())
             .detach();
-        let search_input = cx.new(|cx| Editor::new("搜索电影或剧集", cx).clearable());
+        let search_input = cx.new(|cx| Editor::new("搜索电影或剧集", cx).search());
         cx.subscribe(&search_input, |page, _, event, cx| {
             page.on_search_input_event(event, cx);
         })
@@ -392,6 +400,9 @@ impl HomePage {
         let mut page = Self {
             current_server,
             servers,
+            selecting_server_id: None,
+            sidebar_scroll_handle: ScrollHandle::new(),
+            sidebar_reorder: None,
             home_content,
         };
         page.start_effects(cx);
@@ -400,6 +411,24 @@ impl HomePage {
 
     pub fn title(&self, cx: &App) -> SharedString {
         self.home_content.read(cx).title()
+    }
+
+    pub(crate) fn set_servers(&mut self, servers: Vec<CachedServer>, cx: &mut Context<Self>) {
+        self.servers = servers;
+        cx.notify();
+    }
+
+    pub(crate) fn current_server_id(&self) -> &str {
+        &self.current_server.id
+    }
+
+    pub(crate) fn set_selecting_server(
+        &mut self,
+        server_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.selecting_server_id = server_id;
+        cx.notify();
     }
 
     pub(crate) fn start_effects(&mut self, cx: &mut Context<Self>) {
@@ -459,7 +488,7 @@ impl HomePage {
     }
 
     fn switch_server(&mut self, server_id: &str, cx: &mut Context<Self>) {
-        if server_id != self.current_server.id
+        if (server_id != self.current_server.id || self.selecting_server_id.is_some())
             && self.servers.iter().any(|server| server.id == server_id)
         {
             cx.emit(HomeEvent::SwitchServer(server_id.to_string()));

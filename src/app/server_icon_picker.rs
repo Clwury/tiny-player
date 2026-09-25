@@ -6,6 +6,7 @@ use gpui::{
 };
 use uuid::Uuid;
 
+use crate::ui::radius;
 use crate::{
     server::{CachedServer, icon::all_icons},
     theme,
@@ -65,7 +66,7 @@ impl TinyApp {
         let previous_focus = window.focused(cx);
         focus.focus(window, cx);
         let session = Uuid::new_v4();
-        let search = cx.new(|cx| Editor::new("搜索图标名称…", cx).borderless().clearable());
+        let search = cx.new(|cx| Editor::new("搜索图标名称…", cx).search());
         let search_subscription = cx.subscribe(&search, move |app, _, event, cx| {
             if matches!(event, EditorEvent::Changed)
                 && let Some(picker) = app
@@ -249,7 +250,7 @@ impl TinyApp {
                     .size(px(28.0))
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.0))
+                    .rounded(radius::CONTROL)
                     .hover(move |style| style.bg(theme.secondary_hover))
                     .child(
                         svg()
@@ -272,7 +273,7 @@ impl TinyApp {
                 .h(height)
                 .p_5()
                 .gap_3()
-                .rounded(theme.radius_lg)
+                .rounded(radius::SURFACE)
                 .border_1()
                 .border_color(theme.input_border)
                 .bg(theme.dialog_background)
@@ -285,26 +286,13 @@ impl TinyApp {
                         .debug_selector(|| "server-icon-search".into())
                         .flex()
                         .flex_none()
-                        .items_center()
-                        .pl_2()
-                        .rounded(px(8.0))
-                        .border_1()
-                        .border_color(theme.input_border)
-                        .bg(theme.input_background)
-                        .child(
-                            svg()
-                                .path("icons/search.svg")
-                                .size(px(16.0))
-                                .flex_none()
-                                .text_color(theme.muted_foreground),
-                        )
-                        .child(div().flex_1().min_w_0().child(picker.search.clone())),
+                        .child(picker.search.clone()),
                 )
                 .child(div().text_sm().text_color(theme.muted_foreground).child(
                     if query.is_empty() {
-                        format!("共 {match_count} 个图标 · 点击图标即可应用")
+                        format!("共 {match_count} 个图标")
                     } else {
-                        format!("找到 {match_count} 个图标 · 点击图标即可应用")
+                        format!("找到 {match_count} 个图标")
                     },
                 ))
                 .child(
@@ -346,6 +334,7 @@ impl TinyApp {
         Some(
             div()
                 .id("server-icon-overlay")
+                .cursor_default()
                 .debug_selector(|| "server-icon-overlay".into())
                 .absolute()
                 .top_0()
@@ -398,9 +387,10 @@ impl TinyApp {
             .size_full()
             .gap_1()
             .px_1()
-            .rounded(px(8.0))
+            .rounded(radius::CONTROL)
             .when(selected, |this| this.bg(theme.element_selected))
             .when(pending, |this| this.opacity(0.5))
+            .cursor_default()
             .when(picker.pending_url.is_none(), |this| {
                 this.cursor_pointer()
                     .hover(move |style| {

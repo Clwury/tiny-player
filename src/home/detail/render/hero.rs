@@ -1,6 +1,7 @@
 use std::{path::Path, sync::Arc};
 
 use super::*;
+use crate::ui::radius;
 use gpui::{
     App, ImgResourceLoader, RenderOnce, Resource, black, linear_color_stop, linear_gradient,
 };
@@ -200,7 +201,7 @@ impl HomeContent {
             .size(px(32.0))
             .items_center()
             .justify_center()
-            .rounded_md()
+            .rounded(radius::CONTROL)
             .cursor_pointer()
             .occlude()
             .hover(move |style| style.bg(theme.secondary_hover))
@@ -246,22 +247,20 @@ impl HomeContent {
             .h(px(hero_height))
             .overflow_hidden()
             .bg(theme.input_background)
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
-                    .left_0()
-                    .when_some(backdrop_path, |this, path| {
-                        this.child(
-                            img(path)
-                                .w_full()
-                                .h_full()
-                                .object_fit(gpui::ObjectFit::Cover),
-                        )
-                    }),
-            )
+            .when_some(backdrop_path, |this, path| {
+                // Resolve the image's percentage height against the explicit
+                // hero height. An inset-only wrapper lets the image retain its
+                // intrinsic height and bleed past scrims when scrolling clips
+                // round outward to a device pixel.
+                this.child(
+                    img(path)
+                        .debug_selector(|| "series-detail-backdrop".into())
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Cover),
+                )
+            })
             .child(
                 div()
                     .absolute()
@@ -338,6 +337,7 @@ impl HomeContent {
                             .when(detail.is_series(), |this| {
                                 this.child(
                                     div()
+                                        .id("series-detail-episode-line")
                                         .debug_selector(|| "series-detail-episode-line".to_string())
                                         .flex()
                                         .flex_none()
@@ -349,7 +349,29 @@ impl HomeContent {
                                         .overflow_hidden()
                                         .text_base()
                                         .font_weight(gpui::FontWeight::MEDIUM)
-                                        .when_some(episode_line, |this, line| this.child(line)),
+                                        .cursor_default()
+                                        .when_some(episode_line, |this, line| {
+                                            this.child(
+                                                div()
+                                                    .id("series-detail-episode-line-text")
+                                                    .debug_selector(|| {
+                                                        "series-detail-episode-line-text".into()
+                                                    })
+                                                    .min_w_0()
+                                                    .max_w_full()
+                                                    .overflow_hidden()
+                                                    .when(detail.hero_episode_index().is_some(), |this| {
+                                                        this.on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                            cx.stop_propagation();
+                                                        })
+                                                        .on_click(cx.listener(|page, _, window, cx| {
+                                                            cx.stop_propagation();
+                                                            page.reveal_series_hero_episode(window, cx);
+                                                        }))
+                                                    })
+                                                    .child(line),
+                                            )
+                                        }),
                                 )
                             })
                             .when_some(detail.item.as_ref(), |this, item| {
@@ -389,7 +411,7 @@ impl HomeContent {
                         .flex()
                         .items_center()
                         .gap_1()
-                        .rounded_full()
+                        .rounded(radius::CONTROL)
                         .bg(theme.dialog_background.opacity(0.86))
                         .px_3()
                         .py_1()
@@ -406,7 +428,7 @@ impl HomeContent {
             .when_some(official_rating, |this, rating| {
                 this.child(
                     div()
-                        .rounded_full()
+                        .rounded(radius::CONTROL)
                         .border_1()
                         .border_color(theme.input_border)
                         .bg(theme.dialog_background.opacity(0.86))
@@ -419,7 +441,7 @@ impl HomeContent {
             .when_some(genres, |this, genres| {
                 this.child(
                     div()
-                        .rounded_full()
+                        .rounded(radius::CONTROL)
                         .bg(theme.dialog_background.opacity(0.86))
                         .px_3()
                         .py_1()

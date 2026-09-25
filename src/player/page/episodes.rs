@@ -1,5 +1,6 @@
 use gpui::{FontWeight, ScrollStrategy, UniformListScrollHandle, img, uniform_list};
 
+use crate::ui::radius;
 use crate::{
     emby::{EmbyImageRequest, EmbyImageType, ImageQuality},
     images::{cache as image_cache, loader::ImageLoader},
@@ -141,6 +142,7 @@ impl PlaybackPage {
     pub(super) fn render_episode_list_backdrop(&self, cx: &Context<Self>) -> impl IntoElement {
         div()
             .id("playback-episodes-backdrop")
+            .cursor_default()
             .absolute()
             // The video frame occupies the normal flow. Explicit insets keep
             // outside-click detection over the viewport instead of below it.
@@ -168,6 +170,7 @@ impl PlaybackPage {
         let scroll = &self.episode_list.scroll;
         div()
             .id("playback-episodes-panel")
+            .cursor_default()
             .debug_selector(|| "playback-episodes-panel".into())
             .absolute()
             .right_0()
@@ -301,7 +304,7 @@ impl PlaybackPage {
                 .items_center()
                 .gap_2()
                 .p_2()
-                .rounded(px(8.0))
+                .rounded(radius::CARD)
                 .border_1()
                 .border_color(if selected {
                     theme.input_border_focused
@@ -335,7 +338,7 @@ impl PlaybackPage {
                         .relative()
                         .w(px(144.0))
                         .h(px(81.0))
-                        .rounded(px(6.0))
+                        .rounded(radius::CARD)
                         .overflow_hidden()
                         .bg(theme.input_background)
                         .flex()
@@ -353,7 +356,7 @@ impl PlaybackPage {
                             this.child(
                                 img(path)
                                     .size_full()
-                                    .rounded(px(6.0))
+                                    .rounded(radius::CARD)
                                     .object_fit(gpui::ObjectFit::Cover),
                             )
                         }),

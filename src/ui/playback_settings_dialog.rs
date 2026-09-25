@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
     ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled, Subscription, Window,
-    div, point, prelude::FluentBuilder, px, relative, svg,
+    div, point, prelude::FluentBuilder, px, relative,
 };
 
+use crate::ui::radius;
 use crate::{
     app::window_corner_radii,
     app_metadata::default_playback_cache_dir,
@@ -213,12 +214,7 @@ impl Render for PlaybackSettingsDialogState {
 impl PlaybackSettingsDialogState {
     pub fn new(config: &PlaybackCacheConfig, cx: &mut Context<Self>) -> Self {
         let config = config.clone().normalized();
-        let search = cx.new(|cx| {
-            Editor::new("搜索设置…", cx)
-                .compact()
-                .borderless()
-                .clearable()
-        });
+        let search = cx.new(|cx| Editor::new("搜索设置…", cx).search());
         let scroll_handle = ScrollHandle::new();
         let search_subscription = cx.subscribe(&search, |this, _, event, cx| {
             if matches!(event, EditorEvent::Changed) {
@@ -456,27 +452,8 @@ impl PlaybackSettingsDialogState {
         bottom_left_radius: gpui::Pixels,
         cx: &App,
     ) -> impl IntoElement {
-        let theme = theme::get(cx);
         settings_sidebar(bottom_left_radius, cx)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .pl_2()
-                    .rounded(px(6.0))
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(theme.input_border)
-                    .bg(theme.input_background)
-                    .child(
-                        svg()
-                            .path("icons/search.svg")
-                            .size(px(14.0))
-                            .flex_shrink_0()
-                            .text_color(theme.muted_foreground),
-                    )
-                    .child(div().flex_1().min_w_0().child(self.search.clone())),
-            )
+            .child(self.search.clone())
             .child(
                 div()
                     .flex()
@@ -614,11 +591,13 @@ impl PlaybackSettingsDialogState {
                                 .items_center()
                                 .h(px(32.0))
                                 .px_2()
-                                .rounded(px(6.0))
+                                .rounded(radius::INPUT)
                                 .border_1()
-                                .border_color(theme.input_border)
-                                .bg(theme.input_background)
+                                .border_color(theme.window_border)
+                                .bg(theme.editor_background)
+                                .cursor_default()
                                 .text_sm()
+                                .line_height(gpui::relative(1.3))
                                 .text_color(theme.muted_foreground)
                                 .tooltip(move |_, cx| text_tooltip(tooltip.clone(), cx))
                                 .child(div().min_w_0().text_ellipsis().child(path)),

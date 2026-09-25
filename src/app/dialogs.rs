@@ -11,8 +11,15 @@ impl TinyApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_add_server_dialog(cx);
+    }
+
+    pub(super) fn show_add_server_dialog(&mut self, cx: &mut Context<Self>) {
         if self.server_icon_picker.is_some() {
             return;
+        }
+        if matches!(self.page, super::Page::Home(_)) {
+            self.cancel_server_selection(cx);
         }
         self.open_server_menu = None;
         self.clear_server_notifications();

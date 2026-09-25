@@ -1,4 +1,5 @@
 use super::*;
+use crate::ui::radius;
 
 impl PlaybackPage {
     pub(in super::super) fn playback_control_button(
@@ -23,7 +24,7 @@ impl PlaybackPage {
             .size(button_size)
             .items_center()
             .justify_center()
-            .rounded_full()
+            .rounded(radius::CONTROL)
             .text_color(color)
             .when(enabled, |this| {
                 this.cursor_pointer()
@@ -109,13 +110,14 @@ impl PlaybackPage {
                     .max_h(px(TRACK_SELECT_MENU_MAX_HEIGHT_PX))
                     .gap_1()
                     .overflow_y_scroll()
-                    .rounded(px(8.0))
+                    .rounded(radius::SURFACE)
                     .border_1()
                     .border_color(theme.input_border.opacity(0.72))
                     .bg(rgba(0x000000e6))
                     .p(px(4.0))
                     .shadow_lg()
                     .occlude()
+                    .cursor_default()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
@@ -171,6 +173,7 @@ impl PlaybackPage {
 
         div()
             .id("playback-back-button")
+            .cursor_pointer()
             .absolute()
             .left(px(PLAYBACK_BACK_BUTTON_OFFSET_PX))
             .top(px(PLAYBACK_BACK_BUTTON_OFFSET_PX))
@@ -178,7 +181,7 @@ impl PlaybackPage {
             .size(px(PLAYBACK_BACK_BUTTON_SIZE_PX))
             .items_center()
             .justify_center()
-            .rounded_md()
+            .rounded(radius::CONTROL)
             .hover(move |style| style.bg(theme.secondary_hover))
             .occlude()
             .on_hover(cx.listener(Self::handle_back_button_hover))
@@ -398,6 +401,7 @@ impl PlaybackPage {
         segments.into_iter().fold(
             div()
                 .id("playback-cache-status-popover")
+                .cursor_default()
                 .absolute()
                 .right_0()
                 .bottom(px(32.0))
@@ -405,7 +409,7 @@ impl PlaybackPage {
                 .flex_col()
                 .min_w(px(176.0))
                 .gap_1()
-                .rounded(px(8.0))
+                .rounded(radius::SURFACE)
                 .border_1()
                 .border_color(theme.input_border.opacity(0.62))
                 .bg(rgba(0x000000dd))
@@ -423,7 +427,7 @@ impl PlaybackPage {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .rounded(px(4.0))
+                        .rounded(radius::CONTROL)
                         .bg(theme.foreground.opacity(0.08))
                         .px_2()
                         .text_xs()
@@ -496,8 +500,12 @@ impl PlaybackPage {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_progress_drag))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_progress_drag))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_progress_drag))
-            .on_drag(ProgressBarDrag, |_, _, _, cx| {
+            .on_drag(ProgressBarDrag, |_, _, window, cx| {
                 cx.stop_propagation();
+                // Keep the default arrow when the pointer leaves the track.
+                window.defer(cx, |window, cx| {
+                    cx.set_active_drag_cursor_style(gpui::CursorStyle::Arrow, window);
+                });
                 cx.new(|_| ProgressBarDrag)
             })
             .on_drag_move(cx.listener(Self::drag_progress))
@@ -596,6 +604,7 @@ impl PlaybackPage {
 
         div()
             .id("playback-progress")
+            .cursor_default()
             .debug_selector(|| "playback-progress".into())
             .absolute()
             .left(bounds.left())
@@ -606,7 +615,7 @@ impl PlaybackPage {
             .h(px(PLAYBACK_PROGRESS_BAR_HEIGHT_PX))
             .justify_center()
             .gap_2()
-            .rounded(px(8.0))
+            .rounded(radius::SURFACE)
             .border_1()
             .border_color(theme.input_border.opacity(0.42))
             .bg(rgba(0x00000099))

@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use gpui::Entity;
+use gpui::{Entity, Modifiers, px, size};
 
 use super::*;
 
@@ -128,6 +128,72 @@ fn app_with_cache(
         app.cache_save_path = Some(path.to_path_buf());
         app
     })
+}
+
+#[gpui::test]
+fn newly_added_sidebar_server_authenticates_without_returning_to_cards(cx: &mut TestAppContext) {
+    let mock = MockEmby::new();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let client = EmbyClient::new("test-device".into()).unwrap();
+    let mut added = prepare_server(&client, &mock.submission, None).unwrap();
+    added.id = "newly-added".into();
+    added.icon_url = None;
+    let current = CachedServer {
+        id: "current".into(),
+        icon_url: None,
+        ..saved_server()
+    };
+    cx.update(theme::init);
+    let (app, cx) = cx.add_window_view(|_, cx| {
+        let mut cache = ServerCache::empty();
+        cache.servers.push(current.clone());
+        let mut app = TinyApp::new(cache, None, cx);
+        app.cache_save_path = Some(path.clone());
+        app.window_persistence_enabled = false;
+        app.begin_select_server(&current, cx);
+        let dialog = cx.new(AddServerDialogState::new);
+        app.add_server_dialog = Some(dialog.clone());
+        app.finish_save_server(dialog, Ok(added.clone()), cx);
+        app
+    });
+    cx.simulate_resize(size(px(1100.0), px(720.0)));
+    cx.run_until_parked();
+    let original_home = app.read_with(cx, |app, _| match &app.page {
+        Page::Home(home) => home.entity_id(),
+        _ => panic!("adding a server must retain Home"),
+    });
+    assert_eq!(mock.auth_count(), 0);
+    let saw_cards = std::rc::Rc::new(std::cell::Cell::new(false));
+    let _subscription = cx.update(|_, cx| {
+        cx.observe(&app, {
+            let saw_cards = saw_cards.clone();
+            move |app, cx| {
+                if matches!(app.read(cx).page, Page::Servers) {
+                    saw_cards.set(true);
+                }
+            }
+        })
+    });
+    let item = cx.debug_bounds("sidebar-server-newly-added").unwrap();
+    cx.simulate_click(item.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(mock.auth_count(), 1);
+    assert!(
+        !saw_cards.get(),
+        "sidebar login must never switch through the cards page"
+    );
+    assert!(cx.debug_bounds("server-card-current").is_none());
+    app.read_with(cx, |app, cx| {
+        let Page::Home(home) = &app.page else {
+            panic!("expected target Home");
+        };
+        assert_ne!(home.entity_id(), original_home);
+        assert_eq!(home.read(cx).current_server_id(), added.id);
+        assert!(app.selecting_server_id.is_none());
+    });
+    let saved = storage::load_or_init_from(&path).unwrap();
+    assert_eq!(saved.servers[1].access_token.as_deref(), Some("token-1"));
 }
 
 #[gpui::test]

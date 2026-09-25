@@ -4,6 +4,7 @@ use gpui::{
     Window, canvas, div, px, svg,
 };
 
+use crate::ui::radius;
 use crate::{theme, ui::scrollbar::Scrollbar};
 
 use super::{HomeContent, SeriesDetailState};
@@ -127,6 +128,7 @@ impl HomeContent {
         Some(
             div()
                 .id("movie-overview-overlay")
+                .cursor_default()
                 .debug_selector(|| "movie-overview-overlay".into())
                 .absolute()
                 .inset_0()
@@ -160,7 +162,7 @@ impl HomeContent {
                         .max_h_full()
                         .gap_4()
                         .p_5()
-                        .rounded(theme.radius_lg)
+                        .rounded(radius::SURFACE)
                         .border_1()
                         .border_color(theme.input_border)
                         .bg(theme.dialog_background)
@@ -190,7 +192,7 @@ impl HomeContent {
                                         .size(px(28.0))
                                         .items_center()
                                         .justify_center()
-                                        .rounded_md()
+                                        .rounded(radius::CONTROL)
                                         .cursor_pointer()
                                         .hover(move |style| style.bg(theme.secondary_hover))
                                         .child(

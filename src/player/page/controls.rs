@@ -1,3 +1,5 @@
+use crate::ui::radius;
+
 use super::diagnostics::playback_diagnostics_enabled;
 use super::fullscreen::{
     PLAYBACK_BACK_BUTTON_OFFSET_PX, PLAYBACK_BACK_BUTTON_SIZE_PX,
@@ -295,7 +297,7 @@ pub(super) fn track_select_option(
         .h(px(48.0))
         .min_h(px(48.0))
         .items_center()
-        .rounded(px(6.0))
+        .rounded(radius::CONTROL)
         .px_2()
         .text_sm()
         .font_weight(if selected {

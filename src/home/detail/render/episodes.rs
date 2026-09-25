@@ -57,6 +57,7 @@ impl HomeContent {
         div().flex().flex_col().gap_3().child(
             div()
                 .id("series-detail-episodes-row")
+                .debug_selector(|| "series-detail-episodes-row".into())
                 .relative()
                 .group("series-detail-episodes-row")
                 .w(px(viewport_width))
@@ -95,6 +96,13 @@ impl HomeContent {
                                         )
                                         .cloned();
                                     episode_card(&episode, image_path, selected, cx)
+                                        .cursor_pointer()
+                                        .debug_selector({
+                                            let episode_id = episode_id.clone();
+                                            move || {
+                                                format!("series-detail-episode-card-{episode_id}")
+                                            }
+                                        })
                                         .id((
                                             gpui::ElementId::from("series-detail-episode-card"),
                                             episode_id,

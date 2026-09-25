@@ -27,6 +27,7 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme;
+use crate::ui::radius;
 
 /// Keep the caret proportions in sync with Zed's default `CursorShape::Bar`.
 ///
@@ -356,7 +357,8 @@ pub struct Editor {
     borderless: bool,
     compact: bool,
     centered: bool,
-    input_height: Pixels,
+    input_height: gpui::AbsoluteLength,
+    search: bool,
     clearable: bool,
     /// Render a password visibility control in the editor's suffix slot.
     mask_toggle: bool,
@@ -487,7 +489,8 @@ impl Editor {
             borderless: false,
             compact: false,
             centered: false,
-            input_height: px(34.0),
+            input_height: gpui::rems(2.0).into(),
+            search: false,
             clearable: false,
             mask_toggle: false,
             history: Vec::new(),
@@ -558,15 +561,21 @@ impl Editor {
         self
     }
 
+    /// Match the search field in Zed's extensions view, including its leading icon.
+    pub fn search(mut self) -> Self {
+        self.search = true;
+        self.clearable()
+    }
+
     /// Match Zed's compact settings controls without changing other editors.
     pub fn compact(mut self) -> Self {
         self.compact = true;
-        self.input_height = px(28.0);
+        self.input_height = gpui::rems(1.75).into();
         self
     }
 
     pub fn height(mut self, height: Pixels) -> Self {
-        self.input_height = height;
+        self.input_height = height.into();
         self
     }
 
@@ -677,9 +686,10 @@ impl Editor {
         cx.notify();
     }
 
-    fn clear_button(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn clear_button(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         self.clear_value(cx);
+        self.focus_handle.focus(window, cx);
     }
 
     fn mask_toggle_button(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1688,14 +1698,16 @@ fn editor_suffix_icon(
     let hover_background = theme.secondary_hover;
     div()
         .id(id)
+        .debug_selector(move || id.into())
         .flex()
         .flex_none()
         .size(px(24.0))
         .items_center()
         .justify_center()
-        .rounded_md()
+        .rounded(radius::CONTROL)
         .cursor_pointer()
         .hover(move |style| style.bg(hover_background))
+        .active(move |style| style.bg(hover_background))
         .child(
             svg()
                 .path(icon_path)
@@ -1711,23 +1723,16 @@ fn editor_suffix_icon(
 }
 
 impl Render for Editor {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme::get(cx);
-        let focused = self.focus_handle.is_focused(window);
         let mask_toggle_icon = password_visibility_icon(self.masked);
-        let border_color = if self.borderless {
-            theme.input_background
-        } else if focused {
-            theme.input_border_focused
-        } else {
-            theme.input_border
-        };
 
         div()
+            .debug_selector(|| "editor-input".into())
             .flex()
             .key_context("Editor")
             .track_focus(&self.focus_handle(cx))
-            .cursor(CursorStyle::IBeam)
+            .cursor_default()
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::delete_to_beginning))
@@ -1763,18 +1768,36 @@ impl Render for Editor {
             .items_center()
             .h(self.input_height)
             .w_full()
-            .rounded(px(if self.compact { 6.0 } else { 8.0 }))
-            .border_1()
-            .border_color(border_color)
-            .bg(theme.input_background)
+            // Zed's extensions search keeps a neutral border while editing.
+            // Embedded editors leave the frame and background to their parent.
+            .when(!self.borderless, |this| {
+                this.rounded(radius::INPUT)
+                    .border_1()
+                    .border_color(theme.window_border)
+                    .bg(theme.editor_background)
+            })
             .px(px(if self.compact { 4.0 } else { 8.0 }))
-            .gap_1()
+            .when(self.search, |this| this.pl_1p5())
+            .gap_2()
             .text_color(theme.foreground)
             .text_sm()
+            .line_height(relative(1.3))
+            .when(self.search, |this| {
+                this.child(
+                    svg()
+                        .debug_selector(|| "editor-search-icon".into())
+                        .path("icons/search.svg")
+                        .size_4()
+                        .flex_none()
+                        .text_color(theme.muted_foreground),
+                )
+            })
             .child(
                 div()
+                    .debug_selector(|| "editor-text".into())
                     .flex_1()
                     .min_w_0()
+                    .cursor(CursorStyle::IBeam)
                     .overflow_hidden()
                     .child(EditorElement { input: cx.entity() }),
             )
@@ -1794,7 +1817,7 @@ impl Render for Editor {
                     editor_suffix_icon(
                         "text-input-clear-button",
                         "icons/window-close.svg",
-                        px(14.0),
+                        px(16.0),
                         theme,
                     )
                     .on_click(cx.listener(Self::clear_button)),
@@ -1812,6 +1835,57 @@ impl Focusable for Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn search_adornments_keep_the_editor_ready_for_typing(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            Editor::bind_keys(cx);
+        });
+        let (editor, cx) =
+            cx.add_window_view(|_, cx| Editor::new("搜索", cx).search().default_value("movie"));
+
+        let icon = cx.debug_bounds("editor-search-icon").unwrap();
+        cx.simulate_click(icon.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            let editor = editor.read(cx);
+            assert!(editor.focus_handle.is_focused(window));
+            assert_eq!(editor.selected_range, 0..0);
+            window.blur(cx);
+        });
+        cx.run_until_parked();
+
+        let clear = cx.debug_bounds("text-input-clear-button").unwrap();
+        cx.simulate_click(clear.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            let editor = editor.read(cx);
+            assert!(editor.content.is_empty());
+            assert!(editor.focus_handle.is_focused(window));
+        });
+        cx.simulate_input("新内容");
+        assert_eq!(editor.read_with(cx, |editor, _| editor.value()), "新内容");
+    }
+
+    #[gpui::test]
+    fn password_suffix_does_not_move_the_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let (editor, cx) = cx.add_window_view(|_, cx| {
+            Editor::new("密码", cx)
+                .default_value("a😀b")
+                .masked(true)
+                .mask_toggle()
+        });
+        editor.update(cx, |editor, cx| editor.select_all_text(cx));
+        cx.run_until_parked();
+        let toggle = cx.debug_bounds("toggle-password-visibility").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            let editor = editor.read(cx);
+            assert!(!editor.masked);
+            assert_eq!(editor.selected_range, 0.."a😀b".len());
+            assert!(editor.focus_handle.is_focused(window));
+        });
+    }
 
     #[test]
     fn password_suffix_icon_reflects_mask_state() {

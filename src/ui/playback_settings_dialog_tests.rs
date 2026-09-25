@@ -74,11 +74,7 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
             // Exercise the same window removal that GPUI's backend performs.
             cx.update(|window, _| window.remove_window());
         } else {
-            cx.simulate_mouse_down(
-                bounds.center(),
-                gpui::MouseButton::Left,
-                Modifiers::default(),
-            );
+            cx.simulate_click(bounds.center(), Modifiers::default());
         }
         cx.run_until_parked();
         return;

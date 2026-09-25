@@ -8,6 +8,7 @@ use gpui::{
 };
 use image::{Frame, imageops::FilterType};
 
+use crate::ui::radius;
 use crate::{
     emby::{MediaItem, MediaPerson, ResumeItem, UserItem},
     theme,
@@ -24,7 +25,6 @@ use super::carousel::{
 
 const IMAGE_PROGRESS_BAR_HEIGHT_PX: f32 = 4.0;
 const IMAGE_PROGRESS_BAR_HORIZONTAL_INSET_PX: f32 = 8.0;
-const COVER_IMAGE_CORNER_RADIUS: gpui::Rems = gpui::rems(0.5);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CoverImageSource {
@@ -58,7 +58,7 @@ pub(super) fn cover_img(path: Arc<Path>, width: f32, height: f32) -> impl IntoEl
     img(move |window: &mut Window, cx: &mut App| window.use_asset::<CoverImageAsset>(&source, cx))
         .w(px(width))
         .h(px(height))
-        .rounded(COVER_IMAGE_CORNER_RADIUS)
+        .rounded(radius::CARD)
 }
 
 fn load_cover_image(source: CoverImageSource) -> Result<Arc<RenderImage>> {
@@ -139,7 +139,7 @@ pub(super) fn home_section_more_button(id: gpui::ElementId, cx: &App) -> gpui::S
         .size(px(28.0))
         .items_center()
         .justify_center()
-        .rounded_md()
+        .rounded(radius::CONTROL)
         .cursor_pointer()
         .hover(move |style| style.bg(theme.secondary_hover))
         .child(
@@ -162,8 +162,8 @@ pub(super) fn carousel_button(
 ) -> impl IntoElement {
     let foreground = theme.foreground;
     let background = theme.dialog_background;
-    let border = theme.input_border;
     let hover = theme.secondary_hover;
+    let pressed = hover.blend(foreground.opacity(0.08));
 
     div()
         .id((gpui::ElementId::from(id), "overlay"))
@@ -177,21 +177,22 @@ pub(super) fn carousel_button(
         .when(!align_right, |this| this.left_0())
         .when(align_right, |this| this.right_0())
         .occlude()
+        .cursor_default()
         .on_hover(on_hover)
         .child(
             div()
                 .id((gpui::ElementId::from(id), "button"))
                 .flex()
-                .size(px(34.0))
+                .size(px(32.0))
                 .items_center()
                 .justify_center()
-                .rounded_full()
-                .border_1()
-                .border_color(border)
-                .bg(background.opacity(0.88))
-                .shadow_lg()
+                .rounded(radius::CONTROL)
+                .bg(background.opacity(0.96))
+                .shadow_sm()
                 .opacity(if visible { 1.0 } else { 0.0 })
+                .when(visible, |this| this.cursor_pointer())
                 .hover(move |style| style.bg(hover))
+                .active(move |style| style.bg(pressed))
                 .child(svg().path(icon_path).size(px(18.0)).text_color(foreground))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
@@ -217,7 +218,7 @@ pub(super) fn user_view_card<T>(
         .flex_none()
         .flex_col()
         .gap_2()
-        .rounded_lg()
+        .rounded(radius::CARD)
         .p(px(USER_VIEW_CARD_PADDING_PX))
         .hover(move |style| style.bg(theme.secondary_hover))
         .child(user_view_card_image(image_path, cx))
@@ -239,13 +240,17 @@ fn user_view_card_image<T>(image_path: Option<Arc<Path>>, cx: &Context<T>) -> im
 
     div()
         .when_some(image_path, |this, path| {
-            this.child(img(path).w(px(USER_VIEW_CARD_WIDTH_PX)).rounded_lg())
+            this.child(
+                img(path)
+                    .w(px(USER_VIEW_CARD_WIDTH_PX))
+                    .rounded(radius::CARD),
+            )
         })
         .when(!has_image, |this| {
             this.flex()
                 .w(px(USER_VIEW_CARD_WIDTH_PX))
                 .h(px(USER_VIEW_CARD_IMAGE_HEIGHT_PX))
-                .rounded_lg()
+                .rounded(radius::CARD)
                 .overflow_hidden()
                 .bg(theme.input_background)
                 .items_center()
@@ -272,7 +277,7 @@ fn resume_item_card_image<T>(
         .relative()
         .w(px(USER_VIEW_CARD_WIDTH_PX))
         .h(px(USER_VIEW_CARD_IMAGE_HEIGHT_PX))
-        .rounded(COVER_IMAGE_CORNER_RADIUS)
+        .rounded(radius::CARD)
         .overflow_hidden()
         .bg(theme.input_background)
         .when_some(image_path, |this, path| {
@@ -323,7 +328,7 @@ fn cover_image_progress_bar<T>(played_fraction: f32, cx: &Context<T>) -> impl In
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
-            let radius = COVER_IMAGE_CORNER_RADIUS.to_pixels(window.rem_size());
+            let radius = radius::CARD.to_pixels(window.rem_size());
             let height = px(IMAGE_PROGRESS_BAR_HEIGHT_PX).min(bounds.size.height);
             let track_bounds = Bounds::new(
                 point(bounds.left(), bounds.bottom() - height),
@@ -398,7 +403,7 @@ pub(super) fn resume_item_card<T>(
         .flex_none()
         .flex_col()
         .gap_2()
-        .rounded_lg()
+        .rounded(radius::CARD)
         .p(px(USER_VIEW_CARD_PADDING_PX))
         .hover(move |style| style.bg(theme.secondary_hover))
         .child(resume_item_card_image(
@@ -456,7 +461,7 @@ pub(super) fn user_item_card_with_favorite_badge<T>(
         .flex_none()
         .flex_col()
         .gap_2()
-        .rounded_lg()
+        .rounded(radius::CARD)
         .p(px(HOME_ITEM_CARD_PADDING_PX))
         .hover(move |style| style.bg(theme.secondary_hover))
         .child(user_item_card_image(
@@ -540,7 +545,7 @@ fn compact_episode_card_image<T>(
         .relative()
         .w(px(HOME_ITEM_CARD_WIDTH_PX))
         .h(px(HOME_ITEM_CARD_WIDTH_PX * 9.0 / 16.0))
-        .rounded_lg()
+        .rounded(radius::CARD)
         .overflow_hidden()
         .bg(theme.input_background)
         .when_some(image_path, |this, path| {
@@ -548,6 +553,7 @@ fn compact_episode_card_image<T>(
                 img(path)
                     .w_full()
                     .h_full()
+                    .rounded(radius::CARD)
                     .object_fit(gpui::ObjectFit::Cover),
             )
         })
@@ -595,7 +601,7 @@ fn user_episode_card_with_image<T>(
         .flex_none()
         .flex_col()
         .gap_2()
-        .rounded_lg()
+        .rounded(radius::CARD)
         .p(px(padding))
         .hover(move |style| style.bg(theme.secondary_hover))
         .child(div().relative().child(image).when(
@@ -650,7 +656,7 @@ pub(super) fn episode_card<T>(
         .flex_none()
         .flex_col()
         .gap_2()
-        .rounded_lg()
+        .rounded(radius::CARD)
         .p(px(DETAIL_EPISODE_CARD_PADDING_PX))
         .when(selected, |this| this.bg(theme.element_selected))
         .hover(move |style| {
@@ -659,19 +665,6 @@ pub(super) fn episode_card<T>(
             } else {
                 theme.secondary_hover
             })
-        })
-        .when(selected, |this| {
-            this.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
-                    .left_0()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme.input_border_focused),
-            )
         })
         .child(
             div()
@@ -693,8 +686,16 @@ pub(super) fn episode_card<T>(
                         .id("episode-card-label")
                         .truncate()
                         .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.foreground)
+                        .font_weight(if selected {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::MEDIUM
+                        })
+                        .text_color(if selected {
+                            theme.accent_text
+                        } else {
+                            theme.foreground
+                        })
                         .child(label.clone())
                         .tooltip(move |_, cx| text_tooltip(label.clone(), cx)),
                 )
@@ -751,7 +752,7 @@ fn episode_card_image<T>(
         .w(px(DETAIL_EPISODE_CARD_WIDTH_PX))
         .h(px(DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX))
         .overflow_hidden()
-        .rounded(COVER_IMAGE_CORNER_RADIUS)
+        .rounded(radius::CARD)
         .bg(theme.input_background)
         .when_some(image_path, |this, path| {
             this.child(cover_img(
@@ -786,7 +787,7 @@ pub(super) fn person_card<T>(
         .flex_col()
         .items_center()
         .gap_2()
-        .rounded_lg()
+        .rounded(radius::CARD)
         .p(px(DETAIL_PERSON_CARD_PADDING_PX))
         .hover(move |style| style.bg(theme.secondary_hover))
         .child(person_card_image(image_path, cx))
@@ -834,7 +835,7 @@ fn person_card_image<T>(image_path: Option<Arc<Path>>, cx: &Context<T>) -> impl 
         .w(px(DETAIL_PERSON_CARD_IMAGE_WIDTH_PX))
         .h(px(DETAIL_PERSON_CARD_IMAGE_HEIGHT_PX))
         .overflow_hidden()
-        .rounded_lg()
+        .rounded(radius::CARD)
         .bg(theme.input_background)
         .when_some(image_path, |this, path| {
             this.child(cover_img(
@@ -876,7 +877,7 @@ fn user_item_card_image<T>(
         .w(px(HOME_ITEM_CARD_WIDTH_PX))
         .h(px(HOME_ITEM_CARD_IMAGE_HEIGHT_PX))
         .overflow_hidden()
-        .rounded_lg()
+        .rounded(radius::CARD)
         .bg(theme.input_background)
         .when_some(image_path, |this, path| {
             this.child(cover_img(
