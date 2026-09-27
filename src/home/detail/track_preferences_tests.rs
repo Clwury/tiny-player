@@ -68,6 +68,53 @@ fn selection(page: &HomeContent, cx: &gpui::App) -> SelectedPlayback {
 }
 
 #[gpui::test]
+fn saved_probed_subtitle_overrides_emby_default_in_detail_and_playback(cx: &mut TestAppContext) {
+    let metadata = serde_json::json!({
+        "Id": "1030171", "Name": "恋恋风尘", "Type": "Movie",
+        "MediaSources": [{
+            "Id": "mediasource_1030171", "DefaultSubtitleStreamIndex": 3,
+            "MediaStreams": [
+                {"Index": 2, "Type": "Subtitle", "Codec": "ass", "Language": "chi", "Title": "简英双字", "DisplayTitle": "Chinese (ASS)", "IsExternal": false},
+                {"Index": 3, "Type": "Subtitle", "Codec": "ass", "Language": "chi", "Title": "繁英雙字", "DisplayTitle": "Chinese (ASS)", "IsExternal": false},
+                {"Index": 4, "Type": "Subtitle", "Codec": "PGSSUB", "Language": "fre", "Title": "法字", "DisplayTitle": "French (PGSSUB)", "IsExternal": false}
+            ]
+        }]
+    });
+    let item: UserItem = serde_json::from_value(metadata.clone()).unwrap();
+    let mut detail = SeriesDetailState::from_user_item(&item).unwrap();
+    detail.item = Some(serde_json::from_value(metadata).unwrap());
+    detail.sync_media_source_selection();
+    let saved: SavedTrackChoices = serde_json::from_value(serde_json::json!({
+        "subtitle": {
+            "mode": "track", "stream_index": 2, "label": "简体中文字幕",
+            "codec": "hdmv_pgs_subtitle", "is_external": false
+        }
+    }))
+    .unwrap();
+    cx.update(|cx| {
+        let key = detail.track_preference_key().unwrap();
+        assert_eq!(key.item_id, "1030171");
+        assert_eq!(key.media_source_id, "mediasource_1030171");
+        PlaybackTrackPreferences::restore(&server(), [(key, saved.clone())], cx);
+        let restored = detail.selected_track_choices(&server(), cx);
+        assert_eq!(restored, saved);
+        assert_eq!(
+            detail.selected_subtitle_index(TrackLanguage::Default, None),
+            Some(1)
+        );
+        assert_eq!(
+            detail.selected_subtitle_index(TrackLanguage::Default, restored.subtitle.as_ref()),
+            Some(0),
+        );
+        let playback =
+            selected_playback(&detail, &server(), Default::default(), &restored).unwrap();
+        assert_eq!(playback.selected_tracks.subtitle_stream_index, Some(2));
+        assert!(!playback.remember_subtitle_on_start);
+        assert_eq!(detail.selected_track_choices(&server(), cx), saved);
+    });
+}
+
+#[gpui::test]
 fn unplayed_detail_subtitles_are_temporary_and_isolated_by_version(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("snapshot.json");

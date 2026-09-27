@@ -107,8 +107,8 @@ fn subtitle_off_rejects_queued_cues_and_track_resolution_until_reenabled() {
         .send(BackendEvent::new(
             session,
             BackendEventKind::PlaybackTracksChanged {
-                audio: Vec::new(),
-                subtitles: Vec::new(),
+                audio: vec![crate::PlaybackTrack::new(1, "Audio", false)],
+                subtitles: vec![crate::PlaybackTrack::new(2, "Subtitle", false)],
                 selected: selected.clone(),
             },
         ))

@@ -65,11 +65,23 @@ impl SavedTrackChoice {
         {
             return Some(Some(track));
         }
-        // A rescan can renumber streams. Only restore an unambiguous match;
-        // never reuse an index that now identifies a different track.
+        // A rescan can renumber streams. Prefer an unambiguous metadata match
+        // over an index now occupied by another track.
         let mut candidates = tracks.iter().filter(matches);
-        let track = candidates.next()?;
-        candidates.next().is_none().then_some(Some(track))
+        if let Some(track) = candidates.next() {
+            return candidates.next().is_none().then_some(Some(track));
+        }
+        // Choices are scoped to an account, item and media source. Embedded
+        // tracks use different labels/codecs in Emby and FFmpeg, so a metadata
+        // mismatch alone does not invalidate the saved stream index. External
+        // subtitle entries can be replaced independently of the media file.
+        if *is_external {
+            return None;
+        }
+        tracks
+            .iter()
+            .find(|track| !track.is_external && track.stream_index == *stream_index)
+            .map(Some)
     }
 }
 

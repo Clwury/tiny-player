@@ -147,9 +147,28 @@ fn unavailable_saved_tracks_preserve_current_language_defaults() {
     };
     let expected = selected.clone();
     saved.apply(
-        &[track(1, "new audio")],
-        &[track(9, "new subtitle")],
+        &[track(2, "new audio")],
+        &[track(10, "new subtitle")],
         &mut selected,
     );
     assert_eq!(selected, expected);
+}
+
+#[test]
+fn embedded_track_indices_survive_metadata_changes_without_matching_external_entries() {
+    let saved: SavedTrackChoice = serde_json::from_value(serde_json::json!({
+        "mode": "track", "stream_index": 2, "label": "简体中文字幕",
+        "codec": "hdmv_pgs_subtitle", "is_external": false
+    }))
+    .unwrap();
+    let current = [track(2, "Chinese (ASS)"), track(3, "Chinese (ASS)")];
+    assert_eq!(saved.resolve(&current).flatten().unwrap().stream_index, 2);
+
+    let mut external = current[0].clone();
+    external.is_external = true;
+    assert!(saved.resolve(std::slice::from_ref(&external)).is_none());
+    let saved_external = SavedTrackChoice::from_track(Some(&external));
+    assert!(saved_external.resolve(&current).is_none());
+    external.label = "Replacement external subtitle".into();
+    assert!(saved_external.resolve(&[external]).is_none());
 }

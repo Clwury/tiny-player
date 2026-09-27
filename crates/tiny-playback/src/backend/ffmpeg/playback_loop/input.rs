@@ -194,7 +194,13 @@ pub(super) fn open_playback_input_with_fallback(
     probed.input.shutdown_cached_io_on_drop();
     cached_source.release();
     let opened = open_decoders_for_probed_input(probed)?;
-    reconcile_input_selection(source, &opened, event_tx);
+    reconcile_input_selection(
+        source,
+        &opened.stream_catalog,
+        opened.audio_stream,
+        opened.subtitle_stream,
+        event_tx,
+    );
     let start_position_seconds = initial_position_for_duration(
         source.start_position_seconds,
         opened.input.duration_seconds(),
@@ -228,35 +234,36 @@ fn initial_position_for_duration(position: f64, duration: Option<f64>) -> f64 {
 
 fn reconcile_input_selection(
     source: &mut FfmpegPlaybackInput,
-    opened: &OpenedPlaybackInput,
+    stream_catalog: &StreamCatalog,
+    audio_stream: Option<StreamInfo>,
+    subtitle_stream: Option<StreamInfo>,
     event_tx: &Sender<BackendEvent>,
 ) {
+    let audio = stream_catalog.tracks(ffi::AVMediaType::AVMEDIA_TYPE_AUDIO);
+    let subtitles = stream_catalog.tracks(ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE);
     let mut selected = source.selected_tracks.clone();
-    selected.audio_stream_index = opened
-        .audio_stream
-        .and_then(|stream| usize::try_from(stream.index).ok());
+    selected.audio_stream_index =
+        audio_stream.and_then(|stream| usize::try_from(stream.index).ok());
     if selected.audio_stream_index != source.selected_tracks.audio_stream_index {
         selected.default_audio_stream_index = selected.audio_stream_index;
     }
-    if selected.subtitle_external_url.is_none() && opened.subtitle_stream.is_none() {
-        selected.set_subtitle_track(None);
-    }
-    if selected == source.selected_tracks {
-        return;
+    if selected.subtitle_external_url.is_none() {
+        let index = subtitle_stream.and_then(|stream| usize::try_from(stream.index).ok());
+        selected.set_subtitle_track(
+            subtitles
+                .iter()
+                .find(|track| Some(track.stream_index) == index),
+        );
     }
 
-    // The response can be a server warning clip with an entirely different
-    // stream layout. Future track switches must use the resolved selection too.
+    // Server metadata can describe a different stream layout even when the
+    // initial indices are valid. Always publish the actual tracks and codecs.
     source.selected_tracks = selected.clone();
     let _ = event_tx.send(BackendEvent::new(
         source.session_id,
         BackendEventKind::PlaybackTracksChanged {
-            audio: opened
-                .stream_catalog
-                .tracks(ffi::AVMediaType::AVMEDIA_TYPE_AUDIO),
-            subtitles: opened
-                .stream_catalog
-                .tracks(ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE),
+            audio,
+            subtitles,
             selected,
         },
     ));
@@ -629,7 +636,100 @@ pub(super) fn load_external_subtitle_cue_list(
 
 #[cfg(test)]
 mod tests {
-    use super::initial_position_for_duration;
+    use super::*;
+
+    #[test]
+    fn actual_tracks_are_published_even_when_selected_indices_are_unchanged() {
+        let mut format = unsafe { ffi::avformat_alloc_context() };
+        assert!(!format.is_null());
+        let streams = [
+            ffi::AVCodecID::AV_CODEC_ID_H264,
+            ffi::AVCodecID::AV_CODEC_ID_DTS,
+            ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE,
+            ffi::AVCodecID::AV_CODEC_ID_HDMV_PGS_SUBTITLE,
+            ffi::AVCodecID::AV_CODEC_ID_MJPEG,
+        ]
+        .into_iter()
+        .map(|codec_id| unsafe {
+            let stream = ffi::avformat_new_stream(format, std::ptr::null());
+            assert!(!stream.is_null());
+            (*(*stream).codecpar).codec_id = codec_id;
+            (*(*stream).codecpar).codec_type = ffi::avcodec_get_type(codec_id);
+            StreamInfo {
+                index: (*stream).index,
+                stream,
+                decoder: ffi::avcodec_find_decoder(codec_id),
+                codec_id,
+                time_base: ffi::AVRational { num: 1, den: 1000 },
+                start_nsecs: None,
+                frame_duration_nsecs: None,
+            }
+        })
+        .collect();
+        let catalog = StreamCatalog { streams };
+        let mut source = FfmpegPlaybackInput {
+            session_id: Default::default(),
+            url: "file:///fixture.mkv".into(),
+            http_headers: Vec::new(),
+            content_length: None,
+            start_position_seconds: 0.0,
+            selected_tracks: crate::PlaybackTrackSelection {
+                audio_stream_index: Some(1),
+                default_audio_stream_index: Some(1),
+                subtitle_stream_index: Some(2),
+                subtitle_codec: Some("ass".into()),
+                ..Default::default()
+            },
+            cache_config: Default::default(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        // First correct the stale codec; then publish even an unchanged selection.
+        for _ in 0..2 {
+            reconcile_input_selection(
+                &mut source,
+                &catalog,
+                Some(catalog.streams[1]),
+                Some(catalog.streams[2]),
+                &tx,
+            );
+            let BackendEventKind::PlaybackTracksChanged {
+                audio,
+                subtitles,
+                selected,
+            } = rx.try_recv().unwrap().kind
+            else {
+                panic!("missing resolved tracks");
+            };
+            assert_eq!(
+                audio.iter().map(|t| t.stream_index).collect::<Vec<_>>(),
+                [1]
+            );
+            assert_eq!(
+                subtitles.iter().map(|t| t.stream_index).collect::<Vec<_>>(),
+                [2, 3]
+            );
+            assert!(
+                subtitles
+                    .iter()
+                    .all(|t| t.codec.as_deref() == Some("hdmv_pgs_subtitle"))
+            );
+            assert_eq!(selected.subtitle_stream_index, Some(2));
+            assert_eq!(
+                selected.subtitle_codec.as_deref(),
+                Some("hdmv_pgs_subtitle")
+            );
+            assert_eq!(source.selected_tracks, selected);
+        }
+        source.selected_tracks.set_subtitle_track(Some(
+            &PlaybackTrack::new(7, "External", true)
+                .with_external_url(Some("file:///subtitle.srt".into()))
+                .with_codec(Some("subrip".into())),
+        ));
+        let external_selection = source.selected_tracks.clone();
+        reconcile_input_selection(&mut source, &catalog, Some(catalog.streams[1]), None, &tx);
+        assert_eq!(source.selected_tracks, external_selection);
+        unsafe { ffi::avformat_close_input(&mut format) };
+    }
 
     #[test]
     fn resume_is_reset_only_when_invalid_or_outside_known_duration() {

@@ -38,6 +38,42 @@ mod decoder_open;
 #[path = "codec/decoder_runtime.rs"]
 mod decoder_runtime;
 
+#[cfg(test)]
+impl Decoder {
+    pub(super) fn open_h264_for_test() -> Self {
+        let mut format = unsafe { ffi::avformat_alloc_context() };
+        assert!(!format.is_null());
+        let stream = unsafe { ffi::avformat_new_stream(format, ptr::null()) };
+        if stream.is_null() {
+            unsafe { ffi::avformat_free_context(format) };
+            panic!("test video stream allocates");
+        }
+        let time_base = ffi::AVRational { num: 1, den: 1_000 };
+        let codec_id = ffi::AVCodecID::AV_CODEC_ID_H264;
+        unsafe {
+            let parameters = &mut *(*stream).codecpar;
+            parameters.codec_type = ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+            parameters.codec_id = codec_id;
+            parameters.width = 16;
+            parameters.height = 16;
+        }
+        let decoder = Self::open_video(
+            StreamInfo {
+                index: 0,
+                stream,
+                decoder: unsafe { ffi::avcodec_find_decoder(codec_id) },
+                codec_id,
+                time_base,
+                start_nsecs: Some(0),
+                frame_duration_nsecs: Some(40_000_000),
+            },
+            HardwareDecodeMode::Off,
+        );
+        unsafe { ffi::avformat_close_input(&mut format) };
+        decoder.expect("H.264 test decoder opens without media or GPU")
+    }
+}
+
 const fn av_version_int(major: c_uint, minor: c_uint, micro: c_uint) -> c_uint {
     (major << 16) | (minor << 8) | micro
 }
@@ -81,10 +117,10 @@ fn configured_vulkan_decode_thread_count() -> c_int {
 }
 
 fn video_error_recognition(codec_id: ffi::AVCodecID) -> Option<c_int> {
+    // Like mpv's vd_lavc, leave H.264 at libavcodec's default error
+    // recognition. Open-GOP starts can lack pre-roll references: EXPLODE
+    // turns their MMCO warnings into errors before the decoder converges.
     match codec_id {
-        ffi::AVCodecID::AV_CODEC_ID_H264 => {
-            Some(ffi::AV_EF_BITSTREAM | ffi::AV_EF_BUFFER | ffi::AV_EF_EXPLODE)
-        }
         // FFmpeg otherwise logs a missing HEVC reference, swallows
         // AVERROR_INVALIDDATA at the NAL boundary, and reports the packet as
         // consumed. That hides a broken RPS from tiny until the next IDR makes
@@ -867,7 +903,7 @@ mod tests {
     fn video_error_recognition_surfaces_hevc_rps_failures() {
         assert_eq!(
             video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_H264),
-            Some(ffi::AV_EF_BITSTREAM | ffi::AV_EF_BUFFER | ffi::AV_EF_EXPLODE)
+            None
         );
         assert_eq!(
             video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_HEVC),

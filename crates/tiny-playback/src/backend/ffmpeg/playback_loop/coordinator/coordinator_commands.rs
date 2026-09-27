@@ -120,6 +120,7 @@ pub(super) fn service_playback_commands(
     }
 
     if let Some(pending_track_selection) = drained_commands.pending_track_selection {
+        let seek_generation = pending_track_selection.generation;
         context
             .pipeline
             .video_decode_pipeline
@@ -133,10 +134,7 @@ pub(super) fn service_playback_commands(
             position_seconds,
             pending_track_selection,
         );
-        if context.control.has_pending_seek() {
-            return Ok(PlaybackCommandServiceStatus::Continue);
-        }
-        switch_result?;
+        finish_track_selection_command(context.control, seek_generation, switch_result)?;
         return Ok(PlaybackCommandServiceStatus::Continue);
     }
 
@@ -191,6 +189,23 @@ pub(super) fn service_playback_commands(
     }
 
     Ok(PlaybackCommandServiceStatus::Idle)
+}
+
+fn finish_track_selection_command(
+    control: &FfmpegControl,
+    generation: u64,
+    result: std::result::Result<(), String>,
+) -> std::result::Result<(), String> {
+    // A failed validation can leave this very command pending. Only a newer
+    // generation supersedes its error; otherwise report it and end the wait.
+    control.finish_seek(generation);
+    if control.seek_generation() != generation {
+        return Ok(());
+    }
+    if result.is_err() {
+        control.finish_seek_audio_pause();
+    }
+    result
 }
 
 fn apply_playback_cache_config(
@@ -373,8 +388,31 @@ mod tests {
 
     use super::{
         FfmpegControl, PendingSeek, SUBTITLE_TRACK_CHANGE_LOW_LEVEL_SEEK_REASON,
-        pending_seek_is_latest_generation, track_selection_low_level_seek_reason,
+        finish_track_selection_command, pending_seek_is_latest_generation,
+        track_selection_low_level_seek_reason,
     };
+
+    #[test]
+    fn failed_track_switch_ends_its_wait_without_acknowledging_a_newer_seek() {
+        for superseded in [false, true] {
+            let control = FfmpegControl::new(PlaybackSessionId(1));
+            let generation = control.request_seek();
+            if superseded {
+                control.request_seek();
+            }
+            let error = "FFmpeg 媒体流类型与所选轨道不匹配".to_string();
+            let result = finish_track_selection_command(&control, generation, Err(error.clone()));
+            if superseded {
+                assert!(result.is_ok());
+                assert!(control.has_pending_seek());
+                assert!(control.is_seek_audio_paused());
+            } else {
+                assert_eq!(result, Err(error));
+                assert!(!control.has_pending_seek());
+                assert!(!control.is_seek_audio_paused());
+            }
+        }
+    }
 
     #[test]
     fn subtitle_cache_refresh_only_applies_to_new_internal_tracks() {

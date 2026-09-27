@@ -24,6 +24,34 @@ fn valid_backend_seconds(seconds: f64) -> Option<f64> {
     (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
 }
 
+struct ResolvedPlaybackTracks {
+    audio: Vec<PlaybackTrack>,
+    subtitles: Vec<PlaybackTrack>,
+}
+
+impl ResolvedPlaybackTracks {
+    fn validate_selection(&self, selected: &mut crate::PlaybackTrackSelection) -> Result<()> {
+        if let Some(index) = selected.audio_stream_index
+            && !self.audio.iter().any(|track| track.stream_index == index)
+        {
+            return Err(BackendError::Ffmpeg(format!(
+                "当前媒体不存在音频轨道 {index}"
+            )));
+        }
+        if selected.subtitle_external_url.is_none()
+            && let Some(index) = selected.subtitle_stream_index
+        {
+            let track = self
+                .subtitles
+                .iter()
+                .find(|track| track.stream_index == index)
+                .ok_or_else(|| BackendError::Ffmpeg(format!("当前媒体不存在字幕轨道 {index}")))?;
+            selected.set_subtitle_track(Some(track));
+        }
+        Ok(())
+    }
+}
+
 pub struct FfmpegBackend {
     pub(super) video_output_queue: VideoOutputQueue,
     pub(super) event_tx: Sender<BackendEvent>,
@@ -31,6 +59,7 @@ pub struct FfmpegBackend {
     pub(super) worker: Option<FfmpegWorker>,
     pub(super) current_url: Option<String>,
     pub(super) current_request: Option<BackendLoadRequest>,
+    resolved_tracks: Option<ResolvedPlaybackTracks>,
     pub(super) current_session_id: PlaybackSessionId,
     subtitle_off_session: Option<PlaybackSessionId>,
     pub(super) loaded: bool,
@@ -58,6 +87,7 @@ impl FfmpegBackend {
             worker: None,
             current_url: None,
             current_request: None,
+            resolved_tracks: None,
             current_session_id: PlaybackSessionId::default(),
             subtitle_off_session: None,
             loaded: false,
@@ -108,6 +138,7 @@ impl FfmpegBackend {
         self.stop_worker();
         self.current_url = Some(request.url.clone());
         self.current_request = Some(request.clone());
+        self.resolved_tracks = None;
         self.loaded = false;
         self.user_paused = false;
         self.paused = true;
@@ -142,7 +173,7 @@ impl FfmpegBackend {
 
     fn set_track_selection_in_place(
         &mut self,
-        selected_tracks: crate::PlaybackTrackSelection,
+        mut selected_tracks: crate::PlaybackTrackSelection,
         position_seconds: f64,
     ) -> Result<()> {
         if self.worker.is_none() {
@@ -151,6 +182,10 @@ impl FfmpegBackend {
             ));
         }
 
+        // Reject stale menu selections before changing the session, VO or AO.
+        if let Some(tracks) = &self.resolved_tracks {
+            tracks.validate_selection(&mut selected_tracks)?;
+        }
         let mut request = self
             .current_request
             .clone()
@@ -159,7 +194,7 @@ impl FfmpegBackend {
         let position_seconds = position_seconds.max(0.0);
         let pause_after_switch = self.user_paused;
         let session_id = self.advance_session();
-        self.video_output_queue.begin_session(session_id);
+        // The coordinator commits the VO session after the track seek succeeds.
         if !pause_after_switch {
             self.loaded = false;
         }
@@ -290,6 +325,7 @@ impl FfmpegBackend {
         self.stop_worker();
         self.current_url = None;
         self.current_request = None;
+        self.resolved_tracks = None;
         self.loaded = false;
         self.user_paused = true;
         self.paused = true;
@@ -334,7 +370,15 @@ impl FfmpegBackend {
                 BackendEventKind::PlaybackEnded => {
                     self.paused = true;
                 }
-                BackendEventKind::PlaybackTracksChanged { selected, .. } => {
+                BackendEventKind::PlaybackTracksChanged {
+                    audio,
+                    subtitles,
+                    selected,
+                } => {
+                    self.resolved_tracks = Some(ResolvedPlaybackTracks {
+                        audio: audio.clone(),
+                        subtitles: subtitles.clone(),
+                    });
                     if let Some(request) = self.current_request.as_mut() {
                         request.selected_tracks = selected.clone();
                     }
@@ -662,4 +706,112 @@ fn init_ffmpeg_network() -> Result<()> {
     }
     INITIALIZED.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::PlaybackTrackSelection;
+    use crate::backend::ffmpeg::worker::drain_playback_commands;
+    use crate::backend::ffmpeg::{AudioOutputLifecycle, FfmpegControl};
+
+    #[test]
+    fn stale_track_selection_is_rejected_without_interrupting_playback() {
+        for paused in [false, true] {
+            let mut backend = FfmpegBackend::new().unwrap();
+            let session = backend.current_session_id;
+            let control = Arc::new(FfmpegControl::new(session));
+            control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing);
+            control.set_user_paused(paused);
+            let (worker, commands) = FfmpegWorker::command_queue_for_test(Arc::clone(&control));
+            backend.worker = Some(worker);
+            backend.loaded = true;
+            backend.paused = paused;
+            backend.user_paused = paused;
+            backend.video_output_queue.begin_session(session);
+            let selected = PlaybackTrackSelection {
+                audio_stream_index: Some(1),
+                subtitle_stream_index: Some(2),
+                subtitle_codec: Some("hdmv_pgs_subtitle".into()),
+                ..Default::default()
+            };
+            backend.current_request = Some(BackendLoadRequest {
+                url: "file:///fixture.mkv".into(),
+                http_headers: Vec::new(),
+                content_length: None,
+                start_position_seconds: 442.4,
+                selected_tracks: selected.clone(),
+                cache_config: Default::default(),
+            });
+            backend
+                .event_tx
+                .send(BackendEvent::new(
+                    session,
+                    BackendEventKind::PlaybackTracksChanged {
+                        audio: vec![PlaybackTrack::new(1, "Audio", false)],
+                        subtitles: [2, 3]
+                            .into_iter()
+                            .map(|index| {
+                                PlaybackTrack::new(index, "Chinese", false)
+                                    .with_codec(Some("hdmv_pgs_subtitle".into()))
+                            })
+                            .collect(),
+                        selected: selected.clone(),
+                    },
+                ))
+                .unwrap();
+            backend.poll_events();
+            let before_video = backend.video_output_queue.snapshot();
+            let before_audio = control.audio_output_control_snapshot();
+
+            for index in [4, 99] {
+                let error = backend
+                    .set_subtitle_track(Some(PlaybackTrack::new(index, "French", false)), 442.4)
+                    .unwrap_err();
+                assert!(error.to_string().contains("当前媒体不存在字幕轨道"));
+            }
+            assert!(backend.set_audio_track(Some(4), 442.4).is_err());
+            assert_eq!(backend.current_session_id, session);
+            assert_eq!(
+                backend.current_request.as_ref().unwrap().selected_tracks,
+                selected
+            );
+            assert_eq!(backend.video_output_queue.snapshot(), before_video);
+            assert_eq!(control.audio_output_control_snapshot(), before_audio);
+            assert_eq!(control.seek_generation(), 0);
+            assert!(commands.try_recv().is_err());
+            assert!(backend.event_rx.try_recv().is_err());
+            assert!(backend.loaded);
+            assert_eq!(backend.paused, paused);
+
+            backend
+                .set_subtitle_track(
+                    Some(PlaybackTrack::new(3, "Chinese", false).with_codec(Some("ass".into()))),
+                    442.4,
+                )
+                .unwrap();
+            let pending = drain_playback_commands(&commands, &control)
+                .pending_track_selection
+                .unwrap();
+            assert_eq!(pending.selected_tracks.subtitle_stream_index, Some(3));
+            assert_eq!(
+                pending.selected_tracks.subtitle_codec.as_deref(),
+                Some("hdmv_pgs_subtitle")
+            );
+            assert_eq!(backend.video_output_queue.snapshot(), before_video);
+
+            // External subtitles need not appear in the embedded stream catalog.
+            backend
+                .set_subtitle_track(
+                    Some(
+                        PlaybackTrack::new(4, "External", true)
+                            .with_external_url(Some("file:///subtitle.srt".into())),
+                    ),
+                    442.4,
+                )
+                .unwrap();
+        }
+    }
 }
