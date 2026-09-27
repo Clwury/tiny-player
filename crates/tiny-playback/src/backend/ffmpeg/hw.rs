@@ -26,8 +26,8 @@ const VK_QUEUE_TRANSFER_BIT: u32 = 0x0000_0004;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum HardwareDecodeMode {
-    #[default]
     Off,
+    #[default]
     Auto,
     ForceVulkan,
 }

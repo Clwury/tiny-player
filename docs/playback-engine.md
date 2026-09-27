@@ -38,6 +38,16 @@ cargo run -p tiny-playback --locked --example headless -- /path/to/video.avi
 示例仅使用公开接口，在最多 30 秒内消费视频帧，不创建窗口。YUV/HDR 视频仍可能使用
 Vulkan/libplacebo；没有 GPU 的环境可使用 BGRA 等走软件转换路径的测试素材。
 
+## 视频解码策略
+
+默认使用 `Auto` 模式：优先尝试 Vulkan 硬解，在硬解不可用或解码器打开失败时回退软件解码。
+播放中的 HEVC 硬解恢复流程也允许在 Vulkan 恢复失败后重建软件解码器，并重放缓存或重新定位。
+其他编码格式及未纳入恢复流程的运行时错误不保证自动回退。
+
+可通过 `TINY_HWDEC` 覆盖默认策略：`auto` 使用上述行为，`off` 强制软件解码，
+`vulkan` 或 `force-vulkan` 强制 Vulkan 硬解并禁止显式软解回退。
+软件解码后的常见 YUV 帧仍经由 Vulkan/libplacebo 处理。
+
 ## 图像与应用适配
 
 `VideoPresenter::render_if_needed` 返回 `Option<BgraImage>`。图像拥有紧密排列、

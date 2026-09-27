@@ -8,7 +8,10 @@ Visual Studio, or PATH changes are required on the destination machine.
 Target: Windows 10 22H2 / Windows 11 x64 with current graphics drivers. The UI uses Direct3D;
 video processing uses Vulkan. The Vulkan loader is included, but a working
 Vulkan driver must be provided by your GPU vendor. Vulkan hardware decoding
-additionally depends on the GPU/driver and codec. Software decode is the default.
+additionally depends on the GPU/driver and codec. By default, the player tries
+Vulkan hardware decoding and falls back to software if unavailable or opening
+the hardware decoder fails (TINY_HWDEC=auto). Set TINY_HWDEC=off to use software
+decoding, or TINY_HWDEC=force-vulkan to require Vulkan without software fallback.
 
 Settings and playback caches are stored in your Windows user profile, not in
 this directory. Moving the program does not move these settings.

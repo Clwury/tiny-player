@@ -85,7 +85,8 @@ dist/
 
 面向 Windows 10 22H2 / Windows 11 x64。GPUI 使用 Direct3D 11；视频处理仍使用 Vulkan。
 包内包含 Vulkan loader，显卡 Vulkan 驱动必须由用户系统提供。
-默认软件解码，`TINY_HWDEC=auto` 可尝试 Vulkan 硬解并在不可用时回退。
+默认优先尝试 Vulkan 硬解，并在不可用或打开失败时回退软件解码（`TINY_HWDEC=auto`）。
+`TINY_HWDEC=off` 可强制软件解码；`TINY_HWDEC=force-vulkan` 强制 Vulkan 硬解并禁止软解回退。
 软件解码后的常见 YUV 帧也经过 libplacebo，因此不等于无 Vulkan 需求。
 
 打包程序递归检查 PE 的普通导入、延迟导入和转发导出，拒绝非 x64 二进制或缺失
