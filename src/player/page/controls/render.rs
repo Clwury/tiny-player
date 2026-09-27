@@ -490,7 +490,7 @@ impl PlaybackPage {
             .relative()
             .flex_1()
             .h(px(28.0))
-            .cursor_default()
+            .cursor_pointer()
             .on_mouse_move(cx.listener(|page, event: &MouseMoveEvent, _, cx| {
                 page.update_progress_hover(Some(event.position), cx);
             }))
@@ -502,9 +502,9 @@ impl PlaybackPage {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_progress_drag))
             .on_drag(ProgressBarDrag, |_, _, window, cx| {
                 cx.stop_propagation();
-                // Keep the default arrow when the pointer leaves the track.
+                // Keep the grabbing cursor even when the pointer leaves the track.
                 window.defer(cx, |window, cx| {
-                    cx.set_active_drag_cursor_style(gpui::CursorStyle::Arrow, window);
+                    cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
                 });
                 cx.new(|_| ProgressBarDrag)
             })

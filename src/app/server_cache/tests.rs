@@ -477,6 +477,147 @@ fn editing_preserves_cache_updates_received_while_the_dialog_was_open(cx: &mut T
 }
 
 #[gpui::test]
+fn duplicate_edit_overwrites_saved_card_and_rolls_back_on_save_failure(cx: &mut TestAppContext) {
+    cx.update(theme::init);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut first = saved_server();
+    first.endpoint.address = "example.com".into();
+    first.password = "saved-password".into();
+    first.item_counts = Some(CachedItemCounts {
+        movie_count: 10,
+        series_count: 20,
+    });
+    let second = CachedServer {
+        id: "second".into(),
+        username: "other-user".into(),
+        server_id: Some("old-remote-id".into()),
+        server_name: Some("Old server".into()),
+        icon_url: Some("https://example.com/old-custom.png".into()),
+        icon_is_custom: true,
+        ..first.clone()
+    };
+    let app = cx.new(|cx| {
+        let mut cache = ServerCache::empty();
+        cache.servers = vec![first, second.clone()];
+        let mut app = TinyApp::new(cache, None, cx);
+        app.cache_save_path = Some(path.clone());
+        app
+    });
+    app.update(cx, |app, cx| {
+        app.cache.auto_start_server_id = Some(app.servers[0].id.clone());
+        app.save_cache().unwrap();
+        let before_cache = serde_json::to_value(&app.cache).unwrap();
+        let before_servers = serde_json::to_value(&app.servers).unwrap();
+        let before_file = std::fs::read(&path).unwrap();
+        let dialog = cx.new(|cx| AddServerDialogState::new_edit(&second, cx));
+        app.add_server_dialog = Some(dialog.clone());
+        dialog.update(cx, |dialog, cx| dialog.set_submitting(true, cx));
+        let conflict = CachedServer {
+            username: app.servers[0].username.clone(),
+            password: "edited-password".into(),
+            ..second.clone()
+        };
+
+        app.cache_save_path = Some(path.join("invalid.json"));
+        app.finish_save_server(dialog.clone(), Ok(conflict.clone()), cx);
+
+        assert_eq!(app.add_server_dialog.as_ref(), Some(&dialog));
+        assert_eq!(serde_json::to_value(&app.cache).unwrap(), before_cache);
+        assert_eq!(serde_json::to_value(&app.servers).unwrap(), before_servers);
+        assert_eq!(std::fs::read(&path).unwrap(), before_file);
+        assert!(dialog.update(cx, |dialog, cx| dialog.submit(cx)).is_some());
+
+        app.cache_save_path = Some(path.clone());
+        app.finish_save_server(dialog, Ok(conflict), cx);
+
+        assert!(app.add_server_dialog.is_none());
+        assert_eq!(app.servers.len(), 1);
+        assert_eq!(app.servers[0].id, "second");
+        assert_eq!(app.servers[0].username, "test");
+        assert_eq!(app.servers[0].password, "edited-password");
+        assert_eq!(app.servers[0].server_name, saved_server().server_name);
+        assert_eq!(app.servers[0].server_id, saved_server().server_id);
+        assert_eq!(app.servers[0].icon_url, saved_server().icon_url);
+        assert!(!app.servers[0].icon_is_custom);
+        assert!(app.servers[0].needs_auth_refresh);
+        assert_eq!(app.item_counts.len(), 1);
+        assert!(app.item_counts.contains_key("second"));
+        let saved = storage::load_or_init_from(&path).unwrap();
+        assert_eq!(saved.servers.len(), 1);
+        assert_eq!(saved.servers[0].id, "second");
+        assert_eq!(saved.servers[0].password, "edited-password");
+        assert_eq!(saved.servers[0].server_name, saved_server().server_name);
+        assert_eq!(saved.servers[0].icon_url, saved_server().icon_url);
+        assert!(!saved.servers[0].icon_is_custom);
+        assert_eq!(saved.auto_start_server_id.as_deref(), Some("second"));
+    });
+}
+
+#[gpui::test]
+fn duplicate_edit_uses_latest_destination_metadata_including_custom_or_default_icon(
+    cx: &mut TestAppContext,
+) {
+    cx.update(theme::init);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    for (name, icon, custom) in [
+        (
+            Some("Updated target"),
+            Some("https://example.com/new-custom.png"),
+            true,
+        ),
+        (Some("Private server"), None, false),
+        (None, None, false),
+    ] {
+        let target = saved_server();
+        let edited = CachedServer {
+            id: "edited".into(),
+            endpoint: ServerEndpoint {
+                address: "old.example.com".into(),
+                ..target.endpoint.clone()
+            },
+            server_name: Some("Old server".into()),
+            icon_url: Some("https://example.com/old-custom.png".into()),
+            icon_is_custom: true,
+            ..target.clone()
+        };
+        let app = cx.new(|cx| {
+            let mut cache = ServerCache::empty();
+            cache.servers = vec![target.clone(), edited.clone()];
+            let mut app = TinyApp::new(cache, None, cx);
+            app.cache_save_path = Some(path.clone());
+            app
+        });
+        app.update(cx, |app, cx| {
+            let dialog = cx.new(|cx| AddServerDialogState::new_edit(&edited, cx));
+            app.add_server_dialog = Some(dialog.clone());
+            let submission = CachedServer {
+                endpoint: target.endpoint.clone(),
+                ..edited.clone()
+            };
+            // A refresh or icon choice after the dialog opens must win over
+            // the display metadata in either of the earlier card snapshots.
+            app.cache.servers[0].server_name = name.map(str::to_owned);
+            app.cache.servers[0].icon_url = icon.map(str::to_owned);
+            app.cache.servers[0].icon_is_custom = custom;
+
+            app.finish_save_server(dialog, Ok(submission), cx);
+
+            assert!(app.add_server_dialog.is_none());
+            let saved = storage::load_or_init_from(&path).unwrap();
+            for servers in [&app.servers, &app.cache.servers, &saved.servers] {
+                assert_eq!(servers.len(), 1);
+                assert_eq!(servers[0].id, "edited");
+                assert_eq!(servers[0].server_name.as_deref(), name);
+                assert_eq!(servers[0].icon_url.as_deref(), icon);
+                assert_eq!(servers[0].icon_is_custom, custom);
+            }
+        });
+    }
+}
+
+#[gpui::test]
 fn failed_server_save_keeps_the_edit_dialog_and_saved_login(cx: &mut TestAppContext) {
     cx.update(theme::init);
     let temp = tempfile::tempdir().unwrap();

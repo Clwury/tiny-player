@@ -28,6 +28,7 @@ use crate::{
     emby::{EmbyClient, ResumeItems, UserItemData, UserItems, UserViews},
     images::loader::ImageLoader,
     player::{PlaybackRequest, PlaybackTrackPreferences},
+    search_history::SearchHistory,
     server::CachedServer,
     ui::editor::Editor,
 };
@@ -57,6 +58,7 @@ pub enum HomeEvent {
     },
     SectionChanged,
     TitleChanged,
+    SearchHistoryChanged(SearchHistory),
     OpenSettings,
     OpenPlayback(Box<PlaybackRequest>),
 }
@@ -64,6 +66,7 @@ pub enum HomeEvent {
 #[derive(Clone, Debug)]
 enum HomeContentEvent {
     TitleChanged,
+    SearchHistoryChanged(SearchHistory),
     OpenPlayback(Box<PlaybackRequest>),
 }
 
@@ -391,6 +394,9 @@ impl HomePage {
             &home_content,
             |_: &mut HomePage, _, event, cx| match event {
                 HomeContentEvent::TitleChanged => cx.emit(HomeEvent::TitleChanged),
+                HomeContentEvent::SearchHistoryChanged(history) => {
+                    cx.emit(HomeEvent::SearchHistoryChanged(history.clone()))
+                }
                 HomeContentEvent::OpenPlayback(request) => {
                     cx.emit(HomeEvent::OpenPlayback(request.clone()))
                 }
@@ -416,6 +422,13 @@ impl HomePage {
     pub(crate) fn set_servers(&mut self, servers: Vec<CachedServer>, cx: &mut Context<Self>) {
         self.servers = servers;
         cx.notify();
+    }
+
+    pub(crate) fn set_search_history(&mut self, history: SearchHistory, cx: &mut Context<Self>) {
+        self.home_content.update(cx, |content, cx| {
+            content.search.history = history;
+            cx.notify();
+        });
     }
 
     pub(crate) fn current_server_id(&self) -> &str {

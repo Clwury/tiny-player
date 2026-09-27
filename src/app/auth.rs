@@ -158,6 +158,9 @@ impl TinyApp {
         self.clear_server_notifications();
         let servers = self.servers.clone();
         let home_page = cx.new(|cx| HomePage::new(server, servers, client, cx));
+        home_page.update(cx, |home, cx| {
+            home.set_search_history(self.cache.search_history.clone(), cx);
+        });
         let playback_return_to = home_page.clone();
         cx.subscribe(
             &home_page,
@@ -181,6 +184,10 @@ impl TinyApp {
                     }
                 }
                 HomeEvent::SectionChanged | HomeEvent::TitleChanged => cx.notify(),
+                HomeEvent::SearchHistoryChanged(history) => {
+                    app.cache.search_history = history.clone();
+                    app.schedule_cache_save("保存搜索历史失败", cx);
+                }
                 HomeEvent::OpenSettings => app.open_settings_window(cx),
                 HomeEvent::OpenPlayback(request) => {
                     app.open_playback_page(playback_return_to.clone(), request.as_ref().clone(), cx)
@@ -277,6 +284,7 @@ impl TinyApp {
 
 #[cfg(test)]
 mod tests {
+    mod search_history;
     mod sidebar_switch;
 
     use super::*;

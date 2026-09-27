@@ -1,11 +1,11 @@
 use std::cell::Cell;
 
-use gpui::{AppContext as _, Context, ScrollHandle, SharedString, point, px};
+use gpui::{AppContext as _, Context, ScrollHandle, SharedString, Window, point, px};
 
 use crate::{emby::UserItem, ui::editor::EditorEvent};
 
 use super::{
-    HomeContent, LoadState,
+    HomeContent, HomeContentEvent, LoadState, SearchHistory,
     notification::{
         NotificationScope, SEARCH_INITIAL_NOTIFICATION_KEY, SEARCH_LOAD_MORE_NOTIFICATION_KEY,
     },
@@ -15,6 +15,7 @@ const SEARCH_LIMIT: u32 = 30;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SearchState {
+    pub(crate) history: SearchHistory,
     pub(crate) query: String,
     pub(crate) items: Vec<UserItem>,
     pub(crate) total_record_count: Option<u32>,
@@ -33,6 +34,7 @@ pub(crate) struct SearchState {
 impl Default for SearchState {
     fn default() -> Self {
         Self {
+            history: SearchHistory::default(),
             query: String::new(),
             items: Vec::new(),
             total_record_count: None,
@@ -146,9 +148,37 @@ impl HomeContent {
         if self.search.query == query && self.search.initial == LoadState::Loading {
             return;
         }
+        if self.search.history.record(&query) {
+            cx.emit(HomeContentEvent::SearchHistoryChanged(
+                self.search.history.clone(),
+            ));
+        }
         self.item_context_menu = None;
         let generation = self.search.reset_for_query(query.clone());
         self.start_search_initial(query, generation, cx);
+    }
+
+    pub(super) fn search_from_history(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_input
+            .update(cx, |input, cx| input.set_value(query.to_owned(), cx));
+        self.search_input
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        self.submit_search_from_input(cx);
+    }
+
+    pub(super) fn clear_search_history(&mut self, cx: &mut Context<Self>) {
+        self.search.history.clear();
+        cx.emit(HomeContentEvent::SearchHistoryChanged(
+            self.search.history.clone(),
+        ));
+        cx.notify();
     }
 
     pub(super) fn auto_load_more_search(&mut self, cx: &mut Context<Self>) {
@@ -307,6 +337,9 @@ impl HomeContent {
         cx.notify();
     }
 }
+
+#[cfg(test)]
+mod interaction_tests;
 
 #[cfg(test)]
 mod tests {

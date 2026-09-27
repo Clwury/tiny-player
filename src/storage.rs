@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::{
     app_metadata,
     player::{PlaybackCacheConfig, PlaybackLanguagePreferences, PlaybackVolumeSettings},
+    search_history::SearchHistory,
     server::CachedServer,
     theme::ColorTheme,
 };
@@ -32,6 +33,8 @@ pub struct ServerCache {
     pub track_languages: PlaybackLanguagePreferences,
     #[serde(default)]
     pub playback_volume: PlaybackVolumeSettings,
+    #[serde(default)]
+    pub search_history: SearchHistory,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +55,7 @@ impl ServerCache {
             color_theme: ColorTheme::default(),
             track_languages: PlaybackLanguagePreferences::default(),
             playback_volume: PlaybackVolumeSettings::default(),
+            search_history: SearchHistory::default(),
         }
     }
 
@@ -86,6 +90,7 @@ pub fn save(cache: &ServerCache) -> Result<()> {
 }
 
 pub fn upsert_server(cache: &mut ServerCache, mut server: CachedServer) -> String {
+    deduplicate_servers(cache);
     if let Some(existing) = cache
         .servers
         .iter_mut()
@@ -101,17 +106,22 @@ pub fn upsert_server(cache: &mut ServerCache, mut server: CachedServer) -> Strin
     }
 }
 
-pub fn update_server_by_id(cache: &mut ServerCache, server: CachedServer) -> bool {
-    if let Some(existing) = cache
+pub fn update_server_by_id(cache: &mut ServerCache, server: CachedServer) -> Result<()> {
+    let existing = cache
         .servers
         .iter_mut()
         .find(|existing| existing.id == server.id)
-    {
-        *existing = server;
-        true
-    } else {
-        false
-    }
+        .context("服务器不存在")?;
+    *existing = server.clone();
+    // The edited card wins a conflict and keeps its ID and position.
+    cache.servers.retain(|existing| {
+        let duplicate = existing.id != server.id && same_server(existing, &server);
+        if duplicate && cache.auto_start_server_id.as_deref() == Some(&existing.id) {
+            cache.auto_start_server_id = Some(server.id.clone());
+        }
+        !duplicate
+    });
+    Ok(())
 }
 
 pub fn delete_server_by_id(cache: &mut ServerCache, id: &str) -> bool {
@@ -124,15 +134,26 @@ pub fn delete_server_by_id(cache: &mut ServerCache, id: &str) -> bool {
 }
 
 fn same_server(a: &CachedServer, b: &CachedServer) -> bool {
-    if a.server_id.is_some()
-        && a.server_id == b.server_id
-        && a.user_id.is_some()
-        && a.user_id == b.user_id
-    {
-        return true;
-    }
-
     a.endpoint == b.endpoint && a.username == b.username
+}
+
+fn deduplicate_servers(cache: &mut ServerCache) {
+    // Keep the first card and its position, including for caches saved before
+    // edits checked uniqueness. Redirect auto-start if its duplicate is removed.
+    let mut servers = Vec::with_capacity(cache.servers.len());
+    for server in std::mem::take(&mut cache.servers) {
+        if let Some(existing) = servers
+            .iter()
+            .find(|existing| same_server(existing, &server))
+        {
+            if cache.auto_start_server_id.as_deref() == Some(&server.id) {
+                cache.auto_start_server_id = Some(existing.id.clone());
+            }
+        } else {
+            servers.push(server);
+        }
+    }
+    cache.servers = servers;
 }
 
 fn cache_path() -> Result<std::path::PathBuf> {
@@ -152,11 +173,13 @@ pub(crate) fn load_or_init_from(path: &Path) -> Result<ServerCache> {
     if cache.device_id.is_empty() {
         cache.device_id = Uuid::new_v4().to_string();
     }
+    deduplicate_servers(&mut cache);
     // Normalize both newly added and hand-edited settings before they reach
     // the playback worker. This also makes old cache files (without a
     // `playback` field) behave exactly like a fresh configuration.
     cache.playback = cache.playback.clone().normalized();
     cache.playback_volume = cache.playback_volume.normalized();
+    cache.search_history.normalize();
 
     Ok(cache)
 }
@@ -246,6 +269,46 @@ mod tests {
     }
 
     #[test]
+    fn search_history_loads_old_caches_normalizes_entries_and_persists_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut json = serde_json::to_value(ServerCache::empty()).unwrap();
+        json.as_object_mut().unwrap().remove("search_history");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(
+            load_or_init_from(&path)
+                .unwrap()
+                .search_history
+                .entries()
+                .is_empty()
+        );
+
+        let mut entries = vec!["  Dune  ".to_string(), " ".into(), "Dune".into()];
+        entries.extend((0..35).map(|i| format!("电影 {i}")));
+        json["search_history"] = serde_json::to_value(entries).unwrap();
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut cache = load_or_init_from(&path).unwrap();
+        assert_eq!(cache.search_history.entries().len(), 30);
+        assert_eq!(cache.search_history.entries()[0], "Dune");
+        assert_eq!(cache.search_history.entries()[29], "电影 28");
+        save_to(&cache, &path).unwrap();
+        assert_eq!(
+            load_or_init_from(&path).unwrap().search_history,
+            cache.search_history
+        );
+
+        cache.search_history.clear();
+        save_to(&cache, &path).unwrap();
+        assert!(
+            load_or_init_from(&path)
+                .unwrap()
+                .search_history
+                .entries()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn saves_and_loads_cache() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("servers.json");
@@ -258,6 +321,42 @@ mod tests {
         assert_eq!(loaded.device_id, cache.device_id);
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(loaded.servers[0].access_token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn loading_duplicate_cards_preserves_first_card_order_and_auto_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut cache = ServerCache::empty();
+        let mut first = server("first", "first-token");
+        first.icon_url = Some("https://example.com/custom.png".into());
+        first.icon_is_custom = true;
+        let mut other = server("other", "other-token");
+        other.endpoint.path = "/other".into();
+        cache.servers = vec![
+            first.clone(),
+            other,
+            server("duplicate", "duplicate-token"),
+            server("another-duplicate", "another-token"),
+        ];
+        cache.auto_start_server_id = Some("another-duplicate".into());
+        save_to(&cache, &path).unwrap();
+
+        let loaded = load_or_init_from(&path).unwrap();
+
+        assert_eq!(loaded.servers.len(), 2);
+        assert_eq!(loaded.servers[0].id, "first");
+        assert_eq!(loaded.servers[1].id, "other");
+        assert_eq!(loaded.auto_start_server_id.as_deref(), Some("first"));
+        assert_eq!(
+            serde_json::to_value(&loaded.servers[0]).unwrap(),
+            serde_json::to_value(first).unwrap()
+        );
+        save_to(&loaded, &path).unwrap();
+        assert_eq!(
+            serde_json::to_value(load_or_init_from(&path).unwrap()).unwrap(),
+            serde_json::to_value(loaded).unwrap()
+        );
     }
 
     #[test]
@@ -453,6 +552,125 @@ mod tests {
     }
 
     #[test]
+    fn upsert_matches_endpoint_and_username_without_matching_remote_ids() {
+        for (server_id, user_id) in [
+            (None, None),
+            (Some("different-server"), Some("different-user")),
+        ] {
+            let mut cache = ServerCache::empty();
+            cache.servers.push(server("first", "old"));
+            let mut duplicate = server("duplicate", "new");
+            duplicate.server_id = server_id.map(str::to_owned);
+            duplicate.user_id = user_id.map(str::to_owned);
+            duplicate.password = "new-password".into();
+
+            assert_eq!(upsert_server(&mut cache, duplicate), "first");
+
+            assert_eq!(cache.servers.len(), 1);
+            assert_eq!(cache.servers[0].password, "new-password");
+            assert_eq!(cache.servers[0].access_token.as_deref(), Some("new"));
+        }
+    }
+
+    #[test]
+    fn upsert_removes_all_existing_duplicates_and_redirects_auto_start() {
+        let mut cache = ServerCache::empty();
+        cache.servers = vec![server("first", "old"), server("duplicate", "old")];
+        cache.auto_start_server_id = Some("duplicate".into());
+
+        assert_eq!(upsert_server(&mut cache, server("new", "new")), "first");
+
+        assert_eq!(cache.servers.len(), 1);
+        assert_eq!(cache.servers[0].access_token.as_deref(), Some("new"));
+        assert_eq!(cache.auto_start_server_id.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn endpoint_fields_and_username_distinguish_cards_even_with_identical_remote_ids() {
+        for (protocol, address, port, path, username) in [
+            (Protocol::Http, "example.com", 443, "", "luv"),
+            (Protocol::Https, "other.example.com", 443, "", "luv"),
+            (Protocol::Https, "example.com", 8443, "", "luv"),
+            (Protocol::Https, "example.com", 443, "/custom", "luv"),
+            (Protocol::Https, "example.com", 443, "/emby", "luv"),
+            (Protocol::Https, "example.com", 443, "", "other-user"),
+            (Protocol::Https, "example.com", 443, "", "Luv"),
+        ] {
+            let mut cache = ServerCache::empty();
+            cache.servers.push(server("first", "first-token"));
+            let mut second = server("second", "second-token");
+            second.endpoint = ServerEndpoint {
+                protocol,
+                address: address.into(),
+                port,
+                path: path.into(),
+            };
+            second.username = username.into();
+
+            assert_eq!(upsert_server(&mut cache, second.clone()), "second");
+            assert_eq!(cache.servers.len(), 2);
+            second.access_token = Some("refreshed-token".into());
+            update_server_by_id(&mut cache, second).unwrap();
+            assert_eq!(cache.servers[0].id, "first");
+            assert_eq!(cache.servers[1].id, "second");
+            assert_eq!(
+                cache.servers[1].access_token.as_deref(),
+                Some("refreshed-token")
+            );
+
+            let conflict = CachedServer {
+                id: "second".into(),
+                ..cache.servers[0].clone()
+            };
+            update_server_by_id(&mut cache, conflict).unwrap();
+            assert_eq!(cache.servers.len(), 1);
+            assert_eq!(cache.servers[0].id, "second");
+        }
+    }
+
+    #[test]
+    fn editing_overwrites_all_conflicts_preserving_order_and_auto_start() {
+        for auto_start in [
+            None,
+            Some("before"),
+            Some("edited"),
+            Some("after"),
+            Some("other"),
+        ] {
+            let mut cache = ServerCache::empty();
+            let mut edited = server("edited", "edited-token");
+            edited.username = "other-user".into();
+            edited.icon_url = Some("https://example.com/custom.png".into());
+            edited.icon_is_custom = true;
+            let mut other = server("other", "other-token");
+            other.endpoint.path = "/other".into();
+            cache.servers = vec![
+                server("before", "before-token"),
+                other.clone(),
+                edited.clone(),
+                server("after", "after-token"),
+            ];
+            cache.auto_start_server_id = auto_start.map(str::to_owned);
+            edited.username = "luv".into();
+            edited.password = "edited-password".into();
+
+            update_server_by_id(&mut cache, edited.clone()).unwrap();
+
+            assert_eq!(
+                serde_json::to_value(&cache.servers).unwrap(),
+                serde_json::to_value(vec![other, edited]).unwrap()
+            );
+            assert_eq!(
+                cache.auto_start_server_id.as_deref(),
+                match auto_start {
+                    Some("before" | "after") => Some("edited"),
+                    other => other,
+                }
+            );
+        }
+    }
+
+    #[test]
     fn updates_server_by_id() {
         let mut cache = ServerCache::empty();
         cache.servers.push(server("server-local", "old"));
@@ -462,7 +680,7 @@ mod tests {
         updated.username = "new-user".to_string();
         updated.password = "new-secret".to_string();
 
-        assert!(update_server_by_id(&mut cache, updated));
+        update_server_by_id(&mut cache, updated).unwrap();
 
         assert_eq!(cache.servers.len(), 1);
         assert_eq!(cache.servers[0].id, "server-local");
@@ -474,11 +692,16 @@ mod tests {
     }
 
     #[test]
-    fn update_missing_server_by_id_returns_false() {
+    fn update_missing_server_by_id_returns_error_without_changing_cache() {
         let mut cache = ServerCache::empty();
         cache.servers.push(server("server-local", "old"));
 
-        assert!(!update_server_by_id(&mut cache, server("missing", "new")));
+        assert_eq!(
+            update_server_by_id(&mut cache, server("missing", "new"))
+                .unwrap_err()
+                .to_string(),
+            "服务器不存在"
+        );
 
         assert_eq!(cache.servers.len(), 1);
         assert_eq!(cache.servers[0].id, "server-local");

@@ -5,6 +5,7 @@ pub mod emby;
 mod home;
 mod images;
 pub mod player;
+mod search_history;
 pub mod server;
 mod storage;
 mod theme;

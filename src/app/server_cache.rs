@@ -134,12 +134,28 @@ impl TinyApp {
                     .iter()
                     .find(|current| current.id == server.id)
                     .ok_or_else(|| anyhow!("服务器不存在"))?;
-                // Only settings are edited; keep even cache updates received
-                // while the dialog was open or its save was pending.
+                // Read the destination's latest display metadata before merging
+                // removes its card. Other edits keep the current card's metadata.
+                let display_source = self
+                    .cache
+                    .servers
+                    .iter()
+                    .find(|candidate| {
+                        candidate.id != server.id
+                            && candidate.endpoint == server.endpoint
+                            && candidate.username == server.username
+                    })
+                    .unwrap_or(current);
+                // Keep cache updates received while the dialog was open or its
+                // save was pending, and refresh authentication on the next entry.
                 CachedServer {
                     endpoint: server.endpoint,
                     username: server.username,
                     password: server.password,
+                    server_id: display_source.server_id.clone(),
+                    server_name: display_source.server_name.clone(),
+                    icon_url: display_source.icon_url.clone(),
+                    icon_is_custom: display_source.icon_is_custom,
                     needs_auth_refresh: true,
                     ..current.clone()
                 }
@@ -179,10 +195,7 @@ impl TinyApp {
         let mut cache = self.cache.clone();
         let server_id = if editing {
             let id = server.id.clone();
-            ensure!(
-                storage::update_server_by_id(&mut cache, server),
-                "服务器不存在"
-            );
+            storage::update_server_by_id(&mut cache, server)?;
             id
         } else {
             storage::upsert_server(&mut cache, server)
