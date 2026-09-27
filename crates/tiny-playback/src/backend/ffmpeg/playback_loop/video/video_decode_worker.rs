@@ -44,8 +44,6 @@ pub(super) struct VideoDecodeWorker {
     recovering: bool,
     eof: bool,
     progress: Arc<VideoDecodeWorkerProgress>,
-    shutdown_on_drop: bool,
-    join_on_drop: bool,
 }
 
 #[derive(Default)]
@@ -309,8 +307,6 @@ impl VideoDecodeWorker {
             recovering: false,
             eof: false,
             progress,
-            shutdown_on_drop: true,
-            join_on_drop: true,
         })
     }
 
@@ -323,8 +319,6 @@ impl VideoDecodeWorker {
         timeout: Duration,
     ) -> std::result::Result<(), String> {
         if self.handle.is_none() {
-            self.shutdown_on_drop = false;
-            self.join_on_drop = false;
             return Ok(());
         }
 
@@ -348,7 +342,6 @@ impl VideoDecodeWorker {
         // Once Shutdown is queued, keep draining the bounded result channel so
         // the worker cannot deadlock while publishing the last frame/status in
         // front of the shutdown command.
-        self.shutdown_on_drop = false;
         loop {
             self.discard_results_for_retirement();
             if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -358,7 +351,6 @@ impl VideoDecodeWorker {
                     .expect("finished video decoder worker handle exists")
                     .join()
                     .is_ok();
-                self.join_on_drop = false;
                 self.discard_results_for_retirement();
                 return joined.then_some(()).ok_or_else(|| {
                     "old FFmpeg video decoder worker panicked during retirement".to_string()
@@ -367,7 +359,6 @@ impl VideoDecodeWorker {
             if started_at.elapsed() >= timeout {
                 // Retain the handle so a subsequent bounded fallback can retry
                 // and must not mistake a detached worker for completed teardown.
-                self.join_on_drop = false;
                 return Err(format!(
                     "old FFmpeg video decoder worker did not retire within {:.0}ms",
                     timeout.as_secs_f64() * 1_000.0
@@ -733,18 +724,15 @@ impl VideoDecodeWorker {
 
 impl Drop for VideoDecodeWorker {
     fn drop(&mut self) {
-        let shutdown_joinable = if self.shutdown_on_drop {
-            !matches!(
-                self.command_tx.try_send(VideoDecodeCommand::Shutdown),
-                Err(mpsc::TrySendError::Full(_))
-            )
-        } else {
-            false
-        };
-        if self.join_on_drop
-            && shutdown_joinable
-            && let Some(handle) = self.handle.take()
-        {
+        // Disconnect bounded queues before joining so a final frame/status
+        // cannot block shutdown. Never detach a thread that owns GPU resources,
+        // including after a bounded decoder-retirement attempt timed out.
+        let (_, disconnected_rx) = mpsc::channel();
+        drop(std::mem::replace(&mut self.result_rx, disconnected_rx));
+        let _ = self.command_tx.try_send(VideoDecodeCommand::Shutdown);
+        let (disconnected_tx, _) = mpsc::sync_channel(0);
+        drop(std::mem::replace(&mut self.command_tx, disconnected_tx));
+        if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
@@ -1121,8 +1109,6 @@ mod tests {
                 recovering: false,
                 eof: false,
                 progress: Default::default(),
-                shutdown_on_drop: true,
-                join_on_drop: true,
             },
             result_tx,
             command_rx,
@@ -1281,6 +1267,54 @@ mod tests {
             .shutdown_and_join(Duration::from_millis(200))
             .expect("bounded retirement succeeds after queue drains");
         assert!(worker.handle.is_none());
+    }
+
+    #[test]
+    fn drop_disconnects_full_video_queues_and_joins_after_retirement_timeout() {
+        let (mut worker, result_tx, command_rx) = test_worker_with_command_rx();
+        worker
+            .command_tx
+            .try_send(VideoDecodeCommand::SetSkipNonref(true))
+            .unwrap();
+        result_tx
+            .try_send(VideoDecodeResult::Flushed { generation: 1 })
+            .unwrap();
+        let worker_result_tx = result_tx.clone();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (cleaned_tx, cleaned_rx) = mpsc::channel();
+        worker.handle = Some(thread::spawn(move || {
+            release_rx.recv().unwrap();
+            assert!(
+                worker_result_tx
+                    .send(VideoDecodeResult::Flushed { generation: 2 })
+                    .is_err()
+            );
+            assert!(matches!(
+                command_rx.recv().unwrap(),
+                VideoDecodeCommand::SetSkipNonref(true)
+            ));
+            assert!(command_rx.recv().is_err());
+            cleaned_tx.send(()).unwrap();
+        }));
+        assert!(worker.shutdown_and_join(Duration::ZERO).is_err());
+        assert!(worker.handle.is_some());
+        // Retirement drains results, so fill the result queue again before Drop.
+        // The worker stays gated until Drop has had a chance to disconnect it.
+        result_tx
+            .try_send(VideoDecodeResult::Flushed { generation: 1 })
+            .unwrap();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(worker);
+            dropped_tx.send(()).unwrap();
+        });
+        let premature = dropped_rx.recv_timeout(Duration::from_millis(20));
+        release_tx.send(()).unwrap();
+        assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
+        dropped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cleaned_rx
+            .try_recv()
+            .expect("decoder cleanup must precede Drop returning");
     }
 
     #[test]

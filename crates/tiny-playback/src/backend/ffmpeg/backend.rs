@@ -684,9 +684,9 @@ impl BackendControl for FfmpegBackend {
 
 impl Drop for FfmpegBackend {
     fn drop(&mut self) {
-        if let Some(worker) = self.worker.take() {
-            worker.stop_async();
-        }
+        // GPU frame destruction must finish before the UI can return from
+        // main and the graphics driver's process-exit handlers start running.
+        self.stop_worker();
         self.video_output_queue.clear();
     }
 }

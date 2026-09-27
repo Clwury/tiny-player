@@ -179,6 +179,7 @@ impl VideoPresenter {
 struct VideoRenderWorker {
     state: Arc<VideoRenderState>,
     results: Receiver<VideoRenderResult>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 struct VideoRenderState {
@@ -257,7 +258,7 @@ impl VideoRenderWorker {
         });
         let worker_state = state.clone();
 
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("tiny-video-render".to_string())
             .spawn(move || {
                 let mut tone_mapper = None;
@@ -317,6 +318,7 @@ impl VideoRenderWorker {
         Self {
             state,
             results: result_rx,
+            handle: Some(handle),
         }
     }
 
@@ -418,14 +420,22 @@ fn video_presenter_snapshot(
 
 impl Drop for VideoRenderWorker {
     fn drop(&mut self) {
-        let mut slot = self
-            .state
-            .slot
-            .lock()
-            .expect("video render worker poisoned");
-        slot.shutdown = true;
-        slot.requests.clear();
-        self.state.ready.notify_one();
+        {
+            let mut slot = self
+                .state
+                .slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.shutdown = true;
+            slot.requests.clear();
+            slot.prewarm_request = None;
+            self.state.ready.notify_one();
+        }
+        // Release the slot lock before joining: an in-flight render still
+        // publishes its result and drops its libplacebo/Vulkan resources.
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -769,6 +779,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dropping_presenter_joins_in_flight_render_without_holding_slot_lock() {
+        let mut presenter = presenter_with_manual_render_worker(VideoOutputQueue::default());
+        let state = Arc::clone(&presenter.render_worker.state);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        presenter.render_worker.results = result_rx;
+        presenter.render_worker.handle = Some(thread::spawn(move || {
+            assert!(matches!(
+                state.take_work(),
+                Some(VideoRenderWork::Render(_))
+            ));
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            state.finish_render(Duration::ZERO, None);
+            state.record_ready_result();
+            result_tx
+                .send(VideoRenderResult {
+                    generation: 1,
+                    pts: None,
+                    frame: Err("test render finished".into()),
+                })
+                .unwrap();
+            assert!(state.take_work().is_none());
+        }));
+        presenter
+            .render_worker
+            .enqueue_render(test_render_request(1));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(presenter);
+            dropped_tx.send(()).unwrap();
+        });
+        let premature = dropped_rx.recv_timeout(Duration::from_millis(20));
+        release_tx.send(()).unwrap();
+        assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("render completion must acquire the slot lock before join returns");
+    }
+
+    #[test]
     fn bgra_render_transfers_source_pixels_without_copy_or_output_resize() {
         let pixels = vec![1, 2, 3, 128, 5, 6, 7, 255];
         let allocation = pixels.as_ptr();
@@ -839,6 +892,7 @@ mod tests {
                     ready: Condvar::new(),
                 }),
                 results: result_rx,
+                handle: None,
             },
             last_seen_session_id,
             last_seen_presentation_generation,
@@ -1001,6 +1055,7 @@ mod tests {
             render_worker: VideoRenderWorker {
                 state: render_state.clone(),
                 results: result_rx,
+                handle: None,
             },
             last_seen_session_id,
             last_seen_presentation_generation,

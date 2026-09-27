@@ -492,7 +492,16 @@ enum VideoFramePrepareDirectEnqueueResult {
 
 impl Drop for VideoFramePrepareWorker {
     fn drop(&mut self) {
-        let _ = self.shutdown_and_join(Duration::from_secs(2));
+        // The converter and queued frames can retain the Vulkan device.
+        // Disconnect results to unblock publication, then wait for all cleanup.
+        let (_, disconnected_rx) = mpsc::channel();
+        drop(std::mem::replace(&mut self.result_rx, disconnected_rx));
+        let _ = self.command_tx.try_send(VideoFramePrepareCommand::Shutdown);
+        let (disconnected_tx, _) = mpsc::sync_channel(0);
+        drop(std::mem::replace(&mut self.command_tx, disconnected_tx));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -718,6 +727,50 @@ mod tests {
             in_flight_by_generation: BTreeMap::new(),
             generation_floor: 0,
         }
+    }
+
+    #[test]
+    fn drop_disconnects_full_prepare_queues_before_joining() {
+        let mut worker = test_worker();
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        command_tx
+            .try_send(super::VideoFramePrepareCommand::Prepare(test_input(1)))
+            .unwrap();
+        result_tx
+            .try_send(super::VideoFramePrepareResult {
+                generation: 1,
+                result: Err("test frame".into()),
+                elapsed: std::time::Duration::ZERO,
+            })
+            .unwrap();
+        worker.command_tx = command_tx;
+        worker.result_rx = result_rx;
+        let (cleaned_tx, cleaned_rx) = mpsc::channel();
+        worker.handle = Some(std::thread::spawn(move || {
+            assert!(
+                result_tx
+                    .send(super::VideoFramePrepareResult {
+                        generation: 2,
+                        result: Err("test frame".into()),
+                        elapsed: std::time::Duration::ZERO,
+                    })
+                    .is_err()
+            );
+            drop(command_rx);
+            cleaned_tx.send(()).unwrap();
+        }));
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(worker);
+            dropped_tx.send(()).unwrap();
+        });
+        dropped_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("frame preparation shutdown must unblock both full queues");
+        cleaned_rx
+            .try_recv()
+            .expect("converter cleanup must precede Drop returning");
     }
 
     fn test_input(generation: u64) -> VideoFramePrepareInput {

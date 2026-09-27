@@ -828,21 +828,6 @@ impl FfmpegWorker {
         let _ = command_tx.send(FfmpegCommand::Stop);
         let _ = handle.join();
     }
-
-    pub(super) fn stop_async(self) {
-        let Self {
-            control,
-            command_tx,
-            handle,
-        } = self;
-        control.shutdown();
-        let _ = command_tx.send(FfmpegCommand::Stop);
-        let _ = thread::Builder::new()
-            .name("tiny-ffmpeg-stop".to_string())
-            .spawn(move || {
-                let _ = handle.join();
-            });
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -994,6 +979,38 @@ mod unwind_tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn dropping_backend_waits_for_playback_worker_cleanup() {
+        let mut backend = crate::backend::ffmpeg::FfmpegBackend::new().unwrap();
+        let control = Arc::new(FfmpegControl::new(backend.current_session_id));
+        let worker_control = Arc::clone(&control);
+        let (command_tx, command_rx) = mpsc::channel();
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            assert!(matches!(command_rx.recv().unwrap(), FfmpegCommand::Stop));
+            assert!(worker_control.should_stop());
+            cleanup_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        backend.worker = Some(super::FfmpegWorker {
+            control,
+            command_tx,
+            handle,
+        });
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(backend);
+            dropped_tx.send(()).unwrap();
+        });
+        cleanup_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let premature = dropped_rx.recv_timeout(Duration::from_millis(20));
+        release_tx.send(()).unwrap();
+        dropper.join().unwrap();
+        assert!(matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)));
+        dropped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
 
     #[test]
     fn playback_worker_unwind_is_converted_to_a_terminal_backend_event() {
