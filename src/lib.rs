@@ -20,8 +20,8 @@ use gpui::{App, AppContext, Application, Bounds, Global, Platform, px, size};
 use storage::ServerCache;
 use ui::editor::Editor;
 
-const DEFAULT_WINDOW_WIDTH: u32 = 1100;
-const DEFAULT_WINDOW_HEIGHT: u32 = 720;
+const DEFAULT_WINDOW_WIDTH: u32 = 1280;
+const DEFAULT_WINDOW_HEIGHT: u32 = 960;
 const MIN_WINDOW_WIDTH: u32 = 900;
 const MIN_WINDOW_HEIGHT: u32 = 600;
 
