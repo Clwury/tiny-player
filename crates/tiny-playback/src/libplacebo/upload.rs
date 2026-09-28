@@ -114,6 +114,19 @@ impl LibplaceboToneMapper {
         if input.planes.is_empty() {
             return Err(anyhow!("Vulkan video frame has no planes"));
         }
+        // Match mpv's hwdec mapper: describe the actual VkImage allocation,
+        // e.g. 1088 rows for a 1080-row picture. Only frame.crop uses the
+        // logical size; wrapping an image does not crop or resize it.
+        let allocated_size = input.allocated_size;
+        if size.width == 0
+            || size.height == 0
+            || size.width > allocated_size.width
+            || size.height > allocated_size.height
+        {
+            return Err(anyhow!(
+                "Vulkan video frame dimensions exceed its allocation or are empty"
+            ));
+        }
 
         let raw = RawVideoFrame {
             format: input.format,
@@ -154,10 +167,10 @@ impl LibplaceboToneMapper {
 
             let mut wrap_params = unsafe { mem::zeroed::<ffi::pl_vulkan_wrap_params>() };
             wrap_params.image = plane.image as ffi::VkImage;
-            wrap_params.width =
-                i32::try_from(size.width).map_err(|_| anyhow!("video frame is too wide"))?;
-            wrap_params.height =
-                i32::try_from(size.height).map_err(|_| anyhow!("video frame is too tall"))?;
+            wrap_params.width = i32::try_from(allocated_size.width)
+                .map_err(|_| anyhow!("video frame is too wide"))?;
+            wrap_params.height = i32::try_from(allocated_size.height)
+                .map_err(|_| anyhow!("video frame is too tall"))?;
             wrap_params.format = plane.format as ffi::VkFormat;
             wrap_params.usage = vulkan_image_usage(input.usage);
 
@@ -184,9 +197,11 @@ impl LibplaceboToneMapper {
                 if plane_texture.is_null() {
                     return Err(anyhow!("libplacebo Vulkan 多平面纹理子平面为空"));
                 }
-                let layout = input
-                    .format
-                    .plane_layout_for_color(size, plane_index, input.color)?;
+                let layout = input.format.plane_layout_for_color(
+                    allocated_size,
+                    plane_index,
+                    input.color,
+                )?;
                 let mut out_plane = unsafe { mem::zeroed::<ffi::pl_plane>() };
                 out_plane.texture = plane_texture;
                 out_plane.flipped = false;
@@ -209,9 +224,11 @@ impl LibplaceboToneMapper {
                     return Err(anyhow!("Vulkan video plane has a null VkImage"));
                 }
 
-                let layout = input
-                    .format
-                    .plane_layout_for_color(size, plane_index, input.color)?;
+                let layout = input.format.plane_layout_for_color(
+                    allocated_size,
+                    plane_index,
+                    input.color,
+                )?;
                 let mut wrap_params = unsafe { mem::zeroed::<ffi::pl_vulkan_wrap_params>() };
                 wrap_params.image = plane.image as ffi::VkImage;
                 wrap_params.width =

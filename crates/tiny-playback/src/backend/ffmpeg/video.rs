@@ -201,6 +201,7 @@ pub(super) fn vulkan_video_frame_from_av_frame_with_device(
         frame: frame_ref,
         device,
         format: sw_format,
+        allocated_size: frame_images.allocated_size,
         usage: frame_images.usage,
         color,
         range,

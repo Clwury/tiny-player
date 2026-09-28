@@ -2,8 +2,8 @@ use std::{env, os::raw::c_int, ptr, sync::Arc};
 
 use crate::ffmpeg_vulkan as vulkan_ffi;
 use crate::render_host::{
-    FfmpegAvBufferRef, RawVideoFormat, VulkanDecodeDevice, VulkanDecodeQueue, VulkanDecodeQueues,
-    VulkanVideoPlane,
+    FfmpegAvBufferRef, RawVideoFormat, RenderSize, VulkanDecodeDevice, VulkanDecodeQueue,
+    VulkanDecodeQueues, VulkanVideoPlane,
 };
 use ffmpeg_sys_next as ffi;
 
@@ -302,6 +302,7 @@ pub(super) fn vulkan_sw_format(frame: *const ffi::AVFrame) -> Option<c_int> {
 }
 
 pub(super) struct VulkanFrameImages {
+    pub(super) allocated_size: RenderSize,
     pub(super) usage: u32,
     pub(super) planes: Vec<VulkanVideoPlane>,
 }
@@ -325,6 +326,15 @@ pub(super) fn vulkan_frame_planes(
     let frames = unsafe { (*hw_frames_ctx).data as *const ffi::AVHWFramesContext };
     if frames.is_null() {
         return Err("FFmpeg Vulkan 帧缺少 AVHWFramesContext".to_string());
+    }
+    let allocated_size = RenderSize {
+        width: u32::try_from(unsafe { (*frames).width })
+            .map_err(|_| "FFmpeg Vulkan 帧分配宽度无效".to_string())?,
+        height: u32::try_from(unsafe { (*frames).height })
+            .map_err(|_| "FFmpeg Vulkan 帧分配高度无效".to_string())?,
+    };
+    if allocated_size.width == 0 || allocated_size.height == 0 {
+        return Err("FFmpeg Vulkan 帧分配尺寸为空".to_string());
     }
     let vk_frames = unsafe { (*frames).hwctx as *const vulkan_ffi::AVVulkanFramesContext };
     if vk_frames.is_null() {
@@ -356,6 +366,7 @@ pub(super) fn vulkan_frame_planes(
         planes.truncate(raw_format.plane_count());
     }
     Ok(VulkanFrameImages {
+        allocated_size,
         usage: vk_frames.usage as u32,
         planes,
     })
@@ -363,11 +374,58 @@ pub(super) fn vulkan_frame_planes(
 
 #[cfg(test)]
 mod tests {
+    use std::{mem, ptr};
+
+    use ffmpeg_sys_next as ffi;
+
     use super::{
         HardwareDecodeMode, TINY_VULKAN_EXTRA_HW_FRAMES, VK_QUEUE_GRAPHICS_BIT,
         VK_QUEUE_TRANSFER_BIT, VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VulkanDecodeQueue,
-        find_queue, parse_vulkan_extra_hw_frames, vulkan_ffi, vulkan_hwaccel_flags,
+        find_queue, parse_vulkan_extra_hw_frames, vulkan_ffi, vulkan_frame_planes,
+        vulkan_hwaccel_flags,
     };
+    use crate::render_host::{RawVideoFormat, RenderSize};
+
+    #[test]
+    fn vulkan_frame_images_preserve_each_frames_allocation_extent() {
+        // Stack-only descriptors: no FFmpeg/Vulkan ownership or GPU calls.
+        let mut vk_frame: vulkan_ffi::AVVkFrame = unsafe { mem::zeroed() };
+        vk_frame.img[0] = 1 as _;
+        let mut vk_frames: vulkan_ffi::AVVulkanFramesContext = unsafe { mem::zeroed() };
+        let mut frames: ffi::AVHWFramesContext = unsafe { mem::zeroed() };
+        frames.hwctx = ptr::from_mut(&mut vk_frames).cast();
+        let mut frames_ref: ffi::AVBufferRef = unsafe { mem::zeroed() };
+        let mut frame: ffi::AVFrame = unsafe { mem::zeroed() };
+        frame.format = ffi::AVPixelFormat::AV_PIX_FMT_VULKAN as _;
+        frame.width = 1920;
+        frame.height = 1080;
+        frame.hw_frames_ctx = &mut frames_ref;
+        frame.data[0] = ptr::from_mut(&mut vk_frame).cast();
+
+        for (width, height) in [(1920, 1088), (2048, 1152), (1920, 1080)] {
+            frames.width = width;
+            frames.height = height;
+            frames_ref.data = ptr::from_mut(&mut frames).cast();
+            frame.hw_frames_ctx = &mut frames_ref;
+            let images = vulkan_frame_planes(&frame, RawVideoFormat::Nv12).unwrap();
+            assert_eq!(
+                images.allocated_size,
+                RenderSize {
+                    width: width as u32,
+                    height: height as u32
+                }
+            );
+            assert_eq!((frame.width, frame.height), (1920, 1080));
+        }
+
+        for (width, height) in [(0, 1088), (1920, 0), (-1, 1088), (1920, -1)] {
+            frames.width = width;
+            frames.height = height;
+            frames_ref.data = ptr::from_mut(&mut frames).cast();
+            frame.hw_frames_ctx = &mut frames_ref;
+            assert!(vulkan_frame_planes(&frame, RawVideoFormat::Nv12).is_err());
+        }
+    }
 
     #[test]
     fn hardware_decode_mode_parses_disabled_values() {

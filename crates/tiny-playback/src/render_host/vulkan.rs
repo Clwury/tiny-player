@@ -3,13 +3,17 @@ use std::{fmt, ptr, sync::Arc};
 use anyhow::{Result, anyhow};
 use ffmpeg_sys_next as ffmpeg_ffi;
 
-use super::{FrameColor, FrameDynamicMetadata, RawVideoChromaSite, RawVideoFormat, RawVideoRange};
+use super::{
+    FrameColor, FrameDynamicMetadata, RawVideoChromaSite, RawVideoFormat, RawVideoRange, RenderSize,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VulkanVideoFrame {
     pub frame: FfmpegFrameRef,
     pub device: Arc<VulkanDecodeDevice>,
     pub format: RawVideoFormat,
+    /// AVHWFramesContext allocation extent; the visible frame may be smaller.
+    pub allocated_size: RenderSize,
     pub usage: u32,
     pub color: FrameColor,
     pub range: RawVideoRange,
