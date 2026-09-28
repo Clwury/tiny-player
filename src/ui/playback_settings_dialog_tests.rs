@@ -5,7 +5,7 @@ use gpui::{
 
 use super::{BYTES_PER_MIB, PlaybackSettingsDialogState, SettingsChanged, matches_search};
 use crate::{
-    player::{CacheUnlinkPolicy, PlaybackCacheConfig, PlaybackCacheMode},
+    player::{CacheUnlinkPolicy, HardwareDecodeMode, PlaybackCacheConfig, PlaybackCacheMode},
     theme::{self, ColorTheme},
     ui::editor::Editor,
 };
@@ -301,6 +301,44 @@ fn theme_can_be_found_by_search_and_saved_without_changing_playback_settings(
         reopened.read_with(cx, |dialog, _| dialog.color_theme()),
         ColorTheme::Latte
     );
+}
+
+#[gpui::test]
+fn hardware_decode_can_be_found_by_search_and_saved_without_changing_cache_settings(
+    cx: &mut TestAppContext,
+) {
+    let mut config = PlaybackCacheConfig {
+        cache_secs: 42.56789,
+        hardware_decode: HardwareDecodeMode::ForceVulkan,
+        ..PlaybackCacheConfig::default()
+    };
+    let (root, cx) = settings_window_with_config(cx, config.clone());
+    cx.simulate_resize(size(px(900.0), px(600.0)));
+    cx.run_until_parked();
+    let search = root.read_with(cx, |root, cx| root.dialog.read(cx).search.clone());
+    cx.update(|window, cx| search.read(cx).focus_handle(cx).focus(window, cx));
+    cx.simulate_input("hwdec");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("硬件解码").is_some());
+    click(cx, "hardware-decode-dropdown");
+    click(cx, "hardware-decode-force-vulkan");
+    assert_eq!(root.read_with(cx, |root, _| root.change_count), 0);
+    click(cx, "hardware-decode-dropdown");
+    click(cx, "hardware-decode-off");
+    config.hardware_decode = HardwareDecodeMode::Off;
+    assert_eq!(
+        root.read_with(cx, |root, _| root.saved.clone()),
+        Some(config.clone())
+    );
+    click(cx, "hardware-decode-dropdown");
+    cx.simulate_keystrokes("home enter");
+    cx.run_until_parked();
+    config.hardware_decode = HardwareDecodeMode::Auto;
+    assert_eq!(
+        root.read_with(cx, |root, _| root.saved.clone()),
+        Some(config)
+    );
+    assert_eq!(root.read_with(cx, |root, _| root.change_count), 2);
 }
 
 #[gpui::test]

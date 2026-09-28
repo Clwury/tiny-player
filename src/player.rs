@@ -21,8 +21,8 @@ pub(crate) use page::{
 };
 pub use profile::{DeviceProfileConfig, device_profile};
 pub use tiny_playback::{
-    CacheUnlinkPolicy, PlaybackCacheConfig, PlaybackCacheMode, PlaybackSeekableCacheMode,
-    PlaybackVolumeSettings,
+    CacheUnlinkPolicy, HardwareDecodeMode, PlaybackCacheConfig, PlaybackCacheMode,
+    PlaybackSeekableCacheMode, PlaybackVolumeSettings,
 };
 pub(crate) use track_metadata::track_metadata_label;
 pub use track_preferences::PlaybackTrackPreferenceKey;

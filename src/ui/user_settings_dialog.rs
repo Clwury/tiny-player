@@ -10,7 +10,7 @@ use gpui::{
 
 use crate::{
     app::window_corner_radii,
-    player::{PlaybackCacheConfig, PlaybackLanguagePreferences, TrackLanguage},
+    player::{HardwareDecodeMode, PlaybackCacheConfig, PlaybackLanguagePreferences, TrackLanguage},
     theme::{self, ColorTheme},
 };
 
@@ -18,7 +18,8 @@ use super::{
     editor::Editor,
     scrollbar::Scrollbar,
     settings_controls::{
-        DropdownState, disk_cache_capacity_control, disk_cache_capacity_input, selector_row,
+        DropdownState, HARDWARE_DECODE_DESCRIPTION, disk_cache_capacity_control,
+        disk_cache_capacity_input, hardware_decode_selector, selector_row,
         settings_category_button, settings_sidebar, toggle_switch, track_language_selector,
     },
     settings_dialog::SettingsChanged,
@@ -126,6 +127,13 @@ impl UserSettingsDialogState {
         }
     }
 
+    fn select_hardware_decode(&mut self, mode: HardwareDecodeMode, cx: &mut Context<Self>) {
+        if self.config.hardware_decode != mode {
+            self.config.hardware_decode = mode;
+            self.changed(cx);
+        }
+    }
+
     fn toggle_disk_cache(&mut self, cx: &mut Context<Self>) {
         self.config.disk_cache = !self.config.disk_cache;
         self.changed(cx);
@@ -164,6 +172,7 @@ impl UserSettingsDialogState {
         let theme_dialog = cx.entity();
         let budget_dialog = cx.entity();
         let disk_dialog = cx.entity();
+        let decode_dialog = cx.entity();
         let content = div().flex().flex_col().min_w_0().pb_6().child(
             div()
                 .mt_2()
@@ -204,7 +213,19 @@ impl UserSettingsDialogState {
                         self.language_control(false, cx),
                         cx,
                     )),
-            ),
+            ).child(section("视频解码", cx).mt_5().child(setting_row(
+                "user-setting-hardware-decode",
+                "硬件解码",
+                HARDWARE_DECODE_DESCRIPTION,
+                hardware_decode_selector(
+                    self.dropdown.clone(),
+                    self.config.hardware_decode,
+                    move |mode, cx| {
+                        decode_dialog.update(cx, |dialog, cx| dialog.select_hardware_decode(mode, cx))
+                    },
+                ),
+                cx,
+            ))),
             SettingsCategory::Memory => content.child(
                 section("缓存容量", cx)
                     .child(setting_row(

@@ -193,7 +193,10 @@ pub(super) fn open_playback_input_with_fallback(
     let mut probed = probed;
     probed.input.shutdown_cached_io_on_drop();
     cached_source.release();
-    let opened = open_decoders_for_probed_input(probed)?;
+    let opened = open_decoders_for_probed_input(
+        probed,
+        source.cache_config.hardware_decode.with_env_override(),
+    )?;
     reconcile_input_selection(
         source,
         &opened.stream_catalog,
@@ -382,6 +385,7 @@ fn probe_playback_input(
 
 fn open_decoders_for_probed_input(
     probed: ProbedPlaybackInput,
+    hardware_decode: HardwareDecodeMode,
 ) -> std::result::Result<OpenedPlaybackInput, String> {
     let ProbedPlaybackInput {
         input,
@@ -391,7 +395,7 @@ fn open_decoders_for_probed_input(
         subtitle_stream,
         allow_audio_decoder_failure,
     } = probed;
-    let video_decoder = Decoder::open_video(video_stream, HardwareDecodeMode::from_env())
+    let video_decoder = Decoder::open_video(video_stream, hardware_decode)
         .map_err(|error| format!("FFmpeg 打开视频解码器失败：{error}"))?;
     let audio_decoder = open_audio_decoder(audio_stream, allow_audio_decoder_failure)?;
     let subtitle_decoder = open_subtitle_decoder(subtitle_stream, video_decoder.size().ok())?;

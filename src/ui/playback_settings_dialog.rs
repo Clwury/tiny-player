@@ -13,8 +13,8 @@ use crate::{
     app::window_corner_radii,
     app_metadata::default_playback_cache_dir,
     player::{
-        CacheUnlinkPolicy, PlaybackCacheConfig, PlaybackCacheMode, PlaybackLanguagePreferences,
-        PlaybackSeekableCacheMode, TrackLanguage,
+        CacheUnlinkPolicy, HardwareDecodeMode, PlaybackCacheConfig, PlaybackCacheMode,
+        PlaybackLanguagePreferences, PlaybackSeekableCacheMode, TrackLanguage,
     },
     theme::{self, ColorTheme},
 };
@@ -23,9 +23,10 @@ use super::{
     editor::{Editor, EditorEvent},
     scrollbar::Scrollbar,
     settings_controls::{
-        DropdownState, NumberControl, NumberRange, disk_cache_capacity_control,
-        disk_cache_capacity_input, selector_row, settings_category_button, settings_sidebar,
-        toggle_switch, track_language_selector,
+        DropdownState, HARDWARE_DECODE_DESCRIPTION, NumberControl, NumberRange,
+        disk_cache_capacity_control, disk_cache_capacity_input, hardware_decode_selector,
+        selector_row, settings_category_button, settings_sidebar, toggle_switch,
+        track_language_selector,
     },
     settings_dialog::SettingsChanged,
     tooltip::text_tooltip,
@@ -373,6 +374,13 @@ impl PlaybackSettingsDialogState {
         self.changed(cx);
     }
 
+    fn select_hardware_decode(&mut self, mode: HardwareDecodeMode, cx: &mut Context<Self>) {
+        if self.base_config.hardware_decode != mode {
+            self.base_config.hardware_decode = mode;
+            self.changed(cx);
+        }
+    }
+
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.base_config = self.playback_config();
         cx.emit(SettingsChanged);
@@ -682,6 +690,23 @@ impl PlaybackSettingsDialogState {
                             dialog.update(cx, |dialog, cx| {
                                 dialog.select_track_language(language, false, cx)
                             })
+                        }
+                    },
+                ),
+            ),
+            SettingItem::new(
+                Playback,
+                "视频解码",
+                "硬件解码",
+                HARDWARE_DECODE_DESCRIPTION,
+                "hardware_decode hwdec vulkan 硬解 软解",
+                hardware_decode_selector(
+                    self.dropdown.clone(),
+                    self.base_config.hardware_decode,
+                    {
+                        let dialog = dialog.clone();
+                        move |mode, cx| {
+                            dialog.update(cx, |dialog, cx| dialog.select_hardware_decode(mode, cx))
                         }
                     },
                 ),

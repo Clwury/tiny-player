@@ -98,6 +98,8 @@ fn user_settings_keep_the_sidebar_and_titlebar_fixed_while_switching_pages(
                     "user-setting-subtitle",
                     "audio-language-dropdown",
                     "subtitle-language-dropdown",
+                    "user-setting-hardware-decode",
+                    "hardware-decode-dropdown",
                 ],
             ),
             (
@@ -156,6 +158,7 @@ fn theme_and_language_edits_preserve_custom_playback_settings_at_full_precision(
         disk_cache_max_bytes: 5 * BYTES_PER_GIB + 123,
         unlink_files: CacheUnlinkPolicy::Never,
         decoder_framedrop: true,
+        hardware_decode: HardwareDecodeMode::ForceVulkan,
         ..PlaybackCacheConfig::default()
     };
     let (root, cx) = settings_window(cx, config.clone());
@@ -184,6 +187,46 @@ fn theme_and_language_edits_preserve_custom_playback_settings_at_full_precision(
     );
     assert_eq!(root.read_with(cx, |root, _| root.saved.clone()), config);
     assert_eq!(root.read_with(cx, |root, _| root.changes), 3);
+}
+
+#[gpui::test]
+fn hardware_decode_selection_saves_only_changes_and_preserves_cache_preferences(
+    cx: &mut TestAppContext,
+) {
+    let mut config = PlaybackCacheConfig {
+        cache_secs: 12.34567,
+        disk_cache_max_bytes: 5 * BYTES_PER_GIB + 123,
+        hardware_decode: HardwareDecodeMode::Off,
+        ..PlaybackCacheConfig::default()
+    };
+    let (root, cx) = settings_window(cx, config.clone());
+    cx.simulate_resize(size(px(900.0), px(600.0)));
+    cx.run_until_parked();
+    click(cx, "settings-category-播放");
+    click(cx, "hardware-decode-dropdown");
+    for selector in [
+        "hardware-decode-auto",
+        "hardware-decode-off",
+        "hardware-decode-force-vulkan",
+    ] {
+        let bounds = cx.debug_bounds(selector).expect(selector);
+        assert!(bounds.top() >= px(0.0));
+        assert!(bounds.bottom() <= px(600.0));
+    }
+    click(cx, "hardware-decode-off");
+    assert_eq!(root.read_with(cx, |root, _| root.changes), 0);
+    click(cx, "hardware-decode-dropdown");
+    cx.simulate_keystrokes("end enter");
+    cx.run_until_parked();
+    config.hardware_decode = HardwareDecodeMode::ForceVulkan;
+    assert_eq!(root.read_with(cx, |root, _| root.saved.clone()), config);
+    click(cx, "settings-category-外观");
+    click(cx, "settings-category-播放");
+    click(cx, "hardware-decode-dropdown");
+    click(cx, "hardware-decode-auto");
+    config.hardware_decode = HardwareDecodeMode::Auto;
+    assert_eq!(root.read_with(cx, |root, _| root.saved.clone()), config);
+    assert_eq!(root.read_with(cx, |root, _| root.changes), 2);
 }
 
 #[gpui::test]

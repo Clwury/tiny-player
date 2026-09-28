@@ -1,5 +1,6 @@
 use std::{env, os::raw::c_int, ptr, sync::Arc};
 
+pub(super) use crate::HardwareDecodeMode;
 use crate::ffmpeg_vulkan as vulkan_ffi;
 use crate::render_host::{
     FfmpegAvBufferRef, RawVideoFormat, RenderSize, VulkanDecodeDevice, VulkanDecodeQueue,
@@ -9,7 +10,6 @@ use ffmpeg_sys_next as ffi;
 
 use super::{VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, ffmpeg_error};
 
-const TINY_HWDEC_ENV: &str = "TINY_HWDEC";
 const TINY_VULKAN_EXTRA_HW_FRAMES_ENV: &str = "TINY_VULKAN_EXTRA_HW_FRAMES";
 const MPV_VULKAN_EXTRA_HW_FRAMES: c_int = 6;
 // mpv's six-frame default is sufficient for its demand-driven VO pipeline.
@@ -23,40 +23,6 @@ const TINY_VULKAN_EXTRA_HW_FRAMES_MAX: c_int = 64;
 const VK_QUEUE_GRAPHICS_BIT: u32 = 0x0000_0001;
 const VK_QUEUE_COMPUTE_BIT: u32 = 0x0000_0002;
 const VK_QUEUE_TRANSFER_BIT: u32 = 0x0000_0004;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum HardwareDecodeMode {
-    Off,
-    #[default]
-    Auto,
-    ForceVulkan,
-}
-
-impl HardwareDecodeMode {
-    pub(super) fn from_env() -> Self {
-        env::var(TINY_HWDEC_ENV)
-            .ok()
-            .and_then(|value| Self::parse(&value))
-            .unwrap_or_default()
-    }
-
-    pub(super) fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "" | "0" | "off" | "false" | "no" | "disabled" | "software" | "sw" => Some(Self::Off),
-            "1" | "on" | "true" | "yes" | "auto" | "vulkan-auto" => Some(Self::Auto),
-            "vulkan" | "force" | "force-vulkan" | "vulkan-force" => Some(Self::ForceVulkan),
-            _ => None,
-        }
-    }
-
-    pub(super) fn should_try_vulkan(self) -> bool {
-        matches!(self, Self::Auto | Self::ForceVulkan)
-    }
-
-    pub(super) fn allows_fallback(self) -> bool {
-        matches!(self, Self::Auto)
-    }
-}
 
 #[derive(Clone)]
 pub(super) struct VideoHwDecodeContext {

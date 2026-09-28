@@ -15,7 +15,7 @@ if [[ -n ${startdir:-} && -n ${BUILDDIR:-} && \
 fi
 
 pkgname=tiny-player-git
-pkgver=0.1.1.r115.gd85a323
+pkgver=0.1.2.r126.g404fb6b
 pkgrel=1
 pkgdesc='Native Emby desktop client with FFmpeg and Vulkan playback'
 arch=('x86_64')

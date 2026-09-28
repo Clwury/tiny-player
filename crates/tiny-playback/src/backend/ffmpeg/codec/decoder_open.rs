@@ -66,7 +66,7 @@ impl Decoder {
         }?;
         let active_hwaccel = decoder_context.is_hardware_accelerated();
         if hw_mode == HardwareDecodeMode::ForceVulkan && !active_hwaccel {
-            return Err("TINY_HWDEC=force-vulkan 但 FFmpeg 未激活 Vulkan 硬解".to_string());
+            return Err("已强制使用 Vulkan 硬件解码，但 FFmpeg 未激活 Vulkan 硬解".to_string());
         }
         tracing::info!(
             decoder = %decoder_name(decoder),

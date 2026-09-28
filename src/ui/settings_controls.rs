@@ -9,7 +9,10 @@ use gpui::{
 };
 
 use crate::ui::radius;
-use crate::{player::TrackLanguage, theme};
+use crate::{
+    player::{HardwareDecodeMode, TrackLanguage},
+    theme,
+};
 
 use super::{
     editor::{Editor, EditorEvent},
@@ -17,6 +20,34 @@ use super::{
 };
 
 pub(crate) const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
+
+pub(crate) const HARDWARE_DECODE_DESCRIPTION: &str = "自动优先使用硬件解码，失败时回退到软件。";
+
+pub(crate) fn hardware_decode_selector(
+    state: Entity<DropdownState>,
+    selected: HardwareDecodeMode,
+    on_select: impl Fn(HardwareDecodeMode, &mut App) + 'static,
+) -> impl IntoElement {
+    selector_row(
+        ("hardware-decode-dropdown", "硬件解码"),
+        state,
+        [
+            ("hardware-decode-auto", "自动", HardwareDecodeMode::Auto),
+            (
+                "hardware-decode-off",
+                "关闭（软件解码）",
+                HardwareDecodeMode::Off,
+            ),
+            (
+                "hardware-decode-force-vulkan",
+                "强制 Vulkan",
+                HardwareDecodeMode::ForceVulkan,
+            ),
+        ],
+        selected,
+        on_select,
+    )
+}
 
 pub(crate) fn settings_sidebar(
     bottom_left_radius: gpui::Pixels,

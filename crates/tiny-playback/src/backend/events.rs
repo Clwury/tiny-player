@@ -2,8 +2,8 @@ use std::{fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::SharedBgraImage;
 use crate::render_host::{PlaybackSessionId, RenderSize};
+use crate::{HardwareDecodeMode, SharedBgraImage};
 
 const CACHE_CHUNK_MIN_BYTES: u64 = 64 * 1024;
 const SHARED_CACHE_LAYER_RESERVE_BYTES: u64 = 64 * 1024;
@@ -172,6 +172,9 @@ pub struct PlaybackCacheConfig {
     /// Opt in to decoder catch-up dropping during ordinary playback. Output
     /// dropping stays enabled; precise-seek preroll has a separate policy.
     pub decoder_framedrop: bool,
+    /// Decoder selection for newly opened playback inputs. Updating the cache
+    /// configuration does not reopen an active decoder. `TINY_HWDEC` overrides it.
+    pub hardware_decode: HardwareDecodeMode,
 }
 
 impl Default for PlaybackCacheConfig {
@@ -203,6 +206,7 @@ impl Default for PlaybackCacheConfig {
             adaptive_readahead: true,
             automatic_hysteresis: true,
             decoder_framedrop: false,
+            hardware_decode: HardwareDecodeMode::default(),
         }
     }
 }

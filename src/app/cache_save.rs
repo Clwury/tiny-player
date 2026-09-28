@@ -294,7 +294,9 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         use crate::{
-            player::{PlaybackCacheConfig, PlaybackLanguagePreferences, TrackLanguage},
+            player::{
+                HardwareDecodeMode, PlaybackCacheConfig, PlaybackLanguagePreferences, TrackLanguage,
+            },
             ui::settings_dialog::SettingsDialogMode,
         };
 
@@ -346,6 +348,8 @@ mod tests {
         click(cx, "language-japanese");
         click(cx, "subtitle-language-dropdown");
         click(cx, "language-chinese-simplified");
+        click(cx, "hardware-decode-dropdown");
+        click(cx, "hardware-decode-off");
         click(cx, "settings-category-内存缓存");
         click(cx, "memory-budget-dropdown");
         click(cx, "memory-budget-128-mib");
@@ -373,6 +377,7 @@ mod tests {
             disk_cache_max_bytes: 7 * 1024 * 1024 * 1024,
             cache_secs: 42.5,
             decoder_framedrop: true,
+            hardware_decode: HardwareDecodeMode::Off,
             ..PlaybackCacheConfig::default()
         };
         let saved = storage::load_or_init_from(&path).unwrap();
