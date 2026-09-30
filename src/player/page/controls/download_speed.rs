@@ -10,7 +10,6 @@ const DOWNLOAD_SPEED_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 pub(in super::super) struct DownloadSpeedDisplay {
     label: Option<String>,
     updated_at: Option<Instant>,
-    refresh_scheduled: bool,
 }
 
 impl DownloadSpeedDisplay {
@@ -35,32 +34,20 @@ impl DownloadSpeedDisplay {
 impl PlaybackPage {
     pub(in super::super) fn update_download_speed(&mut self, cx: &mut Context<Self>) {
         let label = http_download_speed_label(
-            self.source_protocol.as_deref(),
-            self.timeline.cache_state.as_ref(),
+            self.session.source_view().source_protocol.as_deref(),
+            self.session.timeline().cache_state.as_ref(),
         );
         let remaining = self
+            .presentation
             .download_speed
             .update(label, cx.background_executor().now());
-        if let Some(remaining) = remaining
-            && !self.download_speed.refresh_scheduled
-        {
-            self.download_speed.refresh_scheduled = true;
-            cx.spawn(async move |page, cx| {
-                cx.background_executor().timer(remaining).await;
-                page.update(cx, |page, cx| {
-                    page.download_speed.refresh_scheduled = false;
-                    if page.progress_bar_visible() {
-                        cx.notify();
-                    }
-                })
-                .ok();
-            })
-            .detach();
+        if let Some(remaining) = remaining {
+            self.schedule_presentation_timer(PresentationTimer::DownloadSpeed, remaining, cx);
         }
     }
 
     pub(in super::super) fn render_download_speed(&self, cx: &Context<Self>) -> impl IntoElement {
-        download_speed_indicator(self.download_speed.label.clone(), cx)
+        download_speed_indicator(self.presentation.download_speed.label.clone(), cx)
     }
 }
 
@@ -164,6 +151,89 @@ mod tests {
             None
         );
         assert_eq!(display.label.as_deref(), Some("2.0 MiB/s"));
+    }
+
+    #[gpui::test]
+    fn page_refresh_uses_latest_rate_at_original_deadline_and_pauses_when_hidden(
+        cx: &mut TestAppContext,
+    ) {
+        let (page, cx) = episodes::tests::playback_window(cx);
+        page.update(cx, |page, cx| {
+            page.session.source_mut().source_protocol = Some("https".into());
+            page.session.timeline_mut().cache_state = Some(PlaybackCacheState {
+                byte: Some(ByteCacheState {
+                    raw_input_rate: Some(1024),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            page.update_download_speed(cx);
+            assert_eq!(
+                page.presentation.download_speed.label.as_deref(),
+                Some("1.0 KiB/s")
+            );
+        });
+        for rate in 2..=10 {
+            cx.executor().advance_clock(Duration::from_millis(100));
+            page.update(cx, |page, cx| {
+                page.session
+                    .timeline_mut()
+                    .cache_state
+                    .as_mut()
+                    .unwrap()
+                    .byte
+                    .as_mut()
+                    .unwrap()
+                    .raw_input_rate = Some(rate * 1024);
+                page.update_download_speed(cx);
+                assert_eq!(
+                    page.presentation.download_speed.label.as_deref(),
+                    Some("1.0 KiB/s")
+                );
+            });
+            cx.run_until_parked();
+        }
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert_eq!(
+                page.presentation.download_speed.label.as_deref(),
+                Some("10.0 KiB/s")
+            )
+        });
+        page.update(cx, |page, cx| {
+            page.session
+                .timeline_mut()
+                .cache_state
+                .as_mut()
+                .unwrap()
+                .byte
+                .as_mut()
+                .unwrap()
+                .raw_input_rate = Some(20 * 1024);
+            page.update_download_speed(cx);
+            page.presentation.fullscreen.controls_visible = false;
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert_eq!(
+                page.presentation.download_speed.label.as_deref(),
+                Some("10.0 KiB/s")
+            )
+        });
+        page.update(cx, |page, cx| {
+            page.presentation.fullscreen.controls_visible = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert_eq!(
+                page.presentation.download_speed.label.as_deref(),
+                Some("20.0 KiB/s")
+            )
+        });
     }
 
     #[test]

@@ -3,7 +3,7 @@ use super::*;
 impl HomeContent {
     pub(super) fn render_series_detail_people_row(
         &self,
-        detail: &SeriesDetailState,
+        detail: DetailView<'_>,
         people: &[MediaPerson],
         viewport_width: f32,
         cx: &Context<Self>,
@@ -22,7 +22,7 @@ impl HomeContent {
             DETAIL_PERSON_CARD_PADDING_PX,
             DETAIL_PERSON_CARD_GAP_PX,
         );
-        let carousel = detail.people_carousel;
+        let carousel = detail.presentation.people_carousel;
         let offset = carousel.scroll_offset(max_offset);
         let previous_offset = carousel.previous_scroll_offset(max_offset);
         let visible_range = carousel_visible_range_between_for(
@@ -50,7 +50,7 @@ impl HomeContent {
         let scroll_right = cx.listener(Self::scroll_series_people_right);
         let animation_key = gpui::ElementId::from((
             gpui::ElementId::from("series-detail-people-scroll"),
-            format!("{}-{animation_id}", detail.series_id),
+            format!("{}-{animation_id}", detail.model.series_id),
         ));
 
         div()
@@ -91,7 +91,7 @@ impl HomeContent {
                                             person.id().unwrap_or("unknown").to_string();
                                         let image_path = self.image_path_for_person_primary(person);
 
-                                        person_card(person, image_path, cx).id((
+                                        person_card(person.into(), image_path, cx).id((
                                             gpui::ElementId::from("series-detail-person-card"),
                                             format!("{person_key}-{index}"),
                                         ))

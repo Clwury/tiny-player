@@ -1,3 +1,4 @@
+use crate::home::model::cards::format_community_rating;
 use gpui::{
     Animation, AnimationExt as _, Context, InteractiveElement, InteractiveText, IntoElement,
     MouseButton, ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage,
@@ -25,12 +26,9 @@ use super::super::{
         carousel_visible_range_between_for, home_main_content_width,
         max_carousel_scroll_offset_for,
     },
-    components::{
-        carousel_button, episode_card, format_community_rating, home_section_title, person_card,
-        user_item_card,
-    },
+    components::{carousel_button, episode_card, home_section_title, person_card, user_item_card},
 };
-use super::{SeriesDetailSelectKind, SeriesDetailState};
+use super::{DetailView, SeriesDetailSelectKind};
 
 const DETAIL_SELECT_MAX_VISIBLE_OPTIONS: usize = 5;
 const DETAIL_SELECT_OPTION_HEIGHT_PX: f32 = 28.0;

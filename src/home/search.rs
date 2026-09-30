@@ -1,161 +1,68 @@
-use std::cell::Cell;
+use gpui::{AppContext as _, Context, Window, point, px};
 
-use gpui::{AppContext as _, Context, ScrollHandle, SharedString, Window, point, px};
-
-use crate::{emby::UserItem, ui::editor::EditorEvent};
+use crate::ui::editor::EditorEvent;
 
 use super::{
-    HomeContent, HomeContentEvent, LoadState, SearchHistory,
+    HomeContent, HomeContentEvent,
+    adapter::EmbyHomeGateway,
+    model::search::SearchPage,
     notification::{
         NotificationScope, SEARCH_INITIAL_NOTIFICATION_KEY, SEARCH_LOAD_MORE_NOTIFICATION_KEY,
     },
 };
 
-const SEARCH_LIMIT: u32 = 30;
-
-#[derive(Clone, Debug)]
-pub(crate) struct SearchState {
-    pub(crate) history: SearchHistory,
-    pub(crate) query: String,
-    pub(crate) items: Vec<UserItem>,
-    pub(crate) total_record_count: Option<u32>,
-    pub(crate) next_start_index: u32,
-    pub(crate) initial: LoadState,
-    pub(crate) load_more: LoadState,
-    pub(crate) initial_error: Option<SharedString>,
-    pub(crate) load_more_error: Option<SharedString>,
-    pub(crate) generation: u64,
-    pub(crate) exhausted: bool,
-    pub(crate) scroll_handle: ScrollHandle,
-    pub(crate) grid_columns: Cell<usize>,
-    pub(crate) focused_once: bool,
-}
-
-impl Default for SearchState {
-    fn default() -> Self {
-        Self {
-            history: SearchHistory::default(),
-            query: String::new(),
-            items: Vec::new(),
-            total_record_count: None,
-            next_start_index: 0,
-            initial: LoadState::Idle,
-            load_more: LoadState::Idle,
-            initial_error: None,
-            load_more_error: None,
-            generation: 0,
-            exhausted: false,
-            scroll_handle: ScrollHandle::new(),
-            grid_columns: Cell::new(1),
-            focused_once: false,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct SearchPage {
-    items: Vec<UserItem>,
-    total_record_count: u32,
-    raw_item_count: u32,
-}
-
-#[derive(Clone, Debug)]
-struct SearchRequestContext {
-    identity: super::WorkspaceIdentity,
-    user_data_revision: u64,
-    query: String,
-    generation: u64,
-    start_index: u32,
-    initial: bool,
-}
-
-impl SearchState {
-    fn reset_for_query(&mut self, query: String) -> u64 {
-        self.generation = self.generation.wrapping_add(1);
-        self.query = query;
-        self.items.clear();
-        self.total_record_count = None;
-        self.next_start_index = 0;
-        self.initial = LoadState::Idle;
-        self.load_more = LoadState::Idle;
-        self.initial_error = None;
-        self.load_more_error = None;
-        self.exhausted = false;
-        self.scroll_handle.set_offset(point(px(0.0), px(0.0)));
-        self.generation
-    }
-
-    fn accepts(&self, generation: u64, query: &str) -> bool {
-        self.generation == generation && self.query == query
-    }
-
-    pub(crate) fn can_load_more(&self) -> bool {
-        !self.query.is_empty()
-            && self.initial == LoadState::Loaded
-            && !self.exhausted
-            && self.initial != LoadState::Loading
-            && self.load_more != LoadState::Loading
-    }
-
-    fn merge_page(&mut self, page: SearchPage) {
-        self.next_start_index = self.next_start_index.saturating_add(page.raw_item_count);
-        self.total_record_count = Some(page.total_record_count);
-        let mut existing = self
-            .items
-            .iter()
-            .map(|item| item.id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        self.items.extend(
-            page.items
-                .into_iter()
-                .filter(|item| existing.insert(item.id.clone())),
-        );
-        self.exhausted =
-            page.raw_item_count < SEARCH_LIMIT || self.next_start_index >= page.total_record_count;
-    }
-}
+pub(crate) mod controller;
+#[cfg(test)]
+use super::LoadState;
+use controller::{SearchIntent, SearchRequestContext};
 
 impl HomeContent {
-    pub(super) fn on_search_input_event(&mut self, event: &EditorEvent, cx: &mut Context<Self>) {
-        match event {
-            EditorEvent::Changed => self.reset_search_from_input(cx),
-            EditorEvent::Submitted => self.submit_search_from_input(cx),
+    fn dispatch_search(&mut self, intent: SearchIntent, cx: &mut Context<Self>) {
+        let transition = self.controller.dispatch_search(intent);
+        if transition.reset_presentation {
+            self.item_context_menu = None;
+            self.search_effect.cancel();
+            self.search_presentation
+                .grid
+                .scroll_handle
+                .set_offset(point(px(0.0), px(0.0)));
+            self.clear_notifications_for_scope(NotificationScope::Search);
+        }
+        if transition.history_changed {
+            cx.emit(HomeContentEvent::SearchHistoryChanged(
+                self.controller.search_view().history.clone(),
+            ));
+        }
+        if let Some(request) = transition.request {
+            if request.request.initial {
+                self.clear_notifications_for_scope(NotificationScope::Search);
+            } else {
+                self.clear_notification(
+                    NotificationScope::Search,
+                    SEARCH_LOAD_MORE_NOTIFICATION_KEY,
+                );
+            }
+            self.spawn_search_request(request, cx);
+        }
+        if transition.notify {
+            cx.notify();
         }
     }
 
-    fn reset_search_from_input(&mut self, cx: &mut Context<Self>) {
-        let query = self.search_input.read(cx).value().trim().to_string();
-        if self.search.query == query {
-            return;
-        }
-        self.item_context_menu = None;
-        self.search.reset_for_query(query);
-        self.clear_notifications_for_scope(NotificationScope::Search);
-        cx.notify();
+    pub(super) fn on_search_input_event(&mut self, event: &EditorEvent, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).value().to_string();
+        let intent = match event {
+            EditorEvent::Changed => SearchIntent::InputChanged(query),
+            EditorEvent::Submitted => SearchIntent::Submit(query),
+        };
+        self.dispatch_search(intent, cx);
     }
 
     fn submit_search_from_input(&mut self, cx: &mut Context<Self>) {
-        let query = self.search_input.read(cx).value().trim().to_string();
-        if query.is_empty() {
-            if !self.search.query.is_empty() || !self.search.items.is_empty() {
-                self.item_context_menu = None;
-                self.search.reset_for_query(String::new());
-                self.clear_notifications_for_scope(NotificationScope::Search);
-                cx.notify();
-            }
-            return;
-        }
-        if self.search.query == query && self.search.initial == LoadState::Loading {
-            return;
-        }
-        if self.search.history.record(&query) {
-            cx.emit(HomeContentEvent::SearchHistoryChanged(
-                self.search.history.clone(),
-            ));
-        }
-        self.item_context_menu = None;
-        let generation = self.search.reset_for_query(query.clone());
-        self.start_search_initial(query, generation, cx);
+        self.dispatch_search(
+            SearchIntent::Submit(self.search_input.read(cx).value().to_string()),
+            cx,
+        );
     }
 
     pub(super) fn search_from_history(
@@ -174,15 +81,11 @@ impl HomeContent {
     }
 
     pub(super) fn clear_search_history(&mut self, cx: &mut Context<Self>) {
-        self.search.history.clear();
-        cx.emit(HomeContentEvent::SearchHistoryChanged(
-            self.search.history.clone(),
-        ));
-        cx.notify();
+        self.dispatch_search(SearchIntent::ClearHistory, cx);
     }
 
     pub(super) fn auto_load_more_search(&mut self, cx: &mut Context<Self>) {
-        if self.navigation.current()
+        if self.controller.route()
             != &super::navigation::HomeRoute::Root(super::navigation::HomeRoot::Search)
         {
             return;
@@ -191,214 +94,64 @@ impl HomeContent {
     }
 
     pub(super) fn load_more_search(&mut self, cx: &mut Context<Self>) {
-        if !self.search.can_load_more() {
-            return;
-        }
-        let query = self.search.query.clone();
-        let generation = self.search.generation;
-        let start_index = self.search.next_start_index;
-        self.search.load_more = LoadState::Loading;
-        self.search.load_more_error = None;
-        self.clear_notification(NotificationScope::Search, SEARCH_LOAD_MORE_NOTIFICATION_KEY);
-        cx.notify();
-        self.spawn_search_request(query, generation, start_index, false, cx);
+        self.dispatch_search(SearchIntent::LoadMore, cx);
     }
 
-    fn start_search_initial(&mut self, query: String, generation: u64, cx: &mut Context<Self>) {
-        if !self.search.accepts(generation, &query) || self.search.initial == LoadState::Loading {
-            return;
-        }
-        self.search.initial = LoadState::Loading;
-        self.search.initial_error = None;
-        self.search.load_more = LoadState::Idle;
-        self.search.load_more_error = None;
-        self.clear_notifications_for_scope(NotificationScope::Search);
-        cx.notify();
-        self.spawn_search_request(query, generation, 0, true, cx);
-    }
-
-    fn spawn_search_request(
-        &mut self,
-        query: String,
-        generation: u64,
-        start_index: u32,
-        initial: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let server = self.current_server.clone();
-        let identity = self.request_identity();
-        let user_data_revision = self.user_data_request_revision();
-        let client = self.emby_client.clone();
-        let task_query = query.clone();
-        let request = SearchRequestContext {
-            identity,
-            user_data_revision,
-            query,
-            generation,
-            start_index,
-            initial,
+    // Identity and Search scope come from the model token. Query reset and Home
+    // release drop the handle; uncancellable IO still passes the token check.
+    // Genuine errors use SEARCH_INITIAL/SEARCH_LOAD_MORE_NOTIFICATION_KEY.
+    fn spawn_search_request(&mut self, request: SearchRequestContext, cx: &mut Context<Self>) {
+        let gateway = EmbyHomeGateway {
+            server: self.current_server.clone(),
+            client: self.emby_client.clone(),
         };
-        let task = cx.background_spawn(async move {
-            let response = client.search_items(&server, &task_query, start_index, SEARCH_LIMIT)?;
-            let raw_item_count = response.items.len() as u32;
-            Ok(SearchPage {
-                items: response.items,
-                total_record_count: response.total_record_count,
-                raw_item_count,
-            })
-        });
-        cx.spawn(async move |page, cx| {
+        let task_request = request.request.clone();
+        let task = cx.background_spawn(async move { effect::run_search(&gateway, &task_request) });
+        self.search_effect.replace(cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
                 page.finish_search_request(request, result, cx);
             })
             .ok();
-        })
-        .detach();
+        }));
     }
 
     fn finish_search_request(
         &mut self,
         request: SearchRequestContext,
-        mut result: anyhow::Result<SearchPage>,
+        result: anyhow::Result<SearchPage>,
         cx: &mut Context<Self>,
     ) {
-        if !self.matches_request_identity(&request.identity)
-            || !self.search.accepts(request.generation, &request.query)
-            || (!request.initial && request.start_index != self.search.next_start_index)
-        {
+        let Some(update) =
+            self.controller
+                .complete_search(&request, result, &self.request_identity())
+        else {
             return;
-        }
-        if let Ok(page) = result.as_mut() {
-            page.items.retain(|item| {
-                !item.id.trim().is_empty()
-                    && matches!(item.item_type.as_deref(), Some("Movie" | "Series"))
-            });
-            let items = crate::emby::UserItems {
-                items: page.items.clone(),
-                total_record_count: page.total_record_count,
-            };
-            self.absorb_user_items_user_data(&items, request.user_data_revision);
+        };
+        if let Some(items) = update.received {
+            self.layout.content_changed();
             self.ensure_feed_user_items_images(&items, cx);
         }
-        if request.initial {
-            self.search.initial = match &result {
-                Ok(_) => LoadState::Loaded,
-                Err(_) => LoadState::Failed,
-            };
-            match result {
-                Ok(page) => {
-                    self.search.items.clear();
-                    self.search.next_start_index = 0;
-                    self.search.merge_page(page);
-                    self.search.initial_error = None;
-                    self.clear_notification(
-                        NotificationScope::Search,
-                        SEARCH_INITIAL_NOTIFICATION_KEY,
-                    );
-                }
-                Err(error) => {
-                    let error_message: SharedString = error.to_string().into();
-                    self.search.initial_error = Some(error_message.clone());
-                    self.push_error_notification(
-                        NotificationScope::Search,
-                        SEARCH_INITIAL_NOTIFICATION_KEY,
-                        format!("搜索失败：{error_message}"),
-                        cx,
-                    );
-                }
-            }
+        let (key, prefix) = if update.initial {
+            (SEARCH_INITIAL_NOTIFICATION_KEY, "搜索失败")
         } else {
-            self.search.load_more = match &result {
-                Ok(_) => LoadState::Loaded,
-                Err(_) => LoadState::Failed,
-            };
-            match result {
-                Ok(page) => {
-                    self.search.merge_page(page);
-                    self.search.load_more_error = None;
-                    self.clear_notification(
-                        NotificationScope::Search,
-                        SEARCH_LOAD_MORE_NOTIFICATION_KEY,
-                    );
-                }
-                Err(error) => {
-                    let error_message: SharedString = error.to_string().into();
-                    self.search.load_more_error = Some(error_message.clone());
-                    self.push_error_notification(
-                        NotificationScope::Search,
-                        SEARCH_LOAD_MORE_NOTIFICATION_KEY,
-                        format!("加载更多搜索结果失败：{error_message}"),
-                        cx,
-                    );
-                }
-            }
+            (SEARCH_LOAD_MORE_NOTIFICATION_KEY, "加载更多搜索结果失败")
+        };
+        let error = update.error;
+        if let Some(error) = error {
+            self.push_error_notification(
+                NotificationScope::Search,
+                key,
+                format!("{prefix}：{error}"),
+                cx,
+            );
+        } else {
+            self.clear_notification(NotificationScope::Search, key);
         }
         cx.notify();
     }
 }
 
+mod effect;
 #[cfg(test)]
 mod interaction_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn item(id: &str) -> UserItem {
-        serde_json::from_value(serde_json::json!({"Id": id, "Name": id, "Type": "Movie"})).unwrap()
-    }
-
-    #[test]
-    fn old_generation_is_rejected_after_query_changes_or_clears() {
-        let mut state = SearchState::default();
-        let old = state.reset_for_query("old".into());
-        let new = state.reset_for_query("new".into());
-        assert!(!state.accepts(old, "old"));
-        assert!(state.accepts(new, "new"));
-        let cleared = state.reset_for_query(String::new());
-        assert!(!state.accepts(new, "new"));
-        assert!(state.accepts(cleared, ""));
-    }
-
-    #[test]
-    fn search_pages_keep_server_order_and_deduplicate_across_pages() {
-        let mut state = SearchState::default();
-        state.reset_for_query("q".into());
-        state.merge_page(SearchPage {
-            items: vec![item("b"), item("a")],
-            total_record_count: 60,
-            raw_item_count: 30,
-        });
-        state.merge_page(SearchPage {
-            items: vec![item("a"), item("c")],
-            total_record_count: 60,
-            raw_item_count: 30,
-        });
-
-        assert_eq!(
-            state
-                .items
-                .iter()
-                .map(|item| item.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["b", "a", "c"]
-        );
-        assert_eq!(state.next_start_index, 60);
-    }
-
-    #[test]
-    fn empty_filtered_page_can_still_load_later_item_pages() {
-        let mut state = SearchState::default();
-        state.reset_for_query("q".into());
-        state.initial = LoadState::Loaded;
-        state.merge_page(SearchPage {
-            items: Vec::new(),
-            total_record_count: 60,
-            raw_item_count: 30,
-        });
-
-        assert!(state.can_load_more());
-        assert_eq!(state.next_start_index, 30);
-    }
-}

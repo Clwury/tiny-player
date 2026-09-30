@@ -38,8 +38,12 @@ fn search_history_persists_across_server_switches_reopening_and_clear(cx: &mut T
     app.update(cx, |app, cx| {
         assert_eq!(app.cache.search_history.entries(), ["星际穿越", "沙丘"]);
         app.flush_scheduled_cache_save(cx);
-        app.cache = crate::storage::load_or_init_from(&path).unwrap();
-        app.open_home_for_server(app.servers[0].clone(), cx);
+        let (config, catalog) =
+            crate::config::GlobalConfig::split(crate::storage::load_or_init_from(&path).unwrap());
+        app.cache = config;
+        *app.server_feature.test_catalog_mut() = catalog;
+        app.server_feature.retain_counts();
+        app.open_home_for_server(app.server_feature.catalog().servers[0].clone(), cx);
         cx.notify();
     });
     cx.run_until_parked();

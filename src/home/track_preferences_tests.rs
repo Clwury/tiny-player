@@ -193,10 +193,10 @@ fn late_snapshot_preserves_new_choices_and_playback_updates_keep_all_versions(
         assert_eq!(saved.audio, Some(SavedTrackChoice::Off));
         assert_eq!(saved.subtitle, Some(SavedTrackChoice::Off));
         assert_eq!(
-            page.played_video_versions["episode"].track_preferences["1080"],
+            page.controller.test_state().played_video_versions["episode"].track_preferences["1080"],
             saved
         );
-        let choices = page.played_video_versions["episode"]
+        let choices = page.controller.test_state().played_video_versions["episode"]
             .track_preferences
             .clone();
         page.apply_playback_update(
@@ -216,9 +216,12 @@ fn late_snapshot_preserves_new_choices_and_playback_updates_keep_all_versions(
             },
             cx,
         );
-        assert_eq!(page.played_video_versions["episode"].source_id, "2160");
         assert_eq!(
-            page.played_video_versions["episode"].track_preferences,
+            page.controller.test_state().played_video_versions["episode"].source_id,
+            "2160"
+        );
+        assert_eq!(
+            page.controller.test_state().played_video_versions["episode"].track_preferences,
             choices
         );
     });
@@ -244,10 +247,44 @@ fn another_account_track_change_does_not_schedule_this_snapshot(cx: &mut TestApp
     });
     cx.run_until_parked();
     page.read_with(cx, |page, _| {
-        assert!(page.played_video_versions.is_empty());
-        assert!(!page.snapshot_save_pending);
+        assert!(
+            page.controller
+                .test_state()
+                .played_video_versions
+                .is_empty()
+        );
+        assert!(!page.persistence.is_dirty(&page.snapshot_dirty_key()));
     });
     cx.update(|_| drop(page));
     cx.run_until_parked();
     assert!(!path.exists());
+}
+
+#[gpui::test]
+fn application_quit_captures_invalidated_home_and_waits_for_final_write(cx: &mut TestAppContext) {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("snapshot.json");
+    let page = home(cx, &path);
+    page.update(cx, |page, cx| {
+        page.controller.test_state_mut().feed.state.resume_items = Some(
+            serde_json::from_value(serde_json::json!({
+                "Items": [{ "Id": "old", "Type": "Movie", "Name": "old" }], "TotalRecordCount": 1
+            }))
+            .unwrap(),
+        );
+        page.schedule_home_snapshot_save(cx);
+        page.invalidate_pending_home_snapshot_save();
+        // Refresh invalidates the scheduled payload before network completion.
+        // Release/quit must capture the owner's current state.
+        page.controller.test_state_mut().feed.state.resume_items = None;
+    });
+    assert!(!path.exists());
+    cx.quit();
+    let saved = cache::load_snapshot_from(&path, &server())
+        .unwrap()
+        .unwrap();
+    assert!(saved.resume_items.is_none());
+    assert!(!page.read_with(cx, |page, _| {
+        page.persistence.is_dirty(&page.snapshot_dirty_key())
+    }));
 }

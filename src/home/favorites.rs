@@ -1,62 +1,58 @@
+use super::adapter::EmbyHomeGateway;
+use crate::home::detail::state::detail_binding;
+pub(crate) mod actions;
+pub(super) mod controller;
+mod effect;
 #[cfg(test)]
 mod integration_tests;
+mod presentation;
 pub(super) mod render;
-mod state;
 
-pub(crate) use state::{
-    FAVORITE_ITEM_TYPES, FAVORITES_PAGE_LIMIT, FavoritesState, favorite_section_title,
+#[cfg(test)]
+use super::LoadState;
+use super::controller::FavoriteIntent;
+use super::model::notification::ActionNotification;
+#[cfg(test)]
+use crate::emby::{SortOrder, UserItemsSort};
+use actions::FavoriteCommand;
+#[cfg(test)]
+use controller::favorite_query;
+pub(crate) use controller::{
+    FAVORITE_ITEM_TYPES, FAVORITES_PAGE_LIMIT, FavoritesController, favorite_section_title,
 };
+use controller::{FavoritesIntent, FavoritesRequest};
+pub(crate) use presentation::FavoritesPresentation;
 
-use std::{borrow::Cow, collections::HashMap};
+use gpui::{AppContext as _, ClickEvent, Context, Window};
 
-use gpui::{AppContext as _, ClickEvent, Context, SharedString, Window};
-
-use crate::emby::{
-    ResumeItem, ResumeItems, SortOrder, UserItem, UserItemData, UserItems, UserItemsQuery,
-    UserItemsSort, VideoItemType,
-};
+#[cfg(test)]
+use crate::emby::UserItem;
+use crate::emby::{UserItemData, UserItems, VideoItemType};
 
 use super::{
-    HomeContent, HomeContentEvent, LoadState,
+    HomeContent, HomeContentEvent,
     navigation::{HomeRoot, HomeRoute},
     notification::NotificationScope,
 };
 
-#[derive(Clone, Debug)]
-pub(crate) struct FavoriteRollback {
-    previous_override: Option<UserItemData>,
-    removed: Option<(VideoItemType, usize, UserItem)>,
-    notification_scope: NotificationScope,
-    notification_key: SharedString,
-}
-
-struct FavoritesRequest {
-    identity: super::WorkspaceIdentity,
-    item_type: VideoItemType,
-    user_data_revision: u64,
-    generation: u64,
-    start_index: u32,
-    initial: bool,
-}
-
 impl HomeContent {
     pub(super) fn enter_favorites_if_needed(&mut self, cx: &mut Context<Self>) {
-        let item_types = match self.navigation.current() {
+        let item_types = match self.controller.route() {
             HomeRoute::FavoriteItems { item_type } => vec![*item_type],
             _ => FAVORITE_ITEM_TYPES.to_vec(),
         };
         for item_type in item_types {
-            let state = &self.favorites[item_type].paged;
-            if matches!(state.initial, LoadState::Idle | LoadState::Failed) || state.dirty {
-                self.load_favorites_initial(item_type, cx);
-            }
+            self.dispatch_favorites(item_type, FavoritesIntent::Enter, cx);
         }
     }
 
     pub(super) fn open_favorite_items(&mut self, item_type: VideoItemType, cx: &mut Context<Self>) {
         self.item_context_menu = None;
-        self.favorites.sync_previous_offsets();
-        self.navigation.push_favorite_items(item_type);
+        self.favorites_presentation.sync_previous_offsets();
+        let change = self
+            .controller
+            .dispatch_navigation(super::controller::NavigationIntent::Favorites(item_type));
+        super::detail::state::apply_navigation_change(change, &mut self.detail_resources);
         self.enter_favorites_if_needed(cx);
         cx.emit(HomeContentEvent::TitleChanged);
         cx.notify();
@@ -67,17 +63,17 @@ impl HomeContent {
         item_type: VideoItemType,
         cx: &mut Context<Self>,
     ) {
-        if self.navigation.current() != &(HomeRoute::FavoriteItems { item_type })
-            || self.favorites[item_type].paged.dirty
-            || !self.favorites[item_type].paged.can_auto_load_more()
-        {
-            return;
+        if self.controller.route() == &(HomeRoute::FavoriteItems { item_type }) {
+            self.dispatch_favorites(item_type, FavoritesIntent::LoadMore { automatic: true }, cx);
         }
-        self.load_more_favorites(item_type, cx);
     }
 
     pub(super) fn load_more_favorites(&mut self, item_type: VideoItemType, cx: &mut Context<Self>) {
-        self.request_favorites_page(item_type, false, cx);
+        self.dispatch_favorites(
+            item_type,
+            FavoritesIntent::LoadMore { automatic: false },
+            cx,
+        );
     }
 
     pub(super) fn load_favorites_initial(
@@ -85,7 +81,12 @@ impl HomeContent {
         item_type: VideoItemType,
         cx: &mut Context<Self>,
     ) {
-        self.request_favorites_page(item_type, true, cx);
+        self.dispatch_favorites(item_type, FavoritesIntent::Refresh, cx);
+    }
+
+    pub(super) fn invalidate_favorites(&mut self) {
+        self.controller.invalidate_favorites();
+        self.favorites_presentation.cancel_effects();
     }
 
     fn clear_favorite_notifications(&mut self, item_type: VideoItemType) {
@@ -97,27 +98,16 @@ impl HomeContent {
         }
     }
 
-    fn request_favorites_page(
+    fn dispatch_favorites(
         &mut self,
         item_type: VideoItemType,
-        initial: bool,
+        intent: FavoritesIntent,
         cx: &mut Context<Self>,
     ) {
-        let state = &mut self.favorites[item_type].paged;
-        if !initial && state.dirty {
-            return;
-        }
-        let request = if initial {
-            state
-                .begin_initial(state.items.is_empty())
-                .map(|generation| (generation, 0))
-        } else {
-            state.begin_load_more()
-        };
-        let Some((generation, start_index)) = request else {
+        let Some(request) = self.controller.dispatch_favorites(item_type, intent) else {
             return;
         };
-        if initial {
+        if request.initial {
             self.clear_favorite_notifications(item_type);
         } else {
             self.clear_notification(
@@ -125,114 +115,58 @@ impl HomeContent {
                 &favorite_notification_key(item_type, "load-more"),
             );
         }
-        let request = FavoritesRequest {
-            identity: self.request_identity(),
-            item_type,
-            user_data_revision: self.user_data_request_revision(),
-            generation,
-            start_index,
-            initial,
-        };
         cx.notify();
-        let server = self.current_server.clone();
-        let client = self.emby_client.clone();
-        let task = cx.background_spawn(async move {
-            client.query_user_items(&server, &favorite_query(item_type, start_index))
-        });
-        cx.spawn(async move |page, cx| {
+        let gateway = EmbyHomeGateway {
+            client: self.emby_client.clone(),
+            server: self.current_server.clone(),
+        };
+        let task_request = request.clone();
+        let task =
+            cx.background_spawn(async move { effect::run_favorites(&gateway, &task_request) });
+        let handle = cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
                 page.finish_favorites_page(request, result, cx)
             })
             .ok();
-        })
-        .detach();
+        });
+        self.favorites_presentation[item_type]
+            .effect
+            .replace(handle);
     }
 
     fn finish_favorites_page(
         &mut self,
         request: FavoritesRequest,
-        mut result: anyhow::Result<UserItems>,
+        result: anyhow::Result<UserItems>,
         cx: &mut Context<Self>,
     ) {
-        let FavoritesRequest {
-            identity,
-            item_type,
-            user_data_revision,
-            generation,
-            start_index,
-            initial,
-        } = request;
-        if !self.matches_request_identity(&identity) {
+        let Some(update) =
+            self.controller
+                .complete_favorites(&request, result, &self.request_identity())
+        else {
             return;
-        }
-        let state = &self.favorites[item_type].paged;
-        if !(if initial {
-            state.accepts_initial(generation)
-        } else {
-            state.accepts_load_more(generation, start_index)
-        }) {
-            return;
-        }
-        let raw_count = result
-            .as_ref()
-            .ok()
-            .map(|items| items.items.len() as u32)
-            .unwrap_or_default();
-        if let Ok(items) = result.as_mut() {
-            items.items.retain(|item| {
-                !item.id.trim().is_empty() && item.item_type.as_deref() == Some(item_type.as_str())
-            });
-            self.absorb_user_items_user_data(items, user_data_revision);
-            items.items.retain(|item| {
-                self.user_data_overrides
-                    .get(&item.id)
-                    .is_none_or(|data| data.is_favorite)
-            });
-            self.ensure_favorite_items_images(items, cx);
-        }
-        let state = &mut self.favorites[item_type].paged;
-        if initial {
-            state.finish_initial_with_raw_count(
-                generation,
-                result,
-                FAVORITES_PAGE_LIMIT,
-                raw_count,
-            );
-        } else {
-            state.finish_load_more_with_raw_count(
-                generation,
-                start_index,
-                result,
-                FAVORITES_PAGE_LIMIT,
-                raw_count,
-            );
-        }
-        let error = if initial {
-            state
-                .initial_error
-                .clone()
-                .map(|error| ("initial", error))
-                .or_else(|| state.refresh_error.clone().map(|error| ("refresh", error)))
-        } else {
-            state
-                .load_more_error
-                .clone()
-                .map(|error| ("load-more", error))
         };
-        if let Some((phase, error)) = error {
+        if let Some(items) = update.images {
+            self.layout.content_changed();
+            self.ensure_favorite_items_images(&items, cx);
+        }
+        if let Some((phase, error)) = update.failure {
             self.push_error_notification(
                 NotificationScope::Favorites,
-                favorite_notification_key(item_type, phase),
-                format!("加载收藏{}失败：{error}", favorite_section_title(item_type)),
+                favorite_notification_key(request.item_type, phase),
+                format!(
+                    "加载收藏{}失败：{error}",
+                    favorite_section_title(request.item_type)
+                ),
                 cx,
             );
-        } else if initial {
-            self.clear_favorite_notifications(item_type);
+        } else if request.initial {
+            self.clear_favorite_notifications(request.item_type);
         } else {
             self.clear_notification(
                 NotificationScope::Favorites,
-                &favorite_notification_key(item_type, "load-more"),
+                &favorite_notification_key(request.item_type, "load-more"),
             );
         }
         cx.notify();
@@ -245,17 +179,15 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let Some(item_id) = self
-            .series_detail
-            .as_ref()
-            .and_then(|detail| detail.selected_playback_item())
+            .detail_view()
+            .and_then(|detail| detail.model.selected_playback_item())
             .map(|item| item.id.clone())
         else {
             return;
         };
         let fallback = self
-            .series_detail
-            .as_ref()
-            .and_then(|detail| detail.selected_playback_item())
+            .detail_view()
+            .and_then(|detail| detail.model.selected_playback_item())
             .and_then(|item| item.user_data.clone());
         self.toggle_item_favorite(item_id, fallback, cx);
     }
@@ -266,193 +198,76 @@ impl HomeContent {
         fallback: Option<UserItemData>,
         cx: &mut Context<Self>,
     ) {
-        if item_id.trim().is_empty() || self.detail_user_data_pending() {
-            return;
-        }
-        if let Some(detail) = self.series_detail.as_mut() {
-            detail.open_select = None;
-        }
-        let old = self
-            .effective_user_data(&item_id, fallback.as_ref())
-            .cloned()
-            .unwrap_or_default();
-        let desired = !old.is_favorite;
-        let mut optimistic = old;
-        optimistic.is_favorite = desired;
-        self.invalidate_pending_home_snapshot_save();
-        self.bump_user_data_revision(&item_id);
-        let previous_override = self.user_data_overrides.insert(item_id.clone(), optimistic);
-        let removed = if self.navigation.root() == HomeRoot::Favorites && !desired {
-            self.favorites.remove_item(&item_id)
-        } else {
-            None
-        };
-        self.favorites.mark_dirty();
-        let (notification_scope, notification_key) =
-            self.item_action_notification(&item_id, "favorite");
-        self.clear_notification(notification_scope, &notification_key);
-        self.favorite_rollbacks.insert(
-            item_id.clone(),
-            FavoriteRollback {
-                previous_override,
-                removed,
-                notification_scope,
-                notification_key,
+        let (scope, key) = self.item_action_notification(&item_id, "favorite");
+        let Some(command) = self.controller.dispatch_favorite(FavoriteIntent {
+            item_id,
+            fallback,
+            notification: ActionNotification {
+                scope,
+                key: key.to_string(),
             },
-        );
-        self.favorite_requests.insert(item_id.clone());
+        }) else {
+            return;
+        };
+        if let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        {
+            detail.presentation.open_select = None;
+        }
+        self.invalidate_pending_home_snapshot_save();
+        self.layout.content_changed();
+        self.favorites_presentation.cancel_effects();
+        self.clear_notification(scope, &key);
         cx.notify();
-
-        let server = self.current_server.clone();
-        let identity = self.request_identity();
-        let client = self.emby_client.clone();
-        let task_item_id = item_id.clone();
-        let task = cx
-            .background_spawn(async move { client.set_favorite(&server, &task_item_id, desired) });
-        cx.spawn(async move |page, cx| {
+        let gateway = EmbyHomeGateway {
+            client: self.emby_client.clone(),
+            server: self.current_server.clone(),
+        };
+        let task_command = command.clone();
+        let task =
+            cx.background_spawn(
+                async move { effect::run_favorite_mutation(&gateway, &task_command) },
+            );
+        let handle = cx.spawn(async move |page, cx| {
             let result = task.await;
             page.update(cx, |page, cx| {
-                page.finish_toggle_favorite(identity, item_id, result, cx);
+                page.finish_toggle_favorite(command, result, cx)
             })
             .ok();
-        })
-        .detach();
+        });
+        self.favorite_effect.replace(handle);
     }
 
     fn finish_toggle_favorite(
         &mut self,
-        identity: super::WorkspaceIdentity,
-        item_id: String,
+        command: FavoriteCommand,
         result: anyhow::Result<UserItemData>,
         cx: &mut Context<Self>,
     ) {
-        if !self.matches_request_identity(&identity) {
+        let Some(update) =
+            self.controller
+                .complete_favorite(&command, result, &self.request_identity())
+        else {
             return;
-        }
-        self.favorite_requests.remove(&item_id);
-        let rollback = self.favorite_rollbacks.remove(&item_id);
-        self.bump_user_data_revision(&item_id);
-        match result {
-            Ok(data) => {
-                self.user_data_overrides.insert(item_id.clone(), data);
-            }
-            Err(error) => {
-                if let Some(rollback) = rollback {
-                    match rollback.previous_override {
-                        Some(previous) => {
-                            self.user_data_overrides.insert(item_id.clone(), previous);
-                        }
-                        None => {
-                            self.user_data_overrides.remove(&item_id);
-                        }
-                    }
-                    if let Some((item_type, index, item)) = rollback.removed {
-                        self.favorites.restore_item(item_type, index, item);
-                    }
-                    self.push_error_notification(
-                        rollback.notification_scope,
-                        rollback.notification_key,
-                        format!("更新收藏失败：{error}"),
-                        cx,
-                    );
-                }
-            }
+        };
+        if let Some((notification, error)) = update.failure {
+            self.push_error_notification(
+                notification.scope,
+                notification.key,
+                format!("更新收藏失败：{error}"),
+                cx,
+            );
         }
         self.schedule_home_snapshot_save(cx);
-        self.favorites.mark_dirty();
+        self.layout.content_changed();
+        self.favorites_presentation.cancel_effects();
         if matches!(
-            self.navigation.current(),
+            self.controller.route(),
             HomeRoute::Root(HomeRoot::Favorites) | HomeRoute::FavoriteItems { .. }
         ) {
             self.enter_favorites_if_needed(cx);
         }
         cx.notify();
-    }
-
-    pub(super) fn user_data_request_revision(&self) -> u64 {
-        self.user_data_revision
-    }
-
-    pub(super) fn bump_user_data_revision(&mut self, item_id: &str) {
-        self.user_data_revision = self.user_data_revision.wrapping_add(1);
-        self.user_data_item_revisions
-            .insert(item_id.to_string(), self.user_data_revision);
-    }
-
-    pub(super) fn absorb_user_items_user_data(&mut self, items: &UserItems, request_revision: u64) {
-        for item in &items.items {
-            if self
-                .series_user_data_response_is_current(item.series_id.as_deref(), request_revision)
-            {
-                self.absorb_user_data(&item.id, item.user_data.as_ref(), request_revision);
-            }
-        }
-    }
-
-    pub(super) fn absorb_resume_items_user_data(
-        &mut self,
-        items: &ResumeItems,
-        request_revision: u64,
-    ) {
-        for item in &items.items {
-            if self
-                .series_user_data_response_is_current(item.series_id.as_deref(), request_revision)
-            {
-                self.absorb_user_data(&item.id, item.user_data.as_ref(), request_revision);
-            }
-        }
-    }
-
-    pub(super) fn absorb_user_data(
-        &mut self,
-        item_id: &str,
-        data: Option<&UserItemData>,
-        request_revision: u64,
-    ) {
-        if self.played_request.is_some()
-            || !user_data_response_is_current(
-                item_id,
-                request_revision,
-                &self.favorite_requests,
-                &self.user_data_item_revisions,
-            )
-        {
-            return;
-        }
-        if let Some(data) = data {
-            self.user_data_overrides
-                .insert(item_id.to_string(), data.clone());
-        }
-    }
-
-    pub(super) fn effective_user_data<'a>(
-        &'a self,
-        item_id: &str,
-        fallback: Option<&'a UserItemData>,
-    ) -> Option<&'a UserItemData> {
-        self.user_data_overrides.get(item_id).or(fallback)
-    }
-
-    pub(super) fn effective_user_item<'a>(&self, item: &'a UserItem) -> Cow<'a, UserItem> {
-        effective_user_item(item, &self.user_data_overrides)
-    }
-
-    pub(super) fn effective_resume_item<'a>(&self, item: &'a ResumeItem) -> Cow<'a, ResumeItem> {
-        effective_resume_item(item, &self.user_data_overrides)
-    }
-}
-
-fn favorite_query(item_type: VideoItemType, start_index: u32) -> UserItemsQuery {
-    UserItemsQuery {
-        include_item_types: vec![item_type],
-        fields: Some("BasicSyncInfo,CommunityRating,ProductionYear,EndDate,Container,ParentId,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,UserData".into()),
-        is_favorite: Some(true),
-        recursive: true,
-        start_index,
-        limit: FAVORITES_PAGE_LIMIT,
-        sort_by: Some(UserItemsSort::DateCreated),
-        sort_order: SortOrder::Descending,
-        ..UserItemsQuery::default()
     }
 }
 
@@ -460,54 +275,8 @@ fn favorite_notification_key(item_type: VideoItemType, phase: &str) -> String {
     format!("favorites:{}:{phase}", item_type.as_str())
 }
 
-fn effective_user_item<'a>(
-    item: &'a UserItem,
-    overrides: &HashMap<String, UserItemData>,
-) -> Cow<'a, UserItem> {
-    let Some(data) = overrides.get(&item.id) else {
-        return Cow::Borrowed(item);
-    };
-    if item.user_data.as_ref() == Some(data) {
-        return Cow::Borrowed(item);
-    }
-
-    let mut item = item.clone();
-    item.user_data = Some(data.clone());
-    Cow::Owned(item)
-}
-
-fn effective_resume_item<'a>(
-    item: &'a ResumeItem,
-    overrides: &HashMap<String, UserItemData>,
-) -> Cow<'a, ResumeItem> {
-    let Some(data) = overrides.get(&item.id) else {
-        return Cow::Borrowed(item);
-    };
-    if item.user_data.as_ref() == Some(data) {
-        return Cow::Borrowed(item);
-    }
-
-    let mut item = item.clone();
-    item.user_data = Some(data.clone());
-    Cow::Owned(item)
-}
-
-fn user_data_response_is_current(
-    item_id: &str,
-    request_revision: u64,
-    favorite_requests: &std::collections::HashSet<String>,
-    item_revisions: &std::collections::HashMap<String, u64>,
-) -> bool {
-    !favorite_requests.contains(item_id)
-        && item_revisions
-            .get(item_id)
-            .is_none_or(|revision| *revision <= request_revision)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
-
     use super::*;
 
     #[test]
@@ -534,126 +303,5 @@ mod tests {
                 assert!(fields.split(',').any(|value| value == field));
             }
         }
-    }
-
-    #[test]
-    fn favorite_override_propagates_and_rollback_restores_all_copies() {
-        let item: UserItem = serde_json::from_value(serde_json::json!({
-            "Id": "movie-1",
-            "Name": "电影",
-            "Type": "Movie",
-            "UserData": { "IsFavorite": false }
-        }))
-        .unwrap();
-        let mut overrides = HashMap::new();
-        overrides.insert(
-            item.id.clone(),
-            UserItemData {
-                is_favorite: true,
-                ..UserItemData::default()
-            },
-        );
-
-        let home_copy = effective_user_item(&item, &overrides);
-        let search_copy = effective_user_item(&item, &overrides);
-        assert!(home_copy.is_favorite());
-        assert!(search_copy.is_favorite());
-
-        overrides.remove(&item.id);
-        assert!(!effective_user_item(&item, &overrides).is_favorite());
-    }
-
-    #[test]
-    fn resume_movie_uses_the_same_favorite_override() {
-        let item: ResumeItem = serde_json::from_value(serde_json::json!({
-            "Id": "movie-1",
-            "Name": "电影",
-            "Type": "Movie",
-            "UserData": { "IsFavorite": false }
-        }))
-        .unwrap();
-        let overrides = HashMap::from([(
-            item.id.clone(),
-            UserItemData {
-                is_favorite: true,
-                ..UserItemData::default()
-            },
-        )]);
-        let effective = effective_resume_item(&item, &overrides);
-
-        assert!(effective.is_favorite());
-    }
-
-    #[test]
-    fn unchanged_user_data_reuses_the_original_item() {
-        let item: UserItem = serde_json::from_value(serde_json::json!({
-            "Id": "movie-1",
-            "Name": "电影",
-            "Type": "Movie",
-            "UserData": { "IsFavorite": false }
-        }))
-        .unwrap();
-        let overrides =
-            HashMap::from([(item.id.clone(), item.user_data.clone().unwrap_or_default())]);
-
-        assert!(matches!(
-            effective_user_item(&item, &overrides),
-            Cow::Borrowed(_)
-        ));
-    }
-
-    #[test]
-    fn changed_user_data_only_clones_the_overridden_item() {
-        let item: UserItem = serde_json::from_value(serde_json::json!({
-            "Id": "movie-1",
-            "Name": "电影",
-            "Type": "Movie",
-            "UserData": { "IsFavorite": false }
-        }))
-        .unwrap();
-        let overrides = HashMap::from([(
-            item.id.clone(),
-            UserItemData {
-                is_favorite: true,
-                ..UserItemData::default()
-            },
-        )]);
-
-        assert!(matches!(
-            effective_user_item(&item, &overrides),
-            Cow::Owned(_)
-        ));
-    }
-
-    #[test]
-    fn stale_or_in_flight_user_data_cannot_replace_a_favorite_mutation() {
-        let item_revisions = HashMap::from([("movie-1".to_string(), 5)]);
-        let mut pending = HashSet::new();
-
-        assert!(!user_data_response_is_current(
-            "movie-1",
-            4,
-            &pending,
-            &item_revisions,
-        ));
-        assert!(user_data_response_is_current(
-            "movie-1",
-            5,
-            &pending,
-            &item_revisions,
-        ));
-        pending.insert("movie-1".to_string());
-        assert!(!user_data_response_is_current(
-            "movie-1",
-            5,
-            &pending,
-            &item_revisions,
-        ));
-        assert!(user_data_response_is_current(
-            "movie-2",
-            0,
-            &pending,
-            &item_revisions,
-        ));
     }
 }

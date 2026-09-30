@@ -1,19 +1,19 @@
-use std::{fs, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
-use anyhow::{Context as _, Result, anyhow};
 use gpui::{
-    App, Asset, Bounds, ClickEvent, ContentMask, Context, ImageCacheError, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, RenderImage, StatefulInteractiveElement, Styled,
-    StyledImage, Window, canvas, div, fill, img, point, prelude::FluentBuilder, px, size, svg,
+    App, Bounds, ClickEvent, ContentMask, Context, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, StatefulInteractiveElement, Styled, StyledImage, Window, canvas, div, fill, img,
+    point, prelude::FluentBuilder, px, size, svg,
 };
-use image::{Frame, imageops::FilterType};
 
-use crate::ui::radius;
-use crate::{
-    emby::{MediaItem, MediaPerson, ResumeItem, UserItem},
-    theme,
-    ui::tooltip::text_tooltip,
+use super::model::cards::{
+    EpisodeCardVm, PersonCardVm, PosterBadgesVm, ResumeCardVm, UserEpisodeCardVm, UserItemCardVm,
 };
+use crate::{
+    images::cover::{CoverImageAsset, CoverImageRequest},
+    ui::radius,
+};
+use crate::{theme, ui::tooltip::text_tooltip};
 
 use super::carousel::{
     DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX, DETAIL_EPISODE_CARD_PADDING_PX,
@@ -26,30 +26,8 @@ use super::carousel::{
 const IMAGE_PROGRESS_BAR_HEIGHT_PX: f32 = 4.0;
 const IMAGE_PROGRESS_BAR_HORIZONTAL_INSET_PX: f32 = 8.0;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CoverImageSource {
-    path: Arc<Path>,
-    width: u32,
-    height: u32,
-}
-
-enum CoverImageAsset {}
-
-impl Asset for CoverImageAsset {
-    type Source = CoverImageSource;
-    type Output = std::result::Result<Arc<RenderImage>, ImageCacheError>;
-
-    #[allow(clippy::manual_async_fn)]
-    fn load(
-        source: Self::Source,
-        _: &mut App,
-    ) -> impl std::future::Future<Output = Self::Output> + Send + 'static {
-        async move { load_cover_image(source).map_err(|error| ImageCacheError::Other(Arc::new(error))) }
-    }
-}
-
 pub(super) fn cover_img(path: Arc<Path>, width: f32, height: f32) -> impl IntoElement {
-    let source = CoverImageSource {
+    let source = CoverImageRequest {
         path,
         width: width as u32,
         height: height as u32,
@@ -59,54 +37,6 @@ pub(super) fn cover_img(path: Arc<Path>, width: f32, height: f32) -> impl IntoEl
         .w(px(width))
         .h(px(height))
         .rounded(radius::CARD)
-}
-
-fn load_cover_image(source: CoverImageSource) -> Result<Arc<RenderImage>> {
-    let bytes = fs::read(&source.path)
-        .with_context(|| format!("读取图片缓存失败：{}", source.path.display()))?;
-    let image = image::load_from_memory(&bytes)
-        .with_context(|| format!("解析图片缓存失败：{}", source.path.display()))?
-        .to_rgba8();
-    let (source_width, source_height) = image.dimensions();
-    let (x, y, crop_width, crop_height) =
-        cover_crop_bounds(source_width, source_height, source.width, source.height)?;
-    let cropped = image::imageops::crop_imm(&image, x, y, crop_width, crop_height).to_image();
-    let mut resized =
-        image::imageops::resize(&cropped, source.width, source.height, FilterType::Lanczos3);
-
-    for pixel in resized.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
-    }
-
-    Ok(Arc::new(RenderImage::new([Frame::new(resized)])))
-}
-
-fn cover_crop_bounds(
-    source_width: u32,
-    source_height: u32,
-    target_width: u32,
-    target_height: u32,
-) -> Result<(u32, u32, u32, u32)> {
-    if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
-        return Err(anyhow!("图片裁剪尺寸无效"));
-    }
-
-    let source_ratio = source_width as f64 / source_height as f64;
-    let target_ratio = target_width as f64 / target_height as f64;
-
-    if source_ratio > target_ratio {
-        let crop_width = ((source_height as f64 * target_ratio).round() as u32)
-            .max(1)
-            .min(source_width);
-        let x = (source_width - crop_width) / 2;
-        Ok((x, 0, crop_width, source_height))
-    } else {
-        let crop_height = ((source_width as f64 / target_ratio).round() as u32)
-            .max(1)
-            .min(source_height);
-        let y = (source_height - crop_height) / 2;
-        Ok((0, y, source_width, crop_height))
-    }
 }
 
 pub(super) fn home_section_title<T>(title: &'static str, cx: &Context<T>) -> gpui::Div {
@@ -388,15 +318,11 @@ fn image_progress_bar<T>(image_width: f32, played_fraction: f32, cx: &Context<T>
 }
 
 pub(super) fn resume_item_card<T>(
-    item: &ResumeItem,
+    view: ResumeCardVm,
     image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
-    let (title, subtitle) = resume_item_card_text(item);
-    let played_fraction = item
-        .played_percentage()
-        .map(|percentage| (percentage / 100.0) as f32);
 
     div()
         .flex()
@@ -408,8 +334,8 @@ pub(super) fn resume_item_card<T>(
         .hover(move |style| style.bg(theme.secondary_hover))
         .child(resume_item_card_image(
             image_path,
-            played_fraction,
-            item.is_favorite(),
+            view.played_fraction,
+            view.favorite,
             cx,
         ))
         .child(
@@ -425,9 +351,9 @@ pub(super) fn resume_item_card<T>(
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.foreground)
-                        .child(title),
+                        .child(view.title),
                 )
-                .when_some(subtitle, |this, subtitle| {
+                .when_some(view.subtitle, |this, subtitle| {
                     this.child(
                         div()
                             .truncate()
@@ -441,17 +367,8 @@ pub(super) fn resume_item_card<T>(
 }
 
 pub(super) fn user_item_card<T>(
-    item: &UserItem,
+    view: UserItemCardVm,
     image_path: Option<Arc<Path>>,
-    cx: &Context<T>,
-) -> gpui::Div {
-    user_item_card_with_favorite_badge(item, image_path, true, cx)
-}
-
-pub(super) fn user_item_card_with_favorite_badge<T>(
-    item: &UserItem,
-    image_path: Option<Arc<Path>>,
-    show_favorite_badge: bool,
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
@@ -464,12 +381,7 @@ pub(super) fn user_item_card_with_favorite_badge<T>(
         .rounded(radius::CARD)
         .p(px(HOME_ITEM_CARD_PADDING_PX))
         .hover(move |style| style.bg(theme.secondary_hover))
-        .child(user_item_card_image(
-            item,
-            image_path,
-            show_favorite_badge,
-            cx,
-        ))
+        .child(user_item_card_image(view.badges, image_path, cx))
         .child(
             div()
                 .w(px(HOME_ITEM_CARD_WIDTH_PX))
@@ -483,29 +395,30 @@ pub(super) fn user_item_card_with_favorite_badge<T>(
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.foreground)
-                        .child(item.name.clone()),
+                        .child(view.title),
                 )
-                .when_some(item.production_year, |this, year| {
+                .when_some(view.year, |this, year| {
                     this.child(
                         div()
                             .truncate()
                             .text_center()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(year.to_string()),
+                            .child(year),
                     )
                 }),
         )
 }
 
 pub(super) fn user_episode_card<T>(
-    item: &UserItem,
+    view: UserEpisodeCardVm,
     image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> gpui::Div {
+    let image = compact_episode_card_image(image_path, view.played_fraction, cx);
     user_episode_card_with_image(
-        item,
-        compact_episode_card_image(image_path, user_episode_played_fraction(item), cx),
+        view,
+        image,
         HOME_ITEM_CARD_WIDTH_PX,
         HOME_ITEM_CARD_PADDING_PX,
         cx,
@@ -513,25 +426,18 @@ pub(super) fn user_episode_card<T>(
 }
 
 pub(super) fn favorite_episode_card<T>(
-    item: &UserItem,
+    view: UserEpisodeCardVm,
     image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> gpui::Div {
+    let image = episode_card_image(image_path, view.played_fraction, cx);
     user_episode_card_with_image(
-        item,
-        episode_card_image(image_path, user_episode_played_fraction(item), cx),
+        view,
+        image,
         DETAIL_EPISODE_CARD_WIDTH_PX,
         DETAIL_EPISODE_CARD_PADDING_PX,
         cx,
     )
-}
-
-fn user_episode_played_fraction(item: &UserItem) -> Option<f32> {
-    item.user_data
-        .as_ref()
-        .and_then(|data| data.played_percentage)
-        .filter(|percentage| percentage.is_finite())
-        .map(|percentage| (percentage.clamp(0.0, 100.0) / 100.0) as f32)
 }
 
 fn compact_episode_card_image<T>(
@@ -571,30 +477,13 @@ fn compact_episode_card_image<T>(
 }
 
 fn user_episode_card_with_image<T>(
-    item: &UserItem,
+    view: UserEpisodeCardVm,
     image: impl IntoElement,
     width: f32,
     padding: f32,
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
-    let episode_number = match (item.parent_index_number, item.index_number) {
-        (Some(season), Some(episode)) => Some(format!("S{season:02}E{episode:02}")),
-        (None, Some(episode)) => Some(format!("E{episode:02}")),
-        _ => None,
-    };
-    let title = item
-        .series_name
-        .as_deref()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or(&item.name)
-        .to_string();
-    let subtitle = match episode_number {
-        Some(number) if title != item.name => format!("{number} · {}", item.name),
-        Some(number) => number,
-        None if title != item.name => item.name.clone(),
-        None => "单集".to_string(),
-    };
 
     div()
         .flex()
@@ -604,10 +493,12 @@ fn user_episode_card_with_image<T>(
         .rounded(radius::CARD)
         .p(px(padding))
         .hover(move |style| style.bg(theme.secondary_hover))
-        .child(div().relative().child(image).when(
-            item.user_data.as_ref().is_some_and(|data| data.played),
-            |this| this.child(episode_played_badge(cx)),
-        ))
+        .child(
+            div()
+                .relative()
+                .child(image)
+                .when(view.played, |this| this.child(episode_played_badge(cx))),
+        )
         .child(
             div()
                 .w(px(width))
@@ -621,7 +512,7 @@ fn user_episode_card_with_image<T>(
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.foreground)
-                        .child(title),
+                        .child(view.title),
                 )
                 .child(
                     div()
@@ -629,26 +520,19 @@ fn user_episode_card_with_image<T>(
                         .text_center()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(subtitle),
+                        .child(view.subtitle),
                 ),
         )
 }
 
 pub(super) fn episode_card<T>(
-    episode: &MediaItem,
+    view: EpisodeCardVm,
     image_path: Option<Arc<Path>>,
-    selected: bool,
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
-    let label = episode.episode_card_label();
-    let played_fraction = if selected {
-        episode
-            .played_percentage()
-            .map(|percentage| (percentage / 100.0) as f32)
-    } else {
-        None
-    };
+    let label = view.label;
+    let selected = view.selected;
 
     div()
         .relative()
@@ -669,11 +553,8 @@ pub(super) fn episode_card<T>(
         .child(
             div()
                 .relative()
-                .child(episode_card_image(image_path, played_fraction, cx))
-                .when(
-                    episode.user_data.as_ref().is_some_and(|data| data.played),
-                    |this| this.child(episode_played_badge(cx)),
-                ),
+                .child(episode_card_image(image_path, view.played_fraction, cx))
+                .when(view.played, |this| this.child(episode_played_badge(cx))),
         )
         .child(
             div()
@@ -699,21 +580,18 @@ pub(super) fn episode_card<T>(
                         .child(label.clone())
                         .tooltip(move |_, cx| text_tooltip(label.clone(), cx)),
                 )
-                .when_some(
-                    compact_episode_overview(episode.overview.as_deref()),
-                    |this, overview| {
-                        this.child(
-                            div()
-                                .id("episode-card-overview")
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .text_ellipsis()
-                                .line_clamp(3)
-                                .child(overview.clone())
-                                .tooltip(move |_, cx| text_tooltip(overview.clone(), cx)),
-                        )
-                    },
-                ),
+                .when_some(view.overview, |this, overview| {
+                    this.child(
+                        div()
+                            .id("episode-card-overview")
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .text_ellipsis()
+                            .line_clamp(3)
+                            .child(overview.clone())
+                            .tooltip(move |_, cx| text_tooltip(overview.clone(), cx)),
+                    )
+                }),
         )
 }
 
@@ -775,7 +653,7 @@ fn episode_card_image<T>(
 }
 
 pub(super) fn person_card<T>(
-    person: &MediaPerson,
+    view: PersonCardVm,
     image_path: Option<Arc<Path>>,
     cx: &Context<T>,
 ) -> gpui::Div {
@@ -805,7 +683,7 @@ pub(super) fn person_card<T>(
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.foreground)
-                        .child(person.display_name()),
+                        .child(view.name),
                 )
                 .child(
                     div()
@@ -813,7 +691,7 @@ pub(super) fn person_card<T>(
                         .truncate()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(person.role_label()),
+                        .child(view.role),
                 )
                 .child(
                     div()
@@ -821,7 +699,7 @@ pub(super) fn person_card<T>(
                         .truncate()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(person.type_label()),
+                        .child(view.kind),
                 ),
         )
 }
@@ -854,23 +732,17 @@ fn person_card_image<T>(image_path: Option<Arc<Path>>, cx: &Context<T>) -> impl 
         })
 }
 
-fn compact_episode_overview(value: Option<&str>) -> Option<String> {
-    let overview = value?.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!overview.is_empty()).then_some(overview)
-}
-
 fn user_item_card_image<T>(
-    item: &UserItem,
+    badges: PosterBadgesVm,
     image_path: Option<Arc<Path>>,
-    show_favorite_badge: bool,
     cx: &Context<T>,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
     let has_image = image_path.is_some();
-    let rating = item.community_rating.map(format_community_rating);
-    let unplayed_count = item.unplayed_count();
+    let rating = badges.rating;
+    let unplayed_count = badges.unplayed_count;
     let has_badges = rating.is_some() || unplayed_count.is_some();
-    let is_favorite = show_favorite_badge && item.is_favorite();
+    let is_favorite = badges.favorite;
 
     div()
         .relative()
@@ -949,39 +821,6 @@ fn user_item_badge<T>(text: String, cx: &Context<T>) -> impl IntoElement {
         .child(text)
 }
 
-pub(super) fn format_community_rating(rating: f32) -> String {
-    let rating = (rating * 10.0).round() / 10.0;
-    if rating.fract().abs() < f32::EPSILON {
-        format!("{rating:.0}")
-    } else {
-        format!("{rating:.1}")
-    }
-}
-
-fn resume_item_card_text(item: &ResumeItem) -> (String, Option<String>) {
-    match item.item_type.as_deref() {
-        Some("Episode") => {
-            let title = item
-                .series_name
-                .as_deref()
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or(&item.name)
-                .to_string();
-            let subtitle = match (item.parent_index_number, item.index_number) {
-                (Some(season), Some(episode)) => format!("S{season}E{episode}: {}", item.name),
-                _ => item.name.clone(),
-            };
-
-            (title, Some(subtitle))
-        }
-        Some("Movie") => (
-            item.name.clone(),
-            item.production_year.map(|year| year.to_string()),
-        ),
-        _ => (item.name.clone(), None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,9 +835,17 @@ mod tests {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 let item = serde_json::json!({"Id": "1", "Name": "Movie", "Type": "Movie"});
                 let card = if self.0 {
-                    episode_card(&serde_json::from_value(item).unwrap(), None, true, cx)
+                    episode_card(
+                        EpisodeCardVm::new(&serde_json::from_value(item).unwrap(), None, true),
+                        None,
+                        cx,
+                    )
                 } else {
-                    user_item_card(&serde_json::from_value(item).unwrap(), None, cx)
+                    user_item_card(
+                        UserItemCardVm::new(&serde_json::from_value(item).unwrap(), None, true),
+                        None,
+                        cx,
+                    )
                 };
                 div()
                     .size_full()
@@ -1041,25 +888,6 @@ mod tests {
                     "selected={selected} position={position:?} bounds={bounds:?}"
                 );
             }
-        }
-    }
-
-    fn resume_item(item_type: &str, name: &str) -> ResumeItem {
-        ResumeItem {
-            id: "item-1".to_string(),
-            name: name.to_string(),
-            item_type: Some(item_type.to_string()),
-            parent_id: None,
-            series_name: None,
-            series_id: None,
-            parent_index_number: None,
-            index_number: None,
-            production_year: None,
-            image_tags: None,
-            backdrop_image_tags: None,
-            parent_backdrop_item_id: None,
-            parent_backdrop_image_tags: None,
-            user_data: None,
         }
     }
 
@@ -1168,99 +996,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn formats_community_rating_badge_text() {
-        assert_eq!(format_community_rating(8.0), "8");
-        assert_eq!(format_community_rating(8.74), "8.7");
-        assert_eq!(format_community_rating(8.75), "8.8");
-    }
-
-    #[test]
-    fn crops_wide_cover_images_horizontally() {
-        assert_eq!(
-            cover_crop_bounds(400, 213, 160, 213).unwrap(),
-            (120, 0, 160, 213)
-        );
-    }
-
-    #[test]
-    fn crops_tall_cover_images_vertically() {
-        assert_eq!(
-            cover_crop_bounds(160, 400, 160, 213).unwrap(),
-            (0, 93, 160, 213)
-        );
-    }
-
-    #[test]
-    fn crops_portrait_resume_image_to_fixed_landscape_frame() {
-        assert_eq!(
-            cover_crop_bounds(
-                160,
-                213,
-                USER_VIEW_CARD_WIDTH_PX as u32,
-                USER_VIEW_CARD_IMAGE_HEIGHT_PX as u32,
-            )
-            .unwrap(),
-            (0, 61, 160, 90)
-        );
-    }
-
-    #[test]
-    fn compacts_indented_paragraphs_before_episode_line_clamp() {
-        let overview = "　　改编自飞卢小说网同名小说。\n\n　　顾长歌穿越到玄幻世界，发现自己成了注定被“天命之子”击败的“天命大反派”顾长歌，为求自保并逆天改命，他被迫利用系统和对“爽文套路”的先知，反向算计、掠夺并打压各位“天命之子”，从而获得奖励，一步步走上巅峰。";
-
-        assert_eq!(
-            compact_episode_overview(Some(overview)).as_deref(),
-            Some(
-                "改编自飞卢小说网同名小说。 顾长歌穿越到玄幻世界，发现自己成了注定被“天命之子”击败的“天命大反派”顾长歌，为求自保并逆天改命，他被迫利用系统和对“爽文套路”的先知，反向算计、掠夺并打压各位“天命之子”，从而获得奖励，一步步走上巅峰。"
-            )
-        );
-        assert_eq!(compact_episode_overview(Some(" \n　\t")), None);
-    }
-
-    #[test]
-    fn formats_episode_resume_card_text() {
-        let mut item = resume_item("Episode", "第三集");
-        item.series_name = Some("示例剧集".to_string());
-        item.parent_index_number = Some(1);
-        item.index_number = Some(3);
-
-        let (title, subtitle) = resume_item_card_text(&item);
-
-        assert_eq!(title, "示例剧集");
-        assert_eq!(subtitle.as_deref(), Some("S1E3: 第三集"));
-    }
-
-    #[test]
-    fn falls_back_for_incomplete_episode_resume_card_text() {
-        let item = resume_item("Episode", "特别篇");
-
-        let (title, subtitle) = resume_item_card_text(&item);
-
-        assert_eq!(title, "特别篇");
-        assert_eq!(subtitle.as_deref(), Some("特别篇"));
-    }
-
-    #[test]
-    fn formats_movie_resume_card_text() {
-        let mut item = resume_item("Movie", "示例电影");
-        item.production_year = Some(2024);
-
-        let (title, subtitle) = resume_item_card_text(&item);
-
-        assert_eq!(title, "示例电影");
-        assert_eq!(subtitle.as_deref(), Some("2024"));
-    }
-
-    #[test]
-    fn omits_missing_movie_resume_card_subtitle() {
-        let item = resume_item("Movie", "无年份电影");
-
-        let (title, subtitle) = resume_item_card_text(&item);
-
-        assert_eq!(title, "无年份电影");
-        assert!(subtitle.is_none());
     }
 }

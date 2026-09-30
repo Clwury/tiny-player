@@ -3,17 +3,20 @@ use super::*;
 const PROGRESS_HOVER_LABEL_WIDTH_PX: f32 = 72.0;
 const PROGRESS_HOVER_CURSOR_GAP_PX: f32 = 8.0;
 
-struct ProgressHoverPreview {
+pub(super) struct ProgressHoverPreview {
     label: String,
     left: Pixels,
     width: Pixels,
     show_on_left: bool,
 }
 
-fn progress_hover_preview(timeline: &PlaybackTimelineState) -> Option<ProgressHoverPreview> {
+pub(super) fn progress_hover_preview(
+    timeline: &PlaybackTimelineState,
+    presentation: &PlaybackTimelinePresentation,
+) -> Option<ProgressHoverPreview> {
     let duration = timeline.duration.and_then(valid_playback_duration)?;
-    let bounds = timeline.progress_track_bounds?;
-    let cursor = timeline.progress_hover_cursor?;
+    let bounds = presentation.progress_track_bounds?;
+    let cursor = presentation.progress_hover_cursor?;
     if !bounds.contains(&cursor) {
         return None;
     }
@@ -42,28 +45,25 @@ fn progress_hover_preview(timeline: &PlaybackTimelineState) -> Option<ProgressHo
 }
 
 pub(super) fn render_progress_hover(
-    timeline: &PlaybackTimelineState,
+    preview: ProgressHoverPreview,
     cx: &gpui::App,
-) -> Option<impl IntoElement> {
-    let preview = progress_hover_preview(timeline)?;
-    Some(
-        div()
-            .debug_selector(|| "playback-progress-hover-time".to_string())
-            .absolute()
-            .top(px(28.0))
-            .left(preview.left)
-            .w(preview.width)
-            .h(px(20.0))
-            .flex()
-            .items_center()
-            .when(preview.show_on_left, |label| label.justify_end())
-            .when(!preview.show_on_left, |label| label.justify_start())
-            .text_xs()
-            .text_color(theme::media_overlay(cx).foreground)
-            .whitespace_nowrap()
-            .overflow_hidden()
-            .child(preview.label),
-    )
+) -> impl IntoElement {
+    div()
+        .debug_selector(|| "playback-progress-hover-time".to_string())
+        .absolute()
+        .top(px(28.0))
+        .left(preview.left)
+        .w(preview.width)
+        .h(px(20.0))
+        .flex()
+        .items_center()
+        .when(preview.show_on_left, |label| label.justify_end())
+        .when(!preview.show_on_left, |label| label.justify_start())
+        .text_xs()
+        .text_color(theme::media_overlay(cx).foreground)
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .child(preview.label)
 }
 
 impl PlaybackPage {
@@ -72,8 +72,15 @@ impl PlaybackPage {
         cursor: Option<Point<Pixels>>,
         cx: &mut Context<Self>,
     ) {
-        if self.timeline.progress_hover_cursor != cursor {
-            self.timeline.progress_hover_cursor = cursor;
+        if self
+            .presentation
+            .timeline_presentation
+            .progress_hover_cursor
+            != cursor
+        {
+            self.presentation
+                .timeline_presentation
+                .progress_hover_cursor = cursor;
             cx.notify();
         }
     }
@@ -112,7 +119,7 @@ impl PlaybackPage {
         // The outside-release listener runs even for clicks on the titlebar.
         // Only consume a release belonging to an active seek; Windows caption
         // buttons need their mouse-up event to reach the native backend.
-        if self.timeline.progress_drag_position.is_none() {
+        if self.session.timeline().progress_drag_position.is_none() {
             return;
         }
         self.commit_progress_drag(window, cx);
@@ -127,14 +134,7 @@ impl PlaybackPage {
         let Some(position) = self.position_for_progress_cursor(cursor_x) else {
             return;
         };
-        if self
-            .timeline
-            .progress_drag_position
-            .is_none_or(|current| (current - position).abs() >= 0.02)
-        {
-            self.timeline.progress_drag_position = Some(position);
-            cx.notify();
-        }
+        self.dispatch_control(PlaybackIntent::PreviewSeek(position), cx);
     }
 
     pub(in super::super) fn commit_progress_drag(
@@ -142,15 +142,18 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(position) = self.timeline.progress_drag_position else {
+        let Some(position) = self.session.timeline().progress_drag_position else {
             return;
         };
         self.seek_to_position(position, window, cx);
     }
 
     pub(in super::super) fn position_for_progress_cursor(&self, cursor_x: Pixels) -> Option<f64> {
-        let duration = self.timeline.duration?;
-        let bounds = self.timeline.progress_track_bounds?;
+        let duration = self.session.timeline().duration?;
+        let bounds = self
+            .presentation
+            .timeline_presentation
+            .progress_track_bounds?;
         let fraction = progress_fraction_for_cursor(cursor_x, bounds)?;
         Some(clamp_playback_position(
             duration * fraction as f64,
@@ -166,6 +169,7 @@ mod tests {
     use tiny_playback::{DemuxCacheState, PlaybackCacheTimeRange};
 
     use super::*;
+    use crate::player::model::progress::{forward_cache_fraction, progress_fraction};
 
     #[gpui::test]
     fn forward_cache_remains_drawn_when_seekable_start_passes_the_playhead(
@@ -258,35 +262,61 @@ mod tests {
     fn progress_hover_time_follows_the_cursor_and_formats_hours() {
         let mut timeline = PlaybackTimelineState {
             duration: Some(7322.0),
+            ..PlaybackTimelineState::default()
+        };
+        let mut presentation = PlaybackTimelinePresentation {
             progress_track_bounds: Some(Bounds::new(
                 point(px(100.0), px(200.0)),
                 size(px(400.0), px(28.0)),
             )),
-            ..PlaybackTimelineState::default()
+            ..PlaybackTimelinePresentation::default()
         };
         // GPUI hit testing excludes the exact right edge.
         for (cursor_x, expected) in [(100.0, "0:00"), (300.0, "1:01:01"), (499.999, "2:02:02")] {
-            timeline.progress_hover_cursor = Some(point(px(cursor_x), px(214.0)));
-            assert_eq!(progress_hover_preview(&timeline).unwrap().label, expected);
+            presentation.progress_hover_cursor = Some(point(px(cursor_x), px(214.0)));
+            assert_eq!(
+                progress_hover_preview(&timeline, &presentation)
+                    .unwrap()
+                    .label,
+                expected
+            );
         }
         timeline.duration = Some(1800.0);
-        timeline.progress_hover_cursor = Some(point(px(300.0), px(214.0)));
-        assert_eq!(progress_hover_preview(&timeline).unwrap().label, "15:00");
+        presentation.progress_hover_cursor = Some(point(px(300.0), px(214.0)));
+        assert_eq!(
+            progress_hover_preview(&timeline, &presentation)
+                .unwrap()
+                .label,
+            "15:00"
+        );
 
         // Recompute against the resized track without waiting for another mouse move.
-        timeline.progress_track_bounds.as_mut().unwrap().size.width = px(800.0);
-        assert_eq!(progress_hover_preview(&timeline).unwrap().label, "7:30");
+        presentation
+            .progress_track_bounds
+            .as_mut()
+            .unwrap()
+            .size
+            .width = px(800.0);
+        assert_eq!(
+            progress_hover_preview(&timeline, &presentation)
+                .unwrap()
+                .label,
+            "7:30"
+        );
     }
 
     #[test]
     fn progress_hover_disappears_outside_the_track_or_without_valid_duration() {
         let mut timeline = PlaybackTimelineState {
             duration: Some(120.0),
+            ..PlaybackTimelineState::default()
+        };
+        let mut presentation = PlaybackTimelinePresentation {
             progress_track_bounds: Some(Bounds::new(
                 point(px(100.0), px(200.0)),
                 size(px(400.0), px(28.0)),
             )),
-            ..PlaybackTimelineState::default()
+            ..PlaybackTimelinePresentation::default()
         };
         for cursor in [
             None,
@@ -295,10 +325,10 @@ mod tests {
             Some(point(px(300.0), px(199.0))),
             Some(point(px(300.0), px(229.0))),
         ] {
-            timeline.progress_hover_cursor = cursor;
-            assert!(progress_hover_preview(&timeline).is_none());
+            presentation.progress_hover_cursor = cursor;
+            assert!(progress_hover_preview(&timeline, &presentation).is_none());
         }
-        timeline.progress_hover_cursor = Some(point(px(100.0), px(214.0)));
+        presentation.progress_hover_cursor = Some(point(px(100.0), px(214.0)));
         for duration in [
             None,
             Some(0.0),
@@ -307,22 +337,28 @@ mod tests {
             Some(f64::INFINITY),
         ] {
             timeline.duration = duration;
-            assert!(progress_hover_preview(&timeline).is_none());
+            assert!(progress_hover_preview(&timeline, &presentation).is_none());
         }
         timeline.duration = Some(120.0);
-        timeline.progress_track_bounds.as_mut().unwrap().size.width = px(0.0);
-        assert!(progress_hover_preview(&timeline).is_none());
+        presentation
+            .progress_track_bounds
+            .as_mut()
+            .unwrap()
+            .size
+            .width = px(0.0);
+        assert!(progress_hover_preview(&timeline, &presentation).is_none());
     }
 
     #[gpui::test]
     fn progress_hover_label_switches_cursor_sides_after_the_midpoint(cx: &mut TestAppContext) {
         struct ProgressPreview {
             timeline: PlaybackTimelineState,
+            timeline_presentation: PlaybackTimelinePresentation,
         }
 
         impl Render for ProgressPreview {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                let bounds = self.timeline.progress_track_bounds.unwrap();
+                let bounds = self.timeline_presentation.progress_track_bounds.unwrap();
                 div().relative().size_full().child(
                     div()
                         .debug_selector(|| "preview-track".to_string())
@@ -336,7 +372,8 @@ mod tests {
                             1.0,
                         ))
                         .when_some(
-                            render_progress_hover(&self.timeline, cx),
+                            progress_hover_preview(&self.timeline, &self.timeline_presentation)
+                                .map(|preview| render_progress_hover(preview, cx)),
                             |track, preview| track.child(preview),
                         ),
                 )
@@ -347,24 +384,28 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, _| ProgressPreview {
             timeline: PlaybackTimelineState {
                 duration: Some(7322.0),
+                ..PlaybackTimelineState::default()
+            },
+            timeline_presentation: PlaybackTimelinePresentation {
                 progress_track_bounds: Some(Bounds::new(
                     point(px(16.0), px(16.0)),
                     size(px(400.0), px(28.0)),
                 )),
-                ..PlaybackTimelineState::default()
+                ..PlaybackTimelinePresentation::default()
             },
         });
         for width in [48.0, 160.0, 400.0] {
             for fraction in [0.0, 0.4999, 0.5, 0.5001, 1.0] {
                 view.update(cx, |view, cx| {
-                    view.timeline
+                    view.timeline_presentation
                         .progress_track_bounds
                         .as_mut()
                         .unwrap()
                         .size
                         .width = px(width);
                     let offset = (width * fraction).min(width - 0.001);
-                    view.timeline.progress_hover_cursor = Some(point(px(16.0 + offset), px(30.0)));
+                    view.timeline_presentation.progress_hover_cursor =
+                        Some(point(px(16.0 + offset), px(30.0)));
                     cx.notify();
                 });
                 cx.run_until_parked();
@@ -373,8 +414,9 @@ mod tests {
                 assert_eq!(label.top(), track.bottom());
                 assert!(label.left() >= track.left());
                 assert!(label.right() <= track.right());
-                let cursor =
-                    view.read_with(cx, |view, _| view.timeline.progress_hover_cursor.unwrap());
+                let cursor = view.read_with(cx, |view, _| {
+                    view.timeline_presentation.progress_hover_cursor.unwrap()
+                });
                 // GPUI rounds painted bounds to physical pixels.
                 if fraction <= 0.5 {
                     assert!(
@@ -391,7 +433,7 @@ mod tests {
             }
         }
         view.update(cx, |view, cx| {
-            view.timeline.progress_hover_cursor = None;
+            view.timeline_presentation.progress_hover_cursor = None;
             cx.notify();
         });
         cx.run_until_parked();

@@ -6,35 +6,31 @@ use gpui::{
 
 use crate::ui::radius;
 use crate::{
-    server::{AddServerSubmission, CachedServer, Protocol, ServerEndpoint},
+    server::{
+        AddServerSubmission, Protocol,
+        feature::form::{
+            ServerFormController, ServerFormInput, ServerFormIntent, ServerFormProps,
+            ServerFormUpdate,
+        },
+    },
     theme,
 };
 
 use super::{
     editor::{Editor, EditorEvent},
-    notification::{
-        NOTIFICATION_AUTOHIDE, NotificationQueue, error_notification, notification_layer,
-    },
+    notification::{NotificationQueue, error_notification, notification_layer},
 };
 
 const SERVER_DIALOG_ERROR_NOTIFICATION_KEY: &str = "server-dialog:error";
 const SERVER_DIALOG_NOTIFICATION_TOP_PX: f32 = 51.0;
 
-#[derive(Clone, Debug)]
-pub enum ServerDialogMode {
-    Add,
-    Edit { server_id: String },
-}
-
 pub struct AddServerDialogState {
-    mode: ServerDialogMode,
-    protocol: Protocol,
+    controller: ServerFormController,
     address: Entity<Editor>,
     port: Entity<Editor>,
     path: Entity<Editor>,
     username: Entity<Editor>,
     password: Entity<Editor>,
-    is_submitting: bool,
     notifications: NotificationQueue<&'static str>,
 }
 
@@ -44,61 +40,28 @@ impl AddServerDialogState {
     }
 
     pub fn new_add(cx: &mut Context<Self>) -> Self {
-        Self::new_with_values(
-            ServerDialogMode::Add,
-            Protocol::Https,
-            String::new(),
-            Protocol::Https.default_port().to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-            cx,
-        )
+        Self::from_props(ServerFormProps::default(), cx)
     }
 
-    pub fn new_edit(server: &CachedServer, cx: &mut Context<Self>) -> Self {
-        Self::new_with_values(
-            ServerDialogMode::Edit {
-                server_id: server.id.clone(),
-            },
-            server.endpoint.protocol,
-            server.endpoint.address_input_value(),
-            server.endpoint.port.to_string(),
-            server.endpoint.path.clone(),
-            server.username.clone(),
-            server.password.clone(),
-            cx,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_values(
-        mode: ServerDialogMode,
-        protocol: Protocol,
-        address: String,
-        port: String,
-        path: String,
-        username: String,
-        password: String,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub(crate) fn from_props(props: ServerFormProps, cx: &mut Context<Self>) -> Self {
+        let controller = ServerFormController::new(&props);
         let address_input = cx.new(|cx| {
             Editor::new("服务器地址", cx)
-                .default_value(address)
+                .default_value(props.address)
                 .borderless()
                 .height(px(30.0))
         });
         let port_input = cx.new(|cx| {
             Editor::new("端口", cx)
-                .default_value(port)
+                .default_value(props.port)
                 .digits_only()
                 .max_chars(5)
         });
-        let path_input = cx.new(|cx| Editor::new("可空", cx).default_value(path));
-        let username_input = cx.new(|cx| Editor::new("用户名", cx).default_value(username));
+        let path_input = cx.new(|cx| Editor::new("可空", cx).default_value(props.path));
+        let username_input = cx.new(|cx| Editor::new("用户名", cx).default_value(props.username));
         let password_input = cx.new(|cx| {
             Editor::new("密码", cx)
-                .default_value(password)
+                .default_value(props.password)
                 .masked(true)
                 .mask_toggle()
         });
@@ -113,51 +76,41 @@ impl AddServerDialogState {
         .detach();
 
         Self {
-            mode,
-            protocol,
+            controller,
             address: address_input,
             port: port_input,
             path: path_input,
             username: username_input,
             password: password_input,
-            is_submitting: false,
             notifications: NotificationQueue::default(),
         }
     }
 
     pub fn submit(&mut self, cx: &mut Context<Self>) -> Option<AddServerSubmission> {
-        if self.is_submitting {
-            return None;
-        }
-
-        self.notifications.clear();
-
-        let protocol = self.protocol;
         let address = self.address.read(cx).value();
         let port = self.port.read(cx).value();
         let path = self.path.read(cx).value();
         let username = self.username.read(cx).value();
         let password = self.password.read(cx).value();
 
-        match validate_server_submission(protocol, &address, &port, &path, &username, &password) {
-            Ok(submission) => Some(submission),
-            Err(error) => {
-                self.push_error_notification(error, cx);
-                None
-            }
-        }
+        self.dispatch_form(
+            ServerFormIntent::Submit(ServerFormInput {
+                address: &address,
+                port: &port,
+                path: &path,
+                username: &username,
+                password: &password,
+            }),
+            cx,
+        )
     }
 
     pub fn edit_server_id(&self) -> Option<String> {
-        match &self.mode {
-            ServerDialogMode::Add => None,
-            ServerDialogMode::Edit { server_id } => Some(server_id.clone()),
-        }
+        self.controller.view().edit_server_id.map(str::to_owned)
     }
 
     pub fn set_submitting(&mut self, is_submitting: bool, cx: &mut Context<Self>) {
-        self.is_submitting = is_submitting;
-        cx.notify();
+        self.dispatch_form(ServerFormIntent::SetSubmitting(is_submitting), cx);
     }
 
     pub fn push_error_notification(
@@ -165,51 +118,62 @@ impl AddServerDialogState {
         error: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        let id = self
-            .notifications
-            .push(SERVER_DIALOG_ERROR_NOTIFICATION_KEY, error.into());
-        cx.notify();
-
-        cx.spawn(async move |dialog, cx| {
-            cx.background_executor().timer(NOTIFICATION_AUTOHIDE).await;
-            dialog
-                .update(cx, |dialog, cx| {
-                    if dialog.notifications.remove(id) {
-                        cx.notify();
-                    }
-                })
-                .ok();
-        })
-        .detach();
+        self.notifications.push_autohide(
+            SERVER_DIALOG_ERROR_NOTIFICATION_KEY,
+            error.into(),
+            cx,
+            |dialog| &mut dialog.notifications,
+        );
     }
 
     fn auto_format_full_url(&mut self, cx: &mut Context<Self>) {
         let address = self.address.read(cx).value();
-        let Some(endpoint) = parsed_full_url_endpoint(&address) else {
-            return;
-        };
+        self.dispatch_form(ServerFormIntent::AddressChanged(&address), cx);
+    }
 
-        self.protocol = endpoint.protocol;
-
-        let formatted_address = endpoint.address_input_value();
-        self.address.update(cx, |address, cx| {
-            if address.value().as_ref() != formatted_address {
-                address.set_value(formatted_address, cx);
+    fn dispatch_form(
+        &mut self,
+        intent: ServerFormIntent<'_>,
+        cx: &mut Context<Self>,
+    ) -> Option<AddServerSubmission> {
+        match self.controller.dispatch(intent) {
+            ServerFormUpdate::Ignored => return None,
+            ServerFormUpdate::Changed => {}
+            ServerFormUpdate::PortChanged(value) => {
+                self.port.update(cx, |port, cx| port.set_value(value, cx));
             }
-        });
-        self.port.update(cx, |port, cx| {
-            let formatted_port = endpoint.port.to_string();
-            if port.value().as_ref() != formatted_port {
-                port.set_value(formatted_port, cx);
+            ServerFormUpdate::EndpointChanged(endpoint) => {
+                let formatted_address = endpoint.address_input_value();
+                self.address.update(cx, |address, cx| {
+                    if address.value().as_ref() != formatted_address {
+                        address.set_value(formatted_address, cx);
+                    }
+                });
+                self.port.update(cx, |port, cx| {
+                    let formatted_port = endpoint.port.to_string();
+                    if port.value().as_ref() != formatted_port {
+                        port.set_value(formatted_port, cx);
+                    }
+                });
+                self.path.update(cx, |path, cx| {
+                    if path.value().as_ref() != endpoint.path {
+                        path.set_value(endpoint.path, cx);
+                    }
+                });
             }
-        });
-        self.path.update(cx, |path, cx| {
-            if path.value().as_ref() != endpoint.path {
-                path.set_value(endpoint.path, cx);
+            ServerFormUpdate::Submission(result) => {
+                self.notifications.clear();
+                return match result {
+                    Ok(submission) => Some(submission),
+                    Err(error) => {
+                        self.push_error_notification(error, cx);
+                        None
+                    }
+                };
             }
-        });
-
+        }
         cx.notify();
+        None
     }
 
     pub fn render_layer(
@@ -221,10 +185,7 @@ impl AddServerDialogState {
         cx: &App,
     ) -> impl IntoElement {
         let theme = theme::get(cx);
-        let (title, submit_label) = match &self.mode {
-            ServerDialogMode::Add => ("添加服务器", "添加"),
-            ServerDialogMode::Edit { .. } => ("编辑服务器", "保存"),
-        };
+        let view = self.controller.view();
 
         div()
             .absolute()
@@ -262,7 +223,7 @@ impl AddServerDialogState {
                             .text_lg()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.foreground)
-                            .child(title),
+                            .child(view.title),
                     )
                     .child(self.render_form(dialog.clone(), cx))
                     .child(
@@ -277,9 +238,9 @@ impl AddServerDialogState {
                             .child(
                                 dialog_button(
                                     "submit-add-server",
-                                    submit_label,
+                                    view.submit_label,
                                     true,
-                                    self.is_submitting,
+                                    view.is_submitting,
                                     cx,
                                 )
                                 .on_click(on_submit),
@@ -293,6 +254,10 @@ impl AddServerDialogState {
 
     fn render_form(&self, dialog: Entity<Self>, cx: &App) -> impl IntoElement {
         let port = self.port.read(cx).value();
+        let view = self.controller.view();
+        let on_protocol_select = move |protocol, cx: &mut App| {
+            dialog.update(cx, |dialog, cx| dialog.select_protocol(protocol, cx));
+        };
 
         div()
             .flex()
@@ -303,7 +268,7 @@ impl AddServerDialogState {
                 "服务器地址",
                 address_input(
                     self.address.clone(),
-                    format!("{}://", self.protocol.scheme()),
+                    format!("{}://", view.protocol.scheme()),
                     format!(":{}", port),
                     cx,
                 ),
@@ -315,7 +280,7 @@ impl AddServerDialogState {
                     .gap_3()
                     .child(div().w(px(148.0)).child(field(
                         "协议",
-                        protocol_selector(dialog.clone(), self.protocol, cx),
+                        protocol_selector(view.protocol, on_protocol_select, cx),
                         cx,
                     )))
                     .child(div().flex_1().child(field("端口", self.port.clone(), cx))),
@@ -326,21 +291,14 @@ impl AddServerDialogState {
     }
 
     fn select_protocol(&mut self, protocol: Protocol, cx: &mut Context<Self>) {
-        if self.protocol == protocol {
-            return;
-        }
-
-        let previous_default = self.protocol.default_port();
-        let next_default = protocol.default_port();
-        self.protocol = protocol;
-
-        self.port.update(cx, |port, cx| {
-            let value = port.value();
-            if value.is_empty() || value.as_ref() == previous_default {
-                port.set_value(next_default, cx);
-            }
-        });
-        cx.notify();
+        let port = self.port.read(cx).value();
+        self.dispatch_form(
+            ServerFormIntent::SelectProtocol {
+                protocol,
+                port: &port,
+            },
+            cx,
+        );
     }
 
     fn dismiss_notification(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -367,43 +325,6 @@ impl AddServerDialogState {
                 )
             }))
     }
-}
-
-fn validate_server_submission(
-    protocol: Protocol,
-    address: &str,
-    port: &str,
-    path: &str,
-    username: &str,
-    password: &str,
-) -> Result<AddServerSubmission, SharedString> {
-    let endpoint = ServerEndpoint::parse_user_input(protocol, address, port, path)
-        .map_err(|error| -> SharedString { error.to_string().into() })?;
-    let username = username.trim();
-    let password = password.trim();
-
-    if username.is_empty() {
-        return Err("请输入用户名".into());
-    }
-    if password.is_empty() {
-        return Err("请输入密码".into());
-    }
-
-    Ok(AddServerSubmission {
-        endpoint,
-        username: username.to_string(),
-        password: password.to_string(),
-    })
-}
-
-fn parsed_full_url_endpoint(address: &str) -> Option<ServerEndpoint> {
-    let address = address.trim();
-    let lower_address = address.to_ascii_lowercase();
-    if !lower_address.starts_with("http://") && !lower_address.starts_with("https://") {
-        return None;
-    }
-
-    ServerEndpoint::parse_user_input(Protocol::Https, address, "", "").ok()
 }
 
 fn field(label: &'static str, input: impl IntoElement, cx: &App) -> impl IntoElement {
@@ -461,8 +382,8 @@ fn address_input(
 }
 
 fn protocol_selector(
-    dialog: Entity<AddServerDialogState>,
     selected: Protocol,
+    on_select: impl Fn(Protocol, &mut App) + Clone + 'static,
     cx: &App,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
@@ -478,23 +399,23 @@ fn protocol_selector(
         .p(px(2.0))
         .gap_0p5()
         .child(protocol_button(
-            dialog.clone(),
             Protocol::Http,
             selected == Protocol::Http,
+            on_select.clone(),
             cx,
         ))
         .child(protocol_button(
-            dialog,
             Protocol::Https,
             selected == Protocol::Https,
+            on_select,
             cx,
         ))
 }
 
 fn protocol_button(
-    dialog: Entity<AddServerDialogState>,
     protocol: Protocol,
     selected: bool,
+    on_select: impl Fn(Protocol, &mut App) + 'static,
     cx: &App,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
@@ -522,9 +443,7 @@ fn protocol_button(
             })
         })
         .child(protocol.label())
-        .on_click(move |_, _, cx| {
-            dialog.update(cx, |dialog, cx| dialog.select_protocol(protocol, cx));
-        })
+        .on_click(move |_, _, cx| on_select(protocol, cx))
 }
 
 fn dialog_button(
@@ -580,69 +499,4 @@ fn dialog_button(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_full_url_for_auto_formatting() {
-        let endpoint = parsed_full_url_endpoint(" http://example.com:8096/custom ").unwrap();
-
-        assert_eq!(endpoint.protocol, Protocol::Http);
-        assert_eq!(endpoint.address_input_value(), "example.com");
-        assert_eq!(endpoint.port, 8096);
-        assert_eq!(endpoint.path, "/custom");
-    }
-
-    #[test]
-    fn parses_full_url_without_port_using_scheme_default() {
-        let endpoint = parsed_full_url_endpoint("https://example.com").unwrap();
-
-        assert_eq!(endpoint.protocol, Protocol::Https);
-        assert_eq!(endpoint.port, 443);
-        assert_eq!(endpoint.path, "");
-    }
-
-    #[test]
-    fn ignores_non_full_url_for_auto_formatting() {
-        assert!(parsed_full_url_endpoint("example.com:8096").is_none());
-        assert!(parsed_full_url_endpoint("ftp://example.com").is_none());
-    }
-
-    #[test]
-    fn validates_address_before_credentials() {
-        let error = validate_server_submission(Protocol::Https, "", "443", "", "", "")
-            .expect_err("blank address should fail validation first");
-
-        assert_eq!(error.as_ref(), "请输入服务器地址");
-    }
-
-    #[test]
-    fn validates_username_before_password() {
-        let error = validate_server_submission(Protocol::Https, "example.com", "443", "", "", "")
-            .expect_err("blank username should fail validation before password");
-
-        assert_eq!(error.as_ref(), "请输入用户名");
-
-        let error =
-            validate_server_submission(Protocol::Https, "example.com", "443", "", "user", "")
-                .expect_err("blank password should fail after username is valid");
-        assert_eq!(error.as_ref(), "请输入密码");
-    }
-
-    #[test]
-    fn valid_submission_trims_credentials() {
-        let submission = validate_server_submission(
-            Protocol::Https,
-            "example.com",
-            "443",
-            "",
-            " user ",
-            " password ",
-        )
-        .expect("valid fields should produce a submission");
-
-        assert_eq!(submission.endpoint.address, "example.com");
-        assert_eq!(submission.username, "user");
-        assert_eq!(submission.password, "password");
-    }
-}
+mod tests;

@@ -1,8 +1,6 @@
 use gpui::{ClickEvent, Context, IntoElement, ParentElement, SharedString};
 
-use crate::ui::notification::{
-    NOTIFICATION_AUTOHIDE, NotificationQueue, error_notification, notification_layer,
-};
+use crate::ui::notification::{NotificationQueue, error_notification, notification_layer};
 
 use super::TinyApp;
 
@@ -20,21 +18,12 @@ impl TinyApp {
         message: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        let id = self
-            .app_notifications
-            .push(AppNotificationKey::AppError, message.into());
-        cx.notify();
-
-        cx.spawn(async move |app, cx| {
-            cx.background_executor().timer(NOTIFICATION_AUTOHIDE).await;
-            app.update(cx, |app, cx| {
-                if app.app_notifications.remove(id) {
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
+        self.app_notifications.push_autohide(
+            AppNotificationKey::AppError,
+            message.into(),
+            cx,
+            |app| &mut app.app_notifications,
+        );
     }
 
     pub(super) fn clear_app_notifications(&mut self) {
@@ -74,21 +63,12 @@ impl TinyApp {
         message: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        let id = self
-            .app_notifications
-            .push(AppNotificationKey::ServerError, message.into());
-        cx.notify();
-
-        cx.spawn(async move |app, cx| {
-            cx.background_executor().timer(NOTIFICATION_AUTOHIDE).await;
-            app.update(cx, |app, cx| {
-                if app.app_notifications.remove(id) {
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
+        self.app_notifications.push_autohide(
+            AppNotificationKey::ServerError,
+            message.into(),
+            cx,
+            |app| &mut app.app_notifications,
+        );
     }
 
     pub(super) fn clear_server_notifications(&mut self) {

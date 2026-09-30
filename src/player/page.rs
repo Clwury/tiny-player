@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use gpui::{
     AppContext as _, Bounds, Context, DragMoveEvent, EventEmitter, FocusHandle, InteractiveElement,
@@ -13,16 +13,14 @@ use crate::{
     theme,
 };
 
-use super::{
-    PlaybackTrackExt,
-    presentation::{SubtitleImages, defer_drop_frame, defer_drop_released_images, render_image},
+use super::presentation::{
+    SubtitleImages, defer_drop_frame, defer_drop_released_images, render_image,
 };
 use tiny_playback::{
-    BackendCommand, BackendControl, BackendEventKind, BackendLoadRequest, BackendSubtitleBitmap,
-    BackendSubtitleCue, FfmpegBackend, PlaybackAudioInfo, PlaybackCacheState, PlaybackFileInfo,
-    PlaybackSeekMode, PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection, PlaybackVideoInfo,
-    PlaybackVolumeSettings, RenderSize, StreamCacheKind, VideoPresenter, VideoPresenterSnapshot,
-    clamp_playback_volume,
+    BackendCommand, BackendLoadRequest, BackendSubtitleBitmap, BackendSubtitleCue,
+    PlaybackAudioInfo, PlaybackCacheState, PlaybackFileInfo, PlaybackSeekMode, PlaybackTrack,
+    PlaybackTrackKind, PlaybackVideoInfo, PlaybackVolumeSettings, RenderSize, StreamCacheKind,
+    VideoPresenterSnapshot, clamp_playback_volume,
 };
 
 mod backend_events;
@@ -30,49 +28,49 @@ mod controls;
 mod diagnostics;
 mod episodes;
 mod fullscreen;
+mod presentation;
 mod progress;
 mod queue;
 mod rate;
 mod render;
-mod request;
-mod runtime;
+mod report_delivery;
 mod session;
 mod shortcuts;
-mod state;
 mod subtitles;
+mod timers;
 mod video_element;
 mod video_viewport;
 
 #[cfg(test)]
+mod adapter_tests;
+#[cfg(test)]
 mod mouse_tests;
 
-pub use request::{
-    EmbyPlaybackContext, PlaybackQueue, PlaybackQueueItem, PlaybackRequest,
-    playback_initial_position_seconds,
-};
-pub(crate) use request::{
-    playback_audio_tracks_for_source, playback_subtitle_tracks_for_source,
-    preferred_playback_track_selection,
-};
+use super::{EmbyPlaybackContext, PlaybackRequest};
+#[cfg(test)]
+use super::{PlaybackQueue, PlaybackQueueItem, PlaybackTrackSelection};
 pub use session::{PlaybackStateUpdate, PlaybackStopCompletion, PlaybackStopResult};
 
+use super::backend::PlaybackBackendAdapter;
+use super::model::source::{PlaybackSourceState, PlaybackTrackState, playback_protocol};
+use super::model::timeline::PlaybackTimelineState;
+use super::session::PlaybackIntent;
+use presentation::{
+    PlaybackPresentationState, PlaybackTimelinePresentation, SubtitleOverlayState, WindowDragState,
+};
 use progress::{
-    ProgressBarDrag, buffered_until_after_seek, cache_range_fractions, cached_seek_target,
-    clamp_playback_position, format_playback_time, forward_cache_fraction, progress_fraction,
-    progress_fraction_for_cursor, should_apply_backend_position, valid_playback_duration,
-    valid_playback_time,
+    ProgressBarDrag, clamp_playback_position, format_playback_time, progress_fraction_for_cursor,
+    valid_playback_duration, valid_playback_time,
 };
 use render::{
     AnimationFrameRequestState, aspect_fit_bounds, normalize_video_viewport, playback_status,
     render_output_size, render_playback_status, should_render_frame,
     should_request_animation_frame, viewport_changed,
 };
-use runtime::{PlaybackBackend, ShutdownOrder};
-use state::{
-    FullscreenControlsState, PlaybackFrameState, PlaybackTimelineState, PlaybackVolumeState,
-    SubtitleOverlayState, TrackSelectState, WindowDragState,
-};
 use subtitles::defer_drop_subtitle;
+use timers::{PresentationEffects, PresentationTimer};
+#[cfg(test)]
+use tiny_playback::BackendEventKind;
 use video_element::VideoFrameElement;
 use video_viewport::VideoViewport;
 
@@ -93,34 +91,28 @@ pub enum PlaybackEvent {
     },
 }
 
+impl PlaybackEvent {
+    pub(crate) fn trace(&self) {
+        let operation = match self {
+            Self::VolumeChanged { .. } => "playback.volume_changed",
+            Self::Update { .. } => "playback.update",
+            Self::Back { .. } => "playback.back",
+            Self::Replace { .. } => "playback.replace",
+        };
+        crate::observability::TraceId::start(operation).record("received");
+    }
+}
+
 pub struct PlaybackPage {
-    focus_handle: FocusHandle,
     title: SharedString,
-    video: ShutdownOrder<PlaybackBackend, VideoPresenter>,
-    frame: PlaybackFrameState,
-    timeline: PlaybackTimelineState,
-    download_speed: controls::DownloadSpeedDisplay,
-    playback_details_visible: bool,
-    fullscreen: FullscreenControlsState,
-    window_drag: WindowDragState,
-    source_protocol: Option<String>,
-    source_url: String,
-    content_length: Option<u64>,
-    playback_file_info: Option<PlaybackFileInfo>,
-    playback_info: Option<PlaybackVideoInfo>,
-    playback_audio_info: Option<PlaybackAudioInfo>,
-    queue: PlaybackQueue,
-    episode_list: episodes::PlaybackEpisodeListState,
+    video: PlaybackBackendAdapter,
+    presentation: PlaybackPresentationState,
+    session: super::session::PlaybackSessionController,
+    // Page-owned continuation; the session owns poll eligibility and token.
+    backend_poll: crate::effects::EffectHandle<gpui::Task<()>>,
     emby: EmbyPlaybackContext,
-    reporting: session::PlaybackReportingState,
-    queue_switch: queue::PlaybackQueueSwitchState,
-    tracks: TrackSelectState,
-    track_preference_key: super::PlaybackTrackPreferenceKey,
-    remember_subtitle_on_start: bool,
-    subtitle: SubtitleOverlayState,
-    volume: PlaybackVolumeState,
-    rate: rate::PlaybackRateState,
-    error_message: Option<SharedString>,
+    report_effects: session::ReportingEffects,
+    queue_effects: queue::QueueEffects,
 }
 
 impl EventEmitter<PlaybackEvent> for PlaybackPage {}
@@ -130,8 +122,8 @@ impl PlaybackPage {
         &mut self,
         config: tiny_playback::PlaybackCacheConfig,
     ) -> tiny_playback::Result<()> {
-        if let Some(backend) = self.video.owner_mut() {
-            backend.command(BackendCommand::SetCacheConfig(config))?;
+        if let Some(result) = self.video.command(BackendCommand::SetCacheConfig(config)) {
+            result?;
         }
         Ok(())
     }
@@ -155,50 +147,23 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) -> Self {
         Self::register_image_cleanup(cx);
-        let volume = PlaybackVolumeState::new(volume_settings);
-        let mut error_message = None;
+        let volume = volume_settings.normalized();
         let source_protocol = playback_protocol(&request.url);
         let content_length = request.content_length;
-        let reporting = session::PlaybackReportingState::new(&request.emby);
+        let report_effects = session::ReportingEffects::new(&request.emby, cx);
+        let queue_effects = queue::QueueEffects::new(&request.emby);
 
-        let (backend, video_presenter) = match FfmpegBackend::new() {
-            Ok(mut backend) => {
-                match VideoPresenter::new(BackendControl::video_output(&backend)) {
-                    Ok(video_presenter) => {
-                        let load_request = BackendLoadRequest {
-                            url: request.url.clone(),
-                            http_headers: request.http_headers.clone(),
-                            content_length: request.content_length,
-                            start_position_seconds: request.initial_position_seconds,
-                            selected_tracks: request.selected_tracks.clone(),
-                            cache_config: super::cache::engine_cache_config(cache_config.clone())
-                                .normalized(),
-                        };
-                        // Restore volume before loading so the first audio samples use it.
-                        let load_result = backend
-                            .command(BackendCommand::SetVolume {
-                                volume: volume.level,
-                            })
-                            .and_then(|()| backend.command(BackendCommand::Load(load_request)));
-                        if let Err(error) = load_result {
-                            error_message = Some(format!("加载视频失败：{error}").into());
-                        }
-                        (
-                            Some(PlaybackBackend::Ffmpeg(backend)),
-                            Some(video_presenter),
-                        )
-                    }
-                    Err(error) => {
-                        error_message = Some(format!("创建视频渲染器失败：{error}").into());
-                        (Some(PlaybackBackend::Ffmpeg(backend)), None)
-                    }
-                }
-            }
-            Err(error) => {
-                error_message = Some(format!("创建 FFmpeg 播放后端失败：{error}").into());
-                (None, None)
-            }
-        };
+        let (video, error_message) = PlaybackBackendAdapter::start(
+            BackendLoadRequest {
+                url: request.url.clone(),
+                http_headers: request.http_headers.clone(),
+                content_length: request.content_length,
+                start_position_seconds: request.initial_position_seconds,
+                selected_tracks: request.selected_tracks.clone(),
+                cache_config,
+            },
+            volume.level,
+        );
 
         let timeline = PlaybackTimelineState {
             position: valid_playback_time(request.initial_position_seconds),
@@ -206,39 +171,41 @@ impl PlaybackPage {
         };
 
         let mut page = Self {
-            focus_handle: cx.focus_handle(),
             title: request.title,
-            video: ShutdownOrder::new(backend, video_presenter),
-            frame: PlaybackFrameState::default(),
-            timeline,
-            download_speed: controls::DownloadSpeedDisplay::default(),
-            playback_details_visible: false,
-            fullscreen: FullscreenControlsState::default(),
-            window_drag: WindowDragState::default(),
-            source_protocol,
-            source_url: request.url,
-            content_length,
-            playback_file_info: None,
-            playback_info: None,
-            playback_audio_info: None,
-            queue: request.queue,
-            episode_list: episodes::PlaybackEpisodeListState::default(),
-            emby: request.emby,
-            reporting,
-            queue_switch: queue::PlaybackQueueSwitchState::default(),
-            tracks: TrackSelectState::new(
-                request.audio_tracks,
-                request.subtitle_tracks,
-                request.selected_tracks,
+            video,
+            presentation: PlaybackPresentationState::new(
+                cx.focus_handle(),
+                request.emby.server.workspace_identity(),
+                episodes::PlaybackEpisodeListState::new(&request.emby),
             ),
-            track_preference_key: request.track_preference_key,
-            remember_subtitle_on_start: request.remember_subtitle_on_start,
-            subtitle: SubtitleOverlayState::default(),
-            volume,
-            rate: rate::PlaybackRateState::default(),
-            error_message,
+            session: super::session::PlaybackSessionController::new(
+                timeline,
+                PlaybackSourceState {
+                    source_protocol,
+                    source_url: request.url,
+                    content_length,
+                    playback_file_info: None,
+                    playback_info: None,
+                    playback_audio_info: None,
+                    tracks: PlaybackTrackState::new(
+                        request.audio_tracks,
+                        request.subtitle_tracks,
+                        request.selected_tracks,
+                    ),
+                    track_preference_key: request.track_preference_key,
+                    remember_subtitle_on_start: request.remember_subtitle_on_start,
+                },
+                request.queue,
+                request.emby.server.workspace_identity(),
+                volume,
+                error_message,
+            ),
+            backend_poll: Default::default(),
+            emby: request.emby,
+            report_effects,
+            queue_effects,
         };
-        if page.error_message.is_some() {
+        if page.session.controls_view().error.is_some() {
             let _ = page.close_playback_reporting(true, false);
         }
         page
@@ -246,8 +213,7 @@ impl PlaybackPage {
 
     fn register_image_cleanup(cx: &Context<Self>) {
         cx.on_release(|page, cx| {
-            let mut images = page.subtitle.images.update(None);
-            images.extend(page.frame.current.take());
+            let images = page.presentation.release_images();
             defer_drop_released_images(images, cx);
         })
         .detach();
@@ -257,22 +223,14 @@ impl PlaybackPage {
         self.title.clone()
     }
 
-    fn can_toggle_playback(&self) -> bool {
-        self.timeline.loaded && !self.timeline.ended && self.error_message.is_none()
-    }
-
-    fn can_seek_playback(&self) -> bool {
-        self.timeline.loaded
-            && !self.timeline.ended
-            && self.error_message.is_none()
-            && self.timeline.duration.is_some()
-    }
-
     fn back_to_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.presentation.presentation_timers.close();
+        self.session.cancel_poll();
+        self.backend_poll.cancel();
         self.cancel_queue_switch();
         self.report_playback_progress(true);
-        let update = self.close_playback_reporting(false, self.timeline.ended);
-        defer_drop_subtitle(&mut self.subtitle, window);
+        let update = self.close_playback_reporting(false, self.session.timeline().ended);
+        defer_drop_subtitle(&mut self.presentation.subtitle, window);
         self.clear_visible_frame(window, cx);
         cx.emit(PlaybackEvent::Back { update });
     }
@@ -303,7 +261,7 @@ impl PlaybackPage {
             cx.stop_propagation();
             return;
         }
-        self.window_drag = if event.click_count == 1
+        self.presentation.window_drag = if event.click_count == 1
             && !window.is_fullscreen()
             && !window_uses_system_decorations(window)
         {
@@ -315,7 +273,8 @@ impl PlaybackPage {
         // non-client press. Its start_window_move() implementation is a no-op.
         // Keep double clicks and menu dismissal in the player instead of
         // letting Windows maximize the window or start a move.
-        if !cfg!(target_os = "windows") || self.window_drag != WindowDragState::Pending {
+        if !cfg!(target_os = "windows") || self.presentation.window_drag != WindowDragState::Pending
+        {
             cx.stop_propagation();
         }
         if event.click_count == 2 {
@@ -360,18 +319,18 @@ impl PlaybackPage {
     ) {
         if !event.dragging()
             || (window_uses_system_decorations(window)
-                && self.window_drag == WindowDragState::Pending)
+                && self.presentation.window_drag == WindowDragState::Pending)
         {
-            self.window_drag = WindowDragState::Idle;
+            self.presentation.window_drag = WindowDragState::Idle;
         }
         if !cfg!(target_os = "windows")
-            && self.window_drag == WindowDragState::Pending
+            && self.presentation.window_drag == WindowDragState::Pending
             && !window.is_fullscreen()
             && event.dragging()
-            && self.timeline.progress_drag_position.is_none()
+            && self.session.timeline().progress_drag_position.is_none()
         {
             // The compositor may consume the release after taking the pointer.
-            self.window_drag = WindowDragState::Idle;
+            self.presentation.window_drag = WindowDragState::Idle;
             cx.stop_propagation();
             window.start_window_move();
             return;
@@ -387,48 +346,56 @@ impl PlaybackPage {
         _cx: &mut Context<Self>,
     ) {
         if self
+            .presentation
             .frame
             .current
             .as_ref()
             .is_some_and(|current| current.id == frame.id)
         {
-            self.frame.current = Some(frame);
+            self.presentation.frame.current = Some(frame);
             return;
         }
 
-        let previous = self.frame.current.replace(frame);
+        let previous = self.presentation.frame.current.replace(frame);
         if let Some(previous) = previous {
             defer_drop_frame(previous, window);
         }
     }
 
     fn clear_visible_frame(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
-        if let Some(frame) = self.frame.current.take() {
+        if let Some(frame) = self.presentation.frame.current.take() {
             defer_drop_frame(frame, window);
         }
     }
 
     fn update_video_viewport(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
-        if !viewport_changed(self.frame.viewport_bounds, bounds) {
+        if !viewport_changed(self.presentation.frame.viewport_bounds, bounds) {
             return;
         }
 
-        self.frame.viewport_bounds = Some(bounds);
+        self.presentation.frame.viewport_bounds = Some(bounds);
         cx.notify();
     }
 
     fn update_progress_track_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
-        if !viewport_changed(self.timeline.progress_track_bounds, bounds) {
+        if !viewport_changed(
+            self.presentation
+                .timeline_presentation
+                .progress_track_bounds,
+            bounds,
+        ) {
             return;
         }
 
-        self.timeline.progress_track_bounds = Some(bounds);
+        self.presentation
+            .timeline_presentation
+            .progress_track_bounds = Some(bounds);
         cx.notify();
     }
 
     fn render_mouse_capture(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let record_press = cx.listener(|page, in_playback: &bool, _, _| {
-            page.window_drag = if *in_playback {
+            page.presentation.window_drag = if *in_playback {
                 WindowDragState::Blocked
             } else {
                 WindowDragState::Idle
@@ -436,11 +403,11 @@ impl PlaybackPage {
         });
         let reset_on_release = cx.listener(|page, event: &MouseUpEvent, _, _| {
             if event.button == MouseButton::Left {
-                page.window_drag = WindowDragState::Idle;
+                page.presentation.window_drag = WindowDragState::Idle;
             }
         });
         let stop_control_drag = cx.listener(|page, _: &MouseMoveEvent, _, cx| {
-            if page.window_drag == WindowDragState::Blocked {
+            if page.presentation.window_drag == WindowDragState::Blocked {
                 cx.stop_propagation();
             }
         });
@@ -508,13 +475,6 @@ impl PlaybackPage {
     }
 }
 
-fn playback_protocol(url: &str) -> Option<String> {
-    url::Url::parse(url)
-        .ok()
-        .map(|url| url.scheme().trim().to_ascii_lowercase())
-        .filter(|protocol| !protocol.is_empty())
-}
-
 fn playback_volume_percent(volume: f32) -> u32 {
     (clamp_playback_volume(volume) * 100.0).round() as u32
 }
@@ -534,20 +494,20 @@ fn volume_delta_from_scroll_delta(delta: ScrollDelta) -> f32 {
 impl Render for PlaybackPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.poll_backend(window, cx);
-        if !self.focus_handle.is_focused(window) {
-            window.focus(&self.focus_handle, cx);
+        if !self.presentation.focus_handle.is_focused(window) {
+            window.focus(&self.presentation.focus_handle, cx);
         }
 
-        let current_frame = self.frame.current.clone();
+        let current_frame = self.presentation.frame.current.clone();
         let current_video_frame = current_frame
             .clone()
-            .zip(self.frame.source_size)
+            .zip(self.presentation.frame.source_size)
             .map(|(frame, source_size)| VideoFrameElement { frame, source_size });
         let status = playback_status(
-            &self.timeline,
+            self.session.timeline(),
             current_frame.is_some(),
-            self.queue_switch.loading,
-            self.error_message.as_ref(),
+            self.session.queue.view_model().loading,
+            self.session.controls_view().error,
         );
         let progress_bar_visible = self.progress_bar_visible();
         if progress_bar_visible {
@@ -555,7 +515,7 @@ impl Render for PlaybackPage {
         }
         let corners = window_corner_radii(window, cx);
         let is_fullscreen = window.is_fullscreen();
-        if is_fullscreen && !self.fullscreen.cursor_visible {
+        if is_fullscreen && !self.presentation.fullscreen.cursor_visible {
             crate::hide_cursor_until_mouse_moves(cx);
         }
         let view = cx.entity().downgrade();
@@ -576,24 +536,25 @@ impl Render for PlaybackPage {
         .bottom_0()
         .left_0();
         let has_viewport = self
+            .presentation
             .frame
             .viewport_bounds
             .is_some_and(|viewport_bounds| normalize_video_viewport(viewport_bounds).is_some());
         let video_presenter_needs_frame = self
             .video
-            .dependent()
-            .is_some_and(|presenter| presenter.snapshot().needs_animation_frame());
+            .presenter_snapshot()
+            .is_some_and(|snapshot| snapshot.needs_animation_frame());
         if should_request_animation_frame(AnimationFrameRequestState {
-            has_backend: self.video.owner().is_some(),
-            has_video_presenter: self.video.dependent().is_some(),
-            has_loaded_file: self.timeline.loaded,
-            playback_ended: self.timeline.ended,
-            has_error: self.error_message.is_some(),
+            has_backend: self.video.has_backend(),
+            has_video_presenter: self.video.has_presenter(),
+            has_loaded_file: self.session.timeline().loaded,
+            playback_ended: self.session.timeline().ended,
+            has_error: self.session.controls_view().error.is_some(),
             has_viewport,
             has_visible_frame: current_frame.is_some(),
-            playback_paused: self.timeline.paused,
-            playback_buffering: self.timeline.buffering,
-            pending_seek: self.timeline.pending_seek_position.is_some(),
+            playback_paused: self.session.timeline().paused,
+            playback_buffering: self.session.timeline().buffering,
+            pending_seek: self.session.timeline().pending_seek_position.is_some(),
             video_presenter_needs_frame,
         }) {
             window.request_animation_frame();
@@ -601,7 +562,7 @@ impl Render for PlaybackPage {
 
         div()
             .key_context("PlaybackPage")
-            .track_focus(&self.focus_handle)
+            .track_focus(&self.presentation.focus_handle)
             .relative()
             .size_full()
             .overflow_hidden()
@@ -610,7 +571,7 @@ impl Render for PlaybackPage {
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_scroll_wheel(cx.listener(Self::handle_surface_scroll_wheel))
             .child(VideoViewport::new(
-                self.frame.source_size,
+                self.presentation.frame.source_size,
                 corners,
                 div()
                     .when_some(current_video_frame, |this, frame| this.child(frame))
@@ -621,14 +582,17 @@ impl Render for PlaybackPage {
                 this.child(render_playback_status(status, cx))
             })
             .child(self.render_mouse_capture(window, cx))
-            .when(self.volume.indicator_visible, |this| {
-                this.child(self.render_volume_indicator(cx))
+            .when(self.presentation.volume_indicator_visible, |this| {
+                this.child(controls::volume_indicator(
+                    self.session.controls_view().volume.level,
+                    cx,
+                ))
             })
-            .when(self.rate.indicator_visible, |this| {
+            .when(self.presentation.rate_indicator_visible, |this| {
                 this.child(self.render_playback_rate_indicator(cx))
             })
             .child(self.render_queue_switch_error(cx))
-            .when(self.episode_list.open, |this| {
+            .when(self.presentation.episode_list.open, |this| {
                 this.child(self.render_episode_list_backdrop(cx))
             })
             .when(progress_bar_visible, |this| {
@@ -638,14 +602,14 @@ impl Render for PlaybackPage {
             .when(
                 fullscreen::playback_back_button_visible(
                     is_fullscreen,
-                    self.fullscreen.controls_visible,
+                    self.presentation.fullscreen.controls_visible,
                 ),
                 |this| this.child(self.render_back_button(cx)),
             )
-            .when(self.episode_list.open, |this| {
+            .when(self.presentation.episode_list.open, |this| {
                 this.child(deferred(self.render_episode_list(window, cx)).with_priority(2))
             })
-            .when(self.playback_details_visible, |this| {
+            .when(self.presentation.playback_details_visible, |this| {
                 // Keep stats above subtitles, controls, and deferred playback menus.
                 this.child(deferred(self.render_playback_details_overlay(window)).with_priority(3))
             })

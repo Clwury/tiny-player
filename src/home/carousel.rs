@@ -1,3 +1,4 @@
+use crate::home::detail::state::detail_binding;
 use std::time::{Duration, Instant};
 
 use gpui::{ClickEvent, Context, Window};
@@ -345,8 +346,9 @@ impl HomeContent {
     ) {
         let viewport_width = home_main_content_width(window);
         let max_offset = self
-            .user_views
-            .as_ref()
+            .controller
+            .feed_view()
+            .views
             .map(|views| max_carousel_scroll_offset(views.items.len(), viewport_width))
             .unwrap_or(0.0);
         if self
@@ -391,8 +393,9 @@ impl HomeContent {
     ) {
         let viewport_width = home_main_content_width(window);
         let max_offset = self
-            .resume_items
-            .as_ref()
+            .controller
+            .feed_view()
+            .resume
             .map(|items| max_carousel_scroll_offset(items.items.len(), viewport_width))
             .unwrap_or(0.0);
         if self
@@ -410,10 +413,10 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let row = self
-            .user_view_items_rows
+            .latest_carousels
             .entry(view_id.to_string())
             .or_default();
-        if row.carousel.set_hovered(hovered) {
+        if row.set_hovered(hovered) {
             cx.notify();
         }
     }
@@ -425,10 +428,10 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let row = self
-            .user_view_items_rows
+            .latest_carousels
             .entry(view_id.to_string())
             .or_default();
-        if row.carousel.set_controls_hovered(hovered) {
+        if row.set_controls_hovered(hovered) {
             cx.notify();
         }
     }
@@ -440,9 +443,9 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let offset = self
-            .user_view_items_rows
+            .latest_carousels
             .get(view_id)
-            .map(|row| row.carousel.scroll_offset(f32::INFINITY) - HOME_ITEM_SCROLL_STEP_PX)
+            .map(|row| row.scroll_offset(f32::INFINITY) - HOME_ITEM_SCROLL_STEP_PX)
             .unwrap_or(0.0);
         self.set_user_view_items_scroll_offset(view_id, offset, window, cx);
     }
@@ -454,9 +457,9 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let offset = self
-            .user_view_items_rows
+            .latest_carousels
             .get(view_id)
-            .map(|row| row.carousel.scroll_offset(f32::INFINITY) + HOME_ITEM_SCROLL_STEP_PX)
+            .map(|row| row.scroll_offset(f32::INFINITY) + HOME_ITEM_SCROLL_STEP_PX)
             .unwrap_or(HOME_ITEM_SCROLL_STEP_PX);
         self.set_user_view_items_scroll_offset(view_id, offset, window, cx);
     }
@@ -470,9 +473,9 @@ impl HomeContent {
     ) {
         let viewport_width = home_main_content_width(window);
         let max_offset = self
-            .user_view_items_rows
-            .get(view_id)
-            .and_then(|row| row.items.as_ref())
+            .controller
+            .latest_row(view_id)
+            .items
             .map(|items| {
                 max_carousel_scroll_offset_for(
                     items.items.len(),
@@ -484,20 +487,22 @@ impl HomeContent {
             })
             .unwrap_or(0.0);
         let row = self
-            .user_view_items_rows
+            .latest_carousels
             .entry(view_id.to_string())
             .or_default();
 
-        if row.carousel.set_scroll_offset(offset, max_offset) {
+        if row.set_scroll_offset(offset, max_offset) {
             cx.notify();
         }
     }
 
     pub(super) fn set_series_similar_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
-        let Some(detail) = &mut self.series_detail else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
-        if detail.similar_carousel.set_hovered(hovered) {
+        if detail.presentation.similar_carousel.set_hovered(hovered) {
             cx.notify();
         }
     }
@@ -507,10 +512,16 @@ impl HomeContent {
         hovered: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = &mut self.series_detail else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
-        if detail.similar_carousel.set_controls_hovered(hovered) {
+        if detail
+            .presentation
+            .similar_carousel
+            .set_controls_hovered(hovered)
+        {
             cx.notify();
         }
     }
@@ -522,10 +533,13 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let offset = self
-            .series_detail
-            .as_ref()
+            .detail_view()
             .map(|detail| {
-                detail.similar_carousel.scroll_offset(f32::INFINITY) - HOME_ITEM_SCROLL_STEP_PX
+                detail
+                    .presentation
+                    .similar_carousel
+                    .scroll_offset(f32::INFINITY)
+                    - HOME_ITEM_SCROLL_STEP_PX
             })
             .unwrap_or(0.0);
         self.set_series_similar_scroll_offset(offset, window, cx);
@@ -538,10 +552,13 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let offset = self
-            .series_detail
-            .as_ref()
+            .detail_view()
             .map(|detail| {
-                detail.similar_carousel.scroll_offset(f32::INFINITY) + HOME_ITEM_SCROLL_STEP_PX
+                detail
+                    .presentation
+                    .similar_carousel
+                    .scroll_offset(f32::INFINITY)
+                    + HOME_ITEM_SCROLL_STEP_PX
             })
             .unwrap_or(HOME_ITEM_SCROLL_STEP_PX);
         self.set_series_similar_scroll_offset(offset, window, cx);
@@ -555,9 +572,8 @@ impl HomeContent {
     ) {
         let viewport_width = home_main_content_width(window);
         let max_offset = self
-            .series_detail
-            .as_ref()
-            .and_then(|detail| detail.similar_items.as_ref())
+            .detail_view()
+            .and_then(|detail| detail.model.similar_items.as_ref())
             .map(|items| {
                 max_carousel_scroll_offset_for(
                     items.items.len(),
@@ -568,11 +584,14 @@ impl HomeContent {
                 )
             })
             .unwrap_or(0.0);
-        let Some(detail) = &mut self.series_detail else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
 
         if detail
+            .presentation
             .similar_carousel
             .set_scroll_offset(offset, max_offset)
         {
@@ -581,10 +600,12 @@ impl HomeContent {
     }
 
     pub(super) fn set_series_episodes_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
-        let Some(detail) = &mut self.series_detail else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
-        if detail.episodes_carousel.set_hovered(hovered) {
+        if detail.presentation.episodes_carousel.set_hovered(hovered) {
             cx.notify();
         }
     }
@@ -594,10 +615,16 @@ impl HomeContent {
         hovered: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = &mut self.series_detail else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
-        if detail.episodes_carousel.set_controls_hovered(hovered) {
+        if detail
+            .presentation
+            .episodes_carousel
+            .set_controls_hovered(hovered)
+        {
             cx.notify();
         }
     }
@@ -609,10 +636,12 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let offset = self
-            .series_detail
-            .as_ref()
+            .detail_view()
             .map(|detail| {
-                detail.episodes_carousel.scroll_offset(f32::INFINITY)
+                detail
+                    .presentation
+                    .episodes_carousel
+                    .scroll_offset(f32::INFINITY)
                     - DETAIL_EPISODE_SCROLL_STEP_PX
             })
             .unwrap_or(0.0);
@@ -620,16 +649,21 @@ impl HomeContent {
     }
 
     pub(super) fn reveal_series_hero_episode(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let Some(detail) = self.series_detail.as_mut() else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
-        let Some(index) = detail.hero_episode_index() else {
+        let Some(index) = detail.model.hero_episode_index() else {
             return;
         };
         let viewport_width = home_main_content_width(window);
         let left = index as f32 * DETAIL_EPISODE_CARD_STEP_PX;
         let right = left + DETAIL_EPISODE_CARD_OUTER_WIDTH_PX;
-        let offset = detail.episodes_carousel.scroll_offset(f32::INFINITY);
+        let offset = detail
+            .presentation
+            .episodes_carousel
+            .scroll_offset(f32::INFINITY);
         let offset = if left < offset || viewport_width < DETAIL_EPISODE_CARD_OUTER_WIDTH_PX {
             left
         } else if right > offset + viewport_width {
@@ -637,7 +671,7 @@ impl HomeContent {
         } else {
             offset
         };
-        detail.open_select = None;
+        detail.presentation.open_select = None;
         self.set_series_episodes_scroll_offset(offset, window, cx);
         cx.notify();
     }
@@ -649,10 +683,12 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let offset = self
-            .series_detail
-            .as_ref()
+            .detail_view()
             .map(|detail| {
-                detail.episodes_carousel.scroll_offset(f32::INFINITY)
+                detail
+                    .presentation
+                    .episodes_carousel
+                    .scroll_offset(f32::INFINITY)
                     + DETAIL_EPISODE_SCROLL_STEP_PX
             })
             .unwrap_or(DETAIL_EPISODE_SCROLL_STEP_PX);
@@ -667,9 +703,8 @@ impl HomeContent {
     ) {
         let viewport_width = home_main_content_width(window);
         let max_offset = self
-            .series_detail
-            .as_ref()
-            .and_then(|detail| detail.episodes.as_ref())
+            .detail_view()
+            .and_then(|detail| detail.model.episodes.as_ref())
             .map(|episodes| {
                 max_carousel_scroll_offset_for(
                     episodes.items.len(),
@@ -680,11 +715,14 @@ impl HomeContent {
                 )
             })
             .unwrap_or(0.0);
-        let Some(detail) = &mut self.series_detail else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
 
         if detail
+            .presentation
             .episodes_carousel
             .set_scroll_offset(offset, max_offset)
         {
@@ -693,10 +731,12 @@ impl HomeContent {
     }
 
     pub(super) fn set_series_people_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
-        let Some(detail) = &mut self.series_detail else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
-        if detail.people_carousel.set_hovered(hovered) {
+        if detail.presentation.people_carousel.set_hovered(hovered) {
             cx.notify();
         }
     }
@@ -706,10 +746,16 @@ impl HomeContent {
         hovered: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = &mut self.series_detail else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
-        if detail.people_carousel.set_controls_hovered(hovered) {
+        if detail
+            .presentation
+            .people_carousel
+            .set_controls_hovered(hovered)
+        {
             cx.notify();
         }
     }
@@ -721,10 +767,13 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let offset = self
-            .series_detail
-            .as_ref()
+            .detail_view()
             .map(|detail| {
-                detail.people_carousel.scroll_offset(f32::INFINITY) - DETAIL_PERSON_SCROLL_STEP_PX
+                detail
+                    .presentation
+                    .people_carousel
+                    .scroll_offset(f32::INFINITY)
+                    - DETAIL_PERSON_SCROLL_STEP_PX
             })
             .unwrap_or(0.0);
         self.set_series_people_scroll_offset(offset, window, cx);
@@ -737,10 +786,13 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         let offset = self
-            .series_detail
-            .as_ref()
+            .detail_view()
             .map(|detail| {
-                detail.people_carousel.scroll_offset(f32::INFINITY) + DETAIL_PERSON_SCROLL_STEP_PX
+                detail
+                    .presentation
+                    .people_carousel
+                    .scroll_offset(f32::INFINITY)
+                    + DETAIL_PERSON_SCROLL_STEP_PX
             })
             .unwrap_or(DETAIL_PERSON_SCROLL_STEP_PX);
         self.set_series_people_scroll_offset(offset, window, cx);
@@ -754,9 +806,8 @@ impl HomeContent {
     ) {
         let viewport_width = home_main_content_width(window);
         let max_offset = self
-            .series_detail
-            .as_ref()
-            .and_then(|detail| detail.item.as_ref())
+            .detail_view()
+            .and_then(|detail| detail.model.item.as_ref())
             .and_then(|item| item.people.as_ref())
             .map(|people| {
                 max_carousel_scroll_offset_for(
@@ -768,11 +819,17 @@ impl HomeContent {
                 )
             })
             .unwrap_or(0.0);
-        let Some(detail) = &mut self.series_detail else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
 
-        if detail.people_carousel.set_scroll_offset(offset, max_offset) {
+        if detail
+            .presentation
+            .people_carousel
+            .set_scroll_offset(offset, max_offset)
+        {
             cx.notify();
         }
     }

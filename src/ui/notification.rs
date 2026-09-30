@@ -1,11 +1,12 @@
 use std::{collections::VecDeque, time::Duration};
 
 use gpui::{
-    Animation, AnimationExt as _, App, ClickEvent, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, ease_in_out, px,
-    svg,
+    Animation, AnimationExt as _, App, ClickEvent, Context, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    ease_in_out, px, svg,
 };
 
+use crate::effects::{EffectHandle, RequestScope, RequestSlot, RequestToken, WorkspaceIdentity};
 use crate::theme;
 use crate::ui::radius;
 
@@ -31,29 +32,57 @@ pub(crate) struct NotificationEntry<K> {
 ///
 /// Reusing a key replaces the previous message, which prevents a retry from
 /// leaving stale copies of the same error in the notification stack.
-#[derive(Clone, Debug)]
+/// The host owns the queue; identity stays fixed until that host is replaced.
+/// Only these queue operations write entries and their bounded deadline tasks.
+#[derive(Debug)]
 pub(crate) struct NotificationQueue<K> {
-    items: VecDeque<NotificationEntry<K>>,
+    items: VecDeque<ManagedNotification<K>>,
     next_id: u64,
+    identity: WorkspaceIdentity,
+}
+
+/// Presentation-owned deadline: push_autohide issues its token; replacing, dismissing,
+/// filtering, evicting, clearing or dropping the entry invalidates it and drops
+/// the task. Local timers have no IO errors or error-notification key.
+#[derive(Debug)]
+struct ManagedNotification<K> {
+    entry: NotificationEntry<K>,
+    deadline: RequestSlot,
+    task: EffectHandle<gpui::Task<()>>,
 }
 
 impl<K> Default for NotificationQueue<K> {
     fn default() -> Self {
+        Self::new(WorkspaceIdentity::default())
+    }
+}
+
+impl<K> NotificationQueue<K> {
+    /// Home supplies its immutable account identity. App/dialog queues use the
+    /// local identity; each entry's slot also fences callbacks by unique owner.
+    pub(crate) fn new(identity: WorkspaceIdentity) -> Self {
         Self {
             items: VecDeque::new(),
             next_id: 0,
+            identity,
         }
     }
 }
 
 impl<K: PartialEq> NotificationQueue<K> {
     pub(crate) fn push(&mut self, key: K, message: SharedString) -> u64 {
-        self.items.retain(|entry| entry.key != key);
+        self.retain(|entry| entry.key != key);
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
-        self.items.push_back(NotificationEntry {
-            key,
-            notification: Notification { id, message },
+        let deadline =
+            RequestSlot::new(RequestScope::NotificationHide { id }, self.identity.clone());
+        self.items.push_back(ManagedNotification {
+            entry: NotificationEntry {
+                key,
+                notification: Notification { id, message },
+            },
+            deadline,
+            task: EffectHandle::default(),
         });
         while self.items.len() > NOTIFICATION_MAX_ITEMS {
             self.items.pop_front();
@@ -61,14 +90,57 @@ impl<K: PartialEq> NotificationQueue<K> {
         id
     }
 
+    /// Shared GPUI runner; the accessor is the only connection to the host page.
+    pub(crate) fn push_autohide<T: 'static>(
+        &mut self,
+        key: K,
+        message: SharedString,
+        cx: &mut Context<T>,
+        queue: fn(&mut T) -> &mut Self,
+    ) where
+        K: 'static,
+    {
+        let id = self.push(key, message);
+        let item = self.items.back_mut().expect("just pushed notification");
+        let token = item.deadline.issue();
+        item.task.replace(cx.spawn(async move |owner, cx| {
+            cx.background_executor().timer(NOTIFICATION_AUTOHIDE).await;
+            owner
+                .update(cx, |owner, cx| {
+                    if queue(owner).expire(id, &token) {
+                        cx.notify();
+                    }
+                })
+                .ok();
+        }));
+        cx.notify();
+    }
+
+    fn expire(&mut self, id: u64, token: &RequestToken) -> bool {
+        if !token.is_for(&self.identity) {
+            return false;
+        }
+        let Some(item) = self
+            .items
+            .iter_mut()
+            .find(|item| item.entry.notification.id == id)
+        else {
+            return false;
+        };
+        if !item.deadline.commit(token) {
+            return false;
+        }
+        self.remove(id)
+    }
+
     pub(crate) fn remove(&mut self, id: u64) -> bool {
         let previous_len = self.items.len();
-        self.items.retain(|entry| entry.notification.id != id);
+        self.retain(|entry| entry.notification.id != id);
         self.items.len() != previous_len
     }
 
-    pub(crate) fn retain(&mut self, f: impl FnMut(&NotificationEntry<K>) -> bool) {
-        self.items.retain(f);
+    pub(crate) fn retain(&mut self, mut f: impl FnMut(&NotificationEntry<K>) -> bool) {
+        self.items.retain(|item| f(&item.entry));
     }
 }
 
@@ -78,7 +150,7 @@ impl<K> NotificationQueue<K> {
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &NotificationEntry<K>> {
-        self.items.iter()
+        self.items.iter().map(|item| &item.entry)
     }
 
     pub(crate) fn clear(&mut self) {
@@ -182,53 +254,4 @@ pub(crate) fn error_notification(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pushing_same_key_replaces_the_previous_notification() {
-        let mut queue = NotificationQueue::default();
-        let first = queue.push("home", "first".into());
-        let second = queue.push("home", "second".into());
-
-        assert_ne!(first, second);
-        assert_eq!(queue.iter().count(), 1);
-        assert_eq!(queue.iter().next().unwrap().notification.message, "second");
-    }
-
-    #[test]
-    fn removing_notification_by_id_reports_whether_it_existed() {
-        let mut queue = NotificationQueue::default();
-        let id = queue.push("home", "error".into());
-
-        assert!(queue.remove(id));
-        assert!(!queue.remove(id));
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn queue_keeps_only_the_most_recent_notifications() {
-        let mut queue = NotificationQueue::default();
-        for index in 0..(NOTIFICATION_MAX_ITEMS + 2) {
-            queue.push(index, format!("error-{index}").into());
-        }
-
-        let retained = queue.iter().map(|entry| entry.key).collect::<Vec<_>>();
-        assert_eq!(
-            retained,
-            (2..(NOTIFICATION_MAX_ITEMS + 2)).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn clearing_queue_keeps_ids_monotonic_for_old_autohide_timers() {
-        let mut queue = NotificationQueue::default();
-        let old_id = queue.push("old", "old error".into());
-        queue.clear();
-        let new_id = queue.push("new", "new error".into());
-
-        assert!(new_id > old_id);
-        assert!(!queue.remove(old_id));
-        assert_eq!(queue.iter().next().unwrap().notification.id, new_id);
-    }
-}
+mod tests;

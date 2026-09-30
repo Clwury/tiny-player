@@ -1,12 +1,12 @@
 use crate::{emby::MediaItem, player::premiere_day};
 
-use super::{SeriesDetailState, video_metadata::video_quality_label};
+use super::{DetailView, video_metadata::video_quality_label};
 
-pub(super) fn hero_metadata_label(detail: &SeriesDetailState) -> Option<String> {
+pub(super) fn hero_metadata_label(detail: DetailView<'_>) -> Option<String> {
     // A season switch clears the episode selection until its response arrives.
     // Keep the reserved row empty instead of flashing series/next-up metadata.
-    let item = detail.selected_playback_item()?;
-    let source = detail.selected_media_source();
+    let item = detail.model.selected_playback_item()?;
+    let source = detail.model.selected_media_source();
     let runtime = source
         .and_then(|source| source.run_time_ticks)
         .filter(|ticks| *ticks > 0)
@@ -64,12 +64,13 @@ mod tests {
     use crate::home::LoadState;
     use serde_json::json;
 
-    fn detail(item_type: &str) -> SeriesDetailState {
-        SeriesDetailState::from_user_item(
+    fn detail(item_type: &str) -> crate::home::detail::test_fixture::DetailFixture {
+        crate::home::detail::test_fixture::DetailFixture::from_user_item(
             &serde_json::from_value(json!({
                 "Id": "item-1", "Name": "Title", "Type": item_type
             }))
             .unwrap(),
+            Default::default(),
         )
         .unwrap()
     }
@@ -77,7 +78,7 @@ mod tests {
     #[test]
     fn hero_metadata_follows_selected_movie_versions_and_episodes() {
         let mut movie = detail("Movie");
-        movie.item = Some(
+        movie.controller.state.item = Some(
             serde_json::from_value(json!({
                 "Id": "item-1", "Name": "Movie", "Type": "Movie",
                 "RunTimeTicks": 72_000_000_000_u64,
@@ -94,17 +95,20 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(
-            hero_metadata_label(&movie).as_deref(),
+            hero_metadata_label(movie.view()).as_deref(),
             Some("2小时 · 2024-02-29 · 1080p SDR")
         );
-        movie.select_media_source(1);
+        {
+            let change = movie.controller.state.select_media_source(1);
+            movie.apply_change(change);
+        }
         assert_eq!(
-            hero_metadata_label(&movie).as_deref(),
+            hero_metadata_label(movie.view()).as_deref(),
             Some("2小时12分钟 · 2024-02-29 · 4K HDR10")
         );
 
         let mut series = detail("Series");
-        series.episodes = Some(
+        series.controller.state.episodes = Some(
             serde_json::from_value(json!({"Items": [
                 {"Id": "episode-1", "Name": "First", "RunTimeTicks": 14_550_000_000_u64,
                  "PremiereDate": "2026-09-20T00:00:00Z"},
@@ -114,12 +118,12 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(
-            hero_metadata_label(&series).as_deref(),
+            hero_metadata_label(series.view()).as_deref(),
             Some("24分钟 · 2026-09-20")
         );
-        series.selected_episode_id = Some("episode-2".into());
+        series.controller.state.selected_episode_id = Some("episode-2".into());
         assert_eq!(
-            hero_metadata_label(&series).as_deref(),
+            hero_metadata_label(series.view()).as_deref(),
             Some("25分钟 · 2026-09-21")
         );
     }
@@ -128,50 +132,60 @@ mod tests {
     fn season_changes_do_not_flash_series_or_other_season_metadata() {
         for has_next_up in [false, true] {
             let mut series = detail("Series");
-            series.item = Some(
+            series.controller.state.item = Some(
                 serde_json::from_value(json!({
                     "Id": "item-1", "Name": "Series", "Type": "Series",
                     "PremiereDate": "2024-01-01T00:00:00Z", "ProductionYear": 2024
                 }))
                 .unwrap(),
             );
-            series.selected_season_id = Some("season-1".into());
-            series.episodes = Some(
+            series.controller.state.selected_season_id = Some("season-1".into());
+            series.controller.state.episodes = Some(
                 serde_json::from_value(json!({"Items": [{
                     "Id": "episode-1", "Name": "First", "SeasonId": "season-1",
                     "RunTimeTicks": 14_550_000_000_u64, "PremiereDate": "2024-01-02T00:00:00Z"
                 }]}))
                 .unwrap(),
             );
-            series.choose_episode_from_loaded_episodes();
+            {
+                let change = series
+                    .controller
+                    .state
+                    .choose_episode_from_loaded_episodes();
+                series.apply_change(change);
+            }
             assert_eq!(
-                hero_metadata_label(&series).as_deref(),
+                hero_metadata_label(series.view()).as_deref(),
                 Some("24分钟 · 2024-01-02")
             );
             if has_next_up {
-                series.next_up = series.episodes.clone();
+                series.controller.state.next_up = series.controller.state.episodes.clone();
             }
 
-            series.selected_season_id = Some("season-2".into());
-            series.reset_episode_selection();
+            series.controller.state.selected_season_id = Some("season-2".into());
+            {
+                let change = series.controller.state.reset_episode_selection();
+                series.apply_change(change);
+            }
             for state in [
                 LoadState::Idle,
                 LoadState::Loading,
                 LoadState::Failed,
                 LoadState::Loaded,
             ] {
-                series.effects.episodes = state;
+                series.controller.state.effects.episodes = state;
                 if state == LoadState::Loaded {
-                    series.episodes = Some(serde_json::from_value(json!({"Items": []})).unwrap());
+                    series.controller.state.episodes =
+                        Some(serde_json::from_value(json!({"Items": []})).unwrap());
                 }
                 assert_eq!(
-                    hero_metadata_label(&series),
+                    hero_metadata_label(series.view()),
                     None,
                     "state={state:?}, next_up={has_next_up}"
                 );
             }
 
-            series.episodes = Some(
+            series.controller.state.episodes = Some(
                 serde_json::from_value(json!({"Items": [{
                     "Id": "episode-2", "Name": "Second", "SeasonId": "season-2",
                     "RunTimeTicks": 15_000_000_000_u64, "PremiereDate": "2026-09-21T00:00:00Z",
@@ -181,9 +195,15 @@ mod tests {
                 }]}))
                 .unwrap(),
             );
-            series.choose_episode_from_loaded_episodes();
+            {
+                let change = series
+                    .controller
+                    .state
+                    .choose_episode_from_loaded_episodes();
+                series.apply_change(change);
+            }
             assert_eq!(
-                hero_metadata_label(&series).as_deref(),
+                hero_metadata_label(series.view()).as_deref(),
                 Some("25分钟 · 2026-09-21 · 4K HDR10")
             );
         }
@@ -209,8 +229,8 @@ mod tests {
             item.as_object_mut()
                 .unwrap()
                 .extend(fields.as_object().unwrap().clone());
-            movie.item = Some(serde_json::from_value(item).unwrap());
-            assert_eq!(hero_metadata_label(&movie).as_deref(), expected);
+            movie.controller.state.item = Some(serde_json::from_value(item).unwrap());
+            assert_eq!(hero_metadata_label(movie.view()).as_deref(), expected);
         }
     }
 }

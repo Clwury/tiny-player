@@ -1,3 +1,5 @@
+use crate::home::detail::test_fixture::detail_binding;
+use crate::home::track_preferences::detail_track_choices;
 use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
@@ -15,12 +17,12 @@ fn server() -> CachedServer {
     .unwrap()
 }
 
-fn detail() -> SeriesDetailState {
+fn detail() -> DetailFixture {
     let item: UserItem = serde_json::from_value(serde_json::json!({
         "Id": "item-1", "Name": "Video", "Type": "Movie"
     }))
     .unwrap();
-    let mut detail = SeriesDetailState::from_user_item(&item).unwrap();
+    let mut detail = DetailFixture::from_user_item(&item, Default::default()).unwrap();
     let source = serde_json::json!({
         "Id": "source-1", "DefaultSubtitleStreamIndex": 10,
         "MediaStreams": [
@@ -30,14 +32,17 @@ fn detail() -> SeriesDetailState {
     });
     let mut other = source.clone();
     other["Id"] = "source-2".into();
-    detail.item = Some(
+    detail.controller.state.item = Some(
         serde_json::from_value(serde_json::json!({
             "Id": "item-1", "Name": "Video", "Type": "Movie",
             "MediaSources": [source, other]
         }))
         .unwrap(),
     );
-    detail.sync_media_source_selection();
+    {
+        let change = detail.controller.state.sync_media_source_selection();
+        detail.apply_change(change);
+    }
     detail
 }
 
@@ -49,7 +54,7 @@ fn home(cx: &mut TestAppContext, path: &Path) -> Entity<HomeContent> {
             cx,
         );
         page.snapshot_save_path = Some(path.to_path_buf());
-        page.series_detail = Some(detail());
+        page.install_detail_fixture(Some(detail()));
         page
     });
     cx.run_until_parked();
@@ -57,12 +62,12 @@ fn home(cx: &mut TestAppContext, path: &Path) -> Entity<HomeContent> {
 }
 
 fn selection(page: &HomeContent, cx: &gpui::App) -> SelectedPlayback {
-    let detail = page.series_detail.as_ref().unwrap();
+    let detail = page.detail_view().unwrap();
     selected_playback(
         detail,
         &page.current_server,
         Default::default(),
-        &detail.selected_track_choices(&page.current_server, cx),
+        &detail_track_choices(detail.model, &page.current_server, cx),
     )
     .unwrap()
 }
@@ -81,9 +86,12 @@ fn saved_probed_subtitle_overrides_emby_default_in_detail_and_playback(cx: &mut 
         }]
     });
     let item: UserItem = serde_json::from_value(metadata.clone()).unwrap();
-    let mut detail = SeriesDetailState::from_user_item(&item).unwrap();
-    detail.item = Some(serde_json::from_value(metadata).unwrap());
-    detail.sync_media_source_selection();
+    let mut detail = DetailFixture::from_user_item(&item, Default::default()).unwrap();
+    detail.controller.state.item = Some(serde_json::from_value(metadata).unwrap());
+    {
+        let change = detail.controller.state.sync_media_source_selection();
+        detail.apply_change(change);
+    }
     let saved: SavedTrackChoices = serde_json::from_value(serde_json::json!({
         "subtitle": {
             "mode": "track", "stream_index": 2, "label": "简体中文字幕",
@@ -92,22 +100,28 @@ fn saved_probed_subtitle_overrides_emby_default_in_detail_and_playback(cx: &mut 
     }))
     .unwrap();
     cx.update(|cx| {
-        let key = detail.track_preference_key().unwrap();
+        let key = detail.controller.state.track_preference_key().unwrap();
         assert_eq!(key.item_id, "1030171");
         assert_eq!(key.media_source_id, "mediasource_1030171");
         PlaybackTrackPreferences::restore(&server(), [(key, saved.clone())], cx);
         let restored = detail.selected_track_choices(&server(), cx);
         assert_eq!(restored, saved);
         assert_eq!(
-            detail.selected_subtitle_index(TrackLanguage::Default, None),
+            detail
+                .controller
+                .state
+                .selected_subtitle_index(TrackLanguage::Default, None),
             Some(1)
         );
         assert_eq!(
-            detail.selected_subtitle_index(TrackLanguage::Default, restored.subtitle.as_ref()),
+            detail
+                .controller
+                .state
+                .selected_subtitle_index(TrackLanguage::Default, restored.subtitle.as_ref()),
             Some(0),
         );
         let playback =
-            selected_playback(&detail, &server(), Default::default(), &restored).unwrap();
+            selected_playback(detail.view(), &server(), Default::default(), &restored).unwrap();
         assert_eq!(playback.selected_tracks.subtitle_stream_index, Some(2));
         assert!(!playback.remember_subtitle_on_start);
         assert_eq!(detail.selected_track_choices(&server(), cx), saved);
@@ -131,16 +145,18 @@ fn unplayed_detail_subtitles_are_temporary_and_isolated_by_version(cx: &mut Test
             Some(9)
         );
         assert!(selection(page, cx).remember_subtitle_on_start);
-        let detail = page.series_detail.as_ref().unwrap();
-        let choices = detail.selected_track_choices(&page.current_server, cx);
+        let detail = page.detail_view().unwrap();
+        let choices = detail_track_choices(detail.model, &page.current_server, cx);
         assert_eq!(
-            detail.selected_subtitle_label(TrackLanguage::Default, choices.subtitle.as_ref()),
+            detail
+                .model
+                .selected_subtitle_label(TrackLanguage::Default, choices.subtitle.as_ref()),
             "Chinese Simplified (默认 ASS)"
         );
         assert!(
             PlaybackTrackPreferences::get(
                 &page.current_server,
-                &detail.track_preference_key().unwrap(),
+                &detail.model.track_preference_key().unwrap(),
                 cx
             )
             .subtitle
@@ -159,7 +175,7 @@ fn unplayed_detail_subtitles_are_temporary_and_isolated_by_version(cx: &mut Test
             selection(page, cx).selected_tracks.subtitle_stream_index,
             Some(9)
         );
-        assert!(!page.snapshot_save_pending);
+        assert!(!page.persistence.is_dirty(&page.snapshot_dirty_key()));
         assert!(page.home_snapshot().played_video_versions.is_empty());
     });
     cx.run_until_parked();
@@ -185,9 +201,9 @@ fn unplayed_detail_subtitles_do_not_overwrite_saved_off_on_close(cx: &mut TestAp
     let path = temp.path().join("snapshot.json");
     let page = home(cx, &path);
     let key = page.read_with(cx, |page, _| {
-        page.series_detail
-            .as_ref()
+        page.detail_view()
             .unwrap()
+            .model
             .track_preference_key()
             .unwrap()
     });
@@ -218,7 +234,7 @@ fn unplayed_detail_subtitles_do_not_overwrite_saved_off_on_close(cx: &mut TestAp
             PlaybackTrackPreferences::get(&server(), &key, cx).subtitle,
             Some(SavedTrackChoice::Off)
         );
-        assert!(!page.snapshot_save_pending);
+        assert!(!page.persistence.is_dirty(&page.snapshot_dirty_key()));
     });
     cx.run_until_parked();
     cx.executor().advance_clock(Duration::from_millis(450));
@@ -256,13 +272,8 @@ fn detail_subtitle_draft_moves_to_playback_request_without_persisting(cx: &mut T
     page.update(cx, |page, cx| {
         page.select_series_subtitle(Some(0), cx);
         let selected = selection(page, cx);
-        page.finish_play_selected_media(
-            page.request_identity(),
-            page.detail_generation,
-            selected,
-            Err(anyhow::anyhow!("unavailable")),
-            cx,
-        );
+        let command = begin_prepared_playback(page, selected);
+        page.finish_play_selected_media(command, Err(anyhow::anyhow!("unavailable")), cx);
         assert_eq!(
             selection(page, cx).selected_tracks.subtitle_stream_index,
             Some(9)
@@ -270,10 +281,9 @@ fn detail_subtitle_draft_moves_to_playback_request_without_persisting(cx: &mut T
         assert!(selection(page, cx).remember_subtitle_on_start);
         assert!(page.home_snapshot().played_video_versions.is_empty());
         let selected = selection(page, cx);
+        let command = begin_prepared_playback(page, selected);
         page.finish_play_selected_media(
-            page.request_identity(),
-            page.detail_generation,
-            selected,
+            command,
             Ok(ResolvedPlayback {
                 item_id: "resolved-item".into(),
                 media_source_id: "resolved-source".into(),
@@ -285,9 +295,9 @@ fn detail_subtitle_draft_moves_to_playback_request_without_persisting(cx: &mut T
             cx,
         );
         assert!(
-            page.series_detail
-                .as_ref()
+            page.detail_view()
                 .unwrap()
+                .model
                 .pending_subtitle_choice()
                 .is_none()
         );
@@ -321,6 +331,8 @@ fn detail_menu_window(cx: &mut TestAppContext) -> (Entity<HomeContent>, &mut Vis
         );
         let mut detail = detail();
         detail
+            .controller
+            .state
             .item
             .as_mut()
             .unwrap()
@@ -331,8 +343,11 @@ fn detail_menu_window(cx: &mut TestAppContext) -> (Entity<HomeContent>, &mut Vis
             .as_mut()
             .unwrap()[0]
             .title = Some("简体中文 · 双语特效字幕".into());
-        page.navigation.push_detail("item-1".into(), None);
-        page.series_detail = Some(detail);
+        page.controller
+            .test_state_mut()
+            .navigation
+            .push_detail_route_fixture("item-1".into(), None);
+        page.install_detail_fixture(Some(detail));
         page
     });
     cx.simulate_resize(size(px(1100.0), px(900.0)));
@@ -384,11 +399,13 @@ fn subtitle_menu_shows_language_with_or_without_title_and_applies_off_as_a_draft
         click(cx, "series-detail-subtitle-off-option");
         assert!(cx.debug_bounds("series-detail-subtitle-menu").is_none());
         page.read_with(cx, |page, cx| {
-            let detail = page.series_detail.as_ref().unwrap();
-            let choices = detail.selected_track_choices(&page.current_server, cx);
+            let detail = page.detail_view().unwrap();
+            let choices = detail_track_choices(detail.model, &page.current_server, cx);
             assert_eq!(choices.subtitle, Some(SavedTrackChoice::Off));
             assert_eq!(
-                detail.selected_subtitle_label(TrackLanguage::Default, choices.subtitle.as_ref()),
+                detail
+                    .model
+                    .selected_subtitle_label(TrackLanguage::Default, choices.subtitle.as_ref()),
                 "Off"
             );
             let selected = selection(page, cx);
@@ -397,7 +414,7 @@ fn subtitle_menu_shows_language_with_or_without_title_and_applies_off_as_a_draft
             assert_eq!(selected.selected_tracks.subtitle_external_url, None);
             assert_eq!(selected.selected_tracks.subtitle_codec, None);
             assert!(page.home_snapshot().played_video_versions.is_empty());
-            assert!(!page.snapshot_save_pending);
+            assert!(!page.persistence.is_dirty(&page.snapshot_dirty_key()));
         });
         click(cx, "series-detail-subtitle-select");
         click(cx, "series-detail-subtitle-option-0");
@@ -416,8 +433,14 @@ fn subtitle_menu_reveals_selected_track_after_off_and_stays_closed_without_subti
 ) {
     let (page, cx) = detail_menu_window(cx);
     page.update(cx, |page, cx| {
-        let detail = page.series_detail.as_mut().unwrap();
+        let detail = detail_binding(
+            page.controller.test_state_mut().navigation,
+            &mut page.detail_resources,
+        )
+        .unwrap();
         let source = &mut detail
+            .controller
+            .state
             .item
             .as_mut()
             .unwrap()
@@ -450,7 +473,11 @@ fn subtitle_menu_reveals_selected_track_after_off_and_stays_closed_without_subti
         selected.bottom() <= menu.bottom(),
         "selected: {selected:?}, menu: {menu:?}, scroll: {:?}",
         page.read_with(cx, |page, _| {
-            let handle = &page.series_detail.as_ref().unwrap().subtitle_scroll_handle;
+            let handle = &page
+                .detail_view()
+                .unwrap()
+                .presentation
+                .subtitle_scroll_handle;
             (handle.offset(), handle.max_offset(), handle.bounds())
         })
     );
@@ -461,8 +488,14 @@ fn subtitle_menu_reveals_selected_track_after_off_and_stays_closed_without_subti
     click(cx, "series-detail-subtitle-option-7");
 
     page.update(cx, |page, cx| {
-        let detail = page.series_detail.as_mut().unwrap();
+        let detail = detail_binding(
+            page.controller.test_state_mut().navigation,
+            &mut page.detail_resources,
+        )
+        .unwrap();
         detail
+            .controller
+            .state
             .item
             .as_mut()
             .unwrap()
@@ -470,8 +503,11 @@ fn subtitle_menu_reveals_selected_track_after_off_and_stays_closed_without_subti
             .as_mut()
             .unwrap()[0]
             .media_streams = Some(Vec::new());
-        detail.pending_subtitle_choices.clear();
-        detail.sync_media_source_selection();
+        detail.controller.state.pending_subtitle_choices.clear();
+        {
+            let change = detail.controller.state.sync_media_source_selection();
+            detail.presentation.apply_change(change);
+        }
         cx.notify();
     });
     cx.run_until_parked();
@@ -483,12 +519,14 @@ fn subtitle_menu_reveals_selected_track_after_off_and_stays_closed_without_subti
             .is_none()
     );
     page.read_with(cx, |page, cx| {
-        let detail = page.series_detail.as_ref().unwrap();
-        assert!(detail.open_select.is_none());
-        assert!(detail.pending_subtitle_choice().is_none());
+        let detail = page.detail_view().unwrap();
+        assert!(detail.presentation.open_select.is_none());
+        assert!(detail.model.pending_subtitle_choice().is_none());
         for preference in [None, Some(&SavedTrackChoice::Off)] {
             assert_eq!(
-                detail.selected_subtitle_label(TrackLanguage::Default, preference),
+                detail
+                    .model
+                    .selected_subtitle_label(TrackLanguage::Default, preference),
                 "无字幕"
             );
         }
@@ -504,13 +542,17 @@ fn subtitle_menu_reveals_selected_track_after_off_and_stays_closed_without_subti
 fn video_menu_shows_metadata_and_reveals_the_selected_version(cx: &mut TestAppContext) {
     let (page, cx) = detail_menu_window(cx);
     page.update(cx, |page, cx| {
-        page.series_detail
-            .as_mut()
-            .unwrap()
-            .item
-            .as_mut()
-            .unwrap()
-            .media_sources = Some(
+        detail_binding(
+            page.controller.test_state_mut().navigation,
+            &mut page.detail_resources,
+        )
+        .unwrap()
+        .controller
+        .state
+        .item
+        .as_mut()
+        .unwrap()
+        .media_sources = Some(
             (0..8)
                 .map(|index| {
                     serde_json::from_value(serde_json::json!({
@@ -552,6 +594,77 @@ fn video_menu_shows_metadata_and_reveals_the_selected_version(cx: &mut TestAppCo
     page.read_with(cx, |page, cx| {
         assert_eq!(selection(page, cx).media_source_id, "source-6");
         assert!(page.home_snapshot().played_video_versions.is_empty());
-        assert!(!page.snapshot_save_pending);
+        assert!(!page.persistence.is_dirty(&page.snapshot_dirty_key()));
     });
+}
+
+#[gpui::test]
+fn changing_video_source_cancels_pending_playback_delivery_without_consuming_the_draft(
+    cx: &mut TestAppContext,
+) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let page = home(cx, &temp.path().join("snapshot.json"));
+    let delivered = Arc::new(AtomicBool::new(false));
+    let task_delivered = delivered.clone();
+    let opens = Rc::new(RefCell::new(0));
+    let _subscription = cx.update(|cx| {
+        let opens = opens.clone();
+        cx.subscribe(&page, move |_, event: &HomeContentEvent, _| {
+            if matches!(event, HomeContentEvent::OpenPlayback(_)) {
+                *opens.borrow_mut() += 1;
+            }
+        })
+    });
+    let command = page.update(cx, |page, cx| {
+        page.select_series_subtitle(Some(0), cx);
+        let selected = selection(page, cx);
+        let command = begin_prepared_playback(page, selected);
+        let pending = command.clone();
+        let task = cx.spawn(async move |page, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            task_delivered.store(true, Ordering::SeqCst);
+            page.update(cx, |page, cx| {
+                page.finish_play_selected_media(pending, Err(anyhow::anyhow!("late")), cx)
+            })
+            .ok();
+        });
+        detail_binding(
+            page.controller.test_state_mut().navigation,
+            &mut page.detail_resources,
+        )
+        .unwrap()
+        .playback_task
+        .replace(task);
+        command
+    });
+    cx.run_until_parked();
+    page.update(cx, |page, cx| {
+        page.select_series_media_source(1, cx);
+        page.select_series_media_source(0, cx);
+        page.finish_play_selected_media(
+            command,
+            Ok(ResolvedPlayback {
+                item_id: "late".into(),
+                media_source_id: "source-1".into(),
+                url: "https://example.invalid/late".into(),
+                http_headers: Vec::new(),
+                content_length: None,
+                play_session_id: None,
+            }),
+            cx,
+        );
+        let detail = page.detail_view().unwrap().model;
+        assert!(!detail.playback_loading);
+        assert!(detail.playback_failed.is_none());
+        assert!(detail.pending_subtitle_choice().is_some());
+        assert!(page.notifications.is_empty());
+    });
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert!(!delivered.load(Ordering::SeqCst));
+    assert_eq!(*opens.borrow(), 0);
 }

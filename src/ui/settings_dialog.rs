@@ -2,49 +2,16 @@
 
 use gpui::{AppContext as _, Context, Entity, EventEmitter, IntoElement, Render, Window};
 
-use crate::{
-    player::{PlaybackCacheConfig, PlaybackLanguagePreferences},
-    theme::ColorTheme,
-};
+use crate::player::PlaybackCacheConfig;
+#[cfg(test)]
+use crate::{player::PlaybackLanguagePreferences, theme::ColorTheme};
 
 use super::{
     playback_settings_dialog::PlaybackSettingsDialogState,
     user_settings_dialog::UserSettingsDialogState,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SettingsDialogMode {
-    Development,
-    User,
-}
-
-impl SettingsDialogMode {
-    pub(crate) fn from_env() -> Self {
-        Self::resolve(
-            cfg!(debug_assertions),
-            std::env::var("TINY_DEV_SETTINGS").ok().as_deref(),
-        )
-    }
-
-    fn resolve(debug_build: bool, override_value: Option<&str>) -> Self {
-        match override_value
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("1" | "true" | "on") => Self::Development,
-            Some("0" | "false" | "off") => Self::User,
-            _ if debug_build => Self::Development,
-            _ => Self::User,
-        }
-    }
-
-    pub(crate) fn title(self) -> &'static str {
-        match self {
-            Self::Development => "开发设置",
-            Self::User => "设置",
-        }
-    }
-}
+pub(crate) use crate::settings::SettingsMode as SettingsDialogMode;
 
 pub(crate) struct SettingsChanged;
 
@@ -93,6 +60,14 @@ impl SettingsDialogState {
         }
     }
 
+    pub(crate) fn snapshot(&self, cx: &gpui::App) -> crate::settings::SettingsSnapshot {
+        match &self.view {
+            SettingsView::Development(dialog) => dialog.read(cx).snapshot(),
+            SettingsView::User(dialog) => dialog.read(cx).snapshot(),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn playback_config(&self, cx: &gpui::App) -> PlaybackCacheConfig {
         match &self.view {
             SettingsView::Development(dialog) => dialog.read(cx).playback_config(),
@@ -100,6 +75,7 @@ impl SettingsDialogState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn color_theme(&self, cx: &gpui::App) -> ColorTheme {
         match &self.view {
             SettingsView::Development(dialog) => dialog.read(cx).color_theme(),
@@ -107,6 +83,7 @@ impl SettingsDialogState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn track_languages(&self, cx: &gpui::App) -> PlaybackLanguagePreferences {
         match &self.view {
             SettingsView::Development(dialog) => dialog.read(cx).track_languages(),

@@ -1,7 +1,12 @@
-use gpui::{AppContext as _, Context, SharedString};
-
-use crate::emby::{SortOrder, UserItems, UserItemsQuery, UserItemsSort, UserView, VideoItemType};
-
+#[cfg(test)]
+use super::model::library::latest_item_types;
+#[cfg(test)]
+use super::model::library::library_item_types;
+pub(crate) mod controller;
+mod effect;
+use super::adapter::EmbyHomeGateway;
+#[cfg(test)]
+use super::paged_items::PAGED_ITEMS_LIMIT;
 use super::{
     HomeContent, HomeContentEvent,
     navigation::HomeRoute,
@@ -9,138 +14,77 @@ use super::{
         NotificationScope, library_initial_notification_key, library_load_more_notification_key,
         library_refresh_notification_key,
     },
-    paged_items::{PAGED_ITEMS_LIMIT, PagedItemsState},
 };
+use crate::effects::EffectHandle;
+use crate::emby::{SortOrder, UserItems, UserItemsSort, UserView};
+#[cfg(test)]
+use crate::{effects::WorkspaceIdentity, emby::VideoItemType};
+#[cfg(test)]
+use controller::LibraryController;
+pub(crate) use controller::available_library_sorts;
+use controller::{LibraryFailure, LibraryIntent, LibraryRequest, LibraryTransition};
+use gpui::{AppContext as _, Context};
 
-#[derive(Clone, Debug)]
-pub(crate) struct LibraryState {
-    pub(crate) title: SharedString,
-    pub(crate) item_types: Vec<VideoItemType>,
-    pub(crate) sort_by: UserItemsSort,
-    pub(crate) sort_order: SortOrder,
-    pub(crate) sort_menu_open: bool,
-    pub(crate) paged: PagedItemsState,
+/// View resources live with HomeContent; business state lives in HomeController.
+#[derive(Debug, Default)]
+pub(super) struct LibraryResources {
+    pub(super) effect: EffectHandle<gpui::Task<()>>,
+    pub(super) presentation: LibraryPresentation,
 }
 
-#[derive(Clone, Debug)]
-struct LibraryRequestContext {
-    identity: super::WorkspaceIdentity,
-    user_data_revision: u64,
-    view_id: String,
-    generation: u64,
-    start_index: u32,
+#[derive(Debug, Default)]
+pub(super) struct LibraryPresentation {
+    pub(super) sort_menu_open: bool,
+    pub(super) grid: super::presentation::GridPresentation,
 }
 
-pub(crate) const LIBRARY_SORT_OPTIONS: [UserItemsSort; 11] = [
-    UserItemsSort::SortName,
-    UserItemsSort::DateCreated,
-    UserItemsSort::PremiereDate,
-    UserItemsSort::ProductionYear,
-    UserItemsSort::CommunityRating,
-    UserItemsSort::CriticRating,
-    UserItemsSort::DatePlayed,
-    UserItemsSort::DateLastContentAdded,
-    UserItemsSort::PlayCount,
-    UserItemsSort::Random,
-    UserItemsSort::OfficialRating,
-];
-
-pub(crate) fn available_library_sorts(
-    item_types: &[VideoItemType],
-) -> impl Iterator<Item = UserItemsSort> + '_ {
-    LIBRARY_SORT_OPTIONS
-        .iter()
-        .copied()
-        .filter(move |sort_by| library_sort_is_available(*sort_by, item_types))
-}
-
-fn library_sort_is_available(sort_by: UserItemsSort, item_types: &[VideoItemType]) -> bool {
-    sort_by != UserItemsSort::DateLastContentAdded || matches!(item_types, [VideoItemType::Series])
-}
-
-impl LibraryState {
-    fn new(title: String, item_types: Vec<VideoItemType>) -> Self {
-        Self {
-            title: title.into(),
-            item_types,
-            sort_by: UserItemsSort::SortName,
-            sort_order: SortOrder::Ascending,
-            sort_menu_open: false,
-            paged: PagedItemsState::default(),
-        }
-    }
+pub(super) struct LibraryView<'a> {
+    pub(super) model: controller::LibraryVm<'a>,
+    pub(super) presentation: &'a LibraryPresentation,
 }
 
 impl HomeContent {
     pub(super) fn open_library_for_view(&mut self, view: &UserView, cx: &mut Context<Self>) {
-        let Some(item_types) = library_item_types(view.collection_type.as_deref()) else {
+        let Some((change, transition)) = self.controller.open_library(view) else {
             return;
         };
         self.item_context_menu = None;
-        let (should_load, clear_items) = {
-            let state = self
-                .libraries
-                .entry(view.id.clone())
-                .or_insert_with(|| LibraryState::new(view.name.clone(), item_types.clone()));
-            state.title = view.name.clone().into();
-            state.item_types = item_types.clone();
-            state.sort_menu_open = false;
-            let reset_sort = !library_sort_is_available(state.sort_by, &state.item_types);
-            if reset_sort {
-                state.sort_by = UserItemsSort::SortName;
-                state.paged.mark_dirty();
-            }
-            let should_load = reset_sort
-                || state.paged.initial == super::LoadState::Idle
-                || (state.paged.initial == super::LoadState::Failed
-                    && state.paged.items.is_empty());
-            (should_load, reset_sort)
-        };
-        self.navigation
-            .push_library(view.id.clone(), view.name.clone(), item_types);
+        self.library_resources.entry(view.id.clone()).or_default();
+        super::detail::state::apply_navigation_change(change, &mut self.detail_resources);
         self.clear_library_notifications(&view.id);
-        self.detail_generation = self.detail_generation.wrapping_add(1);
-        self.series_detail = None;
-        self.detail_history.clear();
-        if should_load {
-            self.load_library_initial(view.id.clone(), clear_items, cx);
-        }
+        self.apply_library_transition(&view.id, transition, cx);
         cx.emit(HomeContentEvent::TitleChanged);
         cx.notify();
     }
 
     pub(super) fn open_library_by_id(&mut self, view_id: &str, cx: &mut Context<Self>) {
-        let view = self
-            .user_views
-            .as_ref()
-            .and_then(|views| views.items.iter().find(|view| view.id == view_id))
-            .cloned();
+        let view = self.controller.user_view(view_id).cloned();
         if let Some(view) = view {
             self.open_library_for_view(&view, cx);
         }
     }
 
     pub(super) fn toggle_current_library_sort_menu(&mut self, cx: &mut Context<Self>) {
-        let HomeRoute::Library { view_id, .. } = self.navigation.current() else {
+        let HomeRoute::Library { view_id, .. } = self.controller.route() else {
             return;
         };
-        let Some(state) = self.libraries.get_mut(view_id) else {
+        let Some(state) = self.library_resources.get_mut(view_id) else {
             return;
         };
 
-        state.sort_menu_open = !state.sort_menu_open;
+        state.presentation.sort_menu_open = !state.presentation.sort_menu_open;
         cx.notify();
     }
 
     pub(super) fn close_current_library_sort_menu(&mut self, cx: &mut Context<Self>) {
-        let HomeRoute::Library { view_id, .. } = self.navigation.current() else {
+        let HomeRoute::Library { view_id, .. } = self.controller.route() else {
             return;
         };
-        let Some(state) = self.libraries.get_mut(view_id) else {
+        let Some(state) = self.library_resources.get_mut(view_id) else {
             return;
         };
-        if state.sort_menu_open {
-            state.sort_menu_open = false;
+        if state.presentation.sort_menu_open {
+            state.presentation.sort_menu_open = false;
             cx.notify();
         }
     }
@@ -151,383 +95,192 @@ impl HomeContent {
         sort_by: UserItemsSort,
         cx: &mut Context<Self>,
     ) {
-        let changed = {
-            let Some(state) = self.libraries.get_mut(&view_id) else {
-                return;
-            };
-            if !library_sort_is_available(sort_by, &state.item_types) {
-                return;
-            }
-            let sort_order = state.sort_order;
-            apply_library_sort(state, sort_by, sort_order)
-        };
-        if changed {
-            self.load_library_initial(view_id, true, cx);
-        } else {
-            cx.notify();
-        }
+        self.dispatch_library(&view_id, LibraryIntent::SortBy(sort_by), cx);
     }
-
     pub(super) fn select_library_sort_order(
         &mut self,
         view_id: String,
         sort_order: SortOrder,
         cx: &mut Context<Self>,
     ) {
-        let changed = {
-            let Some(state) = self.libraries.get_mut(&view_id) else {
-                return;
-            };
-            let sort_by = state.sort_by;
-            apply_library_sort(state, sort_by, sort_order)
-        };
-        if changed {
-            self.load_library_initial(view_id, true, cx);
-        } else {
-            cx.notify();
-        }
+        self.dispatch_library(&view_id, LibraryIntent::SortOrder(sort_order), cx);
     }
-
     pub(super) fn auto_load_more_library(&mut self, view_id: &str, cx: &mut Context<Self>) {
-        let HomeRoute::Library {
-            view_id: current_view_id,
-            ..
-        } = self.navigation.current()
-        else {
-            return;
-        };
-        if current_view_id != view_id {
-            return;
-        }
-        if self
-            .libraries
-            .get(view_id)
-            .is_none_or(|state| !state.paged.can_auto_load_more())
+        if !matches!(self.controller.route(), HomeRoute::Library {view_id: current, ..} if current == view_id)
         {
             return;
         }
-        self.load_more_library(view_id.to_string(), cx);
+        self.dispatch_library(view_id, LibraryIntent::LoadMore { automatic: true }, cx);
     }
-
-    fn load_more_library(&mut self, view_id: String, cx: &mut Context<Self>) {
-        let Some(state) = self.libraries.get_mut(&view_id) else {
+    fn dispatch_library(&mut self, view_id: &str, intent: LibraryIntent, cx: &mut Context<Self>) {
+        let Some(transition) = self.controller.dispatch_library(view_id, intent) else {
             return;
         };
-        let Some((generation, start_index)) = state.paged.begin_load_more() else {
-            return;
-        };
-        let query = library_items_query(&view_id, state, start_index);
-        self.clear_notification(
-            NotificationScope::Library,
-            &library_load_more_notification_key(&view_id),
-        );
-        cx.notify();
-
-        let server = self.current_server.clone();
-        let identity = self.request_identity();
-        let user_data_revision = self.user_data_request_revision();
-        let client = self.emby_client.clone();
-        let request = LibraryRequestContext {
-            identity,
-            user_data_revision,
-            view_id,
-            generation,
-            start_index,
-        };
-        let task = cx.background_spawn(async move { client.query_user_items(&server, &query) });
-        cx.spawn(async move |page, cx| {
-            let result = task.await;
-            page.update(cx, |page, cx| {
-                page.finish_library_load_more(request, result, cx);
-            })
-            .ok();
-        })
-        .detach();
+        self.apply_library_transition(view_id, transition, cx);
     }
-
-    fn load_library_initial(&mut self, view_id: String, clear: bool, cx: &mut Context<Self>) {
-        let Some(state) = self.libraries.get_mut(&view_id) else {
-            return;
-        };
-        let Some(generation) = state
-            .paged
-            .begin_initial(clear || state.paged.items.is_empty())
-        else {
-            return;
-        };
-        let query = library_items_query(&view_id, state, 0);
-        self.clear_library_notifications(&view_id);
-        cx.notify();
-
-        let server = self.current_server.clone();
-        let identity = self.request_identity();
-        let user_data_revision = self.user_data_request_revision();
-        let client = self.emby_client.clone();
-        let request = LibraryRequestContext {
-            identity,
-            user_data_revision,
-            view_id,
-            generation,
-            start_index: 0,
-        };
-        let task = cx.background_spawn(async move { client.query_user_items(&server, &query) });
-        cx.spawn(async move |page, cx| {
-            let result = task.await;
-            page.update(cx, |page, cx| {
-                page.finish_library_initial(request, result, cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn finish_library_initial(
+    fn apply_library_transition(
         &mut self,
-        request: LibraryRequestContext,
-        mut result: anyhow::Result<UserItems>,
+        view_id: &str,
+        transition: LibraryTransition,
         cx: &mut Context<Self>,
     ) {
-        if !self.matches_request_identity(&request.identity) {
+        let Some(state) = self.library_resources.get_mut(view_id) else {
             return;
+        };
+        if transition.close_menu {
+            state.presentation.sort_menu_open = false;
         }
-        if self
-            .libraries
-            .get(&request.view_id)
-            .is_none_or(|state| !state.paged.accepts_initial(request.generation))
-        {
-            return;
+        if transition.cancel {
+            state.effect.cancel();
         }
-        let item_types = self
-            .libraries
-            .get(&request.view_id)
-            .map(|state| state.item_types.clone())
-            .unwrap_or_default();
-        let raw_count = result
-            .as_ref()
-            .ok()
-            .map(|items| items.items.len() as u32)
-            .unwrap_or_default();
-        if let Ok(items) = result.as_mut() {
-            filter_supported_items(items, &item_types);
-            self.absorb_user_items_user_data(items, request.user_data_revision);
-        }
-        let applied = self
-            .libraries
-            .get_mut(&request.view_id)
-            .is_some_and(|state| {
-                state.paged.finish_initial_with_raw_count(
-                    request.generation,
-                    result,
-                    PAGED_ITEMS_LIMIT,
-                    raw_count,
-                )
-            });
-        if applied {
-            let library_result = self.libraries.get(&request.view_id).map(|state| {
-                let items = UserItems {
-                    items: state.paged.items.clone(),
-                    total_record_count: state.paged.total_record_count.unwrap_or_default(),
-                };
-                let failure = state
-                    .paged
-                    .initial_error
-                    .clone()
-                    .map(|error| {
-                        (
-                            library_initial_notification_key(&request.view_id),
-                            format!("加载媒体库失败：{error}"),
-                        )
-                    })
-                    .or_else(|| {
-                        state.paged.refresh_error.clone().map(|error| {
-                            (
-                                library_refresh_notification_key(&request.view_id),
-                                error.to_string(),
-                            )
-                        })
-                    });
-                (items, failure)
-            });
-            let Some((items, failure)) = library_result else {
-                return;
-            };
-            self.ensure_user_items_images(&items, cx);
-            if let Some((key, message)) = failure {
-                self.push_error_notification(NotificationScope::Library, key, message, cx);
-            } else {
-                self.clear_library_notifications(&request.view_id);
-            }
-            cx.notify();
-        }
-    }
-
-    fn finish_library_load_more(
-        &mut self,
-        request: LibraryRequestContext,
-        mut result: anyhow::Result<UserItems>,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.matches_request_identity(&request.identity) {
-            return;
-        }
-        if self.libraries.get(&request.view_id).is_none_or(|state| {
-            !state
-                .paged
-                .accepts_load_more(request.generation, request.start_index)
-        }) {
-            return;
-        }
-        let item_types = self
-            .libraries
-            .get(&request.view_id)
-            .map(|state| state.item_types.clone())
-            .unwrap_or_default();
-        let raw_count = result
-            .as_ref()
-            .ok()
-            .map(|items| items.items.len() as u32)
-            .unwrap_or_default();
-        if let Ok(items) = result.as_mut() {
-            filter_supported_items(items, &item_types);
-            self.absorb_user_items_user_data(items, request.user_data_revision);
-            self.ensure_user_items_images(items, cx);
-        }
-        let applied = self
-            .libraries
-            .get_mut(&request.view_id)
-            .is_some_and(|state| {
-                state.paged.finish_load_more_with_raw_count(
-                    request.generation,
-                    request.start_index,
-                    result,
-                    PAGED_ITEMS_LIMIT,
-                    raw_count,
-                )
-            });
-        if applied {
-            let failure = self
-                .libraries
-                .get(&request.view_id)
-                .and_then(|state| state.paged.load_more_error.clone())
-                .map(|error| format!("加载更多媒体库内容失败：{error}"));
-            if let Some(message) = failure {
-                self.push_error_notification(
-                    NotificationScope::Library,
-                    library_load_more_notification_key(&request.view_id),
-                    message,
-                    cx,
-                );
+        if let Some(request) = transition.request {
+            if request.initial {
+                self.clear_library_notifications(view_id);
             } else {
                 self.clear_notification(
                     NotificationScope::Library,
-                    &library_load_more_notification_key(&request.view_id),
+                    &library_load_more_notification_key(view_id),
                 );
             }
+            let gateway = EmbyHomeGateway {
+                server: self.current_server.clone(),
+                client: self.emby_client.clone(),
+            };
+            let task_request = request.clone();
+            let task =
+                cx.background_spawn(async move { effect::run_library(&gateway, &task_request) });
+            let handle = cx.spawn(async move |page, cx| {
+                let result = task.await;
+                page.update(cx, |page, cx| page.finish_library(request, result, cx))
+                    .ok();
+            });
+            if let Some(state) = self.library_resources.get_mut(view_id) {
+                state.effect.replace(handle);
+            }
+        }
+        if transition.notify {
             cx.notify();
         }
     }
-}
-
-fn library_items_query(view_id: &str, state: &LibraryState, start_index: u32) -> UserItemsQuery {
-    UserItemsQuery {
-        parent_id: Some(view_id.to_string()),
-        include_item_types: state.item_types.clone(),
-        recursive: true,
-        start_index,
-        limit: PAGED_ITEMS_LIMIT,
-        sort_by: Some(state.sort_by),
-        sort_order: state.sort_order,
-        ..UserItemsQuery::default()
+    fn finish_library(
+        &mut self,
+        request: LibraryRequest,
+        result: anyhow::Result<UserItems>,
+        cx: &mut Context<Self>,
+    ) {
+        let identity = self.request_identity();
+        let Some(update) = self
+            .controller
+            .complete_library(&request, result, &identity)
+        else {
+            return;
+        };
+        if let Some(items) = update.images {
+            self.layout.content_changed();
+            self.ensure_user_items_images(&items, cx);
+        }
+        if let Some(failure) = update.failure {
+            let (key, message) = match failure {
+                LibraryFailure::Initial(error) => (
+                    library_initial_notification_key(&request.view_id),
+                    format!("加载媒体库失败：{error}"),
+                ),
+                LibraryFailure::Refresh(error) => {
+                    (library_refresh_notification_key(&request.view_id), error)
+                }
+                LibraryFailure::More(error) => (
+                    library_load_more_notification_key(&request.view_id),
+                    format!("加载更多媒体库内容失败：{error}"),
+                ),
+            };
+            self.push_error_notification(NotificationScope::Library, key, message, cx);
+        } else if request.initial {
+            self.clear_library_notifications(&request.view_id);
+        } else {
+            self.clear_notification(
+                NotificationScope::Library,
+                &library_load_more_notification_key(&request.view_id),
+            );
+        }
+        cx.notify();
     }
-}
-
-fn apply_library_sort(
-    state: &mut LibraryState,
-    sort_by: UserItemsSort,
-    sort_order: SortOrder,
-) -> bool {
-    state.sort_menu_open = false;
-    if state.sort_by == sort_by && state.sort_order == sort_order {
-        return false;
-    }
-
-    state.sort_by = sort_by;
-    state.sort_order = sort_order;
-    state.paged.mark_dirty();
-    true
-}
-
-pub(crate) fn library_item_types(collection_type: Option<&str>) -> Option<Vec<VideoItemType>> {
-    match normalized_collection_type(collection_type).as_deref() {
-        Some("movies") => Some(vec![VideoItemType::Movie]),
-        Some("tvshows") => Some(vec![VideoItemType::Series]),
-        Some("mixed") | None => Some(vec![VideoItemType::Movie, VideoItemType::Series]),
-        Some(collection_type) if known_unsupported_collection(collection_type) => None,
-        Some(_) => Some(vec![VideoItemType::Movie, VideoItemType::Series]),
-    }
-}
-
-pub(crate) fn latest_item_types(collection_type: Option<&str>) -> Option<Vec<VideoItemType>> {
-    match normalized_collection_type(collection_type).as_deref() {
-        Some("movies") => Some(vec![VideoItemType::Movie]),
-        Some("tvshows") => Some(vec![VideoItemType::Series, VideoItemType::Episode]),
-        Some("mixed") | None => Some(vec![
-            VideoItemType::Movie,
-            VideoItemType::Series,
-            VideoItemType::Episode,
-        ]),
-        Some(collection_type) if known_unsupported_collection(collection_type) => None,
-        Some(_) => Some(vec![
-            VideoItemType::Movie,
-            VideoItemType::Series,
-            VideoItemType::Episode,
-        ]),
-    }
-}
-
-pub(crate) fn is_supported_view(view: &UserView) -> bool {
-    !view.id.trim().is_empty() && library_item_types(view.collection_type.as_deref()).is_some()
-}
-
-fn normalized_collection_type(collection_type: Option<&str>) -> Option<String> {
-    collection_type
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase)
-}
-
-fn known_unsupported_collection(collection_type: &str) -> bool {
-    matches!(
-        collection_type,
-        "music"
-            | "musicvideos"
-            | "audiobooks"
-            | "books"
-            | "boxsets"
-            | "playlists"
-            | "homevideos"
-            | "homevideosandphotos"
-            | "photos"
-            | "trailers"
-            | "folders"
-            | "games"
-            | "livetv"
-            | "channels"
-    )
-}
-
-fn filter_supported_items(items: &mut UserItems, allowed: &[VideoItemType]) {
-    items.items.retain(|item| {
-        !item.id.trim().is_empty()
-            && allowed
-                .iter()
-                .any(|allowed| item.item_type.as_deref() == Some(allowed.as_str()))
-    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn reopening_loaded_library_reuses_scroll_and_sort_selection_closes_only_its_menu(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let server = serde_json::from_value(serde_json::json!({
+            "id":"local", "server_id":"remote", "user_id":"user",
+            "endpoint":{"protocol":"Https", "address":"example.com", "port":443, "path":""},
+            "username":"test", "password":"", "added_at_unix":0
+        }))
+        .unwrap();
+        let page = cx.new(|cx| {
+            HomeContent::new(
+                server,
+                crate::emby::EmbyClient::new("test".into()).unwrap(),
+                cx,
+            )
+        });
+        let view: UserView = serde_json::from_value(serde_json::json!({
+            "Id":"library", "Name":"Movies", "CollectionType":"movies"
+        }))
+        .unwrap();
+        page.update(cx, |page, cx| {
+            let mut library = LibraryController::new(
+                vec![VideoItemType::Movie],
+                view.id.clone(),
+                page.request_identity(),
+            );
+            library.test_paged_mut().initial = super::super::LoadState::Loaded;
+            page.controller
+                .test_state_mut()
+                .libraries
+                .insert(view.id.clone(), library);
+            page.open_library_for_view(&view, cx);
+            let offset = gpui::point(gpui::px(0.0), gpui::px(-600.0));
+            page.library_resources[&view.id]
+                .presentation
+                .grid
+                .scroll_handle
+                .set_offset(offset);
+            page.toggle_current_library_sort_menu(cx);
+            assert!(page.library_resources[&view.id].presentation.sort_menu_open);
+            page.select_library_sort_by(view.id.clone(), UserItemsSort::SortName, cx);
+            assert!(!page.library_resources[&view.id].presentation.sort_menu_open);
+            assert_eq!(
+                page.library_resources[&view.id]
+                    .presentation
+                    .grid
+                    .scroll_handle
+                    .offset(),
+                offset
+            );
+            page.open_library_for_view(&view, cx);
+            assert_eq!(page.library_resources.len(), 1);
+            assert_eq!(
+                page.library_resources[&view.id]
+                    .presentation
+                    .grid
+                    .scroll_handle
+                    .offset(),
+                offset
+            );
+            assert_eq!(
+                page.controller.test_state().libraries[&view.id]
+                    .view_model()
+                    .paged
+                    .initial,
+                super::super::LoadState::Loaded
+            );
+        });
+        cx.run_until_parked();
+    }
 
     #[test]
     fn maps_collection_types_to_v1_root_and_latest_types() {
@@ -581,50 +334,81 @@ mod tests {
 
     #[test]
     fn library_query_uses_selected_sort_for_every_page() {
-        let mut state = LibraryState::new("电视剧".to_string(), vec![VideoItemType::Series]);
-        state.sort_by = UserItemsSort::CriticRating;
-        state.sort_order = SortOrder::Descending;
-
-        let query = library_items_query("view-1", &state, 60);
-
-        assert_eq!(query.parent_id.as_deref(), Some("view-1"));
-        assert_eq!(query.include_item_types, vec![VideoItemType::Series]);
-        assert_eq!(query.start_index, 60);
-        assert_eq!(query.limit, PAGED_ITEMS_LIMIT);
-        assert_eq!(query.sort_by, Some(UserItemsSort::CriticRating));
-        assert_eq!(query.sort_order, SortOrder::Descending);
+        let mut state = LibraryController::new(
+            vec![VideoItemType::Series],
+            "view-1".into(),
+            WorkspaceIdentity::default(),
+        );
+        state.dispatch(LibraryIntent::SortBy(UserItemsSort::CriticRating), 0);
+        let changed = state.dispatch(LibraryIntent::SortOrder(SortOrder::Descending), 0);
+        let initial = changed.request.unwrap();
+        state
+            .complete(
+                &initial,
+                Ok(UserItems {
+                    items: (0..PAGED_ITEMS_LIMIT)
+                        .map(|index| {
+                            serde_json::from_value(serde_json::json!({
+                                "Id": index.to_string(), "Name": "Series", "Type": "Series"
+                            }))
+                            .unwrap()
+                        })
+                        .collect(),
+                    total_record_count: PAGED_ITEMS_LIMIT * 3,
+                }),
+                &WorkspaceIdentity::default(),
+            )
+            .unwrap();
+        let more = state
+            .dispatch(LibraryIntent::LoadMore { automatic: true }, 1)
+            .request
+            .unwrap();
+        for (request, start_index) in [(&initial, 0), (&more, PAGED_ITEMS_LIMIT)] {
+            let query = &request.query;
+            assert_eq!(query.parent_id.as_deref(), Some("view-1"));
+            assert_eq!(query.include_item_types, vec![VideoItemType::Series]);
+            assert!(query.recursive);
+            assert_eq!(query.start_index, start_index);
+            assert_eq!(query.limit, PAGED_ITEMS_LIMIT);
+            assert_eq!(query.sort_by, Some(UserItemsSort::CriticRating));
+            assert_eq!(query.sort_order, SortOrder::Descending);
+        }
     }
 
     #[test]
     fn changing_library_sort_invalidates_pages_and_closes_menu() {
-        let mut state = LibraryState::new("电影".to_string(), vec![VideoItemType::Movie]);
-        state.sort_menu_open = true;
-        state.paged.generation = 7;
+        let mut state = LibraryController::new(
+            vec![VideoItemType::Movie],
+            "view".into(),
+            WorkspaceIdentity::default(),
+        );
+        let pending = state.test_paged_mut().begin_initial(true).unwrap();
 
-        assert!(apply_library_sort(
-            &mut state,
-            UserItemsSort::DateCreated,
-            SortOrder::Descending,
-        ));
-        assert_eq!(state.sort_by, UserItemsSort::DateCreated);
-        assert_eq!(state.sort_order, SortOrder::Descending);
-        assert!(!state.sort_menu_open);
-        assert!(state.paged.dirty);
-        assert_eq!(state.paged.generation, 8);
+        let transition = state.dispatch(LibraryIntent::SortBy(UserItemsSort::DateCreated), 0);
+        assert!(transition.close_menu);
+        assert!(transition.request.is_some());
+        state.dispatch(LibraryIntent::SortOrder(SortOrder::Descending), 0);
+        assert_eq!(state.view_model().sort_by, UserItemsSort::DateCreated);
+        assert_eq!(state.view_model().sort_order, SortOrder::Descending);
+        assert!(state.view_model().paged.dirty);
+        assert!(!state.view_model().paged.accepts_initial(&pending));
     }
 
     #[test]
     fn selecting_current_library_sort_only_closes_menu() {
-        let mut state = LibraryState::new("电影".to_string(), vec![VideoItemType::Movie]);
-        state.sort_menu_open = true;
+        let mut state = LibraryController::new(
+            vec![VideoItemType::Movie],
+            "view".into(),
+            WorkspaceIdentity::default(),
+        );
 
-        assert!(!apply_library_sort(
-            &mut state,
-            UserItemsSort::SortName,
-            SortOrder::Ascending,
-        ));
-        assert!(!state.sort_menu_open);
-        assert!(!state.paged.dirty);
-        assert_eq!(state.paged.generation, 0);
+        let transition = state.dispatch(LibraryIntent::SortBy(UserItemsSort::SortName), 0);
+        assert!(transition.close_menu);
+        assert!(transition.request.is_none());
+        assert!(!state.view_model().paged.dirty);
+        assert_eq!(
+            state.view_model().paged.initial,
+            super::super::LoadState::Idle
+        );
     }
 }

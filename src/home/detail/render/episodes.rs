@@ -3,7 +3,7 @@ use super::*;
 impl HomeContent {
     pub(super) fn render_series_detail_episodes_row(
         &self,
-        detail: &SeriesDetailState,
+        detail: DetailView<'_>,
         episodes: &MediaItems,
         viewport_width: f32,
         cx: &Context<Self>,
@@ -22,7 +22,7 @@ impl HomeContent {
             DETAIL_EPISODE_CARD_PADDING_PX,
             DETAIL_EPISODE_CARD_GAP_PX,
         );
-        let carousel = detail.episodes_carousel;
+        let carousel = detail.presentation.episodes_carousel;
         let offset = carousel.scroll_offset(max_offset);
         let previous_offset = carousel.previous_scroll_offset(max_offset);
         let visible_range = carousel_visible_range_between_for(
@@ -48,10 +48,10 @@ impl HomeContent {
         });
         let scroll_left = cx.listener(Self::scroll_series_episodes_left);
         let scroll_right = cx.listener(Self::scroll_series_episodes_right);
-        let selected_episode_id = detail.selected_episode_id.as_deref();
+        let selected_episode_id = detail.model.selected_episode_id.as_deref();
         let animation_key = gpui::ElementId::from((
             gpui::ElementId::from("series-detail-episodes-scroll"),
-            format!("{}-{animation_id}", detail.series_id),
+            format!("{}-{animation_id}", detail.model.series_id),
         ));
 
         div().flex().flex_col().gap_3().child(
@@ -88,26 +88,21 @@ impl HomeContent {
                                         });
                                     let image_path = self.image_path_for_episode_primary(episode);
 
-                                    let mut episode = episode.clone();
-                                    episode.user_data = self
-                                        .effective_user_data(
-                                            &episode.id,
-                                            episode.user_data.as_ref(),
-                                        )
-                                        .cloned();
-                                    episode_card(&episode, image_path, selected, cx)
-                                        .cursor_pointer()
-                                        .debug_selector({
-                                            let episode_id = episode_id.clone();
-                                            move || {
-                                                format!("series-detail-episode-card-{episode_id}")
-                                            }
-                                        })
-                                        .id((
-                                            gpui::ElementId::from("series-detail-episode-card"),
-                                            episode_id,
-                                        ))
-                                        .on_click(on_click)
+                                    episode_card(
+                                        self.controller.episode_card_vm(episode, selected),
+                                        image_path,
+                                        cx,
+                                    )
+                                    .cursor_pointer()
+                                    .debug_selector({
+                                        let episode_id = episode_id.clone();
+                                        move || format!("series-detail-episode-card-{episode_id}")
+                                    })
+                                    .id((
+                                        gpui::ElementId::from("series-detail-episode-card"),
+                                        episode_id,
+                                    ))
+                                    .on_click(on_click)
                                 }),
                         )
                         .when(visible_range.trailing_width > 0.0, |this| {

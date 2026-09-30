@@ -1,15 +1,22 @@
-mod cache;
+use crate::home::detail::state::detail_binding;
+mod adapter;
+pub(crate) mod cache;
 mod carousel;
 mod components;
+mod controller;
 mod data;
 mod detail;
 mod favorites;
+mod feed;
+mod gateway;
 mod item_context_menu;
+mod layout;
 mod library;
-mod navigation;
+mod model;
 mod notification;
-mod paged_items;
 mod playback;
+mod played;
+mod presentation;
 mod render;
 mod resume_actions;
 mod search;
@@ -19,32 +26,35 @@ mod video_version;
 mod visible_row;
 mod workspace_render;
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    time::Instant,
-};
+use std::collections::HashMap;
 
 use crate::{
-    emby::{EmbyClient, ResumeItems, UserItemData, UserItems, UserViews},
-    images::loader::ImageLoader,
+    emby::EmbyClient,
+    images::{
+        ImageRepository,
+        controller::{ImageController, ItemImageRequest},
+        item_images::EmbyImageRepository,
+    },
     player::{PlaybackRequest, PlaybackTrackPreferences},
     search_history::SearchHistory,
     server::CachedServer,
     ui::editor::Editor,
 };
 use carousel::CarouselState;
-use favorites::{FavoriteRollback, FavoritesState};
+use controller::HomeController;
+use favorites::FavoritesPresentation;
 use item_context_menu::ItemContextMenu;
-use library::LibraryState;
-use navigation::{HomeNavigation, HomeRoot, HomeRoute};
+use library::LibraryResources;
+#[cfg(test)]
+use model::paged_items;
+use model::{LoadState, navigation};
+use navigation::{HomeRoot, HomeRoute};
 use notification::HomeNotificationQueue;
-use search::SearchState;
-
-pub(crate) use detail::SeriesDetailState;
+use presentation::SearchPresentation;
 
 use gpui::{
-    App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, ScrollHandle, SharedString,
-    Task, WeakEntity, Window,
+    App, AppContext as _, Context, Entity, EventEmitter, ScrollHandle, SharedString, Task,
+    WeakEntity, Window,
 };
 
 #[derive(Clone, Debug)]
@@ -63,6 +73,23 @@ pub enum HomeEvent {
     OpenPlayback(Box<PlaybackRequest>),
 }
 
+impl HomeEvent {
+    pub(crate) fn trace(&self) {
+        let operation = match self {
+            Self::BackToServers => "home.back_to_servers",
+            Self::SwitchServer(_) => "home.switch_server",
+            Self::AddServer => "home.add_server",
+            Self::ReorderServer { .. } => "home.reorder_server",
+            Self::SectionChanged => "home.section_changed",
+            Self::TitleChanged => "home.title_changed",
+            Self::SearchHistoryChanged(_) => "home.search_history_changed",
+            Self::OpenSettings => "home.open_settings",
+            Self::OpenPlayback(_) => "home.open_playback",
+        };
+        crate::observability::TraceId::start(operation).record("received");
+    }
+}
+
 #[derive(Clone, Debug)]
 enum HomeContentEvent {
     TitleChanged,
@@ -70,44 +97,12 @@ enum HomeContentEvent {
     OpenPlayback(Box<PlaybackRequest>),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum LoadState {
-    #[default]
-    Idle,
-    Loading,
-    Loaded,
-    Failed,
-}
-
-impl LoadState {
-    fn can_start(self) -> bool {
-        matches!(self, Self::Idle | Self::Failed)
-    }
-
-    fn is_loading(self) -> bool {
-        matches!(self, Self::Loading)
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct HomeEffects {
-    home_snapshot: LoadState,
-    user_views: LoadState,
-    resume_items: LoadState,
-}
-
-#[derive(Clone, Debug, Default)]
-struct UserViewItemsRow {
-    items: Option<UserItems>,
-    loading: bool,
-    carousel: CarouselState,
-}
+#[cfg(test)]
+use feed::UserViewItemsRow;
 
 #[derive(Clone, Debug)]
 pub struct HomePage {
-    current_server: CachedServer,
-    servers: Vec<CachedServer>,
-    selecting_server_id: Option<String>,
+    sidebar: model::sidebar::SidebarController,
     sidebar_scroll_handle: ScrollHandle,
     sidebar_reorder: Option<sidebar::reorder::SidebarReorder>,
     home_content: Entity<HomeContent>,
@@ -117,69 +112,52 @@ pub struct HomePage {
 struct HomeContent {
     current_server: CachedServer,
     emby_client: EmbyClient,
-    home_dashboard: Entity<HomeDashboard>,
-    reuse_home_dashboard_until_next_render: bool,
-    last_window_size: Option<(u32, u32)>,
-    resize_in_progress: bool,
-    resize_generation: u64,
-    last_resize_activity: Option<Instant>,
-    resize_settle_task_active: bool,
-    resize_settle_task: Task<()>,
-    defer_workspace_grid_contraction: bool,
-    defer_home_dashboard_warmup: bool,
-    workspace_grid_columns: usize,
+    layout: model::layout::HomeLayoutController,
+    dashboard: presentation::HomeDashboardResources,
     authentication_error: Option<SharedString>,
-    navigation: HomeNavigation,
-    home_refresh_generation: u64,
-    home_effects: HomeEffects,
-    user_views: Option<UserViews>,
-    user_views_failed: Option<gpui::SharedString>,
+    controller: HomeController,
+    feed_effects: data::FeedEffects,
     user_views_carousel: CarouselState,
-    resume_items: Option<ResumeItems>,
-    resume_items_failed: Option<gpui::SharedString>,
     resume_items_carousel: CarouselState,
+    latest_carousels: HashMap<String, CarouselState>,
     item_context_menu: Option<ItemContextMenu>,
-    resume_item_requests: HashSet<String>,
-    user_view_items_rows: HashMap<String, UserViewItemsRow>,
-    latest_queue: VecDeque<String>,
-    latest_in_flight: HashSet<(String, u64)>,
-    libraries: HashMap<String, LibraryState>,
-    favorites: FavoritesState,
-    search: SearchState,
+    // One cancellable continuation per resume mutation target.
+    resume_effects: HashMap<String, EffectHandle<Task<()>>>,
+    library_resources: HashMap<String, LibraryResources>,
+    favorites_presentation: FavoritesPresentation,
+    // Search scope: replace/cancel on query reset; dropping Home cancels delivery.
+    search_effect: EffectHandle<Task<()>>,
+    search_presentation: SearchPresentation,
     search_input: Entity<Editor>,
-    user_data_overrides: HashMap<String, UserItemData>,
-    played_video_versions: HashMap<String, video_version::VideoVersion>,
-    user_data_revision: u64,
-    user_data_item_revisions: HashMap<String, u64>,
-    favorite_requests: HashSet<String>,
-    favorite_rollbacks: HashMap<String, FavoriteRollback>,
-    played_request: Option<detail::PlayedRequest>,
-    series_user_data_revisions: HashMap<String, u64>,
-    series_detail: Option<SeriesDetailState>,
-    detail_history: Vec<SeriesDetailState>,
-    detail_generation: u64,
+    // FavoriteMutation token validates delivery; release cancels this handle.
+    favorite_effect: EffectHandle<Task<()>>,
+    // PlayedMutation owns all followup reads; release cancels delivery.
+    played_effect: EffectHandle<Task<()>>,
+    detail_resources: HashMap<detail::controller::DetailId, detail::state::DetailResources>,
     notifications: HomeNotificationQueue,
     home_scroll_handle: ScrollHandle,
-    image_loader: ImageLoader,
-    snapshot_save_generation: u64,
-    snapshot_save_pending: bool,
-    snapshot_save_task: Task<()>,
+    images: ImageController,
+    // Image requests belong to this workspace; drop cancels every continuation.
+    image_effects: HashMap<crate::images::cache::CachedImageKey, EffectHandle<Task<()>>>,
+    image_repository:
+        std::sync::Arc<dyn ImageRepository<ItemImageRequest, Image = std::path::PathBuf>>,
+    // Shared app-level persistence; page release flushes only this workspace.
+    persistence: crate::persistence::PersistenceService,
     #[cfg(test)]
     snapshot_save_path: Option<std::path::PathBuf>,
-    playback_refresh_generation: u64,
+    // Wait for stop reporting before refreshing Home data. Replacement/release
+    // cancels polling; only the current workspace token may trigger a refresh.
+    playback_refresh_task: EffectHandle<Task<()>>,
 }
 
 #[derive(Debug)]
 struct HomeDashboard {
     home_content: WeakEntity<HomeContent>,
+    #[cfg(test)]
+    render_count: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct WorkspaceIdentity {
-    local_server_id: String,
-    remote_server_id: Option<String>,
-    user_id: Option<String>,
-}
+use crate::effects::{EffectHandle, WorkspaceIdentity};
 
 impl EventEmitter<HomeEvent> for HomePage {}
 
@@ -187,6 +165,7 @@ impl EventEmitter<HomeContentEvent> for HomeContent {}
 
 impl HomeContent {
     fn new(current_server: CachedServer, emby_client: EmbyClient, cx: &mut Context<Self>) -> Self {
+        let persistence = crate::persistence::PersistenceService::get(cx);
         cx.observe_global::<PlaybackTrackPreferences>(|page, cx| {
             if page.sync_track_preferences(cx) {
                 page.schedule_home_snapshot_save(cx);
@@ -204,16 +183,18 @@ impl HomeContent {
         })
         .detach();
         let home_content = cx.weak_entity();
-        let home_dashboard = cx.new(move |_| HomeDashboard { home_content });
+        let home_dashboard = cx.new(move |_| HomeDashboard {
+            home_content,
+            #[cfg(test)]
+            render_count: 0,
+        });
         let observed_home_dashboard = home_dashboard.clone();
         cx.observe_self(move |page, cx| {
             // The cached dashboard reads HomeContent state through a separate
             // entity, so invalidate it whenever visible Home state changes. A
             // route-only transition back to Home can reuse the warm dashboard
             // cache; later data notifications invalidate it normally.
-            if page.navigation.current() == &HomeRoute::Root(HomeRoot::Home)
-                && !page.reuse_home_dashboard_until_next_render
-            {
+            if page.layout.page_notified(page.controller.route()) {
                 observed_home_dashboard.update(cx, |_, cx| cx.notify());
             }
         })
@@ -225,59 +206,46 @@ impl HomeContent {
             .filter(|id| !id.is_empty())
             .is_none()
             .then(|| "Emby 用户信息缺失，请返回服务器页重新登录".into());
+        let identity = current_server.workspace_identity();
+        let feed_effects = data::FeedEffects::new(identity.clone());
+        let images = ImageController::new(identity.clone());
+        let image_repository = std::sync::Arc::new(EmbyImageRepository {
+            client: emby_client.clone(),
+            server: current_server.clone(),
+        });
+        let layout = model::layout::HomeLayoutController::new(identity.clone());
+        let notifications = HomeNotificationQueue::new(identity.clone());
+        let controller = HomeController::new(identity);
         Self {
             current_server,
             emby_client,
-            home_dashboard,
-            reuse_home_dashboard_until_next_render: false,
-            last_window_size: None,
-            resize_in_progress: false,
-            resize_generation: 0,
-            last_resize_activity: None,
-            resize_settle_task_active: false,
-            resize_settle_task: Task::ready(()),
-            defer_workspace_grid_contraction: false,
-            defer_home_dashboard_warmup: false,
-            workspace_grid_columns: 0,
+            layout,
+            dashboard: presentation::HomeDashboardResources::new(home_dashboard),
             authentication_error,
-            navigation: HomeNavigation::default(),
-            home_refresh_generation: 0,
-            home_effects: HomeEffects::default(),
-            user_views: None,
-            user_views_failed: None,
+            controller,
+            feed_effects,
             user_views_carousel: CarouselState::default(),
-            resume_items: None,
-            resume_items_failed: None,
             resume_items_carousel: CarouselState::default(),
+            latest_carousels: HashMap::new(),
             item_context_menu: None,
-            resume_item_requests: HashSet::new(),
-            user_view_items_rows: HashMap::new(),
-            latest_queue: VecDeque::new(),
-            latest_in_flight: HashSet::new(),
-            libraries: HashMap::new(),
-            favorites: FavoritesState::default(),
-            search: SearchState::default(),
+            resume_effects: HashMap::new(),
+            library_resources: HashMap::new(),
+            favorites_presentation: FavoritesPresentation::new(),
+            search_effect: EffectHandle::default(),
+            search_presentation: SearchPresentation::default(),
             search_input,
-            user_data_overrides: HashMap::new(),
-            played_video_versions: HashMap::new(),
-            user_data_revision: 0,
-            user_data_item_revisions: HashMap::new(),
-            favorite_requests: HashSet::new(),
-            favorite_rollbacks: HashMap::new(),
-            played_request: None,
-            series_user_data_revisions: HashMap::new(),
-            series_detail: None,
-            detail_history: Vec::new(),
-            detail_generation: 0,
-            notifications: HomeNotificationQueue::default(),
+            favorite_effect: EffectHandle::default(),
+            played_effect: EffectHandle::default(),
+            detail_resources: HashMap::new(),
+            notifications,
             home_scroll_handle: ScrollHandle::new(),
-            image_loader: ImageLoader::new(),
-            snapshot_save_generation: 0,
-            snapshot_save_pending: false,
-            snapshot_save_task: Task::ready(()),
+            images,
+            image_effects: HashMap::new(),
+            image_repository,
+            persistence,
             #[cfg(test)]
             snapshot_save_path: None,
-            playback_refresh_generation: 0,
+            playback_refresh_task: EffectHandle::default(),
         }
     }
 
@@ -290,47 +258,55 @@ impl HomeContent {
     }
 
     fn title(&self) -> SharedString {
-        match self.navigation.current() {
-            HomeRoute::Detail { .. } => self
-                .series_detail
-                .as_ref()
-                .map(|detail| detail.title.clone().into())
-                .unwrap_or_else(|| self.navigation.root().title().into()),
-            route => route
-                .title()
-                .unwrap_or_else(|| self.navigation.root().title())
-                .to_string()
-                .into(),
+        self.controller.title().to_owned().into()
+    }
+
+    fn detail_view(&self) -> Option<detail::state::DetailView<'_>> {
+        detail::state::detail_view(self.controller.detail_view(), &self.detail_resources)
+    }
+
+    #[cfg(test)]
+    fn install_detail_fixture(&mut self, fixture: Option<detail::test_fixture::DetailFixture>) {
+        if let Some(current) = self.controller.test_state().navigation.detail() {
+            self.detail_resources.remove(&current.id());
         }
+        let controller = fixture.map(|fixture| {
+            let (controller, resources) = fixture.into_parts();
+            self.detail_resources.insert(controller.id(), resources);
+            controller
+        });
+        self.controller
+            .test_state_mut()
+            .navigation
+            .set_detail_fixture(controller);
     }
 
     fn root(&self) -> HomeRoot {
-        self.navigation.root()
+        self.controller.root()
     }
 
     fn select_root(&mut self, root: HomeRoot, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.navigation.select_root(root) {
+        if self.controller.route() == &HomeRoute::Root(root) {
+            return false;
+        }
+        self.sync_previous_offsets();
+        let change = self
+            .controller
+            .dispatch_navigation(controller::NavigationIntent::Root(root));
+        if !change.changed {
             return false;
         }
 
         // Non-Home workspaces keep the last dashboard frame cached behind their
         // opaque overlay. Do not dirty that cache for the route-only Home update.
-        self.reuse_home_dashboard_until_next_render = root == HomeRoot::Home;
+        self.layout.root_selected(root);
 
-        self.sync_previous_offsets();
-        self.detail_generation = self.detail_generation.wrapping_add(1);
-        // Detail responses can contain many episodes, people and media-source
-        // strings. Keep them alive through the next frame so switching a sidebar
-        // item can present the new workspace before doing all of that deallocation.
-        let detail_to_drop = self.series_detail.take();
-        let detail_history_to_drop = std::mem::take(&mut self.detail_history);
-        if detail_to_drop.is_some() || !detail_history_to_drop.is_empty() {
+        // Keep domain data and view handles alive for the original two-frame
+        // release boundary, after cancelling all retired continuations now.
+        let retired = detail::state::apply_navigation_change(change, &mut self.detail_resources);
+        if !retired.0.is_empty() || !retired.1.is_empty() {
             window.on_next_frame(move |window, _| {
-                window.on_next_frame(move |_, _| drop((detail_to_drop, detail_history_to_drop)));
-                // `on_next_frame` callbacks run outside an element's
-                // layout/prepaint/paint context, so `request_animation_frame`
-                // would try to read `current_view` and panic. `refresh` is the
-                // phase-independent way to request the follow-up frame here.
+                window.on_next_frame(move |_, _| drop(retired));
                 window.refresh();
             });
         }
@@ -342,10 +318,10 @@ impl HomeContent {
                 self.enter_favorites_if_needed(cx)
             }
             HomeRoot::Search if self.authentication_error.is_none() => {
-                if !self.search.focused_once {
+                if !self.search_presentation.focused_once {
                     let focus = self.search_input.read(cx).focus_handle(cx);
                     window.focus(&focus, cx);
-                    self.search.focused_once = true;
+                    self.search_presentation.focused_once = true;
                 }
             }
             HomeRoot::Favorites => {}
@@ -356,36 +332,30 @@ impl HomeContent {
     }
 
     pub(super) fn request_identity(&self) -> WorkspaceIdentity {
-        WorkspaceIdentity {
-            local_server_id: self.current_server.id.clone(),
-            remote_server_id: self.current_server.server_id.clone(),
-            user_id: self.current_server.user_id.clone(),
-        }
-    }
-
-    pub(super) fn matches_request_identity(&self, identity: &WorkspaceIdentity) -> bool {
-        self.request_identity() == *identity
+        self.current_server.workspace_identity()
     }
 
     fn sync_previous_offsets(&mut self) {
-        self.favorites.sync_previous_offsets();
+        self.favorites_presentation.sync_previous_offsets();
         self.user_views_carousel.sync_previous_offset();
         self.resume_items_carousel.sync_previous_offset();
-        for row in self.user_view_items_rows.values_mut() {
-            row.carousel.sync_previous_offset();
+        for carousel in self.latest_carousels.values_mut() {
+            carousel.sync_previous_offset();
         }
-        if let Some(detail) = &mut self.series_detail {
-            detail.episodes_carousel.sync_previous_offset();
-            detail.people_carousel.sync_previous_offset();
-            detail.similar_carousel.sync_previous_offset();
+        if let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        {
+            detail.presentation.episodes_carousel.sync_previous_offset();
+            detail.presentation.people_carousel.sync_previous_offset();
+            detail.presentation.similar_carousel.sync_previous_offset();
         }
     }
 }
 
 impl HomePage {
-    pub fn new(
+    pub(crate) fn new(
         current_server: CachedServer,
-        servers: Vec<CachedServer>,
+        servers: Vec<crate::server::feature::SidebarServer>,
         emby_client: EmbyClient,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -404,9 +374,11 @@ impl HomePage {
         )
         .detach();
         let mut page = Self {
-            current_server,
-            servers,
-            selecting_server_id: None,
+            sidebar: model::sidebar::SidebarController::new(
+                current_server.id,
+                current_server.username,
+                servers,
+            ),
             sidebar_scroll_handle: ScrollHandle::new(),
             sidebar_reorder: None,
             home_content,
@@ -419,20 +391,24 @@ impl HomePage {
         self.home_content.read(cx).title()
     }
 
-    pub(crate) fn set_servers(&mut self, servers: Vec<CachedServer>, cx: &mut Context<Self>) {
-        self.servers = servers;
-        cx.notify();
+    pub(crate) fn set_servers(
+        &mut self,
+        servers: Vec<crate::server::feature::SidebarServer>,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_sidebar_intent(model::sidebar::SidebarIntent::ServersChanged(servers), cx);
     }
 
     pub(crate) fn set_search_history(&mut self, history: SearchHistory, cx: &mut Context<Self>) {
         self.home_content.update(cx, |content, cx| {
-            content.search.history = history;
+            content.controller.restore_search_history(history);
             cx.notify();
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn current_server_id(&self) -> &str {
-        &self.current_server.id
+        self.sidebar.current_server_id()
     }
 
     pub(crate) fn set_selecting_server(
@@ -440,8 +416,10 @@ impl HomePage {
         server_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.selecting_server_id = server_id;
-        cx.notify();
+        self.apply_sidebar_intent(
+            model::sidebar::SidebarIntent::SelectingChanged(server_id),
+            cx,
+        );
     }
 
     pub(crate) fn start_effects(&mut self, cx: &mut Context<Self>) {
@@ -462,54 +440,6 @@ impl HomePage {
             cx.emit(HomeEvent::SectionChanged);
             cx.notify();
         }
-    }
-
-    fn select_home_section(
-        &mut self,
-        event: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_active_section(HomeRoot::Home, window, cx);
-        if event.click_count() == 2 {
-            self.home_content
-                .update(cx, |content, cx| content.refresh_home_content(cx));
-            window.refresh();
-        }
-    }
-
-    fn select_favorites_section(
-        &mut self,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_active_section(HomeRoot::Favorites, window, cx);
-    }
-
-    fn select_search_section(
-        &mut self,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_active_section(HomeRoot::Search, window, cx);
-    }
-
-    fn back_to_servers(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(HomeEvent::BackToServers);
-    }
-
-    fn switch_server(&mut self, server_id: &str, cx: &mut Context<Self>) {
-        if (server_id != self.current_server.id || self.selecting_server_id.is_some())
-            && self.servers.iter().any(|server| server.id == server_id)
-        {
-            cx.emit(HomeEvent::SwitchServer(server_id.to_string()));
-        }
-    }
-
-    fn open_settings(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(HomeEvent::OpenSettings);
     }
 
     pub(crate) fn apply_playback_update(

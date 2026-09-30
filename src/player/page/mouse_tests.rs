@@ -1,3 +1,6 @@
+use crate::player::{
+    adapter::subtitles::playback_subtitle_tracks_for_source, playback_audio_tracks_for_source,
+};
 use gpui::{
     DispatchEventResult, Modifiers, PlatformInput, TestAppContext, VisualTestContext, point,
 };
@@ -74,7 +77,7 @@ fn playback_controls_do_not_consume_native_caption_clicks(cx: &mut TestAppContex
     let (page, cx) = playback_with_titlebar(cx);
     for controls_visible in [false, true, false, true] {
         page.update(cx, |page, cx| {
-            page.fullscreen.controls_visible = controls_visible;
+            page.presentation.fullscreen.controls_visible = controls_visible;
             cx.notify();
         });
         cx.run_until_parked();
@@ -99,8 +102,8 @@ fn playback_controls_do_not_consume_native_caption_clicks(cx: &mut TestAppContex
                 "{selector} release with controls visible: {controls_visible}"
             );
             page.read_with(cx, |page, _| {
-                assert!(page.timeline.progress_drag_position.is_none());
-                assert!(!page.timeline.user_paused);
+                assert!(page.session.timeline().progress_drag_position.is_none());
+                assert!(!page.session.timeline().user_paused);
             });
         }
     }
@@ -115,11 +118,15 @@ fn progress_drag_consumes_its_own_release_outside_the_track_only(cx: &mut TestAp
     let video = point(px(1060.0), px(400.0));
     for end in [caption, video] {
         assert!(!dispatch_mouse_press(cx, track.center(), MouseButton::Left, 1).propagate);
-        assert!(page.read_with(cx, |page, _| page.timeline.progress_drag_position.is_some()));
+        assert!(page.read_with(cx, |page, _| {
+            page.session.timeline().progress_drag_position.is_some()
+        }));
         // Releasing a seek over a caption button must finish the seek without
         // accidentally activating the button; subsequent releases must pass.
         assert!(!dispatch_left_release(cx, end).propagate);
-        assert!(page.read_with(cx, |page, _| page.timeline.progress_drag_position.is_none()));
+        assert!(page.read_with(cx, |page, _| {
+            page.session.timeline().progress_drag_position.is_none()
+        }));
         assert!(dispatch_left_release(cx, end).propagate);
     }
 }
@@ -138,28 +145,28 @@ fn surface_drag_press_reaches_windows_but_menu_dismissal_does_not(cx: &mut TestA
         assert_eq!(result.propagate, cfg!(target_os = "windows"));
         page.read_with(cx, |page, _| {
             assert_eq!(
-                page.window_drag,
+                page.presentation.window_drag,
                 if cfg!(target_os = "linux") {
                     WindowDragState::Idle
                 } else {
                     WindowDragState::Pending
                 }
             );
-            assert!(!page.timeline.user_paused);
-            assert!(page.timeline.progress_drag_position.is_none());
+            assert!(!page.session.timeline().user_paused);
+            assert!(page.session.timeline().progress_drag_position.is_none());
         });
         assert!(!cx.update(|window, _| window.is_fullscreen()));
         cx.simulate_mouse_up(origin, MouseButton::Left, Modifiers::default());
 
         page.update(cx, |page, cx| {
-            page.tracks.open = Some(PlaybackTrackKind::Audio);
+            page.presentation.track_select_open = Some(PlaybackTrackKind::Audio);
             cx.notify();
         });
         cx.run_until_parked();
         assert!(!dispatch_mouse_press(cx, origin, MouseButton::Left, 1).propagate);
         page.read_with(cx, |page, _| {
-            assert!(page.tracks.open.is_none());
-            assert_ne!(page.window_drag, WindowDragState::Pending);
+            assert!(page.presentation.track_select_open.is_none());
+            assert_ne!(page.presentation.window_drag, WindowDragState::Pending);
         });
         cx.simulate_mouse_up(origin, MouseButton::Left, Modifiers::default());
     }
@@ -181,7 +188,7 @@ fn surface_double_click_keeps_fullscreen_and_blocks_native_maximize(cx: &mut Tes
         );
         if was_fullscreen {
             assert_eq!(
-                page.read_with(cx, |page, _| page.window_drag),
+                page.read_with(cx, |page, _| page.presentation.window_drag),
                 WindowDragState::Idle
             );
         }
@@ -193,7 +200,7 @@ fn surface_double_click_keeps_fullscreen_and_blocks_native_maximize(cx: &mut Tes
             !was_fullscreen
         );
         assert_eq!(
-            page.read_with(cx, |page, _| page.window_drag),
+            page.read_with(cx, |page, _| page.presentation.window_drag),
             WindowDragState::Idle
         );
         cx.simulate_mouse_up(video, MouseButton::Left, Modifiers::default());
@@ -206,14 +213,16 @@ fn surface_double_click_keeps_fullscreen_and_blocks_native_maximize(cx: &mut Tes
 fn server_decorations_discard_a_pending_playback_window_drag(cx: &mut TestAppContext) {
     let (page, cx) = episodes::tests::playback_window(cx);
     // Model a decoration-mode change after a client-side drag was armed.
-    page.update(cx, |page, _| page.window_drag = WindowDragState::Pending);
+    page.update(cx, |page, _| {
+        page.presentation.window_drag = WindowDragState::Pending
+    });
     cx.simulate_mouse_move(
         point(px(800.0), px(400.0)),
         Some(MouseButton::Left),
         Modifiers::default(),
     );
     assert_eq!(
-        page.read_with(cx, |page, _| page.window_drag),
+        page.read_with(cx, |page, _| page.presentation.window_drag),
         WindowDragState::Idle
     );
 }
@@ -244,14 +253,14 @@ fn native_surface_suppresses_system_menu_and_preserves_volume_scroll(cx: &mut Te
         );
     }
 
-    let initial_volume = page.read_with(cx, |page, _| page.volume.level);
+    let initial_volume = page.read_with(cx, |page, _| page.session.controls_view().volume.level);
     cx.simulate_event(ScrollWheelEvent {
         position: video,
         delta: ScrollDelta::Lines(point(0.0, -3.0)),
         modifiers: Modifiers::default(),
         touch_phase: gpui::TouchPhase::Moved,
     });
-    let actual_volume = page.read_with(cx, |page, _| page.volume.level);
+    let actual_volume = page.read_with(cx, |page, _| page.session.controls_view().volume.level);
     assert!((actual_volume - (initial_volume - PLAYBACK_VOLUME_STEP)).abs() < f32::EPSILON);
 }
 
@@ -261,8 +270,11 @@ fn control_panel_background_closes_track_menus_without_playback_side_effects(
 ) {
     let (page, cx) = episodes::tests::playback_window(cx);
     page.update(cx, |page, cx| {
-        page.tracks.selected_audio_stream_index = Some(0);
-        page.tracks.selected_subtitle_stream_index = Some(1);
+        page.session.source_mut().tracks.selected_audio_stream_index = Some(0);
+        page.session
+            .source_mut()
+            .tracks
+            .selected_subtitle_stream_index = Some(1);
         cx.notify();
     });
     cx.run_until_parked();
@@ -276,9 +288,9 @@ fn control_panel_background_closes_track_menus_without_playback_side_effects(
             .unwrap()
             .center(),
     ];
-    let volume = page.read_with(cx, |page, _| page.volume.level);
-    let position = page.read_with(cx, |page, _| page.timeline.position);
-    let user_paused = page.read_with(cx, |page, _| page.timeline.user_paused);
+    let volume = page.read_with(cx, |page, _| page.session.controls_view().volume.level);
+    let position = page.read_with(cx, |page, _| page.session.timeline().position);
+    let user_paused = page.read_with(cx, |page, _| page.session.timeline().user_paused);
 
     for fullscreen in [false, true] {
         if fullscreen {
@@ -293,7 +305,10 @@ fn control_panel_background_closes_track_menus_without_playback_side_effects(
                     let trigger = cx.debug_bounds(trigger).unwrap().center();
                     cx.simulate_click(trigger, Modifiers::default());
                     cx.run_until_parked();
-                    assert_eq!(page.read_with(cx, |page, _| page.tracks.open), Some(kind));
+                    assert_eq!(
+                        page.read_with(cx, |page, _| page.presentation.track_select_open),
+                        Some(kind)
+                    );
                     cx.simulate_mouse_move(point, None, Modifiers::default());
                     cx.simulate_event(ScrollWheelEvent {
                         position: point,
@@ -301,22 +316,25 @@ fn control_panel_background_closes_track_menus_without_playback_side_effects(
                         modifiers: Modifiers::default(),
                         touch_phase: gpui::TouchPhase::Moved,
                     });
-                    assert_eq!(page.read_with(cx, |page, _| page.tracks.open), Some(kind));
+                    assert_eq!(
+                        page.read_with(cx, |page, _| page.presentation.track_select_open),
+                        Some(kind)
+                    );
                     cx.simulate_mouse_down(point, button, Modifiers::default());
                     page.read_with(cx, |page, _| {
                         assert!(
-                            page.tracks.open.is_none(),
+                            page.presentation.track_select_open.is_none(),
                             "{kind:?}: {button:?} at {point:?}"
                         );
-                        assert_ne!(page.window_drag, WindowDragState::Pending);
+                        assert_ne!(page.presentation.window_drag, WindowDragState::Pending);
                     });
                     cx.simulate_mouse_up(point, button, Modifiers::default());
                     cx.run_until_parked();
                     page.read_with(cx, |page, _| {
-                        assert_eq!(page.volume.level, volume);
-                        assert_eq!(page.timeline.position, position);
-                        assert_eq!(page.timeline.user_paused, user_paused);
-                        assert!(page.timeline.progress_drag_position.is_none());
+                        assert_eq!(page.session.controls_view().volume.level, volume);
+                        assert_eq!(page.session.timeline().position, position);
+                        assert_eq!(page.session.timeline().user_paused, user_paused);
+                        assert!(page.session.timeline().progress_drag_position.is_none());
                     });
                     assert_eq!(cx.update(|window, _| window.is_fullscreen()), fullscreen);
                 }
@@ -331,8 +349,11 @@ fn track_menus_keep_inside_clicks_and_buttons_can_toggle_switch_and_select(
 ) {
     let (page, cx) = episodes::tests::playback_window(cx);
     page.update(cx, |page, cx| {
-        page.tracks.selected_audio_stream_index = Some(0);
-        page.tracks.selected_subtitle_stream_index = Some(1);
+        page.session.source_mut().tracks.selected_audio_stream_index = Some(0);
+        page.session
+            .source_mut()
+            .tracks
+            .selected_subtitle_stream_index = Some(1);
         cx.notify();
     });
     cx.run_until_parked();
@@ -358,11 +379,14 @@ fn track_menus_keep_inside_clicks_and_buttons_can_toggle_switch_and_select(
             cx.simulate_mouse_down(padding, button, Modifiers::default());
             cx.simulate_mouse_up(padding, button, Modifiers::default());
             cx.run_until_parked();
-            assert_eq!(page.read_with(cx, |page, _| page.tracks.open), Some(kind));
+            assert_eq!(
+                page.read_with(cx, |page, _| page.presentation.track_select_open),
+                Some(kind)
+            );
         }
         cx.simulate_click(trigger, Modifiers::default());
         cx.run_until_parked();
-        assert!(page.read_with(cx, |page, _| page.tracks.open.is_none()));
+        assert!(page.read_with(cx, |page, _| page.presentation.track_select_open.is_none()));
     }
     for (kind, trigger) in [
         (PlaybackTrackKind::Audio, "playback-audio-button"),
@@ -372,7 +396,10 @@ fn track_menus_keep_inside_clicks_and_buttons_can_toggle_switch_and_select(
         let trigger = cx.debug_bounds(trigger).unwrap().center();
         cx.simulate_click(trigger, Modifiers::default());
         cx.run_until_parked();
-        assert_eq!(page.read_with(cx, |page, _| page.tracks.open), Some(kind));
+        assert_eq!(
+            page.read_with(cx, |page, _| page.presentation.track_select_open),
+            Some(kind)
+        );
     }
     let off = cx
         .debug_bounds("playback-track-off-option")
@@ -380,7 +407,7 @@ fn track_menus_keep_inside_clicks_and_buttons_can_toggle_switch_and_select(
         .center();
     cx.simulate_click(off, Modifiers::default());
     cx.run_until_parked();
-    assert!(page.read_with(cx, |page, _| page.tracks.open.is_none()));
+    assert!(page.read_with(cx, |page, _| page.presentation.track_select_open.is_none()));
     assert!(cx.debug_bounds("playback-audio-menu").is_none());
     assert!(cx.debug_bounds("playback-caption-menu").is_none());
 }
@@ -406,15 +433,18 @@ fn track_menus_show_metadata_below_labels_and_scroll_to_select_last_track(cx: &m
             })
             .collect::<Vec<_>>();
         let source = serde_json::from_value(serde_json::json!({"MediaStreams": streams})).unwrap();
-        page.tracks.audio = playback_audio_tracks_for_source(&source);
-        page.tracks.subtitles = playback_subtitle_tracks_for_source(
+        page.session.source_mut().tracks.audio = playback_audio_tracks_for_source(&source);
+        page.session.source_mut().tracks.subtitles = playback_subtitle_tracks_for_source(
             &source,
             &page.emby.server,
             &page.emby.item_id,
             &page.emby.media_source_id,
         );
-        page.tracks.selected_audio_stream_index = Some(0);
-        page.tracks.selected_subtitle_stream_index = Some(10);
+        page.session.source_mut().tracks.selected_audio_stream_index = Some(0);
+        page.session
+            .source_mut()
+            .tracks
+            .selected_subtitle_stream_index = Some(10);
         cx.notify();
     });
     cx.run_until_parked();
@@ -474,7 +504,7 @@ fn track_menus_show_metadata_below_labels_and_scroll_to_select_last_track(cx: &m
             cx.simulate_click(metadata.center(), Modifiers::default());
             cx.run_until_parked();
             assert!(cx.debug_bounds(menu_id).is_none());
-            assert!(page.read_with(cx, |page, _| page.tracks.open.is_none()));
+            assert!(page.read_with(cx, |page, _| page.presentation.track_select_open.is_none()));
         }
     }
 }
@@ -506,8 +536,8 @@ fn control_panel_presses_do_not_become_window_drags_outside_the_panel(cx: &mut T
         }
         cx.simulate_mouse_up(stats, MouseButton::Left, Modifiers::default());
         page.read_with(cx, |page, _| {
-            assert!(page.playback_details_visible);
-            assert!(page.timeline.progress_drag_position.is_none());
+            assert!(page.presentation.playback_details_visible);
+            assert!(page.session.timeline().progress_drag_position.is_none());
         });
     }
 }
@@ -532,7 +562,7 @@ fn window_drag_origin_resets_on_release_or_a_new_control_press(cx: &mut TestAppC
         cx.simulate_mouse_move(origin, None, Modifiers::default());
         cx.simulate_mouse_down(origin, MouseButton::Left, Modifiers::default());
         assert_eq!(
-            page.read_with(cx, |page, _| page.window_drag),
+            page.read_with(cx, |page, _| page.presentation.window_drag),
             after_surface_press
         );
 
@@ -540,21 +570,21 @@ fn window_drag_origin_resets_on_release_or_a_new_control_press(cx: &mut TestAppC
         // Skip motion here because native moves are unavailable in tests.
         cx.simulate_mouse_up(play, MouseButton::Left, Modifiers::default());
         assert_eq!(
-            page.read_with(cx, |page, _| page.window_drag),
+            page.read_with(cx, |page, _| page.presentation.window_drag),
             WindowDragState::Idle
         );
         cx.simulate_mouse_move(video, Some(MouseButton::Left), Modifiers::default());
 
         cx.simulate_mouse_down(origin, MouseButton::Left, Modifiers::default());
         assert_eq!(
-            page.read_with(cx, |page, _| page.window_drag),
+            page.read_with(cx, |page, _| page.presentation.window_drag),
             after_surface_press
         );
         // Model a release consumed outside the window: a new press must discard
         // the previous origin even when a button handles that press itself.
         cx.simulate_mouse_down(play, MouseButton::Left, Modifiers::default());
         assert_eq!(
-            page.read_with(cx, |page, _| page.window_drag),
+            page.read_with(cx, |page, _| page.presentation.window_drag),
             WindowDragState::Blocked
         );
         cx.simulate_mouse_move(origin, Some(MouseButton::Left), Modifiers::default());
@@ -564,7 +594,7 @@ fn window_drag_origin_resets_on_release_or_a_new_control_press(cx: &mut TestAppC
     cx.update(|window, _| window.toggle_fullscreen());
     cx.simulate_mouse_down(video, MouseButton::Left, Modifiers::default());
     assert_eq!(
-        page.read_with(cx, |page, _| page.window_drag),
+        page.read_with(cx, |page, _| page.presentation.window_drag),
         WindowDragState::Idle
     );
     cx.simulate_mouse_move(

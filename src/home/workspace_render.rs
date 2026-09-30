@@ -19,15 +19,11 @@ use super::{
         HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
         HOME_MAIN_SCROLLBAR_WIDTH_PX, home_main_content_width_for_window_width,
     },
-    components::{
-        favorite_episode_card, user_episode_card, user_item_card,
-        user_item_card_with_favorite_badge,
-    },
+    components::{favorite_episode_card, user_episode_card, user_item_card},
     favorites::{favorite_section_title, render::favorite_action},
     item_context_menu::ItemContextMenuSource,
-    library::{LibraryState, available_library_sorts},
+    library::{LibraryView, available_library_sorts},
     navigation::HomeRoute,
-    paged_items::PagedItemsState,
 };
 
 const WORKSPACE_AUTO_LOAD_MIN_THRESHOLD_PX: f32 = 480.0;
@@ -40,7 +36,6 @@ const LIBRARY_SORT_ORDERS: [SortOrder; 2] = [SortOrder::Ascending, SortOrder::De
 // measured height here preserves the original flex-grid row spacing exactly.
 const USER_ITEM_GRID_ROW_HEIGHT_PX: f32 = 302.0;
 const USER_ITEM_GRID_ROW_STEP_PX: f32 = USER_ITEM_GRID_ROW_HEIGHT_PX + HOME_ITEM_CARD_GAP_PX;
-const USER_ITEM_GRID_OVERSCAN_ROWS: usize = 1;
 
 #[derive(Clone, Copy)]
 pub(super) enum UserItemGridSource {
@@ -85,19 +80,27 @@ impl UserItemGridSource {
 impl HomeContent {
     pub(super) fn render_library_scrollable_content(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = theme::get(cx);
-        let view_id = match self.navigation.current() {
+        let view_id = match self.controller.route() {
             HomeRoute::Library { view_id, .. } => view_id,
             _ => unreachable!("library renderer requires a Library route"),
         };
-        let state = self
-            .libraries
-            .get(view_id)
-            .expect("Library route has cached LibraryState");
+        let state = LibraryView {
+            model: self
+                .controller
+                .library_view(view_id)
+                .expect("Library route has a controller"),
+            presentation: &self
+                .library_resources
+                .get(view_id)
+                .expect("Library route has presentation resources")
+                .presentation,
+        };
         let total = state
+            .model
             .paged
             .total_record_count
             .map(|total| format!("共 {total} 项"));
-        let sort_select = self.render_library_sort_select(view_id, state, cx);
+        let sort_select = self.render_library_sort_select(view_id, &state, cx);
         let back = cx.listener(Self::close_series_detail);
 
         div()
@@ -152,24 +155,19 @@ impl HomeContent {
                     .min_h_0()
                     .overflow_y_scroll()
                     .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
-                    .track_scroll(&state.paged.scroll_handle)
+                    .track_scroll(&state.presentation.grid.scroll_handle)
                     .px_6()
                     .pb_6()
-                    .when(
-                        state.paged.initial != super::LoadState::Loading
-                            && state.paged.initial_error.is_none()
-                            && state.paged.items.is_empty(),
-                        |this| {
-                            this.child(self.render_center_message("该媒体库暂无内容", false, cx))
-                        },
-                    )
-                    .when(!state.paged.items.is_empty(), |this| {
+                    .when(state.model.empty, |this| {
+                        this.child(self.render_center_message("该媒体库暂无内容", false, cx))
+                    })
+                    .when(!state.model.paged.items.is_empty(), |this| {
                         this.child(self.render_items_grid(
-                            &state.paged.items,
+                            &state.model.paged.items,
                             "library-grid-item",
                             cx,
                         ))
-                        .child(self.render_library_paged_footer(&state.paged, view_id, cx))
+                        .child(self.render_library_paged_footer(&state, view_id, cx))
                     }),
             )
     }
@@ -177,20 +175,20 @@ impl HomeContent {
     fn render_library_sort_select(
         &self,
         view_id: &str,
-        state: &LibraryState,
+        state: &LibraryView<'_>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = theme::get(cx);
-        let sort_by = state.sort_by;
-        let sort_order = state.sort_order;
-        let menu_open = state.sort_menu_open;
+        let sort_by = state.model.sort_by;
+        let sort_order = state.model.sort_order;
+        let menu_open = state.presentation.sort_menu_open;
         let trigger_label = format!(
             "{} · {}",
             library_sort_label(sort_by),
             library_sort_order_label(sort_order)
         );
         let toggle = cx.listener(|page, _, _, cx| page.toggle_current_library_sort_menu(cx));
-        let sort_options = available_library_sorts(&state.item_types)
+        let sort_options = available_library_sorts(state.model.item_types)
             .enumerate()
             .map(|(index, candidate)| {
                 let option_view_id = view_id.to_string();
@@ -291,14 +289,16 @@ impl HomeContent {
         window: &Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let HomeRoute::FavoriteItems { item_type } = self.navigation.current() else {
+        let HomeRoute::FavoriteItems { item_type } = self.controller.route() else {
             unreachable!("favorite category renderer requires a FavoriteItems route");
         };
         let item_type = *item_type;
         let theme = theme::get(cx);
-        let state = &self.favorites[item_type].paged;
+        let section = &self.favorites_presentation[item_type];
+        let state = self.controller.favorite_section(item_type).paged;
+        let presentation = &section.presentation;
         let page = cx.entity().downgrade();
-        let scroll_handle = state.scroll_handle.clone();
+        let scroll_handle = presentation.scroll_handle.clone();
         let observer = canvas(
             |_, _, _| {},
             move |_, _, window, _| {
@@ -318,9 +318,9 @@ impl HomeContent {
         .h(px(1.0));
         let grid = self.render_virtual_items_grid(
             UserItemGridSource::Favorites(item_type),
-            self.workspace_grid_columns.max(1),
-            state.scroll_handle.clone(),
-            &state.grid_columns,
+            self.layout.view_model().grid_columns,
+            presentation.scroll_handle.clone(),
+            &presentation.grid_columns,
             f32::from(window.bounds().size.height),
             cx,
         );
@@ -376,7 +376,7 @@ impl HomeContent {
                     .pb_6()
                     .when(!state.items.is_empty(), |this| this.child(grid))
                     .when(
-                        state.can_auto_load_more() && !self.resize_in_progress,
+                        state.can_auto_load_more() && self.layout.view_model().auto_paginate,
                         |this| this.child(observer),
                     ),
             )
@@ -405,7 +405,7 @@ impl HomeContent {
     ) -> impl IntoElement {
         let theme = theme::get(cx);
         let page = cx.entity().downgrade();
-        let scroll_handle = self.search.scroll_handle.clone();
+        let scroll_handle = self.search_presentation.grid.scroll_handle.clone();
         let auto_load_observer = canvas(
             |bounds, _, _| bounds,
             move |_, _, window, _| {
@@ -427,9 +427,9 @@ impl HomeContent {
         .bottom_0();
         let grid = self.render_virtual_items_grid(
             UserItemGridSource::Search,
-            self.workspace_grid_columns.max(1),
-            self.search.scroll_handle.clone(),
-            &self.search.grid_columns,
+            self.layout.view_model().grid_columns,
+            self.search_presentation.grid.scroll_handle.clone(),
+            &self.search_presentation.grid.grid_columns,
             f32::from(window.bounds().size.height),
             cx,
         );
@@ -456,9 +456,10 @@ impl HomeContent {
                     .pt_6()
                     .pb_5()
                     .child(div().w_full().child(self.search_input.clone()))
-                    .when(!self.search.history.entries().is_empty(), |header| {
-                        header.child(self.render_search_history(cx))
-                    }),
+                    .when(
+                        !self.controller.search_view().history.entries().is_empty(),
+                        |header| header.child(self.render_search_history(cx)),
+                    ),
             )
             .child(
                 div()
@@ -468,22 +469,15 @@ impl HomeContent {
                     .relative()
                     .px_6()
                     .pb_6()
+                    .when(self.controller.search_view().empty_results, |this| {
+                        this.child(self.render_center_message("未找到相关电影或剧集", false, cx))
+                    })
+                    .when(!self.controller.search_view().items.is_empty(), |this| {
+                        this.child(grid)
+                    })
                     .when(
-                        !self.search.query.is_empty()
-                            && self.search.initial == super::LoadState::Loaded
-                            && self.search.items.is_empty()
-                            && self.search.exhausted,
-                        |this| {
-                            this.child(self.render_center_message(
-                                "未找到相关电影或剧集",
-                                false,
-                                cx,
-                            ))
-                        },
-                    )
-                    .when(!self.search.items.is_empty(), |this| this.child(grid))
-                    .when(
-                        self.search.can_load_more() && !self.resize_in_progress,
+                        self.controller.search_view().can_load_more
+                            && self.layout.view_model().auto_paginate,
                         |this| this.child(auto_load_observer),
                     ),
             )
@@ -539,8 +533,13 @@ impl HomeContent {
                     .overflow_y_scroll()
                     .child(
                         div().flex().flex_wrap().gap_2().children(
-                            self.search.history.entries().iter().enumerate().map(
-                                |(index, query)| {
+                            self.controller
+                                .search_view()
+                                .history
+                                .entries()
+                                .iter()
+                                .enumerate()
+                                .map(|(index, query)| {
                                     let query = query.clone();
                                     let tooltip = query.clone();
                                     div()
@@ -571,8 +570,7 @@ impl HomeContent {
                                             cx.stop_propagation();
                                             page.search_from_history(&query, window, cx);
                                         }))
-                                },
-                            ),
+                                }),
                         ),
                     ),
             )
@@ -602,8 +600,13 @@ impl HomeContent {
     ) -> impl IntoElement {
         let columns = columns.max(1);
         let item_count = match source {
-            UserItemGridSource::Favorites(item_type) => self.favorites[item_type].paged.items.len(),
-            UserItemGridSource::Search => self.search.items.len(),
+            UserItemGridSource::Favorites(item_type) => self
+                .controller
+                .favorite_section(item_type)
+                .paged
+                .items
+                .len(),
+            UserItemGridSource::Search => self.controller.search_view().items.len(),
         };
         let row_count = user_item_grid_row_count(item_count, columns);
         let row_step = source.row_step();
@@ -625,11 +628,7 @@ impl HomeContent {
         // while `viewport_height` already describes the new window. Use the new
         // height when choosing rows: the helper anticipates GPUI's upcoming scroll
         // clamp on expansion and avoids building the old tall viewport on shrink.
-        let overscan_rows = if self.resize_in_progress {
-            0
-        } else {
-            USER_ITEM_GRID_OVERSCAN_ROWS
-        };
+        let overscan_rows = self.layout.view_model().grid_overscan_rows;
         let visible_rows = user_item_grid_visible_rows(
             row_count,
             scroll_top,
@@ -688,8 +687,10 @@ impl HomeContent {
         cx: &Context<Self>,
     ) -> gpui::Div {
         let items = match source {
-            UserItemGridSource::Favorites(item_type) => &self.favorites[item_type].paged.items,
-            UserItemGridSource::Search => &self.search.items,
+            UserItemGridSource::Favorites(item_type) => {
+                &self.controller.favorite_section(item_type).paged.items
+            }
+            UserItemGridSource::Search => self.controller.search_view().items,
         };
         let start = row.saturating_mul(columns.max(1));
         if start >= items.len() {
@@ -719,7 +720,6 @@ impl HomeContent {
         id_prefix: &'static str,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let item = self.effective_user_item(item);
         let item_fingerprint = user_item_id_fingerprint(&item.id);
         let open = cx.listener(move |page, _, _, cx| {
             page.open_user_item_grid_index(source, index, item_fingerprint, cx);
@@ -742,17 +742,25 @@ impl HomeContent {
         let item_id = gpui::ElementId::from((id_prefix, item_fingerprint));
         let card = if item.item_type.as_deref() == Some("Episode") {
             let card = if matches!(source, UserItemGridSource::Favorites(_)) {
-                favorite_episode_card(&item, self.image_path_for_favorite_episode(&item), cx)
+                favorite_episode_card(
+                    self.controller.user_episode_card_vm(item),
+                    self.image_path_for_favorite_episode(item),
+                    cx,
+                )
             } else {
-                user_episode_card(&item, self.image_path_for_episode_user_item(&item), cx)
+                user_episode_card(
+                    self.controller.user_episode_card_vm(item),
+                    self.image_path_for_episode_user_item(item),
+                    cx,
+                )
             };
             card.id(item_id)
         } else {
-            let image_path = self.image_path_for_user_item(&item);
-            user_item_card_with_favorite_badge(
-                &item,
+            let image_path = self.image_path_for_user_item(item);
+            user_item_card(
+                self.controller
+                    .user_item_card_vm(item, !matches!(source, UserItemGridSource::Favorites(_))),
                 image_path,
-                !matches!(source, UserItemGridSource::Favorites(_)),
                 cx,
             )
             .id(item_id)
@@ -782,10 +790,13 @@ impl HomeContent {
         expected_fingerprint: u64,
     ) -> Option<String> {
         match source {
-            UserItemGridSource::Favorites(item_type) => {
-                self.favorites[item_type].paged.items.get(index)
-            }
-            UserItemGridSource::Search => self.search.items.get(index),
+            UserItemGridSource::Favorites(item_type) => self
+                .controller
+                .favorite_section(item_type)
+                .paged
+                .items
+                .get(index),
+            UserItemGridSource::Search => self.controller.search_view().items.get(index),
         }
         .filter(|item| user_item_id_fingerprint(&item.id) == expected_fingerprint)
         .map(|item| item.id.clone())
@@ -797,7 +808,6 @@ impl HomeContent {
         id_prefix: &'static str,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let item = self.effective_user_item(item);
         let item_id = item.id.clone();
         let open_item_id = item_id.clone();
         let context_item_id = item_id.clone();
@@ -814,13 +824,17 @@ impl HomeContent {
             page.open_media_detail_by_id(open_item_id.clone(), cx);
         });
         let card = if item.item_type.as_deref() == Some("Episode") {
-            let image_path = self.image_path_for_episode_user_item(&item);
-            user_episode_card(&item, image_path, cx)
+            let image_path = self.image_path_for_episode_user_item(item);
+            user_episode_card(self.controller.user_episode_card_vm(item), image_path, cx)
                 .id((gpui::ElementId::from(id_prefix), item_id.clone()))
         } else {
-            let image_path = self.image_path_for_user_item(&item);
-            user_item_card(&item, image_path, cx)
-                .id((gpui::ElementId::from(id_prefix), item_id.clone()))
+            let image_path = self.image_path_for_user_item(item);
+            user_item_card(
+                self.controller.user_item_card_vm(item, true),
+                image_path,
+                cx,
+            )
+            .id((gpui::ElementId::from(id_prefix), item_id.clone()))
         };
         card.debug_selector(move || format!("{id_prefix}-{item_id}"))
             .cursor_pointer()
@@ -830,13 +844,13 @@ impl HomeContent {
 
     fn render_library_paged_footer(
         &self,
-        state: &PagedItemsState,
+        state: &LibraryView<'_>,
         view_id: &str,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let page = cx.entity().downgrade();
         let auto_load_view_id = view_id.to_string();
-        let scroll_handle = state.scroll_handle.clone();
+        let scroll_handle = state.presentation.grid.scroll_handle.clone();
         let auto_load_observer = canvas(
             |bounds, _, _| bounds,
             move |_, _, window, _| {
@@ -864,7 +878,7 @@ impl HomeContent {
             .flex_col()
             .items_center()
             .gap_2()
-            .when(state.can_auto_load_more(), |this| {
+            .when(state.model.paged.can_auto_load_more(), |this| {
                 this.child(auto_load_observer)
             })
     }

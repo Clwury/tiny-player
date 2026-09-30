@@ -1,12 +1,13 @@
-use std::time::Duration;
-
 use gpui::Context;
 
-use crate::storage;
+use crate::persistence::{DirtyKey, FilePersistence};
 
 use super::TinyApp;
 
-const CACHE_SAVE_DEBOUNCE: Duration = Duration::from_millis(350);
+#[cfg(test)]
+use crate::{persistence::SETTINGS_DEBOUNCE as CACHE_SAVE_DEBOUNCE, storage};
+#[cfg(test)]
+use std::time::Duration;
 
 impl TinyApp {
     pub(super) fn update_playback_volume(
@@ -27,75 +28,71 @@ impl TinyApp {
         error_prefix: &'static str,
         cx: &mut Context<Self>,
     ) {
-        self.pending_cache_save_error_prefix = Some(error_prefix);
-        self.last_cache_save_activity = Some(cx.background_executor().now());
+        self.schedule_config_save(DirtyKey::Settings, error_prefix, cx);
+    }
 
-        // Keep one debounce task alive for the whole burst of changes. Window
-        // resize events can arrive once per frame; creating and cancelling a
-        // timer for every pixel change still allocates work on the foreground
-        // executor even though only the final size needs to be persisted.
-        if self.cache_save_task_active {
-            return;
-        }
-
-        self.cache_save_task_active = true;
-        self.cache_save_task = cx.spawn(async move |app, cx| {
-            cx.background_executor().timer(CACHE_SAVE_DEBOUNCE).await;
-            loop {
-                let remaining = app
-                    .update(cx, |app, cx| {
-                        app.last_cache_save_activity
-                            .map(|last| {
-                                CACHE_SAVE_DEBOUNCE.saturating_sub(
-                                    cx.background_executor()
-                                        .now()
-                                        .saturating_duration_since(last),
-                                )
-                            })
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
-                if remaining.is_zero() {
-                    app.update(cx, |app, cx| {
-                        app.cache_save_task_active = false;
-                        app.last_cache_save_activity = None;
-                        app.flush_scheduled_cache_save(cx);
-                    })
+    pub(super) fn schedule_config_save(
+        &mut self,
+        key: DirtyKey,
+        error_prefix: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let app = cx.weak_entity();
+        self.persistence.schedule_settings(
+            key,
+            self.cache_snapshot(),
+            self.persistence_adapter(),
+            error_prefix,
+            move |message, cx| {
+                app.update(cx, |app, cx| app.push_app_error_notification(message, cx))
                     .ok();
-                    break;
-                }
-                cx.background_executor().timer(remaining).await;
-            }
-        });
+            },
+            cx,
+        );
     }
 
+    #[cfg(test)]
     pub(super) fn flush_scheduled_cache_save(&mut self, cx: &mut Context<Self>) {
-        let Some(error_prefix) = self.pending_cache_save_error_prefix.take() else {
-            return;
-        };
-        // The small settings file is written once per burst on the app thread.
-        // Read the latest state here; overlapping background snapshots could
-        // otherwise overwrite a newer edit or race on the same temporary file.
-        if let Err(error) = self.save_cache() {
-            self.pending_cache_save_error_prefix = Some(error_prefix);
-            self.push_app_error_notification(format!("{error_prefix}：{error}"), cx);
+        if let Some(message) = self.persistence.flush(&DirtyKey::Settings, cx) {
+            self.push_app_error_notification(message, cx);
         }
     }
 
-    pub(super) fn save_pending_cache_on_release(&mut self) {
-        if self.pending_cache_save_error_prefix.take().is_some()
-            && let Err(error) = self.save_cache()
-        {
-            tracing::error!(%error, "failed to save pending application settings on close");
+    pub(super) fn flush_persistence(&mut self, cx: &mut Context<Self>) -> gpui::Task<()> {
+        let (error, task) = self.persistence.flush_all(cx);
+        if let Some(message) = error {
+            self.push_app_error_notification(message, cx);
         }
+        task
     }
 
+    pub(super) fn save_pending_cache_on_release(&mut self, cx: &mut gpui::App) {
+        let (error, task) = self.persistence.flush_all(cx);
+        if error.is_some() {
+            tracing::error!("failed to save pending application settings on close");
+        }
+        task.detach();
+    }
+
+    pub(super) fn cache_snapshot(&self) -> crate::storage::ServerCache {
+        self.cache.snapshot(self.server_feature.catalog())
+    }
+
+    #[cfg(test)]
     pub(super) fn save_cache(&self) -> anyhow::Result<()> {
-        #[cfg(test)]
-        if let Some(path) = &self.cache_save_path {
-            return storage::save_to(&self.cache, path);
-        }
-        storage::save(&self.cache)
+        self.persistence
+            .save_settings_now(self.cache_snapshot(), self.persistence_adapter())
+    }
+
+    pub(super) fn persistence_adapter(
+        &self,
+    ) -> std::sync::Arc<dyn crate::persistence::AppPersistence> {
+        std::sync::Arc::new(FilePersistence {
+            #[cfg(test)]
+            settings_path: self.cache_save_path.clone(),
+            #[cfg(test)]
+            home_path: None,
+        })
     }
 }
 
@@ -170,7 +167,7 @@ mod tests {
         cx.run_until_parked();
         assert!(!path.exists());
         app.update(cx, |app, _| {
-            assert!(app.pending_cache_save_error_prefix.is_none());
+            assert!(app.persistence.pending_settings_error_prefix().is_none());
             app.save_cache().unwrap();
         });
         let json: serde_json::Value =
@@ -552,7 +549,9 @@ mod tests {
             muted
         );
         reopened.update(cx, |app, cx| app.update_playback_volume(muted, cx));
-        assert!(reopened.read_with(cx, |app, _| app.pending_cache_save_error_prefix.is_none()));
+        assert!(reopened.read_with(cx, |app, _| {
+            app.persistence.pending_settings_error_prefix().is_none()
+        }));
     }
 
     #[gpui::test]
@@ -591,7 +590,7 @@ mod tests {
             app.cache.color_theme = ColorTheme::Frappe;
             app.schedule_cache_save("保存设置失败", cx);
             app.flush_scheduled_cache_save(cx);
-            assert!(app.pending_cache_save_error_prefix.is_some());
+            assert!(app.persistence.pending_settings_error_prefix().is_some());
             assert!(app.has_app_notifications());
             app.cache_save_path = Some(path.clone());
             app.cache.color_theme = ColorTheme::Latte;
@@ -604,6 +603,42 @@ mod tests {
             storage::load_or_init_from(&path).unwrap().color_theme,
             ColorTheme::Latte
         );
-        assert!(app.read_with(cx, |app, _| app.pending_cache_save_error_prefix.is_none()));
+        assert!(app.read_with(cx, |app, _| {
+            app.persistence.pending_settings_error_prefix().is_none()
+        }));
+    }
+
+    #[gpui::test]
+    fn application_quit_flushes_each_config_dirty_reason_as_one_latest_snapshot(
+        cx: &mut TestAppContext,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let app = cx.new(|cx| {
+            let mut app = TinyApp::new(ServerCache::empty(), None, cx);
+            app.cache_save_path = Some(path.clone());
+            app
+        });
+        app.update(cx, |app, cx| {
+            app.cache.color_theme = ColorTheme::Latte;
+            app.schedule_cache_save("保存设置失败", cx);
+            app.cache.set_window_size(1234, 789);
+            app.schedule_config_save(DirtyKey::Window, "保存窗口大小失败", cx);
+            app.schedule_config_save(DirtyKey::SearchHistory, "保存搜索历史失败", cx);
+        });
+        assert!(!path.exists());
+        cx.quit();
+        let saved = storage::load_or_init_from(&path).unwrap();
+        assert_eq!(saved.color_theme, ColorTheme::Latte);
+        assert_eq!(saved.window_size().unwrap().width, 1234);
+        app.read_with(cx, |app, _| {
+            for key in [
+                DirtyKey::Settings,
+                DirtyKey::Window,
+                DirtyKey::SearchHistory,
+            ] {
+                assert!(!app.persistence.is_dirty(&key));
+            }
+        });
     }
 }

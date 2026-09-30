@@ -22,7 +22,7 @@ pub struct ServerCache {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_start_server_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    window: Option<WindowState>,
+    pub(crate) window: Option<WindowState>,
     /// Global playback tuning persisted alongside the server list. The
     /// `default` attribute keeps older cache files backward compatible.
     #[serde(default)]
@@ -66,6 +66,7 @@ impl ServerCache {
             .cloned()
     }
 
+    #[cfg(test)]
     pub fn set_window_size(&mut self, width: u32, height: u32) -> bool {
         if width == 0 || height == 0 {
             return false;
@@ -89,71 +90,39 @@ pub fn save(cache: &ServerCache) -> Result<()> {
     save_to(cache, &cache_path()?)
 }
 
-pub fn upsert_server(cache: &mut ServerCache, mut server: CachedServer) -> String {
-    deduplicate_servers(cache);
-    if let Some(existing) = cache
-        .servers
-        .iter_mut()
-        .find(|existing| same_server(existing, &server))
-    {
-        server.id = existing.id.clone();
-        *existing = server;
-        existing.id.clone()
-    } else {
-        let id = server.id.clone();
-        cache.servers.push(server);
-        id
-    }
+#[cfg(test)]
+pub fn upsert_server(cache: &mut ServerCache, server: CachedServer) -> String {
+    with_catalog(cache, |catalog| {
+        crate::server::feature::catalog::upsert_server(catalog, server)
+    })
 }
-
+#[cfg(test)]
 pub fn update_server_by_id(cache: &mut ServerCache, server: CachedServer) -> Result<()> {
-    let existing = cache
-        .servers
-        .iter_mut()
-        .find(|existing| existing.id == server.id)
-        .context("服务器不存在")?;
-    *existing = server.clone();
-    // The edited card wins a conflict and keeps its ID and position.
-    cache.servers.retain(|existing| {
-        let duplicate = existing.id != server.id && same_server(existing, &server);
-        if duplicate && cache.auto_start_server_id.as_deref() == Some(&existing.id) {
-            cache.auto_start_server_id = Some(server.id.clone());
-        }
-        !duplicate
-    });
-    Ok(())
+    with_catalog(cache, |catalog| {
+        crate::server::feature::catalog::update_server_by_id(catalog, server)
+    })
 }
-
+#[cfg(test)]
 pub fn delete_server_by_id(cache: &mut ServerCache, id: &str) -> bool {
-    let original_len = cache.servers.len();
-    cache.servers.retain(|server| server.id != id);
-    if cache.auto_start_server_id.as_deref() == Some(id) {
-        cache.auto_start_server_id = None;
-    }
-    cache.servers.len() != original_len
+    with_catalog(cache, |catalog| {
+        crate::server::feature::catalog::delete_server_by_id(catalog, id)
+    })
 }
-
-fn same_server(a: &CachedServer, b: &CachedServer) -> bool {
-    a.endpoint == b.endpoint && a.username == b.username
-}
-
 fn deduplicate_servers(cache: &mut ServerCache) {
-    // Keep the first card and its position, including for caches saved before
-    // edits checked uniqueness. Redirect auto-start if its duplicate is removed.
-    let mut servers = Vec::with_capacity(cache.servers.len());
-    for server in std::mem::take(&mut cache.servers) {
-        if let Some(existing) = servers
-            .iter()
-            .find(|existing| same_server(existing, &server))
-        {
-            if cache.auto_start_server_id.as_deref() == Some(&server.id) {
-                cache.auto_start_server_id = Some(existing.id.clone());
-            }
-        } else {
-            servers.push(server);
-        }
-    }
-    cache.servers = servers;
+    with_catalog(cache, crate::server::feature::catalog::deduplicate_servers);
+}
+fn with_catalog<R>(
+    cache: &mut ServerCache,
+    f: impl FnOnce(&mut crate::server::feature::ServerCatalog) -> R,
+) -> R {
+    let mut catalog = crate::server::feature::ServerCatalog {
+        servers: std::mem::take(&mut cache.servers),
+        auto_start_server_id: cache.auto_start_server_id.take(),
+    };
+    let result = f(&mut catalog);
+    cache.servers = catalog.servers;
+    cache.auto_start_server_id = catalog.auto_start_server_id;
+    result
 }
 
 fn cache_path() -> Result<std::path::PathBuf> {

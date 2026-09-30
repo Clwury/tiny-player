@@ -1,16 +1,14 @@
-use crate::ui::radius;
-
 use super::diagnostics::playback_diagnostics_enabled;
 use super::fullscreen::{
     PLAYBACK_BACK_BUTTON_OFFSET_PX, PLAYBACK_BACK_BUTTON_SIZE_PX,
     PLAYBACK_PROGRESS_BAR_BOTTOM_OFFSET_PX, PLAYBACK_PROGRESS_BAR_HEIGHT_PX,
 };
-use super::state::effective_playback_paused;
 use super::*;
+use crate::player::model::progress::ProgressTimelineViewModel;
+#[cfg(test)]
+use crate::player::model::timeline::effective_playback_paused;
 
-const TRACK_SELECT_MENU_MAX_HEIGHT_PX: f32 = 260.0;
 const VOLUME_INDICATOR_HIDE_DELAY: Duration = Duration::from_millis(1200);
-const VOLUME_INDICATOR_BAR_HEIGHT_PX: f32 = 192.0;
 
 #[derive(Clone, Copy)]
 struct PlaybackControlsRenderState {
@@ -26,20 +24,14 @@ struct PlaybackControlsRenderState {
     subtitle_select_open: bool,
 }
 
-struct ProgressTimelineRenderState {
-    current_time: String,
-    duration_time: String,
-    played_fraction: f32,
-    cached_seek_preview: Option<bool>,
-    forward_cache_fraction: Option<f32>,
-    cache_ranges: Vec<(f32, f32)>,
-}
-
 #[path = "controls/download_speed.rs"]
 mod download_speed;
 pub(super) use download_speed::DownloadSpeedDisplay;
+#[path = "controls/components.rs"]
+mod components;
 #[path = "controls/progress.rs"]
 mod progress;
+pub(super) use components::{playback_control_button, volume_indicator};
 #[path = "controls/render.rs"]
 mod render;
 #[path = "controls/stats.rs"]
@@ -49,6 +41,47 @@ use stats::*;
 mod tracks;
 #[path = "controls/transport.rs"]
 mod transport;
+
+impl PlaybackPage {
+    pub(super) fn dispatch_control(
+        &mut self,
+        intent: PlaybackIntent,
+        cx: &mut Context<Self>,
+    ) -> crate::player::session::ControlUpdate {
+        let update = self.session.dispatch_control(intent, |effect| {
+            if effect.discard_frames {
+                self.video.discard_pending_frames();
+            }
+            self.video.command(effect.command)
+        });
+        if update.close_track_menu {
+            self.presentation.track_select_open = None;
+        }
+        if let Some(kind) = update.remember_track {
+            self.remember_track_choice(kind, cx);
+        }
+        if let Some(settings) = update.volume_changed {
+            cx.emit(PlaybackEvent::VolumeChanged { settings });
+        }
+        if update.report_progress {
+            self.report_playback_progress(true);
+        }
+        if update.show_rate {
+            self.presentation.rate_indicator_visible = true;
+            self.schedule_presentation_timer(
+                PresentationTimer::Rate,
+                Duration::from_millis(1200),
+                cx,
+            );
+        }
+        if update.show_volume {
+            self.show_volume_indicator(cx);
+        } else if update.notify {
+            cx.notify();
+        }
+        update
+    }
+}
 
 fn progress_track_fill(color: gpui::Hsla, width_fraction: f32) -> gpui::Div {
     div()
@@ -271,79 +304,6 @@ fn format_cache_bytes(bytes: u64) -> String {
     }
 }
 
-pub(super) fn track_select_option(
-    label: impl Into<SharedString>,
-    metadata: impl Into<SharedString>,
-    selected: bool,
-    id: String,
-    cx: &Context<PlaybackPage>,
-) -> gpui::Stateful<gpui::Div> {
-    let theme = theme::media_overlay(cx);
-    let label = label.into();
-    let metadata = metadata.into();
-    let label_id = format!("{id}-label");
-    let metadata_id = format!("{id}-metadata");
-    let hover_background = if selected {
-        theme.input_border_focused.opacity(0.34)
-    } else {
-        theme.foreground.opacity(0.12)
-    };
-
-    div()
-        .id(id.clone())
-        .debug_selector(move || id.clone())
-        .flex()
-        .flex_none()
-        .h(px(48.0))
-        .min_h(px(48.0))
-        .items_center()
-        .rounded(radius::CONTROL)
-        .px_2()
-        .text_sm()
-        .font_weight(if selected {
-            gpui::FontWeight::SEMIBOLD
-        } else {
-            gpui::FontWeight::NORMAL
-        })
-        .text_color(if selected {
-            theme.foreground
-        } else {
-            theme.foreground.opacity(0.86)
-        })
-        .bg(if selected {
-            theme.input_border_focused.opacity(0.24)
-        } else {
-            theme.foreground.opacity(0.0)
-        })
-        .cursor_pointer()
-        .hover(move |style| style.bg(hover_background))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .debug_selector(move || label_id.clone())
-                        .truncate()
-                        .line_height(px(18.0))
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .debug_selector(move || metadata_id.clone())
-                        .truncate()
-                        .text_xs()
-                        .line_height(px(14.0))
-                        .font_weight(gpui::FontWeight::NORMAL)
-                        .text_color(theme.foreground.opacity(if selected { 0.9 } else { 0.72 }))
-                        .child(metadata),
-                ),
-        )
-}
-
 pub(super) fn valid_frame_rate(frame_rate: f64) -> Option<f64> {
     frame_rate
         .is_finite()
@@ -353,7 +313,7 @@ pub(super) fn valid_frame_rate(frame_rate: f64) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use crate::player::page::state::user_pause_from_effective_pause_event;
+    use crate::player::model::timeline::user_pause_from_effective_pause_event;
     use tiny_playback::{ByteCacheState, DemuxCacheState, PlaybackCacheState, StreamCacheState};
 
     use super::*;

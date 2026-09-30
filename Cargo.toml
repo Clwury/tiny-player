@@ -13,7 +13,7 @@ resolver = "3"
 
 [workspace.dependencies]
 anyhow = "1.0"
-gpui = { git = "https://github.com/zed-industries/zed", branch = "main" }
+gpui = { git = "https://github.com/zed-industries/zed", tag = "v1.21.0" }
 image = "0.25"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 serde = { version = "1", features = ["derive"] }
@@ -27,7 +27,7 @@ tiny-playback = { path = "crates/tiny-playback" }
 anyhow.workspace = true
 directories = "5"
 gpui.workspace = true
-gpui_platform = { git = "https://github.com/zed-industries/zed", branch = "main", features = ["wayland", "x11"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", tag = "v1.21.0", features = ["wayland", "x11"] }
 image.workspace = true
 percent-encoding = "2"
 reqwest.workspace = true

@@ -414,7 +414,7 @@ fn saves_auth_and_icon_preserves_latest_settings_and_rolls_back_failed_edits(
         let mut duplicate = saved_server();
         duplicate.id = "duplicate-id".into();
         assert_eq!(app.save_server(duplicate, false).unwrap(), "local-id");
-        assert_eq!(app.cache.servers.len(), 1);
+        assert_eq!(app.server_feature.catalog().servers.len(), 1);
 
         // A parent that is a file makes saving fail without touching the old cache.
         app.cache_save_path = Some(path.join("invalid.json"));
@@ -423,10 +423,15 @@ fn saves_auth_and_icon_preserves_latest_settings_and_rolls_back_failed_edits(
         edited.icon_url = None;
         assert!(app.save_server(edited, true).is_err());
         assert_eq!(
-            app.cache.servers[0].access_token.as_deref(),
+            app.server_feature.catalog().servers[0]
+                .access_token
+                .as_deref(),
             Some("saved-token")
         );
-        assert_eq!(app.cache.servers[0].icon_url, saved_server().icon_url);
+        assert_eq!(
+            app.server_feature.catalog().servers[0].icon_url,
+            saved_server().icon_url
+        );
         assert_eq!(
             storage::load_or_init_from(&path).unwrap().servers[0].icon_url,
             saved_server().icon_url
@@ -447,28 +452,47 @@ fn editing_preserves_cache_updates_received_while_the_dialog_was_open(cx: &mut T
         app
     });
     app.update(cx, |app, cx| {
-        let dialog = cx.new(|cx| AddServerDialogState::new_edit(&app.servers[0], cx));
+        let dialog = cx.new(|cx| {
+            AddServerDialogState::from_props((&app.server_feature.catalog().servers[0]).into(), cx)
+        });
         app.add_server_dialog = Some(dialog.clone());
         let edited = CachedServer {
             password: "edited-password".into(),
-            ..app.servers[0].clone()
+            ..app.server_feature.catalog().servers[0].clone()
         };
         // A background refresh completes after the edited snapshot was taken.
         let counts = CachedItemCounts {
             movie_count: 123,
             series_count: 456,
         };
-        app.cache.servers[0].item_counts = Some(counts.clone());
-        app.servers[0].item_counts = Some(counts.clone());
-        app.item_counts
-            .insert(edited.id.clone(), crate::emby::ItemCounts::from(&counts));
+        let request = app.server_feature.begin_counts(&edited.id).unwrap();
+        assert!(matches!(
+            app.server_feature
+                .finish_counts(&request, Ok(crate::emby::ItemCounts::from(&counts)),),
+            crate::server::feature::CountResult::Saved
+        ));
         app.finish_save_server(dialog, Ok(edited), cx);
         assert!(app.add_server_dialog.is_none());
-        assert!(app.servers[0].needs_auth_refresh);
-        assert_eq!(app.servers[0].password, "edited-password");
-        assert_eq!(app.servers[0].access_token.as_deref(), Some("saved-token"));
-        assert_eq!(app.servers[0].item_counts.as_ref(), Some(&counts));
-        assert_eq!(app.item_counts[&app.servers[0].id].movie_count, 123);
+        assert!(app.server_feature.catalog().servers[0].needs_auth_refresh);
+        assert_eq!(
+            app.server_feature.catalog().servers[0].password,
+            "edited-password"
+        );
+        assert_eq!(
+            app.server_feature.catalog().servers[0]
+                .access_token
+                .as_deref(),
+            Some("saved-token")
+        );
+        assert_eq!(
+            app.server_feature.catalog().servers[0].item_counts.as_ref(),
+            Some(&counts)
+        );
+        assert_eq!(
+            app.server_feature.test_state().counts[&app.server_feature.catalog().servers[0].id]
+                .movie_count,
+            123
+        );
         assert_eq!(
             storage::load_or_init_from(&path).unwrap().servers[0].item_counts,
             Some(counts)
@@ -505,16 +529,17 @@ fn duplicate_edit_overwrites_saved_card_and_rolls_back_on_save_failure(cx: &mut 
         app
     });
     app.update(cx, |app, cx| {
-        app.cache.auto_start_server_id = Some(app.servers[0].id.clone());
+        app.server_feature.test_catalog_mut().auto_start_server_id =
+            Some(app.server_feature.catalog().servers[0].id.clone());
         app.save_cache().unwrap();
-        let before_cache = serde_json::to_value(&app.cache).unwrap();
-        let before_servers = serde_json::to_value(&app.servers).unwrap();
+        let before_cache = serde_json::to_value(app.cache_snapshot()).unwrap();
+        let before_servers = serde_json::to_value(&app.server_feature.catalog().servers).unwrap();
         let before_file = std::fs::read(&path).unwrap();
-        let dialog = cx.new(|cx| AddServerDialogState::new_edit(&second, cx));
+        let dialog = cx.new(|cx| AddServerDialogState::from_props((&second).into(), cx));
         app.add_server_dialog = Some(dialog.clone());
         dialog.update(cx, |dialog, cx| dialog.set_submitting(true, cx));
         let conflict = CachedServer {
-            username: app.servers[0].username.clone(),
+            username: app.server_feature.catalog().servers[0].username.clone(),
             password: "edited-password".into(),
             ..second.clone()
         };
@@ -523,8 +548,14 @@ fn duplicate_edit_overwrites_saved_card_and_rolls_back_on_save_failure(cx: &mut 
         app.finish_save_server(dialog.clone(), Ok(conflict.clone()), cx);
 
         assert_eq!(app.add_server_dialog.as_ref(), Some(&dialog));
-        assert_eq!(serde_json::to_value(&app.cache).unwrap(), before_cache);
-        assert_eq!(serde_json::to_value(&app.servers).unwrap(), before_servers);
+        assert_eq!(
+            serde_json::to_value(app.cache_snapshot()).unwrap(),
+            before_cache
+        );
+        assert_eq!(
+            serde_json::to_value(&app.server_feature.catalog().servers).unwrap(),
+            before_servers
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before_file);
         assert!(dialog.update(cx, |dialog, cx| dialog.submit(cx)).is_some());
 
@@ -532,17 +563,34 @@ fn duplicate_edit_overwrites_saved_card_and_rolls_back_on_save_failure(cx: &mut 
         app.finish_save_server(dialog, Ok(conflict), cx);
 
         assert!(app.add_server_dialog.is_none());
-        assert_eq!(app.servers.len(), 1);
-        assert_eq!(app.servers[0].id, "second");
-        assert_eq!(app.servers[0].username, "test");
-        assert_eq!(app.servers[0].password, "edited-password");
-        assert_eq!(app.servers[0].server_name, saved_server().server_name);
-        assert_eq!(app.servers[0].server_id, saved_server().server_id);
-        assert_eq!(app.servers[0].icon_url, saved_server().icon_url);
-        assert!(!app.servers[0].icon_is_custom);
-        assert!(app.servers[0].needs_auth_refresh);
-        assert_eq!(app.item_counts.len(), 1);
-        assert!(app.item_counts.contains_key("second"));
+        assert_eq!(app.server_feature.catalog().servers.len(), 1);
+        assert_eq!(app.server_feature.catalog().servers[0].id, "second");
+        assert_eq!(app.server_feature.catalog().servers[0].username, "test");
+        assert_eq!(
+            app.server_feature.catalog().servers[0].password,
+            "edited-password"
+        );
+        assert_eq!(
+            app.server_feature.catalog().servers[0].server_name,
+            saved_server().server_name
+        );
+        assert_eq!(
+            app.server_feature.catalog().servers[0].server_id,
+            saved_server().server_id
+        );
+        assert_eq!(
+            app.server_feature.catalog().servers[0].icon_url,
+            saved_server().icon_url
+        );
+        assert!(!app.server_feature.catalog().servers[0].icon_is_custom);
+        assert!(app.server_feature.catalog().servers[0].needs_auth_refresh);
+        assert_eq!(app.server_feature.test_state().counts.len(), 1);
+        assert!(
+            app.server_feature
+                .test_state()
+                .counts
+                .contains_key("second")
+        );
         let saved = storage::load_or_init_from(&path).unwrap();
         assert_eq!(saved.servers.len(), 1);
         assert_eq!(saved.servers[0].id, "second");
@@ -590,7 +638,7 @@ fn duplicate_edit_uses_latest_destination_metadata_including_custom_or_default_i
             app
         });
         app.update(cx, |app, cx| {
-            let dialog = cx.new(|cx| AddServerDialogState::new_edit(&edited, cx));
+            let dialog = cx.new(|cx| AddServerDialogState::from_props((&edited).into(), cx));
             app.add_server_dialog = Some(dialog.clone());
             let submission = CachedServer {
                 endpoint: target.endpoint.clone(),
@@ -598,15 +646,19 @@ fn duplicate_edit_uses_latest_destination_metadata_including_custom_or_default_i
             };
             // A refresh or icon choice after the dialog opens must win over
             // the display metadata in either of the earlier card snapshots.
-            app.cache.servers[0].server_name = name.map(str::to_owned);
-            app.cache.servers[0].icon_url = icon.map(str::to_owned);
-            app.cache.servers[0].icon_is_custom = custom;
+            app.server_feature.test_catalog_mut().servers[0].server_name = name.map(str::to_owned);
+            app.server_feature.test_catalog_mut().servers[0].icon_url = icon.map(str::to_owned);
+            app.server_feature.test_catalog_mut().servers[0].icon_is_custom = custom;
 
             app.finish_save_server(dialog, Ok(submission), cx);
 
             assert!(app.add_server_dialog.is_none());
             let saved = storage::load_or_init_from(&path).unwrap();
-            for servers in [&app.servers, &app.cache.servers, &saved.servers] {
+            for servers in [
+                &app.server_feature.catalog().servers,
+                &app.server_feature.catalog().servers,
+                &saved.servers,
+            ] {
                 assert_eq!(servers.len(), 1);
                 assert_eq!(servers[0].id, "edited");
                 assert_eq!(servers[0].server_name.as_deref(), name);
@@ -631,18 +683,31 @@ fn failed_server_save_keeps_the_edit_dialog_and_saved_login(cx: &mut TestAppCont
         app
     });
     app.update(cx, |app, cx| {
-        let dialog = cx.new(|cx| AddServerDialogState::new_edit(&app.servers[0], cx));
+        let dialog = cx.new(|cx| {
+            AddServerDialogState::from_props((&app.server_feature.catalog().servers[0]).into(), cx)
+        });
         app.add_server_dialog = Some(dialog.clone());
         let edited = CachedServer {
             password: "edited-password".into(),
-            ..app.servers[0].clone()
+            ..app.server_feature.catalog().servers[0].clone()
         };
         app.finish_save_server(dialog, Ok(edited), cx);
         assert!(app.add_server_dialog.is_some());
-        assert_eq!(app.servers[0].password, saved_server().password);
-        assert!(!app.servers[0].needs_auth_refresh);
-        assert_eq!(app.servers[0].access_token.as_deref(), Some("saved-token"));
-        assert_eq!(app.cache.servers[0].icon_url, saved_server().icon_url);
+        assert_eq!(
+            app.server_feature.catalog().servers[0].password,
+            saved_server().password
+        );
+        assert!(!app.server_feature.catalog().servers[0].needs_auth_refresh);
+        assert_eq!(
+            app.server_feature.catalog().servers[0]
+                .access_token
+                .as_deref(),
+            Some("saved-token")
+        );
+        assert_eq!(
+            app.server_feature.catalog().servers[0].icon_url,
+            saved_server().icon_url
+        );
         assert!(!storage::load_or_init_from(&path).unwrap().servers[0].needs_auth_refresh);
     });
 }

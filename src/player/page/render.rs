@@ -12,10 +12,10 @@ pub(super) fn playback_status(
     timeline: &PlaybackTimelineState,
     has_visible_frame: bool,
     switching_episode: bool,
-    error: Option<&SharedString>,
+    error: Option<&str>,
 ) -> Option<PlaybackStatus> {
     if let Some(error) = error {
-        return Some(PlaybackStatus::Error(error.clone()));
+        return Some(PlaybackStatus::Error(error.to_owned().into()));
     }
 
     let waiting_for_seek =

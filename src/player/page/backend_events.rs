@@ -1,7 +1,14 @@
 use tiny_playback::BackendEvent;
 
-use super::state::{effective_playback_paused, user_pause_from_effective_pause_event};
 use super::*;
+#[cfg(test)]
+use crate::player::model::timeline::{
+    apply_cache_buffering_to_timeline, apply_paused_for_cache_to_timeline,
+    apply_playback_restart_to_timeline,
+};
+#[cfg(test)]
+use crate::player::session::cache_state_needs_poll;
+use crate::player::session::{BackendAction, BackendContext};
 
 const PAUSED_BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -15,10 +22,7 @@ impl PlaybackPage {
     }
 
     fn poll_backend_events(&mut self) -> Vec<BackendEvent> {
-        self.video
-            .owner_mut()
-            .map(|backend| backend.poll_events())
-            .unwrap_or_default()
+        self.video.poll_events()
     }
 
     fn apply_backend_event(
@@ -27,297 +31,131 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match event.kind {
-            BackendEventKind::Diagnostic(diagnostic) => {
-                tracing::debug!(
-                    code = diagnostic.code,
-                    message = %diagnostic.message,
-                    "playback backend diagnostic event"
-                );
+        let transition = self.session.reduce_backend(
+            event.kind,
+            BackendContext {
+                item_id: &self.emby.item_id,
+                media_source_id: &self.emby.media_source_id,
+                play_session_id: self.emby.play_session_id.as_deref(),
+                run_time_ticks: self.emby.run_time_ticks,
+                has_frame: self.presentation.frame.current.is_some(),
+            },
+        );
+        let mut closed_update = None;
+        for reporting in transition.reporting {
+            if let Some(update) = self.execute_reporting_transition(reporting, cx) {
+                closed_update = Some(update);
             }
-            BackendEventKind::PlaybackRestart => {
-                if self.playback_reporting_closed() {
-                    return;
-                }
-                apply_playback_restart_to_timeline(&mut self.timeline);
-                self.error_message = None;
-                self.handle_playback_restart_reporting(cx);
+        }
+        match transition.action {
+            BackendAction::None => {}
+            BackendAction::Diagnostic(diagnostic) => {
+                tracing::debug!(code = diagnostic.code, message = %diagnostic.message, "playback backend diagnostic event");
             }
-            BackendEventKind::LoadFailed(message) => {
+            BackendAction::Restart => {
+                self.presentation.timeline_presentation.cache_status_open = false;
+            }
+            BackendAction::Failed => {
+                self.backend_poll.cancel();
                 self.cancel_queue_switch();
-                let _ = self.close_playback_reporting(true, false);
-                self.reset_after_backend_failure(
-                    format!("加载视频失败：{message}").into(),
-                    window,
-                    cx,
-                );
+                self.reset_after_backend_failure(window, cx);
             }
-            BackendEventKind::Fatal(message) => {
-                self.cancel_queue_switch();
-                let _ = self.close_playback_reporting(true, false);
-                self.reset_after_backend_failure(
-                    format!("播放后端错误：{message}").into(),
-                    window,
-                    cx,
-                );
-            }
-            BackendEventKind::PlaybackEnded => {
-                if self.timeline.ended || self.playback_reporting_closed() {
-                    return;
-                }
-                self.prepare_playback_end_report();
-                self.report_playback_progress(true);
-                let update = self.close_playback_reporting(false, true);
+            BackendAction::Ended { auto_next } => {
+                self.backend_poll.cancel();
                 self.finish_playback(window, cx);
-                if self.can_switch_to_next_episode() {
+                if auto_next {
                     self.switch_to_next_episode_after_end(window, cx);
                 } else {
-                    cx.emit(PlaybackEvent::Update { update });
+                    cx.emit(PlaybackEvent::Update {
+                        update: closed_update.expect("ended transition closes reporting"),
+                    });
                 }
             }
-            BackendEventKind::Pause(paused) => {
-                self.timeline.user_paused = user_pause_from_effective_pause_event(
-                    self.timeline.user_paused,
-                    self.timeline.paused_for_cache,
-                    paused,
-                );
-                self.timeline.paused = effective_playback_paused(
-                    self.timeline.user_paused,
-                    self.timeline.paused_for_cache,
-                );
-                self.report_playback_progress(false);
+            BackendAction::TracksChanged => {
+                self.presentation.track_select_open = None;
             }
-            BackendEventKind::Buffering(buffering) => {
-                let hidden_by_soft_seek = buffering
-                    && self.timeline.pending_seek_keeps_frame
-                    && self.frame.current.is_some();
-                self.timeline.buffering = buffering && !hidden_by_soft_seek;
-            }
-            BackendEventKind::PlaybackInfoChanged(info) => {
-                self.playback_info = info;
-            }
-            BackendEventKind::PlaybackFileInfoChanged(info) => {
-                self.playback_file_info = Some(info);
-            }
-            BackendEventKind::PlaybackAudioInfoChanged(info) => {
-                self.playback_audio_info = info;
-            }
-            BackendEventKind::PlaybackTracksChanged {
-                audio,
-                mut subtitles,
-                selected,
-            } => {
-                // Do not save an automatic subtitle fallback as the user's
-                // preference. An unchanged valid detail selection still saves
-                // normally when playback starts.
-                if selected.subtitle_stream_index != self.tracks.selected_subtitle_stream_index {
-                    self.remember_subtitle_on_start = false;
-                }
-                subtitles.extend(
-                    self.tracks
-                        .subtitles
-                        .iter()
-                        .filter(|track| track.is_external)
-                        .cloned(),
-                );
-                self.tracks = TrackSelectState::new(audio, subtitles, selected);
-            }
-            BackendEventKind::SubtitleChanged(cue) => {
-                for image in self.subtitle.images.update(cue.as_ref()) {
+            BackendAction::Subtitle(cue) => {
+                for image in self.presentation.subtitle.images.update(cue.as_ref()) {
                     defer_drop_frame(image, window);
                 }
-                self.subtitle.active = cue;
+                self.presentation.subtitle.active = cue;
             }
-            BackendEventKind::VideoSizeChanged(size) => {
-                if self.frame.source_size != size {
-                    self.frame.source_size = size;
+            BackendAction::VideoSize(size) => {
+                if self.presentation.frame.source_size != size {
+                    self.presentation.frame.source_size = size;
                     self.clear_visible_frame(window, cx);
                 }
-                if let (Some(info), Some(size)) = (self.playback_info.as_mut(), size) {
-                    info.size = size;
-                }
-            }
-            BackendEventKind::PositionChanged(position) => {
-                if should_apply_backend_position(
-                    self.timeline.progress_drag_position,
-                    self.timeline.pending_seek_position,
-                ) {
-                    self.timeline.position = valid_playback_time(position);
-                }
-            }
-            BackendEventKind::DurationChanged(duration) => {
-                self.timeline.duration = valid_playback_duration(duration);
-                if let (Some(drag_position), Some(duration)) =
-                    (self.timeline.progress_drag_position, self.timeline.duration)
-                {
-                    self.timeline.progress_drag_position =
-                        Some(clamp_playback_position(drag_position, duration));
-                }
-            }
-            BackendEventKind::BufferedChanged(buffered_until) => {
-                let buffered_until = buffered_until.and_then(valid_playback_time);
-                self.timeline.buffered_until = if self.timeline.pending_seek_keeps_frame {
-                    match (self.timeline.buffered_until, buffered_until) {
-                        (Some(current), Some(next)) => Some(current.max(next)),
-                        (_, next) => next,
-                    }
-                } else {
-                    buffered_until
-                };
-            }
-            BackendEventKind::CacheStateChanged(state) => {
-                self.apply_cache_state(state);
-            }
-            BackendEventKind::PausedForCacheChanged(paused_for_cache) => {
-                apply_paused_for_cache_to_timeline(&mut self.timeline, paused_for_cache);
-            }
-            BackendEventKind::CacheBufferingChanged(percent) => {
-                apply_cache_buffering_to_timeline(&mut self.timeline, percent);
             }
         }
     }
 
     fn schedule_paused_backend_poll(&mut self, cx: &mut Context<Self>) {
-        if self.timeline.paused_backend_poll_scheduled || !self.should_poll_backend_while_paused() {
+        let has_backend = self.video.has_backend();
+        let has_error = self.session.controls_view().error.is_some();
+        if !self.session.should_poll(has_backend, has_error) {
+            self.session.cancel_poll();
+            self.backend_poll.cancel();
             return;
         }
-
-        self.timeline.paused_backend_poll_scheduled = true;
-        cx.spawn(async move |page, cx| {
+        let Some(token) = self.session.begin_poll(has_backend, has_error) else {
+            return;
+        };
+        self.backend_poll.replace(cx.spawn(async move |page, cx| {
             cx.background_executor()
                 .timer(PAUSED_BACKEND_POLL_INTERVAL)
                 .await;
             page.update(cx, |page, cx| {
-                page.timeline.paused_backend_poll_scheduled = false;
-                if page.should_poll_backend_while_paused() {
+                if page.session.complete_poll(
+                    &token,
+                    &page.emby.server.workspace_identity(),
+                    page.video.has_backend(),
+                    page.session.controls_view().error.is_some(),
+                ) {
                     cx.notify();
                 }
             })
             .ok();
-        })
-        .detach();
-    }
-
-    fn should_poll_backend_while_paused(&self) -> bool {
-        self.video.owner().is_some()
-            && self.timeline.loaded
-            && self.timeline.paused
-            && !self.timeline.ended
-            && self.error_message.is_none()
-            && self
-                .timeline
-                .cache_state
-                .as_ref()
-                .is_some_and(cache_state_needs_poll)
-    }
-
-    fn apply_cache_state(&mut self, state: PlaybackCacheState) {
-        self.timeline.buffered_until = state.demux.cache_end.and_then(valid_playback_time);
-        self.timeline.paused_for_cache = state.paused_for_cache;
-        self.timeline.paused =
-            effective_playback_paused(self.timeline.user_paused, state.paused_for_cache);
-        self.timeline.cache_buffering_percent = state.buffering_percent;
-        self.timeline.cache_state = Some(state);
+        }));
     }
 
     fn finish_playback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.timeline.loaded = true;
-        self.timeline.ended = true;
-        self.timeline.user_paused = true;
-        self.timeline.paused = true;
-        self.timeline.buffering = false;
-        self.timeline.cache_state = None;
-        self.timeline.cache_status_open = false;
-        self.timeline.paused_for_cache = false;
-        self.timeline.cache_buffering_percent = None;
-        self.timeline.pending_seek_position = None;
-        self.timeline.pending_seek_keeps_frame = false;
-        self.timeline.progress_drag_position = None;
-        if let Some(duration) = self.timeline.duration {
-            self.timeline.position = Some(duration);
-            self.timeline.buffered_until = Some(duration);
-        }
-        self.timeline.cache_state = None;
-        self.timeline.paused_for_cache = false;
-        self.timeline.cache_buffering_percent = None;
-        self.tracks.open = None;
-        self.timeline.user_paused = true;
-        self.error_message = None;
-        defer_drop_subtitle(&mut self.subtitle, window);
+        self.presentation.timeline_presentation.cache_status_open = false;
+        self.presentation.track_select_open = None;
+        defer_drop_subtitle(&mut self.presentation.subtitle, window);
         cx.notify();
     }
 
-    fn prepare_playback_end_report(&mut self) {
-        self.timeline.progress_drag_position = None;
-        self.timeline.pending_seek_position = None;
-        self.timeline.pending_seek_keeps_frame = false;
-        let terminal_position = self.timeline.duration.or_else(|| {
-            self.emby
-                .run_time_ticks
-                .filter(|ticks| *ticks > 0)
-                .map(|ticks| ticks as f64 / request::EMBY_TICKS_PER_SECOND as f64)
-                .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
-        });
-        if let Some(position) = terminal_position {
-            self.timeline.position = Some(position);
-            self.timeline.buffered_until = Some(position);
-        }
-    }
-
-    fn reset_after_backend_failure(
-        &mut self,
-        message: SharedString,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.timeline.loaded = false;
-        self.timeline.ended = false;
-        self.frame.source_size = None;
-        self.playback_file_info = None;
-        self.playback_info = None;
-        self.playback_audio_info = None;
-        self.timeline.user_paused = true;
-        self.timeline.paused = true;
-        self.timeline.buffering = false;
-        self.timeline.buffered_until = None;
-        self.timeline.cache_state = None;
-        self.timeline.cache_status_open = false;
-        self.timeline.paused_for_cache = false;
-        self.timeline.cache_buffering_percent = None;
-        self.timeline.pending_seek_position = None;
-        self.timeline.pending_seek_keeps_frame = false;
-        self.timeline.progress_drag_position = None;
-        defer_drop_subtitle(&mut self.subtitle, window);
+    fn reset_after_backend_failure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.presentation.frame.source_size = None;
+        self.presentation.timeline_presentation.cache_status_open = false;
+        defer_drop_subtitle(&mut self.presentation.subtitle, window);
         self.clear_visible_frame(window, cx);
-        self.error_message = Some(message);
     }
 
     fn poll_video_presenter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(presenter) = self.video.dependent_mut() {
-            presenter.prewarm_if_needed();
-        }
+        self.video.prewarm();
 
         let render_size = self
+            .presentation
             .frame
             .viewport_bounds
-            .zip(self.frame.source_size)
+            .zip(self.presentation.frame.source_size)
             .and_then(|(viewport_bounds, source_size)| {
                 render_output_size(viewport_bounds, source_size)
             });
         if should_render_frame(
-            self.video.dependent().is_some(),
-            self.timeline.loaded,
-            self.error_message.is_some(),
-            self.frame.source_size.is_some(),
+            self.video.has_presenter(),
+            self.session.timeline().loaded,
+            self.session.controls_view().error.is_some(),
+            self.presentation.frame.source_size.is_some(),
             render_size.is_some(),
         ) {
             let size = render_size.expect("render size checked above");
-            let presenter = self
+            let render_result = self.video.render(size);
+            let presenter_snapshot = self
                 .video
-                .dependent_mut()
+                .presenter_snapshot()
                 .expect("video presenter checked above");
-            let render_result = presenter.render_if_needed(size);
-            let presenter_snapshot = presenter.snapshot();
             if let Some(blocked_on) = presenter_snapshot.blocked_on {
                 tracing::trace!(
                     blocked_on,
@@ -339,71 +177,24 @@ impl PlaybackPage {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    self.timeline.user_paused = true;
-                    self.timeline.paused = true;
+                    let transition = self.session.render_failed(
+                        error.to_string(),
+                        BackendContext {
+                            item_id: &self.emby.item_id,
+                            media_source_id: &self.emby.media_source_id,
+                            play_session_id: self.emby.play_session_id.as_deref(),
+                            run_time_ticks: self.emby.run_time_ticks,
+                            has_frame: self.presentation.frame.current.is_some(),
+                        },
+                    );
                     self.cancel_queue_switch();
-                    let _ = self.close_playback_reporting(true, false);
+                    self.execute_reporting_transition(transition, cx);
                     self.clear_visible_frame(window, cx);
-                    self.error_message = Some(format!("渲染视频失败：{error}").into());
                 }
             }
         } else {
             self.clear_visible_frame(window, cx);
         }
-    }
-}
-
-fn cache_state_needs_poll(state: &PlaybackCacheState) -> bool {
-    if state.paused_for_cache || state.buffering_percent.is_some() {
-        return true;
-    }
-    if state.byte.as_ref().is_some_and(|byte| !byte.idle) {
-        return true;
-    }
-    !state.demux.idle && !state.demux.eof
-}
-
-fn apply_playback_restart_to_timeline(timeline: &mut PlaybackTimelineState) {
-    let first_restart = !timeline.loaded;
-    let paused_for_cache = timeline.paused_for_cache;
-    let cache_buffering_percent = timeline.cache_buffering_percent;
-    timeline.loaded = true;
-    timeline.ended = false;
-    if first_restart {
-        timeline.user_paused = false;
-    }
-    timeline.paused = effective_playback_paused(timeline.user_paused, paused_for_cache);
-    timeline.buffering = false;
-    // A restart also marks the first frame after a seek. The cache state emitted
-    // earlier in the same poll remains authoritative until the next cache tick.
-    timeline.cache_status_open = false;
-    timeline.paused_for_cache = paused_for_cache;
-    timeline.cache_buffering_percent = cache_buffering_percent.filter(|_| paused_for_cache);
-    timeline.pending_seek_position = None;
-    timeline.pending_seek_keeps_frame = false;
-}
-
-fn apply_paused_for_cache_to_timeline(
-    timeline: &mut PlaybackTimelineState,
-    paused_for_cache: bool,
-) {
-    timeline.paused_for_cache = paused_for_cache;
-    timeline.paused = effective_playback_paused(timeline.user_paused, paused_for_cache);
-    if !paused_for_cache {
-        timeline.cache_buffering_percent = None;
-    }
-    if let Some(cache_state) = timeline.cache_state.as_mut() {
-        cache_state.paused_for_cache = paused_for_cache;
-        if !paused_for_cache {
-            cache_state.buffering_percent = None;
-        }
-    }
-}
-
-fn apply_cache_buffering_to_timeline(timeline: &mut PlaybackTimelineState, percent: Option<u8>) {
-    timeline.cache_buffering_percent = percent;
-    if let Some(cache_state) = timeline.cache_state.as_mut() {
-        cache_state.buffering_percent = percent;
     }
 }
 
@@ -421,7 +212,28 @@ mod tests {
         apply_paused_for_cache_to_timeline, apply_playback_restart_to_timeline,
         cache_state_needs_poll,
     };
-    use crate::player::page::state::PlaybackTimelineState;
+    use crate::player::model::timeline::PlaybackTimelineState;
+
+    #[gpui::test]
+    fn playback_restart_closes_cache_popover_after_reducing_timeline(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        cx.update(|window, cx| {
+            page.update(cx, |page, cx| {
+                page.presentation.timeline_presentation.cache_status_open = true;
+                page.session.timeline_mut().pending_seek_position = Some(30.0);
+                page.apply_backend_event(
+                    BackendEvent::new(Default::default(), BackendEventKind::PlaybackRestart),
+                    window,
+                    cx,
+                );
+                assert!(!page.presentation.timeline_presentation.cache_status_open);
+                assert!(page.session.timeline().loaded);
+                assert_eq!(page.session.timeline().pending_seek_position, None);
+            });
+        });
+    }
 
     #[gpui::test]
     fn subtitle_events_reuse_images_and_clear_them_after_failure(cx: &mut gpui::TestAppContext) {
@@ -458,7 +270,13 @@ mod tests {
                         cx,
                     );
                 }
-                let rendered = page.subtitle.images.get(&image).unwrap().clone();
+                let rendered = page
+                    .presentation
+                    .subtitle
+                    .images
+                    .get(&image)
+                    .unwrap()
+                    .clone();
                 page.apply_backend_event(
                     BackendEvent::new(
                         Default::default(),
@@ -469,7 +287,7 @@ mod tests {
                 );
                 assert!(Arc::ptr_eq(
                     &rendered,
-                    page.subtitle.images.get(&image).unwrap()
+                    page.presentation.subtitle.images.get(&image).unwrap()
                 ));
                 assert_eq!(rendered.as_bytes(0).unwrap(), image.image().bytes());
                 page.apply_backend_event(
@@ -480,8 +298,8 @@ mod tests {
                     window,
                     cx,
                 );
-                assert!(page.subtitle.active.is_none());
-                assert!(page.subtitle.images.get(&image).is_none());
+                assert!(page.presentation.subtitle.active.is_none());
+                assert!(page.presentation.subtitle.images.get(&image).is_none());
             });
         });
     }
@@ -496,21 +314,26 @@ mod tests {
                 let original_subtitle = PlaybackTrack::new(7, "Chinese Simplified (ASS)", false);
                 let external = PlaybackTrack::new(8, "External subtitle", true)
                     .with_external_url(Some("https://example.invalid/sub.srt".into()));
-                page.tracks.audio = vec![PlaybackTrack::new(5, "Original audio", false)];
-                page.tracks.subtitles = vec![original_subtitle.clone(), external.clone()];
-                page.tracks.selected_audio_stream_index = Some(5);
-                page.tracks.selected_subtitle_stream_index = Some(7);
-                page.remember_subtitle_on_start = true;
+                page.session.source_mut().tracks.audio =
+                    vec![PlaybackTrack::new(5, "Original audio", false)];
+                page.session.source_mut().tracks.subtitles =
+                    vec![original_subtitle.clone(), external.clone()];
+                page.session.source_mut().tracks.selected_audio_stream_index = Some(5);
+                page.session
+                    .source_mut()
+                    .tracks
+                    .selected_subtitle_stream_index = Some(7);
+                page.session.source_mut().remember_subtitle_on_start = true;
                 PlaybackTrackPreferences::remember(
                     &page.emby.server,
-                    std::slice::from_ref(&page.track_preference_key),
+                    std::slice::from_ref(&page.session.source_view().track_preference_key),
                     PlaybackTrackKind::Subtitle,
                     Some(&original_subtitle),
                     cx,
                 );
                 let saved = PlaybackTrackPreferences::get(
                     &page.emby.server,
-                    &page.track_preference_key,
+                    &page.session.source_view().track_preference_key,
                     cx,
                 )
                 .subtitle;
@@ -530,22 +353,34 @@ mod tests {
                     window,
                     cx,
                 );
-                assert_eq!(page.tracks.audio, audio);
-                assert_eq!(page.tracks.subtitles, vec![external]);
-                assert_eq!(page.tracks.selected_audio_stream_index, Some(1));
-                assert!(page.tracks.selected_subtitle_stream_index.is_none());
-                assert!(!page.remember_subtitle_on_start);
+                assert_eq!(page.session.source_view().tracks.audio, audio);
+                assert_eq!(page.session.source_view().tracks.subtitles, vec![external]);
+                assert_eq!(
+                    page.session
+                        .source_view()
+                        .tracks
+                        .selected_audio_stream_index,
+                    Some(1)
+                );
+                assert!(
+                    page.session
+                        .source_view()
+                        .tracks
+                        .selected_subtitle_stream_index
+                        .is_none()
+                );
+                assert!(!page.session.source_view().remember_subtitle_on_start);
                 page.apply_backend_event(
                     BackendEvent::new(Default::default(), BackendEventKind::PlaybackRestart),
                     window,
                     cx,
                 );
-                assert!(page.timeline.loaded);
-                assert!(page.error_message.is_none());
+                assert!(page.session.timeline().loaded);
+                assert!(page.session.controls_view().error.is_none());
                 assert_eq!(
                     PlaybackTrackPreferences::get(
                         &page.emby.server,
-                        &page.track_preference_key,
+                        &page.session.source_view().track_preference_key,
                         cx,
                     )
                     .subtitle,
@@ -563,9 +398,12 @@ mod tests {
         cx.update(|window, cx| {
             page.update(cx, |page, cx| {
                 let subtitle = PlaybackTrack::new(7, "Chinese Simplified (ASS)", false);
-                page.tracks.subtitles = vec![subtitle.clone()];
-                page.tracks.selected_subtitle_stream_index = Some(7);
-                page.remember_subtitle_on_start = true;
+                page.session.source_mut().tracks.subtitles = vec![subtitle.clone()];
+                page.session
+                    .source_mut()
+                    .tracks
+                    .selected_subtitle_stream_index = Some(7);
+                page.session.source_mut().remember_subtitle_on_start = true;
                 page.apply_backend_event(
                     BackendEvent::new(
                         Default::default(),
@@ -582,7 +420,7 @@ mod tests {
                     window,
                     cx,
                 );
-                assert!(page.remember_subtitle_on_start);
+                assert!(page.session.source_view().remember_subtitle_on_start);
                 page.apply_backend_event(
                     BackendEvent::new(Default::default(), BackendEventKind::PlaybackRestart),
                     window,
@@ -591,7 +429,7 @@ mod tests {
                 assert_eq!(
                     PlaybackTrackPreferences::get(
                         &page.emby.server,
-                        &page.track_preference_key,
+                        &page.session.source_view().track_preference_key,
                         cx,
                     )
                     .subtitle,
@@ -606,14 +444,17 @@ mod tests {
         let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
         cx.update(|window, cx| {
             page.update(cx, |page, cx| {
-                page.timeline.loaded = false;
-                page.tracks.subtitles =
+                page.session.timeline_mut().loaded = false;
+                page.session.source_mut().tracks.subtitles =
                     vec![PlaybackTrack::new(9, "Chinese Simplified (ASS)", false)];
-                page.tracks.selected_subtitle_stream_index = Some(9);
-                page.remember_subtitle_on_start = true;
+                page.session
+                    .source_mut()
+                    .tracks
+                    .selected_subtitle_stream_index = Some(9);
+                page.session.source_mut().remember_subtitle_on_start = true;
                 PlaybackTrackPreferences::remember(
                     &page.emby.server,
-                    std::slice::from_ref(&page.track_preference_key),
+                    std::slice::from_ref(&page.session.source_view().track_preference_key),
                     PlaybackTrackKind::Subtitle,
                     None,
                     cx,
@@ -626,7 +467,7 @@ mod tests {
                 assert_eq!(
                     PlaybackTrackPreferences::get(
                         &page.emby.server,
-                        &page.track_preference_key,
+                        &page.session.source_view().track_preference_key,
                         cx
                     )
                     .subtitle,
@@ -641,18 +482,20 @@ mod tests {
                 assert_eq!(
                     PlaybackTrackPreferences::get(
                         &page.emby.server,
-                        &page.track_preference_key,
+                        &page.session.source_view().track_preference_key,
                         cx
                     )
                     .subtitle,
-                    Some(SavedTrackChoice::from_track(page.tracks.subtitles.first()))
+                    Some(SavedTrackChoice::from_track(
+                        page.session.source_view().tracks.subtitles.first()
+                    ))
                 );
-                assert!(!page.remember_subtitle_on_start);
+                assert!(!page.session.source_view().remember_subtitle_on_start);
 
                 // A later player change must not be replaced by the consumed detail draft.
                 PlaybackTrackPreferences::remember(
                     &page.emby.server,
-                    std::slice::from_ref(&page.track_preference_key),
+                    std::slice::from_ref(&page.session.source_view().track_preference_key),
                     PlaybackTrackKind::Subtitle,
                     None,
                     cx,
@@ -665,7 +508,7 @@ mod tests {
                 assert_eq!(
                     PlaybackTrackPreferences::get(
                         &page.emby.server,
-                        &page.track_preference_key,
+                        &page.session.source_view().track_preference_key,
                         cx
                     )
                     .subtitle,
@@ -685,14 +528,17 @@ mod tests {
             let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
             cx.update(|window, cx| {
                 page.update(cx, |page, cx| {
-                    page.timeline.loaded = false;
-                    page.tracks.subtitles =
+                    page.session.timeline_mut().loaded = false;
+                    page.session.source_mut().tracks.subtitles =
                         vec![PlaybackTrack::new(9, "Chinese Simplified (ASS)", false)];
-                    page.tracks.selected_subtitle_stream_index = Some(9);
-                    page.remember_subtitle_on_start = true;
+                    page.session
+                        .source_mut()
+                        .tracks
+                        .selected_subtitle_stream_index = Some(9);
+                    page.session.source_mut().remember_subtitle_on_start = true;
                     PlaybackTrackPreferences::remember(
                         &page.emby.server,
-                        std::slice::from_ref(&page.track_preference_key),
+                        std::slice::from_ref(&page.session.source_view().track_preference_key),
                         PlaybackTrackKind::Subtitle,
                         None,
                         cx,
@@ -714,7 +560,7 @@ mod tests {
                     assert_eq!(
                         PlaybackTrackPreferences::get(
                             &page.emby.server,
-                            &page.track_preference_key,
+                            &page.session.source_view().track_preference_key,
                             cx
                         )
                         .subtitle,
@@ -732,9 +578,12 @@ mod tests {
         let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
         cx.update(|window, cx| {
             page.update(cx, |page, cx| {
-                page.tracks.subtitles =
+                page.session.source_mut().tracks.subtitles =
                     vec![PlaybackTrack::new(10, "Chinese Simplified (ASS)", false)];
-                page.tracks.selected_subtitle_stream_index = Some(10);
+                page.session
+                    .source_mut()
+                    .tracks
+                    .selected_subtitle_stream_index = Some(10);
                 page.apply_backend_event(
                     BackendEvent::new(Default::default(), BackendEventKind::PlaybackRestart),
                     window,
@@ -743,7 +592,7 @@ mod tests {
                 assert!(
                     PlaybackTrackPreferences::get(
                         &page.emby.server,
-                        &page.track_preference_key,
+                        &page.session.source_view().track_preference_key,
                         cx
                     )
                     .subtitle
@@ -849,7 +698,6 @@ mod tests {
             loaded: true,
             buffering: true,
             cache_state: Some(cache_state.clone()),
-            cache_status_open: true,
             pending_seek_position: Some(60.0),
             pending_seek_keeps_frame: true,
             ..PlaybackTimelineState::default()
@@ -860,7 +708,6 @@ mod tests {
         assert_eq!(timeline.cache_state.as_ref(), Some(&cache_state));
         assert!(timeline.loaded);
         assert!(!timeline.buffering);
-        assert!(!timeline.cache_status_open);
         assert_eq!(timeline.pending_seek_position, None);
         assert!(!timeline.pending_seek_keeps_frame);
     }

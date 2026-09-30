@@ -7,7 +7,7 @@ use crate::ui::radius;
 use crate::{emby::VideoItemType, theme};
 
 use super::super::{
-    HomeContent, LoadState,
+    HomeContent,
     carousel::{
         HOME_ITEM_CARD_GAP_PX, HOME_ITEM_CARD_PADDING_PX, HOME_MAIN_SCROLLBAR_WIDTH_PX,
         carousel_content_width_for, carousel_visible_range_between_for, home_main_content_width,
@@ -35,7 +35,7 @@ impl HomeContent {
             .id("home-favorites-content")
             .overflow_y_scroll()
             .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
-            .track_scroll(&self.favorites.scroll_handle)
+            .track_scroll(&self.favorites_presentation.scroll_handle)
             .p_6()
             .flex()
             .flex_col()
@@ -43,10 +43,7 @@ impl HomeContent {
             .children(
                 FAVORITE_ITEM_TYPES
                     .into_iter()
-                    .filter(|item_type| {
-                        let state = &self.favorites[*item_type].paged;
-                        !state.items.is_empty() || state.initial == LoadState::Failed
-                    })
+                    .filter(|item_type| self.controller.favorite_section(*item_type).show_section)
                     .map(|item_type| self.render_favorite_section(item_type, width, cx)),
             )
     }
@@ -57,8 +54,8 @@ impl HomeContent {
         width: f32,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let state = &self.favorites[item_type].paged;
-        let has_items = !state.items.is_empty();
+        let state = self.controller.favorite_section(item_type);
+        let has_items = state.has_items;
         let title = favorite_section_title(item_type);
         div()
             .id((ElementId::from("favorite-section"), item_type.as_str()))
@@ -88,7 +85,7 @@ impl HomeContent {
             .when(has_items, |this| {
                 this.child(self.render_favorite_row(item_type, width, cx))
             })
-            .when(state.initial == LoadState::Failed, |this| {
+            .when(state.can_retry, |this| {
                 this.child(favorite_action(
                     format!("favorite-retry-{}", item_type.as_str()),
                     "重试",
@@ -107,8 +104,14 @@ impl HomeContent {
         let theme = theme::get(cx);
         let source = UserItemGridSource::Favorites(item_type);
         let card_width = source.card_width();
-        let section = &self.favorites[item_type];
-        let count = section.paged.items.len().min(FAVORITES_PAGE_LIMIT as usize);
+        let section = &self.favorites_presentation[item_type];
+        let count = self
+            .controller
+            .favorite_section(item_type)
+            .paged
+            .items
+            .len()
+            .min(FAVORITES_PAGE_LIMIT as usize);
         let width = viewport_width.min(carousel_content_width_for(
             count,
             card_width,
@@ -132,11 +135,7 @@ impl HomeContent {
             card_width,
             HOME_ITEM_CARD_PADDING_PX,
             HOME_ITEM_CARD_GAP_PX,
-            if self.resize_in_progress {
-                (0, 0)
-            } else {
-                (2, 4)
-            },
+            self.layout.view_model().carousel_overscan,
         );
         let controls_visible = carousel.controls_visible(max_offset > 0.0);
 
@@ -159,7 +158,7 @@ impl HomeContent {
                     })
                     .children((visible.start..visible.end).map(|index| {
                         self.render_user_item_grid_card(
-                            &section.paged.items[index],
+                            &self.controller.favorite_section(item_type).paged.items[index],
                             index,
                             source,
                             "favorite-row-item",
@@ -218,7 +217,7 @@ impl HomeContent {
         controls: bool,
         cx: &mut Context<Self>,
     ) {
-        let carousel = &mut self.favorites[item_type].carousel;
+        let carousel = &mut self.favorites_presentation[item_type].carousel;
         let changed = if controls {
             carousel.set_controls_hovered(hovered)
         } else {
@@ -238,8 +237,14 @@ impl HomeContent {
     ) {
         let width = home_main_content_width(window);
         let card_width = UserItemGridSource::Favorites(item_type).card_width();
-        let section = &mut self.favorites[item_type];
-        let count = section.paged.items.len().min(FAVORITES_PAGE_LIMIT as usize);
+        let section = &mut self.favorites_presentation[item_type];
+        let count = self
+            .controller
+            .favorite_section(item_type)
+            .paged
+            .items
+            .len()
+            .min(FAVORITES_PAGE_LIMIT as usize);
         let max_offset = max_carousel_scroll_offset_for(
             count,
             width,

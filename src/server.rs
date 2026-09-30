@@ -4,7 +4,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+pub(crate) mod feature;
 pub(crate) mod icon;
+pub(crate) mod view;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
@@ -202,6 +204,14 @@ pub struct CachedServer {
 }
 
 impl CachedServer {
+    pub(crate) fn workspace_identity(&self) -> crate::effects::WorkspaceIdentity {
+        crate::effects::WorkspaceIdentity {
+            local_server_id: self.id.clone(),
+            remote_server_id: self.server_id.clone(),
+            user_id: self.user_id.clone(),
+        }
+    }
+
     pub(crate) fn can_reuse_auth(&self) -> bool {
         !self.needs_auth_refresh
             && self

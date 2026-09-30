@@ -1,6 +1,6 @@
 //! Full settings for development and playback diagnostics.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
@@ -11,7 +11,6 @@ use gpui::{
 use crate::ui::radius;
 use crate::{
     app::window_corner_radii,
-    app_metadata::default_playback_cache_dir,
     player::{
         CacheUnlinkPolicy, HardwareDecodeMode, PlaybackCacheConfig, PlaybackCacheMode,
         PlaybackLanguagePreferences, PlaybackSeekableCacheMode, TrackLanguage,
@@ -32,47 +31,16 @@ use super::{
     tooltip::text_tooltip,
 };
 
-const BYTES_PER_MIB: u64 = 1024 * 1024;
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum SettingsCategory {
-    #[default]
-    Appearance,
-    Playback,
-    General,
-    Memory,
-    Disk,
-    Readahead,
-}
-
-impl SettingsCategory {
-    const ALL: [Self; 6] = [
-        Self::Appearance,
-        Self::Playback,
-        Self::General,
-        Self::Memory,
-        Self::Disk,
-        Self::Readahead,
-    ];
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Appearance => "外观",
-            Self::Playback => "播放",
-            Self::General => "缓存策略",
-            Self::Memory => "内存缓存",
-            Self::Disk => "磁盘缓存",
-            Self::Readahead => "预读策略",
-        }
-    }
-}
+#[cfg(test)]
+use crate::settings::values::{BYTES_PER_MIB, parse_seconds};
+use crate::settings::values::{bytes_to_mib, format_seconds, resolved_cache_directories};
+use crate::settings::{
+    NumericSetting, SettingDescriptor, SettingsCategory, SettingsController, SettingsIntent,
+    SettingsMode, SettingsSnapshot, ToggleSetting,
+};
 
 struct SettingItem {
-    category: SettingsCategory,
-    section: &'static str,
-    title: &'static str,
-    description: &'static str,
-    keywords: &'static str,
+    descriptor: SettingDescriptor,
     control: AnyElement,
 }
 
@@ -86,33 +54,22 @@ impl SettingItem {
         control: impl IntoElement,
     ) -> Self {
         Self {
-            category,
-            section,
-            title,
-            description,
-            keywords,
+            descriptor: SettingDescriptor {
+                category,
+                section,
+                title,
+                description,
+                keywords,
+            },
             control: control.into_any_element(),
         }
-    }
-
-    fn matches_query(&self, query: &str) -> bool {
-        matches_search(
-            query,
-            &[
-                self.category.title(),
-                self.section,
-                self.title,
-                self.description,
-                self.keywords,
-            ],
-        )
     }
 
     fn render(self, last_in_section: bool, cx: &App) -> impl IntoElement {
         let theme = theme::get(cx);
         div()
-            .id(self.title)
-            .debug_selector(move || self.title.into())
+            .id(self.descriptor.title)
+            .debug_selector(move || self.descriptor.title.into())
             .flex()
             .min_w_0()
             .w_full()
@@ -141,53 +98,27 @@ impl SettingItem {
                         div()
                             .text_sm()
                             .text_color(theme.foreground)
-                            .child(self.title),
+                            .child(self.descriptor.title),
                     )
                     .child(
                         div()
                             .text_xs()
                             .line_height(relative(1.5))
                             .text_color(theme.muted_foreground)
-                            .child(self.description),
+                            .child(self.descriptor.description),
                     ),
             )
             .child(div().flex_shrink_0().child(self.control))
     }
 }
 
-#[derive(Clone, Copy)]
-enum ToggleSetting {
-    DecoderFramedrop,
-    DiskCache,
-    CachePause,
-    CachePauseInitial,
-    DonateBuffer,
-    AdaptiveReadahead,
-    AutomaticHysteresis,
-    DemuxerCacheWait,
-}
-
 pub struct PlaybackSettingsDialogState {
-    category: SettingsCategory,
-    color_theme: ColorTheme,
-    track_languages: PlaybackLanguagePreferences,
+    controller: SettingsController,
     search: Entity<Editor>,
     dropdown: Entity<DropdownState>,
     scroll_handle: ScrollHandle,
     _search_subscription: Subscription,
-    base_config: PlaybackCacheConfig,
-    mode: PlaybackCacheMode,
-    seekable_cache: PlaybackSeekableCacheMode,
-    unlink_files: CacheUnlinkPolicy,
     cache_directories: [PathBuf; 2],
-    disk_cache: bool,
-    cache_pause: bool,
-    cache_pause_initial: bool,
-    demuxer_donate_buffer: bool,
-    adaptive_readahead: bool,
-    automatic_hysteresis: bool,
-    demuxer_cache_wait: bool,
-    decoder_framedrop: bool,
     total_cache_mib: Entity<Editor>,
     http_cache_mib: Entity<Editor>,
     http_cache_chunk_mib: Entity<Editor>,
@@ -217,190 +148,171 @@ impl PlaybackSettingsDialogState {
         let config = config.clone().normalized();
         let search = cx.new(|cx| Editor::new("搜索设置…", cx).search());
         let scroll_handle = ScrollHandle::new();
-        let search_subscription = cx.subscribe(&search, |this, _, event, cx| {
+        let search_subscription = cx.subscribe(&search, |this, search, event, cx| {
             if matches!(event, EditorEvent::Changed) {
+                this.dispatch(
+                    SettingsIntent::Search(search.read(cx).value().to_string()),
+                    cx,
+                );
                 this.dropdown.update(cx, |state, cx| state.close(cx));
                 this.scroll_handle.set_offset(point(px(0.0), px(0.0)));
                 cx.notify();
             }
         });
+        cx.on_release(|dialog, _| {
+            dialog.controller.dispatch(SettingsIntent::Close);
+        })
+        .detach();
         Self {
-            category: SettingsCategory::default(),
-            color_theme: theme::get(cx).selection,
-            track_languages: PlaybackLanguagePreferences::get(cx),
+            controller: SettingsController::new(
+                &config,
+                SettingsMode::Development,
+                theme::get(cx).selection,
+                PlaybackLanguagePreferences::get(cx),
+            ),
             search,
             dropdown: cx.new(DropdownState::new),
             scroll_handle,
             _search_subscription: search_subscription,
-            base_config: config.clone(),
-            mode: config.mode,
-            seekable_cache: config.seekable_cache,
-            unlink_files: config.unlink_files,
             cache_directories: resolved_cache_directories(
                 config.cache_dir.as_deref(),
                 ["TINY_HTTP_CACHE_DIR", "TINY_DEMUX_PACKET_CACHE_DIR"]
                     .map(|key| std::env::var(key).ok().map(PathBuf::from)),
             ),
-            disk_cache: config.disk_cache,
-            cache_pause: config.cache_pause,
-            cache_pause_initial: config.cache_pause_initial,
-            demuxer_donate_buffer: config.demuxer_donate_buffer,
-            adaptive_readahead: config.adaptive_readahead,
-            automatic_hysteresis: config.automatic_hysteresis,
-            demuxer_cache_wait: config.demuxer_cache_wait,
-            decoder_framedrop: config.decoder_framedrop,
             total_cache_mib: number_input(
                 "总缓存上限（MiB，0=独立上限）",
                 bytes_to_mib(config.total_cache_max_bytes),
-                |config, value| config.total_cache_max_bytes = value.saturating_mul(BYTES_PER_MIB),
+                NumericSetting::TotalCacheMib,
                 cx,
             ),
             http_cache_mib: number_input(
                 "HTTP 内存缓存（MiB）",
                 bytes_to_mib(config.http_cache_max_bytes),
-                |config, value| config.http_cache_max_bytes = value.saturating_mul(BYTES_PER_MIB),
+                NumericSetting::HttpCacheMib,
                 cx,
             ),
             http_cache_chunk_mib: number_input(
                 "HTTP 分页块（MiB）",
                 bytes_to_mib(config.http_cache_chunk_bytes),
-                |config, value| config.http_cache_chunk_bytes = value.saturating_mul(BYTES_PER_MIB),
+                NumericSetting::HttpCacheChunkMib,
                 cx,
             ),
             demuxer_forward_mib: number_input(
                 "Demux 前向缓存（MiB，0=不限）",
                 bytes_to_mib(config.demuxer_max_bytes),
-                |config, value| config.demuxer_max_bytes = value.saturating_mul(BYTES_PER_MIB),
+                NumericSetting::DemuxerForwardMib,
                 cx,
             ),
             demuxer_back_mib: number_input(
                 "Demux 回看缓存（MiB，0=关闭）",
                 bytes_to_mib(config.demuxer_max_back_bytes),
-                |config, value| config.demuxer_max_back_bytes = value.saturating_mul(BYTES_PER_MIB),
+                NumericSetting::DemuxerBackMib,
                 cx,
             ),
             range_request_mib: number_input(
                 "HTTP Range 请求（MiB）",
                 bytes_to_mib(config.http_cache_range_request_bytes),
-                |config, value| {
-                    config.http_cache_range_request_bytes = value.saturating_mul(BYTES_PER_MIB)
-                },
+                NumericSetting::RangeRequestMib,
                 cx,
             ),
             cache_secs: decimal_input(
                 "网络缓存目标（秒）",
                 config.cache_secs,
-                |config, value| config.cache_secs = value,
+                NumericSetting::CacheSecs,
                 cx,
             ),
             readahead_secs: decimal_input(
                 "Demux 预读（秒）",
                 config.demuxer_readahead_secs,
-                |config, value| config.demuxer_readahead_secs = value,
+                NumericSetting::ReadaheadSecs,
                 cx,
             ),
             packet_readahead_secs: decimal_input(
                 "Packet 预读上限（秒，0=不限）",
                 config.demuxer_packet_max_readahead_secs,
-                |config, value| config.demuxer_packet_max_readahead_secs = value,
+                NumericSetting::PacketReadaheadSecs,
                 cx,
             ),
             hysteresis_secs: decimal_input(
                 "滞回带（秒，自动模式下0=自动）",
                 config.demuxer_hysteresis_secs,
-                |config, value| config.demuxer_hysteresis_secs = value,
+                NumericSetting::HysteresisSecs,
                 cx,
             ),
             cache_pause_wait_secs: decimal_input(
                 "Cache-pause 恢复阈值（秒）",
                 config.cache_pause_wait,
-                |config, value| config.cache_pause_wait = value,
+                NumericSetting::CachePauseWaitSecs,
                 cx,
             ),
             max_ranges: number_input(
                 "最多保留 Demux range",
                 config.demuxer_max_ranges as u64,
-                |config, value| {
-                    config.demuxer_max_ranges = usize::try_from(value).unwrap_or(usize::MAX)
-                },
+                NumericSetting::MaxRanges,
                 cx,
             ),
             disk_cache_gib: disk_cache_capacity_input(
                 config.disk_cache_max_bytes,
-                |this, bytes, cx| {
-                    if this.base_config.disk_cache_max_bytes != bytes {
-                        this.base_config.disk_cache_max_bytes = bytes;
-                        this.changed(cx);
-                    }
+                |this, input, cx| {
+                    this.dispatch(
+                        SettingsIntent::EditNumber {
+                            field: NumericSetting::DiskCacheGib,
+                            input,
+                        },
+                        cx,
+                    )
                 },
                 cx,
             ),
         }
     }
 
+    #[cfg(test)]
     pub fn color_theme(&self) -> ColorTheme {
-        self.color_theme
+        self.controller.view_model().color_theme
     }
-
+    #[cfg(test)]
     pub fn track_languages(&self) -> PlaybackLanguagePreferences {
-        self.track_languages
+        self.controller.view_model().track_languages
+    }
+    #[cfg(test)]
+    pub fn playback_config(&self) -> PlaybackCacheConfig {
+        self.controller.view_model().config.clone()
+    }
+    pub(crate) fn snapshot(&self) -> SettingsSnapshot {
+        self.controller.snapshot()
     }
 
+    fn dispatch(&mut self, intent: SettingsIntent, cx: &mut Context<Self>) {
+        let change = self.controller.dispatch(intent);
+        if let Some(selection) = change.theme {
+            theme::set(selection, cx);
+            self.controller
+                .finish_theme_selection(theme::get(cx).selection);
+        }
+        if let Some(languages) = change.languages {
+            languages.apply(cx);
+        }
+        if change.persist {
+            cx.emit(SettingsChanged);
+        }
+        if change.view_changed {
+            cx.notify();
+        }
+    }
     fn select_track_language(
         &mut self,
         language: TrackLanguage,
         audio: bool,
         cx: &mut Context<Self>,
     ) {
-        let selected = if audio {
-            &mut self.track_languages.audio
-        } else {
-            &mut self.track_languages.subtitle
-        };
-        if *selected == language {
-            return;
-        }
-        *selected = language;
-        self.track_languages.apply(cx);
-        self.changed(cx);
+        self.dispatch(SettingsIntent::Language { language, audio }, cx);
     }
-
     fn select_color_theme(&mut self, selection: ColorTheme, cx: &mut Context<Self>) {
-        if self.color_theme == selection {
-            return;
-        }
-        theme::set(selection, cx);
-        self.color_theme = theme::get(cx).selection;
-        self.changed(cx);
+        self.dispatch(SettingsIntent::Theme(selection), cx);
     }
-
     fn select_hardware_decode(&mut self, mode: HardwareDecodeMode, cx: &mut Context<Self>) {
-        if self.base_config.hardware_decode != mode {
-            self.base_config.hardware_decode = mode;
-            self.changed(cx);
-        }
-    }
-
-    fn changed(&mut self, cx: &mut Context<Self>) {
-        self.base_config = self.playback_config();
-        cx.emit(SettingsChanged);
-        cx.notify();
-    }
-
-    pub fn playback_config(&self) -> PlaybackCacheConfig {
-        let mut config = self.base_config.clone();
-        config.mode = self.mode;
-        config.seekable_cache = self.seekable_cache;
-        config.unlink_files = self.unlink_files;
-        config.disk_cache = self.disk_cache;
-        config.cache_pause = self.cache_pause;
-        config.cache_pause_initial = self.cache_pause_initial;
-        config.demuxer_donate_buffer = self.demuxer_donate_buffer;
-        config.adaptive_readahead = self.adaptive_readahead;
-        config.automatic_hysteresis = self.automatic_hysteresis;
-        config.demuxer_cache_wait = self.demuxer_cache_wait;
-        config.decoder_framedrop = self.decoder_framedrop;
-        config.normalized()
+        self.dispatch(SettingsIntent::HardwareDecode(mode), cx);
     }
 
     fn render_content(
@@ -410,7 +322,7 @@ impl PlaybackSettingsDialogState {
         cx: &App,
     ) -> impl IntoElement {
         let dropdown = self.dropdown.clone();
-        let query = self.search.read(cx).value();
+        let query = self.controller.view_model().query;
         let searching = !query.trim().is_empty();
         div()
             .id("playback-settings-panel")
@@ -468,14 +380,15 @@ impl PlaybackSettingsDialogState {
                     .flex_col()
                     .gap_1()
                     .children(SettingsCategory::ALL.into_iter().map(|category| {
-                        let selected = !searching && self.category == category;
+                        let selected =
+                            !searching && self.controller.view_model().category == category;
                         let dialog = dialog.clone();
                         settings_category_button(category.title(), selected, cx).on_click(
                             move |_, window, cx| {
                                 dialog.update(cx, |dialog, cx| {
                                     // Do not leave focus in an editor that disappears with its page.
                                     window.blur(cx);
-                                    dialog.category = category;
+                                    dialog.dispatch(SettingsIntent::Category(category), cx);
                                     dialog.dropdown.update(cx, |state, cx| state.close(cx));
                                     dialog
                                         .search
@@ -495,13 +408,7 @@ impl PlaybackSettingsDialogState {
         let items: Vec<_> = self
             .setting_items(dialog, cx)
             .into_iter()
-            .filter(|item| {
-                if searching {
-                    item.matches_query(query)
-                } else {
-                    item.category == self.category
-                }
-            })
+            .filter(|item| self.controller.view_model().includes(&item.descriptor))
             .collect();
         let mut content = div().flex().flex_col().min_w_0().child(
             div()
@@ -512,7 +419,7 @@ impl PlaybackSettingsDialogState {
                 .child(if searching {
                     "搜索结果"
                 } else {
-                    self.category.title()
+                    self.controller.view_model().category.title()
                 }),
         );
         if items.is_empty() {
@@ -535,7 +442,7 @@ impl PlaybackSettingsDialogState {
         let mut previous_section = None;
         let mut items = items.into_iter().peekable();
         while let Some(item) = items.next() {
-            let section = (item.category, item.section);
+            let section = (item.descriptor.category, item.descriptor.section);
             if previous_section != Some(section) {
                 content = content.child(
                     div()
@@ -546,16 +453,20 @@ impl PlaybackSettingsDialogState {
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.muted_foreground)
                         .child(if searching {
-                            format!("{} / {}", item.category.title(), item.section)
+                            format!(
+                                "{} / {}",
+                                item.descriptor.category.title(),
+                                item.descriptor.section
+                            )
                         } else {
-                            item.section.to_string()
+                            item.descriptor.section.to_string()
                         }),
                 );
                 previous_section = Some(section);
             }
             let last_in_section = items
                 .peek()
-                .is_none_or(|next| (next.category, next.section) != section);
+                .is_none_or(|next| (next.descriptor.category, next.descriptor.section) != section);
             content = content.child(item.render(last_in_section, cx));
         }
         content
@@ -645,7 +556,7 @@ impl PlaybackSettingsDialogState {
                     ("color-theme-dropdown", "颜色主题"),
                     self.dropdown.clone(),
                     ColorTheme::ALL.map(|selection| (selection.id(), selection.name(), selection)),
-                    self.color_theme,
+                    self.controller.view_model().color_theme,
                     {
                         let dialog = dialog.clone();
                         move |selection, cx| {
@@ -663,7 +574,7 @@ impl PlaybackSettingsDialogState {
                 track_language_selector(
                     ("audio-language-dropdown", "音轨语言"),
                     self.dropdown.clone(),
-                    self.track_languages.audio,
+                    self.controller.view_model().track_languages.audio,
                     {
                         let dialog = dialog.clone();
                         move |language, cx| {
@@ -683,7 +594,7 @@ impl PlaybackSettingsDialogState {
                 track_language_selector(
                     ("subtitle-language-dropdown", "字幕语言"),
                     self.dropdown.clone(),
-                    self.track_languages.subtitle,
+                    self.controller.view_model().track_languages.subtitle,
                     {
                         let dialog = dialog.clone();
                         move |language, cx| {
@@ -702,7 +613,7 @@ impl PlaybackSettingsDialogState {
                 "hardware_decode hwdec vulkan 硬解 软解",
                 hardware_decode_selector(
                     self.dropdown.clone(),
-                    self.base_config.hardware_decode,
+                    self.controller.view_model().config.hardware_decode,
                     {
                         let dialog = dialog.clone();
                         move |mode, cx| {
@@ -720,7 +631,7 @@ impl PlaybackSettingsDialogState {
                 toggle(
                     ToggleSetting::DecoderFramedrop,
                     "解码器追赶丢帧",
-                    self.decoder_framedrop,
+                    self.controller.view_model().config.decoder_framedrop,
                 ),
             ),
             SettingItem::new(
@@ -729,7 +640,11 @@ impl PlaybackSettingsDialogState {
                 "普通缓存",
                 "自动模式根据媒体来源决定是否启用缓存。",
                 "mode auto",
-                mode_selector(dialog.clone(), self.mode, self.dropdown.clone()),
+                mode_selector(
+                    dialog.clone(),
+                    self.controller.view_model().config.mode,
+                    self.dropdown.clone(),
+                ),
             ),
             SettingItem::new(
                 General,
@@ -737,7 +652,11 @@ impl PlaybackSettingsDialogState {
                 "回看缓存",
                 "保留已读取的数据，以便向后跳转和重复播放。",
                 "seekable_cache seek",
-                seekable_selector(dialog.clone(), self.seekable_cache, self.dropdown.clone()),
+                seekable_selector(
+                    dialog.clone(),
+                    self.controller.view_model().config.seekable_cache,
+                    self.dropdown.clone(),
+                ),
             ),
             SettingItem::new(
                 General,
@@ -748,7 +667,7 @@ impl PlaybackSettingsDialogState {
                 toggle(
                     ToggleSetting::CachePause,
                     "缓冲不足时暂停",
-                    self.cache_pause,
+                    self.controller.view_model().config.cache_pause,
                 ),
             ),
             SettingItem::new(
@@ -760,7 +679,7 @@ impl PlaybackSettingsDialogState {
                 toggle(
                     ToggleSetting::CachePauseInitial,
                     "启动时等待缓存",
-                    self.cache_pause_initial,
+                    self.controller.view_model().config.cache_pause_initial,
                 ),
             ),
             SettingItem::new(
@@ -774,7 +693,7 @@ impl PlaybackSettingsDialogState {
                     self.cache_pause_wait_secs.clone(),
                     "秒",
                     NumberRange::seconds(),
-                    self.base_config.cache_pause_wait,
+                    self.controller.view_model().config.cache_pause_wait,
                 ),
             ),
             SettingItem::new(
@@ -786,7 +705,7 @@ impl PlaybackSettingsDialogState {
                 toggle(
                     ToggleSetting::DemuxerCacheWait,
                     "等待预读完成",
-                    self.demuxer_cache_wait,
+                    self.controller.view_model().config.demuxer_cache_wait,
                 ),
             ),
             SettingItem::new(
@@ -800,7 +719,7 @@ impl PlaybackSettingsDialogState {
                     self.total_cache_mib.clone(),
                     "MiB",
                     NumberRange::integer(0, 999_999_999_999),
-                    bytes_to_mib(self.base_config.total_cache_max_bytes) as f64,
+                    bytes_to_mib(self.controller.view_model().config.total_cache_max_bytes) as f64,
                 ),
             ),
             SettingItem::new(
@@ -814,7 +733,7 @@ impl PlaybackSettingsDialogState {
                     self.http_cache_mib.clone(),
                     "MiB",
                     NumberRange::integer(0, 999_999_999_999),
-                    bytes_to_mib(self.base_config.http_cache_max_bytes) as f64,
+                    bytes_to_mib(self.controller.view_model().config.http_cache_max_bytes) as f64,
                 ),
             ),
             SettingItem::new(
@@ -828,7 +747,7 @@ impl PlaybackSettingsDialogState {
                     self.http_cache_chunk_mib.clone(),
                     "MiB",
                     NumberRange::integer(0, 16),
-                    bytes_to_mib(self.base_config.http_cache_chunk_bytes) as f64,
+                    bytes_to_mib(self.controller.view_model().config.http_cache_chunk_bytes) as f64,
                 ),
             ),
             SettingItem::new(
@@ -842,7 +761,12 @@ impl PlaybackSettingsDialogState {
                     self.range_request_mib.clone(),
                     "MiB",
                     NumberRange::integer(0, 128),
-                    bytes_to_mib(self.base_config.http_cache_range_request_bytes) as f64,
+                    bytes_to_mib(
+                        self.controller
+                            .view_model()
+                            .config
+                            .http_cache_range_request_bytes,
+                    ) as f64,
                 ),
             ),
             SettingItem::new(
@@ -856,7 +780,7 @@ impl PlaybackSettingsDialogState {
                     self.demuxer_forward_mib.clone(),
                     "MiB",
                     NumberRange::integer(0, 999_999_999_999),
-                    bytes_to_mib(self.base_config.demuxer_max_bytes) as f64,
+                    bytes_to_mib(self.controller.view_model().config.demuxer_max_bytes) as f64,
                 ),
             ),
             SettingItem::new(
@@ -870,7 +794,7 @@ impl PlaybackSettingsDialogState {
                     self.demuxer_back_mib.clone(),
                     "MiB",
                     NumberRange::integer(0, 999_999_999_999),
-                    bytes_to_mib(self.base_config.demuxer_max_back_bytes) as f64,
+                    bytes_to_mib(self.controller.view_model().config.demuxer_max_back_bytes) as f64,
                 ),
             ),
             SettingItem::new(
@@ -884,7 +808,7 @@ impl PlaybackSettingsDialogState {
                     self.max_ranges.clone(),
                     "个",
                     NumberRange::integer(1, 64),
-                    self.base_config.demuxer_max_ranges as f64,
+                    self.controller.view_model().config.demuxer_max_ranges as f64,
                 ),
             ),
             SettingItem::new(
@@ -896,7 +820,7 @@ impl PlaybackSettingsDialogState {
                 toggle(
                     ToggleSetting::DonateBuffer,
                     "共享空闲前向预算",
-                    self.demuxer_donate_buffer,
+                    self.controller.view_model().config.demuxer_donate_buffer,
                 ),
             ),
             SettingItem::new(
@@ -905,7 +829,11 @@ impl PlaybackSettingsDialogState {
                 "启用磁盘缓存",
                 "将较远的数据存入磁盘，扩大预读和回看范围。",
                 "disk_cache",
-                toggle(ToggleSetting::DiskCache, "启用磁盘缓存", self.disk_cache),
+                toggle(
+                    ToggleSetting::DiskCache,
+                    "启用磁盘缓存",
+                    self.controller.view_model().config.disk_cache,
+                ),
             ),
             SettingItem::new(
                 Disk,
@@ -915,7 +843,7 @@ impl PlaybackSettingsDialogState {
                 "disk_cache_max_bytes",
                 disk_cache_capacity_control(
                     self.disk_cache_gib.clone(),
-                    self.base_config.disk_cache_max_bytes,
+                    self.controller.view_model().config.disk_cache_max_bytes,
                 ),
             ),
             cache_dir,
@@ -925,7 +853,11 @@ impl PlaybackSettingsDialogState {
                 "缓存文件清理",
                 "选择何时移除磁盘上的缓存文件。",
                 "unlink_files",
-                unlink_selector(dialog.clone(), self.unlink_files, self.dropdown.clone()),
+                unlink_selector(
+                    dialog.clone(),
+                    self.controller.view_model().config.unlink_files,
+                    self.dropdown.clone(),
+                ),
             ),
             SettingItem::new(
                 Readahead,
@@ -938,7 +870,7 @@ impl PlaybackSettingsDialogState {
                     self.cache_secs.clone(),
                     "秒",
                     NumberRange::seconds(),
-                    self.base_config.cache_secs,
+                    self.controller.view_model().config.cache_secs,
                 ),
             ),
             SettingItem::new(
@@ -952,7 +884,7 @@ impl PlaybackSettingsDialogState {
                     self.readahead_secs.clone(),
                     "秒",
                     NumberRange::seconds(),
-                    self.base_config.demuxer_readahead_secs,
+                    self.controller.view_model().config.demuxer_readahead_secs,
                 ),
             ),
             SettingItem::new(
@@ -966,7 +898,10 @@ impl PlaybackSettingsDialogState {
                     self.packet_readahead_secs.clone(),
                     "秒",
                     NumberRange::seconds(),
-                    self.base_config.demuxer_packet_max_readahead_secs,
+                    self.controller
+                        .view_model()
+                        .config
+                        .demuxer_packet_max_readahead_secs,
                 ),
             ),
             SettingItem::new(
@@ -978,7 +913,7 @@ impl PlaybackSettingsDialogState {
                 toggle(
                     ToggleSetting::AdaptiveReadahead,
                     "自适应预读",
-                    self.adaptive_readahead,
+                    self.controller.view_model().config.adaptive_readahead,
                 ),
             ),
             SettingItem::new(
@@ -990,7 +925,7 @@ impl PlaybackSettingsDialogState {
                 toggle(
                     ToggleSetting::AutomaticHysteresis,
                     "自动补充阈值",
-                    self.automatic_hysteresis,
+                    self.controller.view_model().config.automatic_hysteresis,
                 ),
             ),
             SettingItem::new(
@@ -1004,59 +939,30 @@ impl PlaybackSettingsDialogState {
                     self.hysteresis_secs.clone(),
                     "秒",
                     NumberRange::seconds(),
-                    self.base_config.demuxer_hysteresis_secs,
+                    self.controller.view_model().config.demuxer_hysteresis_secs,
                 ),
             ),
         ]
     }
 
     fn select_mode(&mut self, mode: PlaybackCacheMode, cx: &mut Context<Self>) {
-        if self.mode == mode {
-            return;
-        }
-        self.mode = mode;
-        self.changed(cx);
+        self.dispatch(SettingsIntent::Mode(mode), cx);
     }
-
     fn select_seekable_cache(&mut self, mode: PlaybackSeekableCacheMode, cx: &mut Context<Self>) {
-        if self.seekable_cache == mode {
-            return;
-        }
-        self.seekable_cache = mode;
-        self.changed(cx);
+        self.dispatch(SettingsIntent::SeekableCache(mode), cx);
     }
-
     fn select_unlink_files(&mut self, policy: CacheUnlinkPolicy, cx: &mut Context<Self>) {
-        if self.unlink_files == policy {
-            return;
-        }
-        self.unlink_files = policy;
-        self.changed(cx);
+        self.dispatch(SettingsIntent::UnlinkFiles(policy), cx);
     }
-
     fn toggle(&mut self, setting: ToggleSetting, cx: &mut Context<Self>) {
-        match setting {
-            ToggleSetting::DecoderFramedrop => self.decoder_framedrop = !self.decoder_framedrop,
-            ToggleSetting::DiskCache => self.disk_cache = !self.disk_cache,
-            ToggleSetting::CachePause => self.cache_pause = !self.cache_pause,
-            ToggleSetting::CachePauseInitial => {
-                self.cache_pause_initial = !self.cache_pause_initial
-            }
-            ToggleSetting::DonateBuffer => self.demuxer_donate_buffer = !self.demuxer_donate_buffer,
-            ToggleSetting::AdaptiveReadahead => self.adaptive_readahead = !self.adaptive_readahead,
-            ToggleSetting::AutomaticHysteresis => {
-                self.automatic_hysteresis = !self.automatic_hysteresis
-            }
-            ToggleSetting::DemuxerCacheWait => self.demuxer_cache_wait = !self.demuxer_cache_wait,
-        }
-        self.changed(cx);
+        self.dispatch(SettingsIntent::Toggle(setting), cx);
     }
 }
 
 fn number_input(
     placeholder: &'static str,
     value: u64,
-    update_config: fn(&mut PlaybackCacheConfig, u64),
+    field: NumericSetting,
     cx: &mut Context<PlaybackSettingsDialogState>,
 ) -> Entity<Editor> {
     let input = cx.new(|cx| {
@@ -1071,23 +977,13 @@ fn number_input(
     });
     cx.subscribe(&input, move |this, input, event, cx| {
         if matches!(event, EditorEvent::Changed) {
-            let Ok(value) = input.read(cx).value().trim().parse::<u64>() else {
-                return;
-            };
-            let mut config = this.base_config.clone();
-            update_config(&mut config, value);
-            let config = config.normalized();
-            // Normalize dependent settings, but reject an input that would
-            // itself be silently replaced by a different value on save.
-            let mut requested = config.clone();
-            update_config(&mut requested, value);
-            if requested != config {
-                return;
-            }
-            if config != this.base_config {
-                this.base_config = config;
-                this.changed(cx);
-            }
+            this.dispatch(
+                SettingsIntent::EditNumber {
+                    field,
+                    input: input.read(cx).value().to_string(),
+                },
+                cx,
+            );
         }
     })
     .detach();
@@ -1097,7 +993,7 @@ fn number_input(
 fn decimal_input(
     placeholder: &'static str,
     value: f64,
-    update_config: fn(&mut PlaybackCacheConfig, f64),
+    field: NumericSetting,
     cx: &mut Context<PlaybackSettingsDialogState>,
 ) -> Entity<Editor> {
     let input = cx.new(|cx| {
@@ -1111,73 +1007,17 @@ fn decimal_input(
     });
     cx.subscribe(&input, move |this, input, event, cx| {
         if matches!(event, EditorEvent::Changed) {
-            let Some(value) = parse_seconds(input.read(cx).value().as_ref()) else {
-                return;
-            };
-            let mut config = this.base_config.clone();
-            update_config(&mut config, value);
-            let config = config.normalized();
-            if config != this.base_config {
-                this.base_config = config;
-                this.changed(cx);
-            }
+            this.dispatch(
+                SettingsIntent::EditNumber {
+                    field,
+                    input: input.read(cx).value().to_string(),
+                },
+                cx,
+            );
         }
     })
     .detach();
     input
-}
-
-fn bytes_to_mib(bytes: u64) -> u64 {
-    bytes / BYTES_PER_MIB
-}
-
-fn parse_seconds(value: &str) -> Option<f64> {
-    value
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|value| value.is_finite() && *value >= 0.0)
-}
-
-fn format_seconds(value: f64) -> String {
-    let value = if value.is_finite() && value >= 0.0 {
-        value
-    } else {
-        0.0
-    };
-    let mut formatted = format!("{value:.3}");
-    while formatted.ends_with('0') {
-        formatted.pop();
-    }
-    if formatted.ends_with('.') {
-        formatted.pop();
-    }
-    if formatted.is_empty() {
-        "0".to_string()
-    } else {
-        formatted
-    }
-}
-
-fn resolved_cache_directories(
-    configured_dir: Option<&Path>,
-    environment_dirs: [Option<PathBuf>; 2],
-) -> [PathBuf; 2] {
-    // Match the HTTP and demux disk caches: configuration, per-cache override,
-    // then the application's temporary directory. Only resolve for display.
-    environment_dirs.map(|directory| {
-        configured_dir
-            .map(Path::to_path_buf)
-            .or(directory)
-            .unwrap_or_else(default_playback_cache_dir)
-    })
-}
-
-fn matches_search(query: &str, fields: &[&str]) -> bool {
-    let haystack = fields.join(" ").to_lowercase();
-    query
-        .split_whitespace()
-        .all(|word| haystack.contains(&word.to_lowercase()))
 }
 
 fn mode_selector(

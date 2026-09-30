@@ -1,39 +1,34 @@
-use anyhow::{Result, anyhow};
-
-use crate::emby::playback::resolve_direct_stream_url;
-use crate::ui::radius;
-
-use super::request::{
-    playback_audio_tracks_for_source, playback_subtitle_tracks_for_source,
-    preferred_playback_media_source, preferred_playback_track_selection,
-};
-use super::state::effective_playback_paused;
+//! GPUI adapter for queue intents, backend commands, and page replacement.
 use super::*;
+use crate::{
+    effects::EffectHandle,
+    player::{
+        adapter::EmbyPlaybackGateway,
+        gateway::PlaybackGateway,
+        queue::{
+            QueueAction, QueueSwitchCommand, QueueSwitchUpdate, ResolvedQueuePlayback, effect,
+        },
+    },
+    ui::radius,
+};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PlaybackQueueAction {
-    Previous,
-    Next,
-    Select(usize),
+// Page-owned immutable account gateway and cancellable continuation. Back,
+// backend failure, accepted completion and release cancel the handle. Blocking
+// IO may finish, but only the current token can update the inline queue error.
+pub(super) struct QueueEffects {
+    gateway: Arc<dyn PlaybackGateway>,
+    task: EffectHandle<gpui::Task<()>>,
 }
-
-impl PlaybackQueueAction {
-    fn failure_prefix(self) -> &'static str {
-        match self {
-            Self::Previous => "切换上一集失败",
-            Self::Next => "切换下一集失败",
-            Self::Select(_) => "切换剧集失败",
+impl QueueEffects {
+    pub(super) fn new(context: &EmbyPlaybackContext) -> Self {
+        Self {
+            gateway: Arc::new(EmbyPlaybackGateway {
+                client: context.client.clone(),
+                server: context.server.clone(),
+            }),
+            task: EffectHandle::default(),
         }
     }
-}
-
-#[derive(Default)]
-pub(super) struct PlaybackQueueSwitchState {
-    generation: u64,
-    pub(super) loading: bool,
-    resume_on_failure: bool,
-    publish_terminal_update_on_failure: bool,
-    error: Option<SharedString>,
 }
 
 impl PlaybackPage {
@@ -43,17 +38,8 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.begin_queue_switch(PlaybackQueueAction::Select(index), false, window, cx);
+        self.begin_queue_switch(QueueAction::Select(index), false, window, cx);
     }
-
-    pub(super) fn can_switch_to_previous_episode(&self) -> bool {
-        !self.queue_switch.loading && self.queue.previous_index().is_some()
-    }
-
-    pub(super) fn can_switch_to_next_episode(&self) -> bool {
-        !self.queue_switch.loading && self.queue.next_index().is_some()
-    }
-
     pub(super) fn switch_to_previous_episode(
         &mut self,
         _: &MouseDownEvent,
@@ -61,9 +47,8 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        self.begin_queue_switch(PlaybackQueueAction::Previous, false, window, cx);
+        self.begin_queue_switch(QueueAction::Previous, false, window, cx);
     }
-
     pub(super) fn switch_to_next_episode(
         &mut self,
         _: &MouseDownEvent,
@@ -71,165 +56,118 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        self.begin_queue_switch(PlaybackQueueAction::Next, false, window, cx);
+        self.begin_queue_switch(QueueAction::Next, false, window, cx);
     }
-
     pub(super) fn switch_to_next_episode_after_end(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.begin_queue_switch(PlaybackQueueAction::Next, true, window, cx);
+        self.begin_queue_switch(QueueAction::Next, true, window, cx);
     }
-
     pub(super) fn cancel_queue_switch(&mut self) {
-        self.queue_switch.generation = self.queue_switch.generation.wrapping_add(1);
-        self.queue_switch.loading = false;
-        self.queue_switch.resume_on_failure = false;
-        self.queue_switch.publish_terminal_update_on_failure = false;
-        self.queue_switch.error = None;
+        self.session.queue.cancel();
+        self.queue_effects.task.cancel();
     }
-
     fn begin_queue_switch(
         &mut self,
-        action: PlaybackQueueAction,
+        action: QueueAction,
         automatic: bool,
-        _window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.queue_switch.loading {
-            return;
-        }
-        let target_index = match action {
-            PlaybackQueueAction::Previous => self.queue.previous_index(),
-            PlaybackQueueAction::Next => self.queue.next_index(),
-            PlaybackQueueAction::Select(index) => {
-                (index != self.queue.current_index).then_some(index)
-            }
-        };
-        let Some(target_index) = target_index else {
+        let Some(command) = self.session.queue.begin(
+            action,
+            automatic,
+            self.session.timeline().user_paused,
+            self.session.timeline().ended,
+        ) else {
             return;
         };
-        let Some(target) = self.queue.items.get(target_index).cloned() else {
-            return;
-        };
-
         self.close_track_select(cx);
         self.close_episode_list(cx);
-        self.queue_switch.generation = self.queue_switch.generation.wrapping_add(1);
-        let generation = self.queue_switch.generation;
-        self.queue_switch.loading = true;
-        self.queue_switch.resume_on_failure =
-            !automatic && !self.timeline.user_paused && !self.timeline.ended;
-        self.queue_switch.publish_terminal_update_on_failure = automatic;
-        self.queue_switch.error = None;
-
-        if self.queue_switch.resume_on_failure {
-            let pause_result = self
-                .video
-                .owner_mut()
-                .map(|backend| backend.command(BackendCommand::Pause));
-            if let Some(Err(error)) = pause_result {
-                self.queue_switch.loading = false;
-                self.queue_switch.resume_on_failure = false;
-                self.queue_switch.publish_terminal_update_on_failure = false;
-                self.queue_switch.error =
-                    Some(format!("{}：{error}", action.failure_prefix()).into());
-                cx.notify();
-                return;
-            }
-            self.timeline.user_paused = true;
-            self.timeline.paused = true;
-            self.timeline.buffering = false;
-        }
-        self.report_playback_progress(true);
-        cx.notify();
-
-        let client = self.emby.client.clone();
-        let server = self.emby.server.clone();
-        let mut queue = self.queue.clone();
-        queue.current_index = target_index;
-        let languages = crate::player::PlaybackLanguagePreferences::get(cx);
-        let saved_tracks = preferred_playback_media_source(&target.media_sources)
-            .and_then(|source| {
-                Some(crate::player::PlaybackTrackPreferenceKey {
-                    item_id: source.playback_item_id(&target.item_id).to_string(),
-                    media_source_id: source.id.clone()?,
-                })
-            })
-            .map(|key| crate::player::PlaybackTrackPreferences::get(&server, &key, cx))
-            .unwrap_or_default();
-        let task = cx.background_spawn(async move {
-            resolve_queue_playback_request(client, server, queue, target, languages, saved_tracks)
-        });
-        cx.spawn(async move |page, cx| {
-            let result = task.await;
-            page.update(cx, |page, cx| {
-                page.finish_queue_switch(generation, action, result, cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn finish_queue_switch(
-        &mut self,
-        generation: u64,
-        action: PlaybackQueueAction,
-        result: Result<PlaybackRequest>,
-        cx: &mut Context<Self>,
-    ) {
-        if self.queue_switch.generation != generation || !self.queue_switch.loading {
+        if !self.session.pause_for_queue(
+            &command,
+            &self.emby.server.workspace_identity(),
+            |command| self.video.command(command),
+        ) {
+            cx.notify();
             return;
         }
-
-        self.queue_switch.loading = false;
-        match result {
-            Ok(mut request) => {
-                self.queue_switch.resume_on_failure = false;
-                self.queue_switch.publish_terminal_update_on_failure = false;
-                let mut update = self.close_playback_reporting(false, self.timeline.ended);
-                if let Some(item) = request.queue.items.get_mut(self.queue.current_index) {
-                    item.playback_position_ticks = Some(if update.ended {
-                        0
-                    } else {
-                        update.position_ticks
-                    });
-                }
-                update.selected_item_id = request.queue.current().map(|item| item.item_id.clone());
+        self.report_playback_progress(true);
+        let languages = crate::player::PlaybackLanguagePreferences::get(cx);
+        let saved_tracks = effect::preference_key(&command.queue)
+            .map(|key| crate::player::PlaybackTrackPreferences::get(&self.emby.server, &key, cx))
+            .unwrap_or_default();
+        let gateway = self.queue_effects.gateway.clone();
+        let work = cx.background_spawn(async move {
+            let result = effect::resolve(gateway.as_ref(), &command.queue, languages, saved_tracks);
+            (command, result)
+        });
+        self.queue_effects
+            .task
+            .replace(cx.spawn(async move |page, cx| {
+                let (command, result) = work.await;
+                page.update(cx, |page, cx| page.finish_queue_switch(command, result, cx))
+                    .ok();
+            }));
+        cx.notify();
+    }
+    fn finish_queue_switch(
+        &mut self,
+        command: QueueSwitchCommand,
+        result: anyhow::Result<ResolvedQueuePlayback>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(update) =
+            self.session
+                .queue
+                .complete(command, result, &self.emby.server.workspace_identity())
+        else {
+            return;
+        };
+        self.queue_effects.task.cancel();
+        match update {
+            QueueSwitchUpdate::Replace(mut replacement) => {
+                let mut update =
+                    self.close_playback_reporting(false, self.session.timeline().ended);
+                replacement.apply_close(&mut update);
+                let playback = replacement.playback;
                 cx.emit(PlaybackEvent::Replace {
-                    request: Box::new(request),
+                    request: Box::new(PlaybackRequest {
+                        title: playback.title.into(),
+                        url: playback.source.url,
+                        http_headers: playback.source.http_headers,
+                        content_length: playback.source.content_length,
+                        audio_tracks: playback.audio_tracks,
+                        subtitle_tracks: playback.subtitle_tracks,
+                        selected_tracks: playback.selected_tracks,
+                        track_preference_key: playback.track_preference_key,
+                        remember_subtitle_on_start: false,
+                        initial_position_seconds: playback.initial_position_seconds,
+                        queue: replacement.queue,
+                        emby: EmbyPlaybackContext {
+                            client: self.emby.client.clone(),
+                            server: self.emby.server.clone(),
+                            item_id: playback.source.item_id,
+                            media_source_id: playback.source.media_source_id,
+                            play_session_id: playback.source.play_session_id,
+                            run_time_ticks: playback.run_time_ticks,
+                        },
+                    }),
                     update,
                 });
             }
-            Err(error) => {
-                let resume_on_failure = self.queue_switch.resume_on_failure;
-                let publish_terminal_update = self.queue_switch.publish_terminal_update_on_failure;
-                self.queue_switch.resume_on_failure = false;
-                self.queue_switch.publish_terminal_update_on_failure = false;
-                self.queue_switch.error =
-                    Some(format!("{}：{error}", action.failure_prefix()).into());
-                if resume_on_failure && !self.timeline.ended {
-                    let resume_result = self
-                        .video
-                        .owner_mut()
-                        .map(|backend| backend.command(BackendCommand::Resume));
-                    if let Some(Err(resume_error)) = resume_result {
-                        self.queue_switch.error = Some(
-                            format!(
-                                "{}：{error}；恢复当前播放失败：{resume_error}",
-                                action.failure_prefix()
-                            )
-                            .into(),
-                        );
-                    } else {
-                        self.timeline.user_paused = false;
-                        self.timeline.paused =
-                            effective_playback_paused(false, self.timeline.paused_for_cache);
-                        self.report_playback_progress(true);
-                    }
+            QueueSwitchUpdate::Failed(recovery) => {
+                if self
+                    .session
+                    .resume_after_queue_failure(recovery.resume_current, |command| {
+                        self.video.command(command)
+                    })
+                {
+                    self.report_playback_progress(true);
                 }
-                if publish_terminal_update {
+                if recovery.publish_terminal_update {
                     let update = self.close_playback_reporting(false, true);
                     cx.emit(PlaybackEvent::Update { update });
                 }
@@ -239,7 +177,7 @@ impl PlaybackPage {
     }
 
     pub(super) fn render_queue_switch_error(&self, cx: &Context<Self>) -> impl IntoElement {
-        let Some(error) = self.queue_switch.error.clone() else {
+        let Some(error) = self.session.queue.view_model().error.map(str::to_owned) else {
             return div()
                 .id("playback-queue-switch-error-empty")
                 .into_any_element();
@@ -267,82 +205,10 @@ impl PlaybackPage {
             .into_any_element()
     }
 }
-
-fn resolve_queue_playback_request(
-    client: crate::emby::EmbyClient,
-    server: crate::server::CachedServer,
-    queue: PlaybackQueue,
-    item: PlaybackQueueItem,
-    languages: crate::player::PlaybackLanguagePreferences,
-    saved_tracks: crate::player::SavedTrackChoices,
-) -> Result<PlaybackRequest> {
-    let source = preferred_playback_media_source(&item.media_sources)
-        .ok_or_else(|| anyhow!("目标单集没有可用视频源"))?;
-    let selected_media_source_id = source
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| anyhow!("目标单集视频源缺少 ID"))?
-        .to_string();
-    let requested_item_id = source.playback_item_id(&item.item_id);
-    let playback_info =
-        client.playback_info(&server, requested_item_id, &selected_media_source_id)?;
-    let resolved_source = playback_info.direct_stream_source_for(&selected_media_source_id)?;
-    let playback_item_id = resolved_source
-        .playback_item_id(requested_item_id)
-        .to_string();
-    let direct_stream_url = resolved_source.direct_stream_url()?;
-    let url = resolve_direct_stream_url(&server, direct_stream_url)?;
-    let http_headers = client.playback_http_headers(&server)?;
-    let media_source_id = resolved_source
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .unwrap_or(selected_media_source_id.as_str())
-        .to_string();
-    let audio_tracks = playback_audio_tracks_for_source(source);
-    let subtitle_tracks =
-        playback_subtitle_tracks_for_source(source, &server, &playback_item_id, &media_source_id);
-    let mut selected_tracks =
-        preferred_playback_track_selection(source, &subtitle_tracks, languages);
-    saved_tracks.apply(&audio_tracks, &subtitle_tracks, &mut selected_tracks);
-    let track_preference_key = crate::player::PlaybackTrackPreferenceKey {
-        item_id: requested_item_id.to_string(),
-        media_source_id: selected_media_source_id,
-    };
-    let initial_position_seconds =
-        playback_initial_position_seconds(item.playback_position_ticks, item.run_time_ticks);
-
-    Ok(PlaybackRequest {
-        title: item.title,
-        url: url.to_string(),
-        http_headers,
-        content_length: resolved_source.size,
-        audio_tracks,
-        subtitle_tracks,
-        selected_tracks,
-        track_preference_key,
-        remember_subtitle_on_start: false,
-        initial_position_seconds,
-        queue,
-        emby: EmbyPlaybackContext {
-            client,
-            server,
-            item_id: playback_item_id,
-            media_source_id,
-            play_session_id: playback_info
-                .play_session_id
-                .filter(|id| !id.trim().is_empty()),
-            run_time_ticks: item.run_time_ticks,
-        },
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use crate::emby::{MediaSource, MediaStream};
+    use crate::player::preferred_playback_media_source;
 
     use super::*;
 
@@ -430,3 +296,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "queue_tests.rs"]
+mod interaction_tests;

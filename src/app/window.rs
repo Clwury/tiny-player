@@ -298,7 +298,7 @@ impl TinyApp {
     }
 
     pub(super) fn title(&self, cx: &Context<Self>) -> SharedString {
-        match &self.page {
+        match self.shell.page() {
             Page::Servers => APP_NAME.into(),
             Page::Home(page) => page.read(cx).title(cx),
             Page::Playback { page, .. } => page.read(cx).title(),
@@ -323,7 +323,7 @@ impl TinyApp {
             return;
         }
 
-        self.schedule_cache_save("保存窗口大小失败", cx);
+        self.schedule_config_save(crate::persistence::DirtyKey::Window, "保存窗口大小失败", cx);
     }
 }
 

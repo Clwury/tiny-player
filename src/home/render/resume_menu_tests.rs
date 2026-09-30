@@ -4,7 +4,7 @@ use gpui::{
 };
 
 use crate::{
-    emby::{EmbyClient, UserItemData},
+    emby::EmbyClient,
     home::{UserViewItemsRow, item_context_menu::ItemContextMenuSource},
     server::CachedServer,
     theme,
@@ -51,7 +51,7 @@ fn resume_menu_window(cx: &mut TestAppContext) -> (Entity<HomeContent>, &mut Vis
                     EmbyClient::new("resume-menu-test".into()).unwrap(),
                     cx,
                 );
-                content.resume_items = Some(
+                content.controller.test_state_mut().feed.state.resume_items = Some(
                     serde_json::from_value(serde_json::json!({
                         "Items": [
                             { "Id": "first", "Name": "First movie", "Type": "Movie" },
@@ -64,9 +64,11 @@ fn resume_menu_window(cx: &mut TestAppContext) -> (Entity<HomeContent>, &mut Vis
                 content
             });
             HomePage {
-                current_server: server.clone(),
-                servers: vec![server],
-                selecting_server_id: None,
+                sidebar: crate::home::model::sidebar::SidebarController::new(
+                    server.id.clone(),
+                    server.username.clone(),
+                    vec![crate::server::feature::SidebarServer::from(&server)],
+                ),
                 sidebar_scroll_handle: gpui::ScrollHandle::new(),
                 sidebar_reorder: None,
                 home_content,
@@ -169,10 +171,7 @@ fn resume_menu_dismisses_on_sidebar_content_and_titlebar_clicks(cx: &mut TestApp
     click(cx, search, MouseButton::Left);
     content.read_with(cx, |page, _| {
         assert!(page.item_context_menu.is_none());
-        assert_eq!(
-            page.navigation.current(),
-            &HomeRoute::Root(HomeRoot::Search)
-        );
+        assert_eq!(page.controller.route(), &HomeRoute::Root(HomeRoot::Search));
     });
 }
 
@@ -189,7 +188,12 @@ fn resume_menu_keeps_inside_clicks_and_retargets_another_card(cx: &mut TestAppCo
     open_menu(cx, "resume-item-card-second");
     content.update(cx, |page, cx| {
         assert_eq!(page.item_context_menu.as_ref().unwrap().item_id, "second");
-        page.resume_item_requests.insert("second".into());
+        page.controller
+            .dispatch_resume_action(
+                "second".into(),
+                crate::home::resume_actions::ResumeItemAction::HideFromResume,
+            )
+            .unwrap();
         cx.notify();
     });
     cx.run_until_parked();
@@ -199,7 +203,12 @@ fn resume_menu_keeps_inside_clicks_and_retargets_another_card(cx: &mut TestAppCo
         assert_hovered_option(cx, None);
         content.read_with(cx, |page, _| {
             assert_eq!(page.item_context_menu.as_ref().unwrap().item_id, "second");
-            assert_eq!(page.resume_item_requests.len(), 1);
+            assert!(
+                page.controller
+                    .test_state()
+                    .resume_actions
+                    .is_pending("second")
+            );
         });
     }
 }
@@ -212,14 +221,16 @@ fn resume_menu_favorite_label_uses_current_state_and_disables_pending_actions(
     open_menu(cx, "resume-item-card-first");
     assert!(cx.debug_bounds("resume-item-favorite-收藏").is_some());
     content.update(cx, |page, cx| {
-        page.user_data_overrides.insert(
-            "first".into(),
-            UserItemData {
-                is_favorite: true,
-                ..UserItemData::default()
-            },
-        );
-        page.favorite_requests.insert("first".into());
+        page.controller
+            .dispatch_favorite(crate::home::controller::FavoriteIntent {
+                item_id: "first".into(),
+                fallback: None,
+                notification: crate::home::model::notification::ActionNotification {
+                    scope: crate::home::notification::NotificationScope::Home,
+                    key: "home:favorite:first".into(),
+                },
+            })
+            .unwrap();
         cx.notify();
     });
     cx.run_until_parked();
@@ -229,8 +240,13 @@ fn resume_menu_favorite_label_uses_current_state_and_disables_pending_actions(
         click(cx, option.center(), MouseButton::Left);
         content.read_with(cx, |page, _| {
             assert!(page.item_context_menu.is_some());
-            assert!(page.resume_item_requests.is_empty());
-            assert_eq!(page.favorite_requests.len(), 1);
+            assert!(!page.controller.test_state().resume_actions.has_pending());
+            assert!(
+                page.controller
+                    .test_state()
+                    .favorite_actions
+                    .is_pending("first")
+            );
         });
     }
 }
@@ -241,10 +257,10 @@ fn user_view_covers_open_retarget_and_dismiss_their_menu_without_navigating(
 ) {
     let (content, cx) = resume_menu_window(cx);
     content.update(cx, |page, cx| {
-        page.user_views = Some(serde_json::from_value(serde_json::json!({
+        page.controller.test_state_mut().feed.state.user_views = Some(serde_json::from_value(serde_json::json!({
             "Items": [{"Id": "videos", "Name": "Videos", "CollectionType": "movies"}], "TotalRecordCount": 1
         })).unwrap());
-        page.user_view_items_rows.insert("videos".into(), UserViewItemsRow {
+        page.controller.test_state_mut().feed.state.user_view_items_rows.insert("videos".into(), UserViewItemsRow {
             items: Some(serde_json::from_value(serde_json::json!({"Items": [
                 {"Id": "first", "Name": "Movie", "Type": "Movie"},
                 {"Id": "series", "Name": "Series", "Type": "Series", "UserData": {"IsFavorite": true}},
@@ -283,8 +299,8 @@ fn user_view_covers_open_retarget_and_dismiss_their_menu_without_navigating(
             let menu = page.item_context_menu.as_ref().unwrap();
             assert_eq!(menu.item_id, id);
             assert_eq!(menu.source, ItemContextMenuSource::UserItem);
-            assert_eq!(page.navigation.current(), &HomeRoute::Root(HomeRoot::Home));
-            assert!(page.series_detail.is_none());
+            assert_eq!(page.controller.route(), &HomeRoute::Root(HomeRoot::Home));
+            assert!(page.controller.test_state().navigation.detail().is_none());
         });
     }
     open_menu(cx, "resume-item-card-first");

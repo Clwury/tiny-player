@@ -3,19 +3,15 @@ use gpui::{
 };
 
 use crate::{
-    server::CachedServer,
+    server::feature::SidebarServer,
     theme,
     ui::{radius, server_icon::server_icon},
 };
 
-use super::{HomeEvent, HomePage, server_title};
-
 #[derive(Clone, Debug)]
 pub(crate) struct SidebarReorder {
-    pub(super) server_id: String,
-    target_index: usize,
-    pub(super) focus: FocusHandle,
-    previous_focus: Option<FocusHandle>,
+    pub(in crate::home) focus: FocusHandle,
+    pub(super) previous_focus: Option<FocusHandle>,
 }
 
 #[derive(Clone)]
@@ -27,11 +23,11 @@ pub(super) struct DraggedSidebarServer {
 }
 
 impl DraggedSidebarServer {
-    pub(super) fn new(server: &CachedServer, owner: EntityId) -> Self {
+    pub(super) fn new(server: &SidebarServer, owner: EntityId) -> Self {
         Self {
             owner,
             server_id: server.id.clone(),
-            title: server_title(server),
+            title: server.title.clone(),
             icon_url: server.icon_url.clone(),
         }
     }
@@ -61,84 +57,5 @@ impl Render for DraggedSidebarServer {
                     .truncate()
                     .child(self.title.clone()),
             )
-    }
-}
-
-impl HomePage {
-    pub(super) fn begin_sidebar_reorder(
-        &mut self,
-        server_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(target_index) = self
-            .servers
-            .iter()
-            .position(|server| server.id == server_id)
-        else {
-            return;
-        };
-        let focus = cx.focus_handle();
-        let previous_focus = window.focused(cx);
-        focus.focus(window, cx);
-        self.sidebar_reorder = Some(SidebarReorder {
-            server_id: server_id.into(),
-            target_index,
-            focus,
-            previous_focus,
-        });
-        cx.notify();
-    }
-
-    pub(super) fn preview_sidebar_reorder(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(reorder) = &mut self.sidebar_reorder
-            && index < self.servers.len()
-            && reorder.target_index != index
-        {
-            reorder.target_index = index;
-            cx.notify();
-        }
-    }
-
-    pub(super) fn preview_sidebar_servers(&self) -> Vec<CachedServer> {
-        let mut servers = self.servers.clone();
-        if let Some(reorder) = &self.sidebar_reorder
-            && let Some(source) = servers
-                .iter()
-                .position(|server| server.id == reorder.server_id)
-        {
-            let target = reorder.target_index.min(servers.len() - 1);
-            let server = servers.remove(source);
-            servers.insert(target, server);
-        }
-        servers
-    }
-
-    pub(in crate::home) fn finish_sidebar_reorder(
-        &mut self,
-        commit: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(reorder) = self.sidebar_reorder.take() else {
-            return;
-        };
-        if commit
-            && let Some(target) = self.servers.get(reorder.target_index)
-            && target.id != reorder.server_id
-        {
-            cx.emit(HomeEvent::ReorderServer {
-                server_id: reorder.server_id,
-                target_id: target.id.clone(),
-            });
-        }
-        if reorder.focus.is_focused(window) {
-            if let Some(focus) = reorder.previous_focus {
-                focus.focus(window, cx);
-            } else {
-                window.blur(cx);
-            }
-        }
-        cx.notify();
     }
 }

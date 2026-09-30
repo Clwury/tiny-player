@@ -3,7 +3,8 @@ use gpui::{
     TestAppContext, VisualTestContext, Window, div, px, size,
 };
 
-use super::{BYTES_PER_MIB, PlaybackSettingsDialogState, SettingsChanged, matches_search};
+use super::{BYTES_PER_MIB, PlaybackSettingsDialogState, SettingsChanged};
+use crate::settings::values::matches_search;
 use crate::{
     player::{CacheUnlinkPolicy, HardwareDecodeMode, PlaybackCacheConfig, PlaybackCacheMode},
     theme::{self, ColorTheme},
@@ -361,7 +362,9 @@ fn search_and_category_changes_preserve_automatically_saved_edits(cx: &mut TestA
     assert!(cx.debug_bounds("启用磁盘缓存").is_some());
     assert!(cx.debug_bounds("总缓存上限").is_none());
     click(cx, "settings-toggle-启用磁盘缓存");
-    assert!(dialog.read_with(cx, |dialog, _| dialog.disk_cache));
+    assert!(dialog.read_with(cx, |dialog, _| {
+        dialog.controller.view_model().config.disk_cache
+    }));
 
     cx.update(|window, cx| search.read(cx).focus_handle(cx).focus(window, cx));
     cx.simulate_keystrokes("ctrl-a");
@@ -495,7 +498,7 @@ fn dropdown_selects_by_mouse_and_keyboard_and_dismisses_without_changing_value(
     assert_eq!(menu.top(), trigger.bottom() + px(4.0));
     click(cx, "cache-mode-enabled");
     assert_eq!(
-        dialog.read_with(cx, |dialog, _| dialog.mode),
+        dialog.read_with(cx, |dialog, _| dialog.controller.view_model().config.mode),
         PlaybackCacheMode::Enabled
     );
     assert!(cx.debug_bounds("cache-mode-dropdown-menu").is_none());
@@ -511,7 +514,7 @@ fn dropdown_selects_by_mouse_and_keyboard_and_dismisses_without_changing_value(
     click(cx, "cache-mode-dropdown");
     cx.simulate_keystrokes("down enter");
     assert_eq!(
-        dialog.read_with(cx, |dialog, _| dialog.mode),
+        dialog.read_with(cx, |dialog, _| dialog.controller.view_model().config.mode),
         PlaybackCacheMode::Disabled
     );
     assert!(cx.debug_bounds("cache-mode-dropdown-menu").is_none());
@@ -521,7 +524,7 @@ fn dropdown_selects_by_mouse_and_keyboard_and_dismisses_without_changing_value(
     settle_menu_frames(cx);
     cx.simulate_keystrokes("home escape");
     assert_eq!(
-        dialog.read_with(cx, |dialog, _| dialog.mode),
+        dialog.read_with(cx, |dialog, _| dialog.controller.view_model().config.mode),
         PlaybackCacheMode::Disabled
     );
     assert!(cx.debug_bounds("cache-mode-dropdown-menu").is_none());

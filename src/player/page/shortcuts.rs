@@ -52,13 +52,14 @@ impl PlaybackPage {
                 cx.notify();
             }
             PlaybackShortcut::SeekRelative(seconds) => {
-                self.fullscreen.controls_visible = true;
+                self.presentation.fullscreen.controls_visible = true;
                 self.schedule_fullscreen_controls_hide(cx);
                 self.seek_relative(f64::from(seconds), window, cx);
                 cx.notify();
             }
             PlaybackShortcut::ToggleInfoOverlay => {
-                self.playback_details_visible = !self.playback_details_visible;
+                self.presentation.playback_details_visible =
+                    !self.presentation.playback_details_visible;
                 cx.notify();
             }
             PlaybackShortcut::RaiseSubtitle => {

@@ -1,4 +1,6 @@
 use super::*;
+use crate::home::detail::state::detail_binding;
+use crate::home::track_preferences::detail_track_choices;
 use crate::player::{PlaybackLanguagePreferences, track_metadata_label};
 use crate::ui::radius;
 
@@ -39,20 +41,14 @@ fn detail_icon_button(
 impl HomeContent {
     fn render_series_actions_menu(
         &self,
-        detail: &SeriesDetailState,
+        detail: DetailView<'_>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let colors = &theme::get(cx).context_menu;
-        let data = self.effective_user_data(
-            &detail.series_id,
-            detail
-                .item
-                .as_ref()
-                .and_then(|item| item.user_data.as_ref()),
-        );
-        let favorite = data.is_some_and(|data| data.is_favorite);
-        let played = data.is_some_and(|data| data.played);
-        let enabled = !self.detail_user_data_pending();
+        let actions = self.controller.detail_actions(detail.model, true);
+        let favorite = actions.favorite;
+        let played = actions.played;
+        let enabled = actions.enabled;
         let foreground = if enabled {
             colors.foreground
         } else {
@@ -77,13 +73,16 @@ impl HomeContent {
             .shadow_lg()
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .when_some(detail.action_menu_focus.as_ref(), |this, focus| {
-                this.track_focus(focus)
-            })
+            .when_some(
+                detail.presentation.action_menu_focus.as_ref(),
+                |this, focus| this.track_focus(focus),
+            )
             .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
-                    if let Some(detail) = page.series_detail.as_mut() {
-                        detail.open_select = None;
+                    if let Some(detail) =
+                        detail_binding(page.controller.detail_view(), &mut page.detail_resources)
+                    {
+                        detail.presentation.open_select = None;
                     }
                     window.blur(cx);
                     cx.stop_propagation();
@@ -164,48 +163,38 @@ impl HomeContent {
 
     pub(super) fn render_series_detail_controls(
         &self,
-        detail: &SeriesDetailState,
+        detail: DetailView<'_>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = theme::get(cx);
-        let video_label = detail.selected_media_source_label();
-        let subtitle_language = PlaybackLanguagePreferences::get(cx).subtitle;
-        let saved_tracks = detail.selected_track_choices(&self.current_server, cx);
-        let subtitle_label =
-            detail.selected_subtitle_label(subtitle_language, saved_tracks.subtitle.as_ref());
+        let saved_tracks = detail_track_choices(detail.model, &self.current_server, cx);
+        let view = self.controller.detail_controls(
+            detail.model,
+            PlaybackLanguagePreferences::get(cx).subtitle,
+            &saved_tracks,
+        );
         let play = cx.listener(Self::play_selected_media);
         let toggle_video = cx.listener(Self::toggle_series_media_source_select);
         let toggle_subtitle = cx.listener(Self::toggle_series_subtitle_select);
         let toggle_favorite = cx.listener(Self::toggle_detail_favorite);
-        let selected_item = detail.selected_playback_item();
-        let selected_data = selected_item
-            .and_then(|item| self.effective_user_data(&item.id, item.user_data.as_ref()));
-        let favorite = selected_data.is_some_and(|data| data.is_favorite);
-        let played = selected_data.is_some_and(|data| data.played);
-        let actions_enabled = selected_item.is_some() && !self.detail_user_data_pending();
-        let media_sources = detail.selected_media_sources().unwrap_or_default();
+        let favorite = view.actions.favorite;
+        let played = view.actions.played;
+        let actions_enabled = view.actions.enabled;
+        let media_sources = view.media_sources;
         let source_count = media_sources.len();
-        let selected_source_index = detail.selected_media_source_index();
-        let subtitle_streams = detail
-            .selected_media_source()
-            .map(|source| source.subtitle_streams())
-            .unwrap_or_default();
+        let subtitle_streams = view.subtitle_streams;
         let subtitle_count = subtitle_streams.len();
-        let subtitle_select_enabled = subtitle_count > 0 && !detail.video_sources_loading();
-        let selected_subtitle_index =
-            detail.selected_subtitle_index(subtitle_language, saved_tracks.subtitle.as_ref());
-        let media_source_select_open =
-            detail.open_select == Some(SeriesDetailSelectKind::MediaSource) && source_count > 0;
-        let subtitle_select_open =
-            detail.open_select == Some(SeriesDetailSelectKind::Subtitle) && subtitle_select_enabled;
-        let can_play = !detail.playback_loading
-            && !detail.video_sources_loading()
-            && detail.selected_playback_item().is_some()
-            && detail
-                .selected_media_source()
-                .and_then(|source| source.id.as_deref())
-                .is_some_and(|id| !id.trim().is_empty());
-        let play_label = detail_play_button_label(detail.playback_position_seconds());
+        let selected_source_index = view.selected_source_index;
+        let selected_subtitle_index = view.selected_subtitle_index;
+        let subtitle_select_enabled = view.subtitle_select_enabled;
+        let media_source_select_open = detail.presentation.open_select
+            == Some(SeriesDetailSelectKind::MediaSource)
+            && source_count > 0;
+        let subtitle_select_open = detail.presentation.open_select
+            == Some(SeriesDetailSelectKind::Subtitle)
+            && subtitle_select_enabled;
+        let can_play = view.can_play;
+        let play_label = detail_play_button_label(view.playback_position_seconds);
 
         div().flex().flex_col().w_full().gap_2().child(
             div()
@@ -232,7 +221,10 @@ impl HomeContent {
                         .text_base()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.accent_foreground)
-                        .child(detail_play_button_icon(detail.playback_loading, theme))
+                        .child(detail_play_button_icon(
+                            detail.model.playback_loading,
+                            theme,
+                        ))
                         .child(play_label)
                         .when(can_play, |this| {
                             this.cursor_pointer()
@@ -283,7 +275,7 @@ impl HomeContent {
                                 }))
                             }),
                         )
-                        .when(detail.is_series(), |this| {
+                        .when(view.is_series, |this| {
                             this.child(
                                 div()
                                     .relative()
@@ -298,7 +290,8 @@ impl HomeContent {
                                         .on_click(cx.listener(Self::toggle_detail_actions_menu)),
                                     )
                                     .when(
-                                        detail.open_select == Some(SeriesDetailSelectKind::Actions),
+                                        detail.presentation.open_select
+                                            == Some(SeriesDetailSelectKind::Actions),
                                         |this| {
                                             this.child(
                                                 deferred(
@@ -326,8 +319,8 @@ impl HomeContent {
                                 .child(
                                     detail_select_box(
                                         "视频",
-                                        video_label,
-                                        source_count > 0 && !detail.video_sources_loading(),
+                                        view.video_label,
+                                        view.media_source_select_enabled,
                                         cx,
                                     )
                                     .id("series-detail-video-select")
@@ -341,7 +334,7 @@ impl HomeContent {
                                             source_count,
                                             DETAIL_SELECT_WIDTH_PX,
                                             DETAIL_TWO_LINE_OPTION_HEIGHT_PX,
-                                            &detail.media_source_scroll_handle,
+                                            &detail.presentation.media_source_scroll_handle,
                                             cx,
                                             media_sources.iter().enumerate().map(
                                                 |(index, source)| {
@@ -383,7 +376,7 @@ impl HomeContent {
                                 .child(
                                     detail_select_box(
                                         "字幕",
-                                        subtitle_label,
+                                        view.subtitle_label,
                                         subtitle_select_enabled,
                                         cx,
                                     )
@@ -398,7 +391,7 @@ impl HomeContent {
                                             subtitle_count + 1,
                                             DETAIL_SELECT_WIDTH_PX,
                                             DETAIL_TWO_LINE_OPTION_HEIGHT_PX,
-                                            &detail.subtitle_scroll_handle,
+                                            &detail.presentation.subtitle_scroll_handle,
                                             cx,
                                             std::iter::once(
                                                 detail_select_option_with_subtitle(
@@ -458,12 +451,12 @@ impl HomeContent {
 
     pub(super) fn render_series_detail_season_selector(
         &self,
-        detail: &SeriesDetailState,
+        detail: DetailView<'_>,
         seasons: &MediaItems,
         window: &Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let selected_season = detail.selected_season();
+        let selected_season = detail.model.selected_season();
         let selected_id = selected_season.map(|season| season.id.as_str());
         let selected_label = selected_season
             .map(|season| season.name.clone())
@@ -473,8 +466,8 @@ impl HomeContent {
             seasons.items.iter().map(|season| season.name.as_str()),
             window,
         );
-        let menu_open =
-            detail.open_select == Some(SeriesDetailSelectKind::Season) && season_count > 0;
+        let menu_open = detail.presentation.open_select == Some(SeriesDetailSelectKind::Season)
+            && season_count > 0;
         let toggle = cx.listener(Self::toggle_series_season_select);
 
         div()
@@ -493,7 +486,7 @@ impl HomeContent {
                         season_count,
                         select_width,
                         DETAIL_SELECT_OPTION_HEIGHT_PX,
-                        &detail.season_scroll_handle,
+                        &detail.presentation.season_scroll_handle,
                         cx,
                         seasons.items.iter().enumerate().map(|(index, season)| {
                             let season_id = season.id.clone();

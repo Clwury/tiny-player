@@ -1,7 +1,5 @@
 //! User-facing preferences. Advanced cache tuning stays in the development dialog.
 
-mod memory_budget;
-
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
     ParentElement, Render, ScrollHandle, StatefulInteractiveElement, Styled, Window, div, point,
@@ -24,35 +22,13 @@ use super::{
     },
     settings_dialog::SettingsChanged,
 };
-use memory_budget::MemoryBudget;
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum SettingsCategory {
-    #[default]
-    Appearance,
-    Playback,
-    Memory,
-    Disk,
-}
-
-impl SettingsCategory {
-    const ALL: [Self; 4] = [Self::Appearance, Self::Playback, Self::Memory, Self::Disk];
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Appearance => "外观",
-            Self::Playback => "播放",
-            Self::Memory => "内存缓存",
-            Self::Disk => "磁盘缓存",
-        }
-    }
-}
+use crate::settings::{
+    NumericSetting, SettingsCategory, SettingsController, SettingsIntent, SettingsMode,
+    SettingsSnapshot, ToggleSetting, memory_budget::MemoryBudget,
+};
 
 pub(crate) struct UserSettingsDialogState {
-    category: SettingsCategory,
-    config: PlaybackCacheConfig,
-    color_theme: ColorTheme,
-    track_languages: PlaybackLanguagePreferences,
+    controller: SettingsController,
     dropdown: Entity<DropdownState>,
     disk_cache_gib: Entity<Editor>,
     scroll_handle: ScrollHandle,
@@ -63,87 +39,82 @@ impl EventEmitter<SettingsChanged> for UserSettingsDialogState {}
 impl UserSettingsDialogState {
     pub(crate) fn new(config: &PlaybackCacheConfig, cx: &mut Context<Self>) -> Self {
         let config = config.clone().normalized();
+        cx.on_release(|dialog, _| {
+            dialog.controller.dispatch(SettingsIntent::Close);
+        })
+        .detach();
         Self {
-            category: SettingsCategory::default(),
+            controller: SettingsController::new(
+                &config,
+                SettingsMode::User,
+                theme::get(cx).selection,
+                PlaybackLanguagePreferences::get(cx),
+            ),
             disk_cache_gib: disk_cache_capacity_input(
                 config.disk_cache_max_bytes,
-                |this, bytes, cx| {
-                    if this.config.disk_cache_max_bytes != bytes {
-                        this.config.disk_cache_max_bytes = bytes;
-                        this.changed(cx);
-                    }
+                |this, input, cx| {
+                    this.dispatch(
+                        SettingsIntent::EditNumber {
+                            field: NumericSetting::DiskCacheGib,
+                            input,
+                        },
+                        cx,
+                    )
                 },
                 cx,
             ),
-            config,
-            color_theme: theme::get(cx).selection,
-            track_languages: PlaybackLanguagePreferences::get(cx),
             dropdown: cx.new(DropdownState::new),
             scroll_handle: ScrollHandle::new(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn playback_config(&self) -> PlaybackCacheConfig {
-        self.config.clone()
+        self.controller.view_model().config.clone()
     }
-
+    #[cfg(test)]
     pub(crate) fn color_theme(&self) -> ColorTheme {
-        self.color_theme
+        self.controller.view_model().color_theme
     }
-
+    #[cfg(test)]
     pub(crate) fn track_languages(&self) -> PlaybackLanguagePreferences {
-        self.track_languages
+        self.controller.view_model().track_languages
+    }
+    pub(crate) fn snapshot(&self) -> SettingsSnapshot {
+        self.controller.snapshot()
     }
 
-    fn changed(&self, cx: &mut Context<Self>) {
-        cx.emit(SettingsChanged);
-        cx.notify();
-    }
-
-    fn select_theme(&mut self, selection: ColorTheme, cx: &mut Context<Self>) {
-        if self.color_theme != selection {
+    fn dispatch(&mut self, intent: SettingsIntent, cx: &mut Context<Self>) {
+        let change = self.controller.dispatch(intent);
+        if let Some(selection) = change.theme {
             theme::set(selection, cx);
-            self.color_theme = theme::get(cx).selection;
-            self.changed(cx);
+            self.controller
+                .finish_theme_selection(theme::get(cx).selection);
+        }
+        if let Some(languages) = change.languages {
+            languages.apply(cx);
+        }
+        if change.persist {
+            cx.emit(SettingsChanged);
+        }
+        if change.view_changed {
+            cx.notify();
         }
     }
-
+    fn select_theme(&mut self, selection: ColorTheme, cx: &mut Context<Self>) {
+        self.dispatch(SettingsIntent::Theme(selection), cx);
+    }
     fn select_language(&mut self, language: TrackLanguage, audio: bool, cx: &mut Context<Self>) {
-        let current = if audio {
-            &mut self.track_languages.audio
-        } else {
-            &mut self.track_languages.subtitle
-        };
-        if *current != language {
-            *current = language;
-            self.track_languages.apply(cx);
-            self.changed(cx);
-        }
+        self.dispatch(SettingsIntent::Language { language, audio }, cx);
     }
-
     fn select_memory_budget(&mut self, budget: Option<MemoryBudget>, cx: &mut Context<Self>) {
-        if let Some(budget) = budget {
-            self.set_config(budget.apply(&self.config), cx);
-        }
+        self.dispatch(SettingsIntent::MemoryBudget(budget), cx);
     }
-
     fn select_hardware_decode(&mut self, mode: HardwareDecodeMode, cx: &mut Context<Self>) {
-        if self.config.hardware_decode != mode {
-            self.config.hardware_decode = mode;
-            self.changed(cx);
-        }
+        self.dispatch(SettingsIntent::HardwareDecode(mode), cx);
     }
-
     fn toggle_disk_cache(&mut self, cx: &mut Context<Self>) {
-        self.config.disk_cache = !self.config.disk_cache;
-        self.changed(cx);
-    }
-
-    fn set_config(&mut self, config: PlaybackCacheConfig, cx: &mut Context<Self>) {
-        if self.config != config {
-            self.config = config;
-            self.changed(cx);
-        }
+        self.dispatch(SettingsIntent::Toggle(ToggleSetting::DiskCache), cx);
     }
 
     fn language_control(&self, audio: bool, cx: &Context<Self>) -> impl IntoElement {
@@ -156,9 +127,9 @@ impl UserSettingsDialogState {
             },
             self.dropdown.clone(),
             if audio {
-                self.track_languages.audio
+                self.controller.view_model().track_languages.audio
             } else {
-                self.track_languages.subtitle
+                self.controller.view_model().track_languages.subtitle
             },
             move |language, cx| {
                 dialog.update(cx, |dialog, cx| dialog.select_language(language, audio, cx))
@@ -168,7 +139,7 @@ impl UserSettingsDialogState {
 
     fn render_preferences(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = theme::get(cx);
-        let budget = MemoryBudget::current(&self.config);
+        let budget = MemoryBudget::current(self.controller.view_model().config);
         let theme_dialog = cx.entity();
         let budget_dialog = cx.entity();
         let disk_dialog = cx.entity();
@@ -179,9 +150,10 @@ impl UserSettingsDialogState {
                 .mb_3()
                 .text_base()
                 .text_color(theme.foreground)
-                .child(self.category.title()),
+                .child(self.controller.view_model().category.title()),
         );
-        match self.category {
+        match self.controller.view_model().category {
+            SettingsCategory::General | SettingsCategory::Readahead => unreachable!("development category in user settings"),
             SettingsCategory::Appearance => content.child(section("主题", cx).child(setting_row(
                 "user-setting-theme",
                 "颜色主题",
@@ -190,7 +162,7 @@ impl UserSettingsDialogState {
                     ("color-theme-dropdown", "颜色主题"),
                     self.dropdown.clone(),
                     ColorTheme::ALL.map(|selection| (selection.id(), selection.name(), selection)),
-                    self.color_theme,
+                    self.controller.view_model().color_theme,
                     move |selection, cx| {
                         theme_dialog.update(cx, |dialog, cx| dialog.select_theme(selection, cx))
                     },
@@ -219,7 +191,7 @@ impl UserSettingsDialogState {
                 HARDWARE_DECODE_DESCRIPTION,
                 hardware_decode_selector(
                     self.dropdown.clone(),
-                    self.config.hardware_decode,
+                    self.controller.view_model().config.hardware_decode,
                     move |mode, cx| {
                         decode_dialog.update(cx, |dialog, cx| dialog.select_hardware_decode(mode, cx))
                     },
@@ -258,12 +230,12 @@ impl UserSettingsDialogState {
                         "user-setting-disk",
                         "启用磁盘缓存",
                         "将较远的数据存入磁盘，扩大预读和回看范围。",
-                        toggle_switch("启用磁盘缓存", self.config.disk_cache,
+                        toggle_switch("启用磁盘缓存", self.controller.view_model().config.disk_cache,
                             move |cx| disk_dialog.update(cx, |dialog, cx| dialog.toggle_disk_cache(cx)), cx),
                         cx,
                     ))
                     .child(setting_row("user-setting-disk-limit", "磁盘缓存上限", "限制磁盘缓存使用的空间。",
-                        disk_cache_capacity_control(self.disk_cache_gib.clone(), self.config.disk_cache_max_bytes), cx))),
+                        disk_cache_capacity_control(self.disk_cache_gib.clone(), self.controller.view_model().config.disk_cache_max_bytes), cx))),
         }
     }
 
@@ -273,19 +245,22 @@ impl UserSettingsDialogState {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         settings_sidebar(bottom_left_radius, cx).child(div().flex().flex_col().gap_1().children(
-            SettingsCategory::ALL.map(|category| {
+            SettingsCategory::USER.map(|category| {
                 let dialog = cx.entity();
-                settings_category_button(category.title(), self.category == category, cx).on_click(
-                    move |_, window, cx| {
-                        dialog.update(cx, |dialog, cx| {
-                            window.blur(cx);
-                            dialog.category = category;
-                            dialog.dropdown.update(cx, |state, cx| state.close(cx));
-                            dialog.scroll_handle.set_offset(point(px(0.0), px(0.0)));
-                            cx.notify();
-                        })
-                    },
+                settings_category_button(
+                    category.title(),
+                    self.controller.view_model().category == category,
+                    cx,
                 )
+                .on_click(move |_, window, cx| {
+                    dialog.update(cx, |dialog, cx| {
+                        window.blur(cx);
+                        dialog.dispatch(SettingsIntent::Category(category), cx);
+                        dialog.dropdown.update(cx, |state, cx| state.close(cx));
+                        dialog.scroll_handle.set_offset(point(px(0.0), px(0.0)));
+                        cx.notify();
+                    })
+                })
             }),
         ))
     }

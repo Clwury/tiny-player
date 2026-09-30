@@ -512,15 +512,17 @@ fn progress_drag_across_stats_does_not_move_the_playback_window(cx: &mut gpui::T
         cx.run_until_parked();
         cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
         cx.run_until_parked();
-        assert!(view.read_with(cx, |page, _| page.timeline.progress_drag_position.is_some()));
+        assert!(view.read_with(cx, |page, _| {
+            page.session.timeline().progress_drag_position.is_some()
+        }));
         // GPUI's test window does not implement native window moves. Reaching
         // that path while seeking would panic instead of completing this drag.
         cx.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::default());
         cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
         cx.run_until_parked();
         view.read_with(cx, |page, _| {
-            assert!(page.playback_details_visible);
-            assert!(page.timeline.progress_drag_position.is_none());
+            assert!(page.presentation.playback_details_visible);
+            assert!(page.session.timeline().progress_drag_position.is_none());
         });
     }
 }

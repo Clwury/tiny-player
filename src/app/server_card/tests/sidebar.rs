@@ -10,7 +10,7 @@ fn sidebar_window(cx: &mut TestAppContext) -> (Entity<TinyApp>, &mut VisualTestC
 }
 
 fn home_id(app: &Entity<TinyApp>, cx: &VisualTestContext) -> EntityId {
-    app.read_with(cx, |app, _| match &app.page {
+    app.read_with(cx, |app, _| match app.shell.page() {
         Page::Home(home) => home.entity_id(),
         _ => panic!("sidebar actions must preserve the Home page"),
     })
@@ -18,7 +18,8 @@ fn home_id(app: &Entity<TinyApp>, cx: &VisualTestContext) -> EntityId {
 
 fn assert_saved_order(app: &Entity<TinyApp>, cx: &VisualTestContext, expected: &[&str]) {
     app.read_with(cx, |app, _| {
-        for servers in [&app.servers, &app.cache.servers] {
+        let snapshot = app.cache_snapshot();
+        for servers in [&app.server_feature.catalog().servers, &snapshot.servers] {
             assert_eq!(
                 servers
                     .iter()
@@ -27,7 +28,7 @@ fn assert_saved_order(app: &Entity<TinyApp>, cx: &VisualTestContext, expected: &
                 expected
             );
         }
-        assert!(app.selecting_server_id.is_none());
+        assert!(app.server_feature.selecting_server_id().is_none());
     });
 }
 
@@ -102,8 +103,9 @@ fn sidebar_drag_previews_then_saves_order_without_switching_servers(cx: &mut Tes
     assert!(!path.exists());
     // The drag must move the current cached record, including updates made mid-drag.
     app.update(cx, |app, _| {
-        app.cache.servers[0].server_name = Some("Refreshed".into());
-        app.cache.servers[0].access_token = Some("refreshed-token".into());
+        app.server_feature.test_catalog_mut().servers[0].server_name = Some("Refreshed".into());
+        app.server_feature.test_catalog_mut().servers[0].access_token =
+            Some("refreshed-token".into());
     });
     drop_at(cx, third.center());
     assert_saved_order(&app, cx, &["second", "third", "first"]);
@@ -178,7 +180,7 @@ fn cancelling_sidebar_drag_or_dropping_on_add_does_not_save_or_open_dialog(
             first.origin
         );
         app.read_with(cx, |app, _| {
-            assert!(app.pending_cache_save_error_prefix.is_none());
+            assert!(app.persistence.pending_settings_error_prefix().is_none());
             assert!(app.add_server_dialog.is_none());
         });
     }

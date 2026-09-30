@@ -1,41 +1,49 @@
 use gpui::{
     App, AppContext as _, AsyncWindowContext, Context, Entity, FocusHandle, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, UniformListScrollHandle, Window, div, prelude::FluentBuilder, px, svg,
-    uniform_list,
+    IntoElement, MouseButton, ParentElement, StatefulInteractiveElement, Styled, Subscription,
+    UniformListScrollHandle, Window, div, prelude::FluentBuilder, px, svg, uniform_list,
 };
 use uuid::Uuid;
 
 use crate::ui::radius;
 use crate::{
-    server::{CachedServer, icon::all_icons},
+    images::{
+        FileImageRepository,
+        server_icon_assets::{clear_icon_previews, reload_server_icon},
+    },
+    server::{
+        CachedServer,
+        feature::{
+            IconDownloadResult, IconRequest, ServerCommand, ServerIntent, effect::download_icon,
+        },
+        icon::all_icons,
+    },
     theme,
     ui::{
         editor::{Editor, EditorEvent, Escape},
         scrollbar::Scrollbar,
-        server_icon::{cache_server_icon, clear_icon_previews, icon_preview, reload_server_icon},
+        server_icon::icon_preview,
     },
 };
 
 use super::{Page, TinyApp, WindowCornersExt, window_corner_radii};
 
 pub(super) struct ServerIconPicker {
-    server_id: String,
     session: Uuid,
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
     scroll: UniformListScrollHandle,
     search: Entity<Editor>,
     _search_subscription: Subscription,
-    selected_url: Option<String>,
-    pending_url: Option<String>,
-    error: Option<SharedString>,
-    task: Task<()>,
 }
 
 impl ServerIconPicker {
     pub(super) fn clear_previews(&self, cx: &mut App) {
-        clear_icon_previews(self.session, cx);
+        clear_icon_previews(
+            self.session,
+            all_icons().iter().map(|icon| icon.url.as_str()),
+            cx,
+        );
     }
 }
 
@@ -47,27 +55,26 @@ impl TinyApp {
         cx: &mut Context<Self>,
     ) {
         self.dismiss_server_menu(window, cx);
-        if !matches!(self.page, Page::Servers)
-            || self.selecting_server_id.is_some()
+        if !matches!(self.shell.page(), Page::Servers)
+            || self.server_feature.selecting_server_id().is_some()
             || self.add_server_dialog.is_some()
             || self.server_icon_picker.is_some()
         {
             return;
         }
-        let Some(server) = self
-            .cache
-            .servers
-            .iter()
-            .find(|saved| saved.id == server.id)
-        else {
+        if !matches!(
+            self.server_feature
+                .dispatch(ServerIntent::OpenIconPicker(server.id.clone())),
+            ServerCommand::PreviewChanged
+        ) {
             return;
-        };
+        }
         let focus = cx.focus_handle();
         let previous_focus = window.focused(cx);
         focus.focus(window, cx);
         let session = Uuid::new_v4();
         let search = cx.new(|cx| Editor::new("搜索图标名称…", cx).search());
-        let search_subscription = cx.subscribe(&search, move |app, _, event, cx| {
+        let search_subscription = cx.subscribe(&search, move |app, editor, event, cx| {
             if matches!(event, EditorEvent::Changed)
                 && let Some(picker) = app
                     .server_icon_picker
@@ -75,21 +82,19 @@ impl TinyApp {
                     .filter(|picker| picker.session == session)
             {
                 picker.scroll = UniformListScrollHandle::new();
+                let query = editor.read(cx).value().to_string();
+                app.server_feature
+                    .dispatch(ServerIntent::SearchIcons(query));
                 cx.notify();
             }
         });
         self.server_icon_picker = Some(ServerIconPicker {
-            server_id: server.id.clone(),
             session,
             focus,
             previous_focus,
             scroll: UniformListScrollHandle::new(),
             search,
             _search_subscription: search_subscription,
-            selected_url: server.icon_url.clone(),
-            pending_url: None,
-            error: None,
-            task: Task::ready(()),
         });
         cx.notify();
     }
@@ -99,6 +104,8 @@ impl TinyApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.server_effects.icon.cancel();
+        self.server_feature.dispatch(ServerIntent::CloseIconPicker);
         if let Some(picker) = self.server_icon_picker.take() {
             picker.clear_previews(cx);
             if let Some(focus) = picker.previous_focus {
@@ -111,74 +118,57 @@ impl TinyApp {
     }
 
     fn select_server_icon(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(picker) = self.server_icon_picker.as_mut() else {
-            return;
-        };
-        if picker.pending_url.is_some() {
+        if self.server_icon_picker.is_none() {
             return;
         }
-        let Some(icon) = all_icons().get(index) else {
+        let ServerCommand::DownloadIcon(request) = self
+            .server_feature
+            .dispatch(ServerIntent::SelectIcon(index))
+        else {
             return;
         };
-        let url = icon.url.clone();
-        let session = picker.session;
-        picker.pending_url = Some(url.clone());
-        picker.error = None;
-        let download_url = url.clone();
+        let download_request = request.clone();
         let download =
-            cx.background_spawn(async move { cache_server_icon(&download_url).map(|_| ()) });
-        picker.task = cx.spawn_in(window, async move |app, cx: &mut AsyncWindowContext| {
-            let result = download.await;
-            app.update_in(cx, |app, window, cx| {
-                app.finish_select_server_icon(session, url, result, window, cx);
-            })
-            .ok();
-        });
+            cx.background_spawn(
+                async move { download_icon(&FileImageRepository, &download_request) },
+            );
+        self.server_effects.icon.replace(cx.spawn_in(
+            window,
+            async move |app, cx: &mut AsyncWindowContext| {
+                let result = download.await;
+                app.update_in(cx, |app, window, cx| {
+                    app.finish_select_server_icon(&request, result, window, cx);
+                })
+                .ok();
+            },
+        ));
         cx.notify();
     }
 
     fn finish_select_server_icon(
         &mut self,
-        session: Uuid,
-        url: String,
+        request: &IconRequest,
         result: anyhow::Result<()>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(picker) = self
-            .server_icon_picker
-            .as_ref()
-            .filter(|picker| picker.session == session)
-        else {
-            return;
-        };
-        let server_id = picker.server_id.clone();
-        let result = result.and_then(|()| {
-            // Merge into the latest server so concurrent count updates are preserved.
-            let mut server = self
-                .cache
-                .servers
-                .iter()
-                .find(|server| server.id == server_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("服务器不存在"))?;
-            server.icon_url = Some(url.clone());
-            server.icon_is_custom = true;
-            self.save_server(server, true)?;
-            Ok(())
-        });
-        match result {
-            Ok(()) => {
-                self.servers = self.cache.servers.clone();
-                reload_server_icon(&url, cx);
-                self.dismiss_server_icon_picker(window, cx);
-            }
-            Err(error) => {
-                let picker = self.server_icon_picker.as_mut().unwrap();
-                picker.pending_url = None;
-                picker.error = Some(format!("选择图标失败：{error}").into());
+        let server = match self.server_feature.finish_icon_download(request, result) {
+            IconDownloadResult::Ignored => return,
+            IconDownloadResult::Invalidated | IconDownloadResult::Failed => {
+                self.server_effects.icon.cancel();
                 cx.notify();
+                return;
             }
+            IconDownloadResult::Save(server) => server,
+        };
+        let result = self.save_server(*server, true).map(|_| ());
+        self.server_feature.finish_icon_save(request, result);
+        self.server_effects.icon.cancel();
+        if self.server_feature.icon_picker().is_none() {
+            reload_server_icon(&request.url, cx);
+            self.dismiss_server_icon_picker(window, cx);
+        } else {
+            cx.notify();
         }
     }
 
@@ -188,6 +178,7 @@ impl TinyApp {
         cx: &Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let picker = self.server_icon_picker.as_ref()?;
+        let vm = self.server_feature.icon_picker()?;
         let theme = theme::get(cx);
         let width = (window.viewport_size().width - px(48.0)).min(px(760.0));
         let height = (window.viewport_size().height - px(48.0)).min(px(600.0));
@@ -195,12 +186,9 @@ impl TinyApp {
         let cell_width = (f32::from(width) - 56.0) / columns as f32;
         let session = picker.session;
         let scroll = picker.scroll.0.borrow().base_handle.clone();
-        let query = picker.search.read(cx).value().trim().to_lowercase();
-        let matching_icons: Vec<_> = all_icons()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, icon)| icon.name.to_lowercase().contains(&query).then_some(index))
-            .collect();
+        let query = vm.query;
+        let server_id = vm.server_id.to_owned();
+        let matching_icons = vm.matching_icons.clone();
         let match_count = matching_icons.len();
 
         let grid = uniform_list(
@@ -211,6 +199,10 @@ impl TinyApp {
                     .server_icon_picker
                     .as_ref()
                     .is_some_and(|picker| picker.session == session)
+                    || !app
+                        .server_feature
+                        .icon_picker()
+                        .is_some_and(|vm| vm.server_id == server_id)
                 {
                     return Vec::new();
                 }
@@ -319,7 +311,7 @@ impl TinyApp {
                             )
                         }),
                 )
-                .when(picker.pending_url.is_some(), |this| {
+                .when(vm.pending_url.is_some(), |this| {
                     this.child(
                         div()
                             .text_sm()
@@ -327,7 +319,7 @@ impl TinyApp {
                             .child("正在应用图标…"),
                     )
                 })
-                .when_some(picker.error.clone(), |this, error| {
+                .when_some(vm.error.map(str::to_owned), |this, error| {
                     this.child(div().text_sm().text_color(theme.error).child(error))
                 });
 
@@ -372,10 +364,11 @@ impl TinyApp {
 
     fn render_icon_choice(&self, index: usize, width: f32, cx: &Context<Self>) -> impl IntoElement {
         let picker = self.server_icon_picker.as_ref().unwrap();
+        let vm = self.server_feature.icon_picker().unwrap();
         let theme = theme::get(cx);
         let icon = &all_icons()[index];
-        let selected = picker.selected_url.as_deref() == Some(&icon.url);
-        let pending = picker.pending_url.as_deref() == Some(&icon.url);
+        let selected = vm.selected_url == Some(&icon.url);
+        let pending = vm.pending_url == Some(&icon.url);
         let choice = div()
             .id(("server-icon-choice", index))
             .debug_selector(move || format!("server-icon-choice-{index}"))
@@ -391,7 +384,7 @@ impl TinyApp {
             .when(selected, |this| this.bg(theme.element_selected))
             .when(pending, |this| this.opacity(0.5))
             .cursor_default()
-            .when(picker.pending_url.is_none(), |this| {
+            .when(vm.pending_url.is_none(), |this| {
                 this.cursor_pointer()
                     .hover(move |style| {
                         style.bg(if selected {

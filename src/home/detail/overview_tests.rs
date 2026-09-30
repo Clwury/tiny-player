@@ -1,3 +1,4 @@
+use crate::home::detail::test_fixture::DetailFixture;
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, point, px, size};
 use serde_json::json;
 
@@ -19,11 +20,13 @@ fn movie_window<'a>(
         let mut page = HomeContent::new(server, EmbyClient::new("test".into()).unwrap(), cx);
         let movie =
             json!({"Id": "movie-1", "Name": "Movie", "Type": "Movie", "Overview": overview});
-        let mut detail =
-            SeriesDetailState::new_movie(&serde_json::from_value(movie.clone()).unwrap());
-        detail.item = Some(serde_json::from_value(movie).unwrap());
-        page.navigation.push_detail("movie-1".into(), None);
-        page.series_detail = Some(detail);
+        let mut detail = DetailFixture::new_movie(&serde_json::from_value(movie.clone()).unwrap());
+        detail.controller.state.item = Some(serde_json::from_value(movie).unwrap());
+        page.controller
+            .test_state_mut()
+            .navigation
+            .push_detail_route_fixture("movie-1".into(), None);
+        page.install_detail_fixture(Some(detail));
         page
     });
     cx.simulate_resize(size(px(1000.0), px(800.0)));
@@ -70,7 +73,11 @@ fn long_movie_overview_opens_centered_scrollable_overlay_and_restores_focus(
     assert!(panel.top() >= overlay.top() + px(24.0));
     assert!(panel.bottom() <= overlay.bottom() - px(24.0));
     let detail_offset = page.read_with(cx, |page, _| {
-        page.series_detail.as_ref().unwrap().scroll_handle.offset()
+        page.detail_view()
+            .unwrap()
+            .presentation
+            .scroll_handle
+            .offset()
     });
     cx.simulate_mouse_move(scroll.center(), None, Modifiers::default());
     cx.simulate_event(gpui::ScrollWheelEvent {
@@ -81,9 +88,10 @@ fn long_movie_overview_opens_centered_scrollable_overlay_and_restores_focus(
     });
     cx.run_until_parked();
     page.read_with(cx, |page, _| {
-        let detail = page.series_detail.as_ref().unwrap();
+        let detail = page.detail_view().unwrap();
         assert!(
             detail
+                .presentation
                 .overview_overlay
                 .as_ref()
                 .unwrap()
@@ -92,7 +100,7 @@ fn long_movie_overview_opens_centered_scrollable_overlay_and_restores_focus(
                 .y
                 < px(0.0)
         );
-        assert_eq!(detail.scroll_handle.offset(), detail_offset);
+        assert_eq!(detail.presentation.scroll_handle.offset(), detail_offset);
     });
     // Clicking inside the panel must not dismiss it through the backdrop.
     click(cx, "movie-overview-scroll");
@@ -105,9 +113,9 @@ fn long_movie_overview_opens_centered_scrollable_overlay_and_restores_focus(
     click(cx, "movie-detail-overview");
     page.read_with(cx, |page, _| {
         assert_eq!(
-            page.series_detail
-                .as_ref()
+            page.detail_view()
                 .unwrap()
+                .presentation
                 .overview_overlay
                 .as_ref()
                 .unwrap()
@@ -124,7 +132,7 @@ fn long_movie_overview_opens_centered_scrollable_overlay_and_restores_focus(
     cx.run_until_parked();
     assert!(cx.debug_bounds("movie-overview-panel").is_none());
     page.read_with(cx, |page, _| {
-        assert_eq!(page.series_detail.as_ref().unwrap().series_id, "movie-1")
+        assert_eq!(page.detail_view().unwrap().model.series_id, "movie-1")
     });
 }
 

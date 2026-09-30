@@ -28,6 +28,15 @@ fn app(cx: &mut TestAppContext, path: &std::path::Path) -> Entity<TinyApp> {
     })
 }
 
+fn select_icon_request(app: &mut TinyApp, index: usize) -> IconRequest {
+    let ServerCommand::DownloadIcon(request) =
+        app.server_feature.dispatch(ServerIntent::SelectIcon(index))
+    else {
+        panic!("icon download expected")
+    };
+    *request
+}
+
 struct Root(Entity<TinyApp>);
 
 impl Render for Root {
@@ -51,24 +60,39 @@ fn applying_an_icon_updates_only_the_target_and_persists_the_manual_choice(
             app.update(cx, |app, cx| {
                 let previous_focus = cx.focus_handle();
                 previous_focus.focus(window, cx);
-                let server = app.servers[1].clone();
+                let server = app.server_feature.catalog().servers[1].clone();
                 app.open_server_icon_picker(&server, window, cx);
-                let picker = app.server_icon_picker.as_mut().unwrap();
-                let session = picker.session;
-                picker.pending_url = Some(selected.clone());
-                assert!(picker.focus.is_focused(window));
-                app.cache.servers[1].item_counts = Some(CachedItemCounts {
-                    movie_count: 12,
-                    series_count: 34,
-                });
-                app.finish_select_server_icon(session, selected.clone(), Ok(()), window, cx);
+                assert!(
+                    app.server_icon_picker
+                        .as_ref()
+                        .unwrap()
+                        .focus
+                        .is_focused(window)
+                );
+                let request = select_icon_request(app, 2);
+                app.server_feature.test_catalog_mut().servers[1].item_counts =
+                    Some(CachedItemCounts {
+                        movie_count: 12,
+                        series_count: 34,
+                    });
+                app.finish_select_server_icon(&request, Ok(()), window, cx);
                 assert!(app.server_icon_picker.is_none());
                 assert!(previous_focus.is_focused(window));
-                assert!(app.servers[0].icon_url.is_none());
-                assert!(!app.servers[0].icon_is_custom);
-                assert_eq!(app.servers[1].icon_url.as_deref(), Some(selected.as_str()));
-                assert!(app.servers[1].icon_is_custom);
-                assert_eq!(app.servers[1].item_counts.as_ref().unwrap().movie_count, 12);
+                assert!(app.server_feature.catalog().servers[0].icon_url.is_none());
+                assert!(!app.server_feature.catalog().servers[0].icon_is_custom);
+                assert_eq!(
+                    app.server_feature.catalog().servers[1].icon_url.as_deref(),
+                    Some(selected.as_str())
+                );
+                assert!(app.server_feature.catalog().servers[1].icon_is_custom);
+                assert_eq!(
+                    app.server_feature.catalog().servers[1]
+                        .item_counts
+                        .as_ref()
+                        .unwrap()
+                        .movie_count,
+                    12
+                );
             })
         })
         .unwrap();
@@ -92,19 +116,17 @@ fn download_and_settings_save_failures_keep_the_original_icon_and_allow_retry(
     window
         .update(cx, |_, window, cx| {
             app.update(cx, |app, cx| {
-                let server = app.servers[0].clone();
+                let server = app.server_feature.catalog().servers[0].clone();
                 app.open_server_icon_picker(&server, window, cx);
-                let selected = all_icons()[0].url.clone();
-                let session = app.server_icon_picker.as_ref().unwrap().session;
                 for result in [Err(anyhow::anyhow!("下载失败")), Ok(())] {
-                    app.server_icon_picker.as_mut().unwrap().pending_url = Some(selected.clone());
-                    app.finish_select_server_icon(session, selected.clone(), result, window, cx);
-                    let picker = app.server_icon_picker.as_ref().unwrap();
+                    let request = select_icon_request(app, 0);
+                    app.finish_select_server_icon(&request, result, window, cx);
+                    let picker = app.server_feature.icon_picker().unwrap();
                     assert!(picker.error.is_some());
                     assert!(picker.pending_url.is_none());
-                    assert!(app.servers[0].icon_url.is_none());
-                    assert!(app.cache.servers[0].icon_url.is_none());
-                    assert!(!app.cache.servers[0].icon_is_custom);
+                    assert!(app.server_feature.catalog().servers[0].icon_url.is_none());
+                    assert!(app.cache_snapshot().servers[0].icon_url.is_none());
+                    assert!(!app.server_feature.catalog().servers[0].icon_is_custom);
                     // The second completion fails when saving settings, after a valid download.
                     std::fs::write(&path, b"not a directory").unwrap();
                     app.cache_save_path = Some(path.join("servers.json"));
@@ -126,27 +148,27 @@ fn closed_picker_completions_cannot_change_a_new_picker_or_select_a_server(
     window
         .update(cx, |_, window, cx| {
             app.update(cx, |app, cx| {
-                let first = app.servers[0].clone();
-                let second = app.servers[1].clone();
+                let first = app.server_feature.catalog().servers[0].clone();
+                let second = app.server_feature.catalog().servers[1].clone();
                 app.open_server_icon_picker(&first, window, cx);
-                let old_session = app.server_icon_picker.as_ref().unwrap().session;
+                let old_request = select_icon_request(app, 0);
                 app.dismiss_server_icon_picker(window, cx);
                 app.open_server_icon_picker(&second, window, cx);
-                app.finish_select_server_icon(
-                    old_session,
-                    all_icons()[0].url.clone(),
-                    Ok(()),
-                    window,
-                    cx,
-                );
+                app.finish_select_server_icon(&old_request, Ok(()), window, cx);
                 assert_eq!(
-                    app.server_icon_picker.as_ref().unwrap().server_id,
+                    app.server_feature.icon_picker().unwrap().server_id,
                     second.id
                 );
-                assert!(app.servers.iter().all(|server| server.icon_url.is_none()));
+                assert!(
+                    app.server_feature
+                        .catalog()
+                        .servers
+                        .iter()
+                        .all(|server| server.icon_url.is_none())
+                );
                 app.begin_select_server(&first, cx);
-                assert!(app.selecting_server_id.is_none());
-                assert!(matches!(app.page, Page::Servers));
+                assert!(app.server_feature.selecting_server_id().is_none());
+                assert!(matches!(app.shell.page(), Page::Servers));
                 app.dismiss_server_icon_picker(window, cx);
             })
         })
@@ -222,7 +244,10 @@ fn context_menu_opens_a_scrollable_modal_and_dismissal_releases_previews(cx: &mu
     }
     let session = app.read_with(cx, |app, cx| {
         let picker = app.server_icon_picker.as_ref().unwrap();
-        assert_eq!(picker.server_id, "second");
+        assert_eq!(
+            app.server_feature.icon_picker().unwrap().server_id,
+            "second"
+        );
         assert!(has_preview(picker.session, &all_icons()[0].url, cx));
         picker.session
     });
@@ -252,13 +277,13 @@ fn context_menu_opens_a_scrollable_modal_and_dismissal_releases_previews(cx: &mu
     assert!(cx.debug_bounds("server-icon-picker").is_none());
     app.read_with(cx, |app, cx| {
         assert!(app.server_icon_picker.is_none());
-        assert!(app.selecting_server_id.is_none());
+        assert!(app.server_feature.selecting_server_id().is_none());
         assert!(!has_preview(session, &all_icons()[0].url, cx));
         assert!(!has_preview(session, &all_icons().last().unwrap().url, cx));
     });
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
-            let server = app.servers[0].clone();
+            let server = app.server_feature.catalog().servers[0].clone();
             app.open_server_icon_picker(&server, window, cx);
             assert_ne!(app.server_icon_picker.as_ref().unwrap().session, session);
         })
@@ -269,8 +294,8 @@ fn context_menu_opens_a_scrollable_modal_and_dismissal_releases_previews(cx: &mu
     cx.run_until_parked();
     assert!(cx.debug_bounds("server-icon-picker").is_none());
     app.read_with(cx, |app, _| {
-        assert!(app.selecting_server_id.is_none());
-        assert!(matches!(app.page, Page::Servers));
+        assert!(app.server_feature.selecting_server_id().is_none());
+        assert!(matches!(app.shell.page(), Page::Servers));
     });
 }
 
@@ -288,7 +313,7 @@ fn searching_names_resets_scroll_preserves_catalog_indices_and_can_be_cleared(
     cx.simulate_resize(size(px(960.0), px(680.0)));
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
-            let server = app.servers[1].clone();
+            let server = app.server_feature.catalog().servers[1].clone();
             app.open_server_icon_picker(&server, window, cx);
         })
     });
@@ -353,7 +378,7 @@ fn searching_names_resets_scroll_preserves_catalog_indices_and_can_be_cleared(
     assert!(cx.debug_bounds("server-icon-picker").is_none());
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
-            let server = app.servers[1].clone();
+            let server = app.server_feature.catalog().servers[1].clone();
             app.open_server_icon_picker(&server, window, cx);
         })
     });
@@ -364,7 +389,13 @@ fn searching_names_resets_scroll_preserves_catalog_indices_and_can_be_cleared(
     cx.run_until_parked();
     assert!(cx.debug_bounds("server-icon-picker").is_none());
     app.read_with(cx, |app, _| {
-        assert!(app.servers.iter().all(|server| server.icon_url.is_none()));
-        assert!(app.selecting_server_id.is_none());
+        assert!(
+            app.server_feature
+                .catalog()
+                .servers
+                .iter()
+                .all(|server| server.icon_url.is_none())
+        );
+        assert!(app.server_feature.selecting_server_id().is_none());
     });
 }

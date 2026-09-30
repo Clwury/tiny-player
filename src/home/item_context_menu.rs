@@ -65,9 +65,11 @@ impl HomeContent {
         }
         match menu.source {
             ItemContextMenuSource::Resume => self
+                .controller
                 .resume_item_by_id(&menu.item_id)
                 .map(|item| item.user_data.unwrap_or_default()),
             ItemContextMenuSource::UserItem => self
+                .controller
                 .user_item_by_id(&menu.item_id)
                 .filter(|item| {
                     matches!(
@@ -84,7 +86,7 @@ impl HomeContent {
         action: ItemContextMenuAction,
         cx: &mut Context<Self>,
     ) {
-        if self.detail_user_data_pending() {
+        if self.controller.user_data_pending() {
             return;
         }
         let Some(menu) = self.item_context_menu.clone() else {
@@ -128,7 +130,7 @@ impl HomeContent {
     ) -> impl IntoElement {
         let theme = theme::get(cx);
         let data = self.context_menu_user_data(&menu);
-        let pending = self.detail_user_data_pending() || data.is_none();
+        let pending = self.controller.user_data_pending() || data.is_none();
         let favorite = data.is_some_and(|data| data.is_favorite);
         let resume = menu.source == ItemContextMenuSource::Resume;
         let menu_id = if resume {

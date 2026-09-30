@@ -8,21 +8,24 @@ impl PlaybackPage {
         delta: f32,
         cx: &mut Context<Self>,
     ) {
-        let current_offset_fraction = self.subtitle.vertical_offset_fraction.unwrap_or(0.0);
-        self.subtitle.vertical_offset_fraction = Some(subtitle_vertical_offset_after_adjustment(
-            current_offset_fraction,
-            delta,
-        ));
+        let current_offset_fraction = self
+            .presentation
+            .subtitle
+            .vertical_offset_fraction
+            .unwrap_or(0.0);
+        self.presentation.subtitle.vertical_offset_fraction = Some(
+            subtitle_vertical_offset_after_adjustment(current_offset_fraction, delta),
+        );
         cx.notify();
     }
 
     pub(super) fn render_subtitle_overlay(&self) -> impl IntoElement {
-        let Some(cue) = self.subtitle.active.as_ref() else {
+        let Some(cue) = self.presentation.subtitle.active.as_ref() else {
             return div()
                 .id("playback-subtitle-overlay-empty")
                 .into_any_element();
         };
-        let Some(observed_video_bounds) = self.frame.viewport_bounds else {
+        let Some(observed_video_bounds) = self.presentation.frame.viewport_bounds else {
             return div()
                 .id("playback-subtitle-overlay-empty")
                 .into_any_element();
@@ -30,7 +33,7 @@ impl PlaybackPage {
         // Canvas observations are window-relative; subtitle children are laid
         // out inside the same adaptive video viewport as the image.
         let video_bounds = local_video_viewport_bounds(observed_video_bounds);
-        let Some(source_size) = self.frame.source_size else {
+        let Some(source_size) = self.presentation.frame.source_size else {
             return div()
                 .id("playback-subtitle-overlay-empty")
                 .into_any_element();
@@ -56,9 +59,14 @@ impl PlaybackPage {
         let subtitle_render_bottom = subtitle_render_bottom(
             video_fitted_bounds,
             subtitle_bottom,
-            self.subtitle.vertical_offset_fraction,
+            self.presentation.subtitle.vertical_offset_fraction,
         );
-        let bitmap_top = if self.subtitle.vertical_offset_fraction.is_some() {
+        let bitmap_top = if self
+            .presentation
+            .subtitle
+            .vertical_offset_fraction
+            .is_some()
+        {
             subtitle_bitmap_overlay_top_for_bottom(
                 cue,
                 bitmap_bounds,
@@ -80,6 +88,7 @@ impl PlaybackPage {
                 .h(bitmap_bounds.size.height),
             |this, bitmap| {
                 let image = self
+                    .presentation
                     .subtitle
                     .images
                     .get(&bitmap.image)
@@ -108,7 +117,7 @@ impl PlaybackPage {
         let text_overlay_bounds = subtitle_text_overlay_bounds(
             video_fitted_bounds,
             subtitle_render_bottom,
-            self.subtitle.vertical_offset_fraction,
+            self.presentation.subtitle.vertical_offset_fraction,
         );
         overlay
             .child(

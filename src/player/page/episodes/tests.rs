@@ -1,3 +1,6 @@
+use crate::player::{
+    model::episode_card::episode_metadata_label, playback_audio_tracks_for_source,
+};
 use std::{
     cell::RefCell,
     io::{Read, Write},
@@ -62,11 +65,94 @@ fn episode_metadata_formats_dates_durations_and_sizes_and_omits_missing_fields()
     }
 }
 
+#[gpui::test]
+fn episode_images_preserve_request_parameters_and_reopen_without_reloading(
+    cx: &mut TestAppContext,
+) {
+    let (page, cx) = playback_window(cx);
+    let repository = Arc::new(crate::images::test_support::FakeItemImages::default());
+    page.update(cx, |page, _| {
+        page.presentation.episode_list.image_repository = repository.clone();
+        page.session.queue.queue_mut().current_index = 6;
+        for item in &mut page.session.queue.queue_mut().items {
+            item.primary_image_tag = Some("tag".into());
+        }
+    });
+    click(cx, "playback-episodes-button");
+    let requests = repository.requests.lock().unwrap();
+    assert_eq!(requests.len(), 12);
+    // The scheduler starts near the selected row. Concurrent jobs may execute
+    // out of order; all twelve requests must retain their original parameters.
+    assert!(
+        requests
+            .iter()
+            .all(|image| image.request.max_width == Some(640)
+                && image.request.image_type == EmbyImageType::Primary
+                && image.request.quality == ImageQuality::DEFAULT)
+    );
+    drop(requests);
+    page.read_with(cx, |page, _| {
+        assert!(page.presentation.episode_list.image_effects.is_empty())
+    });
+    click(cx, "playback-episodes-close");
+    click(cx, "playback-episodes-button");
+    assert_eq!(repository.requests.lock().unwrap().len(), 12);
+}
+
+#[gpui::test]
+fn closing_episode_drawer_accepts_running_images_without_starting_queued_work(
+    cx: &mut TestAppContext,
+) {
+    let (page, cx) = playback_window(cx);
+    let repository = Arc::new(crate::images::test_support::FakeItemImages::default());
+    page.update(cx, |page, cx| {
+        page.presentation.episode_list.image_repository = repository.clone();
+        page.presentation.episode_list.open = true;
+        for id in ["one", "two", "three", "four", "five"] {
+            page.presentation.episode_list.images.ensure_image(
+                EmbyImageRequest::primary(id, Some("tag".into())),
+                Instant::now(),
+            );
+        }
+        let jobs = page.presentation.episode_list.images.start_queued_jobs();
+        assert_eq!(jobs.len(), 4);
+        page.close_episode_list(cx);
+        page.finish_episode_image(jobs[0].clone(), Ok("/tmp/one.png".into()), cx);
+        page.finish_episode_image(
+            jobs[0].clone(),
+            Err(anyhow::anyhow!("duplicate failure")),
+            cx,
+        );
+        assert!(repository.requests.lock().unwrap().is_empty());
+        assert!(
+            page.presentation
+                .episode_list
+                .images
+                .path_for_request(&jobs[0].image.request)
+                .is_some()
+        );
+        page.presentation.episode_list.open = true;
+        page.load_episode_images(cx);
+    });
+    cx.run_until_parked();
+    let requests = repository.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].request.item_id, "five");
+}
+
 pub(in crate::player::page) fn playback_window(
     cx: &mut TestAppContext,
 ) -> (Entity<PlaybackPage>, &mut VisualTestContext) {
     cx.update(theme::init);
-    let (page, cx) = cx.add_window_view(|_, cx| {
+    let (page, cx) = cx.add_window_view(|_, cx| PlaybackPage::test_fixture(cx));
+    cx.simulate_resize(size(px(1100.0), px(800.0)));
+    cx.run_until_parked();
+    (page, cx)
+}
+
+impl PlaybackPage {
+    /// In-memory page for interaction tests; no FFmpeg, Vulkan or audio device.
+    pub(crate) fn test_fixture(cx: &mut gpui::Context<Self>) -> Self {
         let emby = EmbyPlaybackContext {
             client: crate::emby::EmbyClient::new("episode-list-test".into()).unwrap(),
             server: serde_json::from_value(json!({
@@ -83,57 +169,55 @@ pub(in crate::player::page) fn playback_window(
         };
         // Exercise the real page and event flow without starting FFmpeg or Vulkan.
         PlaybackPage::register_image_cleanup(cx);
+        let mut presentation = PlaybackPresentationState::new(
+            cx.focus_handle(),
+            emby.server.workspace_identity(),
+            PlaybackEpisodeListState::new(&emby),
+        );
+        presentation.fullscreen.controls_visible = true;
+        presentation.fullscreen.cursor_visible = true;
         PlaybackPage {
-            focus_handle: cx.focus_handle(),
+            presentation,
             title: "Series S1E1".into(),
-            video: ShutdownOrder::new(None, None),
-            frame: PlaybackFrameState::default(),
-            timeline: PlaybackTimelineState {
-                loaded: true,
-                duration: Some(1800.0),
-                position: Some(45.0),
-                user_paused: false,
-                paused: false,
-                ..Default::default()
-            },
-            download_speed: controls::DownloadSpeedDisplay::default(),
-            playback_details_visible: false,
-            fullscreen: FullscreenControlsState {
-                controls_visible: true,
-                cursor_visible: true,
-                ..Default::default()
-            },
-            window_drag: WindowDragState::default(),
-            source_protocol: None,
-            source_url: "episode.mkv".to_string(),
-            content_length: None,
-            playback_file_info: None,
-            playback_info: None,
-            playback_audio_info: None,
-            queue: PlaybackQueue::new((0..12).map(episode).collect(), 0),
-            episode_list: PlaybackEpisodeListState::default(),
-            reporting: session::PlaybackReportingState::new(&emby),
-            emby,
-            queue_switch: queue::PlaybackQueueSwitchState::default(),
-            track_preference_key: crate::player::PlaybackTrackPreferenceKey {
-                item_id: "episode-0".into(),
-                media_source_id: "source-0".into(),
-            },
-            tracks: TrackSelectState::new(
-                Vec::new(),
-                Vec::new(),
-                PlaybackTrackSelection::default(),
+            video: PlaybackBackendAdapter::empty(),
+            backend_poll: Default::default(),
+            session: crate::player::session::PlaybackSessionController::new(
+                PlaybackTimelineState {
+                    loaded: true,
+                    duration: Some(1800.0),
+                    position: Some(45.0),
+                    user_paused: false,
+                    paused: false,
+                    ..Default::default()
+                },
+                PlaybackSourceState {
+                    source_protocol: None,
+                    source_url: "episode.mkv".to_string(),
+                    content_length: None,
+                    playback_file_info: None,
+                    playback_info: None,
+                    playback_audio_info: None,
+                    track_preference_key: crate::player::PlaybackTrackPreferenceKey {
+                        item_id: "episode-0".into(),
+                        media_source_id: "source-0".into(),
+                    },
+                    tracks: PlaybackTrackState::new(
+                        Vec::new(),
+                        Vec::new(),
+                        PlaybackTrackSelection::default(),
+                    ),
+                    remember_subtitle_on_start: false,
+                },
+                PlaybackQueue::new((0..12).map(episode).collect(), 0),
+                emby.server.workspace_identity(),
+                PlaybackVolumeSettings::default(),
+                None,
             ),
-            remember_subtitle_on_start: false,
-            subtitle: SubtitleOverlayState::default(),
-            volume: PlaybackVolumeState::new(PlaybackVolumeSettings::default()),
-            rate: rate::PlaybackRateState::default(),
-            error_message: None,
+            report_effects: session::ReportingEffects::new(&emby, cx),
+            queue_effects: queue::QueueEffects::new(&emby),
+            emby,
         }
-    });
-    cx.simulate_resize(size(px(1100.0), px(800.0)));
-    cx.run_until_parked();
-    (page, cx)
+    }
 }
 
 fn click(cx: &mut VisualTestContext, selector: &'static str) {
@@ -180,33 +264,82 @@ fn episode_sizes_use_the_playing_version_and_the_queued_default_source(cx: &mut 
     let (page, cx) = playback_window(cx);
     page.update(cx, |page, _| {
         let gib = 1_u64 << 30;
-        page.queue.items[0].media_sources = serde_json::from_value(json!([
+        page.session.queue.queue_mut().items[0].media_sources = serde_json::from_value(json!([
             {"Id": "default-source", "Type": "Default", "Size": gib},
             {"Id": "source-0", "Size": 2 * gib}
         ]))
         .unwrap();
-        page.queue.items[1].media_sources = serde_json::from_value(json!([
+        page.session.queue.queue_mut().items[1].media_sources = serde_json::from_value(json!([
             {"Id": "alternate-source", "Size": gib},
             {"Id": "source-1", "Type": "Default", "Size": 4 * gib}
         ]))
         .unwrap();
 
-        page.content_length = Some(3 * gib);
-        assert_eq!(page.episode_file_size(0), Some(3 * gib));
-        assert_eq!(page.episode_file_size(1), Some(4 * gib));
+        page.session.source_mut().content_length = Some(3 * gib);
+        let view = page
+            .session
+            .episode_card_vm(0, &page.emby.media_source_id)
+            .unwrap();
+        assert!(view.selected);
+        assert_eq!(view.item_id, "episode-0");
+        assert_eq!(view.metadata.as_deref(), Some("1998-04-03 30:00 3.00 GiB"));
+        let queued = page
+            .session
+            .episode_card_vm(1, &page.emby.media_source_id)
+            .unwrap();
+        assert!(!queued.selected);
+        assert_eq!(
+            queued.metadata.as_deref(),
+            Some("1998-04-03 30:00 4.00 GiB")
+        );
+        assert!(
+            page.session
+                .episode_card_vm(usize::MAX, &page.emby.media_source_id)
+                .is_none()
+        );
 
-        page.content_length = None;
+        assert_eq!(
+            page.session
+                .episode_file_size(0, &page.emby.media_source_id),
+            Some(3 * gib)
+        );
+        assert_eq!(
+            page.session
+                .episode_file_size(1, &page.emby.media_source_id),
+            Some(4 * gib)
+        );
+
+        page.session.source_mut().content_length = None;
         page.emby.media_source_id = "resolved-source".into();
-        assert_eq!(page.episode_file_size(0), Some(2 * gib));
+        assert_eq!(
+            page.session
+                .episode_file_size(0, &page.emby.media_source_id),
+            Some(2 * gib)
+        );
         page.emby.media_source_id = "default-source".into();
-        assert_eq!(page.episode_file_size(0), Some(gib));
+        assert_eq!(
+            page.session
+                .episode_file_size(0, &page.emby.media_source_id),
+            Some(gib)
+        );
 
-        page.content_length = Some(0);
+        page.session.source_mut().content_length = Some(0);
         page.emby.media_source_id = "missing".into();
-        page.track_preference_key.media_source_id = "missing".into();
-        assert_eq!(page.episode_file_size(0), None);
-        page.queue.items[1].media_sources[1].size = None;
-        assert_eq!(page.episode_file_size(1), None);
+        page.session
+            .source_mut()
+            .track_preference_key
+            .media_source_id = "missing".into();
+        assert_eq!(
+            page.session
+                .episode_file_size(0, &page.emby.media_source_id),
+            None
+        );
+        page.session.queue.queue_mut().items[1].media_sources[1].size = None;
+        assert_eq!(
+            page.session
+                .episode_file_size(1, &page.emby.media_source_id),
+            None
+        );
     });
 }
 
@@ -246,7 +379,7 @@ fn episode_card_metadata_fits_between_the_title_and_overview(cx: &mut TestAppCon
     }
 
     page.update(cx, |page, cx| {
-        let item = &mut page.queue.items[1];
+        let item = &mut page.session.queue.queue_mut().items[1];
         item.premiere_date = None;
         item.run_time_ticks = None;
         item.media_sources.clear();
@@ -256,9 +389,9 @@ fn episode_card_metadata_fits_between_the_title_and_overview(cx: &mut TestAppCon
     assert!(cx.debug_bounds("playback-episode-metadata-1").is_none());
     click(cx, "playback-episode-metadata-0");
     page.read_with(cx, |page, _| {
-        assert!(!page.episode_list.open);
-        assert!(!page.queue_switch.loading);
-        assert_eq!(page.queue.current_index, 0);
+        assert!(!page.presentation.episode_list.open);
+        assert!(!page.session.queue.view_model().loading);
+        assert_eq!(page.session.queue.queue().current_index, 0);
     });
 }
 
@@ -313,7 +446,7 @@ fn episode_drawer_hides_controls_and_restores_them_when_dismissed(cx: &mut TestA
     }
 
     page.update(cx, |page, cx| {
-        page.playback_details_visible = true;
+        page.presentation.playback_details_visible = true;
         cx.notify();
     });
     for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
@@ -325,7 +458,7 @@ fn episode_drawer_hides_controls_and_restores_them_when_dismissed(cx: &mut TestA
         cx.run_until_parked();
         assert!(cx.debug_bounds("playback-episodes-panel").is_none());
         assert!(cx.debug_bounds("playback-progress").is_some());
-        assert!(!page.read_with(cx, |page, _| page.timeline.user_paused));
+        assert!(!page.read_with(cx, |page, _| page.session.timeline().user_paused));
     }
 
     click(cx, "playback-episodes-button");
@@ -341,7 +474,7 @@ fn episode_drawer_scrolls_to_current_and_keeps_the_fullscreen_cursor_visible(
 ) {
     let (page, cx) = playback_window(cx);
     page.update(cx, |page, cx| {
-        page.queue = PlaybackQueue::new((0..100).map(episode).collect(), 80);
+        *page.session.queue.queue_mut() = PlaybackQueue::new((0..100).map(episode).collect(), 80);
         cx.notify();
     });
     cx.update(|window, _| window.toggle_fullscreen());
@@ -359,9 +492,15 @@ fn episode_drawer_scrolls_to_current_and_keeps_the_fullscreen_cursor_visible(
                 && quad.border_color == theme::media_overlay(cx).input_border_focused
         }))
     );
-    let volume = page.read_with(cx, |page, _| page.volume.level);
+    let volume = page.read_with(cx, |page, _| page.session.controls_view().volume.level);
     let scroll_before = page.read_with(cx, |page, _| {
-        page.episode_list.scroll.0.borrow().base_handle.offset()
+        page.presentation
+            .episode_list
+            .scroll
+            .0
+            .borrow()
+            .base_handle
+            .offset()
     });
     cx.simulate_mouse_move(list.center(), None, Modifiers::default());
     cx.simulate_event(ScrollWheelEvent {
@@ -371,14 +510,27 @@ fn episode_drawer_scrolls_to_current_and_keeps_the_fullscreen_cursor_visible(
         touch_phase: TouchPhase::Moved,
     });
     cx.run_until_parked();
-    assert_eq!(page.read_with(cx, |page, _| page.volume.level), volume);
+    assert_eq!(
+        page.read_with(cx, |page, _| page.session.controls_view().volume.level),
+        volume
+    );
     assert!(page.read_with(cx, |page, _| {
-        page.episode_list.scroll.0.borrow().base_handle.offset().y < scroll_before.y
+        page.presentation
+            .episode_list
+            .scroll
+            .0
+            .borrow()
+            .base_handle
+            .offset()
+            .y
+            < scroll_before.y
     }));
     cx.executor().advance_clock(Duration::from_secs(1));
     cx.run_until_parked();
-    assert!(page.read_with(cx, |page, _| page.fullscreen.cursor_visible
-        && page.episode_list.open));
+    assert!(
+        page.read_with(cx, |page, _| page.presentation.fullscreen.cursor_visible
+            && page.presentation.episode_list.open)
+    );
     assert!(cx.debug_bounds("playback-progress").is_none());
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
@@ -393,14 +545,14 @@ fn current_episode_and_movie_do_not_start_queue_switches(cx: &mut TestAppContext
     click(cx, "playback-episodes-button");
     click(cx, "playback-episode-0");
     page.read_with(cx, |page, _| {
-        assert!(!page.queue_switch.loading);
-        assert!(!page.timeline.user_paused);
-        assert_eq!(page.queue.current_index, 0);
-        assert!(!page.episode_list.open);
+        assert!(!page.session.queue.view_model().loading);
+        assert!(!page.session.timeline().user_paused);
+        assert_eq!(page.session.queue.queue().current_index, 0);
+        assert!(!page.presentation.episode_list.open);
     });
     page.update(cx, |page, cx| {
-        page.queue.items.truncate(1);
-        page.queue.items[0].series_id = None;
+        page.session.queue.queue_mut().items.truncate(1);
+        page.session.queue.queue_mut().items[0].series_id = None;
         cx.notify();
     });
     cx.run_until_parked();
@@ -411,15 +563,19 @@ fn current_episode_and_movie_do_not_start_queue_switches(cx: &mut TestAppContext
 #[gpui::test]
 fn unavailable_episode_restores_current_playback_and_shows_error(cx: &mut TestAppContext) {
     let (page, cx) = playback_window(cx);
-    page.update(cx, |page, _| page.queue.items[2].media_sources.clear());
+    page.update(cx, |page, _| {
+        page.session.queue.queue_mut().items[2]
+            .media_sources
+            .clear()
+    });
     click(cx, "playback-episodes-button");
     click(cx, "playback-episode-2");
     page.read_with(cx, |page, _| {
-        assert!(!page.queue_switch.loading);
-        assert_eq!(page.queue.current_index, 0);
-        assert!(!page.timeline.user_paused);
-        assert!(!page.timeline.paused);
-        assert!(!page.episode_list.open);
+        assert!(!page.session.queue.view_model().loading);
+        assert_eq!(page.session.queue.queue().current_index, 0);
+        assert!(!page.session.timeline().user_paused);
+        assert!(!page.session.timeline().paused);
+        assert!(!page.presentation.episode_list.open);
     });
     assert!(cx.debug_bounds("playback-queue-switch-error").is_some());
     assert!(cx.debug_bounds("playback-progress").is_some());
@@ -441,14 +597,24 @@ fn episode_scrollbar_drags_the_list_and_hides_without_overflow(cx: &mut TestAppC
     cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
     cx.run_until_parked();
     page.read_with(cx, |page, _| {
-        assert!(page.episode_list.scroll.0.borrow().base_handle.offset().y < px(0.0));
-        assert!(page.episode_list.open);
-        assert!(!page.queue_switch.loading);
+        assert!(
+            page.presentation
+                .episode_list
+                .scroll
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y
+                < px(0.0)
+        );
+        assert!(page.presentation.episode_list.open);
+        assert!(!page.session.queue.view_model().loading);
     });
     assert!(scrollbar_thumb(cx).unwrap().top() > thumb.top());
     click(cx, "playback-episodes-close");
     page.update(cx, |page, cx| {
-        page.queue.items.truncate(2);
+        page.session.queue.queue_mut().items.truncate(2);
         cx.notify();
     });
     cx.run_until_parked();
@@ -518,6 +684,7 @@ fn clicking_non_adjacent_episode_resolves_playback_and_preserves_resume_position
     page.update(cx, |page, cx| {
         page.emby.server.endpoint.address = "127.0.0.1".into();
         page.emby.server.endpoint.port = port;
+        page.queue_effects = queue::QueueEffects::new(&page.emby);
         let source = serde_json::from_value(json!({
             "Id": "source-2", "DefaultSubtitleStreamIndex": 10,
             "MediaStreams": [
@@ -539,7 +706,7 @@ fn clicking_non_adjacent_episode_resolves_playback_and_preserves_resume_position
         crate::player::PlaybackTrackPreferences::remember(
             &page.emby.server, &[key], PlaybackTrackKind::Subtitle, None, cx,
         );
-        page.queue.items[2].media_sources = vec![source];
+        page.session.queue.queue_mut().items[2].media_sources = vec![source];
     });
     let replacements = Rc::new(RefCell::new(Vec::new()));
     cx.update(|_, cx| {

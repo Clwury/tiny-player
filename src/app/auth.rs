@@ -1,26 +1,33 @@
+use crate::effects::RequestToken;
+use crate::server::feature::{
+    AuthRequest, AuthResult, ServerCommand, ServerIntent, effect::authenticate_server,
+};
 use anyhow::Result;
-use gpui::{AppContext as _, Context, Entity, Task, Window};
+#[cfg(test)]
+use gpui::Entity;
+use gpui::{AppContext as _, Context};
 
 use crate::{
     home::{HomeEvent, HomePage},
-    player::{PlaybackEvent, PlaybackRequest},
+    player::PlaybackRequest,
     server::CachedServer,
 };
 
-use super::{Page, TinyApp, server_cache::authenticate_server};
+use super::{Page, TinyApp, intent::AppIntent};
 
 impl TinyApp {
-    fn set_selecting_server(&mut self, server_id: Option<String>, cx: &mut Context<Self>) {
-        self.selecting_server_id = server_id.clone();
-        if let Page::Home(home) = &self.page {
+    fn sync_server_selection(&mut self, cx: &mut Context<Self>) {
+        let server_id = self.server_feature.selecting_server_id().map(str::to_owned);
+        if let Page::Home(home) = self.shell.page() {
             home.update(cx, |home, cx| home.set_selecting_server(server_id, cx));
         }
         cx.notify();
     }
 
     pub(super) fn cancel_server_selection(&mut self, cx: &mut Context<Self>) {
-        self.select_server_task = Task::ready(());
-        self.set_selecting_server(None, cx);
+        self.server_effects.auth.cancel();
+        self.server_feature.dispatch(ServerIntent::CancelSelection);
+        self.sync_server_selection(cx);
     }
 
     fn server_selection_error(
@@ -28,7 +35,7 @@ impl TinyApp {
         message: impl Into<gpui::SharedString>,
         cx: &mut Context<Self>,
     ) {
-        if matches!(self.page, Page::Home(_)) {
+        if matches!(self.shell.page(), Page::Home(_)) {
             self.push_app_error_notification(message, cx);
         } else {
             self.push_server_error_notification(message, cx);
@@ -36,111 +43,110 @@ impl TinyApp {
     }
 
     pub(super) fn show_servers_page_from_home(&mut self, cx: &mut Context<Self>) {
-        self.open_server_menu = None;
+        self.clear_server_menu();
         self.cancel_server_selection(cx);
-        self.page = Page::Servers;
+        self.server_feature.enter_workspace(None);
+        self.shell.show_servers();
         cx.notify();
-    }
-
-    pub(super) fn select_server(
-        &mut self,
-        server: &CachedServer,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.begin_select_server(server, cx);
     }
 
     pub(super) fn begin_select_server(&mut self, server: &CachedServer, cx: &mut Context<Self>) {
         if self.server_icon_picker.is_some() {
             return;
         }
-        // Clicking the current server cancels a pending sidebar switch without
-        // rebuilding its page or losing the current browsing position.
-        if let Page::Home(home) = &self.page
-            && home.read(cx).current_server_id() == server.id
-        {
+        let command = self
+            .server_feature
+            .dispatch(ServerIntent::SelectServer(server.id.clone()));
+        if matches!(command, ServerCommand::Ignored) {
+            return;
+        }
+        if matches!(command, ServerCommand::Cancelled) {
             self.cancel_server_selection(cx);
             return;
         }
-        // Cards and sidebar items can hold snapshots from before a server edit.
-        let Some(server) = self
-            .servers
-            .iter()
-            .find(|current| current.id == server.id)
-            .cloned()
-        else {
-            return;
-        };
-        if self.selecting_server_id.as_deref() == Some(&server.id) {
-            return;
-        }
-        self.open_server_menu = None;
+        self.clear_server_menu();
         self.clear_app_notifications();
         self.clear_server_notifications();
-        self.cancel_server_selection(cx);
-
-        let server_id = server.id.clone();
-        if server.can_reuse_auth() {
-            self.open_home_for_server(server.clone(), cx);
-            self.load_item_counts_for_server_id(&server_id, cx);
-            cx.notify();
-            return;
+        self.server_effects.auth.cancel();
+        match command {
+            ServerCommand::Open(server) => {
+                let id = server.id.clone();
+                self.open_home_for_server(*server, cx);
+                self.load_item_counts_for_server_id(&id, cx);
+                cx.notify();
+            }
+            ServerCommand::Authenticate(request) => {
+                let Some(client) = self.emby_client.clone() else {
+                    self.server_feature.selection_failed();
+                    self.sync_server_selection(cx);
+                    self.server_selection_error("Emby HTTP 客户端不可用", cx);
+                    return;
+                };
+                self.sync_server_selection(cx);
+                if !matches!(self.shell.page(), Page::Home(_)) {
+                    self.shell.show_servers();
+                }
+                let task_server = request.server.clone();
+                let task =
+                    cx.background_spawn(async move { authenticate_server(&client, &task_server) });
+                self.server_effects
+                    .auth
+                    .replace(cx.spawn(async move |app, cx| {
+                        let result = task.await;
+                        app.update(cx, |app, cx| {
+                            app.finish_select_server(request.server, request.token, result, cx)
+                        })
+                        .ok();
+                    }));
+            }
+            ServerCommand::Ignored
+            | ServerCommand::Cancelled
+            | ServerCommand::CatalogChanged
+            | ServerCommand::DownloadIcon(_)
+            | ServerCommand::PreviewChanged => unreachable!(),
         }
+    }
 
-        let Some(client) = self.emby_client.clone() else {
-            self.server_selection_error("Emby HTTP 客户端不可用", cx);
-            cx.notify();
-            return;
-        };
-        self.set_selecting_server(Some(server_id), cx);
-        if !matches!(self.page, Page::Home(_)) {
-            self.page = Page::Servers;
-        }
-        cx.notify();
-
-        let request = server.clone();
-        let task = cx.background_spawn(async move { authenticate_server(&client, &request) });
-        self.select_server_task = cx.spawn(async move |app, cx| {
-            let result = task.await;
-            app.update(cx, |app, cx| app.finish_select_server(server, result, cx))
-                .ok();
-        });
+    #[cfg(test)]
+    fn begin_authentication_token(&mut self, server: &CachedServer) -> RequestToken {
+        self.server_feature
+            .begin_authentication(server.clone())
+            .token
     }
 
     fn finish_select_server(
         &mut self,
         requested: CachedServer,
+        token: RequestToken,
         result: Result<CachedServer>,
         cx: &mut Context<Self>,
     ) {
-        if self.selecting_server_id.as_deref() != Some(&requested.id) {
-            return;
-        }
-        self.set_selecting_server(None, cx);
-        // An edit or deletion while the request was running invalidates its result.
-        if !self.servers.iter().any(|current| {
-            current.id == requested.id
-                && current.endpoint == requested.endpoint
-                && current.username == requested.username
-                && current.password == requested.password
-                && current.needs_auth_refresh == requested.needs_auth_refresh
-        }) {
-            cx.notify();
-            return;
-        }
-
+        let result = match self.server_feature.finish_authentication(
+            &AuthRequest {
+                server: requested,
+                token,
+            },
+            result,
+        ) {
+            AuthResult::Ignored => return,
+            AuthResult::Invalidated => {
+                self.sync_server_selection(cx);
+                return;
+            }
+            AuthResult::Ready(result) => result.map(|server| *server),
+        };
+        self.sync_server_selection(cx);
         let result = result.and_then(|server| {
             self.save_server(server.clone(), true)?;
             Ok(server)
         });
         match result {
             Ok(server) => {
-                self.servers = self.cache.servers.clone();
                 self.refresh_saved_server_counts(&server.id, cx);
                 self.open_home_for_server(server, cx);
             }
             Err(error) => {
+                self.server_feature.selection_failed();
                 self.server_selection_error(format!("登录服务器失败：{error}"), cx);
             }
         }
@@ -149,61 +155,40 @@ impl TinyApp {
 
     fn open_home_for_server(&mut self, server: CachedServer, cx: &mut Context<Self>) {
         let Some(client) = self.emby_client.clone() else {
-            self.set_selecting_server(None, cx);
+            self.cancel_server_selection(cx);
             self.server_selection_error("Emby HTTP 客户端不可用", cx);
             return;
         };
 
-        self.selecting_server_id = None;
+        self.server_feature.enter_workspace(Some(server.id.clone()));
         self.clear_server_notifications();
-        let servers = self.servers.clone();
+        let servers = self.server_feature.sidebar_servers();
+        let identity = server.workspace_identity();
         let home_page = cx.new(|cx| HomePage::new(server, servers, client, cx));
         home_page.update(cx, |home, cx| {
             home.set_search_history(self.cache.search_history.clone(), cx);
         });
-        let playback_return_to = home_page.clone();
-        cx.subscribe(
+        let token = self.shell.mount_home(home_page.clone(), identity);
+        let source = token.clone();
+        let subscription = cx.subscribe(
             &home_page,
-            move |app: &mut TinyApp, _, event, cx| match event {
-                HomeEvent::BackToServers => app.show_servers_page_from_home(cx),
-                HomeEvent::AddServer => app.show_add_server_dialog(cx),
-                HomeEvent::ReorderServer {
-                    server_id,
-                    target_id,
-                } => {
-                    app.reorder_server(server_id, target_id, cx);
-                }
-                HomeEvent::SwitchServer(server_id) => {
-                    if let Some(server) = app
-                        .servers
-                        .iter()
-                        .find(|server| &server.id == server_id)
-                        .cloned()
-                    {
-                        app.begin_select_server(&server, cx);
-                    }
-                }
-                HomeEvent::SectionChanged | HomeEvent::TitleChanged => cx.notify(),
-                HomeEvent::SearchHistoryChanged(history) => {
-                    app.cache.search_history = history.clone();
-                    app.schedule_cache_save("保存搜索历史失败", cx);
-                }
-                HomeEvent::OpenSettings => app.open_settings_window(cx),
-                HomeEvent::OpenPlayback(request) => {
-                    app.open_playback_page(playback_return_to.clone(), request.as_ref().clone(), cx)
-                }
+            move |app: &mut TinyApp, _, event: &HomeEvent, cx| {
+                app.dispatch_app_intent(
+                    AppIntent::Home {
+                        source: source.clone(),
+                        event: event.clone(),
+                    },
+                    cx,
+                );
             },
-        )
-        .detach();
-        self.page = Page::Home(home_page);
+        );
+        self.shell.subscribe_home(&token, subscription);
     }
 
-    fn open_playback_page(
-        &mut self,
-        return_to: Entity<HomePage>,
-        request: PlaybackRequest,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn open_playback_page(&mut self, request: PlaybackRequest, cx: &mut Context<Self>) {
+        if self.shell.home().is_none() {
+            return;
+        }
         // Playback on the retained page takes precedence over an in-flight switch.
         self.cancel_server_selection(cx);
         let playback_cache_config = self.cache.playback.clone();
@@ -216,48 +201,56 @@ impl TinyApp {
                 cx,
             )
         });
-        cx.subscribe(
+        self.mount_playback_page(playback_page, cx);
+    }
+
+    pub(super) fn mount_playback_page(
+        &mut self,
+        playback_page: gpui::Entity<crate::player::PlaybackPage>,
+        cx: &mut Context<Self>,
+    ) {
+        let token = self
+            .shell
+            .mount_playback(playback_page.clone())
+            .expect("playback retains mounted Home");
+        let source = token.clone();
+        let subscription = cx.subscribe(
             &playback_page,
-            |app: &mut TinyApp, _, event, cx| match event {
-                PlaybackEvent::VolumeChanged { settings } => {
-                    app.update_playback_volume(*settings, cx);
-                }
-                PlaybackEvent::Update { update } => app.update_playback_origin(update.clone(), cx),
-                PlaybackEvent::Back { update } => app.return_to_playback_origin(update.clone(), cx),
-                PlaybackEvent::Replace { request, update } => {
-                    app.replace_playback_page(request.as_ref().clone(), update.clone(), cx)
-                }
+            move |app: &mut TinyApp, _, event: &crate::player::PlaybackEvent, cx| {
+                app.dispatch_app_intent(
+                    AppIntent::Playback {
+                        source: source.clone(),
+                        event: event.clone(),
+                    },
+                    cx,
+                );
             },
-        )
-        .detach();
-        self.page = Page::Playback {
-            page: playback_page,
-            return_to,
-        };
+        );
+        self.shell.subscribe_playback(&token, subscription);
         cx.notify();
     }
 
-    fn return_to_playback_origin(
+    pub(super) fn return_to_playback_origin(
         &mut self,
         update: crate::player::PlaybackStateUpdate,
         cx: &mut Context<Self>,
     ) {
-        let Page::Playback { return_to, .. } = &self.page else {
+        let Page::Playback { return_to, .. } = self.shell.page() else {
             return;
         };
         return_to.update(cx, |page, cx| {
             page.apply_playback_update(update, cx);
         });
-        self.page = Page::Home(return_to.clone());
+        self.shell.return_home();
         cx.notify();
     }
 
-    fn update_playback_origin(
+    pub(super) fn update_playback_origin(
         &mut self,
         update: crate::player::PlaybackStateUpdate,
         cx: &mut Context<Self>,
     ) {
-        let Page::Playback { return_to, .. } = &self.page else {
+        let Page::Playback { return_to, .. } = self.shell.page() else {
             return;
         };
         return_to.update(cx, |page, cx| {
@@ -265,26 +258,27 @@ impl TinyApp {
         });
     }
 
-    fn replace_playback_page(
+    pub(super) fn replace_playback_page(
         &mut self,
         request: PlaybackRequest,
         update: crate::player::PlaybackStateUpdate,
         cx: &mut Context<Self>,
     ) {
-        let Page::Playback { return_to, .. } = &self.page else {
+        let Page::Playback { return_to, .. } = self.shell.page() else {
             return;
         };
         let return_to = return_to.clone();
         return_to.update(cx, |page, cx| {
             page.apply_playback_update(update, cx);
         });
-        self.open_playback_page(return_to, request, cx);
+        self.open_playback_page(request, cx);
     }
 }
 
 #[cfg(test)]
 mod tests {
     mod search_history;
+    mod shell_routes;
     mod sidebar_switch;
 
     use super::*;
@@ -312,18 +306,29 @@ mod tests {
             app
         });
         app.update(cx, |app, cx| {
-            app.selecting_server_id = Some(requested.id.clone());
             let response = CachedServer {
                 user_id: Some("user-id".into()),
                 access_token: Some("old-login-token".into()),
                 ..requested.clone()
             };
-            app.finish_select_server(requested, Ok(response), cx);
-            assert!(matches!(app.page, Page::Servers));
-            assert!(app.selecting_server_id.is_none());
-            assert_eq!(app.servers[0].password, "edited-password");
-            assert!(app.servers[0].access_token.is_none());
-            assert!(app.cache.servers[0].access_token.is_none());
+            let token = app.begin_authentication_token(&requested);
+            app.finish_select_server(requested, token, Ok(response), cx);
+            assert!(matches!(app.shell.page(), Page::Servers));
+            assert!(app.server_feature.selecting_server_id().is_none());
+            assert_eq!(
+                app.server_feature.catalog().servers[0].password,
+                "edited-password"
+            );
+            assert!(
+                app.server_feature.catalog().servers[0]
+                    .access_token
+                    .is_none()
+            );
+            assert!(
+                app.server_feature.catalog().servers[0]
+                    .access_token
+                    .is_none()
+            );
         });
         assert!(!path.exists(), "a stale response must not write the cache");
     }
@@ -348,7 +353,7 @@ mod tests {
                 .collect();
             let mut app = TinyApp::new(cache, None, cx);
             app.window_persistence_enabled = false;
-            app.open_home_for_server(app.servers[0].clone(), cx);
+            app.open_home_for_server(app.server_feature.catalog().servers[0].clone(), cx);
             app
         });
         cx.simulate_resize(size(px(1100.0), px(720.0)));
@@ -359,7 +364,7 @@ mod tests {
     #[gpui::test]
     fn sidebar_switches_with_cached_auth_and_authenticates_without_it(cx: &mut TestAppContext) {
         let (app, cx) = sidebar_window(cx);
-        let original_home = app.read_with(cx, |app, _| match &app.page {
+        let original_home = app.read_with(cx, |app, _| match app.shell.page() {
             Page::Home(home) => home.entity_id(),
             _ => panic!("expected initial home page"),
         });
@@ -367,7 +372,9 @@ mod tests {
         cx.simulate_click(current.center(), Modifiers::default());
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
-            assert!(matches!(&app.page, Page::Home(home) if home.entity_id() == original_home));
+            assert!(
+                matches!(app.shell.page(), Page::Home(home) if home.entity_id() == original_home)
+            );
         });
 
         let mut previous_home = original_home;
@@ -376,10 +383,10 @@ mod tests {
             cx.simulate_click(target.center(), Modifiers::default());
             cx.run_until_parked();
             let switched_home = app.read_with(cx, |app, _| {
-                let Page::Home(home) = &app.page else {
+                let Page::Home(home) = app.shell.page() else {
                     panic!("cached authentication must switch directly to Home");
                 };
-                assert!(app.selecting_server_id.is_none());
+                assert!(app.server_feature.selecting_server_id().is_none());
                 home.entity_id()
             });
             assert_ne!(switched_home, previous_home);
@@ -388,7 +395,7 @@ mod tests {
             cx.simulate_click(current.center(), Modifiers::default());
             cx.run_until_parked();
             app.read_with(cx, |app, _| {
-                assert!(matches!(&app.page, Page::Home(home) if home.entity_id() == switched_home));
+                assert!(matches!(app.shell.page(), Page::Home(home) if home.entity_id() == switched_home));
             });
             previous_home = switched_home;
         }
@@ -397,8 +404,10 @@ mod tests {
         cx.simulate_click(target.center(), Modifiers::default());
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
-            assert!(matches!(&app.page, Page::Home(home) if home.entity_id() == previous_home));
-            assert!(app.selecting_server_id.is_none());
+            assert!(
+                matches!(app.shell.page(), Page::Home(home) if home.entity_id() == previous_home)
+            );
+            assert!(app.server_feature.selecting_server_id().is_none());
             assert!(app.has_app_notifications());
         });
     }

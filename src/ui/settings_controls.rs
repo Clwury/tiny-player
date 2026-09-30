@@ -8,6 +8,7 @@ use gpui::{
     Subscription, Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px, svg,
 };
 
+use crate::effects::{RequestScope, RequestSlot, RequestToken, WorkspaceIdentity};
 use crate::ui::radius;
 use crate::{
     player::{HardwareDecodeMode, TrackLanguage},
@@ -177,7 +178,7 @@ pub(crate) fn toggle_switch(
 
 pub(crate) fn disk_cache_capacity_input<T: 'static>(
     bytes: u64,
-    on_change: impl Fn(&mut T, u64, &mut Context<T>) + 'static,
+    on_change: impl Fn(&mut T, String, &mut Context<T>) + 'static,
     cx: &mut Context<T>,
 ) -> Entity<Editor> {
     let input = cx.new(|cx| {
@@ -191,17 +192,8 @@ pub(crate) fn disk_cache_capacity_input<T: 'static>(
             .max_chars(12)
     });
     cx.subscribe(&input, move |this, input, event, cx| {
-        if matches!(event, EditorEvent::Changed)
-            && let Some(bytes) = input
-                .read(cx)
-                .value()
-                .trim()
-                .parse::<u64>()
-                .ok()
-                .and_then(|value| value.checked_mul(BYTES_PER_GIB))
-                .filter(|value| *value > 0)
-        {
-            on_change(this, bytes, cx);
+        if matches!(event, EditorEvent::Changed) {
+            on_change(this, input.read(cx).value().to_string(), cx);
         }
     })
     .detach();
@@ -239,6 +231,11 @@ pub(crate) struct DropdownState {
     active: usize,
     focus: FocusHandle,
     blur_subscription: Option<Subscription>,
+    // Owned by this dropdown entity. Each show replaces the deferred focus;
+    // close invalidates it and release drops the slot. GPUI frame callbacks
+    // cannot be removed, so weak-entity + token checks cancel delivery. This
+    // account-independent UI operation has no business error notification.
+    pending_focus: RequestSlot,
 }
 
 impl DropdownState {
@@ -250,10 +247,15 @@ impl DropdownState {
             active: 0,
             focus,
             blur_subscription: None,
+            pending_focus: RequestSlot::new(
+                RequestScope::DropdownFocus,
+                WorkspaceIdentity::default(),
+            ),
         }
     }
 
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
+        self.pending_focus.invalidate();
         if self.open.take().is_some() {
             cx.notify();
         }
@@ -270,19 +272,30 @@ impl DropdownState {
         self.active = selected;
         // Like Zed's PopoverMenu, focus after deferred menu drawing has joined
         // the dispatch tree. A menu dismissed in the meantime must stay closed.
+        let token = self.pending_focus.issue();
         let state = cx.weak_entity();
         window.on_next_frame(move |window, _| {
             window.on_next_frame(move |window, cx| {
                 state
                     .update(cx, |state, cx| {
-                        if state.open == Some(id) {
-                            state.focus.focus(window, cx);
-                        }
+                        state.finish_focus(id, &token, window, cx);
                     })
                     .ok();
             });
         });
         cx.notify();
+    }
+
+    fn finish_focus(
+        &mut self,
+        id: &'static str,
+        token: &RequestToken,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.open == Some(id) && self.pending_focus.commit(token) {
+            self.focus.focus(window, cx);
+        }
     }
 }
 
@@ -831,6 +844,8 @@ impl RenderOnce for NumberControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod dropdown_focus;
 
     #[test]
     fn stepper_clamps_limits_and_recovers_invalid_input_from_saved_value() {

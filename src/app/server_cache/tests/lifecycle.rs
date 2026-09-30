@@ -159,7 +159,7 @@ fn newly_added_sidebar_server_authenticates_without_returning_to_cards(cx: &mut 
     });
     cx.simulate_resize(size(px(1100.0), px(720.0)));
     cx.run_until_parked();
-    let original_home = app.read_with(cx, |app, _| match &app.page {
+    let original_home = app.read_with(cx, |app, _| match app.shell.page() {
         Page::Home(home) => home.entity_id(),
         _ => panic!("adding a server must retain Home"),
     });
@@ -169,7 +169,7 @@ fn newly_added_sidebar_server_authenticates_without_returning_to_cards(cx: &mut 
         cx.observe(&app, {
             let saw_cards = saw_cards.clone();
             move |app, cx| {
-                if matches!(app.read(cx).page, Page::Servers) {
+                if matches!(app.read(cx).shell.page(), Page::Servers) {
                     saw_cards.set(true);
                 }
             }
@@ -185,12 +185,12 @@ fn newly_added_sidebar_server_authenticates_without_returning_to_cards(cx: &mut 
     );
     assert!(cx.debug_bounds("server-card-current").is_none());
     app.read_with(cx, |app, cx| {
-        let Page::Home(home) = &app.page else {
+        let Page::Home(home) = app.shell.page() else {
             panic!("expected target Home");
         };
         assert_ne!(home.entity_id(), original_home);
         assert_eq!(home.read(cx).current_server_id(), added.id);
-        assert!(app.selecting_server_id.is_none());
+        assert!(app.server_feature.selecting_server_id().is_none());
     });
     let saved = storage::load_or_init_from(&path).unwrap();
     assert_eq!(saved.servers[1].access_token.as_deref(), Some("token-1"));
@@ -212,7 +212,7 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
         app.add_server_dialog = Some(dialog.clone());
         app.finish_save_server(dialog, Ok(pending.clone()), cx);
         assert!(app.add_server_dialog.is_none());
-        assert!(matches!(app.page, Page::Servers));
+        assert!(matches!(app.shell.page(), Page::Servers));
     });
     cx.run_until_parked();
     assert_eq!(mock.auth_count(), 0);
@@ -234,25 +234,33 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
         app.begin_select_server(&pending, cx);
         app.begin_select_server(&pending, cx);
         assert_eq!(
-            app.selecting_server_id.as_deref(),
+            app.server_feature.selecting_server_id(),
             Some(pending.id.as_str())
         );
     });
     cx.run_until_parked();
     assert_eq!(mock.auth_count(), 1);
     app.read_with(cx, |app, _| {
-        assert!(matches!(app.page, Page::Home(_)));
-        assert!(app.selecting_server_id.is_none());
-        assert_eq!(app.servers[0].access_token.as_deref(), Some("token-1"));
-        assert!(!app.servers[0].needs_auth_refresh);
+        assert!(matches!(app.shell.page(), Page::Home(_)));
+        assert!(app.server_feature.selecting_server_id().is_none());
+        assert_eq!(
+            app.server_feature.catalog().servers[0]
+                .access_token
+                .as_deref(),
+            Some("token-1")
+        );
+        assert!(!app.server_feature.catalog().servers[0].needs_auth_refresh);
         assert!(
-            app.servers[0]
+            app.server_feature.catalog().servers[0]
                 .icon_url
                 .as_deref()
                 .unwrap()
                 .ends_with("/UHD-emby.png")
         );
-        assert_eq!(app.item_counts[&pending.id].movie_count, 15296);
+        assert_eq!(
+            app.server_feature.test_state().counts[&pending.id].movie_count,
+            15296
+        );
     });
 
     app.update(cx, |app, cx| {
@@ -286,27 +294,34 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
     let edited =
         prepare_server(&client, &edited_submission, Some(&previously_authenticated)).unwrap();
     app.update(cx, |app, cx| {
-        let dialog = cx.new(|cx| AddServerDialogState::new_edit(&previously_authenticated, cx));
+        let dialog =
+            cx.new(|cx| AddServerDialogState::from_props((&previously_authenticated).into(), cx));
         app.add_server_dialog = Some(dialog.clone());
         app.finish_save_server(dialog, Ok(edited), cx);
         assert_eq!(
-            app.servers[0].access_token,
+            app.server_feature.catalog().servers[0].access_token,
             previously_authenticated.access_token
         );
-        assert_eq!(app.servers[0].user_id, previously_authenticated.user_id);
         assert_eq!(
-            app.servers[0].server_name,
+            app.server_feature.catalog().servers[0].user_id,
+            previously_authenticated.user_id
+        );
+        assert_eq!(
+            app.server_feature.catalog().servers[0].server_name,
             previously_authenticated.server_name
         );
-        assert!(app.servers[0].needs_auth_refresh);
+        assert!(app.server_feature.catalog().servers[0].needs_auth_refresh);
         assert!(
-            app.servers[0]
+            app.server_feature.catalog().servers[0]
                 .icon_url
                 .as_deref()
                 .unwrap()
                 .ends_with("/UHD-emby.png")
         );
-        assert_eq!(app.item_counts[&pending.id].movie_count, 15296);
+        assert_eq!(
+            app.server_feature.test_state().counts[&pending.id].movie_count,
+            15296
+        );
     });
     cx.run_until_parked();
     assert_eq!(mock.auth_count(), 1, "saving an edit must not authenticate");
@@ -330,12 +345,17 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
     cx.run_until_parked();
     assert_eq!(mock.auth_count(), 2);
     app.read_with(cx, |app, _| {
-        assert!(matches!(app.page, Page::Home(_)));
-        assert_eq!(app.servers[0].id, pending.id);
-        assert_eq!(app.servers[0].access_token.as_deref(), Some("token-2"));
-        assert!(!app.servers[0].needs_auth_refresh);
+        assert!(matches!(app.shell.page(), Page::Home(_)));
+        assert_eq!(app.server_feature.catalog().servers[0].id, pending.id);
+        assert_eq!(
+            app.server_feature.catalog().servers[0]
+                .access_token
+                .as_deref(),
+            Some("token-2")
+        );
+        assert!(!app.server_feature.catalog().servers[0].needs_auth_refresh);
         assert!(
-            app.servers[0]
+            app.server_feature.catalog().servers[0]
                 .icon_url
                 .as_deref()
                 .unwrap()
@@ -385,14 +405,26 @@ fn failed_entry_preserves_pending_and_existing_caches_and_can_be_retried(cx: &mu
         assert_eq!(mock.auth_count(), 1);
         let before = serde_json::to_value(&server).unwrap();
         app.read_with(cx, |app, _| {
-            assert!(matches!(app.page, Page::Servers));
-            assert!(app.selecting_server_id.is_none());
+            assert!(matches!(app.shell.page(), Page::Servers));
+            assert!(app.server_feature.selecting_server_id().is_none());
             assert!(app.has_server_page_notifications());
-            assert_eq!(serde_json::to_value(&app.servers[0]).unwrap(), before);
-            assert_eq!(serde_json::to_value(&app.cache.servers[0]).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(&app.server_feature.catalog().servers[0]).unwrap(),
+                before
+            );
+            assert_eq!(
+                serde_json::to_value(&app.server_feature.catalog().servers[0]).unwrap(),
+                before
+            );
             if after_edit {
-                assert_eq!(app.item_counts[&server.id].movie_count, 10);
-                assert_eq!(app.item_counts[&server.id].series_count, 20);
+                assert_eq!(
+                    app.server_feature.test_state().counts[&server.id].movie_count,
+                    10
+                );
+                assert_eq!(
+                    app.server_feature.test_state().counts[&server.id].series_count,
+                    20
+                );
             }
         });
         assert_eq!(
@@ -403,10 +435,18 @@ fn failed_entry_preserves_pending_and_existing_caches_and_can_be_retried(cx: &mu
         cx.run_until_parked();
         assert_eq!(mock.auth_count(), 2);
         app.read_with(cx, |app, _| {
-            assert!(matches!(app.page, Page::Home(_)));
-            assert!(!app.servers[0].needs_auth_refresh);
-            assert_eq!(app.servers[0].access_token.as_deref(), Some("token-2"));
-            assert_eq!(app.item_counts[&server.id].movie_count, 15296);
+            assert!(matches!(app.shell.page(), Page::Home(_)));
+            assert!(!app.server_feature.catalog().servers[0].needs_auth_refresh);
+            assert_eq!(
+                app.server_feature.catalog().servers[0]
+                    .access_token
+                    .as_deref(),
+                Some("token-2")
+            );
+            assert_eq!(
+                app.server_feature.test_state().counts[&server.id].movie_count,
+                15296
+            );
         });
         drop(app);
         cx.run_until_parked();
@@ -435,18 +475,40 @@ fn count_refresh_failure_after_edit_preserves_cached_totals_until_success(cx: &m
     mock.reject_next_counts.store(true, Ordering::SeqCst);
     app.update(cx, |app, cx| {
         app.begin_select_server(&server, cx);
-        assert_eq!(app.item_counts[&server.id].movie_count, 10);
+        assert_eq!(
+            app.server_feature.test_state().counts[&server.id].movie_count,
+            10
+        );
     });
     cx.run_until_parked();
     assert_eq!(mock.auth_count(), 1);
     app.read_with(cx, |app, _| {
-        assert!(matches!(app.page, Page::Home(_)));
-        assert!(!app.servers[0].needs_auth_refresh);
-        assert_eq!(app.servers[0].access_token.as_deref(), Some("token-1"));
-        assert!(app.item_counts_failed.contains(&server.id));
-        assert_eq!(app.item_counts[&server.id].movie_count, 10);
-        assert_eq!(app.item_counts[&server.id].series_count, 20);
-        assert_eq!(app.cache.servers[0].item_counts, server.item_counts);
+        assert!(matches!(app.shell.page(), Page::Home(_)));
+        assert!(!app.server_feature.catalog().servers[0].needs_auth_refresh);
+        assert_eq!(
+            app.server_feature.catalog().servers[0]
+                .access_token
+                .as_deref(),
+            Some("token-1")
+        );
+        assert!(
+            app.server_feature
+                .test_state()
+                .counts_failed
+                .contains(&server.id)
+        );
+        assert_eq!(
+            app.server_feature.test_state().counts[&server.id].movie_count,
+            10
+        );
+        assert_eq!(
+            app.server_feature.test_state().counts[&server.id].series_count,
+            20
+        );
+        assert_eq!(
+            app.server_feature.catalog().servers[0].item_counts,
+            server.item_counts
+        );
     });
     assert_eq!(
         storage::load_or_init_from(&path).unwrap().servers[0].item_counts,
@@ -454,13 +516,27 @@ fn count_refresh_failure_after_edit_preserves_cached_totals_until_success(cx: &m
     );
     app.update(cx, |app, cx| {
         app.refresh_saved_server_counts(&server.id, cx);
-        assert_eq!(app.item_counts[&server.id].movie_count, 10);
+        assert_eq!(
+            app.server_feature.test_state().counts[&server.id].movie_count,
+            10
+        );
     });
     cx.run_until_parked();
     app.update(cx, |app, cx| {
-        assert!(!app.item_counts_failed.contains(&server.id));
-        assert_eq!(app.item_counts[&server.id].movie_count, 15296);
-        assert_eq!(app.item_counts[&server.id].series_count, 13625);
+        assert!(
+            !app.server_feature
+                .test_state()
+                .counts_failed
+                .contains(&server.id)
+        );
+        assert_eq!(
+            app.server_feature.test_state().counts[&server.id].movie_count,
+            15296
+        );
+        assert_eq!(
+            app.server_feature.test_state().counts[&server.id].series_count,
+            13625
+        );
         app.flush_scheduled_cache_save(cx);
     });
     assert_eq!(

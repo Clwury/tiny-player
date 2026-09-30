@@ -1,4 +1,7 @@
+use crate::home::detail::test_fixture::detail_binding;
+use crate::home::played::PlayedRequest;
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     net::TcpListener,
     sync::{
@@ -14,9 +17,10 @@ use serde_json::json;
 
 use super::*;
 use crate::{
-    emby::{EmbyClient, SortOrder, UserItemsSort, VideoItemType},
+    emby::{EmbyClient, UserItemData, VideoItemType},
     home::{
-        UserViewItemsRow, library::LibraryState, navigation::HomeRoot, paged_items::PagedItemsState,
+        UserViewItemsRow, library::controller::LibraryController, navigation::HomeRoot,
+        paged_items::PagedItemsState,
     },
     theme,
 };
@@ -220,16 +224,16 @@ fn detail_window<'a>(
         })).unwrap();
         let mut page = HomeContent::new(server, EmbyClient::new("test".into()).unwrap(), cx);
         let item = json!({"Id":"series-1", "Name":"Series", "Type":"Series", "UserData":{"Played":false,"IsFavorite":false}});
-        let mut detail = SeriesDetailState::from_user_item(&serde_json::from_value(item.clone()).unwrap()).unwrap();
-        detail.item = Some(serde_json::from_value(item).unwrap());
-        detail.episodes = Some(serde_json::from_value(json!({"Items":[
+        let mut detail = DetailFixture::from_user_item(&serde_json::from_value(item.clone()).unwrap(), Default::default()).unwrap();
+        detail.controller.state.item = Some(serde_json::from_value(item).unwrap());
+        detail.controller.state.episodes = Some(serde_json::from_value(json!({"Items":[
             {"Id":"episode-1","Name":"First","Type":"Episode","SeriesId":"series-1","IndexNumber":1,"UserData":{"Played":false,"IsFavorite":false}},
             {"Id":"episode-2","Name":"Second","Type":"Episode","SeriesId":"series-1","IndexNumber":2,"UserData":{"Played":false,"IsFavorite":false}}
         ]})).unwrap());
-        detail.selected_episode_id = Some("episode-1".into());
-        detail.selected_season_id = Some("season-1".into());
-        page.navigation.push_detail("series-1".into(), None);
-        page.series_detail = Some(detail);
+        detail.controller.state.selected_episode_id = Some("episode-1".into());
+        detail.controller.state.selected_season_id = Some("season-1".into());
+        page.controller.test_state_mut().navigation.push_detail_route_fixture("series-1".into(), None);
+        page.install_detail_fixture(Some(detail));
         page
     });
     cx.simulate_resize(size(px(1200.0), px(1000.0)));
@@ -251,9 +255,9 @@ fn home_menu_window<'a>(
 ) -> (Entity<HomeContent>, &'a mut VisualTestContext) {
     let (page, cx) = detail_window(cx, server);
     page.update(cx, |page, cx| {
-        page.navigation.select_root(HomeRoot::Home);
-        page.series_detail = None;
-        page.user_views = Some(serde_json::from_value(json!({"Items": [
+        page.controller.test_state_mut().navigation.select_root(HomeRoot::Home);
+        page.install_detail_fixture(None);
+        page.controller.test_state_mut().feed.state.user_views = Some(serde_json::from_value(json!({"Items": [
             {"Id": "videos", "Name": "Videos", "CollectionType": "movies"}
         ], "TotalRecordCount": 1})).unwrap());
         let items = json!([
@@ -262,11 +266,11 @@ fn home_menu_window<'a>(
             {"Id":"episode-1", "Name":"First", "Type":"Episode", "SeriesId":"series-1", "UserData":{"Played":false,"IsFavorite":false}},
             {"Id":"episode-2", "Name":"Second", "Type":"Episode", "SeriesId":"series-1", "UserData":{"Played":false,"IsFavorite":false}}
         ]);
-        page.user_view_items_rows.insert("videos".into(), UserViewItemsRow {
+        page.controller.test_state_mut().feed.state.user_view_items_rows.insert("videos".into(), UserViewItemsRow {
             items: Some(serde_json::from_value(json!({"Items": items, "TotalRecordCount":4})).unwrap()),
             ..UserViewItemsRow::default()
         });
-        page.resume_items = Some(serde_json::from_value(json!({
+        page.controller.test_state_mut().feed.state.resume_items = Some(serde_json::from_value(json!({
             "Items": [items[0].clone(), items[2].clone(), items[3].clone()], "TotalRecordCount": 3
         })).unwrap());
         cx.notify();
@@ -314,9 +318,13 @@ fn cover_and_resume_menus_toggle_the_clicked_item_favorite_without_removing_it(
             } else {
                 "episode-1"
             };
-            assert_eq!(page.user_item_by_id(id).unwrap().is_favorite(), desired);
             assert_eq!(
-                page.resume_item_by_id(id)
+                page.controller.user_item_by_id(id).unwrap().is_favorite(),
+                desired
+            );
+            assert_eq!(
+                page.controller
+                    .resume_item_by_id(id)
                     .unwrap()
                     .user_data
                     .unwrap()
@@ -324,9 +332,24 @@ fn cover_and_resume_menus_toggle_the_clicked_item_favorite_without_removing_it(
                 desired
             );
             assert!(page.item_context_menu.is_none());
-            assert!(page.favorite_requests.is_empty());
-            assert_eq!(page.resume_items.as_ref().unwrap().total_record_count, 3);
-            assert!(page.favorites[VideoItemType::Movie].paged.dirty);
+            assert!(!page.controller.favorite_pending());
+            assert_eq!(
+                page.controller
+                    .test_state()
+                    .feed
+                    .state
+                    .resume_items
+                    .as_ref()
+                    .unwrap()
+                    .total_record_count,
+                3
+            );
+            assert!(
+                page.controller
+                    .favorite_section(VideoItemType::Movie)
+                    .paged
+                    .dirty
+            );
         });
     }
     assert_eq!(
@@ -357,20 +380,51 @@ fn cover_menu_marks_movies_episodes_and_whole_series_played_and_updates_resume(
         right_click(cx, card);
         click(cx, "user-view-item-mark-played");
         page.read_with(cx, |page, _| {
-            assert!(page.user_data_overrides[id].played);
-            assert!(page.user_item_by_id(id).unwrap().user_data.unwrap().played);
-            assert_eq!(page.resume_items.as_ref().unwrap().items.len(), remaining);
+            assert!(page.controller.test_state().user_data.overrides[id].played);
+            assert!(
+                page.controller
+                    .user_item_by_id(id)
+                    .unwrap()
+                    .user_data
+                    .unwrap()
+                    .played
+            );
             assert_eq!(
-                page.resume_items.as_ref().unwrap().total_record_count as usize,
+                page.controller
+                    .test_state()
+                    .feed
+                    .state
+                    .resume_items
+                    .as_ref()
+                    .unwrap()
+                    .items
+                    .len(),
                 remaining
             );
-            assert!(page.played_request.is_none());
-            assert!(page.user_data_overrides["episode-1"].is_favorite);
+            assert_eq!(
+                page.controller
+                    .test_state()
+                    .feed
+                    .state
+                    .resume_items
+                    .as_ref()
+                    .unwrap()
+                    .total_record_count as usize,
+                remaining
+            );
+            assert!(!page.controller.test_state().played_actions.has_pending());
+            assert!(page.controller.test_state().user_data.overrides["episode-1"].is_favorite);
         });
     }
     page.read_with(cx, |page, _| {
-        assert!(page.user_data_overrides["episode-2"].played);
-        assert!(page.series_user_data_revisions.contains_key("series-1"));
+        assert!(page.controller.test_state().user_data.overrides["episode-2"].played);
+        assert!(
+            page.controller
+                .test_state()
+                .user_data
+                .series_revisions
+                .contains_key("series-1")
+        );
         let snapshot = page.home_snapshot();
         assert!(snapshot.resume_items.unwrap().data.items.is_empty());
     });
@@ -398,15 +452,23 @@ fn resume_menu_keeps_played_and_hide_actions_after_favoriting(cx: &mut TestAppCo
     right_click(cx, "resume-item-card-episode-1");
     click(cx, "resume-item-hide-from-resume");
     page.read_with(cx, |page, _| {
-        let data = &page.user_data_overrides["movie-1"];
+        let data = &page.controller.test_state().user_data.overrides["movie-1"];
         assert!(data.is_favorite && data.played);
         assert_eq!(data.playback_position_ticks, Some(0));
-        let resume = page.resume_items.as_ref().unwrap();
+        let resume = page
+            .controller
+            .test_state()
+            .feed
+            .state
+            .resume_items
+            .as_ref()
+            .unwrap();
         assert_eq!(resume.items.len(), 1);
         assert_eq!(resume.total_record_count, 1);
         assert_eq!(resume.items[0].id, "episode-2");
         assert!(
             !page
+                .controller
                 .user_item_by_id("episode-1")
                 .unwrap()
                 .user_data
@@ -456,12 +518,28 @@ fn card_menu_failures_restore_favorites_and_keep_resume_items_with_visible_error
         right_click(cx, card);
         click(cx, option);
         page.update(cx, |page, _| {
-            let data = page.user_item_by_id(id).unwrap().user_data.unwrap();
+            let data = page
+                .controller
+                .user_item_by_id(id)
+                .unwrap()
+                .user_data
+                .unwrap();
             assert_eq!(data.is_favorite, favorite);
             assert!(!data.played);
-            assert_eq!(page.resume_items.as_ref().unwrap().items.len(), 3);
+            assert_eq!(
+                page.controller
+                    .test_state()
+                    .feed
+                    .state
+                    .resume_items
+                    .as_ref()
+                    .unwrap()
+                    .items
+                    .len(),
+                3
+            );
             assert!(page.has_visible_notifications());
-            assert!(!page.detail_user_data_pending());
+            assert!(!page.controller.user_data_pending());
             page.clear_all_notifications();
         });
     }
@@ -472,8 +550,17 @@ fn library_cover_menu_uses_library_item_and_shows_failure_in_that_library(cx: &m
     let server = MockEmby::new();
     let (page, cx) = home_menu_window(cx, &server);
     page.update(cx, |page, cx| {
-        let view = page.user_views.as_ref().unwrap().items[0].clone();
-        let items = page.user_view_items_rows["videos"]
+        let view = page
+            .controller
+            .test_state()
+            .feed
+            .state
+            .user_views
+            .as_ref()
+            .unwrap()
+            .items[0]
+            .clone();
+        let items = page.controller.test_state().feed.state.user_view_items_rows["videos"]
             .items
             .as_ref()
             .unwrap()
@@ -483,32 +570,47 @@ fn library_cover_menu_uses_library_item_and_shows_failure_in_that_library(cx: &m
         paged.items = items;
         paged.initial = LoadState::Loaded;
         paged.exhausted = true;
-        page.libraries.insert(
+        let mut library = LibraryController::new(
+            vec![VideoItemType::Movie],
             "videos".into(),
-            LibraryState {
-                title: "Videos".into(),
-                item_types: vec![VideoItemType::Movie],
-                sort_by: UserItemsSort::SortName,
-                sort_order: SortOrder::Ascending,
-                sort_menu_open: false,
-                paged,
-            },
+            page.request_identity(),
         );
+        *library.test_paged_mut() = paged;
+        page.controller
+            .test_state_mut()
+            .libraries
+            .insert("videos".into(), library);
         page.open_library_for_view(&view, cx);
     });
     cx.run_until_parked();
     right_click(cx, "library-grid-item-movie-1");
     click(cx, "user-view-item-favorite");
     page.read_with(cx, |page, _| {
-        assert!(page.user_item_by_id("movie-1").unwrap().is_favorite())
+        assert!(
+            page.controller
+                .user_item_by_id("movie-1")
+                .unwrap()
+                .is_favorite()
+        )
     });
     server.fail_next.store(true, Ordering::SeqCst);
     right_click(cx, "library-grid-item-movie-1");
     click(cx, "user-view-item-mark-played");
     page.read_with(cx, |page, _| {
         assert!(page.has_visible_notifications());
-        assert!(!page.user_data_overrides["movie-1"].played);
-        assert_eq!(page.resume_items.as_ref().unwrap().items.len(), 3);
+        assert!(!page.controller.test_state().user_data.overrides["movie-1"].played);
+        assert_eq!(
+            page.controller
+                .test_state()
+                .feed
+                .state
+                .resume_items
+                .as_ref()
+                .unwrap()
+                .items
+                .len(),
+            3
+        );
     });
 }
 
@@ -529,12 +631,12 @@ fn episode_buttons_use_selected_id_and_series_menu_uses_series_id(cx: &mut TestA
     click(cx, "series-detail-favorite-button");
     click(cx, "series-detail-played-button");
     page.read_with(cx, |page, _| {
-        assert!(page.user_data_overrides["episode-1"].is_favorite);
-        assert!(!page.user_data_overrides["episode-1"].played);
-        assert!(page.user_data_overrides["episode-2"].is_favorite);
-        assert!(page.user_data_overrides["episode-2"].played);
-        assert!(!page.user_data_overrides["series-1"].is_favorite);
-        assert!(!page.user_data_overrides["series-1"].played);
+        assert!(page.controller.test_state().user_data.overrides["episode-1"].is_favorite);
+        assert!(!page.controller.test_state().user_data.overrides["episode-1"].played);
+        assert!(page.controller.test_state().user_data.overrides["episode-2"].is_favorite);
+        assert!(page.controller.test_state().user_data.overrides["episode-2"].played);
+        assert!(!page.controller.test_state().user_data.overrides["series-1"].is_favorite);
+        assert!(!page.controller.test_state().user_data.overrides["series-1"].played);
     });
     assert!(cx.debug_bounds("episode-watched").is_some());
     assert!(cx.debug_bounds("episode-unwatched").is_none());
@@ -545,8 +647,8 @@ fn episode_buttons_use_selected_id_and_series_menu_uses_series_id(cx: &mut TestA
     assert!(cx.debug_bounds("episode-unwatched").is_none());
     page.read_with(cx, |page, _| {
         for id in ["series-1", "episode-1", "episode-2"] {
-            assert!(page.user_data_overrides[id].played);
-            assert!(page.user_data_overrides[id].is_favorite);
+            assert!(page.controller.test_state().user_data.overrides[id].played);
+            assert!(page.controller.test_state().user_data.overrides[id].is_favorite);
         }
     });
     click(cx, "series-detail-more-button");
@@ -592,18 +694,21 @@ fn episode_played_uses_mutation_response_without_fetching_episode_items(cx: &mut
             ]
         );
         page.read_with(cx, |page, _| {
-            let detail = page.series_detail.as_ref().unwrap();
-            assert_eq!(detail.selected_episode_id.as_deref(), Some("episode-1"));
-            let episode = detail.selected_episode().unwrap();
+            let detail = page.detail_view().unwrap();
+            assert_eq!(
+                detail.model.selected_episode_id.as_deref(),
+                Some("episode-1")
+            );
+            let episode = detail.model.selected_episode().unwrap();
             let data = episode.user_data.as_ref().unwrap();
             assert_eq!(data.played, played);
             assert_eq!(data.played_percentage, played.then_some(23.5));
             assert_eq!(data.playback_position_ticks, played.then_some(47_000_000));
             assert_eq!(
-                page.user_data_overrides["episode-1"].played_percentage,
+                page.controller.test_state().user_data.overrides["episode-1"].played_percentage,
                 played.then_some(23.5)
             );
-            let other = &detail.episodes.as_ref().unwrap().items[1];
+            let other = &detail.model.episodes.as_ref().unwrap().items[1];
             assert!(!other.user_data.as_ref().unwrap().played);
             assert_eq!(other.played_percentage(), None);
         });
@@ -634,10 +739,11 @@ fn failed_requests_preserve_state_and_menu_dismisses_without_mutating(cx: &mut T
         server.fail_next.store(true, Ordering::SeqCst);
         click(cx, selector);
         page.read_with(cx, |page, _| {
-            assert!(!page.detail_user_data_pending());
-            let detail = page.series_detail.as_ref().unwrap();
-            let item = detail.selected_playback_item().unwrap();
+            assert!(!page.controller.user_data_pending());
+            let detail = page.detail_view().unwrap();
+            let item = detail.model.selected_playback_item().unwrap();
             let data = page
+                .controller
                 .effective_user_data(&item.id, item.user_data.as_ref())
                 .unwrap();
             assert!(!data.played && !data.is_favorite);
@@ -654,6 +760,9 @@ fn series_played_refreshes_both_endpoints_and_preserves_server_progress(cx: &mut
     });
     cx.run_until_parked();
     for played in [true, false] {
+        let stale_request = page.update(cx, |page, _| {
+            restart_detail_request(page, crate::effects::DetailResource::Episodes, None)
+        });
         let start = server.requests.lock().unwrap().len();
         click(cx, "series-detail-more-button");
         click(cx, "series-detail-series-played");
@@ -673,30 +782,25 @@ fn series_played_refreshes_both_endpoints_and_preserves_server_progress(cx: &mut
             "GET /emby/Users/user-1/Items/episode-2 HTTP/1.1"
         );
         page.update(cx, |page, cx| {
-            let detail = page.series_detail.as_ref().unwrap();
-            assert_eq!(detail.selected_season_id.as_deref(), Some("season-1"));
-            assert_eq!(detail.selected_episode_id.as_deref(), Some("episode-2"));
-            let episodes = &detail.episodes.as_ref().unwrap().items;
+            let detail = page.detail_view().unwrap();
+            assert_eq!(detail.model.selected_season_id.as_deref(), Some("season-1"));
+            assert_eq!(detail.model.selected_episode_id.as_deref(), Some("episode-2"));
+            let episodes = &detail.model.episodes.as_ref().unwrap().items;
             assert_eq!(episodes[0].user_data.as_ref().unwrap().played_percentage, None);
             assert_eq!(episodes[0].user_data.as_ref().unwrap().played, played);
-            let selected = detail.selected_episode().unwrap();
+            let selected = detail.model.selected_episode().unwrap();
             assert_eq!(selected.name, "Refreshed Episode");
             assert_eq!(selected.overview.as_deref(), Some("Refreshed overview"));
             assert_eq!(selected.user_data.as_ref().unwrap().played, played);
             assert_eq!(selected.played_percentage(), Some(37.5));
-            assert_eq!(detail.playback_position_ticks(), Some(75_000_000));
-            assert_eq!(page.user_data_overrides["episode-2"].played_percentage, Some(37.5));
+            assert_eq!(detail.model.playback_position_ticks(), Some(75_000_000));
+            assert_eq!(page.controller.test_state().user_data.overrides["episode-2"].played_percentage, Some(37.5));
             let stale = serde_json::from_value(json!({"Items":[{"Id":"episode-2","Name":"Stale","Type":"Episode","SeriesId":"series-1","UserData":{"Played":!played,"PlayedPercentage":100.0}}], "TotalRecordCount":1})).unwrap();
-            page.absorb_user_items_user_data(&stale, 0);
-            assert_eq!(page.user_data_overrides["episode-2"].played, played);
-            assert_eq!(page.user_data_overrides["episode-2"].played_percentage, Some(37.5));
-            page.finish_series_episodes(
-                page.request_identity(),
-                DetailRequestRevisions { detail: page.detail_generation, user_data: 0 },
-                "series-1".into(), "season-1".into(),
-                Ok(serde_json::from_value(json!({"Items":[]})).unwrap()), cx,
-            );
-            assert_eq!(page.series_detail.as_ref().unwrap().episodes.as_ref().unwrap().items.len(), 2);
+            page.controller.test_absorb_user_items(&stale, 0);
+            assert_eq!(page.controller.test_state().user_data.overrides["episode-2"].played, played);
+            assert_eq!(page.controller.test_state().user_data.overrides["episode-2"].played_percentage, Some(37.5));
+            page.finish_detail_request(stale_request, Ok(super::controller::DetailResponse::Episodes(serde_json::from_value(json!({"Items":[]})).unwrap())), cx);
+            assert_eq!(page.detail_view().unwrap().model.episodes.as_ref().unwrap().items.len(), 2);
         });
     }
 }
@@ -709,26 +813,33 @@ fn a_failed_series_refresh_still_fetches_the_other_endpoint(cx: &mut TestAppCont
     click(cx, "series-detail-more-button");
     click(cx, "series-detail-series-played");
     page.read_with(cx, |page, _| {
-        assert!(!page.detail_user_data_pending());
-        assert!(page.user_data_overrides["series-1"].played);
-        let detail = page.series_detail.as_ref().unwrap();
+        assert!(!page.controller.user_data_pending());
+        assert!(page.controller.test_state().user_data.overrides["series-1"].played);
+        let detail = page.detail_view().unwrap();
         assert_eq!(
-            detail.selected_episode().unwrap().played_percentage(),
+            detail.model.selected_episode().unwrap().played_percentage(),
             Some(37.5)
         );
         assert_eq!(
-            detail.episodes.as_ref().unwrap().items[1].played_percentage(),
+            detail.model.episodes.as_ref().unwrap().items[1].played_percentage(),
             None
         );
-        assert!(!page.user_data_overrides.contains_key("episode-2"));
+        assert!(
+            !page
+                .controller
+                .test_state()
+                .user_data
+                .overrides
+                .contains_key("episode-2")
+        );
     });
     *server.fail_path.lock().unwrap() = Some("/emby/Users/user-1/Items/episode-1".into());
     click(cx, "series-detail-more-button");
     click(cx, "series-detail-series-played");
     page.read_with(cx, |page, _| {
-        assert!(!page.detail_user_data_pending());
-        let detail = page.series_detail.as_ref().unwrap();
-        for episode in &detail.episodes.as_ref().unwrap().items {
+        assert!(!page.controller.user_data_pending());
+        let detail = page.detail_view().unwrap();
+        for episode in &detail.model.episodes.as_ref().unwrap().items {
             assert!(!episode.user_data.as_ref().unwrap().played);
             assert_eq!(episode.played_percentage(), None);
         }
@@ -743,21 +854,24 @@ fn a_series_refresh_does_not_replace_a_newly_selected_season(cx: &mut TestAppCon
         let request = PlayedRequest {
             item_id: "series-1".into(), series_id: Some("series-1".into()),
             whole_series: true, played: true, season_id: Some("season-1".into()),
-            episode_id: Some("episode-1".into()), detail_generation: page.detail_generation,
-            user_data: None, notification_scope: NotificationScope::Detail,
-            notification_key: "detail:played".into(),
+            episode_id: Some("episode-1".into()), detail_activation: page.controller.test_state().navigation.detail().and_then(|detail| detail.activation().cloned()),
+            user_data: None, notification: ActionNotification { scope: NotificationScope::Detail, key: "detail:played".into() },
         };
-        let detail = page.series_detail.as_mut().unwrap();
-        detail.selected_season_id = Some("season-2".into());
-        detail.selected_episode_id = Some("episode-3".into());
-        detail.episodes = Some(serde_json::from_value(json!({"Items":[{"Id":"episode-3","Name":"Third","Type":"Episode","UserData":{"Played":false}}]})).unwrap());
+        let detail = detail_binding(page.controller.test_state_mut().navigation, &mut page.detail_resources).unwrap();
+        detail.controller.state.selected_season_id = Some("season-2".into());
+        detail.controller.state.selected_episode_id = Some("episode-3".into());
+        detail.controller.state.episodes = Some(serde_json::from_value(json!({"Items":[{"Id":"episode-3","Name":"Third","Type":"Episode","UserData":{"Played":false}}]})).unwrap());
         let episode: MediaItem = serde_json::from_value(json!({"Id":"episode-1","Name":"Refreshed","Type":"Episode","UserData":{"Played":true,"PlayedPercentage":18.0}})).unwrap();
-        page.apply_series_played_refresh(&request,
-            Some(Ok(MediaItems { items: vec![episode.clone()], total_record_count: 1 })), Some(Ok(episode)), cx);
-        let detail = page.series_detail.as_ref().unwrap();
-        assert_eq!(detail.selected_season_id.as_deref(), Some("season-2"));
-        assert_eq!(detail.selected_episode().unwrap().id, "episode-3");
-        assert_eq!(detail.episodes.as_ref().unwrap().items.len(), 1);
-        assert_eq!(page.user_data_overrides["episode-1"].played_percentage, Some(18.0));
+        let command = page.controller.test_state_mut().played_actions.begin(request, false).unwrap();
+        page.finish_detail_played(command, Ok(PlayedResponse {
+            data: UserItemData { played: true, ..Default::default() }, parent: None,
+            episodes: Some(Ok(MediaItems { items: vec![episode.clone()], total_record_count: 1 })),
+            episode: Some(Ok(episode)),
+        }), cx);
+        let detail = page.detail_view().unwrap();
+        assert_eq!(detail.model.selected_season_id.as_deref(), Some("season-2"));
+        assert_eq!(detail.model.selected_episode().unwrap().id, "episode-3");
+        assert_eq!(detail.model.episodes.as_ref().unwrap().items.len(), 1);
+        assert_eq!(page.controller.test_state().user_data.overrides["episode-1"].played_percentage, Some(18.0));
     });
 }

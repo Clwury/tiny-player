@@ -1,12 +1,17 @@
 mod app;
 mod app_metadata;
 mod assets;
+mod config;
+mod effects;
 pub mod emby;
 mod home;
 mod images;
+mod observability;
+mod persistence;
 pub mod player;
 mod search_history;
 pub mod server;
+mod settings;
 mod storage;
 mod theme;
 mod ui;
@@ -46,7 +51,9 @@ pub fn run() {
             theme::init(cx);
             Editor::bind_keys(cx);
 
-            let (cache, startup_error) = match storage::load_or_init() {
+            let (cache, startup_error) = match persistence::AppPersistence::load_settings(
+                &persistence::FilePersistence::default(),
+            ) {
                 Ok(cache) => (cache, None),
                 Err(error) => (
                     ServerCache::empty(),

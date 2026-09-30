@@ -1,16 +1,21 @@
-use gpui::{FontWeight, ScrollStrategy, UniformListScrollHandle, img, uniform_list};
+use gpui::{FontWeight, ScrollStrategy, UniformListScrollHandle, uniform_list};
+use std::time::Instant;
 
-use crate::ui::radius;
 use crate::{
+    effects::EffectHandle,
     emby::{EmbyImageRequest, EmbyImageType, ImageQuality},
-    images::{cache as image_cache, loader::ImageLoader},
+    images::{
+        ImageRepository,
+        cache::CachedImageKey,
+        controller::{ImageController, ImageUpdate, ItemImageCommand, ItemImageRequest},
+        item_images::EmbyImageRepository,
+    },
     ui::{scrollbar::Scrollbar, tooltip::text_tooltip},
 };
 
 use super::*;
 
-mod metadata;
-use metadata::episode_metadata_label;
+mod components;
 
 const EPISODE_LIST_WIDTH_PX: f32 = 420.0;
 const EPISODE_ROW_HEIGHT_PX: f32 = 120.0;
@@ -20,30 +25,35 @@ const EPISODE_IMAGE_MAX_WIDTH: u32 = 640;
 pub(super) struct PlaybackEpisodeListState {
     pub(super) open: bool,
     scroll: UniformListScrollHandle,
-    images: ImageLoader,
+    images: ImageController,
+    image_effects: std::collections::HashMap<CachedImageKey, EffectHandle<gpui::Task<()>>>,
+    image_repository:
+        std::sync::Arc<dyn ImageRepository<ItemImageRequest, Image = std::path::PathBuf>>,
 }
 
-impl Default for PlaybackEpisodeListState {
-    fn default() -> Self {
+impl PlaybackEpisodeListState {
+    pub(super) fn new(emby: &EmbyPlaybackContext) -> Self {
         Self {
             open: false,
             scroll: UniformListScrollHandle::new(),
-            images: ImageLoader::with_limits(4, Duration::from_secs(30), 3),
+            images: ImageController::with_limits(
+                emby.server.workspace_identity(),
+                4,
+                Duration::from_secs(30),
+                3,
+            ),
+            image_effects: Default::default(),
+            image_repository: Arc::new(EmbyImageRepository {
+                client: emby.client.clone(),
+                server: emby.server.clone(),
+            }),
         }
     }
 }
 
 impl PlaybackPage {
-    fn has_episode_list(&self) -> bool {
-        self.queue.current().is_some_and(|item| {
-            item.series_id
-                .as_deref()
-                .is_some_and(|id| !id.trim().is_empty())
-        })
-    }
-
     pub(super) fn close_episode_list(&mut self, cx: &mut Context<Self>) -> bool {
-        if !std::mem::take(&mut self.episode_list.open) {
+        if !std::mem::take(&mut self.presentation.episode_list.open) {
             return false;
         }
         self.schedule_fullscreen_controls_hide(cx);
@@ -58,26 +68,30 @@ impl PlaybackPage {
 
     fn toggle_episode_list(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
-        if self.close_episode_list(cx) || !self.has_episode_list() || self.queue_switch.loading {
+        if self.close_episode_list(cx)
+            || !self.session.queue.view_model().has_episode_list()
+            || self.session.queue.view_model().loading
+        {
             return;
         }
         self.close_track_select(cx);
-        self.episode_list.open = true;
-        self.fullscreen.controls_visible = true;
-        self.fullscreen.cursor_visible = true;
-        self.episode_list
-            .scroll
-            .scroll_to_item(self.queue.current_index, ScrollStrategy::Center);
-        let first_visible = self.queue.current_index.saturating_sub(3);
-        for item in self.queue.items[first_visible..]
+        self.presentation.episode_list.open = true;
+        self.presentation.fullscreen.controls_visible = true;
+        self.presentation.fullscreen.cursor_visible = true;
+        self.presentation.episode_list.scroll.scroll_to_item(
+            self.session.queue.queue().current_index,
+            ScrollStrategy::Center,
+        );
+        let first_visible = self.session.queue.queue().current_index.saturating_sub(3);
+        for item in self.session.queue.queue().items[first_visible..]
             .iter()
-            .chain(&self.queue.items[..first_visible])
+            .chain(&self.session.queue.queue().items[..first_visible])
         {
             if let Some(tag) = &item.primary_image_tag {
-                self.episode_list.images.ensure_image(
-                    &self.emby.server,
+                self.presentation.episode_list.images.ensure_image(
                     EmbyImageRequest::primary(item.item_id.clone(), Some(tag.clone()))
                         .with_max_width(EPISODE_IMAGE_MAX_WIDTH),
+                    Instant::now(),
                 );
             }
         }
@@ -86,42 +100,61 @@ impl PlaybackPage {
     }
 
     fn load_episode_images(&mut self, cx: &mut Context<Self>) {
-        if !self.episode_list.open {
+        if !self.presentation.episode_list.open {
             return;
         }
-        for job in self.episode_list.images.start_queued_jobs() {
-            let client = self.emby.client.clone();
-            let server = self.emby.server.clone();
-            let key = job.key.clone();
-            let task = cx.background_spawn(async move {
-                let image = client.item_image(&server, &job.request)?;
-                let path = image_cache::write_cached_image(
-                    &job.key,
-                    &image.bytes,
-                    image.content_type.as_deref(),
-                )?;
-                let _ = image_cache::prune_cache(image_cache::DEFAULT_MAX_CACHE_BYTES);
-                Ok(path)
-            });
-            cx.spawn(async move |page, cx| {
+        for command in self.presentation.episode_list.images.start_queued_jobs() {
+            let repository = self.presentation.episode_list.image_repository.clone();
+            let task_image = command.image.clone();
+            let key = command.image.key.clone();
+            let task = cx.background_spawn(async move { repository.load(&task_image) });
+            let handle = cx.spawn(async move |page, cx| {
                 let result = task.await;
                 page.update(cx, |page, cx| {
-                    page.episode_list.images.finish_job(key, result);
-                    page.load_episode_images(cx);
-                    if page.episode_list.open {
-                        cx.notify();
-                    }
+                    page.finish_episode_image(command, result, cx)
                 })
                 .ok();
-            })
-            .detach();
+            });
+            self.presentation
+                .episode_list
+                .image_effects
+                .entry(key)
+                .or_default()
+                .replace(handle);
+        }
+    }
+
+    fn finish_episode_image(
+        &mut self,
+        command: ItemImageCommand,
+        result: anyhow::Result<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let identity = self.emby.server.workspace_identity();
+        let update = self.presentation.episode_list.images.finish_job(
+            &command,
+            result,
+            &identity,
+            Instant::now(),
+        );
+        if update == ImageUpdate::Ignored {
+            return;
+        }
+        self.presentation
+            .episode_list
+            .image_effects
+            .remove(&command.image.key);
+        self.load_episode_images(cx);
+        if self.presentation.episode_list.open && update == ImageUpdate::Ready {
+            cx.notify();
         }
     }
 
     pub(super) fn render_episode_list_button(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = theme::media_overlay(cx);
-        let enabled = self.has_episode_list() && !self.queue_switch.loading;
-        Self::playback_control_button(
+        let enabled = self.session.queue.view_model().has_episode_list()
+            && !self.session.queue.view_model().loading;
+        controls::playback_control_button(
             "playback-episodes-button",
             "icons/columns.svg",
             px(30.0),
@@ -131,7 +164,7 @@ impl PlaybackPage {
         )
         .aria_label("剧集列表")
         .tooltip(|_, cx| text_tooltip("剧集列表", cx))
-        .when(self.episode_list.open, |this| {
+        .when(self.presentation.episode_list.open, |this| {
             this.bg(theme.element_selected)
         })
         .when(enabled, |this| {
@@ -166,8 +199,8 @@ impl PlaybackPage {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = theme::media_overlay(cx);
-        let count = self.queue.items.len();
-        let scroll = &self.episode_list.scroll;
+        let count = self.session.queue.queue().items.len();
+        let scroll = &self.presentation.episode_list.scroll;
         div()
             .id("playback-episodes-panel")
             .cursor_default()
@@ -202,7 +235,7 @@ impl PlaybackPage {
                     .text_sm()
                     .text_color(theme.foreground)
                     .child(
-                        Self::playback_control_button(
+                        controls::playback_control_button(
                             "playback-episodes-close",
                             "icons/window-close.svg",
                             px(24.0),
@@ -249,165 +282,34 @@ impl PlaybackPage {
             )
     }
 
-    fn episode_file_size(&self, index: usize) -> Option<u64> {
-        let item = self.queue.items.get(index)?;
-        if index == self.queue.current_index {
-            return self.content_length.filter(|size| *size > 0).or_else(|| {
-                [
-                    &self.emby.media_source_id,
-                    &self.track_preference_key.media_source_id,
-                ]
-                .into_iter()
-                .find_map(|source_id| {
-                    item.media_sources
-                        .iter()
-                        .find(|source| source.id.as_ref() == Some(source_id))
-                        .and_then(|source| source.size)
-                        .filter(|size| *size > 0)
-                })
-            });
-        }
-        request::preferred_playback_media_source(&item.media_sources)
-            .and_then(|source| source.size)
-            .filter(|size| *size > 0)
-    }
-
     fn render_episode_card(&self, index: usize, cx: &Context<Self>) -> gpui::Div {
-        let theme = theme::media_overlay(cx);
-        let item = &self.queue.items[index];
-        let selected = index == self.queue.current_index;
-        let label = item.episode_label.clone();
-        let metadata = episode_metadata_label(item, self.episode_file_size(index));
-        let overview = item
-            .overview
-            .as_deref()
-            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
-            .filter(|text| !text.is_empty());
-        let image_path = self.episode_list.images.path_for_source(
-            &self.emby.server,
-            &item.item_id,
+        let Some(view) = self
+            .session
+            .episode_card_vm(index, &self.emby.media_source_id)
+        else {
+            return div().h(px(EPISODE_ROW_HEIGHT_PX));
+        };
+        let selected = view.selected;
+        let image_path = self.presentation.episode_list.images.path_for_source(
+            view.item_id,
             EmbyImageType::Primary,
-            item.primary_image_tag.as_deref(),
+            view.image_tag,
             Some(EPISODE_IMAGE_MAX_WIDTH),
             ImageQuality::DEFAULT,
         );
-
-        div().h(px(EPISODE_ROW_HEIGHT_PX)).pb_2().child(
-            div()
-                .id((
-                    gpui::ElementId::from("playback-episode"),
-                    item.item_id.clone(),
-                ))
-                .debug_selector(move || format!("playback-episode-{index}"))
-                .size_full()
-                .flex()
-                .items_center()
-                .gap_2()
-                .p_2()
-                .rounded(radius::CARD)
-                .border_1()
-                .border_color(if selected {
-                    theme.input_border_focused
+        components::episode_card(
+            view,
+            index,
+            image_path,
+            cx,
+            cx.listener(move |page, _, window, cx| {
+                cx.stop_propagation();
+                if selected {
+                    page.close_episode_list(cx);
                 } else {
-                    theme.input_border.opacity(0.32)
-                })
-                .when(selected, |this| this.bg(theme.element_selected))
-                .cursor_pointer()
-                .hover(move |style| {
-                    style.bg(if selected {
-                        theme.element_selected_hover
-                    } else {
-                        theme.secondary_hover
-                    })
-                })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |page, _, window, cx| {
-                        cx.stop_propagation();
-                        if selected {
-                            page.close_episode_list(cx);
-                        } else {
-                            page.switch_to_episode(index, window, cx);
-                        }
-                    }),
-                )
-                .child(
-                    div()
-                        .debug_selector(move || format!("playback-episode-image-{index}"))
-                        .flex_none()
-                        .relative()
-                        .w(px(144.0))
-                        .h(px(81.0))
-                        .rounded(radius::CARD)
-                        .overflow_hidden()
-                        .bg(theme.input_background)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(image_path.is_none(), |this| {
-                            this.child(
-                                svg()
-                                    .path("icons/clapperboard.svg")
-                                    .size(px(24.0))
-                                    .text_color(theme.muted_foreground),
-                            )
-                        })
-                        .when_some(image_path, |this, path| {
-                            this.child(
-                                img(path)
-                                    .size_full()
-                                    .rounded(radius::CARD)
-                                    .object_fit(gpui::ObjectFit::Cover),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .id("episode-label")
-                                .debug_selector(move || format!("playback-episode-label-{index}"))
-                                .truncate()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.foreground)
-                                .child(label.clone())
-                                .tooltip(move |_, cx| text_tooltip(label.clone(), cx)),
-                        )
-                        .when_some(metadata, |this, metadata| {
-                            this.child(
-                                div()
-                                    .debug_selector(move || {
-                                        format!("playback-episode-metadata-{index}")
-                                    })
-                                    .truncate()
-                                    .text_xs()
-                                    .line_height(px(16.0))
-                                    .text_color(theme.muted_foreground)
-                                    .child(metadata),
-                            )
-                        })
-                        .when_some(overview, |this, overview| {
-                            this.child(
-                                div()
-                                    .id("episode-overview")
-                                    .debug_selector(move || {
-                                        format!("playback-episode-overview-{index}")
-                                    })
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .text_ellipsis()
-                                    .line_clamp(2)
-                                    .child(overview.clone())
-                                    .tooltip(move |_, cx| text_tooltip(overview.clone(), cx)),
-                            )
-                        }),
-                ),
+                    page.switch_to_episode(index, window, cx);
+                }
+            }),
         )
     }
 }

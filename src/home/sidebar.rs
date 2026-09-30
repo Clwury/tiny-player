@@ -1,224 +1,249 @@
+mod adapter;
 pub(super) mod reorder;
 
-use std::time::Duration;
-
-use gpui::{
-    Animation, AnimationExt as _, App, AppContext as _, ClickEvent, Context, Corners,
-    DragMoveEvent, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
-    SharedString, StatefulInteractiveElement, Styled, Transformation, Window, div, percentage,
-    prelude::FluentBuilder, px, svg,
+use super::{
+    carousel::HOME_SIDEBAR_WIDTH_PX,
+    model::sidebar::{SidebarRow, SidebarViewModel},
+    navigation::HomeRoot,
 };
-
-use crate::ui::radius;
-use crate::{app_metadata::APP_NAME, server::CachedServer, theme, ui::server_icon::server_icon};
-
-use super::{HomeEvent, HomePage, carousel::HOME_SIDEBAR_WIDTH_PX, navigation::HomeRoot};
+use crate::{
+    app_metadata::APP_NAME,
+    theme,
+    ui::{radius, server_icon::server_icon},
+};
+use gpui::{
+    Animation, AnimationExt as _, App, AppContext as _, ClickEvent, Corners, DragMoveEvent,
+    EntityId, FocusHandle, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Transformation, Window, div,
+    percentage, prelude::FluentBuilder, px, svg,
+};
 use reorder::DraggedSidebarServer;
+use std::{rc::Rc, time::Duration};
 
-impl HomePage {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn render_sidebar(
-        &self,
-        cx: &Context<Self>,
-        corners: Corners<Pixels>,
-        on_back: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-        on_home: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-        on_favorites: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-        on_search: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-        on_settings: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        let theme = theme::get(cx);
-        let username = self.current_server.username.clone();
-        let active_root = self.home_content.read(cx).root();
-
-        div()
-            .flex()
-            .h_full()
-            .w(px(HOME_SIDEBAR_WIDTH_PX))
-            .flex_col()
-            .border_r_1()
-            .border_color(theme.title_bar_border)
-            .bg(theme.panel_background)
-            .rounded_bl(corners.bottom_left)
-            .overflow_hidden()
-            .p_3()
-            .child(self.render_title_row(cx, on_back))
-            .child(div().h(px(12.0)).flex_none())
-            .gap_1()
-            .child(sidebar_nav_item(
-                "home-section",
-                "icons/home.svg",
-                HomeRoot::Home.title(),
-                active_root == HomeRoot::Home,
-                cx,
-                on_home,
-            ))
-            .child(sidebar_nav_item(
-                "favorites-section",
-                "icons/heart.svg",
-                HomeRoot::Favorites.title(),
-                active_root == HomeRoot::Favorites,
-                cx,
-                on_favorites,
-            ))
-            .child(sidebar_nav_item(
-                "search-section",
-                "icons/search.svg",
-                HomeRoot::Search.title(),
-                active_root == HomeRoot::Search,
-                cx,
-                on_search,
-            ))
-            .child(
-                div()
-                    .my_3()
-                    .h(px(1.0))
-                    .flex_none()
-                    .bg(theme.title_bar_border),
-            )
-            .child(
-                div()
-                    .flex()
-                    .min_h_0()
-                    .flex_1()
-                    .flex_col()
-                    .gap_1()
-                    .child(self.render_server_list(cx))
-                    .child(add_server_item(cx)),
-            )
-            .child(
-                div()
-                    .my_3()
-                    .h(px(1.0))
-                    .flex_none()
-                    .bg(theme.title_bar_border),
-            )
-            .child(user_row(username, cx, on_settings))
-    }
-
-    fn render_server_list(&self, cx: &Context<Self>) -> impl IntoElement {
-        div()
-            .id("sidebar-servers")
-            .debug_selector(|| "sidebar-servers".into())
-            .flex()
-            .min_h_0()
-            .flex_shrink_1()
-            .flex_col()
-            .gap_1()
-            .overflow_y_scroll()
-            .scrollbar_width(px(0.0))
-            .track_scroll(&self.sidebar_scroll_handle)
-            .when_some(self.sidebar_reorder.as_ref(), |this, reorder| {
-                this.track_focus(&reorder.focus).on_key_down(cx.listener(
-                    |page, event: &gpui::KeyDownEvent, window, cx| {
-                        if event.keystroke.key == "escape" {
-                            cx.stop_active_drag(window);
-                            page.finish_sidebar_reorder(false, window, cx);
-                            cx.stop_propagation();
-                        }
-                    },
-                ))
-            })
-            .children(
-                self.preview_sidebar_servers()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, server)| {
-                        let server_id = server.id.clone();
-                        let placeholder = self
-                            .sidebar_reorder
-                            .as_ref()
-                            .is_some_and(|reorder| reorder.server_id == server.id);
-                        div()
-                            .id((
-                                gpui::ElementId::from("sidebar-server-slot"),
-                                server.id.clone(),
-                            ))
-                            .flex_none()
-                            .on_drag_move(cx.listener(
-                                move |page, event: &DragMoveEvent<DraggedSidebarServer>, _, cx| {
-                                    if event.drag(cx).owner == cx.entity_id()
-                                        && event.bounds.contains(&event.event.position)
-                                        && page
-                                            .sidebar_scroll_handle
-                                            .bounds()
-                                            .contains(&event.event.position)
-                                    {
-                                        page.preview_sidebar_reorder(index, cx);
-                                    }
-                                },
-                            ))
-                            .on_drop(cx.listener(
-                                move |page, drag: &DraggedSidebarServer, window, cx| {
-                                    if drag.owner == cx.entity_id() {
-                                        page.preview_sidebar_reorder(index, cx);
-                                        page.finish_sidebar_reorder(true, window, cx);
-                                    }
-                                },
-                            ))
-                            .child(server_list_item(
-                                server,
-                                server.id == self.current_server.id,
-                                placeholder,
-                                self.selecting_server_id.as_deref() == Some(&server.id),
-                                self.selecting_server_id.is_none(),
-                                cx,
-                                cx.listener(move |page, _, _, cx| {
-                                    page.switch_server(&server_id, cx)
-                                }),
-                            ))
-                    }),
-            )
-    }
-
-    fn render_title_row(
-        &self,
-        cx: &Context<HomePage>,
-        on_back: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        let theme = theme::get(cx);
-
-        div()
-            .relative()
-            .flex()
-            .flex_none()
-            .h(px(36.0))
-            .items_center()
-            .justify_center()
-            .child(
-                div()
-                    .id("home-back")
-                    .debug_selector(|| "home-back".into())
-                    .cursor_pointer()
-                    .absolute()
-                    .left_0()
-                    .flex()
-                    .size(px(32.0))
-                    .items_center()
-                    .justify_center()
-                    .rounded(radius::CONTROL)
-                    .hover(move |style| style.bg(theme.secondary_hover))
-                    .child(
-                        svg()
-                            .path("icons/chevron-left.svg")
-                            .size(px(18.0))
-                            .text_color(theme.foreground),
-                    )
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_click(on_back),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.foreground)
-                    .child(APP_NAME),
-            )
-    }
+pub(super) enum SidebarViewIntent {
+    Back,
+    Add,
+    Settings,
+    Root { root: HomeRoot, refresh: bool },
+    Select(String),
+    BeginReorder(String),
+    PreviewReorder(usize),
+    FinishReorder(bool),
+}
+pub(super) type SidebarListener = Rc<dyn Fn(SidebarViewIntent, &mut Window, &mut App)>;
+pub(super) struct SidebarProps<'a> {
+    pub(super) view: SidebarViewModel<'a>,
+    pub(super) active_root: HomeRoot,
+    pub(super) corners: Corners<Pixels>,
+    pub(super) owner: EntityId,
+    pub(super) scroll: ScrollHandle,
+    pub(super) reorder_focus: Option<FocusHandle>,
 }
 
+pub(super) fn render_sidebar(
+    props: SidebarProps<'_>,
+    on_intent: SidebarListener,
+    cx: &App,
+) -> gpui::AnyElement {
+    let theme = theme::get(cx);
+    let SidebarProps {
+        view,
+        active_root,
+        corners,
+        owner,
+        scroll,
+        reorder_focus,
+    } = props;
+    let back = on_intent.clone();
+    let settings = on_intent.clone();
+    div()
+        .flex()
+        .h_full()
+        .w(px(HOME_SIDEBAR_WIDTH_PX))
+        .flex_col()
+        .border_r_1()
+        .border_color(theme.title_bar_border)
+        .bg(theme.panel_background)
+        .rounded_bl(corners.bottom_left)
+        .overflow_hidden()
+        .p_3()
+        .child(render_title_row(cx, move |_, window, cx| {
+            back(SidebarViewIntent::Back, window, cx)
+        }))
+        .child(div().h(px(12.0)).flex_none())
+        .gap_1()
+        .children(
+            [
+                (HomeRoot::Home, "home-section", "icons/home.svg"),
+                (HomeRoot::Favorites, "favorites-section", "icons/heart.svg"),
+                (HomeRoot::Search, "search-section", "icons/search.svg"),
+            ]
+            .map(|(root, id, icon)| {
+                let on_intent = on_intent.clone();
+                sidebar_nav_item(
+                    id,
+                    icon,
+                    root.title(),
+                    active_root == root,
+                    cx,
+                    move |event, window, cx| {
+                        on_intent(
+                            SidebarViewIntent::Root {
+                                root,
+                                refresh: root == HomeRoot::Home && event.click_count() == 2,
+                            },
+                            window,
+                            cx,
+                        );
+                    },
+                )
+            }),
+        )
+        .child(
+            div()
+                .my_3()
+                .h(px(1.0))
+                .flex_none()
+                .bg(theme.title_bar_border),
+        )
+        .child(
+            div()
+                .flex()
+                .min_h_0()
+                .flex_1()
+                .flex_col()
+                .gap_1()
+                .child(render_server_list(
+                    view.rows,
+                    owner,
+                    scroll,
+                    reorder_focus,
+                    on_intent.clone(),
+                    cx,
+                ))
+                .child(add_server_item(on_intent, cx)),
+        )
+        .child(
+            div()
+                .my_3()
+                .h(px(1.0))
+                .flex_none()
+                .bg(theme.title_bar_border),
+        )
+        .child(user_row(
+            view.username.to_owned(),
+            cx,
+            move |_, window, cx| settings(SidebarViewIntent::Settings, window, cx),
+        ))
+        .into_any_element()
+}
+
+fn render_server_list(
+    rows: Vec<SidebarRow<'_>>,
+    owner: EntityId,
+    scroll: ScrollHandle,
+    focus: Option<FocusHandle>,
+    on_intent: SidebarListener,
+    cx: &App,
+) -> gpui::AnyElement {
+    let on_key = on_intent.clone();
+    div()
+        .id("sidebar-servers")
+        .debug_selector(|| "sidebar-servers".into())
+        .flex()
+        .min_h_0()
+        .flex_shrink_1()
+        .flex_col()
+        .gap_1()
+        .overflow_y_scroll()
+        .scrollbar_width(px(0.0))
+        .track_scroll(&scroll)
+        .when_some(focus, |this, focus| {
+            this.track_focus(&focus)
+                .on_key_down(move |event, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_active_drag(window);
+                        on_key(SidebarViewIntent::FinishReorder(false), window, cx);
+                        cx.stop_propagation();
+                    }
+                })
+        })
+        .children(rows.into_iter().enumerate().map(|(index, row)| {
+            let on_move = on_intent.clone();
+            let on_drop = on_intent.clone();
+            let scroll = scroll.clone();
+            div()
+                .id((
+                    gpui::ElementId::from("sidebar-server-slot"),
+                    row.server.id.clone(),
+                ))
+                .flex_none()
+                .on_drag_move(
+                    move |event: &DragMoveEvent<DraggedSidebarServer>, window, cx| {
+                        if event.drag(cx).owner == owner
+                            && event.bounds.contains(&event.event.position)
+                            && scroll.bounds().contains(&event.event.position)
+                        {
+                            on_move(SidebarViewIntent::PreviewReorder(index), window, cx);
+                        }
+                    },
+                )
+                .on_drop(move |drag: &DraggedSidebarServer, window, cx| {
+                    if drag.owner == owner {
+                        on_drop(SidebarViewIntent::PreviewReorder(index), window, cx);
+                        on_drop(SidebarViewIntent::FinishReorder(true), window, cx);
+                    }
+                })
+                .child(server_list_item(row, owner, on_intent.clone(), cx))
+        }))
+        .into_any_element()
+}
+
+fn render_title_row(
+    cx: &App,
+    on_back: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+
+    div()
+        .relative()
+        .flex()
+        .flex_none()
+        .h(px(36.0))
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .id("home-back")
+                .debug_selector(|| "home-back".into())
+                .cursor_pointer()
+                .absolute()
+                .left_0()
+                .flex()
+                .size(px(32.0))
+                .items_center()
+                .justify_center()
+                .rounded(radius::CONTROL)
+                .hover(move |style| style.bg(theme.secondary_hover))
+                .child(
+                    svg()
+                        .path("icons/chevron-left.svg")
+                        .size(px(18.0))
+                        .text_color(theme.foreground),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_click(on_back),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.foreground)
+                .child(APP_NAME),
+        )
+}
 fn sidebar_nav_item(
     id: &'static str,
     icon: &'static str,
@@ -269,18 +294,21 @@ fn sidebar_nav_item(
 }
 
 fn server_list_item(
-    server: &CachedServer,
-    active: bool,
-    placeholder: bool,
-    loading: bool,
-    can_reorder: bool,
-    cx: &Context<HomePage>,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+    row: SidebarRow<'_>,
+    owner: EntityId,
+    on_intent: SidebarListener,
+    cx: &App,
+) -> gpui::AnyElement {
+    let SidebarRow {
+        server,
+        active,
+        placeholder,
+        loading,
+        can_reorder,
+    } = row;
     let theme = theme::get(cx);
     let server_id = server.id.clone();
-    let page = cx.weak_entity();
-    let drag = DraggedSidebarServer::new(server, cx.entity_id());
+    let drag = DraggedSidebarServer::new(server, owner);
 
     div()
         .id((gpui::ElementId::from("sidebar-server"), server_id.clone()))
@@ -317,7 +345,7 @@ fn server_list_item(
                 .min_w_0()
                 .flex_1()
                 .truncate()
-                .child(server_title(server)),
+                .child(server.title.clone()),
         )
         .when(loading, |this| {
             let id = server.id.clone();
@@ -347,25 +375,31 @@ fn server_list_item(
             )
         })
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_click(move |event, window, cx| {
-            cx.stop_propagation();
-            on_click(event, window, cx);
+        .on_click({
+            let on_intent = on_intent.clone();
+            let id = server.id.clone();
+            move |_, window, cx| {
+                cx.stop_propagation();
+                on_intent(SidebarViewIntent::Select(id.clone()), window, cx);
+            }
         })
         .when(can_reorder, |this| {
             this.on_drag(drag, move |drag, _, window, cx| {
-                page.update(cx, |page, cx| {
-                    page.begin_sidebar_reorder(&drag.server_id, window, cx)
-                })
-                .ok();
+                on_intent(
+                    SidebarViewIntent::BeginReorder(drag.server_id.clone()),
+                    window,
+                    cx,
+                );
                 window.defer(cx, |window, cx| {
                     cx.set_active_drag_cursor_style(gpui::CursorStyle::ClosedHand, window);
                 });
                 cx.new(|_| drag.clone())
             })
         })
+        .into_any_element()
 }
 
-fn add_server_item(cx: &Context<HomePage>) -> impl IntoElement {
+fn add_server_item(on_intent: SidebarListener, cx: &App) -> impl IntoElement {
     let theme = theme::get(cx);
     div()
         .id("sidebar-add-server")
@@ -387,15 +421,15 @@ fn add_server_item(cx: &Context<HomePage>) -> impl IntoElement {
                 .text_color(theme.foreground),
         )
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_click(cx.listener(|_, _, _, cx| {
+        .on_click(move |_, window, cx| {
             cx.stop_propagation();
-            cx.emit(HomeEvent::AddServer);
-        }))
+            on_intent(SidebarViewIntent::Add, window, cx);
+        })
 }
 
 fn user_row(
     username: String,
-    cx: &Context<HomePage>,
+    cx: &App,
     on_settings: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
@@ -452,20 +486,11 @@ fn user_row(
         )
 }
 
-fn server_title(server: &CachedServer) -> String {
-    server
-        .server_name
-        .as_deref()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(&server.endpoint.address)
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emby::EmbyClient;
-    use gpui::{Modifiers, Render, TestAppContext, point, size};
+    use crate::{emby::EmbyClient, home::HomePage, server::CachedServer};
+    use gpui::{Context, Modifiers, Render, TestAppContext, point, size};
 
     struct SidebarHover;
 
@@ -540,7 +565,7 @@ mod tests {
                 })
                 .collect::<Vec<CachedServer>>();
             // Missing user IDs prevent background effects from starting.
-            HomePage::new(servers[0].clone(), servers, EmbyClient::new("test".into()).unwrap(), cx)
+            HomePage::new(servers[0].clone(), servers.iter().map(crate::server::feature::SidebarServer::from).collect(), EmbyClient::new("test".into()).unwrap(), cx)
         });
         for height in [900.0, 500.0, 720.0] {
             cx.simulate_resize(size(px(1100.0), px(height)));

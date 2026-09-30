@@ -43,22 +43,25 @@ impl TinyApp {
             return;
         }
 
-        self.open_server_menu = None;
+        self.clear_server_menu();
         self.clear_app_notifications();
         let config = self.cache.playback.clone();
         let settings = cx.new(|cx| SettingsDialogState::new(&config, mode, cx));
         cx.subscribe(&settings, |app, settings, _: &SettingsChanged, cx| {
+            let trace = crate::observability::TraceId::start("settings.changed");
             let settings = settings.read(cx);
-            app.cache.playback = settings.playback_config(cx);
-            app.cache.color_theme = settings.color_theme(cx);
-            app.cache.track_languages = settings.track_languages(cx);
-            if let super::Page::Playback { page, .. } = &app.page {
+            crate::settings::SettingsPersistenceAdapter::apply(
+                settings.snapshot(cx),
+                &mut app.cache,
+            );
+            if let super::Page::Playback { page, .. } = app.shell.page() {
                 let config = app.cache.playback.clone();
                 if let Err(error) = page.update(cx, |page, _| page.apply_playback_config(config)) {
                     app.push_app_error_notification(format!("应用播放设置失败：{error}"), cx);
                 }
             }
             app.schedule_cache_save("自动保存设置失败", cx);
+            trace.record("scheduled_save");
         })
         .detach();
         let initial_size = size(px(960.0), px(680.0));
@@ -73,7 +76,7 @@ impl TinyApp {
                 self.push_app_error_notification(format!("打开设置窗口失败：{error}"), cx)
             }
         }
-        if let Some(error_prefix) = self.pending_cache_save_error_prefix {
+        if let Some(error_prefix) = self.persistence.pending_settings_error_prefix() {
             self.schedule_cache_save(error_prefix, cx);
         }
         cx.notify();

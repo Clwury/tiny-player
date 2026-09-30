@@ -63,9 +63,9 @@ impl HomeContent {
             .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
             .track_scroll(
                 &self
-                    .series_detail
-                    .as_ref()
+                    .detail_view()
                     .expect("detail route has detail state")
+                    .presentation
                     .scroll_handle,
             )
             .on_mouse_down(
@@ -74,7 +74,7 @@ impl HomeContent {
             )
             .on_mouse_down_out(cx.listener(Self::close_series_detail_select))
             .child(div().flex().flex_col().w_full().when_some(
-                self.series_detail.as_ref(),
+                self.detail_view(),
                 |this, detail| {
                     this.child(self.render_series_detail_hero(detail, hero_height, cx))
                         .child(
@@ -83,12 +83,13 @@ impl HomeContent {
                                 .flex()
                                 .flex_col()
                                 .gap_5()
-                                .when(detail.item.is_some(), |this| {
+                                .when(detail.model.item.is_some(), |this| {
                                     this.child(self.render_series_detail_controls(detail, cx))
                                 })
-                                .when(detail.is_movie(), |this| {
+                                .when(detail.model.is_movie(), |this| {
                                     this.when_some(
                                         detail
+                                            .model
                                             .item
                                             .as_ref()
                                             .and_then(hero_metadata::movie_overview),
@@ -99,14 +100,17 @@ impl HomeContent {
                                         },
                                     )
                                 })
-                                .when(detail.is_series(), |this| {
-                                    this.when_some(detail.seasons.as_ref(), |this, seasons| {
-                                        this.child(self.render_series_detail_season_selector(
-                                            detail, seasons, window, cx,
-                                        ))
-                                    })
+                                .when(detail.model.is_series(), |this| {
+                                    this.when_some(
+                                        detail.model.seasons.as_ref(),
+                                        |this, seasons| {
+                                            this.child(self.render_series_detail_season_selector(
+                                                detail, seasons, window, cx,
+                                            ))
+                                        },
+                                    )
                                     .when_some(
-                                        detail.episode_selection_warning.clone(),
+                                        detail.model.episode_selection_warning.clone(),
                                         |this, warning| {
                                             this.child(
                                                 div()
@@ -118,6 +122,7 @@ impl HomeContent {
                                     )
                                     .when_some(
                                         detail
+                                            .model
                                             .episodes
                                             .as_ref()
                                             .filter(|episodes| !episodes.items.is_empty()),
@@ -131,8 +136,9 @@ impl HomeContent {
                                         },
                                     )
                                     .when(
-                                        detail.effects.episodes == LoadState::Loaded
+                                        detail.model.effects.episodes == LoadState::Loaded
                                             && detail
+                                                .model
                                                 .episodes
                                                 .as_ref()
                                                 .is_none_or(|episodes| episodes.items.is_empty()),
@@ -148,6 +154,7 @@ impl HomeContent {
                                 })
                                 .when_some(
                                     detail
+                                        .model
                                         .item
                                         .as_ref()
                                         .and_then(|item| item.people.as_deref())
@@ -163,6 +170,7 @@ impl HomeContent {
                                 )
                                 .when(
                                     detail
+                                        .model
                                         .similar_items
                                         .as_ref()
                                         .is_some_and(|items| !items.items.is_empty()),
@@ -174,7 +182,7 @@ impl HomeContent {
                                         ))
                                     },
                                 )
-                                .when_some(detail.item.as_ref(), |this, item| {
+                                .when_some(detail.model.item.as_ref(), |this, item| {
                                     this.when(has_studios(item), |this| {
                                         this.child(self.render_series_detail_studios_row(item, cx))
                                     })
@@ -219,26 +227,33 @@ impl HomeContent {
 
     pub(super) fn render_series_detail_hero(
         &self,
-        detail: &SeriesDetailState,
+        detail: DetailView<'_>,
         hero_height: f32,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = theme::media_overlay(cx);
         let backdrop_path = detail
+            .model
             .item
             .as_ref()
             .and_then(|item| self.image_path_for_series_backdrop(item));
         let logo_path = detail
+            .model
             .item
             .as_ref()
             .and_then(|item| self.image_path_for_series_logo(item));
-        let episode_line = detail.hero_line();
+        let episode_line = detail.model.hero_line();
         let metadata = hero_metadata::hero_metadata_label(detail);
         // Leave room for the information row, rating badges, gaps and bottom
         // padding, plus the episode line on series pages, even in short windows.
-        let logo_max_height = (hero_height * 0.5)
-            .min(HERO_LOGO_MAX_HEIGHT_PX)
-            .min(hero_height - if detail.is_series() { 140.0 } else { 104.0 });
+        let logo_max_height = (hero_height * 0.5).min(HERO_LOGO_MAX_HEIGHT_PX).min(
+            hero_height
+                - if detail.model.is_series() {
+                    140.0
+                } else {
+                    104.0
+                },
+        );
 
         div()
             .debug_selector(|| "series-detail-hero".to_string())
@@ -334,7 +349,7 @@ impl HomeContent {
                             )
                             // Reserve the episode line before asynchronous episode data arrives.
                             // This bottom-aligned stack must keep the logo at the same height.
-                            .when(detail.is_series(), |this| {
+                            .when(detail.model.is_series(), |this| {
                                 this.child(
                                     div()
                                         .id("series-detail-episode-line")
@@ -360,7 +375,7 @@ impl HomeContent {
                                                     .min_w_0()
                                                     .max_w_full()
                                                     .overflow_hidden()
-                                                    .when(detail.hero_episode_index().is_some(), |this| {
+                                                    .when(detail.model.hero_episode_index().is_some(), |this| {
                                                         this.on_mouse_down(MouseButton::Left, |_, _, cx| {
                                                             cx.stop_propagation();
                                                         })
@@ -374,7 +389,7 @@ impl HomeContent {
                                         }),
                                 )
                             })
-                            .when_some(detail.item.as_ref(), |this, item| {
+                            .when_some(detail.model.item.as_ref(), |this, item| {
                                 this.child(self.render_series_detail_metadata_row(item, cx))
                             }),
                     ),

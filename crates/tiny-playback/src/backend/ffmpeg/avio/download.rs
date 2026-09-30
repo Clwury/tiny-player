@@ -851,8 +851,10 @@ mod tests {
             );
             let downloading = cache.clone();
             let (result_tx, result_rx) = mpsc::channel();
+            let (body_read_tx, body_read_rx) = mpsc::channel();
             let worker = thread::spawn(move || {
-                let client = HttpClient::new().unwrap();
+                let mut client = HttpClient::new().unwrap();
+                client.body_read_started = Some(body_read_tx);
                 let result = download_http_cache_range(
                     &client,
                     &url,
@@ -863,6 +865,12 @@ mod tests {
                 result_tx.send(result).unwrap();
             });
             ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if send_headers {
+                // Sending headers does not prove the client reached body I/O.
+                // Wait past the capacity/restart check so this case exercises
+                // cancellation of the body read, not the ordinary restart path.
+                body_read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
             cache.note_reader_offset(500_000, HttpCacheRangeKind::Playback);
             let result = result_rx.recv_timeout(Duration::from_secs(1));
             release_tx.send(()).unwrap();
@@ -889,6 +897,16 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            // Wait for the request before sending a response. An unsolicited
+            // response can fail HTTP request dispatch before shutdown is tested.
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
             stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1000\r\nContent-Range: bytes 0-999/1000\r\n\r\n").unwrap();
             ready_tx.send(()).unwrap();
             let _ = release_rx.recv_timeout(Duration::from_secs(3));
@@ -916,14 +934,18 @@ mod tests {
         release_tx.send(()).unwrap();
         worker.join().unwrap();
         server.join().unwrap();
-        assert!(matches!(
-            result.unwrap(),
-            Ok(HttpDownloadOutcome::Stopped)
-                | Err(super::HttpDownloadError {
-                    cancelled: true,
-                    ..
-                })
-        ));
+        let result = result.unwrap();
+        assert!(
+            matches!(
+                result,
+                Ok(HttpDownloadOutcome::Stopped)
+                    | Err(super::HttpDownloadError {
+                        cancelled: true,
+                        ..
+                    })
+            ),
+            "unexpected shutdown result: {result:?}"
+        );
     }
 
     fn spawn_partial_content_server(

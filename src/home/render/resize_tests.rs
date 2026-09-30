@@ -18,6 +18,214 @@ struct DashboardWindow {
     content: Entity<HomeContent>,
 }
 
+fn frame(cx: &mut VisualTestContext) {
+    cx.update(|window, cx| {
+        window.simulate_next_frame(cx);
+    });
+    cx.run_until_parked();
+}
+
+fn render_count(content: &Entity<HomeContent>, cx: &VisualTestContext) -> usize {
+    content.read_with(cx, |page, cx| page.dashboard.entity.read(cx).render_count)
+}
+
+fn choose_root(
+    content: &Entity<HomeContent>,
+    root: crate::home::navigation::HomeRoot,
+    cx: &mut VisualTestContext,
+) {
+    cx.update(|window, cx| {
+        content.update(cx, |page, cx| {
+            page.select_root(root, window, cx);
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn native_resize_settles_final_grid_before_two_frame_dashboard_warmup(cx: &mut TestAppContext) {
+    use crate::home::{
+        model::layout::RESIZE_SETTLE_DEBOUNCE,
+        navigation::{HomeRoot, HomeRoute},
+    };
+    use std::time::Duration;
+    cx.update(theme::init);
+    let (root, cx) = cx.add_window_view(|_, cx| dashboard_window(cx));
+    cx.simulate_resize(size(px(1600.0), px(900.0)));
+    cx.run_until_parked();
+    let content = root.read_with(cx, |root, _| root.content.clone());
+    choose_root(&content, HomeRoot::Search, cx);
+    let route = HomeRoute::Root(HomeRoot::Search);
+    let before = render_count(&content, cx);
+    let columns = content.read_with(cx, |page, _| page.layout.view_model().grid_columns);
+    cx.simulate_resize(size(px(900.0), px(700.0)));
+    cx.run_until_parked();
+    content.read_with(cx, |page, _| {
+        assert_eq!(page.layout.view_model().grid_columns, columns);
+        assert!(!page.layout.view_model().auto_paginate);
+        assert!(
+            !page
+                .layout
+                .view_model()
+                .dashboard_should_mount(&route, false)
+        );
+    });
+    cx.executor()
+        .advance_clock(RESIZE_SETTLE_DEBOUNCE - Duration::from_millis(1));
+    cx.run_until_parked();
+    assert!(!content.read_with(cx, |page, _| page.layout.view_model().auto_paginate));
+    cx.executor().advance_clock(Duration::from_millis(1));
+    cx.run_until_parked();
+    content.read_with(cx, |page, _| {
+        assert!(page.layout.view_model().auto_paginate);
+        assert!(page.layout.view_model().grid_columns < columns);
+        assert!(
+            !page
+                .layout
+                .view_model()
+                .dashboard_should_mount(&route, false)
+        );
+    });
+    assert_eq!(render_count(&content, cx), before);
+    frame(cx);
+    assert!(!content.read_with(cx, |page, _| {
+        page.layout
+            .view_model()
+            .dashboard_should_mount(&route, false)
+    }));
+    frame(cx);
+    assert!(content.read_with(cx, |page, _| {
+        page.layout
+            .view_model()
+            .dashboard_should_mount(&route, false)
+    }));
+    assert!(render_count(&content, cx) > before);
+}
+
+#[gpui::test]
+fn newer_resize_invalidates_already_queued_dashboard_frames(cx: &mut TestAppContext) {
+    use crate::home::{
+        model::layout::RESIZE_SETTLE_DEBOUNCE,
+        navigation::{HomeRoot, HomeRoute},
+    };
+    cx.update(theme::init);
+    let (root, cx) = cx.add_window_view(|_, cx| dashboard_window(cx));
+    cx.simulate_resize(size(px(1600.0), px(900.0)));
+    cx.run_until_parked();
+    let content = root.read_with(cx, |root, _| root.content.clone());
+    choose_root(&content, HomeRoot::Search, cx);
+    cx.simulate_resize(size(px(900.0), px(700.0)));
+    cx.run_until_parked();
+    cx.executor().advance_clock(RESIZE_SETTLE_DEBOUNCE);
+    cx.run_until_parked();
+    frame(cx);
+    cx.simulate_resize(size(px(1000.0), px(800.0)));
+    cx.run_until_parked();
+    frame(cx);
+    let route = HomeRoute::Root(HomeRoot::Search);
+    assert!(!content.read_with(cx, |page, _| {
+        page.layout
+            .view_model()
+            .dashboard_should_mount(&route, false)
+    }));
+    cx.executor().advance_clock(RESIZE_SETTLE_DEBOUNCE);
+    cx.run_until_parked();
+    frame(cx);
+    assert!(!content.read_with(cx, |page, _| {
+        page.layout
+            .view_model()
+            .dashboard_should_mount(&route, false)
+    }));
+    frame(cx);
+    assert!(content.read_with(cx, |page, _| {
+        page.layout
+            .view_model()
+            .dashboard_should_mount(&route, false)
+    }));
+}
+
+#[gpui::test]
+fn home_return_reuses_cached_frame_until_hidden_data_or_images_change(cx: &mut TestAppContext) {
+    use crate::home::{model::LoadState, navigation::HomeRoot};
+    use crate::player::PlaybackStateUpdate;
+    cx.update(theme::init);
+    let (root, cx) = cx.add_window_view(|_, cx| dashboard_window(cx));
+    cx.run_until_parked();
+    let content = root.read_with(cx, |root, _| root.content.clone());
+    content.update(cx, |page, _| {
+        page.controller.test_state_mut().feed.state.home_snapshot = LoadState::Loaded
+    });
+    // Establish a cached frame for the normal window bounds.
+    frame(cx);
+    choose_root(&content, HomeRoot::Search, cx);
+    let before = render_count(&content, cx);
+    choose_root(&content, HomeRoot::Home, cx);
+    assert_eq!(render_count(&content, cx), before);
+    choose_root(&content, HomeRoot::Search, cx);
+    let before = render_count(&content, cx);
+    content.update(cx, |page, cx| {
+        page.apply_playback_update(
+            PlaybackStateUpdate {
+                item_id: "movie-0".into(),
+                list_item_id: "movie-0".into(),
+                media_source_id: "source".into(),
+                media_source_name: None,
+                series_id: None,
+                season_id: None,
+                position_ticks: 10_000_000,
+                run_time_ticks: Some(100_000_000),
+                ended: false,
+                failed: false,
+                selected_item_id: None,
+                stop_completion: None,
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    assert_eq!(render_count(&content, cx), before);
+    choose_root(&content, HomeRoot::Home, cx);
+    assert!(render_count(&content, cx) > before);
+    let before = render_count(&content, cx);
+    content.update(cx, |page, cx| {
+        page.controller
+            .test_state_mut()
+            .feed
+            .state
+            .resume_items
+            .as_mut()
+            .unwrap()
+            .items
+            .clear();
+        page.layout.content_changed();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(render_count(&content, cx) > before);
+    choose_root(&content, HomeRoot::Search, cx);
+    let before = render_count(&content, cx);
+    content.update(cx, |page, cx| {
+        page.image_repository =
+            std::sync::Arc::new(crate::images::test_support::FakeItemImages::default());
+        page.ensure_image(
+            crate::emby::EmbyImageRequest::primary("movie-0", Some("arrived-while-hidden".into()))
+                .with_max_width(640),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    content.read_with(cx, |page, _| {
+        assert!(
+            page.image_path_for_primary_image("movie-0", Some("arrived-while-hidden"))
+                .is_some()
+        );
+    });
+    assert_eq!(render_count(&content, cx), before);
+    choose_root(&content, HomeRoot::Home, cx);
+    assert!(render_count(&content, cx) > before);
+}
+
 impl Render for DashboardWindow {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div().relative().size_full().child(
@@ -43,7 +251,7 @@ fn dashboard_window(cx: &mut Context<DashboardWindow>) -> DashboardWindow {
     let content = cx.new(|cx| {
         // Populate local data without starting Home's network/cache effects.
         let mut content = HomeContent::new(server, client, cx);
-        content.user_views = Some(serde_json::from_value(serde_json::json!({
+        content.controller.test_state_mut().feed.state.user_views = Some(serde_json::from_value(serde_json::json!({
             "Items": (0..10).map(|index| serde_json::json!({
                 "Id": format!("library-{index}"), "Name": "Movies", "Type": "CollectionFolder"
             })).collect::<Vec<_>>(),
@@ -54,10 +262,10 @@ fn dashboard_window(cx: &mut Context<DashboardWindow>) -> DashboardWindow {
                 "Id": format!("movie-{index}"), "Name": "Movie", "Type": "Movie", "ProductionYear": 2024
             }))
             .collect::<Vec<_>>();
-        content.resume_items = Some(serde_json::from_value(serde_json::json!({
+        content.controller.test_state_mut().feed.state.resume_items = Some(serde_json::from_value(serde_json::json!({
             "Items": items, "TotalRecordCount": 20
         })).unwrap());
-        content.user_view_items_rows.insert("library-0".into(), UserViewItemsRow {
+        content.controller.test_state_mut().feed.state.user_view_items_rows.insert("library-0".into(), UserViewItemsRow {
             items: Some(serde_json::from_value::<UserItems>(serde_json::json!({
                 "Items": items, "TotalRecordCount": 20
             })).unwrap()),

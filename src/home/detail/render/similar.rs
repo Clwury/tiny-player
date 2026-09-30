@@ -3,11 +3,11 @@ use super::*;
 impl HomeContent {
     pub(super) fn render_series_detail_similar_section(
         &self,
-        detail: &SeriesDetailState,
+        detail: DetailView<'_>,
         viewport_width: f32,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let items = detail.similar_items.as_ref();
+        let items = detail.model.similar_items.as_ref();
 
         div()
             .flex()
@@ -29,7 +29,7 @@ impl HomeContent {
 
     pub(super) fn render_series_detail_similar_row(
         &self,
-        detail: &SeriesDetailState,
+        detail: DetailView<'_>,
         items: &UserItems,
         viewport_width: f32,
         cx: &Context<Self>,
@@ -48,7 +48,7 @@ impl HomeContent {
             HOME_ITEM_CARD_PADDING_PX,
             HOME_ITEM_CARD_GAP_PX,
         );
-        let carousel = detail.similar_carousel;
+        let carousel = detail.presentation.similar_carousel;
         let offset = carousel.scroll_offset(max_offset);
         let previous_offset = carousel.previous_scroll_offset(max_offset);
         let visible_range = carousel_visible_range_between_for(
@@ -76,7 +76,7 @@ impl HomeContent {
         let scroll_right = cx.listener(Self::scroll_series_similar_right);
         let animation_key = gpui::ElementId::from((
             gpui::ElementId::from("series-detail-similar-scroll"),
-            format!("{}-{animation_id}", detail.series_id),
+            format!("{}-{animation_id}", detail.model.series_id),
         ));
 
         div()
@@ -99,10 +99,14 @@ impl HomeContent {
                         items.items[visible_range.start..visible_range.end]
                             .iter()
                             .map(|item| {
-                                let item = self.effective_user_item(item);
-                                let image_path = self.image_path_for_user_item(&item);
+                                let image_path = self.image_path_for_user_item(item);
                                 let item_id = item.id.clone();
-                                let card = user_item_card(&item, image_path, cx).id((
+                                let card = user_item_card(
+                                    self.controller.user_item_card_vm(item, true),
+                                    image_path,
+                                    cx,
+                                )
+                                .id((
                                     gpui::ElementId::from("series-detail-similar-card"),
                                     item_id.clone(),
                                 ));

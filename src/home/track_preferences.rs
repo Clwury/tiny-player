@@ -1,8 +1,22 @@
 use gpui::App;
 
-use crate::player::{PlaybackTrackPreferenceKey, PlaybackTrackPreferences};
+use crate::player::{PlaybackTrackPreferences, SavedTrackChoices};
 
 use super::HomeContent;
+
+/// GPUI preference adapter. The model merges the detail-local draft purely;
+/// resource bindings and read models never look up application globals.
+pub(super) fn detail_track_choices(
+    model: &super::model::detail::SeriesDetailModel,
+    server: &crate::server::CachedServer,
+    cx: &App,
+) -> SavedTrackChoices {
+    let saved = model
+        .track_preference_key()
+        .map(|key| PlaybackTrackPreferences::get(server, &key, cx))
+        .unwrap_or_default();
+    model.selected_track_choices(saved)
+}
 
 impl HomeContent {
     pub(super) fn sync_track_preferences(&mut self, cx: &App) -> bool {
@@ -12,47 +26,11 @@ impl HomeContent {
         else {
             return false;
         };
-        let mut changed = false;
-        for (item_id, sources) in items {
-            let version = self
-                .played_video_versions
-                .entry(item_id.clone())
-                .or_default();
-            for (source_id, saved) in sources {
-                let current = version
-                    .track_preferences
-                    .entry(source_id.clone())
-                    .or_default();
-                // Explicit in-memory choices take priority over a late snapshot load.
-                let mut merged = saved.clone();
-                merged.fill_missing(current);
-                if *current != merged {
-                    *current = merged;
-                    changed = true;
-                }
-            }
-        }
-        changed
+        self.controller.merge_track_preferences(items)
     }
 
     pub(super) fn restore_track_preferences(&self, cx: &mut App) {
-        let entries = self
-            .played_video_versions
-            .iter()
-            .flat_map(|(item_id, version)| {
-                version
-                    .track_preferences
-                    .iter()
-                    .map(move |(source_id, saved)| {
-                        (
-                            PlaybackTrackPreferenceKey {
-                                item_id: item_id.clone(),
-                                media_source_id: source_id.clone(),
-                            },
-                            saved.clone(),
-                        )
-                    })
-            });
+        let entries = self.controller.track_preferences();
         PlaybackTrackPreferences::restore(&self.current_server, entries, cx);
     }
 }

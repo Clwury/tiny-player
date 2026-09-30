@@ -1,4 +1,8 @@
 use super::*;
+pub(super) use crate::player::model::progress::format_playback_time;
+pub(super) use crate::player::model::time::{
+    clamp_playback_position, valid_playback_duration, valid_playback_time,
+};
 
 pub(super) struct ProgressBarDrag;
 
@@ -6,142 +10,6 @@ impl Render for ProgressBarDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div().hidden()
     }
-}
-
-pub(super) fn valid_playback_time(time: f64) -> Option<f64> {
-    (time.is_finite() && time >= 0.0).then_some(time)
-}
-
-pub(super) fn valid_playback_duration(duration: f64) -> Option<f64> {
-    (duration.is_finite() && duration > 0.0).then_some(duration)
-}
-
-pub(super) fn clamp_playback_position(position: f64, duration: f64) -> f64 {
-    if !position.is_finite() {
-        return 0.0;
-    }
-    position.clamp(0.0, duration.max(0.0))
-}
-
-pub(super) fn progress_fraction(position: f64, duration: f64) -> f32 {
-    let Some(duration) = valid_playback_duration(duration) else {
-        return 0.0;
-    };
-    (clamp_playback_position(position, duration) / duration) as f32
-}
-
-pub(super) fn forward_cache_fraction(timeline: &PlaybackTimelineState) -> Option<f32> {
-    let duration = timeline.duration.and_then(valid_playback_duration)?;
-    let seek_position = timeline
-        .progress_drag_position
-        .or(timeline.pending_seek_position);
-    let position = valid_playback_time(seek_position.or(timeline.position).unwrap_or(0.0))?;
-    let buffered_until = if seek_position.is_some() {
-        // A seek needs a retained recovery point. Preview only the range that
-        // contains its target, without bridging gaps to the current reader.
-        if let Some(cache_state) = &timeline.cache_state {
-            cache_state
-                .demux
-                .seekable_ranges
-                .iter()
-                .filter(|range| {
-                    range.start.is_finite()
-                        && range.end.is_finite()
-                        && range.start <= position
-                        && range.end > position
-                })
-                .map(|range| range.end)
-                .max_by(f64::total_cmp)?
-        } else {
-            if !cached_seek_target(None, timeline.buffered_until, timeline.position, position) {
-                return None;
-            }
-            timeline.buffered_until?
-        }
-    } else {
-        // BufferedChanged/CacheStateChanged report the active demux cache end.
-        // During continuous playback, consumed packets are already in the
-        // decoder/output queues: trimming their recovery points can move the
-        // seekable start ahead of the playhead without losing forward data.
-        timeline.buffered_until?
-    };
-    let end_fraction = progress_fraction(valid_playback_time(buffered_until)?, duration);
-    (end_fraction > progress_fraction(position, duration)).then_some(end_fraction)
-}
-
-pub(super) fn cache_range_fractions(
-    cache_state: Option<&PlaybackCacheState>,
-    duration: f64,
-) -> Vec<(f32, f32)> {
-    let Some(duration) = valid_playback_duration(duration) else {
-        return Vec::new();
-    };
-    let Some(cache_state) = cache_state else {
-        return Vec::new();
-    };
-    // Mirror mpv OSC's seekRangesF: map each authoritative demux range directly
-    // onto the duration. The FFmpeg demux report already coalesces positively
-    // overlapping physical ranges like mpv's cache range joining. Clamping
-    // happens only when the range is translated to track coordinates for drawing.
-    cache_state
-        .demux
-        .seekable_ranges
-        .iter()
-        .filter_map(|range| normalized_cache_range(range.start, range.end, duration))
-        .map(|(start, end)| ((start / duration) as f32, (end / duration) as f32))
-        .collect()
-}
-
-fn normalized_cache_range(start: f64, end: f64, duration: f64) -> Option<(f64, f64)> {
-    if !start.is_finite() || !end.is_finite() || !duration.is_finite() || duration <= 0.0 {
-        return None;
-    }
-    (end > start).then_some((start, end))
-}
-
-pub(super) fn cached_seek_target(
-    cache_state: Option<&PlaybackCacheState>,
-    buffered_until: Option<f64>,
-    reader_position: Option<f64>,
-    target: f64,
-) -> bool {
-    let Some(target) = valid_playback_time(target) else {
-        return false;
-    };
-    if let Some(cache_state) = cache_state {
-        let ranges = &cache_state.demux.seekable_ranges;
-        return ranges.iter().any(|range| {
-            range.start.is_finite()
-                && range.end.is_finite()
-                && target >= range.start
-                && target <= range.end
-        });
-    }
-
-    let Some(reader_position) = reader_position.and_then(valid_playback_time) else {
-        return false;
-    };
-    let Some(buffered_until) = buffered_until.and_then(valid_playback_time) else {
-        return false;
-    };
-    target >= reader_position && target <= buffered_until
-}
-
-pub(super) fn buffered_until_after_seek(previous: Option<f64>, position: f64) -> Option<f64> {
-    let position = valid_playback_time(position)?;
-    Some(
-        previous
-            .and_then(valid_playback_time)
-            .unwrap_or(position)
-            .max(position),
-    )
-}
-
-pub(super) fn should_apply_backend_position(
-    progress_drag_position: Option<f64>,
-    pending_seek_position: Option<f64>,
-) -> bool {
-    progress_drag_position.is_none() && pending_seek_position.is_none()
 }
 
 pub(super) fn progress_fraction_for_cursor(
@@ -156,20 +24,9 @@ pub(super) fn progress_fraction_for_cursor(
     Some(((f32::from(cursor_x) - f32::from(bounds.origin.x)) / width).clamp(0.0, 1.0))
 }
 
-pub(super) fn format_playback_time(seconds: f64) -> String {
-    let seconds = valid_playback_time(seconds).unwrap_or(0.0).round() as u64;
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
-    let seconds = seconds % 60;
-    if hours > 0 {
-        format!("{hours}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes}:{seconds:02}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::player::model::time::should_apply_backend_position;
     use gpui::{Bounds, point, px, size};
 
     use tiny_playback::{
@@ -178,6 +35,10 @@ mod tests {
     };
 
     use super::*;
+    use crate::player::model::progress::{
+        buffered_until_after_seek, cache_range_fractions, cached_seek_target,
+        forward_cache_fraction, progress_fraction,
+    };
 
     #[test]
     fn playback_time_helpers_reject_invalid_values() {

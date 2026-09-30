@@ -11,65 +11,57 @@ const FULLSCREEN_CONTROLS_HOT_ZONE_FRACTION: f32 = 0.5;
 
 impl PlaybackPage {
     pub(super) fn progress_bar_visible(&self) -> bool {
-        !self.episode_list.open
+        !self.presentation.episode_list.open
             && playback_progress_bar_visible(
-                self.timeline.duration.is_some(),
-                self.fullscreen.controls_visible,
+                self.session.timeline().duration.is_some(),
+                self.presentation.fullscreen.controls_visible,
             )
     }
 
     pub(super) fn reset_fullscreen_controls(&mut self) {
-        self.window_drag = WindowDragState::Idle;
-        self.fullscreen.cursor_visible = false;
-        self.fullscreen.controls_visible = false;
-        self.fullscreen.mouse_in_controls = false;
-        self.fullscreen.mouse_in_back_button = false;
-        self.timeline.progress_hover_cursor = None;
-        self.fullscreen.hide_generation = self.fullscreen.hide_generation.wrapping_add(1);
-        self.tracks.open = None;
-        self.episode_list.open = false;
+        self.presentation.window_drag = WindowDragState::Idle;
+        self.presentation.fullscreen.cursor_visible = false;
+        self.presentation.fullscreen.controls_visible = false;
+        self.presentation.fullscreen.mouse_in_controls = false;
+        self.presentation.fullscreen.mouse_in_back_button = false;
+        self.presentation
+            .timeline_presentation
+            .progress_hover_cursor = None;
+        self.presentation
+            .presentation_timers
+            .cancel(PresentationTimer::Controls);
+        self.presentation.track_select_open = None;
+        self.presentation.episode_list.open = false;
     }
 
     pub(super) fn schedule_fullscreen_controls_hide(&mut self, cx: &mut Context<Self>) {
-        self.fullscreen.hide_generation = self.fullscreen.hide_generation.wrapping_add(1);
-        let generation = self.fullscreen.hide_generation;
-
-        cx.spawn(async move |page, cx| {
-            cx.background_executor()
-                .timer(FULLSCREEN_CONTROLS_HIDE_DELAY)
-                .await;
-            page.update(cx, |page, cx| {
-                page.hide_idle_fullscreen_controls(generation, cx);
-            })
-            .ok();
-        })
-        .detach();
+        self.schedule_presentation_timer(
+            PresentationTimer::Controls,
+            FULLSCREEN_CONTROLS_HIDE_DELAY,
+            cx,
+        );
     }
 
-    pub(super) fn hide_idle_fullscreen_controls(
-        &mut self,
-        generation: u64,
-        cx: &mut Context<Self>,
-    ) {
-        if self.episode_list.open
+    pub(super) fn hide_idle_fullscreen_controls(&mut self, cx: &mut Context<Self>) {
+        if self.presentation.episode_list.open
             || !playback_controls_should_hide(
-                self.fullscreen.hide_generation,
-                generation,
-                self.fullscreen.mouse_in_controls,
-                self.fullscreen.mouse_in_back_button,
-                self.timeline.progress_drag_position.is_some(),
+                self.presentation.fullscreen.mouse_in_controls,
+                self.presentation.fullscreen.mouse_in_back_button,
+                self.session.timeline().progress_drag_position.is_some(),
             )
         {
             return;
         }
 
-        let changed = self.fullscreen.cursor_visible
-            || self.fullscreen.controls_visible
-            || self.tracks.open.is_some();
-        self.fullscreen.cursor_visible = false;
-        self.fullscreen.controls_visible = false;
-        self.tracks.open = None;
-        self.timeline.progress_hover_cursor = None;
+        let changed = self.presentation.fullscreen.cursor_visible
+            || self.presentation.fullscreen.controls_visible
+            || self.presentation.track_select_open.is_some();
+        self.presentation.fullscreen.cursor_visible = false;
+        self.presentation.fullscreen.controls_visible = false;
+        self.presentation.track_select_open = None;
+        self.presentation
+            .timeline_presentation
+            .progress_hover_cursor = None;
         if changed {
             cx.notify();
         }
@@ -87,14 +79,15 @@ impl PlaybackPage {
         let in_hot_zone =
             playback_controls_hot_zone_contains(event.position, bounds, is_fullscreen);
 
-        let controls_visible = self.fullscreen.controls_visible || in_controls || in_hot_zone;
-        let changed = !self.fullscreen.cursor_visible
-            || self.fullscreen.controls_visible != controls_visible
-            || self.fullscreen.mouse_in_controls != in_controls;
+        let controls_visible =
+            self.presentation.fullscreen.controls_visible || in_controls || in_hot_zone;
+        let changed = !self.presentation.fullscreen.cursor_visible
+            || self.presentation.fullscreen.controls_visible != controls_visible
+            || self.presentation.fullscreen.mouse_in_controls != in_controls;
 
-        self.fullscreen.cursor_visible = true;
-        self.fullscreen.controls_visible = controls_visible;
-        self.fullscreen.mouse_in_controls = in_controls;
+        self.presentation.fullscreen.cursor_visible = true;
+        self.presentation.fullscreen.controls_visible = controls_visible;
+        self.presentation.fullscreen.mouse_in_controls = in_controls;
         self.schedule_fullscreen_controls_hide(cx);
 
         if changed {
@@ -109,20 +102,22 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         if *hovered {
-            let changed = !self.fullscreen.cursor_visible
-                || !self.fullscreen.controls_visible
-                || !self.fullscreen.mouse_in_back_button;
-            self.fullscreen.hide_generation = self.fullscreen.hide_generation.wrapping_add(1);
-            self.fullscreen.cursor_visible = true;
-            self.fullscreen.controls_visible = true;
-            self.fullscreen.mouse_in_back_button = true;
+            let changed = !self.presentation.fullscreen.cursor_visible
+                || !self.presentation.fullscreen.controls_visible
+                || !self.presentation.fullscreen.mouse_in_back_button;
+            self.presentation
+                .presentation_timers
+                .cancel(PresentationTimer::Controls);
+            self.presentation.fullscreen.cursor_visible = true;
+            self.presentation.fullscreen.controls_visible = true;
+            self.presentation.fullscreen.mouse_in_back_button = true;
             if changed {
                 cx.notify();
             }
             return;
         }
 
-        self.fullscreen.mouse_in_back_button = false;
+        self.presentation.fullscreen.mouse_in_back_button = false;
         self.schedule_fullscreen_controls_hide(cx);
     }
 
@@ -133,30 +128,27 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if !self.fullscreen.mouse_in_back_button
-            || !self.fullscreen.controls_visible
-            || !self.fullscreen.cursor_visible
+        if !self.presentation.fullscreen.mouse_in_back_button
+            || !self.presentation.fullscreen.controls_visible
+            || !self.presentation.fullscreen.cursor_visible
         {
-            self.fullscreen.hide_generation = self.fullscreen.hide_generation.wrapping_add(1);
-            self.fullscreen.mouse_in_back_button = true;
-            self.fullscreen.controls_visible = true;
-            self.fullscreen.cursor_visible = true;
+            self.presentation
+                .presentation_timers
+                .cancel(PresentationTimer::Controls);
+            self.presentation.fullscreen.mouse_in_back_button = true;
+            self.presentation.fullscreen.controls_visible = true;
+            self.presentation.fullscreen.cursor_visible = true;
             cx.notify();
         }
     }
 }
 
 fn playback_controls_should_hide(
-    current_generation: u64,
-    requested_generation: u64,
     mouse_in_controls: bool,
     mouse_in_back_button: bool,
     progress_dragging: bool,
 ) -> bool {
-    current_generation == requested_generation
-        && !mouse_in_controls
-        && !mouse_in_back_button
-        && !progress_dragging
+    !mouse_in_controls && !mouse_in_back_button && !progress_dragging
 }
 
 pub(super) fn window_viewport_bounds(window: &Window) -> Bounds<Pixels> {
@@ -245,10 +237,10 @@ mod tests {
 
     #[test]
     fn hovered_back_button_blocks_scheduled_controls_hide() {
-        assert!(!playback_controls_should_hide(7, 7, false, true, false));
-        assert!(!playback_controls_should_hide(7, 7, true, false, false));
-        assert!(playback_controls_should_hide(7, 7, false, false, false));
-        assert!(!playback_controls_should_hide(8, 7, false, false, false));
+        assert!(!playback_controls_should_hide(false, true, false));
+        assert!(!playback_controls_should_hide(true, false, false));
+        assert!(playback_controls_should_hide(false, false, false));
+        assert!(!playback_controls_should_hide(false, false, true));
     }
 
     #[test]

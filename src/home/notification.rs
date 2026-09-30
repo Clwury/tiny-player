@@ -1,8 +1,6 @@
 use gpui::{ClickEvent, Context, IntoElement, ParentElement, SharedString};
 
-use crate::ui::notification::{
-    NOTIFICATION_AUTOHIDE, NotificationQueue, error_notification, notification_layer,
-};
+use crate::ui::notification::{NotificationQueue, error_notification, notification_layer};
 
 use super::{
     HomeContent,
@@ -32,14 +30,7 @@ pub(super) fn latest_items_notification_key(view_id: &str) -> String {
     format!("home:latest:{view_id}")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum NotificationScope {
-    Home,
-    Favorites,
-    Search,
-    Library,
-    Detail,
-}
+pub(super) use super::model::notification::NotificationScope;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct HomeNotificationKey {
@@ -62,7 +53,7 @@ impl HomeContent {
         item_id: &str,
         action: &str,
     ) -> (NotificationScope, SharedString) {
-        let prefix = match self.navigation.current() {
+        let prefix = match self.controller.route() {
             HomeRoute::Library { view_id, .. } => format!("library:{view_id}"),
             HomeRoute::FavoriteItems { item_type } => format!("favorites:{}", item_type.as_str()),
             HomeRoute::Root(HomeRoot::Favorites) => "favorites".into(),
@@ -84,21 +75,12 @@ impl HomeContent {
         message: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        let id = self
-            .notifications
-            .push(HomeNotificationKey::new(scope, key), message.into());
-        cx.notify();
-
-        cx.spawn(async move |page, cx| {
-            cx.background_executor().timer(NOTIFICATION_AUTOHIDE).await;
-            page.update(cx, |page, cx| {
-                if page.notifications.remove(id) {
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
+        self.notifications.push_autohide(
+            HomeNotificationKey::new(scope, key),
+            message.into(),
+            cx,
+            |page| &mut page.notifications,
+        );
     }
 
     pub(super) fn clear_notification(&mut self, scope: NotificationScope, key: &str) {
@@ -125,7 +107,7 @@ impl HomeContent {
     }
 
     pub(super) fn current_notification_scope(&self) -> Option<NotificationScope> {
-        notification_scope_for_route(self.navigation.current())
+        notification_scope_for_route(self.controller.route())
     }
 
     fn dismiss_notification(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -140,11 +122,11 @@ impl HomeContent {
         }
         self.notifications
             .iter()
-            .any(|entry| notification_matches_route(&entry.key, self.navigation.current()))
+            .any(|entry| notification_matches_route(&entry.key, self.controller.route()))
     }
 
     pub(crate) fn render_notification_layer(&self, cx: &Context<Self>) -> impl IntoElement {
-        let route = self.navigation.current().clone();
+        let route = self.controller.route().clone();
 
         notification_layer().children(
             self.notifications

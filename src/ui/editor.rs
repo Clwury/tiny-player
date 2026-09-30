@@ -26,6 +26,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::effects::{EffectHandle, RequestScope, RequestSlot, RequestToken, WorkspaceIdentity};
 use crate::theme;
 use crate::ui::radius;
 
@@ -343,13 +344,13 @@ pub struct Editor {
     /// transition always reveals the caret immediately, matching Zed's
     /// `BlinkManager::enable` behaviour.
     was_focused: bool,
-    /// Whether a blink timer is currently allowed to wake this editor.
-    cursor_blink_enabled: bool,
     /// The next instant at which the caret should toggle visibility.
     cursor_blink_deadline: Instant,
-    /// Avoid spawning a second blink task while the current timer is waiting.
-    cursor_blink_task_active: bool,
-    cursor_blink_task: Task<()>,
+    /// Editor-owned UI scope; paint starts one wait, activity moves its deadline,
+    /// blur invalidates it, and entity release drops the task. The slot's owner
+    /// separates editors even though they have no server/account identity.
+    cursor_blink: RequestSlot,
+    cursor_blink_task: EffectHandle<Task<()>>,
     is_selecting: bool,
     masked: bool,
     digits_only: bool,
@@ -478,10 +479,12 @@ impl Editor {
             scroll_offset: px(0.0),
             last_cursor_activity: Instant::now(),
             was_focused: false,
-            cursor_blink_enabled: false,
             cursor_blink_deadline: Instant::now() + CURSOR_BLINK_INTERVAL,
-            cursor_blink_task_active: false,
-            cursor_blink_task: Task::ready(()),
+            cursor_blink: RequestSlot::new(
+                RequestScope::EditorCaretBlink,
+                WorkspaceIdentity::default(),
+            ),
+            cursor_blink_task: EffectHandle::default(),
             is_selecting: false,
             masked: false,
             digits_only: false,
@@ -1120,21 +1123,20 @@ impl Editor {
             }
         }
 
-        self.cursor_blink_enabled = focused;
         if !focused {
-            self.cursor_blink_task_active = false;
-            self.cursor_blink_task = Task::ready(());
+            self.cursor_blink.invalidate();
+            self.cursor_blink_task.cancel();
             return;
         }
-        if self.cursor_blink_task_active {
+        if self.cursor_blink.is_active() {
             return;
         }
 
-        self.cursor_blink_task_active = true;
-        self.cursor_blink_task = cx.spawn(async move |editor, cx| {
+        let token = self.cursor_blink.issue();
+        let task = cx.spawn(async move |editor, cx| {
             while let Some(delay) = editor
                 .update(cx, |editor, _| {
-                    if !editor.cursor_blink_enabled {
+                    if !token.is_current(&editor.cursor_blink) {
                         return None;
                     }
                     Some(
@@ -1153,16 +1155,20 @@ impl Editor {
 
                 editor
                     .update(cx, |editor, cx| {
-                        if editor.cursor_blink_enabled {
-                            editor.cursor_blink_deadline = Instant::now() + CURSOR_BLINK_INTERVAL;
-                            editor.cursor_blink_task_active = false;
-                            cx.notify();
-                        }
+                        editor.finish_cursor_blink(&token, cx);
                     })
                     .ok();
                 break;
             }
         });
+        self.cursor_blink_task.replace(task);
+    }
+
+    fn finish_cursor_blink(&mut self, token: &RequestToken, cx: &mut Context<Self>) {
+        if self.cursor_blink.commit(token) {
+            self.cursor_blink_deadline = Instant::now() + CURSOR_BLINK_INTERVAL;
+            cx.notify();
+        }
     }
 
     fn cursor_is_visible(&self, focused: bool, now: Instant) -> bool {
@@ -1835,6 +1841,8 @@ impl Focusable for Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod blink;
 
     #[gpui::test]
     fn search_adornments_keep_the_editor_ready_for_typing(cx: &mut gpui::TestAppContext) {

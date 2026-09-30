@@ -1,3 +1,4 @@
+use crate::home::detail::state::detail_binding;
 use gpui::{
     ClickEvent, Context, CursorStyle, FocusHandle, HitboxBehavior, InteractiveElement, IntoElement,
     MouseButton, ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, StyledText,
@@ -7,7 +8,7 @@ use gpui::{
 use crate::ui::radius;
 use crate::{theme, ui::scrollbar::Scrollbar};
 
-use super::{HomeContent, SeriesDetailState};
+use super::{DetailView, HomeContent};
 
 #[derive(Clone, Debug)]
 pub(in crate::home) struct MovieOverviewOverlay {
@@ -19,7 +20,7 @@ pub(in crate::home) struct MovieOverviewOverlay {
 impl HomeContent {
     pub(in crate::home) fn render_movie_overview_preview(
         &self,
-        detail: &SeriesDetailState,
+        detail: DetailView<'_>,
         overview: String,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -28,7 +29,7 @@ impl HomeContent {
         let layout = text.layout().clone();
         let cursor_layout = layout.clone();
         let cursor_text = overview.clone();
-        let detail_id = detail.series_id.clone();
+        let detail_id = detail.model.series_id.clone();
 
         div()
             .id("movie-detail-overview")
@@ -71,16 +72,22 @@ impl HomeContent {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = self.series_detail.as_mut().filter(|detail| {
-            detail.is_movie() && detail.series_id == detail_id && detail.overview_overlay.is_none()
-        }) else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources).filter(
+                |detail| {
+                    detail.model.is_movie()
+                        && detail.model.series_id == detail_id
+                        && detail.presentation.overview_overlay.is_none()
+                },
+            )
+        else {
             return;
         };
         let focus = cx.focus_handle();
         let previous_focus = window.focused(cx);
         focus.focus(window, cx);
-        detail.open_select = None;
-        detail.overview_overlay = Some(MovieOverviewOverlay {
+        detail.presentation.open_select = None;
+        detail.presentation.overview_overlay = Some(MovieOverviewOverlay {
             focus,
             previous_focus,
             scroll_handle: ScrollHandle::new(),
@@ -94,10 +101,9 @@ impl HomeContent {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(overlay) = self
-            .series_detail
-            .as_mut()
-            .and_then(|detail| detail.overview_overlay.take())
+        let Some(overlay) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+                .and_then(|detail| detail.presentation.overview_overlay.take())
         else {
             return;
         };
@@ -117,12 +123,18 @@ impl HomeContent {
         cx: &Context<Self>,
     ) -> Option<impl IntoElement> {
         let detail = self
-            .series_detail
-            .as_ref()
-            .filter(|detail| detail.is_movie())?;
-        let overlay = detail.overview_overlay.as_ref()?;
+            .detail_view()
+            .filter(|detail| detail.model.is_movie())?;
+        let overlay = detail.presentation.overview_overlay.as_ref()?;
         // Keep the complete original paragraphs in the expanded view.
-        let overview = detail.item.as_ref()?.overview.as_deref()?.trim().to_owned();
+        let overview = detail
+            .model
+            .item
+            .as_ref()?
+            .overview
+            .as_deref()?
+            .trim()
+            .to_owned();
         let theme = theme::get(cx);
 
         Some(

@@ -17,7 +17,7 @@ use crate::{
 const HOME_SNAPSHOT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct HomeSnapshot {
+pub(crate) struct HomeSnapshot {
     version: u32,
     server_id: String,
     remote_server_id: Option<String>,
@@ -40,18 +40,34 @@ pub(super) struct CachedSection<T> {
 }
 
 impl HomeSnapshot {
+    #[cfg(test)]
     pub(super) fn new(
         server: &CachedServer,
         user_views: Option<UserViews>,
         resume_items: Option<ResumeItems>,
         latest_items_by_view: HashMap<String, UserItems>,
     ) -> Self {
-        let saved_at_unix = current_unix_time();
+        Self::from_data(
+            &server.workspace_identity(),
+            current_unix_time(),
+            user_views,
+            resume_items,
+            latest_items_by_view,
+        )
+    }
+
+    pub(super) fn from_data(
+        identity: &crate::effects::WorkspaceIdentity,
+        saved_at_unix: u64,
+        user_views: Option<UserViews>,
+        resume_items: Option<ResumeItems>,
+        latest_items_by_view: HashMap<String, UserItems>,
+    ) -> Self {
         Self {
             version: HOME_SNAPSHOT_VERSION,
-            server_id: server.id.clone(),
-            remote_server_id: server.server_id.clone(),
-            user_id: server.user_id.clone(),
+            server_id: identity.local_server_id.clone(),
+            remote_server_id: identity.remote_server_id.clone(),
+            user_id: identity.user_id.clone(),
             saved_at_unix,
             played_video_versions: HashMap::new(),
             user_views: user_views.map(|data| CachedSection::new(data, saved_at_unix)),
@@ -80,11 +96,11 @@ impl<T> CachedSection<T> {
     }
 }
 
-pub(super) fn load_snapshot(server: &CachedServer) -> Result<Option<HomeSnapshot>> {
+pub(crate) fn load_snapshot(server: &CachedServer) -> Result<Option<HomeSnapshot>> {
     load_snapshot_from(&snapshot_path(server)?, server)
 }
 
-pub(super) fn save_snapshot(server: &CachedServer, snapshot: &HomeSnapshot) -> Result<()> {
+pub(crate) fn save_snapshot(server: &CachedServer, snapshot: &HomeSnapshot) -> Result<()> {
     if !snapshot.matches_server(server) {
         return Err(anyhow!("首页缓存与当前服务器不匹配"));
     }
@@ -106,7 +122,7 @@ fn snapshot_path(server: &CachedServer) -> Result<PathBuf> {
         .join("snapshot.json"))
 }
 
-pub(super) fn load_snapshot_from(
+pub(crate) fn load_snapshot_from(
     path: &Path,
     server: &CachedServer,
 ) -> Result<Option<HomeSnapshot>> {
@@ -125,7 +141,7 @@ pub(super) fn load_snapshot_from(
     }
 }
 
-pub(super) fn save_snapshot_to(path: &Path, snapshot: &HomeSnapshot) -> Result<()> {
+pub(crate) fn save_snapshot_to(path: &Path, snapshot: &HomeSnapshot) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建首页缓存目录失败：{}", parent.display()))?;
@@ -143,7 +159,7 @@ pub(super) fn save_snapshot_to(path: &Path, snapshot: &HomeSnapshot) -> Result<(
     Ok(())
 }
 
-fn current_unix_time() -> u64 {
+pub(super) fn current_unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())

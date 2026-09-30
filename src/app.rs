@@ -1,21 +1,22 @@
 mod auth;
 mod cache_save;
 mod dialogs;
+mod intent;
 mod item_counts;
 mod notification;
 mod render;
 mod resize;
 mod server_cache;
+#[cfg(test)]
 mod server_card;
 mod server_icon_picker;
 mod server_reorder;
+mod server_view;
 mod settings_window;
+mod shell;
 mod window;
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::Instant,
-};
+use std::collections::HashMap;
 
 use gpui::{Context, Entity, SharedString, Task, WindowHandle};
 
@@ -25,16 +26,12 @@ pub(crate) use window::{
     window_uses_system_decorations,
 };
 
+use crate::server::view::ServerContextMenu;
 use crate::{
-    emby::{EmbyClient, ItemCounts},
-    home::HomePage,
-    player::PlaybackPage,
-    server::CachedServer,
-    storage::ServerCache,
+    emby::EmbyClient, home::HomePage, player::PlaybackPage, storage::ServerCache,
     ui::add_server_dialog::AddServerDialogState,
 };
 use notification::AppNotificationQueue;
-use server_card::ServerContextMenu;
 
 pub struct TinyApp {
     add_server_dialog: Option<Entity<AddServerDialogState>>,
@@ -42,37 +39,32 @@ pub struct TinyApp {
     open_server_menu: Option<ServerContextMenu>,
     server_icon_picker: Option<server_icon_picker::ServerIconPicker>,
     server_reorder: Option<server_reorder::ServerReorder>,
-    server_card_positions: HashMap<String, server_reorder::CardPosition>,
-    cache: ServerCache,
+    server_card_positions: HashMap<String, crate::server::view::reorder::CardPosition>,
+    cache: crate::config::GlobalConfig,
     emby_client: Option<EmbyClient>,
-    servers: Vec<CachedServer>,
+    server_feature: crate::server::feature::ServerController,
+    server_effects: ServerEffects,
     app_notifications: AppNotificationQueue,
-    item_counts: HashMap<String, ItemCounts>,
-    item_counts_loading: HashSet<String>,
-    item_counts_failed: HashSet<String>,
-    item_counts_refreshed: HashSet<String>,
-    selecting_server_id: Option<String>,
-    select_server_task: Task<()>,
     window_bounds_observed: bool,
     window_persistence_enabled: bool,
-    pending_cache_save_error_prefix: Option<&'static str>,
-    last_cache_save_activity: Option<Instant>,
-    cache_save_task_active: bool,
-    cache_save_task: Task<()>,
+    persistence: crate::persistence::PersistenceService,
     #[cfg(test)]
     cache_save_path: Option<std::path::PathBuf>,
-    page: Page,
+    shell: AppShell,
 }
 
-#[derive(Clone, Debug)]
-enum Page {
-    Servers,
-    Home(Entity<HomePage>),
-    Playback {
-        page: Entity<PlaybackPage>,
-        return_to: Entity<HomePage>,
-    },
+/// GPUI runner handles are separate from pure server state. Auth replacement,
+/// count reset/deletion and shell release cancel delivery; tokens fence IO.
+#[derive(Default)]
+struct ServerEffects {
+    auth: crate::effects::EffectHandle<Task<()>>,
+    save: crate::effects::EffectHandle<Task<()>>,
+    icon: crate::effects::EffectHandle<Task<()>>,
+    counts: HashMap<String, crate::effects::EffectHandle<Task<()>>>,
 }
+
+type Page = shell::MountedPage<Entity<HomePage>, Entity<PlaybackPage>>;
+type AppShell = shell::ShellController<Entity<HomePage>, Entity<PlaybackPage>, gpui::Subscription>;
 
 impl TinyApp {
     pub fn new(
@@ -80,10 +72,11 @@ impl TinyApp {
         startup_error: Option<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let persistence = crate::persistence::PersistenceService::get(cx);
         cache.track_languages.apply(cx);
-        let servers = cache.servers.clone();
+        let (cache, catalog) = crate::config::GlobalConfig::split(cache);
+        let server_feature = crate::server::feature::ServerController::new(catalog);
         let window_persistence_enabled = startup_error.is_none();
-        let item_counts = item_counts::cached_item_counts_by_server(&servers);
         let (emby_client, emby_client_error) = match EmbyClient::new(cache.device_id.clone()) {
             Ok(client) => (Some(client), None),
             Err(error) => (None, Some(format!("{error}").into())),
@@ -93,7 +86,7 @@ impl TinyApp {
             if let Some(picker) = app.server_icon_picker.take() {
                 picker.clear_previews(cx);
             }
-            app.save_pending_cache_on_release();
+            app.save_pending_cache_on_release(cx);
             if let Some(settings) = app.settings_window.take() {
                 settings
                     .update(cx, |_, window, _| window.remove_window())
@@ -109,18 +102,14 @@ impl TinyApp {
                     .is_some_and(|window| window.window_id() == window_id)
                 {
                     app.settings_window = None;
-                    app.flush_scheduled_cache_save(cx);
+                    app.flush_persistence(cx).detach();
                     cx.notify();
                 }
             })
             .ok();
         })
         .detach();
-        cx.on_app_quit(|app, cx| {
-            app.flush_scheduled_cache_save(cx);
-            async {}
-        })
-        .detach();
+        cx.on_app_quit(|app, cx| app.flush_persistence(cx)).detach();
         let mut app = Self {
             add_server_dialog: None,
             settings_window: None,
@@ -130,33 +119,19 @@ impl TinyApp {
             server_card_positions: HashMap::new(),
             cache,
             emby_client,
-            servers,
+            server_feature,
+            server_effects: ServerEffects::default(),
             app_notifications: AppNotificationQueue::default(),
-            item_counts,
-            item_counts_loading: HashSet::new(),
-            item_counts_failed: HashSet::new(),
-            item_counts_refreshed: HashSet::new(),
-            selecting_server_id: None,
-            select_server_task: Task::ready(()),
             window_bounds_observed: false,
             window_persistence_enabled,
-            pending_cache_save_error_prefix: None,
-            last_cache_save_activity: None,
-            cache_save_task_active: false,
-            cache_save_task: Task::ready(()),
+            persistence,
             #[cfg(test)]
             cache_save_path: None,
-            page: Page::Servers,
+            shell: AppShell::default(),
         };
         if let Some(error) = initial_error {
             app.push_app_error_notification(error, cx);
-        } else if let Some(server) = app
-            .cache
-            .auto_start_server_id
-            .as_ref()
-            .and_then(|id| app.servers.iter().find(|server| &server.id == id))
-            .cloned()
-        {
+        } else if let Some(server) = app.server_feature.auto_start_server().cloned() {
             app.begin_select_server(&server, cx);
         }
         app

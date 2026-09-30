@@ -9,7 +9,6 @@ use anyhow::{Context, Result};
 use crate::{
     app_metadata,
     emby::{EmbyImageRequest, EmbyImageType, ImageQuality},
-    server::CachedServer,
 };
 
 pub const DEFAULT_MAX_CACHE_BYTES: u64 = 512 * 1024 * 1024;
@@ -25,14 +24,14 @@ pub struct CachedImageKey {
 }
 
 impl CachedImageKey {
-    pub fn from_request(server: &CachedServer, request: &EmbyImageRequest) -> Option<Self> {
+    pub fn from_request(server_id: &str, request: &EmbyImageRequest) -> Option<Self> {
         let tag = request.tag.as_deref()?.trim();
         if tag.is_empty() {
             return None;
         }
 
         Some(Self {
-            server_id: server.id.clone(),
+            server_id: server_id.to_owned(),
             item_id: request.item_id.clone(),
             image_type: request.image_type,
             tag: tag.to_string(),
@@ -42,8 +41,11 @@ impl CachedImageKey {
     }
 }
 
-pub fn cached_image_exists(key: &CachedImageKey) -> Result<Option<PathBuf>> {
-    for path in cached_image_candidate_paths(key)? {
+pub(super) fn cached_image_exists_in(
+    base_dir: &Path,
+    key: &CachedImageKey,
+) -> Result<Option<PathBuf>> {
+    for path in cached_image_candidate_paths(base_dir, key)? {
         if path.exists() {
             return Ok(Some(path));
         }
@@ -52,21 +54,18 @@ pub fn cached_image_exists(key: &CachedImageKey) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-pub fn write_cached_image(
+pub(super) fn write_cached_image_in(
+    base_dir: &Path,
     key: &CachedImageKey,
     bytes: &[u8],
     content_type: Option<&str>,
 ) -> Result<PathBuf> {
-    let path = cached_image_path_for_response(key, bytes, content_type)?;
+    let path = cached_image_path_for_response(base_dir, key, bytes, content_type)?;
     write_cached_image_to(&path, bytes)?;
     Ok(path)
 }
 
-pub fn prune_cache(max_bytes: u64) -> Result<()> {
-    prune_cache_dir(&image_cache_dir()?, max_bytes)
-}
-
-fn image_cache_dir() -> Result<PathBuf> {
+pub(super) fn image_cache_dir() -> Result<PathBuf> {
     Ok(app_metadata::cache_dir()?.join("images"))
 }
 
@@ -76,22 +75,22 @@ fn cached_image_path_in(base_dir: &Path, key: &CachedImageKey) -> Result<PathBuf
 }
 
 fn cached_image_path_for_response(
+    base_dir: &Path,
     key: &CachedImageKey,
     bytes: &[u8],
     content_type: Option<&str>,
 ) -> Result<PathBuf> {
     cached_image_path_with_extension_in(
-        &image_cache_dir()?,
+        base_dir,
         key,
         image_extension_for_response(bytes, content_type),
     )
 }
 
-fn cached_image_candidate_paths(key: &CachedImageKey) -> Result<Vec<PathBuf>> {
-    let base_dir = image_cache_dir()?;
+fn cached_image_candidate_paths(base_dir: &Path, key: &CachedImageKey) -> Result<Vec<PathBuf>> {
     IMAGE_CACHE_EXTENSIONS
         .iter()
-        .map(|extension| cached_image_path_with_extension_in(&base_dir, key, extension))
+        .map(|extension| cached_image_path_with_extension_in(base_dir, key, extension))
         .collect::<Result<Vec<_>>>()
 }
 
@@ -177,7 +176,7 @@ struct CacheFile {
     modified: SystemTime,
 }
 
-fn prune_cache_dir(base_dir: &Path, max_bytes: u64) -> Result<()> {
+pub(super) fn prune_cache_dir(base_dir: &Path, max_bytes: u64) -> Result<()> {
     if !base_dir.exists() {
         return Ok(());
     }
@@ -279,7 +278,7 @@ fn set_file_permissions(_: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::{Protocol, ServerEndpoint};
+    use crate::server::{CachedServer, Protocol, ServerEndpoint};
 
     fn server() -> CachedServer {
         CachedServer {
@@ -309,7 +308,7 @@ mod tests {
         let request =
             EmbyImageRequest::primary("36089", Some("tag-1".to_string())).with_max_width(640);
 
-        let key = CachedImageKey::from_request(&server(), &request).unwrap();
+        let key = CachedImageKey::from_request(&server().id, &request).unwrap();
 
         assert_eq!(key.server_id, "server/local");
         assert_eq!(key.item_id, "36089");
@@ -323,7 +322,7 @@ mod tests {
     fn ignores_untagged_request() {
         let request = EmbyImageRequest::primary("36089", None);
 
-        assert!(CachedImageKey::from_request(&server(), &request).is_none());
+        assert!(CachedImageKey::from_request(&server().id, &request).is_none());
     }
 
     #[test]

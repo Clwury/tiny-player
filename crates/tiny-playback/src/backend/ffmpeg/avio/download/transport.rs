@@ -14,6 +14,8 @@ use super::{
 pub(super) struct HttpClient {
     pub(super) inner: reqwest::Client,
     runtime: Runtime,
+    #[cfg(test)]
+    pub(super) body_read_started: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl HttpClient {
@@ -26,7 +28,12 @@ impl HttpClient {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|error| error.to_string())?;
-        Ok(Self { inner, runtime })
+        Ok(Self {
+            inner,
+            runtime,
+            #[cfg(test)]
+            body_read_started: None,
+        })
     }
 
     pub(super) fn send(
@@ -138,6 +145,10 @@ impl HttpResponse<'_> {
             return Err(HttpDownloadError::cancelled(offset));
         }
         while self.pending_pos == self.pending.len() {
+            #[cfg(test)]
+            if let Some(started) = &self.client.body_read_started {
+                let _ = started.send(());
+            }
             let chunk = self.client.run(
                 &self.shared,
                 self.generation,

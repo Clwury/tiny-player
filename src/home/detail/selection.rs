@@ -1,5 +1,8 @@
+use super::controller::DetailIntent;
 use super::*;
-use crate::player::PlaybackTrackExt;
+use crate::effects::DetailResource;
+use crate::home::detail::state::detail_binding;
+use crate::home::track_preferences::detail_track_choices;
 
 impl HomeContent {
     pub(in super::super) fn select_series_season(
@@ -7,22 +10,7 @@ impl HomeContent {
         season_id: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = self.series_detail.as_mut() else {
-            return;
-        };
-        if detail.selected_season_id.as_deref() == Some(season_id.as_str()) {
-            detail.open_select = None;
-            cx.notify();
-            return;
-        }
-
-        detail.selected_season_id = Some(season_id);
-        detail.preferred_episode_id = None;
-        detail.clear_preferred_season_hint();
-        detail.open_select = None;
-        detail.reset_episode_selection();
-        self.load_series_episodes_if_needed(cx);
-        cx.notify();
+        self.dispatch_detail_selection(DetailIntent::Season(season_id), true, cx);
     }
 
     pub(in super::super) fn toggle_series_season_select(
@@ -31,19 +19,22 @@ impl HomeContent {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = self.series_detail.as_mut() else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
-        let Some(seasons) = detail.seasons.as_ref() else {
+        let Some(seasons) = detail.model.seasons.as_ref() else {
             return;
         };
         if seasons.items.is_empty() {
             return;
         }
 
-        let opening = detail.open_select != Some(SeriesDetailSelectKind::Season);
+        let opening = detail.presentation.open_select != Some(SeriesDetailSelectKind::Season);
         if opening {
             let selected_index = detail
+                .model
                 .selected_season_id
                 .as_deref()
                 .and_then(|selected_id| {
@@ -53,9 +44,12 @@ impl HomeContent {
                         .position(|season| season.id == selected_id)
                 })
                 .unwrap_or(0);
-            detail.season_scroll_handle.scroll_to_item(selected_index);
+            detail
+                .presentation
+                .season_scroll_handle
+                .scroll_to_item(selected_index);
         }
-        detail.open_select = opening.then_some(SeriesDetailSelectKind::Season);
+        detail.presentation.open_select = opening.then_some(SeriesDetailSelectKind::Season);
         cx.notify();
     }
 
@@ -64,23 +58,7 @@ impl HomeContent {
         episode_id: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = self.series_detail.as_mut() else {
-            return;
-        };
-        let exists = detail.episodes.as_ref().is_some_and(|episodes| {
-            episodes
-                .items
-                .iter()
-                .any(|episode| episode.id == episode_id)
-        });
-        if !exists {
-            return;
-        }
-
-        detail.preferred_episode_id = Some(episode_id.clone());
-        detail.apply_selected_episode(Some(episode_id));
-        detail.open_select = None;
-        cx.notify();
+        self.dispatch_detail_selection(DetailIntent::Episode(episode_id), true, cx);
     }
 
     pub(in super::super) fn toggle_series_media_source_select(
@@ -89,22 +67,23 @@ impl HomeContent {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = self.series_detail.as_mut() else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
-        let source_count = detail.selected_media_sources().map(<[_]>::len).unwrap_or(0);
-        if source_count == 0 || detail.video_sources_loading() {
+        if !detail.model.can_select_media_source() {
             return;
         }
 
-        let opening = detail.open_select != Some(SeriesDetailSelectKind::MediaSource);
+        let opening = detail.presentation.open_select != Some(SeriesDetailSelectKind::MediaSource);
         if opening {
             render::reveal_two_line_option(
-                &detail.media_source_scroll_handle,
-                detail.selected_media_source_index().unwrap_or(0),
+                &detail.presentation.media_source_scroll_handle,
+                detail.model.selected_media_source_index().unwrap_or(0),
             );
         }
-        detail.open_select = opening.then_some(SeriesDetailSelectKind::MediaSource);
+        detail.presentation.open_select = opening.then_some(SeriesDetailSelectKind::MediaSource);
         cx.notify();
     }
 
@@ -114,23 +93,22 @@ impl HomeContent {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = self.series_detail.as_mut() else {
+        let Some(detail) =
+            detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+        else {
             return;
         };
-        if detail.video_sources_loading()
-            || detail
-                .selected_media_source()
-                .is_none_or(|source| source.subtitle_streams().is_empty())
-        {
+        if !detail.model.can_select_subtitle() {
             return;
         }
 
-        let opening = detail.open_select != Some(SeriesDetailSelectKind::Subtitle);
+        let opening = detail.presentation.open_select != Some(SeriesDetailSelectKind::Subtitle);
         if opening {
-            let saved_tracks = detail.selected_track_choices(&self.current_server, cx);
+            let saved_tracks = detail_track_choices(detail.model, &self.current_server, cx);
             render::reveal_two_line_option(
-                &detail.subtitle_scroll_handle,
+                &detail.presentation.subtitle_scroll_handle,
                 detail
+                    .model
                     .selected_subtitle_index(
                         PlaybackLanguagePreferences::get(cx).subtitle,
                         saved_tracks.subtitle.as_ref(),
@@ -139,7 +117,7 @@ impl HomeContent {
                     .unwrap_or(0),
             );
         }
-        detail.open_select = opening.then_some(SeriesDetailSelectKind::Subtitle);
+        detail.presentation.open_select = opening.then_some(SeriesDetailSelectKind::Subtitle);
         cx.notify();
     }
 
@@ -148,11 +126,7 @@ impl HomeContent {
         index: usize,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = self.series_detail.as_mut() else {
-            return;
-        };
-        detail.select_media_source(index);
-        cx.notify();
+        self.dispatch_detail_selection(DetailIntent::MediaSource(index), false, cx);
     }
 
     pub(in super::super) fn select_series_subtitle(
@@ -160,32 +134,36 @@ impl HomeContent {
         index: Option<usize>,
         cx: &mut Context<Self>,
     ) {
-        let Some(detail) = self.series_detail.as_mut() else {
-            return;
-        };
-        let Some(key) = detail.track_preference_key() else {
-            return;
-        };
-        let track = match index {
-            Some(index) => {
-                let Some(track) = detail.selected_media_source().and_then(|source| {
-                    source
-                        .subtitle_streams()
-                        .get(index)
-                        .and_then(|stream| PlaybackTrack::from_subtitle_stream(stream, index))
-                }) else {
-                    return;
-                };
-                Some(track)
-            }
-            None => None,
-        };
+        self.dispatch_detail_selection(DetailIntent::Subtitle(index), true, cx);
+    }
 
-        detail.open_select = None;
-        detail.pending_subtitle_choices.insert(
-            key,
-            crate::player::SavedTrackChoice::from_track(track.as_ref()),
-        );
+    fn dispatch_detail_selection(
+        &mut self,
+        intent: DetailIntent,
+        close_select: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.detail_view().is_none() {
+            return;
+        }
+        let Some(update) = self.controller.dispatch_detail(intent) else {
+            return;
+        };
+        let detail = detail_binding(self.controller.detail_view(), &mut self.detail_resources)
+            .expect("accepted detail selection keeps its resources");
+        detail.presentation.apply_change(update.change);
+        if update.playback_cancelled {
+            detail.playback_task.cancel();
+        }
+        if close_select {
+            detail.presentation.open_select = None;
+        }
+        if update.change.episodes_reset {
+            detail.tasks.remove(&DetailResource::Episodes);
+        }
+        if update.load_episodes {
+            self.load_series_episodes_if_needed(cx);
+        }
         cx.notify();
     }
 }

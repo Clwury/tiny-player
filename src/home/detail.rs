@@ -1,31 +1,42 @@
+#[cfg(test)]
+use crate::home::detail::test_fixture::detail_binding;
 mod actions;
+pub(in crate::home) mod controller;
+mod effect;
 mod images;
+mod launch;
 mod overview;
+pub(in crate::home) mod playback;
+#[cfg(test)]
+mod playback_tests;
 mod render;
-mod state;
-mod video_sources;
+pub(in crate::home) mod state;
+#[cfg(test)]
+pub(in crate::home) mod test_fixture;
 
 use super::notification::{HOME_RESUME_DETAIL_NOTIFICATION_KEY, NotificationScope};
-pub(super) use actions::PlayedRequest;
-pub(crate) use state::{SeriesDetailSelectKind, SeriesDetailState};
+pub(crate) use state::{DetailView, SeriesDetailSelectKind};
+#[cfg(test)]
+use test_fixture::DetailFixture;
 
-use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, SharedString, Window};
+use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, Window};
 
 use crate::{
-    emby::{
-        MediaItem, MediaItems, ResumeItem, UserItem, UserItems, playback::resolve_direct_stream_url,
-    },
+    emby::{ResumeItem, UserItem},
     player::{
-        EmbyPlaybackContext, PlaybackLanguagePreferences, PlaybackQueue, PlaybackQueueItem,
-        PlaybackRequest, PlaybackTrack, PlaybackTrackPreferenceKey, PlaybackTrackSelection,
-        SavedTrackChoices, playback_initial_position_seconds,
+        EmbyPlaybackContext, PlaybackLanguagePreferences, PlaybackRequest,
+        PlaybackTrackPreferenceKey, playback_initial_position_seconds,
     },
-    server::CachedServer,
 };
 
-use super::{
-    HomeContent, HomeContentEvent, LoadState, WorkspaceIdentity,
-    carousel::DETAIL_EPISODE_CARD_STEP_PX,
+use super::{HomeContent, HomeContentEvent};
+#[cfg(test)]
+use {
+    self::playback::SelectedPlayback,
+    super::LoadState,
+    crate::emby::{MediaItem, MediaItems},
+    crate::player::{PlaybackTrack, SavedTrackChoices, gateway::ResolvedPlayback},
+    crate::server::CachedServer,
 };
 
 const DETAIL_ITEM_NOTIFICATION_KEY: &str = "detail:item";
@@ -34,36 +45,6 @@ const DETAIL_SEASONS_NOTIFICATION_KEY: &str = "detail:seasons";
 const DETAIL_NEXT_UP_NOTIFICATION_KEY: &str = "detail:next-up";
 const DETAIL_EPISODES_NOTIFICATION_KEY: &str = "detail:episodes";
 const DETAIL_PLAYBACK_NOTIFICATION_KEY: &str = "detail:playback";
-
-struct SelectedPlayback {
-    detail_id: String,
-    list_item_id: String,
-    item_id: String,
-    media_source_id: String,
-    title: SharedString,
-    audio_tracks: Vec<PlaybackTrack>,
-    subtitle_tracks: Vec<PlaybackTrack>,
-    selected_tracks: PlaybackTrackSelection,
-    remember_subtitle_on_start: bool,
-    run_time_ticks: Option<u64>,
-    playback_position_ticks: Option<u64>,
-    queue: PlaybackQueue,
-}
-
-struct ResolvedPlayback {
-    item_id: String,
-    url: String,
-    http_headers: Vec<(String, String)>,
-    content_length: Option<u64>,
-    media_source_id: String,
-    play_session_id: Option<String>,
-}
-
-#[derive(Clone, Copy)]
-struct DetailRequestRevisions {
-    detail: u64,
-    user_data: u64,
-}
 
 #[path = "detail/loading.rs"]
 mod loading;
@@ -76,189 +57,92 @@ mod selection;
 #[path = "detail/track_preferences_tests.rs"]
 mod track_preferences_tests;
 
-fn selected_playback(
-    detail: &SeriesDetailState,
-    server: &CachedServer,
-    languages: PlaybackLanguagePreferences,
-    saved_tracks: &SavedTrackChoices,
-) -> Result<SelectedPlayback, String> {
-    let item = detail
-        .selected_playback_item()
-        .ok_or_else(|| "请选择要播放的媒体".to_string())?;
-    let source = detail
-        .selected_media_source()
-        .ok_or_else(|| "请选择视频源".to_string())?;
-    let media_source_id = source
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| "所选视频源缺少 ID，无法获取播放地址".to_string())?
-        .to_string();
-    let title = if detail.is_movie() {
-        item.name.clone()
-    } else {
-        let series_name = detail
-            .item
-            .as_ref()
-            .map(|item| item.name.clone())
-            .unwrap_or_else(|| detail.title.clone());
-        format!("{series_name} {}", item.episode_label())
-    };
-
-    let audio_tracks = playback_audio_tracks(source);
-    let item_id = source.playback_item_id(&item.id);
-    let subtitle_tracks = playback_subtitle_tracks(source, server, item_id, &media_source_id);
-    let mut selected_tracks =
-        crate::player::preferred_playback_track_selection(source, &subtitle_tracks, languages);
-    saved_tracks.apply(&audio_tracks, &subtitle_tracks, &mut selected_tracks);
-    let remember_subtitle_on_start = detail
-        .pending_subtitle_choice()
-        .is_some_and(|choice| choice.resolve(&subtitle_tracks).is_some());
-    let playback_position_ticks = detail.playback_position_ticks();
-    let mut queue = playback_queue(detail, item, &title);
-    if let Some(current) = queue.items.get_mut(queue.current_index) {
-        current.playback_position_ticks = playback_position_ticks;
-        current.media_sources = detail.selected_media_sources().unwrap_or_default().to_vec();
-    }
-
-    Ok(SelectedPlayback {
-        detail_id: detail.series_id.clone(),
-        list_item_id: item.id.clone(),
-        item_id: item_id.to_string(),
-        media_source_id,
-        title: title.into(),
-        audio_tracks,
-        subtitle_tracks,
-        selected_tracks,
-        remember_subtitle_on_start,
-        run_time_ticks: item.run_time_ticks,
-        playback_position_ticks,
-        queue,
-    })
-}
-
-fn playback_queue(
-    detail: &SeriesDetailState,
-    selected_item: &MediaItem,
-    selected_title: &str,
-) -> PlaybackQueue {
-    if detail.is_movie() {
-        return PlaybackQueue::new(
-            vec![playback_queue_item(
-                selected_item,
-                selected_title.to_string().into(),
-                None,
-                None,
-            )],
-            0,
-        );
-    }
-
-    let series_name = detail
-        .item
-        .as_ref()
-        .map(|item| item.name.as_str())
-        .unwrap_or(detail.title.as_str());
-    let selected_season_id = detail.selected_season_id.clone();
-    // The response is already scoped to this season and checked when loaded.
-    // Grouped versions can carry other physical SeasonIds, so do not filter
-    // those episodes out of the playback queue.
-    let mut items = detail
-        .episodes
-        .as_ref()
-        .map(|episodes| {
-            episodes
-                .items
-                .iter()
-                .filter(|episode| playback_queue_episode_is_valid(episode))
-                .map(|episode| {
-                    playback_queue_item(
-                        episode,
-                        format!("{series_name} {}", episode.episode_label()).into(),
-                        Some(detail.series_id.clone()),
-                        // Playback updates must retain the detail's season context.
-                        selected_season_id
-                            .clone()
-                            .or_else(|| episode.season_id.clone()),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let current_index = items
-        .iter()
-        .position(|item| item.item_id == selected_item.id);
-    if let Some(current_index) = current_index {
-        return PlaybackQueue::new(items, current_index);
-    }
-
-    items.clear();
-    items.push(playback_queue_item(
-        selected_item,
-        selected_title.to_string().into(),
-        Some(detail.series_id.clone()),
-        selected_season_id.or_else(|| selected_item.season_id.clone()),
-    ));
-    PlaybackQueue::new(items, 0)
-}
-
-fn playback_queue_episode_is_valid(item: &MediaItem) -> bool {
-    !item.id.trim().is_empty()
-        && item
-            .item_type
-            .as_deref()
-            .is_none_or(|item_type| item_type.eq_ignore_ascii_case("Episode"))
-        && item.media_sources.as_ref().is_some_and(|sources| {
-            sources
-                .iter()
-                .any(|source| source.id.as_deref().is_some_and(|id| !id.trim().is_empty()))
-        })
-}
-
-fn playback_queue_item(
-    item: &MediaItem,
-    title: SharedString,
-    series_id: Option<String>,
-    season_id: Option<String>,
-) -> PlaybackQueueItem {
-    PlaybackQueueItem {
-        item_id: item.id.clone(),
-        title,
-        episode_label: item.episode_label().into(),
-        overview: item.overview.clone(),
-        primary_image_tag: item.primary_image_tag().map(str::to_string),
-        series_id,
-        season_id,
-        premiere_date: item.premiere_date.clone(),
-        run_time_ticks: item.run_time_ticks,
-        playback_position_ticks: item.playback_position_ticks(),
-        media_sources: item.media_sources.clone().unwrap_or_default(),
-    }
-}
-
-fn apply_media_item_user_data_overrides(
-    items: &mut [MediaItem],
-    overrides: &std::collections::HashMap<String, crate::emby::UserItemData>,
-) {
-    for item in items {
-        if let Some(data) = overrides.get(&item.id) {
-            item.user_data = Some(data.clone());
-        }
-    }
-}
-
-fn playback_audio_tracks(source: &crate::emby::MediaSource) -> Vec<PlaybackTrack> {
-    crate::player::playback_audio_tracks_for_source(source)
-}
-
+#[cfg(test)]
 fn playback_subtitle_tracks(
     source: &crate::emby::MediaSource,
     server: &CachedServer,
     item_id: &str,
     media_source_id: &str,
 ) -> Vec<PlaybackTrack> {
-    crate::player::playback_subtitle_tracks_for_source(source, server, item_id, media_source_id)
+    crate::player::adapter::subtitles::playback_subtitle_tracks_for_source(
+        source,
+        server,
+        item_id,
+        media_source_id,
+    )
+}
+
+#[cfg(test)]
+fn selected_playback(
+    detail: DetailView<'_>,
+    server: &CachedServer,
+    languages: PlaybackLanguagePreferences,
+    saved: &SavedTrackChoices,
+) -> Result<SelectedPlayback, String> {
+    effect::selected_playback(
+        detail.model,
+        &crate::player::adapter::EmbyPlaybackGateway {
+            client: crate::emby::EmbyClient::new("test".into()).unwrap(),
+            server: server.clone(),
+        },
+        languages,
+        saved,
+    )
+}
+#[cfg(test)]
+fn playback_queue(
+    detail: DetailView<'_>,
+    selected: &crate::emby::MediaItem,
+    title: &str,
+) -> crate::player::PlaybackQueue {
+    playback::playback_queue(detail.model, selected, title)
+}
+
+#[cfg(test)]
+fn begin_prepared_playback(
+    page: &mut HomeContent,
+    selected: SelectedPlayback,
+) -> playback::DetailPlaybackCommand {
+    let identity = page.request_identity();
+    detail_binding(
+        page.controller.test_state_mut().navigation,
+        &mut page.detail_resources,
+    )
+    .unwrap()
+    .controller
+    .begin_playback(Ok(selected), identity)
+    .unwrap()
+    .unwrap()
+}
+
+#[cfg(test)]
+fn restart_detail_request(
+    page: &mut HomeContent,
+    resource: crate::effects::DetailResource,
+    revision: Option<u64>,
+) -> controller::DetailRequest {
+    use crate::effects::DetailResource;
+    let identity = page.request_identity();
+    let revision = revision.unwrap_or_else(|| page.controller.user_data_request_revision());
+    let detail = detail_binding(
+        page.controller.test_state_mut().navigation,
+        &mut page.detail_resources,
+    )
+    .unwrap();
+    detail.tasks.remove(&resource);
+    let effects = &mut detail.controller.state.effects;
+    *match resource {
+        DetailResource::Item => &mut effects.item,
+        DetailResource::Similar => &mut effects.similar,
+        DetailResource::Seasons => &mut effects.seasons,
+        DetailResource::NextUp => &mut effects.next_up,
+        DetailResource::Episodes => &mut effects.episodes,
+        DetailResource::ResumeSources => &mut effects.resume_sources,
+    } = LoadState::Idle;
+    detail
+        .controller
+        .begin(resource, identity, revision)
+        .unwrap()
 }
 
 #[cfg(test)]
@@ -301,9 +185,9 @@ mod tests {
             "Type": "Series"
         }))
         .unwrap();
-        let mut detail = SeriesDetailState::new_series(&series);
-        detail.selected_season_id = Some("season-1".to_string());
-        detail.episodes = Some(
+        let mut detail = DetailFixture::new_series(&series);
+        detail.controller.state.selected_season_id = Some("season-1".to_string());
+        detail.controller.state.episodes = Some(
             serde_json::from_value::<MediaItems>(serde_json::json!({
                 "Items": [
                     {
@@ -344,10 +228,10 @@ mod tests {
             }))
             .unwrap(),
         );
-        detail.selected_episode_id = Some("episode-1".to_string());
-        let selected = detail.selected_episode().unwrap();
+        detail.controller.state.selected_episode_id = Some("episode-1".to_string());
+        let selected = detail.controller.state.selected_episode().unwrap();
 
-        let queue = playback_queue(&detail, selected, "Series S1E1");
+        let queue = playback_queue(detail.view(), selected, "Series S1E1");
 
         assert_eq!(
             queue
@@ -383,10 +267,10 @@ mod tests {
             "Id": "series-1", "Name": "Series", "Type": "Series"
         }))
         .unwrap();
-        let mut detail = SeriesDetailState::new_series(&series);
-        detail.selected_season_id = Some("season-1".into());
-        detail.episodes_request_season_id = Some("season-1".into());
-        detail.episodes = Some(MediaItems {
+        let mut detail = DetailFixture::new_series(&series);
+        detail.controller.state.selected_season_id = Some("season-1".into());
+        detail.controller.state.episodes_request_season_id = Some("season-1".into());
+        detail.controller.state.episodes = Some(MediaItems {
             items: (1..=20)
                 .map(|number| {
                     serde_json::from_value(serde_json::json!({
@@ -403,9 +287,9 @@ mod tests {
                 .collect(),
             total_record_count: 20,
         });
-        detail.selected_episode_id = Some("episode-7".into());
+        detail.controller.state.selected_episode_id = Some("episode-7".into());
         let playback = selected_playback(
-            &detail,
+            detail.view(),
             &server(),
             PlaybackLanguagePreferences::default(),
             &SavedTrackChoices::default(),
@@ -449,9 +333,19 @@ mod tests {
         };
         detail.apply_playback_update(&update, &crate::emby::UserItemData::default());
 
-        assert_eq!(detail.selected_episode_id.as_deref(), Some("episode-20"));
-        assert_eq!(detail.selected_season_id.as_deref(), Some("season-1"));
-        let queue = playback_queue(&detail, detail.selected_episode().unwrap(), "Series S1E20");
+        assert_eq!(
+            detail.controller.state.selected_episode_id.as_deref(),
+            Some("episode-20")
+        );
+        assert_eq!(
+            detail.controller.state.selected_season_id.as_deref(),
+            Some("season-1")
+        );
+        let queue = playback_queue(
+            detail.view(),
+            detail.controller.state.selected_episode().unwrap(),
+            "Series S1E20",
+        );
         assert_eq!(queue.items.len(), 20);
         assert_eq!(queue.current_index, 19);
         assert_eq!(queue.next_index(), None);
@@ -463,15 +357,15 @@ mod tests {
             "Id": "series-1", "Name": "Series", "Type": "Series"
         }))
         .unwrap();
-        let mut detail = SeriesDetailState::new_series(&series);
-        detail.selected_season_id = Some("season-1".into());
+        let mut detail = DetailFixture::new_series(&series);
+        detail.controller.state.selected_season_id = Some("season-1".into());
         let episode = serde_json::from_value(serde_json::json!({
             "Id": "episode-1", "Name": "First", "Type": "Episode",
             "SeasonId": "alternate-season-1", "MediaSources": [{"Id": "source-1"}]
         }))
         .unwrap();
 
-        let queue = playback_queue(&detail, &episode, "Series S1E1");
+        let queue = playback_queue(detail.view(), &episode, "Series S1E1");
 
         assert_eq!(queue.items.len(), 1);
         assert_eq!(
@@ -495,11 +389,20 @@ mod tests {
                 "Id": "series-1", "Name": "Series", "Type": "Series"
             }))
             .unwrap();
-            let mut detail = SeriesDetailState::new_series(&series);
-            detail.selected_season_id = Some("season-2".into());
-            detail.episodes_request_season_id = Some("season-2".into());
-            detail.effects.episodes = LoadState::Loading;
-            page.series_detail = Some(detail);
+            let mut detail = DetailFixture::new_series(&series);
+            detail.controller.state.selected_season_id = Some("season-1".into());
+            page.install_detail_fixture(Some(detail));
+            let old = restart_detail_request(page, crate::effects::DetailResource::Episodes, None);
+            detail_binding(
+                page.controller.test_state_mut().navigation,
+                &mut page.detail_resources,
+            )
+            .unwrap()
+            .controller
+            .dispatch(controller::DetailIntent::Season("season-2".into()));
+            let current =
+                restart_detail_request(page, crate::effects::DetailResource::Episodes, None);
+            let requests = [old, current];
 
             for season_id in ["season-1", "season-2", "season-1"] {
                 let response = serde_json::from_value(serde_json::json!({
@@ -511,19 +414,13 @@ mod tests {
                     "TotalRecordCount": 1
                 }))
                 .unwrap();
-                page.finish_series_episodes(
-                    page.request_identity(),
-                    DetailRequestRevisions {
-                        detail: page.detail_generation,
-                        user_data: page.user_data_request_revision(),
-                    },
-                    "series-1".into(),
-                    season_id.into(),
-                    Ok(response),
+                page.finish_detail_request(
+                    requests[usize::from(season_id == "season-2")].clone(),
+                    Ok(controller::DetailResponse::Episodes(response)),
                     cx,
                 );
-                let detail = page.series_detail.as_ref().unwrap();
-                if let Some(selected) = detail.selected_episode() {
+                let detail = page.detail_view().unwrap();
+                if let Some(selected) = detail.model.selected_episode() {
                     let queue = playback_queue(detail, selected, "Series S2E1");
                     assert_eq!(queue.items.len(), 1);
                     assert_eq!(queue.current().unwrap().item_id, "season-2-episode");
@@ -533,7 +430,7 @@ mod tests {
                     );
                 } else {
                     assert_eq!(season_id, "season-1");
-                    assert_eq!(detail.effects.episodes, LoadState::Loading);
+                    assert_eq!(detail.model.effects.episodes, LoadState::Loading);
                 }
             }
         });
@@ -546,8 +443,8 @@ mod tests {
             "Id": "movie-1", "Name": "Movie", "Type": "Movie"
         }))
         .unwrap();
-        let mut detail = SeriesDetailState::from_user_item(&movie).unwrap();
-        detail.item = Some(serde_json::from_value(serde_json::json!({
+        let mut detail = DetailFixture::from_user_item(&movie, Default::default()).unwrap();
+        detail.controller.state.item = Some(serde_json::from_value(serde_json::json!({
             "Id": "movie-1", "Name": "Movie", "Type": "Movie",
             "MediaSources": [{"Id": "source-1", "MediaStreams": [
                 {"Index": 1, "Type": "Audio", "Language": "eng", "IsDefault": true},
@@ -556,9 +453,15 @@ mod tests {
                 {"Index": 7, "Type": "Subtitle", "Language": "chs", "DisplayTitle": "简体中文"}
             ]}]
         })).unwrap());
-        detail.sync_media_source_selection();
+        {
+            let change = detail.controller.state.sync_media_source_selection();
+            detail.apply_change(change);
+        }
         assert_eq!(
-            detail.selected_subtitle_label(TrackLanguage::Default, None),
+            detail
+                .controller
+                .state
+                .selected_subtitle_label(TrackLanguage::Default, None),
             "English"
         );
         let languages = PlaybackLanguagePreferences {
@@ -566,12 +469,19 @@ mod tests {
             subtitle: TrackLanguage::ChineseSimplified,
         };
         assert_eq!(
-            detail.selected_subtitle_label(languages.subtitle, None),
+            detail
+                .controller
+                .state
+                .selected_subtitle_label(languages.subtitle, None),
             "简体中文"
         );
-        let selected =
-            selected_playback(&detail, &server(), languages, &SavedTrackChoices::default())
-                .unwrap();
+        let selected = selected_playback(
+            detail.view(),
+            &server(),
+            languages,
+            &SavedTrackChoices::default(),
+        )
+        .unwrap();
         assert_eq!(selected.selected_tracks.audio_stream_index, Some(3));
         assert_eq!(selected.selected_tracks.subtitle_stream_index, Some(7));
 
@@ -581,12 +491,18 @@ mod tests {
             )),
             ..Default::default()
         };
-        detail.sync_media_source_selection();
+        {
+            let change = detail.controller.state.sync_media_source_selection();
+            detail.apply_change(change);
+        }
         assert_eq!(
-            detail.selected_subtitle_label(languages.subtitle, saved.subtitle.as_ref()),
+            detail
+                .controller
+                .state
+                .selected_subtitle_label(languages.subtitle, saved.subtitle.as_ref()),
             "English"
         );
-        let selected = selected_playback(&detail, &server(), languages, &saved).unwrap();
+        let selected = selected_playback(detail.view(), &server(), languages, &saved).unwrap();
         assert_eq!(selected.selected_tracks.subtitle_stream_index, Some(4));
     }
 

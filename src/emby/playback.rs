@@ -57,7 +57,7 @@ impl EmbyClient {
         )
     }
 
-    #[instrument(skip(self, server, report), fields(server = %server.endpoint.display_url(), item_id = %report.item_id, media_source_id = %report.media_source_id))]
+    #[instrument(skip_all)]
     pub fn report_playback_started(
         &self,
         server: &CachedServer,
@@ -70,7 +70,7 @@ impl EmbyClient {
             .context("上报 Emby 播放开始失败")
     }
 
-    #[instrument(skip(self, server, report), fields(server = %server.endpoint.display_url(), item_id = %report.item_id, media_source_id = %report.media_source_id))]
+    #[instrument(skip_all)]
     pub fn report_playback_progress(
         &self,
         server: &CachedServer,
@@ -83,7 +83,7 @@ impl EmbyClient {
             .context("上报 Emby 播放进度失败")
     }
 
-    #[instrument(skip(self, server, report), fields(server = %server.endpoint.display_url(), item_id = %report.item_id, media_source_id = %report.media_source_id))]
+    #[instrument(skip_all)]
     pub fn report_playback_stopped(
         &self,
         server: &CachedServer,
