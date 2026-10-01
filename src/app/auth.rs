@@ -203,11 +203,13 @@ impl TinyApp {
         self.cancel_server_selection(cx);
         let playback_cache_config = self.cache.playback.clone();
         let playback_volume = self.cache.playback_volume;
+        let ports = crate::player::adapter::playback_ports(&request.emby);
         let playback_page = cx.new(|cx| {
-            crate::player::PlaybackPage::new_with_settings(
+            crate::player::PlaybackPage::with_ports(
                 request,
                 playback_cache_config,
                 playback_volume,
+                ports,
                 cx,
             )
         });

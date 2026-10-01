@@ -3,11 +3,8 @@ mod delivery;
 use super::*;
 use crate::{
     effects::EffectHandle,
-    player::{
-        adapter::EmbyPlaybackGateway,
-        reporting::{
-            PROGRESS_INTERVAL, ReportingIntent, ReportingTransition, effect::PlaybackReporter,
-        },
+    player::reporting::{
+        PROGRESS_INTERVAL, ReportingIntent, ReportingTransition, effect::PlaybackReporter,
     },
 };
 
@@ -19,16 +16,14 @@ pub(super) struct ReportingEffects {
 }
 
 impl ReportingEffects {
-    pub(super) fn new(context: &EmbyPlaybackContext, cx: &gpui::App) -> Self {
+    pub(super) fn new(
+        gateway: Arc<dyn crate::player::reporting::gateway::PlaybackReportGateway>,
+        identity: crate::effects::WorkspaceIdentity,
+        cx: &gpui::App,
+    ) -> Self {
         Self {
             reporter: delivery::ReportDelivery::new(
-                PlaybackReporter::new(
-                    Arc::new(EmbyPlaybackGateway {
-                        client: context.client.clone(),
-                        server: context.server.clone(),
-                    }),
-                    context.server.workspace_identity(),
-                ),
+                PlaybackReporter::new(gateway, identity),
                 cx.foreground_executor().clone(),
             ),
             periodic: EffectHandle::default(),

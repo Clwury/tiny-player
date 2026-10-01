@@ -14,6 +14,16 @@ pub(crate) struct EmbyPlaybackGateway {
     pub(crate) server: CachedServer,
 }
 
+/// Default composition for the public page constructors and the app shell.
+/// Both ports retain the same immutable account snapshot for this page's lifetime.
+pub(crate) fn playback_ports(context: &super::EmbyPlaybackContext) -> super::PlaybackPorts {
+    let gateway = std::sync::Arc::new(EmbyPlaybackGateway {
+        client: context.client.clone(),
+        server: context.server.clone(),
+    });
+    super::PlaybackPorts::new(gateway.clone(), gateway)
+}
+
 impl PlaybackReportGateway for EmbyPlaybackGateway {
     fn report(&self, report: &super::reporting::PlaybackReport) -> anyhow::Result<()> {
         use super::reporting::PlaybackReport;

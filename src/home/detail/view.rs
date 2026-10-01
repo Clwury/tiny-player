@@ -49,19 +49,12 @@ pub(super) fn reveal_two_line_option(scroll_handle: &ScrollHandle, option_index:
     ));
 }
 
-#[path = "render/controls.rs"]
 mod controls;
-#[path = "render/episodes.rs"]
 mod episodes;
-#[path = "render/hero.rs"]
 mod hero;
-#[path = "render/hero_metadata.rs"]
 mod hero_metadata;
-#[path = "render/people.rs"]
 mod people;
-#[path = "render/similar.rs"]
 mod similar;
-#[path = "render/video_metadata.rs"]
 mod video_metadata;
 
 fn has_studios(item: &MediaItem) -> bool {

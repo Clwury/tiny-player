@@ -1,4 +1,5 @@
-use gpui::{Entity, Render, TestAppContext};
+use crate::theme;
+use gpui::{Entity, IntoElement, MouseButton, Render, TestAppContext, px};
 
 use crate::{
     server::CachedItemCounts,

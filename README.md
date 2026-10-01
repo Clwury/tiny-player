@@ -100,6 +100,10 @@ module ownership and build details. The engine has no GPUI dependency; the appli
 adapts its video and subtitle pixels for display. Run `cargo test --workspace --locked` to test
 both crates, or `cargo test -p tiny-playback --locked` for engine tests.
 
+Application UI ownership and repeatable boundary checks are documented in
+[Application UI boundaries](docs/application-ui-boundaries.md). The original spec,
+audit, and migration record are kept under `docs/refactors/application-ui-business/`.
+
 After cloning the repository, prepare the following dependencies for Linux development:
 
 - Stable Rust, C/C++ build tools, Clang/libclang, and pkg-config.

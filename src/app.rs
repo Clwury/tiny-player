@@ -22,7 +22,7 @@ use gpui::{Context, Entity, SharedString, Task, WindowHandle};
 
 pub(crate) use resize::WINDOW_RESIZE_EDGE_WIDTH_PX;
 pub(crate) use window::{
-    WindowCornersExt, app_window_options, window_corner_radii, window_has_rounded_corners,
+    app_window_options, window_corner_radii, window_has_rounded_corners,
     window_uses_system_decorations,
 };
 

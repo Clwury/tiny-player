@@ -99,6 +99,9 @@ tar -xzf "tiny-player-<version>-linux-x86_64.tar.gz"
 运行 `cargo test --workspace --locked` 测试两个 crate，或使用
 `cargo test -p tiny-playback --locked` 单独测试引擎。
 
+应用 UI 的职责划分和可重复执行的边界检查见[应用 UI 模块边界](docs/application-ui-boundaries.md)。
+原始规范、交付审计和迁移记录保存在 `docs/refactors/application-ui-business/`。
+
 克隆仓库后，Linux 开发环境需要：
 
 - Rust stable、C/C++ 构建工具、Clang/libclang、pkg-config。

@@ -5,6 +5,7 @@ mod image_resources;
 mod media_metadata;
 mod model;
 mod page;
+mod ports;
 mod profile;
 mod queue;
 pub(crate) mod reporting;
@@ -26,6 +27,7 @@ pub(crate) use crate::media::{
 pub(crate) use media_metadata::{format_video_size, premiere_day};
 pub use model::time::playback_initial_position_seconds;
 pub use page::{PlaybackEvent, PlaybackPage};
+pub(crate) use ports::PlaybackPorts;
 pub use profile::{DeviceProfileConfig, device_profile};
 pub use reporting::{PlaybackStateUpdate, PlaybackStopCompletion, PlaybackStopResult};
 pub use request::{EmbyPlaybackContext, PlaybackRequest};

@@ -24,22 +24,15 @@ struct PlaybackControlsRenderState {
     subtitle_select_open: bool,
 }
 
-#[path = "controls/download_speed.rs"]
 mod download_speed;
 pub(super) use download_speed::DownloadSpeedDisplay;
-#[path = "controls/components.rs"]
 mod components;
-#[path = "controls/progress.rs"]
 mod progress;
 pub(super) use components::{playback_control_button, volume_indicator};
-#[path = "controls/render.rs"]
 mod render;
-#[path = "controls/stats.rs"]
 mod stats;
 use stats::*;
-#[path = "controls/tracks.rs"]
 mod tracks;
-#[path = "controls/transport.rs"]
 mod transport;
 
 impl PlaybackPage {

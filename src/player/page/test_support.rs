@@ -41,20 +41,24 @@ pub(in crate::player::page) fn playback_window(
 impl PlaybackPage {
     /// In-memory page for interaction tests; no FFmpeg, Vulkan or audio device.
     pub(crate) fn test_fixture(cx: &mut gpui::Context<Self>) -> Self {
-        let emby = EmbyPlaybackContext {
-            client: crate::emby::EmbyClient::new("episode-list-test".into()).unwrap(),
-            server: serde_json::from_value(json!({
-                "id": "episode-list-test",
-                "endpoint": {"protocol": "Http", "address": "", "port": 80, "path": "/emby"},
-                "username": "test", "password": "", "user_id": "user",
-                "access_token": "test-token", "added_at_unix": 0
-            }))
-            .unwrap(),
-            item_id: "episode-0".into(),
-            media_source_id: "source-0".into(),
-            play_session_id: None,
-            run_time_ticks: Some(18_000_000_000),
-        };
+        let emby = playback_context();
+        let ports = crate::player::adapter::playback_ports(&emby);
+        Self::fixture_with_context(emby, ports, cx)
+    }
+
+    pub(in crate::player::page) fn test_fixture_with_ports(
+        ports: crate::player::PlaybackPorts,
+        cx: &mut gpui::Context<Self>,
+    ) -> Self {
+        Self::fixture_with_context(playback_context(), ports, cx)
+    }
+
+    fn fixture_with_context(
+        emby: EmbyPlaybackContext,
+        ports: crate::player::PlaybackPorts,
+        cx: &mut gpui::Context<Self>,
+    ) -> Self {
+        let (report_effects, queue_effects) = lifecycle::bind_ports(&emby, ports, cx);
         // Exercise the real page and event flow without starting FFmpeg or Vulkan.
         PlaybackPage::register_image_cleanup(cx);
         let mut presentation = PlaybackPresentationState::new(
@@ -101,9 +105,26 @@ impl PlaybackPage {
                 PlaybackVolumeSettings::default(),
                 None,
             ),
-            report_effects: reporting::ReportingEffects::new(&emby, cx),
-            queue_effects: queue::QueueEffects::new(&emby),
+            report_effects,
+            queue_effects,
             emby,
         }
+    }
+}
+
+fn playback_context() -> EmbyPlaybackContext {
+    EmbyPlaybackContext {
+        client: crate::emby::EmbyClient::new("episode-list-test".into()).unwrap(),
+        server: serde_json::from_value(json!({
+            "id": "episode-list-test",
+            "endpoint": {"protocol": "Http", "address": "", "port": 80, "path": "/emby"},
+            "username": "test", "password": "", "user_id": "user",
+            "access_token": "test-token", "added_at_unix": 0
+        }))
+        .unwrap(),
+        item_id: "episode-0".into(),
+        media_source_id: "source-0".into(),
+        play_session_id: None,
+        run_time_ticks: Some(18_000_000_000),
     }
 }

@@ -581,7 +581,7 @@ fn clicking_non_adjacent_episode_resolves_playback_and_preserves_resume_position
     page.update(cx, |page, cx| {
         page.emby.server.endpoint.address = "127.0.0.1".into();
         page.emby.server.endpoint.port = port;
-        page.queue_effects = queue::QueueEffects::new(&page.emby);
+        page.queue_effects = queue::QueueEffects::new(crate::player::adapter::playback_ports(&page.emby).source);
         let source = serde_json::from_value(json!({
             "Id": "source-2", "DefaultSubtitleStreamIndex": 10,
             "MediaStreams": [

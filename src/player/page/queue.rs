@@ -3,11 +3,8 @@ use super::*;
 use crate::media::gateway::PlaybackSourceGateway;
 use crate::{
     effects::EffectHandle,
-    player::{
-        adapter::EmbyPlaybackGateway,
-        queue::{
-            QueueAction, QueueSwitchCommand, QueueSwitchUpdate, ResolvedQueuePlayback, effect,
-        },
+    player::queue::{
+        QueueAction, QueueSwitchCommand, QueueSwitchUpdate, ResolvedQueuePlayback, effect,
     },
     ui::radius,
 };
@@ -20,12 +17,9 @@ pub(super) struct QueueEffects {
     task: EffectHandle<gpui::Task<()>>,
 }
 impl QueueEffects {
-    pub(super) fn new(context: &EmbyPlaybackContext) -> Self {
+    pub(super) fn new(gateway: Arc<dyn PlaybackSourceGateway>) -> Self {
         Self {
-            gateway: Arc::new(EmbyPlaybackGateway {
-                client: context.client.clone(),
-                server: context.server.clone(),
-            }),
+            gateway,
             task: EffectHandle::default(),
         }
     }

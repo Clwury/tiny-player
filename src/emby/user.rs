@@ -9,11 +9,8 @@ use crate::server::{AddServerSubmission, CachedServer};
 
 use super::{CLIENT_NAME, EmbyClient, EmbyImageType, VERSION, api_url, log_secrets, url_for_log};
 
-#[path = "user/authentication.rs"]
 mod authentication;
-#[path = "user/mutations.rs"]
 mod mutations;
-#[path = "user/queries.rs"]
 mod queries;
 
 fn add_resume_items_query(url: &mut url::Url) {

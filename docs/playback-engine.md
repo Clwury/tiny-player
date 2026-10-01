@@ -9,7 +9,7 @@
 | `tiny-playback` | FFmpeg 解码、HTTP 与 demux 缓存、音频、时钟与调度、Vulkan、libplacebo 和视频呈现 |
 
 应用的 `src/player.rs` 保留页面接口，并转导出常用引擎类型。
-`src/player/tracks.rs` 通过应用内扩展 trait 将 Emby 媒体流转换为引擎轨道；
+`src/media/tracks.rs` 通过应用内扩展 trait 将 Emby 媒体流转换为引擎轨道；
 语言选择、轨道偏好和 Emby device profile 留在应用包。
 
 ## 引擎接口
@@ -56,7 +56,7 @@ Vulkan/libplacebo；没有 GPU 的环境可使用 BGRA 等走软件转换路径�
 HDR/Dolby Vision 映射和 Vulkan 渲染继续在引擎线程内完成，现有 CPU 回读路径不变。
 
 `BgraImage` 不实现 `Clone`，应用通过 `into_bytes()` 接管像素分配。
-`src/player/presentation.rs` 将其包装为 GPUI `RenderImage`，视频适配不复制整帧。
+`src/player/image_resources.rs` 将其包装为 GPUI `RenderImage`，视频适配不复制整帧。
 GPUI 使用的 `RgbaImage` 容器实际承载 BGRA 字节，适配时不交换颜色通道。
 
 位图字幕通过 `SharedBgraImage` 共享不可变像素，克隆不复制数据，相等性比较对象身份。

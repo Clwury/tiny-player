@@ -13,7 +13,7 @@ mod tests;
 
 pub(crate) use catalog::ServerCatalog;
 pub(crate) use controller::ServerController;
-pub(crate) use icons::{IconDownloadResult, IconRequest};
+pub(crate) use icons::{IconDownloadResult, IconPickerVm, IconRequest};
 pub(crate) use model::{
     AuthRequest, AuthResult, CountRequest, CountResult, ServerCommand, ServerIntent,
 };

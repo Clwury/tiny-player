@@ -1,4 +1,5 @@
 pub(crate) mod form;
+pub(crate) mod icon_picker;
 use std::{rc::Rc, time::Duration};
 pub(crate) mod reorder;
 

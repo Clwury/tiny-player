@@ -78,7 +78,7 @@ impl HomeContent {
 
         let opening = detail.presentation.open_select != Some(SeriesDetailSelectKind::MediaSource);
         if opening {
-            render::reveal_two_line_option(
+            view::reveal_two_line_option(
                 &detail.presentation.media_source_scroll_handle,
                 detail.model.selected_media_source_index().unwrap_or(0),
             );
@@ -105,7 +105,7 @@ impl HomeContent {
         let opening = detail.presentation.open_select != Some(SeriesDetailSelectKind::Subtitle);
         if opening {
             let saved_tracks = detail_track_choices(detail.model, &self.current_server, cx);
-            render::reveal_two_line_option(
+            view::reveal_two_line_option(
                 &detail.presentation.subtitle_scroll_handle,
                 detail
                     .model

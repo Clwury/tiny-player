@@ -30,12 +30,22 @@ impl PlaybackPage {
         volume_settings: PlaybackVolumeSettings,
         cx: &mut Context<Self>,
     ) -> Self {
+        let ports = crate::player::adapter::playback_ports(&request.emby);
+        Self::with_ports(request, cache_config, volume_settings, ports, cx)
+    }
+
+    pub(crate) fn with_ports(
+        request: PlaybackRequest,
+        cache_config: tiny_playback::PlaybackCacheConfig,
+        volume_settings: PlaybackVolumeSettings,
+        ports: crate::player::PlaybackPorts,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self::register_image_cleanup(cx);
         let volume = volume_settings.normalized();
         let source_protocol = playback_protocol(&request.url);
         let content_length = request.content_length;
-        let report_effects = reporting::ReportingEffects::new(&request.emby, cx);
-        let queue_effects = queue::QueueEffects::new(&request.emby);
+        let (report_effects, queue_effects) = bind_ports(&request.emby, ports, cx);
 
         let (video, error_message) = PlaybackBackendAdapter::start(
             BackendLoadRequest {
@@ -138,4 +148,16 @@ impl PlaybackPage {
         window.toggle_fullscreen();
         cx.notify();
     }
+}
+
+/// Page construction and in-memory fixtures share the same port binding path.
+pub(super) fn bind_ports(
+    context: &EmbyPlaybackContext,
+    ports: crate::player::PlaybackPorts,
+    cx: &gpui::App,
+) -> (reporting::ReportingEffects, queue::QueueEffects) {
+    (
+        reporting::ReportingEffects::new(ports.reporting, context.server.workspace_identity(), cx),
+        queue::QueueEffects::new(ports.source),
+    )
 }

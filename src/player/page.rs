@@ -48,6 +48,8 @@ mod adapter_tests;
 #[cfg(test)]
 mod mouse_tests;
 #[cfg(test)]
+mod ports_tests;
+#[cfg(test)]
 mod test_support;
 
 use super::{EmbyPlaybackContext, PlaybackRequest};

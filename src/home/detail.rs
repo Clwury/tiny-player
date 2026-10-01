@@ -11,9 +11,9 @@ mod overview;
 pub(in crate::home) mod playback;
 #[cfg(test)]
 mod playback_tests;
-mod render;
 #[cfg(test)]
 pub(in crate::home) mod test_fixture;
+mod view;
 
 use super::notification::{HOME_RESUME_DETAIL_NOTIFICATION_KEY, NotificationScope};
 pub(crate) use binding::{DetailView, SeriesDetailSelectKind};
@@ -45,15 +45,11 @@ const DETAIL_NEXT_UP_NOTIFICATION_KEY: &str = "detail:next-up";
 const DETAIL_EPISODES_NOTIFICATION_KEY: &str = "detail:episodes";
 const DETAIL_PLAYBACK_NOTIFICATION_KEY: &str = "detail:playback";
 
-#[path = "detail/loading.rs"]
 mod loading;
-#[path = "detail/navigation.rs"]
 mod navigation;
-#[path = "detail/selection.rs"]
 mod selection;
 
 #[cfg(test)]
-#[path = "detail/track_preferences_tests.rs"]
 mod track_preferences_tests;
 
 #[cfg(test)]
