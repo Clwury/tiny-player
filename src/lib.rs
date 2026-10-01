@@ -6,6 +6,7 @@ mod effects;
 pub mod emby;
 mod home;
 mod images;
+mod media;
 mod observability;
 mod persistence;
 pub mod player;

@@ -1,8 +1,6 @@
 use super::*;
 use crate::emby::{MediaSource, MediaStream};
-use crate::player::model::selection::{
-    playback_audio_tracks_for_source, preferred_playback_track_selection,
-};
+use crate::media::{playback_audio_tracks_for_source, preferred_playback_track_selection};
 use crate::server::{CachedServer, Protocol, ServerEndpoint};
 
 #[test]

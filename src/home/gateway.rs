@@ -5,7 +5,7 @@ pub(crate) mod test_support;
 
 /// Home IO port. Methods return domain values, never entities or UI handles.
 /// Additional Home endpoints move here as their controllers are migrated.
-pub(super) trait HomeGateway: Send + Sync {
+pub(crate) trait HomeGateway: Send + Sync {
     fn similar_items(&self, item_id: &str) -> anyhow::Result<crate::emby::UserItems>;
     fn show_seasons(&self, series_id: &str) -> anyhow::Result<crate::emby::MediaItems>;
     fn show_next_up(&self, series_id: &str) -> anyhow::Result<crate::emby::MediaItems>;

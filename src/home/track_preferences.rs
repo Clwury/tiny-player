@@ -1,13 +1,13 @@
 use gpui::App;
 
-use crate::player::{PlaybackTrackPreferences, SavedTrackChoices};
+use crate::{media::SavedTrackChoices, settings::binding::PlaybackTrackPreferences};
 
 use super::HomeContent;
 
 /// GPUI preference adapter. The model merges the detail-local draft purely;
 /// resource bindings and read models never look up application globals.
 pub(super) fn detail_track_choices(
-    model: &super::model::detail::SeriesDetailModel,
+    model: &super::detail::model::SeriesDetailModel,
     server: &crate::server::CachedServer,
     cx: &App,
 ) -> SavedTrackChoices {
@@ -36,5 +36,4 @@ impl HomeContent {
 }
 
 #[cfg(test)]
-#[path = "track_preferences_tests.rs"]
 mod tests;

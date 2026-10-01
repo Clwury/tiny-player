@@ -1,11 +1,11 @@
+use super::binding::*;
 use super::controller::{DetailController, DetailId};
-use super::state::*;
 use crate::effects::WorkspaceIdentity;
 use crate::effects::{DetailResource, EffectHandle};
 use crate::emby::UserItem;
-use crate::home::model::detail::{DetailChange, SeriesDetailModel};
+use crate::home::detail::model::{DetailChange, SeriesDetailModel};
 use crate::home::model::navigation::HomeNavigation;
-use crate::player::SavedTrackChoices;
+use crate::media::SavedTrackChoices;
 use std::collections::HashMap;
 
 #[derive(Debug)]

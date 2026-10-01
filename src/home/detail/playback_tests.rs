@@ -6,10 +6,10 @@ use super::{
 use crate::{
     effects::WorkspaceIdentity,
     emby::{MediaSource, UserItem},
-    home::model::detail::SeriesDetailModel,
-    player::{
+    home::detail::model::SeriesDetailModel,
+    media::{
         PlaybackTrack, SavedTrackChoice,
-        gateway::{PlaybackGateway, ResolvedPlayback},
+        gateway::{PlaybackSourceGateway, ResolvedPlayback},
     },
 };
 use serde_json::json;
@@ -21,11 +21,7 @@ struct FakePlayback {
     track_calls: Mutex<Vec<(String, String)>>,
     fail: bool,
 }
-impl PlaybackGateway for FakePlayback {
-    fn report(&self, _: &crate::player::gateway::PlaybackReport) -> anyhow::Result<()> {
-        panic!("detail launch must not start session reporting");
-    }
-
+impl PlaybackSourceGateway for FakePlayback {
     fn resolve_source(&self, item: &str, source: &str) -> anyhow::Result<ResolvedPlayback> {
         self.resolve_calls
             .lock()

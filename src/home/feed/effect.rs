@@ -8,7 +8,7 @@ const HOME_ITEM_PAGE_LIMIT: u32 = 30;
 /// The runner captures one immutable server/port. All results return to the
 /// FeedController token gate, before images, optimistic overlays or notices.
 pub(in crate::home) fn run_feed(
-    gateway: &impl HomeGateway,
+    gateway: &(impl HomeGateway + ?Sized),
     persistence: &dyn AppPersistence,
     server: &CachedServer,
     request: &FeedRequest,

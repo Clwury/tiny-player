@@ -1,10 +1,10 @@
 //! GPUI adapter for queue intents, backend commands, and page replacement.
 use super::*;
+use crate::media::gateway::PlaybackSourceGateway;
 use crate::{
     effects::EffectHandle,
     player::{
         adapter::EmbyPlaybackGateway,
-        gateway::PlaybackGateway,
         queue::{
             QueueAction, QueueSwitchCommand, QueueSwitchUpdate, ResolvedQueuePlayback, effect,
         },
@@ -16,7 +16,7 @@ use crate::{
 // backend failure, accepted completion and release cancel the handle. Blocking
 // IO may finish, but only the current token can update the inline queue error.
 pub(super) struct QueueEffects {
-    gateway: Arc<dyn PlaybackGateway>,
+    gateway: Arc<dyn PlaybackSourceGateway>,
     task: EffectHandle<gpui::Task<()>>,
 }
 impl QueueEffects {
@@ -97,7 +97,9 @@ impl PlaybackPage {
         self.report_playback_progress(true);
         let languages = crate::player::PlaybackLanguagePreferences::get(cx);
         let saved_tracks = effect::preference_key(&command.queue)
-            .map(|key| crate::player::PlaybackTrackPreferences::get(&self.emby.server, &key, cx))
+            .map(|key| {
+                crate::settings::binding::PlaybackTrackPreferences::get(&self.emby.server, &key, cx)
+            })
             .unwrap_or_default();
         let gateway = self.queue_effects.gateway.clone();
         let work = cx.background_spawn(async move {

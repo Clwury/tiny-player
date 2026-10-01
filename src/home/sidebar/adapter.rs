@@ -3,7 +3,7 @@
 use super::{SidebarListener, SidebarViewIntent, reorder::SidebarReorder};
 use crate::home::{
     HomeEvent, HomePage,
-    model::sidebar::{SidebarCommand, SidebarIntent},
+    sidebar::controller::{SidebarCommand, SidebarIntent},
 };
 use gpui::{Context, Window};
 

@@ -1,14 +1,10 @@
 //! Pure Home state and transitions. No GPUI entities, handles, IO or tasks.
 
 pub(crate) mod cards;
-pub(crate) mod detail;
 pub(crate) mod layout;
-pub(crate) mod library;
 pub(crate) mod navigation;
 pub(crate) mod notification;
 pub(crate) mod paged_items;
-pub(crate) mod search;
-pub(crate) mod sidebar;
 pub(crate) mod user_data;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

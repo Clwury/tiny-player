@@ -17,4 +17,4 @@ pub(crate) use icons::{IconDownloadResult, IconRequest};
 pub(crate) use model::{
     AuthRequest, AuthResult, CountRequest, CountResult, ServerCommand, ServerIntent,
 };
-pub(crate) use selectors::{ServerCardVm, ServerMenuVm, SidebarServer};
+pub(crate) use selectors::{ServerCardVm, ServerMenuVm};

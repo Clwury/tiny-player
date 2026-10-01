@@ -1,6 +1,6 @@
 use super::HomeController;
 use crate::home::cache::HomeSnapshot;
-use crate::player::{PlaybackTrackPreferenceKey, SavedTrackChoices};
+use crate::media::{PlaybackTrackPreferenceKey, SavedTrackChoices};
 use std::collections::HashMap;
 
 impl HomeController {

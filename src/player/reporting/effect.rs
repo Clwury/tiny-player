@@ -3,7 +3,10 @@
 use std::sync::{Arc, Condvar, Mutex};
 
 use super::controller::{PlaybackReport, ReportingCommand};
-use crate::{effects::WorkspaceIdentity, observability::TraceId, player::gateway::PlaybackGateway};
+use crate::{
+    effects::WorkspaceIdentity, observability::TraceId,
+    player::reporting::gateway::PlaybackReportGateway,
+};
 
 #[derive(Default)]
 pub(in crate::player) struct Pending {
@@ -104,7 +107,7 @@ pub(in crate::player) struct PlaybackReporter {
 
 impl PlaybackReporter {
     pub(in crate::player) fn new(
-        gateway: Arc<dyn PlaybackGateway>,
+        gateway: Arc<dyn PlaybackReportGateway>,
         identity: WorkspaceIdentity,
     ) -> Self {
         let mailbox = Arc::new(Mailbox::default());
@@ -145,7 +148,7 @@ impl Drop for PlaybackReporter {
     }
 }
 
-fn run(worker: WorkerLifetime, gateway: &dyn PlaybackGateway, identity: &WorkspaceIdentity) {
+fn run(worker: WorkerLifetime, gateway: &dyn PlaybackReportGateway, identity: &WorkspaceIdentity) {
     while let Some(command) = worker.0.next() {
         if !command.accepts(identity) {
             continue;

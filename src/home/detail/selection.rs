@@ -1,7 +1,7 @@
 use super::controller::DetailIntent;
 use super::*;
 use crate::effects::DetailResource;
-use crate::home::detail::state::detail_binding;
+use crate::home::detail::binding::detail_binding;
 use crate::home::track_preferences::detail_track_choices;
 
 impl HomeContent {

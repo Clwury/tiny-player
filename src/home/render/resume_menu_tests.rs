@@ -64,10 +64,10 @@ fn resume_menu_window(cx: &mut TestAppContext) -> (Entity<HomeContent>, &mut Vis
                 content
             });
             HomePage {
-                sidebar: crate::home::model::sidebar::SidebarController::new(
+                sidebar: crate::home::sidebar::controller::SidebarController::new(
                     server.id.clone(),
                     server.username.clone(),
-                    vec![crate::server::feature::SidebarServer::from(&server)],
+                    vec![crate::server::SidebarServer::from(&server)],
                 ),
                 sidebar_scroll_handle: gpui::ScrollHandle::new(),
                 sidebar_reorder: None,

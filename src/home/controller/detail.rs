@@ -6,13 +6,13 @@ use crate::home::{
 use crate::{
     effects::{DetailResource, WorkspaceIdentity},
     home::{
+        detail::model::SeriesDetailModel,
         detail::{
             controller::DetailIntent,
             playback::{DetailPlaybackCommand, DetailPlaybackUpdate, SelectedPlayback},
         },
-        model::detail::SeriesDetailModel,
     },
-    player::gateway::ResolvedPlayback,
+    media::gateway::ResolvedPlayback,
 };
 /// Borrowed active-detail identity and read model. No mutable controller escapes.
 pub(in crate::home) struct DetailModelView<'a> {

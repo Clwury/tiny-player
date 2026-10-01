@@ -1,15 +1,13 @@
 use std::{fs, path::Path};
+use tiny_playback::{PlaybackCacheConfig, PlaybackVolumeSettings};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    app_metadata,
-    player::{PlaybackCacheConfig, PlaybackLanguagePreferences, PlaybackVolumeSettings},
-    search_history::SearchHistory,
-    server::CachedServer,
-    theme::ColorTheme,
+    app_metadata, media::PlaybackLanguagePreferences, search_history::SearchHistory,
+    server::CachedServer, theme::ColorTheme,
 };
 
 const CACHE_VERSION: u32 = 1;
@@ -362,7 +360,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("servers.json");
         let mut cache = ServerCache::empty();
-        for language in crate::player::TrackLanguage::ALL {
+        for language in crate::media::TrackLanguage::ALL {
             cache.track_languages.audio = language;
             cache.track_languages.subtitle = language;
             save_to(&cache, &path).unwrap();

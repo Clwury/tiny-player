@@ -1,6 +1,5 @@
 use super::{
     HomeContent,
-    adapter::EmbyHomeGateway,
     notification::{HOME_RESUME_ACTION_NOTIFICATION_KEY, NotificationScope},
 };
 use gpui::{AppContext as _, Context};
@@ -22,13 +21,11 @@ impl HomeContent {
         self.item_context_menu = None;
         self.clear_notification(NotificationScope::Home, HOME_RESUME_ACTION_NOTIFICATION_KEY);
         cx.notify();
-        let gateway = EmbyHomeGateway {
-            server: self.current_server.clone(),
-            client: self.emby_client.clone(),
-        };
+        let gateway = self.ports.browsing.clone();
         let task_command = command.clone();
-        let task =
-            cx.background_spawn(async move { effect::run_resume_action(&gateway, &task_command) });
+        let task = cx.background_spawn(async move {
+            effect::run_resume_action(gateway.as_ref(), &task_command)
+        });
         let item_id = command.item_id.clone();
         let handle = cx.spawn(async move |page, cx| {
             let result = task.await;

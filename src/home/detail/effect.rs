@@ -2,7 +2,7 @@ use super::controller::{DetailRequest, DetailResponse};
 use crate::{effects::DetailResource, home::gateway::HomeGateway};
 
 pub(super) fn run_detail(
-    gateway: &impl HomeGateway,
+    gateway: &(impl HomeGateway + ?Sized),
     request: &DetailRequest,
 ) -> anyhow::Result<DetailResponse> {
     let id = &request.item_id;
@@ -26,15 +26,15 @@ pub(super) fn run_detail(
 
 use super::playback::{DetailPlaybackCommand, SelectedPlayback, playback_queue};
 use crate::{
-    home::model::detail::SeriesDetailModel,
-    player::{
+    home::detail::model::SeriesDetailModel,
+    media::{
         PlaybackLanguagePreferences, SavedTrackChoices,
-        gateway::{PlaybackGateway, ResolvedPlayback},
+        gateway::{PlaybackSourceGateway, ResolvedPlayback},
     },
 };
 
 pub(super) fn run_playback(
-    gateway: &impl PlaybackGateway,
+    gateway: &(impl PlaybackSourceGateway + ?Sized),
     command: &DetailPlaybackCommand,
 ) -> anyhow::Result<ResolvedPlayback> {
     gateway.resolve_source(&command.selected.item_id, &command.selected.media_source_id)
@@ -42,7 +42,7 @@ pub(super) fn run_playback(
 
 pub(super) fn selected_playback(
     detail: &SeriesDetailModel,
-    gateway: &impl PlaybackGateway,
+    gateway: &(impl PlaybackSourceGateway + ?Sized),
     languages: PlaybackLanguagePreferences,
     saved_tracks: &SavedTrackChoices,
 ) -> Result<SelectedPlayback, String> {
@@ -70,11 +70,11 @@ pub(super) fn selected_playback(
         format!("{series_name} {}", item.episode_label())
     };
 
-    let audio_tracks = crate::player::playback_audio_tracks_for_source(source);
+    let audio_tracks = crate::media::playback_audio_tracks_for_source(source);
     let item_id = source.playback_item_id(&item.id);
     let subtitle_tracks = gateway.subtitle_tracks(source, item_id, &media_source_id);
     let mut selected_tracks =
-        crate::player::preferred_playback_track_selection(source, &subtitle_tracks, languages);
+        crate::media::preferred_playback_track_selection(source, &subtitle_tracks, languages);
     saved_tracks.apply(&audio_tracks, &subtitle_tracks, &mut selected_tracks);
     let remember_subtitle_on_start = detail
         .pending_subtitle_choice()

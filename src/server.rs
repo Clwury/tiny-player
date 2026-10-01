@@ -6,7 +6,9 @@ use url::Url;
 
 pub(crate) mod feature;
 pub(crate) mod icon;
+mod sidebar;
 pub(crate) mod view;
+pub(crate) use sidebar::SidebarServer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {

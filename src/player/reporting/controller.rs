@@ -2,7 +2,7 @@ use super::{PlaybackStateUpdate, PlaybackStopCompletion};
 use crate::{
     effects::{RequestScope, RequestSlot, RequestToken, WorkspaceIdentity},
     emby::{PlaybackProgressReport, PlaybackStartReport, PlaybackStopReport},
-    player::model::queue::PlaybackQueue,
+    media::PlaybackQueue,
 };
 use tiny_playback::clamp_playback_volume;
 

@@ -1,14 +1,12 @@
-pub(crate) mod add_server_dialog;
+pub(crate) mod dropdown;
 pub(crate) mod editor;
 pub(crate) mod notification;
+pub(crate) mod number_input;
 pub(crate) mod paint;
-pub(crate) mod playback_settings_dialog;
 pub(crate) mod radius;
 pub(crate) mod scrollbar;
 pub(crate) mod server_icon;
-pub(crate) mod settings_controls;
-pub(crate) mod settings_dialog;
 pub(crate) mod text_input;
 pub(crate) mod titlebar;
+pub(crate) mod toggle;
 pub(crate) mod tooltip;
-pub(crate) mod user_settings_dialog;

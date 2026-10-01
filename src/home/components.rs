@@ -1,14 +1,16 @@
 use std::{path::Path, sync::Arc};
 
 use gpui::{
-    App, Bounds, ClickEvent, ContentMask, Context, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, StatefulInteractiveElement, Styled, StyledImage, Window, canvas, div, fill, img,
-    point, prelude::FluentBuilder, px, size, svg,
+    Animation, AnimationExt as _, App, Bounds, ClickEvent, ContentMask, Context,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, StatefulInteractiveElement,
+    Styled, StyledImage, Window, canvas, div, ease_in_out, fill, img, point,
+    prelude::FluentBuilder, px, size, svg,
 };
 
 use super::model::cards::{
     EpisodeCardVm, PersonCardVm, PosterBadgesVm, ResumeCardVm, UserEpisodeCardVm, UserItemCardVm,
 };
+use crate::emby::UserItem;
 use crate::{
     images::cover::{CoverImageAsset, CoverImageRequest},
     ui::radius,
@@ -16,7 +18,7 @@ use crate::{
 use crate::{theme, ui::tooltip::text_tooltip};
 
 use super::carousel::{
-    DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX, DETAIL_EPISODE_CARD_PADDING_PX,
+    CAROUSEL_SCROLL_DURATION, DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX, DETAIL_EPISODE_CARD_PADDING_PX,
     DETAIL_EPISODE_CARD_WIDTH_PX, DETAIL_PERSON_CARD_IMAGE_HEIGHT_PX,
     DETAIL_PERSON_CARD_IMAGE_WIDTH_PX, DETAIL_PERSON_CARD_PADDING_PX, DETAIL_PERSON_CARD_WIDTH_PX,
     HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
@@ -819,6 +821,70 @@ fn user_item_badge<T>(text: String, cx: &Context<T>) -> impl IntoElement {
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.foreground)
         .child(text)
+}
+
+pub(in crate::home) fn workspace_back_button(
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+
+    div()
+        .id("home-library-back-button")
+        .debug_selector(|| "home-library-back-button".into())
+        .flex()
+        .size(px(32.0))
+        // Match the sidebar's 32px button centered in a 36px title row.
+        .my(px(2.0))
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .rounded(radius::CONTROL)
+        .occlude()
+        .cursor_pointer()
+        .hover(move |style| style.bg(theme.secondary_hover))
+        .child(
+            svg()
+                .path("icons/chevron-left.svg")
+                .size(px(18.0))
+                .text_color(theme.foreground),
+        )
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_click(on_click)
+}
+
+pub(super) fn home_carousel_track(
+    track: gpui::Div,
+    animation_id: impl Into<gpui::ElementId>,
+    previous_offset: f32,
+    offset: f32,
+) -> gpui::AnyElement {
+    if previous_offset == offset {
+        // Stationary rows need no animation state or extra frame requests,
+        // including rows that reappear after being outside the viewport.
+        track.ml(px(-offset)).into_any_element()
+    } else {
+        track
+            .with_animation(
+                animation_id,
+                Animation::new(CAROUSEL_SCROLL_DURATION).with_easing(ease_in_out),
+                move |track, delta| {
+                    track.ml(px(-(previous_offset + (offset - previous_offset) * delta)))
+                },
+            )
+            .into_any_element()
+    }
+}
+
+pub(super) fn tallest_home_item(items: &[UserItem]) -> Option<&UserItem> {
+    items.iter().max_by_key(|item| {
+        (
+            item.item_type.as_deref() != Some("Episode"),
+            item.production_year.is_some(),
+        )
+    })
 }
 
 #[cfg(test)]

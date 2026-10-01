@@ -491,7 +491,7 @@ fn stats_forward_pointer_events_to_the_playback_surface_without_copying(
 
 #[gpui::test]
 fn progress_drag_across_stats_does_not_move_the_playback_window(cx: &mut gpui::TestAppContext) {
-    let (view, cx) = crate::player::page::episodes::tests::playback_window(cx);
+    let (view, cx) = crate::player::page::test_support::playback_window(cx);
     cx.simulate_keystrokes("i");
     for fullscreen in [false, true] {
         cx.update(|window, _| {

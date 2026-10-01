@@ -36,11 +36,3 @@ impl Default for GridPresentation {
         }
     }
 }
-
-/// HomeContent owns this alongside SearchState. Query resets reset the offset;
-/// first route activation focuses once. Both are released with the workspace.
-#[derive(Debug, Default)]
-pub(crate) struct SearchPresentation {
-    pub(crate) grid: GridPresentation,
-    pub(crate) focused_once: bool,
-}

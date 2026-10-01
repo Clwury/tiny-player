@@ -1,4 +1,4 @@
-use crate::home::detail::state::detail_binding;
+use crate::home::detail::binding::detail_binding;
 use std::time::{Duration, Instant};
 
 use gpui::{ClickEvent, Context, Window};

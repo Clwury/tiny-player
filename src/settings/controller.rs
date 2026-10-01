@@ -3,11 +3,9 @@ use super::{
     model::*,
     values::{BYTES_PER_MIB, parse_seconds},
 };
-use crate::{
-    player::{PlaybackCacheConfig, PlaybackLanguagePreferences},
-    theme::ColorTheme,
-};
+use crate::{media::PlaybackLanguagePreferences, theme::ColorTheme};
 use std::collections::HashSet;
+use tiny_playback::PlaybackCacheConfig;
 
 /// The one editable settings snapshot for the open window. Edits enter through
 /// intents. Editors/dropdowns/scrolling belong to the chosen GPUI presentation;
@@ -62,6 +60,15 @@ impl SettingsVm<'_> {
 }
 
 impl SettingsController {
+    pub(crate) fn from_snapshot(snapshot: SettingsSnapshot, mode: SettingsMode) -> Self {
+        Self::new(
+            &snapshot.playback,
+            mode,
+            snapshot.color_theme,
+            snapshot.track_languages,
+        )
+    }
+
     pub(crate) fn new(
         config: &PlaybackCacheConfig,
         mode: SettingsMode,

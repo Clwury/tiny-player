@@ -110,8 +110,8 @@ impl HomeNavigation {
     pub(crate) fn detail_models_mut(
         &mut self,
     ) -> (
-        Option<&mut crate::home::model::detail::SeriesDetailModel>,
-        impl Iterator<Item = &mut crate::home::model::detail::SeriesDetailModel>,
+        Option<&mut crate::home::detail::model::SeriesDetailModel>,
+        impl Iterator<Item = &mut crate::home::detail::model::SeriesDetailModel>,
     ) {
         (
             self.detail.as_mut().map(|detail| &mut detail.state),

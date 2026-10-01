@@ -1,10 +1,10 @@
 use crate::home::{
     gateway::HomeGateway,
-    model::search::{SEARCH_LIMIT, SearchPage, SearchRequest},
+    search::model::{SEARCH_LIMIT, SearchPage, SearchRequest},
 };
 
 pub(super) fn run_search(
-    gateway: &impl HomeGateway,
+    gateway: &(impl HomeGateway + ?Sized),
     request: &SearchRequest,
 ) -> anyhow::Result<SearchPage> {
     gateway

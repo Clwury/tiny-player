@@ -1,10 +1,11 @@
 mod adapter;
+pub(in crate::home) mod controller;
 pub(super) mod reorder;
 
 use super::{
     carousel::HOME_SIDEBAR_WIDTH_PX,
-    model::sidebar::{SidebarRow, SidebarViewModel},
     navigation::HomeRoot,
+    sidebar::controller::{SidebarRow, SidebarViewModel},
 };
 use crate::{
     app_metadata::APP_NAME,
@@ -565,7 +566,7 @@ mod tests {
                 })
                 .collect::<Vec<CachedServer>>();
             // Missing user IDs prevent background effects from starting.
-            HomePage::new(servers[0].clone(), servers.iter().map(crate::server::feature::SidebarServer::from).collect(), EmbyClient::new("test".into()).unwrap(), cx)
+            HomePage::new(servers[0].clone(), servers.iter().map(crate::server::SidebarServer::from).collect(), EmbyClient::new("test".into()).unwrap(), cx)
         });
         for height in [900.0, 500.0, 720.0] {
             cx.simulate_resize(size(px(1100.0), px(height)));

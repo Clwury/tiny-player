@@ -13,12 +13,12 @@ mod tests;
 use crate::{
     effects::{DetailResource, RequestScope, RequestSlot, RequestToken, WorkspaceIdentity},
     emby::{MediaItem, MediaItems, MediaSource, UserItems},
+    home::detail::model::{DetailChange, SeriesDetailModel},
     home::model::{
         LoadState,
-        detail::{DetailChange, SeriesDetailModel},
         user_data::{PendingUserData, UserDataState, apply_media_item_user_data_overrides},
     },
-    player::{PlaybackTrack, PlaybackTrackExt, SavedTrackChoice},
+    media::{PlaybackTrack, PlaybackTrackExt, SavedTrackChoice},
 };
 
 /// One entry owns its data and independent request slots. Leaving the active
@@ -211,7 +211,7 @@ impl DetailController {
     pub(crate) fn complete_playback(
         &mut self,
         command: super::playback::DetailPlaybackCommand,
-        result: anyhow::Result<crate::player::gateway::ResolvedPlayback>,
+        result: anyhow::Result<crate::media::gateway::ResolvedPlayback>,
         identity: &WorkspaceIdentity,
     ) -> Option<super::playback::DetailPlaybackUpdate> {
         if !command.token.is_for(identity)
@@ -226,7 +226,7 @@ impl DetailController {
             Ok(playback) => {
                 self.state.playback_failed = None;
                 self.state.pending_subtitle_choices.remove(
-                    &crate::player::PlaybackTrackPreferenceKey {
+                    &crate::media::PlaybackTrackPreferenceKey {
                         item_id: command.selected.item_id.clone(),
                         media_source_id: command.selected.media_source_id.clone(),
                     },

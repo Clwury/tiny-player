@@ -76,7 +76,7 @@ impl PlaybackPage {
         ) else {
             return;
         };
-        crate::player::PlaybackTrackPreferences::remember(
+        crate::settings::binding::PlaybackTrackPreferences::remember(
             &self.emby.server,
             &update.keys,
             kind,
@@ -89,13 +89,14 @@ impl PlaybackPage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::{PlaybackTrackPreferenceKey, PlaybackTrackPreferences, SavedTrackChoice};
+    use crate::player::{PlaybackTrackPreferenceKey, SavedTrackChoice};
+    use crate::settings::binding::PlaybackTrackPreferences;
 
     #[gpui::test]
     fn saved_player_choices_restore_for_grouped_and_resolved_item_ids(
         cx: &mut gpui::TestAppContext,
     ) {
-        let (page, cx) = episodes::tests::playback_window(cx);
+        let (page, cx) = test_support::playback_window(cx);
         page.update(cx, |page, cx| {
             page.session.queue.queue_mut().items[0].item_id = "grouped-episode".into();
             page.emby.item_id = "resolved-episode".into();
@@ -149,7 +150,7 @@ mod tests {
 
     #[gpui::test]
     fn rejected_track_switches_do_not_overwrite_saved_choices(cx: &mut gpui::TestAppContext) {
-        let (page, cx) = episodes::tests::playback_window(cx);
+        let (page, cx) = test_support::playback_window(cx);
         page.update(cx, |page, cx| {
             page.session.source_mut().tracks.audio = vec![PlaybackTrack::new(1, "Japanese", false)];
             page.session.source_mut().tracks.subtitles =

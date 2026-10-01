@@ -2,9 +2,9 @@
 //! this adapter constructs the application-facing playback event.
 use super::playback::{DetailPlaybackCommand, DetailPlaybackUpdate};
 use super::*;
-use crate::home::detail::state::detail_binding;
+use crate::home::detail::binding::detail_binding;
 use crate::home::track_preferences::detail_track_choices;
-use crate::player::{adapter::EmbyPlaybackGateway, gateway::ResolvedPlayback};
+use crate::media::gateway::ResolvedPlayback;
 
 impl HomeContent {
     pub(in crate::home) fn play_selected_media(
@@ -13,12 +13,13 @@ impl HomeContent {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.launch_selected_media(cx);
+    }
+
+    fn launch_selected_media(&mut self, cx: &mut Context<Self>) {
         self.clear_notification(NotificationScope::Detail, DETAIL_PLAYBACK_NOTIFICATION_KEY);
         let identity = self.request_identity();
-        let gateway = EmbyPlaybackGateway {
-            client: self.emby_client.clone(),
-            server: self.current_server.clone(),
-        };
+        let gateway = self.ports.playback.clone();
         let Some(detail) = self.detail_view() else {
             return;
         };
@@ -27,7 +28,7 @@ impl HomeContent {
         }
         let selected = effect::selected_playback(
             detail.model,
-            &gateway,
+            gateway.as_ref(),
             PlaybackLanguagePreferences::get(cx),
             &detail_track_choices(detail.model, &self.current_server, cx),
         );
@@ -49,7 +50,7 @@ impl HomeContent {
             .expect("started detail playback keeps its resources");
         detail.presentation.open_select = None;
         let work = cx.background_spawn(async move {
-            let result = effect::run_playback(&gateway, &command);
+            let result = effect::run_playback(gateway.as_ref(), &command);
             (command, result)
         });
         let task = cx.spawn(async move |page, cx| {
@@ -126,3 +127,6 @@ impl HomeContent {
         cx.notify();
     }
 }
+
+#[cfg(test)]
+mod tests;

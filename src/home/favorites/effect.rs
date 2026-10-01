@@ -2,14 +2,14 @@ use super::controller::{FavoritesRequest, favorite_query};
 use crate::{emby::UserItems, home::gateway::HomeGateway};
 
 pub(super) fn run_favorite_mutation(
-    gateway: &impl HomeGateway,
+    gateway: &(impl HomeGateway + ?Sized),
     command: &super::actions::FavoriteCommand,
 ) -> anyhow::Result<crate::emby::UserItemData> {
     gateway.set_favorite(&command.item_id, command.desired)
 }
 
 pub(super) fn run_favorites(
-    gateway: &impl HomeGateway,
+    gateway: &(impl HomeGateway + ?Sized),
     request: &FavoritesRequest,
 ) -> anyhow::Result<UserItems> {
     gateway.user_items(&favorite_query(request.item_type, request.start_index))

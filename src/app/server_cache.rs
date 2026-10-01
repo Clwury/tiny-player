@@ -2,7 +2,7 @@ use crate::server::feature::{ServerCommand, ServerIntent};
 use anyhow::Result;
 use gpui::{Context, Entity, Window};
 
-use crate::{server::CachedServer, ui::add_server_dialog::AddServerDialogState};
+use crate::{server::CachedServer, server::view::form::AddServerDialogState};
 
 use super::{Page, TinyApp};
 

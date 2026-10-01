@@ -1,4 +1,4 @@
-use crate::home::detail::state::detail_binding;
+use crate::home::detail::binding::detail_binding;
 use gpui::{
     ClickEvent, Context, CursorStyle, FocusHandle, HitboxBehavior, InteractiveElement, IntoElement,
     MouseButton, ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, StyledText,

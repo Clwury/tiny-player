@@ -1,6 +1,6 @@
 use gpui::{AppContext as _, ClickEvent, Context, MouseDownEvent, Pixels, Point, Window};
 
-use crate::{server::CachedServer, ui::add_server_dialog::AddServerDialogState};
+use crate::{server::CachedServer, server::view::form::AddServerDialogState};
 
 use super::TinyApp;
 use crate::server::feature::effect::prepare_server;

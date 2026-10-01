@@ -1,7 +1,5 @@
-use crate::home::model::{
-    LoadState,
-    search::{SearchPage, SearchRequest, SearchState},
-};
+use super::model::{SearchPage, SearchRequest, SearchState};
+use crate::home::model::LoadState;
 use crate::{
     effects::WorkspaceIdentity,
     emby::{UserItem, UserItems},

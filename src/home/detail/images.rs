@@ -6,7 +6,7 @@ use crate::emby::{
     EmbyImageRequest, EmbyImageType, ImageQuality, MediaItem, MediaItems, MediaPerson,
 };
 
-use super::super::{HomeContent, data::EPISODE_CARD_IMAGE_MAX_WIDTH};
+use super::super::{HomeContent, image_effects::EPISODE_CARD_IMAGE_MAX_WIDTH};
 
 const SERIES_BACKDROP_IMAGE_MAX_WIDTH: u32 = 1024;
 const SERIES_PERSON_IMAGE_MAX_WIDTH: u32 = 320;

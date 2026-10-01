@@ -91,6 +91,66 @@ pub(super) struct SubtitleOverlayState {
     pub(super) vertical_offset_fraction: Option<f32>,
 }
 
+impl PlaybackPage {
+    pub(super) fn replace_visible_frame(
+        &mut self,
+        frame: Arc<RenderImage>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if self
+            .presentation
+            .frame
+            .current
+            .as_ref()
+            .is_some_and(|current| current.id == frame.id)
+        {
+            self.presentation.frame.current = Some(frame);
+            return;
+        }
+
+        let previous = self.presentation.frame.current.replace(frame);
+        if let Some(previous) = previous {
+            defer_drop_frame(previous, window);
+        }
+    }
+
+    pub(super) fn clear_visible_frame(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        if let Some(frame) = self.presentation.frame.current.take() {
+            defer_drop_frame(frame, window);
+        }
+    }
+
+    pub(super) fn update_video_viewport(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if !viewport_changed(self.presentation.frame.viewport_bounds, bounds) {
+            return;
+        }
+
+        self.presentation.frame.viewport_bounds = Some(bounds);
+        cx.notify();
+    }
+
+    pub(super) fn update_progress_track_bounds(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if !viewport_changed(
+            self.presentation
+                .timeline_presentation
+                .progress_track_bounds,
+            bounds,
+        ) {
+            return;
+        }
+
+        self.presentation
+            .timeline_presentation
+            .progress_track_bounds = Some(bounds);
+        cx.notify();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,7 +168,7 @@ mod tests {
     fn replacing_page_retires_video_and_subtitle_images_after_two_frames(
         cx: &mut gpui::TestAppContext,
     ) {
-        let (page, cx) = episodes::tests::playback_window(cx);
+        let (page, cx) = test_support::playback_window(cx);
         let video = render_image(BgraImage::new(vec![1, 2, 3, 255], 1, 1).unwrap());
         let bitmap = SharedBgraImage::new(BgraImage::new(vec![4, 5, 6, 255], 1, 1).unwrap());
         let subtitle = page.update(cx, |page, cx| {

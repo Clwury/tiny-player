@@ -2,8 +2,8 @@
 use crate::{
     effects::RequestToken,
     emby::MediaItem,
-    home::model::detail::SeriesDetailModel,
-    player::{PlaybackQueue, PlaybackQueueItem, PlaybackTrack, PlaybackTrackSelection},
+    home::detail::model::SeriesDetailModel,
+    media::{PlaybackQueue, PlaybackQueueItem, PlaybackTrack, PlaybackTrackSelection},
 };
 
 #[derive(Clone)]
@@ -31,7 +31,7 @@ pub(crate) struct DetailPlaybackCommand {
 pub(crate) enum DetailPlaybackUpdate {
     Open {
         selected: Box<SelectedPlayback>,
-        playback: crate::player::gateway::ResolvedPlayback,
+        playback: crate::media::gateway::ResolvedPlayback,
     },
     Failed(String),
 }

@@ -1,7 +1,7 @@
 use super::controller::*;
 use crate::{
     effects::WorkspaceIdentity,
-    player::model::queue::{PlaybackQueue, PlaybackQueueItem},
+    media::{PlaybackQueue, PlaybackQueueItem},
 };
 
 pub(in crate::player) struct Session {

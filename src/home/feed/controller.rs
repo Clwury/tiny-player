@@ -5,10 +5,8 @@ use crate::{
     emby::{UserItems, VideoItemType},
     home::{
         cache::HomeSnapshot,
-        model::{
-            LoadState,
-            library::{is_supported_view, latest_item_types},
-        },
+        library::model::{is_supported_view, latest_item_types},
+        model::LoadState,
     },
 };
 

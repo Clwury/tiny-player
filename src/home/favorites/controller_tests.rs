@@ -235,3 +235,29 @@ fn refresh_failure_retains_data_and_pagination_retry_keeps_the_failed_offset() {
     assert_eq!(h.controller.view_model(kind).paged.items.len(), 31);
     assert!(h.controller.view_model(kind).paged.exhausted);
 }
+
+#[test]
+fn favorite_queries_load_each_type_independently_with_newest_first() {
+    for item_type in FAVORITE_ITEM_TYPES {
+        let query = favorite_query(item_type, 30);
+        assert_eq!(query.include_item_types, vec![item_type]);
+        assert_eq!(query.is_favorite, Some(true));
+        assert!(query.recursive);
+        assert_eq!(query.start_index, 30);
+        assert_eq!(query.limit, 30);
+        assert_eq!(query.sort_by, Some(UserItemsSort::DateCreated));
+        assert_eq!(query.sort_order, SortOrder::Descending);
+        let fields = query.fields.as_deref().unwrap();
+        for field in [
+            "BasicSyncInfo",
+            "CommunityRating",
+            "ProductionYear",
+            "EndDate",
+            "Container",
+            "SeriesId",
+            "SeriesName",
+        ] {
+            assert!(fields.split(',').any(|value| value == field));
+        }
+    }
+}

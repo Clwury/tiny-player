@@ -2,8 +2,8 @@ use super::{
     controller::{DetailRequest, DetailResponse, DetailUpdate},
     *,
 };
-use crate::home::detail::state::detail_binding;
-use crate::{effects::DetailResource, home::adapter::EmbyHomeGateway};
+use crate::effects::DetailResource;
+use crate::home::detail::binding::detail_binding;
 
 fn notification_key(resource: DetailResource) -> &'static str {
     match resource {
@@ -57,13 +57,10 @@ impl HomeContent {
         };
         let detail = detail_binding(self.controller.detail_view(), &mut self.detail_resources)
             .expect("started detail request keeps its resources");
-        let gateway = EmbyHomeGateway {
-            client: self.emby_client.clone(),
-            server: self.current_server.clone(),
-        };
+        let gateway = self.ports.browsing.clone();
         let command = request.clone();
-        let work =
-            cx.background_spawn(async move { super::effect::run_detail(&gateway, &command) });
+        let work = cx
+            .background_spawn(async move { super::effect::run_detail(gateway.as_ref(), &command) });
         let task = cx.spawn(async move |page, cx| {
             let result = work.await;
             page.update(cx, |page, cx| {

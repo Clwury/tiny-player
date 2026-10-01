@@ -1,12 +1,13 @@
 //! Shell-owned global configuration. Server records have a single feature owner;
 //! persistence composes both into the unchanged ServerCache document.
 use crate::{
-    player::{PlaybackCacheConfig, PlaybackLanguagePreferences, PlaybackVolumeSettings},
+    media::PlaybackLanguagePreferences,
     search_history::SearchHistory,
     server::feature::ServerCatalog,
     storage::{ServerCache, WindowState},
     theme::ColorTheme,
 };
+use tiny_playback::{PlaybackCacheConfig, PlaybackVolumeSettings};
 
 #[derive(Clone)]
 pub(crate) struct GlobalConfig {

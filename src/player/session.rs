@@ -1,10 +1,10 @@
 //! Session business owner and backend event reducer. It produces ordered report
 //! commands before resetting the timeline; GPUI owns presentation and execution.
+
 mod controls;
 mod episode_cards;
 use super::{
     model::{
-        queue::PlaybackQueue,
         source::PlaybackSourceState,
         timeline::{
             PlaybackTimelineState, apply_cache_buffering_to_timeline,
@@ -16,7 +16,10 @@ use super::{
         ReportContext, ReportTelemetry, ReportingController, ReportingIntent, ReportingTransition,
     },
 };
-use crate::effects::{RequestScope, RequestSlot, RequestToken, WorkspaceIdentity};
+use crate::{
+    effects::{RequestScope, RequestSlot, RequestToken, WorkspaceIdentity},
+    media::PlaybackQueue,
+};
 use controls::ControlState;
 pub(super) use controls::{ControlUpdate, PlaybackIntent};
 use tiny_playback::{BackendDiagnostic, BackendEventKind, BackendSubtitleCue, RenderSize};

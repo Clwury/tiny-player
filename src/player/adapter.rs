@@ -1,6 +1,7 @@
 pub(crate) mod subtitles;
 
-use super::gateway::{PlaybackGateway, ResolvedPlayback};
+use super::reporting::gateway::PlaybackReportGateway;
+use crate::media::gateway::{PlaybackSourceGateway, ResolvedPlayback};
 use crate::{
     emby::{EmbyClient, MediaSource, playback::resolve_direct_stream_url},
     server::CachedServer,
@@ -13,7 +14,7 @@ pub(crate) struct EmbyPlaybackGateway {
     pub(crate) server: CachedServer,
 }
 
-impl PlaybackGateway for EmbyPlaybackGateway {
+impl PlaybackReportGateway for EmbyPlaybackGateway {
     fn report(&self, report: &super::reporting::PlaybackReport) -> anyhow::Result<()> {
         use super::reporting::PlaybackReport;
         match report {
@@ -28,7 +29,9 @@ impl PlaybackGateway for EmbyPlaybackGateway {
             }
         }
     }
+}
 
+impl PlaybackSourceGateway for EmbyPlaybackGateway {
     fn resolve_source(
         &self,
         item_id: &str,
@@ -158,5 +161,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "adapter_reporting_tests.rs"]
 mod reporting_tests;

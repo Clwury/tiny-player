@@ -1,7 +1,6 @@
 use super::*;
-use crate::home::detail::state::detail_binding;
+use crate::home::detail::binding::detail_binding;
 use crate::home::{
-    adapter::EmbyHomeGateway,
     controller::PlayedIntent,
     model::notification::ActionNotification,
     played::{PlayedCommand, PlayedResponse},
@@ -94,13 +93,10 @@ impl HomeContent {
             &command.request.notification.key,
         );
         cx.notify();
-        let gateway = EmbyHomeGateway {
-            server: self.current_server.clone(),
-            client: self.emby_client.clone(),
-        };
+        let gateway = self.ports.browsing.clone();
         let task_command = command.clone();
         let task = cx.background_spawn(async move {
-            crate::home::played::effect::run_played(&gateway, &task_command)
+            crate::home::played::effect::run_played(gateway.as_ref(), &task_command)
         });
         let handle = cx.spawn(async move |page, cx| {
             let result = task.await;

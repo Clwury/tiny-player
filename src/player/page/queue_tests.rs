@@ -1,5 +1,5 @@
 use super::*;
-use crate::player::gateway::{PlaybackReport, ResolvedPlayback};
+use crate::media::gateway::{PlaybackSourceGateway, ResolvedPlayback};
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -14,10 +14,7 @@ struct FakeGateway {
     fail: bool,
     calls: Mutex<Vec<(String, String)>>,
 }
-impl PlaybackGateway for FakeGateway {
-    fn report(&self, _: &PlaybackReport) -> anyhow::Result<()> {
-        unreachable!()
-    }
+impl PlaybackSourceGateway for FakeGateway {
     fn resolve_source(&self, item: &str, source: &str) -> anyhow::Result<ResolvedPlayback> {
         self.calls
             .lock()
@@ -73,7 +70,7 @@ fn pending_task(cx: &mut Context<PlaybackPage>, cancelled: Arc<AtomicBool>) -> g
 
 #[gpui::test]
 fn failed_manual_switch_restores_user_pause_and_cache_pause_policy(cx: &mut gpui::TestAppContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let gateway = Arc::new(FakeGateway {
         fail: true,
         ..Default::default()
@@ -117,7 +114,7 @@ fn backend_pause_failure_prevents_queue_resolution_without_changing_playback(
     cx: &mut gpui::TestAppContext,
 ) {
     use crate::player::backend::test_support::{FakeState, adapter};
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let gateway = Arc::new(FakeGateway::default());
     let state = Rc::new(RefCell::new(FakeState {
         fail_pause: true,
@@ -151,7 +148,7 @@ fn failed_queue_resolution_keeps_pause_when_backend_resume_also_fails(
     cx: &mut gpui::TestAppContext,
 ) {
     use crate::player::backend::test_support::{FakeState, adapter};
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let gateway = Arc::new(FakeGateway {
         fail: true,
         ..Default::default()
@@ -188,7 +185,7 @@ fn failed_queue_resolution_keeps_pause_when_backend_resume_also_fails(
 fn automatic_failure_publishes_finished_update_without_resuming_episode(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let recorded = events(&page, cx);
     cx.update(|window, cx| {
         page.update(cx, |page, cx| {
@@ -225,7 +222,7 @@ fn automatic_failure_publishes_finished_update_without_resuming_episode(
 fn stale_results_cannot_replace_page_clear_error_or_cancel_current_effect(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let recorded = events(&page, cx);
     let cancelled = Arc::new(AtomicBool::new(false));
     page.update(cx, |page, cx| {
@@ -277,7 +274,7 @@ fn stale_results_cannot_replace_page_clear_error_or_cancel_current_effect(
 
 #[gpui::test]
 fn back_and_page_release_cancel_owned_queue_continuation(cx: &mut gpui::TestAppContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_on_release = Arc::new(AtomicBool::new(false));
     cx.update(|window, cx| {
@@ -313,7 +310,7 @@ fn back_and_page_release_cancel_owned_queue_continuation(cx: &mut gpui::TestAppC
 
 #[gpui::test]
 fn returning_to_detail_cancels_pending_backend_poll(cx: &mut gpui::TestAppContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let cancelled = Arc::new(AtomicBool::new(false));
     cx.update(|window, cx| {
         page.update(cx, |page, cx| {

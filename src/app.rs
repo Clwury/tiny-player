@@ -28,8 +28,8 @@ pub(crate) use window::{
 
 use crate::server::view::ServerContextMenu;
 use crate::{
-    emby::EmbyClient, home::HomePage, player::PlaybackPage, storage::ServerCache,
-    ui::add_server_dialog::AddServerDialogState,
+    emby::EmbyClient, home::HomePage, player::PlaybackPage,
+    server::view::form::AddServerDialogState, storage::ServerCache,
 };
 use notification::AppNotificationQueue;
 

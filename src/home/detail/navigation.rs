@@ -1,5 +1,5 @@
 use super::*;
-use crate::home::detail::state::detail_binding;
+use crate::home::detail::binding::detail_binding;
 
 use crate::home::navigation::{HomeRoot, HomeRoute};
 use crate::home::{controller::OpenDetailIntent, model::navigation::NavigationChange};
@@ -85,7 +85,7 @@ impl HomeContent {
             .expect("opened detail is active")
             .id;
         self.detail_resources.entry(id).or_default();
-        super::state::apply_navigation_change(change, &mut self.detail_resources);
+        super::binding::apply_navigation_change(change, &mut self.detail_resources);
         self.load_media_detail_effects(cx);
         cx.emit(HomeContentEvent::TitleChanged);
         cx.notify();
@@ -105,7 +105,7 @@ impl HomeContent {
             return;
         }
         self.clear_notifications_for_scope(NotificationScope::Detail);
-        super::state::apply_navigation_change(change, &mut self.detail_resources);
+        super::binding::apply_navigation_change(change, &mut self.detail_resources);
         if self.controller.detail_view().is_some() {
             self.load_media_detail_effects(cx);
         }

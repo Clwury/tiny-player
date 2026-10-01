@@ -1,9 +1,7 @@
+use crate::media::gateway::ResolvedPlayback;
 use crate::{
     effects::RequestToken,
-    player::{
-        PlaybackTrackPreferenceKey, gateway::ResolvedPlayback, model::queue::PlaybackQueue,
-        reporting::PlaybackStateUpdate,
-    },
+    player::{PlaybackQueue, PlaybackTrackPreferenceKey, reporting::PlaybackStateUpdate},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

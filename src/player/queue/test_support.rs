@@ -1,9 +1,8 @@
 use super::model::ResolvedQueuePlayback;
+use crate::media::gateway::ResolvedPlayback;
 use crate::{
     effects::WorkspaceIdentity,
-    player::{
-        PlaybackQueue, PlaybackQueueItem, PlaybackTrackPreferenceKey, gateway::ResolvedPlayback,
-    },
+    player::{PlaybackQueue, PlaybackQueueItem, PlaybackTrackPreferenceKey},
 };
 
 pub(super) fn identity() -> WorkspaceIdentity {

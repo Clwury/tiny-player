@@ -1,5 +1,5 @@
 use super::*;
-use crate::player::model::queue::PlaybackQueueItem;
+use crate::media::PlaybackQueueItem;
 use crate::server::{CachedServer, Protocol, ServerEndpoint};
 
 #[test]

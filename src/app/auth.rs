@@ -164,7 +164,17 @@ impl TinyApp {
         self.clear_server_notifications();
         let servers = self.server_feature.sidebar_servers();
         let identity = server.workspace_identity();
-        let home_page = cx.new(|cx| HomePage::new(server, servers, client, cx));
+        let ports = crate::home::HomePorts::new(
+            std::sync::Arc::new(crate::home::adapter::EmbyHomeGateway {
+                client: client.clone(),
+                server: server.clone(),
+            }),
+            std::sync::Arc::new(crate::player::adapter::EmbyPlaybackGateway {
+                client: client.clone(),
+                server: server.clone(),
+            }),
+        );
+        let home_page = cx.new(|cx| HomePage::with_ports(server, servers, client, ports, cx));
         home_page.update(cx, |home, cx| {
             home.set_search_history(self.cache.search_history.clone(), cx);
         });

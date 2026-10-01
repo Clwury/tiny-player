@@ -4,11 +4,9 @@ use gpui::{
 };
 
 use crate::{
+    settings::view::{SettingsChanged, SettingsDialogMode, SettingsDialogState},
     theme,
-    ui::{
-        settings_dialog::{SettingsChanged, SettingsDialogMode, SettingsDialogState},
-        titlebar::app_titlebar,
-    },
+    ui::titlebar::app_titlebar,
 };
 
 use super::{
@@ -45,8 +43,12 @@ impl TinyApp {
 
         self.clear_server_menu();
         self.clear_app_notifications();
-        let config = self.cache.playback.clone();
-        let settings = cx.new(|cx| SettingsDialogState::new(&config, mode, cx));
+        let snapshot = crate::settings::SettingsSnapshot {
+            playback: self.cache.playback.clone(),
+            color_theme: theme::get(cx).selection,
+            track_languages: crate::media::PlaybackLanguagePreferences::get(cx),
+        };
+        let settings = cx.new(|cx| SettingsDialogState::new(snapshot, mode, cx));
         cx.subscribe(&settings, |app, settings, _: &SettingsChanged, cx| {
             let trace = crate::observability::TraceId::start("settings.changed");
             let settings = settings.read(cx);
@@ -142,7 +144,10 @@ mod tests {
         let (root, cx) = cx.add_window_view(|_, cx| SettingsWindow {
             settings: cx.new(|cx| {
                 SettingsDialogState::new(
-                    &PlaybackCacheConfig::default(),
+                    crate::settings::view::test_support::settings_snapshot(
+                        &PlaybackCacheConfig::default(),
+                        cx,
+                    ),
                     SettingsDialogMode::Development,
                     cx,
                 )
@@ -150,8 +155,16 @@ mod tests {
         });
         for mode in [SettingsDialogMode::Development, SettingsDialogMode::User] {
             root.update(cx, |window, cx| {
-                window.settings = cx
-                    .new(|cx| SettingsDialogState::new(&PlaybackCacheConfig::default(), mode, cx));
+                window.settings = cx.new(|cx| {
+                    SettingsDialogState::new(
+                        crate::settings::view::test_support::settings_snapshot(
+                            &PlaybackCacheConfig::default(),
+                            cx,
+                        ),
+                        mode,
+                        cx,
+                    )
+                });
                 cx.notify();
             });
             for selection in ColorTheme::ALL {

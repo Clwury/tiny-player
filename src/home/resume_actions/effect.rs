@@ -2,7 +2,7 @@ use super::controller::{ResumeCommand, ResumeItemAction, ResumeItemActionRespons
 use crate::home::gateway::HomeGateway;
 
 pub(super) fn run_resume_action(
-    gateway: &impl HomeGateway,
+    gateway: &(impl HomeGateway + ?Sized),
     command: &ResumeCommand,
 ) -> anyhow::Result<ResumeItemActionResponse> {
     match command.action {

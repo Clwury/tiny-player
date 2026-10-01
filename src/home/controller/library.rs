@@ -6,7 +6,8 @@ use crate::{
         library::controller::{
             LibraryController, LibraryIntent, LibraryRequest, LibraryTransition, LibraryUpdate,
         },
-        model::{library::library_item_types, navigation::NavigationChange},
+        library::model::library_item_types,
+        model::navigation::NavigationChange,
     },
 };
 

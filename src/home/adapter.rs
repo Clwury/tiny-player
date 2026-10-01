@@ -7,9 +7,9 @@ use super::gateway::HomeGateway;
 
 /// Immutable account/client snapshot owned by one effect. Request tokens govern
 /// whether a response from this snapshot is allowed to reach the current model.
-pub(super) struct EmbyHomeGateway {
-    pub(super) client: EmbyClient,
-    pub(super) server: CachedServer,
+pub(crate) struct EmbyHomeGateway {
+    pub(crate) client: EmbyClient,
+    pub(crate) server: CachedServer,
 }
 
 impl HomeGateway for EmbyHomeGateway {

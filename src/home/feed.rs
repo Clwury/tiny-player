@@ -1,8 +1,10 @@
-//! Home dashboard business flow; presentation and IO executors live outside.
+//! Home dashboard feature; controller policy, GPUI bindings and views are separate.
+pub(super) mod binding;
 mod controller;
 pub(super) mod effect;
 mod model;
 mod selectors;
+mod view;
 
 #[cfg(test)]
 mod tests;

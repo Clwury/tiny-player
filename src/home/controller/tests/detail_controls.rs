@@ -1,5 +1,5 @@
 use super::*;
-use crate::home::model::detail::SeriesDetailModel;
+use crate::home::detail::model::SeriesDetailModel;
 
 fn movie() -> SeriesDetailModel {
     let metadata = json!({

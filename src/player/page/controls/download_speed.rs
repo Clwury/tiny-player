@@ -157,7 +157,7 @@ mod tests {
     fn page_refresh_uses_latest_rate_at_original_deadline_and_pauses_when_hidden(
         cx: &mut TestAppContext,
     ) {
-        let (page, cx) = episodes::tests::playback_window(cx);
+        let (page, cx) = test_support::playback_window(cx);
         page.update(cx, |page, cx| {
             page.session.source_mut().source_protocol = Some("https".into());
             page.session.timeline_mut().cache_state = Some(PlaybackCacheState {

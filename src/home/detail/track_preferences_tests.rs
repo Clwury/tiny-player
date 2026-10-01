@@ -1,10 +1,11 @@
 use crate::home::detail::test_fixture::detail_binding;
 use crate::home::track_preferences::detail_track_choices;
+use crate::settings::binding::PlaybackTrackPreferences;
 use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
 
-use crate::player::{PlaybackTrackKind, PlaybackTrackPreferences, SavedTrackChoice, TrackLanguage};
+use crate::player::{PlaybackTrackKind, SavedTrackChoice, TrackLanguage};
 
 use super::*;
 

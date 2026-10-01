@@ -1,7 +1,7 @@
 use super::{effect, test_support::*};
+use crate::media::gateway::{PlaybackSourceGateway, ResolvedPlayback};
 use crate::player::{
     PlaybackLanguagePreferences, PlaybackTrack, SavedTrackChoice, SavedTrackChoices, TrackLanguage,
-    gateway::{PlaybackGateway, PlaybackReport, ResolvedPlayback},
 };
 use std::sync::Mutex;
 
@@ -12,10 +12,7 @@ struct FakeGateway {
     fail: bool,
     blank_session: bool,
 }
-impl PlaybackGateway for FakeGateway {
-    fn report(&self, _: &PlaybackReport) -> anyhow::Result<()> {
-        panic!("source resolution cannot report playback")
-    }
+impl PlaybackSourceGateway for FakeGateway {
     fn resolve_source(&self, item: &str, source: &str) -> anyhow::Result<ResolvedPlayback> {
         self.requests
             .lock()

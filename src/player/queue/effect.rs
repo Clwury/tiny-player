@@ -1,12 +1,13 @@
 //! Blocking source resolution through the playback port. No GPUI or account IO
 //! reaches the controller; the result is committed before page event assembly.
 use super::model::ResolvedQueuePlayback;
-use crate::player::{
-    PlaybackLanguagePreferences, PlaybackTrackPreferenceKey, SavedTrackChoices,
-    gateway::PlaybackGateway, model::queue::PlaybackQueue, playback_audio_tracks_for_source,
-    playback_initial_position_seconds, preferred_playback_media_source,
+use crate::media::gateway::PlaybackSourceGateway;
+use crate::media::{
+    PlaybackLanguagePreferences, PlaybackQueue, PlaybackTrackPreferenceKey, SavedTrackChoices,
+    playback_audio_tracks_for_source, preferred_playback_media_source,
     preferred_playback_track_selection,
 };
+use crate::player::playback_initial_position_seconds;
 use anyhow::{Result, anyhow};
 
 pub(in crate::player) fn preference_key(
@@ -21,7 +22,7 @@ pub(in crate::player) fn preference_key(
 }
 
 pub(in crate::player) fn resolve(
-    gateway: &dyn PlaybackGateway,
+    gateway: &dyn PlaybackSourceGateway,
     queue: &PlaybackQueue,
     languages: PlaybackLanguagePreferences,
     saved_tracks: SavedTrackChoices,

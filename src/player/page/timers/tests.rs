@@ -16,7 +16,7 @@ fn advance(cx: &mut gpui::VisualTestContext, milliseconds: u64) {
 fn volume_and_rate_hide_independently_and_repeated_volume_restarts_its_delay(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     page.update(cx, |page, cx| {
         page.video = adapter(Rc::new(RefCell::new(FakeState::default())), false);
         page.show_volume_indicator(cx);
@@ -44,7 +44,7 @@ fn volume_and_rate_hide_independently_and_repeated_volume_restarts_its_delay(
 
 #[gpui::test]
 fn controls_deadline_respects_hover_drag_and_episode_drawer(cx: &mut gpui::TestAppContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     for blocked in 0..4 {
         page.update(cx, |page, cx| {
             page.presentation.fullscreen.controls_visible = true;
@@ -111,7 +111,7 @@ fn pending(cx: &mut Context<PlaybackPage>, cancelled: Arc<AtomicBool>) -> gpui::
 fn stale_callbacks_keep_current_task_and_back_release_cancel_all_tasks(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let replaced = Arc::new(AtomicBool::new(false));
     let on_back: [_; 4] = std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
     page.update(cx, |page, cx| {

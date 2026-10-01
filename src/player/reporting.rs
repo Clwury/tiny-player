@@ -2,6 +2,7 @@
 mod completion;
 mod controller;
 pub(super) mod effect;
+pub(crate) mod gateway;
 
 pub use completion::{PlaybackStateUpdate, PlaybackStopCompletion, PlaybackStopResult};
 pub(crate) use controller::PlaybackReport;

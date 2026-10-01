@@ -2,7 +2,7 @@ use super::model::{PlayedCommand, PlayedResponse};
 use crate::home::gateway::HomeGateway;
 
 pub(in crate::home) fn run_played(
-    gateway: &impl HomeGateway,
+    gateway: &(impl HomeGateway + ?Sized),
     command: &PlayedCommand,
 ) -> anyhow::Result<PlayedResponse> {
     let request = &command.request;

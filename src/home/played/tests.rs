@@ -1,11 +1,9 @@
 use super::*;
 use crate::emby::{ResumeItems, UserItem};
 use crate::home::{
+    detail::model::SeriesDetailModel,
     gateway::test_support::{Call, FakeMutations, Reply},
-    model::{
-        detail::SeriesDetailModel,
-        notification::{ActionNotification, NotificationScope},
-    },
+    model::notification::{ActionNotification, NotificationScope},
     played::effect::run_played,
 };
 use serde_json::json;

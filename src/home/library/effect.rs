@@ -2,7 +2,7 @@ use super::controller::LibraryRequest;
 use crate::{emby::UserItems, home::gateway::HomeGateway};
 
 pub(super) fn run_library(
-    gateway: &impl HomeGateway,
+    gateway: &(impl HomeGateway + ?Sized),
     request: &LibraryRequest,
 ) -> anyhow::Result<UserItems> {
     gateway.user_items(&request.query)

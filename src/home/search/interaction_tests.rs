@@ -1,7 +1,10 @@
-use super::*;
+use super::controller::{SearchIntent, SearchRequestContext};
+use crate::home::{HomeContent, LoadState, search::model::SearchPage};
+use crate::ui::editor::EditorEvent;
 use crate::{
     emby::EmbyClient, home::navigation::HomeRoot, server::CachedServer, theme, ui::editor::Editor,
 };
+use gpui::px;
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, size};
 
 fn search_window(cx: &mut TestAppContext) -> (Entity<HomeContent>, &mut VisualTestContext) {

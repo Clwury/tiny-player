@@ -314,6 +314,7 @@ pub(super) fn valid_frame_rate(frame_rate: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use crate::player::model::timeline::user_pause_from_effective_pause_event;
+    use crate::player::page::surface::volume_delta_from_scroll_delta;
     use tiny_playback::{ByteCacheState, DemuxCacheState, PlaybackCacheState, StreamCacheState};
 
     use super::*;

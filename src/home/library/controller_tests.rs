@@ -255,3 +255,96 @@ fn workspace_and_library_tokens_are_isolated_and_failed_initial_can_retry() {
     assert!(controller.view_model().empty);
     assert_eq!(controller.view_model().paged.next_start_index, 3);
 }
+
+#[test]
+fn last_content_added_sort_is_available_only_for_series_libraries() {
+    let series_sorts = available_library_sorts(&[VideoItemType::Series]).collect::<Vec<_>>();
+    assert!(series_sorts.contains(&UserItemsSort::DateLastContentAdded));
+
+    let movie_sorts = available_library_sorts(&[VideoItemType::Movie]).collect::<Vec<_>>();
+    assert!(!movie_sorts.contains(&UserItemsSort::DateLastContentAdded));
+
+    let mixed_sorts =
+        available_library_sorts(&[VideoItemType::Movie, VideoItemType::Series]).collect::<Vec<_>>();
+    assert!(!mixed_sorts.contains(&UserItemsSort::DateLastContentAdded));
+}
+
+#[test]
+fn library_query_uses_selected_sort_for_every_page() {
+    let mut state = LibraryController::new(
+        vec![VideoItemType::Series],
+        "view-1".into(),
+        WorkspaceIdentity::default(),
+    );
+    state.dispatch(LibraryIntent::SortBy(UserItemsSort::CriticRating), 0);
+    let changed = state.dispatch(LibraryIntent::SortOrder(SortOrder::Descending), 0);
+    let initial = changed.request.unwrap();
+    state
+        .complete(
+            &initial,
+            Ok(UserItems {
+                items: (0..PAGED_ITEMS_LIMIT)
+                    .map(|index| {
+                        serde_json::from_value(serde_json::json!({
+                            "Id": index.to_string(), "Name": "Series", "Type": "Series"
+                        }))
+                        .unwrap()
+                    })
+                    .collect(),
+                total_record_count: PAGED_ITEMS_LIMIT * 3,
+            }),
+            &WorkspaceIdentity::default(),
+        )
+        .unwrap();
+    let more = state
+        .dispatch(LibraryIntent::LoadMore { automatic: true }, 1)
+        .request
+        .unwrap();
+    for (request, start_index) in [(&initial, 0), (&more, PAGED_ITEMS_LIMIT)] {
+        let query = &request.query;
+        assert_eq!(query.parent_id.as_deref(), Some("view-1"));
+        assert_eq!(query.include_item_types, vec![VideoItemType::Series]);
+        assert!(query.recursive);
+        assert_eq!(query.start_index, start_index);
+        assert_eq!(query.limit, PAGED_ITEMS_LIMIT);
+        assert_eq!(query.sort_by, Some(UserItemsSort::CriticRating));
+        assert_eq!(query.sort_order, SortOrder::Descending);
+    }
+}
+
+#[test]
+fn changing_library_sort_invalidates_pages_and_closes_menu() {
+    let mut state = LibraryController::new(
+        vec![VideoItemType::Movie],
+        "view".into(),
+        WorkspaceIdentity::default(),
+    );
+    let pending = state.test_paged_mut().begin_initial(true).unwrap();
+
+    let transition = state.dispatch(LibraryIntent::SortBy(UserItemsSort::DateCreated), 0);
+    assert!(transition.close_menu);
+    assert!(transition.request.is_some());
+    state.dispatch(LibraryIntent::SortOrder(SortOrder::Descending), 0);
+    assert_eq!(state.view_model().sort_by, UserItemsSort::DateCreated);
+    assert_eq!(state.view_model().sort_order, SortOrder::Descending);
+    assert!(state.view_model().paged.dirty);
+    assert!(!state.view_model().paged.accepts_initial(&pending));
+}
+
+#[test]
+fn selecting_current_library_sort_only_closes_menu() {
+    let mut state = LibraryController::new(
+        vec![VideoItemType::Movie],
+        "view".into(),
+        WorkspaceIdentity::default(),
+    );
+
+    let transition = state.dispatch(LibraryIntent::SortBy(UserItemsSort::SortName), 0);
+    assert!(transition.close_menu);
+    assert!(transition.request.is_none());
+    assert!(!state.view_model().paged.dirty);
+    assert_eq!(
+        state.view_model().paged.initial,
+        crate::home::LoadState::Idle
+    );
+}

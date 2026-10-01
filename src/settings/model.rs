@@ -1,10 +1,11 @@
 use super::memory_budget::MemoryBudget;
 use crate::{
-    player::{
-        CacheUnlinkPolicy, HardwareDecodeMode, PlaybackCacheConfig, PlaybackCacheMode,
-        PlaybackLanguagePreferences, PlaybackSeekableCacheMode, TrackLanguage,
-    },
+    media::{PlaybackLanguagePreferences, TrackLanguage},
     theme::ColorTheme,
+};
+use tiny_playback::{
+    CacheUnlinkPolicy, HardwareDecodeMode, PlaybackCacheConfig, PlaybackCacheMode,
+    PlaybackSeekableCacheMode,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

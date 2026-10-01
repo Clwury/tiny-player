@@ -3,8 +3,8 @@
 use super::HomeController;
 use crate::{
     emby::{MediaSource, MediaStream},
-    home::model::detail::SeriesDetailModel,
-    player::{SavedTrackChoices, TrackLanguage},
+    home::detail::model::SeriesDetailModel,
+    media::{SavedTrackChoices, TrackLanguage},
 };
 
 pub(in crate::home) struct DetailActionsVm {

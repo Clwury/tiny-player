@@ -1,7 +1,7 @@
 use crate::{
     effects::RequestToken,
     emby::{MediaItem, MediaItems, ResumeItems, UserItem, UserItemData},
-    home::model::{detail::SeriesDetailModel, notification::ActionNotification},
+    home::{detail::model::SeriesDetailModel, model::notification::ActionNotification},
 };
 
 #[derive(Clone, Debug)]

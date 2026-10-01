@@ -3,7 +3,7 @@ use gpui::{
 };
 
 use crate::{
-    server::feature::SidebarServer,
+    server::SidebarServer,
     theme,
     ui::{radius, server_icon::server_icon},
 };

@@ -200,9 +200,8 @@ impl PlaybackPage {
 
 #[cfg(test)]
 mod tests {
-    use crate::player::{
-        PlaybackTrack, PlaybackTrackKind, PlaybackTrackPreferences, SavedTrackChoice,
-    };
+    use crate::player::{PlaybackTrack, PlaybackTrackKind, SavedTrackChoice};
+    use crate::settings::binding::PlaybackTrackPreferences;
     use tiny_playback::{
         ByteCacheState, DemuxCacheState, PlaybackCacheState, PlaybackCacheTimeRange,
     };
@@ -218,7 +217,7 @@ mod tests {
     fn playback_restart_closes_cache_popover_after_reducing_timeline(
         cx: &mut gpui::TestAppContext,
     ) {
-        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        let (page, cx) = crate::player::page::test_support::playback_window(cx);
         cx.update(|window, cx| {
             page.update(cx, |page, cx| {
                 page.presentation.timeline_presentation.cache_status_open = true;
@@ -242,7 +241,7 @@ mod tests {
             BackendSubtitleBitmap, BackendSubtitleCue, BgraImage, SharedBgraImage,
         };
 
-        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        let (page, cx) = crate::player::page::test_support::playback_window(cx);
         let image = SharedBgraImage::new(BgraImage::new(vec![1, 2, 3, 128], 1, 1).unwrap());
         let cue = BackendSubtitleCue {
             text: String::new(),
@@ -308,7 +307,7 @@ mod tests {
     fn resolved_stream_tracks_update_menus_without_saving_automatic_subtitle_off(
         cx: &mut gpui::TestAppContext,
     ) {
-        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        let (page, cx) = crate::player::page::test_support::playback_window(cx);
         cx.update(|window, cx| {
             page.update(cx, |page, cx| {
                 let original_subtitle = PlaybackTrack::new(7, "Chinese Simplified (ASS)", false);
@@ -394,7 +393,7 @@ mod tests {
     fn audio_fallback_keeps_valid_detail_subtitle_pending_until_playback_starts(
         cx: &mut gpui::TestAppContext,
     ) {
-        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        let (page, cx) = crate::player::page::test_support::playback_window(cx);
         cx.update(|window, cx| {
             page.update(cx, |page, cx| {
                 let subtitle = PlaybackTrack::new(7, "Chinese Simplified (ASS)", false);
@@ -441,7 +440,7 @@ mod tests {
 
     #[gpui::test]
     fn detail_subtitle_is_saved_only_after_backend_start(cx: &mut gpui::TestAppContext) {
-        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        let (page, cx) = crate::player::page::test_support::playback_window(cx);
         cx.update(|window, cx| {
             page.update(cx, |page, cx| {
                 page.session.timeline_mut().loaded = false;
@@ -525,7 +524,7 @@ mod tests {
             Some(BackendEventKind::Fatal("decoder failed".into())),
             None,
         ] {
-            let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+            let (page, cx) = crate::player::page::test_support::playback_window(cx);
             cx.update(|window, cx| {
                 page.update(cx, |page, cx| {
                     page.session.timeline_mut().loaded = false;
@@ -575,7 +574,7 @@ mod tests {
     fn starting_automatic_subtitle_does_not_create_an_explicit_preference(
         cx: &mut gpui::TestAppContext,
     ) {
-        let (page, cx) = crate::player::page::episodes::tests::playback_window(cx);
+        let (page, cx) = crate::player::page::test_support::playback_window(cx);
         cx.update(|window, cx| {
             page.update(cx, |page, cx| {
                 page.session.source_mut().tracks.subtitles =

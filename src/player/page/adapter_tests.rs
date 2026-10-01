@@ -6,7 +6,7 @@ use tiny_playback::{BackendEvent, BgraImage, PlaybackRateChange};
 
 #[gpui::test]
 fn command_failures_preserve_pause_seek_volume_and_rate(cx: &mut gpui::TestAppContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let state = Rc::new(RefCell::new(FakeState {
         fail_commands: true,
         ..Default::default()
@@ -69,7 +69,7 @@ fn command_failures_preserve_pause_seek_volume_and_rate(cx: &mut gpui::TestAppCo
 fn successful_commands_keep_cache_pause_and_precise_seek_and_emit_saved_volume(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let state = Rc::new(RefCell::new(FakeState::default()));
     let volumes = Rc::new(RefCell::new(Vec::new()));
     cx.update(|_, cx| {
@@ -122,7 +122,7 @@ fn successful_commands_keep_cache_pause_and_precise_seek_and_emit_saved_volume(
 fn render_failure_clears_frame_closes_reporting_and_cancels_queue_before_release(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let state = Rc::new(RefCell::new(FakeState {
         fail_render: true,
         ..Default::default()
@@ -182,7 +182,7 @@ fn render_failure_clears_frame_closes_reporting_and_cancels_queue_before_release
 fn paused_poll_reads_driver_events_at_interval_and_stops_after_cache_is_idle(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let state = Rc::new(RefCell::new(FakeState::default()));
     page.update(cx, |page, cx| {
         page.video = adapter(state.clone(), false);

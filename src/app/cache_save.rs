@@ -99,6 +99,7 @@ impl TinyApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::binding::PlaybackTrackPreferences;
     use crate::{
         storage::ServerCache,
         theme::{self, ColorTheme},
@@ -131,9 +132,7 @@ mod tests {
 
     #[gpui::test]
     fn track_choices_do_not_write_application_settings(cx: &mut TestAppContext) {
-        use crate::player::{
-            PlaybackTrackKind, PlaybackTrackPreferenceKey, PlaybackTrackPreferences,
-        };
+        use crate::player::{PlaybackTrackKind, PlaybackTrackPreferenceKey};
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("servers.json");
@@ -179,7 +178,7 @@ mod tests {
     #[gpui::test]
     fn settings_window_changes_reach_disk_and_survive_reopening(cx: &mut TestAppContext) {
         use crate::player::{PlaybackLanguagePreferences, TrackLanguage};
-        use crate::ui::settings_dialog::SettingsDialogMode;
+        use crate::settings::view::SettingsDialogMode;
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("servers.json");
         cx.update(|cx| {
@@ -294,7 +293,7 @@ mod tests {
             player::{
                 HardwareDecodeMode, PlaybackCacheConfig, PlaybackLanguagePreferences, TrackLanguage,
             },
-            ui::settings_dialog::SettingsDialogMode,
+            settings::view::SettingsDialogMode,
         };
 
         let temp = tempfile::tempdir().unwrap();

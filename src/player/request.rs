@@ -1,7 +1,7 @@
 //! Immutable launch payload exchanged between Home, app shell and playback.
 //! GPUI's SharedString remains a presentation-facing title; selection and time
 //! rules live in pure models, while authenticated URL assembly is an adapter.
-use super::model::queue::PlaybackQueue;
+use crate::media::PlaybackQueue;
 use gpui::SharedString;
 use std::fmt;
 use tiny_playback::{PlaybackTrack, PlaybackTrackSelection};

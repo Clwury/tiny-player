@@ -27,7 +27,7 @@ impl Render for PlaybackWithTitlebar {
 fn playback_with_titlebar(
     cx: &mut TestAppContext,
 ) -> (gpui::Entity<PlaybackPage>, &mut VisualTestContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     cx.update(|window, cx| window.replace_root(cx, |_, _| PlaybackWithTitlebar(page.clone())));
     cx.run_until_parked();
     (page, cx)
@@ -133,7 +133,7 @@ fn progress_drag_consumes_its_own_release_outside_the_track_only(cx: &mut TestAp
 
 #[gpui::test]
 fn surface_drag_press_reaches_windows_but_menu_dismissal_does_not(cx: &mut TestAppContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     cx.simulate_keystrokes("i");
     let file = cx.debug_bounds("playback-stats-File").unwrap();
     let video = point(px(1060.0), px(400.0));
@@ -174,7 +174,7 @@ fn surface_drag_press_reaches_windows_but_menu_dismissal_does_not(cx: &mut TestA
 
 #[gpui::test]
 fn surface_double_click_keeps_fullscreen_and_blocks_native_maximize(cx: &mut TestAppContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     let video = point(px(1060.0), px(400.0));
     for was_fullscreen in [false, true] {
         assert_eq!(
@@ -211,7 +211,7 @@ fn surface_double_click_keeps_fullscreen_and_blocks_native_maximize(cx: &mut Tes
 #[cfg(target_os = "linux")]
 #[gpui::test]
 fn server_decorations_discard_a_pending_playback_window_drag(cx: &mut TestAppContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     // Model a decoration-mode change after a client-side drag was armed.
     page.update(cx, |page, _| {
         page.presentation.window_drag = WindowDragState::Pending
@@ -230,7 +230,7 @@ fn server_decorations_discard_a_pending_playback_window_drag(cx: &mut TestAppCon
 #[cfg(target_os = "windows")]
 #[gpui::test]
 fn native_surface_suppresses_system_menu_and_preserves_volume_scroll(cx: &mut TestAppContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     cx.simulate_keystrokes("i");
     let file = cx.debug_bounds("playback-stats-File").unwrap();
     let video = point(px(1060.0), px(400.0));
@@ -268,7 +268,7 @@ fn native_surface_suppresses_system_menu_and_preserves_volume_scroll(cx: &mut Te
 fn control_panel_background_closes_track_menus_without_playback_side_effects(
     cx: &mut TestAppContext,
 ) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     page.update(cx, |page, cx| {
         page.session.source_mut().tracks.selected_audio_stream_index = Some(0);
         page.session
@@ -347,7 +347,7 @@ fn control_panel_background_closes_track_menus_without_playback_side_effects(
 fn track_menus_keep_inside_clicks_and_buttons_can_toggle_switch_and_select(
     cx: &mut TestAppContext,
 ) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     page.update(cx, |page, cx| {
         page.session.source_mut().tracks.selected_audio_stream_index = Some(0);
         page.session
@@ -414,7 +414,7 @@ fn track_menus_keep_inside_clicks_and_buttons_can_toggle_switch_and_select(
 
 #[gpui::test]
 fn track_menus_show_metadata_below_labels_and_scroll_to_select_last_track(cx: &mut TestAppContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     page.update(cx, |page, cx| {
         let streams = (0..8)
             .flat_map(|index| {
@@ -544,7 +544,7 @@ fn control_panel_presses_do_not_become_window_drags_outside_the_panel(cx: &mut T
 
 #[gpui::test]
 fn window_drag_origin_resets_on_release_or_a_new_control_press(cx: &mut TestAppContext) {
-    let (page, cx) = episodes::tests::playback_window(cx);
+    let (page, cx) = test_support::playback_window(cx);
     cx.simulate_keystrokes("i");
     let file = cx.debug_bounds("playback-stats-File").unwrap();
     let play = cx

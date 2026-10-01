@@ -1,8 +1,5 @@
 use super::*;
-use crate::player::{
-    gateway::ResolvedPlayback,
-    reporting::{PlaybackStopResult, ReportingIntent, test_support::Session},
-};
+use crate::player::reporting::{PlaybackStopResult, ReportingIntent, test_support::Session};
 use std::{sync::mpsc, time::Duration};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -20,7 +17,7 @@ struct FakeGateway {
     panic_start: bool,
 }
 
-impl PlaybackGateway for FakeGateway {
+impl PlaybackReportGateway for FakeGateway {
     fn report(&self, report: &PlaybackReport) -> anyhow::Result<()> {
         self.sent.lock().unwrap().push(match report {
             PlaybackReport::Started(_) => Sent::Started,
@@ -42,17 +39,6 @@ impl PlaybackGateway for FakeGateway {
             "synthetic failure"
         );
         Ok(())
-    }
-    fn resolve_source(&self, _: &str, _: &str) -> anyhow::Result<ResolvedPlayback> {
-        unreachable!()
-    }
-    fn subtitle_tracks(
-        &self,
-        _: &crate::emby::MediaSource,
-        _: &str,
-        _: &str,
-    ) -> Vec<crate::player::PlaybackTrack> {
-        unreachable!()
     }
 }
 

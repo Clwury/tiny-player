@@ -555,7 +555,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[gpui::test]
     fn server_decorations_remove_client_chrome_from_main_and_settings(cx: &mut TestAppContext) {
-        use crate::ui::settings_dialog::SettingsDialogMode;
+        use crate::settings::view::SettingsDialogMode;
         use gpui::{Modifiers, MouseButton};
 
         cx.update(theme::init);

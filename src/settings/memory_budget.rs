@@ -1,4 +1,4 @@
-use crate::player::PlaybackCacheConfig;
+use tiny_playback::PlaybackCacheConfig;
 
 const MIB: u64 = 1024 * 1024;
 

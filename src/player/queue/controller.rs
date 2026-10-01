@@ -1,6 +1,6 @@
 use super::model::*;
 use crate::effects::{RequestScope, RequestSlot, RequestToken, WorkspaceIdentity};
-use crate::player::model::queue::PlaybackQueue;
+use crate::media::PlaybackQueue;
 
 struct PendingSwitch {
     action: QueueAction,

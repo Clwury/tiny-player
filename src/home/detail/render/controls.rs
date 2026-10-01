@@ -1,7 +1,7 @@
 use super::*;
-use crate::home::detail::state::detail_binding;
+use crate::home::detail::binding::detail_binding;
 use crate::home::track_preferences::detail_track_choices;
-use crate::player::{PlaybackLanguagePreferences, track_metadata_label};
+use crate::media::{PlaybackLanguagePreferences, track_metadata_label};
 use crate::ui::radius;
 
 fn detail_icon_button(

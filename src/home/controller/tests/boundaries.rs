@@ -1,11 +1,8 @@
 use super::*;
 use crate::home::{
-    model::{
-        notification::{ActionNotification, NotificationScope},
-        search::SearchPage,
-    },
+    model::notification::{ActionNotification, NotificationScope},
     resume_actions::controller::{ResumeItemAction, ResumeItemActionResponse},
-    search::controller::SearchIntent,
+    search::{controller::SearchIntent, model::SearchPage},
 };
 
 fn notification() -> ActionNotification {

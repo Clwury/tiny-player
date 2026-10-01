@@ -1,10 +1,10 @@
 use super::HomeController;
 use crate::{
     home::{
-        model::search::SearchPage,
         search::controller::{
             SearchIntent, SearchRequestContext, SearchTransition, SearchUpdate, SearchVm,
         },
+        search::model::SearchPage,
     },
     search_history::SearchHistory,
 };
