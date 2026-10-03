@@ -1,7 +1,7 @@
 use super::{
-    Duration, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, VIDEO_OUTPUT_START_FAST_READY_DURATION,
-    VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER, VIDEO_TIMESTAMP_ROUNDING_TOLERANCE_NSECS,
-    duration_nsecs,
+    DemuxReaderWatermark, Duration, VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE,
+    VIDEO_OUTPUT_START_FAST_READY_DURATION, VIDEO_OUTPUT_STARTUP_DEMUX_FALLBACK_AFTER,
+    VIDEO_TIMESTAMP_ROUNDING_TOLERANCE_NSECS, duration_nsecs,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +34,7 @@ pub(in crate::backend::ffmpeg::playback_loop::output_gate) enum InitialStartBloc
     NoAudioCoverage,
     AudioVideoOffset,
     ActiveRecovery,
+    DemuxPrefetch,
     InsufficientLookahead,
     SingleFrameNotVulkan,
     TargetFrameNotConfirmed,
@@ -48,6 +49,7 @@ impl InitialStartBlockReason {
             Self::NoAudioCoverage => "no_audio_coverage",
             Self::AudioVideoOffset => "audio_video_offset",
             Self::ActiveRecovery => "active_recovery",
+            Self::DemuxPrefetch => "demux_cache",
             Self::InsufficientLookahead => "insufficient_lookahead",
             Self::SingleFrameNotVulkan => "single_frame_not_vulkan",
             Self::TargetFrameNotConfirmed => "target_frame_not_confirmed",
@@ -100,6 +102,9 @@ pub(in crate::backend::ffmpeg::playback_loop::output_gate) struct InitialStartAd
         Option<u64>,
     pub(in crate::backend::ffmpeg::playback_loop::output_gate) startup_sync_elapsed:
         Option<Duration>,
+    pub(in crate::backend::ffmpeg::playback_loop::output_gate) prefetch_target_nsecs: Option<u64>,
+    pub(in crate::backend::ffmpeg::playback_loop::output_gate) demux_watermark:
+        DemuxReaderWatermark,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +141,25 @@ pub(in crate::backend::ffmpeg::playback_loop::output_gate) fn initial_start_admi
         video_anchor_nsecs,
         audio_start_target_nsecs: observed_audio_start_nsecs.max(video_anchor_nsecs),
     };
+    if let Some(target_nsecs) = input.prefetch_target_nsecs.filter(|target| *target > 0) {
+        let watermark = input.demux_watermark;
+        let forward_nsecs = watermark
+            .video_forward_nsecs
+            .zip(watermark.audio_forward_nsecs)
+            .map(|(video, audio)| video.min(audio))
+            .or(watermark.selected_min_forward_nsecs);
+        let idle = watermark.idle || (watermark.video_idle && watermark.audio_idle);
+        let underrun = watermark.underrun || watermark.video_underrun || watermark.audio_underrun;
+        // Like mpv's cache pause, network seek output waits for media-time
+        // coverage, except when input is idle at EOF or the cache limit. The
+        // watermark preserves readable packet coverage independently of the
+        // decoded prefix, extending it only with contiguous downstream data.
+        if underrun || (!idle && forward_nsecs.is_none_or(|forward| forward < target_nsecs)) {
+            // Network buffering is not part of the bounded A/V commit. Start
+            // its watchdog only after the prefetch gate has opened.
+            return waiting(InitialStartBlockReason::DemuxPrefetch, None);
+        }
+    }
     if input.active_recovery {
         return waiting(InitialStartBlockReason::ActiveRecovery, Some(pair));
     }
@@ -251,6 +275,112 @@ mod tests {
             require_strict_fast_lookahead: false,
             cached_exact_landing_nsecs: None,
             startup_sync_elapsed: Some(Duration::from_millis(800)),
+            prefetch_target_nsecs: None,
+            demux_watermark: DemuxReaderWatermark::default(),
+        }
+    }
+
+    #[test]
+    fn network_seek_does_not_start_two_frames_into_empty_prefetch() {
+        let mut input = input();
+        input.expected_target_nsecs = 3_078_127_000_000;
+        input.first_video_nsecs = Some(3_078_158_000_000);
+        input.first_audio_nsecs = input.first_video_nsecs;
+        input.decoded_video_forward_nsecs = Some(83_708_333);
+        input.strict_video_forward_nsecs = Some(83_708_333);
+        input.decoded_audio_forward_nsecs = Some(423_299_120);
+        input.contiguous_video_frames = 2;
+        input.prefetch_target_nsecs = Some(1_000_000_000);
+        input.demux_watermark = DemuxReaderWatermark {
+            video_forward_nsecs: Some(83_708_333),
+            audio_forward_nsecs: Some(423_299_120),
+            selected_min_forward_nsecs: Some(83_708_333),
+            ..DemuxReaderWatermark::default()
+        };
+        // Even the elapsed single-frame fallback cannot bypass network fill.
+        input.startup_sync_elapsed = Some(Duration::from_secs(5));
+        let evaluation = initial_start_admission(input);
+        assert_eq!(
+            evaluation.admission,
+            InitialStartAdmission::Waiting(InitialStartBlockReason::DemuxPrefetch)
+        );
+        assert!(
+            evaluation.pair.is_none(),
+            "cache fill must not start the commit watchdog"
+        );
+
+        input.demux_watermark.video_forward_nsecs = Some(1_000_000_000);
+        input.demux_watermark.audio_forward_nsecs = Some(1_000_000_000);
+        assert!(matches!(
+            initial_start_admission(input).admission,
+            InitialStartAdmission::Prime {
+                mode: InitialStartAdmissionMode::FastLookahead,
+                ..
+            }
+        ));
+
+        input.demux_watermark.audio_underrun = true;
+        assert_eq!(
+            initial_start_admission(input).admission,
+            InitialStartAdmission::Waiting(InitialStartBlockReason::DemuxPrefetch)
+        );
+    }
+
+    #[test]
+    fn network_seek_prefetch_wait_survives_single_frame_fallback_deadline() {
+        let mut input = input();
+        input.prefetch_target_nsecs = Some(1_000_000_000);
+        input.startup_sync_elapsed = Some(Duration::from_secs(5));
+        for target in [input.expected_target_nsecs, 0] {
+            input.expected_target_nsecs = target;
+            input.first_video_nsecs = Some(target);
+            input.first_audio_nsecs = Some(target);
+            assert_eq!(
+                initial_start_admission(input).admission,
+                InitialStartAdmission::Waiting(InitialStartBlockReason::DemuxPrefetch)
+            );
+        }
+    }
+
+    #[test]
+    fn network_seek_can_start_below_waterline_when_demux_is_idle() {
+        let mut input = input();
+        input.prefetch_target_nsecs = Some(1_000_000_000);
+        input.demux_watermark = DemuxReaderWatermark {
+            video_forward_nsecs: Some(100_000_000),
+            audio_forward_nsecs: Some(100_000_000),
+            video_idle: true,
+            audio_idle: true,
+            ..DemuxReaderWatermark::default()
+        };
+        assert!(matches!(
+            initial_start_admission(input).admission,
+            InitialStartAdmission::Prime { .. }
+        ));
+
+        input.demux_watermark.audio_idle = false;
+        assert_eq!(
+            initial_start_admission(input).admission,
+            InitialStartAdmission::Waiting(InitialStartBlockReason::DemuxPrefetch)
+        );
+
+        input.demux_watermark.idle = true;
+        assert!(matches!(
+            initial_start_admission(input).admission,
+            InitialStartAdmission::Prime { .. }
+        ));
+    }
+
+    #[test]
+    fn local_or_disabled_cache_start_does_not_wait_for_network_prefetch() {
+        let mut input = input();
+        input.demux_watermark.underrun = true;
+        for target in [None, Some(0)] {
+            input.prefetch_target_nsecs = target;
+            assert!(matches!(
+                initial_start_admission(input).admission,
+                InitialStartAdmission::Prime { .. }
+            ));
         }
     }
 

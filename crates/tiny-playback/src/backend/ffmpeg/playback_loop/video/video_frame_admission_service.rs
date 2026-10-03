@@ -16,16 +16,13 @@ use super::video_output_gate::{
     service_audio_clocked_drain_decoded_video_frame, service_video_clocked_decoded_video_frame,
 };
 use super::{
-    AudioOutput, BufferedReporter, DemuxReaderWatermark, FfmpegControl, PlaybackOutputScheduler,
-    PlaybackScheduler, PositionReporter, QueuedVideoFrame, SubtitlePipeline,
+    AudioOutput, BufferedReporter, FfmpegControl, PlaybackOutputScheduler, PlaybackScheduler,
+    PositionReporter, QueuedVideoFrame, SubtitlePipeline,
 };
 
-pub(super) fn admit_prepared_video_frame<F>(
-    context: PreparedVideoFrameAdmissionContext<'_, F>,
-) -> std::result::Result<(), String>
-where
-    F: FnMut() -> DemuxReaderWatermark,
-{
+pub(super) fn admit_prepared_video_frame(
+    context: PreparedVideoFrameAdmissionContext<'_>,
+) -> std::result::Result<(), String> {
     let PreparedVideoFrame {
         generation,
         frame,
@@ -94,13 +91,10 @@ where
             context.event_tx,
             context.subtitle_pipeline,
             context.buffered_reporter,
-            context.scheduler,
             frame,
             timeline_nsecs,
             duration_nsecs,
             context.current_start_position_nsecs,
-            context.video_is_hevc,
-            context.demux_reader_watermark,
         )? == DecodedVideoAdmissionStatus::Stop
         {
             return Ok(());
@@ -177,10 +171,7 @@ fn log_prepared_video_frame_admission_entry(
     );
 }
 
-pub(super) struct PreparedVideoFrameAdmissionContext<'a, F>
-where
-    F: FnMut() -> DemuxReaderWatermark,
-{
+pub(super) struct PreparedVideoFrameAdmissionContext<'a> {
     pub(super) prepared_frame: PreparedVideoFrame,
     pub(super) decoded_video_frame_count: u64,
     pub(super) scheduler: &'a mut PlaybackScheduler,
@@ -195,8 +186,6 @@ where
     pub(super) position_reporter: &'a mut PositionReporter,
     pub(super) subtitle_pipeline: &'a mut SubtitlePipeline,
     pub(super) current_start_position_nsecs: &'a mut u64,
-    pub(super) video_is_hevc: bool,
-    pub(super) demux_reader_watermark: F,
 }
 
 pub(super) fn admit_drained_prepared_video_frame(

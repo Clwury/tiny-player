@@ -115,12 +115,13 @@ fn playback_shortcut_for_event(event: &KeyDownEvent) -> Option<PlaybackShortcut>
         && !adjusts_volume
         && !matches!(
             shortcut,
-            PlaybackShortcut::ChangeRate(
-                PlaybackRateChange::Decrease
-                    | PlaybackRateChange::Increase
-                    | PlaybackRateChange::Halve
-                    | PlaybackRateChange::Double
-            )
+            PlaybackShortcut::SeekRelative(_)
+                | PlaybackShortcut::ChangeRate(
+                    PlaybackRateChange::Decrease
+                        | PlaybackRateChange::Increase
+                        | PlaybackRateChange::Halve
+                        | PlaybackRateChange::Double
+                )
         )
     {
         return None;
@@ -314,13 +315,11 @@ mod tests {
     }
 
     #[test]
-    fn held_keys_repeat_volume_adjustment_but_not_toggles_or_seeks() {
+    fn held_keys_repeat_volume_adjustment_and_seek_but_not_toggles() {
         for key in ["9", "0", "/", "*", "divide", "multiply", "shift-8->*"] {
             assert!(shortcut_for_keystroke(key, true).is_some(), "{key}");
         }
-        for key in [
-            "m", "space", "p", "f", "escape", "i", "r", "t", "left", "right", "up", "down",
-        ] {
+        for key in ["m", "space", "p", "f", "escape", "i", "r", "t"] {
             assert_eq!(shortcut_for_keystroke(key, true), None, "{key}");
         }
     }
@@ -328,11 +327,13 @@ mod tests {
     #[test]
     fn arrow_shortcuts_seek_with_mpv_intervals() {
         for (key, seconds) in [("left", -5), ("right", 5), ("up", 60), ("down", -60)] {
-            assert_eq!(
-                shortcut_for_keystroke(key, false),
-                Some(PlaybackShortcut::SeekRelative(seconds)),
-                "{key}"
-            );
+            for is_held in [false, true] {
+                assert_eq!(
+                    shortcut_for_keystroke(key, is_held),
+                    Some(PlaybackShortcut::SeekRelative(seconds)),
+                    "{key}: held={is_held}"
+                );
+            }
             assert_eq!(
                 playback_shortcut_for_key(&key.to_uppercase()),
                 Some(PlaybackShortcut::SeekRelative(seconds))

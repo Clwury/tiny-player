@@ -224,8 +224,9 @@ pub(in crate::backend::ffmpeg) fn flush_pending_start_audio(
             position_reporter,
             event_tx,
         );
-        subtitle_pipeline.update_overlay(
+        subtitle_pipeline.update_overlay_from_audio_clock(
             audio_snapshot.played_timeline_nsecs,
+            vo_queue,
             session_id,
             event_tx,
         );
@@ -753,8 +754,9 @@ pub(in crate::backend::ffmpeg) fn push_decoded_audio_to_output(
                     position_reporter,
                     event_tx,
                 );
-                subtitle_pipeline.update_overlay(
+                subtitle_pipeline.update_overlay_from_audio_clock(
                     audio_snapshot.played_timeline_nsecs,
+                    vo_queue,
                     session_id,
                     event_tx,
                 );
@@ -856,7 +858,12 @@ pub(in crate::backend::ffmpeg) fn service_audio_clocked_video_queue(
         position_reporter,
         event_tx,
     );
-    subtitle_pipeline.update_overlay(audio_snapshot.played_timeline_nsecs, session_id, event_tx);
+    subtitle_pipeline.update_overlay_from_audio_clock(
+        audio_snapshot.played_timeline_nsecs,
+        vo_queue,
+        session_id,
+        event_tx,
+    );
 
     let needs_prefetch = subtitle_pipeline.needs_prefetch();
     if queued_video_frames.limit_reached(needs_prefetch) {

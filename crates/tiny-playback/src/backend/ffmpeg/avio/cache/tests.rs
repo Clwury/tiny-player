@@ -10,3 +10,5 @@ mod progress;
 mod range;
 #[path = "tests/shared.rs"]
 mod shared;
+#[path = "tests/side_download.rs"]
+mod side_download;

@@ -1,5 +1,6 @@
 use super::output_gate::{
-    InitialAudioTransientRetry, OutputGateResumeStatus, service_output_gate_resume_if_ready,
+    InitialAudioTransientRetry, OutputGateResumeStatus,
+    demux_watermark_with_initial_combined_coverage, service_output_gate_resume_if_ready,
 };
 use super::output_rebuffer::demux_reader_ready_for_output;
 use super::playback_snapshot::PlaybackPipelineTelemetry;
@@ -25,7 +26,7 @@ use super::{
     FfmpegControl, HttpRingCache, OUTPUT_GATE_INTERNAL_STAGE_TIMING_LOG_AFTER, OutputServiceDemand,
     PlaybackOutputSnapshot, PlaybackOutputState, PlaybackPipelineState,
     VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION, VIDEO_OUTPUT_REBUFFER_RESUME_DURATION,
-    VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE, duration_nsecs, expire_initial_av_start_hard_deadline,
+    duration_nsecs, expire_initial_av_start_hard_deadline,
 };
 
 const HEVC_POST_FALLBACK_AUDIO_READY_NSECS: u64 = 250_000_000;
@@ -181,6 +182,10 @@ fn service_output_gate_or_wait(
         })
         .and_then(|stream| stream.reader_nsecs);
     let initial_av_start_pending = context.pipeline.output_scheduler.restart_pending();
+    let initial_prefetch_target_nsecs = (context.http_cache.is_some()
+        && (initial_start_target_nsecs > 0 || context.control.seek_generation() > 0))
+        .then_some(demux_packet_snapshot.cache_pause_wait_nsecs)
+        .flatten();
     let resume_status = service_output_gate_resume_if_ready(
         &mut context.pipeline.output_scheduler,
         context.pipeline.audio_output.as_ref(),
@@ -226,18 +231,26 @@ fn service_output_gate_or_wait(
             .video_decode_pipeline
             .hevc_decode_chain_stats(),
         context.output_service_demand,
+        initial_prefetch_target_nsecs,
         || {
-            demux_watermark_with_initial_combined_coverage(
-                context.demux_cache.cached_reader_watermark(),
-                initial_av_start_pending,
-                initial_start_target_nsecs,
-                initial_decoded_video_until_nsecs,
-                initial_video_reader_nsecs,
-                initial_audio_contiguous_range_nsecs,
-                initial_audio_reader_nsecs,
-                resume_has_audio_output,
-                resume_downstream_audio_coverage_nsecs,
-            )
+            let watermark = context.demux_cache.cached_reader_watermark();
+            if initial_av_start_pending {
+                demux_watermark_with_initial_combined_coverage(
+                    watermark,
+                    initial_start_target_nsecs,
+                    initial_decoded_video_until_nsecs,
+                    initial_video_reader_nsecs,
+                    initial_audio_contiguous_range_nsecs,
+                    initial_audio_reader_nsecs,
+                    resume_has_audio_output,
+                )
+            } else {
+                demux_watermark_with_downstream_audio_coverage(
+                    watermark,
+                    resume_has_audio_output,
+                    resume_downstream_audio_coverage_nsecs,
+                )
+            }
         },
     )?;
     timing.resume = stage_started_at.elapsed();
@@ -631,103 +644,6 @@ fn demux_watermark_with_downstream_audio_coverage(
     demux_watermark
 }
 
-#[allow(clippy::too_many_arguments)]
-fn demux_watermark_with_initial_combined_coverage(
-    mut demux_watermark: super::DemuxReaderWatermark,
-    initial_av_start_pending: bool,
-    exact_target_nsecs: u64,
-    decoded_video_until_nsecs: Option<u64>,
-    video_reader_nsecs: Option<u64>,
-    pending_audio_range_nsecs: Option<(u64, u64)>,
-    audio_reader_nsecs: Option<u64>,
-    has_audio_output: bool,
-    downstream_audio_coverage_nsecs: u64,
-) -> super::DemuxReaderWatermark {
-    if !initial_av_start_pending {
-        return demux_watermark_with_downstream_audio_coverage(
-            demux_watermark,
-            has_audio_output,
-            downstream_audio_coverage_nsecs,
-        );
-    }
-    let continuity_tolerance_nsecs = duration_nsecs(VIDEO_OUTPUT_START_AV_SYNC_TOLERANCE);
-    let combined_video_forward_nsecs = decoded_video_until_nsecs.and_then(|until_nsecs| {
-        contiguous_downstream_and_demux_forward_nsecs(
-            exact_target_nsecs,
-            (exact_target_nsecs, until_nsecs),
-            video_reader_nsecs,
-            demux_watermark.video_forward_nsecs,
-            continuity_tolerance_nsecs,
-        )
-    });
-    if let Some(combined_video_forward_nsecs) = combined_video_forward_nsecs {
-        demux_watermark.video_forward_nsecs = Some(combined_video_forward_nsecs);
-        demux_watermark.video_underrun = false;
-    }
-    let combined_audio_forward_nsecs = has_audio_output
-        .then(|| {
-            pending_audio_range_nsecs.and_then(|range| {
-                contiguous_downstream_and_demux_forward_nsecs(
-                    exact_target_nsecs,
-                    range,
-                    audio_reader_nsecs,
-                    demux_watermark.audio_forward_nsecs,
-                    continuity_tolerance_nsecs,
-                )
-            })
-        })
-        .flatten();
-    if let Some(combined_audio_forward_nsecs) = combined_audio_forward_nsecs {
-        demux_watermark.audio_forward_nsecs = Some(combined_audio_forward_nsecs);
-        demux_watermark.audio_underrun = false;
-    }
-    demux_watermark.underrun =
-        demux_watermark.video_underrun || (has_audio_output && demux_watermark.audio_underrun);
-    demux_watermark.selected_min_forward_nsecs = if has_audio_output {
-        demux_watermark
-            .video_forward_nsecs
-            .zip(demux_watermark.audio_forward_nsecs)
-            .map(|(video, audio)| video.min(audio))
-            .or(demux_watermark.video_forward_nsecs)
-            .or(demux_watermark.audio_forward_nsecs)
-    } else {
-        demux_watermark.video_forward_nsecs
-    };
-    demux_watermark
-}
-
-fn contiguous_downstream_and_demux_forward_nsecs(
-    exact_target_nsecs: u64,
-    downstream_range_nsecs: (u64, u64),
-    demux_reader_nsecs: Option<u64>,
-    demux_forward_nsecs: Option<u64>,
-    continuity_tolerance_nsecs: u64,
-) -> Option<u64> {
-    let (downstream_start_nsecs, downstream_end_nsecs) = downstream_range_nsecs;
-    if downstream_end_nsecs <= exact_target_nsecs
-        || downstream_start_nsecs > exact_target_nsecs.saturating_add(continuity_tolerance_nsecs)
-    {
-        return None;
-    }
-    let downstream_forward_nsecs = downstream_end_nsecs.saturating_sub(exact_target_nsecs);
-    let combined_end_nsecs = demux_reader_nsecs
-        .zip(demux_forward_nsecs)
-        .filter(|(reader_nsecs, demux_forward_nsecs)| {
-            *reader_nsecs <= downstream_end_nsecs.saturating_add(continuity_tolerance_nsecs)
-                && reader_nsecs
-                    .saturating_add(*demux_forward_nsecs)
-                    .saturating_add(continuity_tolerance_nsecs)
-                    >= downstream_end_nsecs
-        })
-        .map(|(reader_nsecs, demux_forward_nsecs)| reader_nsecs.saturating_add(demux_forward_nsecs))
-        .unwrap_or(downstream_end_nsecs);
-    Some(
-        combined_end_nsecs
-            .saturating_sub(exact_target_nsecs)
-            .max(downstream_forward_nsecs),
-    )
-}
-
 fn audio_output_underrun_can_recover(
     output_underrun: bool,
     output_snapshot: PlaybackOutputSnapshot,
@@ -838,8 +754,7 @@ mod tests {
         PlaybackOutputSnapshot, PlaybackOutputState, VIDEO_OUTPUT_REBUFFER_LOW_WATER_DURATION,
         VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, audio_output_starving,
         audio_output_underrun_can_recover, byte_cache_active_forward_low_water,
-        demux_watermark_with_downstream_audio_coverage,
-        demux_watermark_with_initial_combined_coverage, downstream_audio_can_recover_output,
+        demux_watermark_with_downstream_audio_coverage, downstream_audio_can_recover_output,
         downstream_audio_coverage_nsecs, duration_nsecs, output_forward_cache_gate,
         output_gate_service_status_after_resume,
     };
@@ -888,124 +803,6 @@ mod tests {
         assert_eq!(status.outcome, OutputGateServiceOutcome::Ready);
         assert!(status.should_wait_for_demux);
         assert!(!status.should_continue());
-    }
-
-    #[test]
-    fn startup_waterline_joins_exact_decoded_and_demux_coverage() {
-        let target_nsecs = 184_700_000_000;
-        let decoded_until_nsecs = 186_300_000_000;
-        let raw = DemuxReaderWatermark {
-            video_forward_nsecs: Some(900_000_000),
-            audio_forward_nsecs: Some(2_500_000_000),
-            selected_min_forward_nsecs: Some(900_000_000),
-            video_underrun: true,
-            underrun: true,
-            ..DemuxReaderWatermark::default()
-        };
-
-        let combined = demux_watermark_with_initial_combined_coverage(
-            raw,
-            true,
-            target_nsecs,
-            Some(decoded_until_nsecs),
-            Some(decoded_until_nsecs),
-            None,
-            None,
-            true,
-            0,
-        );
-
-        assert_eq!(combined.video_forward_nsecs, Some(2_500_000_000));
-        assert_eq!(combined.selected_min_forward_nsecs, Some(2_500_000_000));
-        assert!(!combined.video_underrun);
-        assert!(!combined.underrun);
-    }
-
-    #[test]
-    fn startup_waterline_does_not_replace_missing_exact_target_coverage() {
-        let raw = DemuxReaderWatermark {
-            video_forward_nsecs: Some(900_000_000),
-            video_underrun: true,
-            underrun: true,
-            ..DemuxReaderWatermark::default()
-        };
-
-        let combined = demux_watermark_with_initial_combined_coverage(
-            raw,
-            true,
-            184_700_000_000,
-            None,
-            Some(186_300_000_000),
-            None,
-            None,
-            false,
-            0,
-        );
-
-        assert_eq!(combined.video_forward_nsecs, Some(900_000_000));
-        assert!(combined.video_underrun);
-        assert!(combined.underrun);
-    }
-
-    #[test]
-    fn startup_waterline_joins_delayed_pending_audio_with_adjacent_demux() {
-        let target_nsecs = 184_700_000_000;
-        let pending_audio_end_nsecs = 185_573_739_000;
-        let raw = DemuxReaderWatermark {
-            video_forward_nsecs: Some(2_500_000_000),
-            audio_forward_nsecs: Some(1_700_000_000),
-            selected_min_forward_nsecs: Some(1_700_000_000),
-            audio_underrun: true,
-            underrun: true,
-            ..DemuxReaderWatermark::default()
-        };
-
-        let combined = demux_watermark_with_initial_combined_coverage(
-            raw,
-            true,
-            target_nsecs,
-            Some(187_200_000_000),
-            Some(187_200_000_000),
-            Some((184_714_739_000, pending_audio_end_nsecs)),
-            Some(pending_audio_end_nsecs),
-            true,
-            0,
-        );
-
-        assert_eq!(combined.audio_forward_nsecs, Some(2_573_739_000));
-        assert_eq!(combined.selected_min_forward_nsecs, Some(2_573_739_000));
-        assert!(!combined.audio_underrun);
-        assert!(!combined.underrun);
-    }
-
-    #[test]
-    fn startup_waterline_does_not_sum_disconnected_audio_ranges() {
-        let target_nsecs = 184_700_000_000;
-        let pending_audio_end_nsecs = 185_573_739_000;
-        let raw = DemuxReaderWatermark {
-            video_forward_nsecs: Some(2_500_000_000),
-            audio_forward_nsecs: Some(2_500_000_000),
-            audio_underrun: true,
-            underrun: true,
-            ..DemuxReaderWatermark::default()
-        };
-
-        let combined = demux_watermark_with_initial_combined_coverage(
-            raw,
-            true,
-            target_nsecs,
-            Some(187_200_000_000),
-            Some(187_200_000_000),
-            Some((184_714_739_000, pending_audio_end_nsecs)),
-            Some(190_000_000_000),
-            true,
-            0,
-        );
-
-        assert_eq!(combined.audio_forward_nsecs, Some(873_739_000));
-        assert_eq!(combined.selected_min_forward_nsecs, Some(873_739_000));
-        assert!(!combined.audio_underrun);
-        assert!(!combined.underrun);
     }
 
     #[test]

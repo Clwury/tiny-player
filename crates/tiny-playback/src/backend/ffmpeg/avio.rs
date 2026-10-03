@@ -122,6 +122,7 @@ impl CachedAvio {
         cache: HttpRingCache,
         shutdown_cache_on_drop: bool,
     ) -> std::result::Result<Self, String> {
+        cache.begin_metadata_probe();
         let reader = Box::into_raw(Box::new(CachedAvioReader {
             cache: cache.clone(),
             read_pos: 0,

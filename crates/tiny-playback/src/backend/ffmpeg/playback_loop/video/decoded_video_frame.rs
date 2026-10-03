@@ -742,8 +742,6 @@ where
                         position_reporter,
                         subtitle_pipeline,
                         current_start_position_nsecs,
-                        video_is_hevc: video_stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC,
-                        demux_reader_watermark: &mut demux_reader_watermark,
                     })?;
                     if video_stream.codec_id == ffi::AVCodecID::AV_CODEC_ID_HEVC
                         && let Some(staged_end_nsecs) =

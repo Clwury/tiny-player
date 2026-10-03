@@ -313,7 +313,8 @@ impl PlaybackOutputScheduler {
         let periodic_probe_due = (self.playback_output_state.rebuffering()
             || (self.restart_pending()
                 && self.initial_av_start_transaction.is_none()
-                && self.initial_av_pair_started_at.is_some()))
+                && (self.initial_av_pair_started_at.is_some()
+                    || !self.scheduled_video_queue.is_empty())))
             && self
                 .last_output_housekeeping_service_at
                 .is_none_or(|serviced_at| {
@@ -633,7 +634,8 @@ impl PlaybackOutputScheduler {
         let periodic_probe_deadline = (self.playback_output_state.rebuffering()
             || (self.restart_pending()
                 && self.initial_av_start_transaction.is_none()
-                && self.initial_av_pair_started_at.is_some())
+                && (self.initial_av_pair_started_at.is_some()
+                    || !self.scheduled_video_queue.is_empty()))
             || self.decode_recovery_active())
         .then(|| {
             self.last_output_housekeeping_service_at

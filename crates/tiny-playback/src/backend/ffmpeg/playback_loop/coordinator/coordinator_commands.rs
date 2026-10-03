@@ -322,11 +322,14 @@ fn service_track_selection_command(
 
     if pending_track_selection.pause_after_switch {
         context.control.set_user_paused(true);
-        context.pipeline.subtitle_pipeline.update_overlay(
-            context.pipeline.current_start_position_nsecs,
-            context.session.id(),
-            context.event_tx,
-        );
+        context
+            .pipeline
+            .subtitle_pipeline
+            .resume_overlay_updates_at(
+                context.pipeline.current_start_position_nsecs,
+                context.session.id(),
+                context.event_tx,
+            );
         let _ = context.event_tx.send(BackendEvent::new(
             context.session.id(),
             BackendEventKind::Pause(true),

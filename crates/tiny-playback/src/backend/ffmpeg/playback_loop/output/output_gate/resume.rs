@@ -118,6 +118,7 @@ fn initial_start_wait_status(admission: InitialStartAdmission) -> OutputGateResu
         return OutputGateResumeStatus::Waiting;
     };
     match reason {
+        super::InitialStartBlockReason::DemuxPrefetch => OutputGateResumeStatus::WaitingForDemux,
         super::InitialStartBlockReason::NoAudioFrame
         | super::InitialStartBlockReason::NoAudioCoverage
         | super::InitialStartBlockReason::AudioVideoOffset => {
@@ -138,6 +139,7 @@ fn log_initial_sync_observation(
     output_scheduler: &mut PlaybackOutputScheduler,
     session_id: PlaybackSessionId,
     observation: InitialSyncLogObservation,
+    initial_prefetch_target_nsecs: Option<u64>,
     now: Instant,
 ) {
     let decision = output_scheduler.observe_initial_sync_log(observation, now);
@@ -157,6 +159,8 @@ fn log_initial_sync_observation(
         strict_video = ?observation.strict_video_nsecs,
         decoded_audio = ?observation.decoded_audio_nsecs,
         demux_min = ?observation.demux_min_nsecs,
+        initial_prefetch_target_ms = ?initial_prefetch_target_nsecs
+            .map(|target| target as f64 / 1_000_000.0),
         blocked_on = observation.blocked_on,
         due_kind = observation.due_kind.as_str(),
         output_generation = output_scheduler.output_housekeeping_generation,
@@ -653,6 +657,7 @@ pub(in crate::backend::ffmpeg) fn service_output_gate_resume_if_ready<F>(
     hevc_cached_exact_landing_nsecs: Option<u64>,
     hevc_decode_chain_stats: HevcDecodeChainStats,
     output_service_demand: OutputServiceDemand,
+    initial_prefetch_target_nsecs: Option<u64>,
     mut demux_watermark: F,
 ) -> std::result::Result<OutputGateResumeStatus, String>
 where
@@ -763,7 +768,13 @@ where
                 blocked_on: "no_video_frame",
                 due_kind: output_service_demand,
             };
-            log_initial_sync_observation(output_scheduler, session_id, observation, Instant::now());
+            log_initial_sync_observation(
+                output_scheduler,
+                session_id,
+                observation,
+                initial_prefetch_target_nsecs,
+                Instant::now(),
+            );
         }
         let empty_queue_status = if output_scheduler.playback_output_state.restart_pending() {
             OutputGateResumeStatus::WaitingForDecodedVideo
@@ -994,6 +1005,8 @@ where
                 .then_some(hevc_cached_exact_landing_nsecs)
                 .flatten(),
             startup_sync_elapsed: output_scheduler.startup_sync_elapsed(),
+            prefetch_target_nsecs: initial_prefetch_target_nsecs,
+            demux_watermark: waterline_demux_watermark,
         });
         let now = Instant::now();
         if evaluation.pair.is_some() {
@@ -1017,6 +1030,7 @@ where
                     .unwrap_or("none"),
                 due_kind: output_service_demand,
             },
+            initial_prefetch_target_nsecs,
             now,
         );
         match evaluation.admission {
@@ -1027,6 +1041,8 @@ where
                     decoded_video = ?waterline.decoded_output.video_forward_nsecs,
                     decoded_audio = ?waterline.decoded_output.audio_forward_nsecs,
                     demux_min = ?waterline.prefetch.min_forward_nsecs,
+                    initial_prefetch_target_ms = ?initial_prefetch_target_nsecs
+                        .map(|target| target as f64 / 1_000_000.0),
                     blocked_on = "none",
                     due_kind = output_service_demand.as_str(),
                     admission_mode = mode.as_str(),

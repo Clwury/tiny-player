@@ -717,7 +717,6 @@ fn publish_initial_video_for_audio_commit(
         };
         let timeline_nsecs = frame.timeline_nsecs;
         let duration_nsecs = frame.duration_nsecs;
-        subtitle_pipeline.update_overlay(timeline_nsecs, session_id, event_tx);
         let admitted = present_video_frame_to_vo(
             frame.frame,
             timeline_nsecs,
@@ -739,6 +738,7 @@ fn publish_initial_video_for_audio_commit(
 
         let first_presentation = !output_scheduler.first_frame_presented;
         let first_present_elapsed = output_scheduler.mark_first_frame_presented();
+        subtitle_pipeline.resume_overlay_updates_at(timeline_nsecs, session_id, event_tx);
         if first_presentation {
             report_first_video_frame_presented(session_id, event_tx);
             tracing::debug!(

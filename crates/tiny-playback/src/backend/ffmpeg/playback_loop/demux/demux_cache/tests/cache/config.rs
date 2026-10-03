@@ -1,6 +1,44 @@
 use super::*;
 
 #[test]
+fn snapshot_pause_wait_follows_cache_policy_and_time_limit() {
+    let mut config = PlaybackCacheConfig {
+        mode: PlaybackCacheMode::Enabled,
+        cache_secs: 0.25,
+        demuxer_readahead_secs: 0.0,
+        cache_pause_wait: 2.0,
+        ..PlaybackCacheConfig::default()
+    };
+    let mut state = DemuxPacketCacheState::new(
+        0,
+        0,
+        ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+        PlaybackSessionId(1),
+        config.clone(),
+    );
+    assert_eq!(
+        state.packet_queue_snapshot().cache_pause_wait_nsecs,
+        Some(250_000_000)
+    );
+
+    config.cache_pause = false;
+    state.apply_cache_config(config.clone());
+    assert_eq!(state.packet_queue_snapshot().cache_pause_wait_nsecs, None);
+
+    config.cache_pause = true;
+    config.cache_pause_wait = 0.0;
+    state.apply_cache_config(config.clone());
+    assert_eq!(
+        state.packet_queue_snapshot().cache_pause_wait_nsecs,
+        Some(0)
+    );
+
+    config.mode = PlaybackCacheMode::Disabled;
+    state.apply_cache_config(config);
+    assert_eq!(state.packet_queue_snapshot().cache_pause_wait_nsecs, None);
+}
+
+#[test]
 fn demux_packet_cache_repeated_forward_seeks_refill_150_mib_during_output_recovery() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let shared = Arc::new(shared_for_test(control));

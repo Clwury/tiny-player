@@ -277,6 +277,7 @@ pub(super) fn service_playback_position_state_reset(
         .pipeline
         .subtitle_pipeline
         .reset_cues_for_position(current_start_position_nsecs);
+    context.pipeline.subtitle_pipeline.defer_overlay_updates();
     context.pipeline.buffered_reporter = BufferedReporter::new_with_events(
         context.pipeline.audio_output.is_some(),
         context.emit_playback_buffered_events,

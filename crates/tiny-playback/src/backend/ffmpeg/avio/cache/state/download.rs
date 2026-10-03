@@ -147,11 +147,10 @@ impl HttpRingCacheState {
         if self.active_range_kind != HttpCacheRangeKind::Playback || offset != self.next_offset {
             return None;
         }
-        let range_index = self.retained_ranges.iter().position(|range| {
-            range.range_kind == HttpCacheRangeKind::Playback
-                && offset >= range.base_offset
-                && offset < range.next_offset
-        })?;
+        let range_index = self
+            .retained_ranges
+            .iter()
+            .position(|range| offset >= range.base_offset && offset < range.next_offset)?;
         let range = self.retained_ranges.get(range_index)?;
         let copy_offset = usize::try_from(offset.saturating_sub(range.base_offset)).ok()?;
         let copy_len = usize::try_from(range.next_offset.saturating_sub(offset)).ok()?;
@@ -604,10 +603,13 @@ impl HttpRingCacheState {
     pub(in crate::backend::ffmpeg) fn append_capacity_from(&mut self, offset: u64) -> usize {
         self.trim_to_capacity(self.active_memory_capacity());
         if self.active_range_kind == HttpCacheRangeKind::Playback
-            && !self.offset_in_active_range(self.reader_offset)
+            && self.reader_offset < self.base_offset
             && (self.cached_range_contains(self.reader_offset)
                 || self.side_download_may_produce(self.reader_offset))
         {
+            // Only a reader behind this response makes forward prefetch
+            // unrelated. Retained bytes can advance the reader beyond the
+            // append edge; keep downloading so this response can catch up.
             self.prefetch_paused = true;
             return 0;
         }

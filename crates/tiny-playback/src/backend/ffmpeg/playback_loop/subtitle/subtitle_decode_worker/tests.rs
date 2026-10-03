@@ -143,7 +143,7 @@ fn subtitle_output_drain_recovers_full_queue_after_seek_and_emits_new_cues() {
             .unwrap();
     }
     pipeline
-        .drain_ready_decode_output(None, &control, session_id, &event_tx)
+        .drain_ready_decode_output(&control, session_id)
         .unwrap();
     assert!(matches!(
         command_rx.try_recv(),
@@ -155,7 +155,7 @@ fn subtitle_output_drain_recovers_full_queue_after_seek_and_emits_new_cues() {
         })
         .unwrap();
     pipeline
-        .drain_ready_decode_output(None, &control, session_id, &event_tx)
+        .drain_ready_decode_output(&control, session_id)
         .unwrap();
     let snapshot = pipeline.snapshot().unwrap();
     assert_eq!(snapshot.state, SubtitleDecodeWorkerState::NeedPacket);
@@ -181,7 +181,7 @@ fn subtitle_output_drain_recovers_full_queue_after_seek_and_emits_new_cues() {
         .unwrap();
     assert!(
         pipeline
-            .drain_ready_decode_output(None, &control, session_id, &event_tx)
+            .drain_ready_decode_output(&control, session_id)
             .unwrap()
     );
     pipeline.update_overlay(212_000_000_000, session_id, &event_tx);
@@ -215,7 +215,7 @@ fn consecutive_subtitle_seeks_wait_for_the_latest_flush_without_new_packets() {
         .unwrap();
     result_tx.send(completed_packet(31, "stale")).unwrap();
     pipeline
-        .drain_ready_decode_output(None, &control, session_id, &event_tx)
+        .drain_ready_decode_output(&control, session_id)
         .unwrap();
     assert_eq!(
         pipeline.snapshot().unwrap().state,
@@ -226,7 +226,7 @@ fn consecutive_subtitle_seeks_wait_for_the_latest_flush_without_new_packets() {
         .send(SubtitleDecodeResult::Flushed { generation: 33 })
         .unwrap();
     pipeline
-        .drain_ready_decode_output(None, &control, session_id, &event_tx)
+        .drain_ready_decode_output(&control, session_id)
         .unwrap();
     assert_eq!(
         pipeline.snapshot().unwrap().state,

@@ -1,5 +1,6 @@
 use super::{
-    ByteRingBuffer, CacheRestartRequest, HttpCacheRangeKind, HttpRingCacheState, RetainedCacheRange,
+    ByteRingBuffer, CacheRestartRequest, HttpCacheRangeKind, HttpRingCacheState,
+    RetainedCacheRange, SideDownloadRequest,
 };
 
 impl HttpRingCacheState {
@@ -75,10 +76,24 @@ impl HttpRingCacheState {
         &mut self,
         offset: u64,
     ) -> bool {
-        if self.short_seek_may_produce(offset) {
+        if self.cached_range_contains(offset) || self.short_seek_may_produce(offset) {
             return false;
         }
         let range_kind = self.take_range_kind_for_miss(offset);
+        if range_kind == HttpCacheRangeKind::Playback
+            && self.config.continuous_playback_requests
+            && (offset < self.base_offset || offset > self.next_offset)
+        {
+            if self
+                .restart_request
+                .is_some_and(|request| request.range_kind == range_kind && request.offset == offset)
+                || self.try_short_forward_read_through(offset)
+            {
+                return false;
+            }
+            // Playback gaps in either direction belong to the main response.
+            return self.request_active_playback_restart_at(offset);
+        }
         self.request_side_download_at(offset, range_kind)
     }
 
@@ -86,6 +101,11 @@ impl HttpRingCacheState {
         &self,
         offset: u64,
     ) -> HttpCacheRangeKind {
+        if self.metadata_probe_active
+            && self.reader_range_kind == HttpCacheRangeKind::TailMetadataProbe
+        {
+            return HttpCacheRangeKind::TailMetadataProbe;
+        }
         self.pending_seek_range_kind
             .filter(|(pending_offset, _)| *pending_offset == offset)
             .map(|(_, range_kind)| range_kind)
@@ -117,36 +137,26 @@ impl HttpRingCacheState {
         range_kind: HttpCacheRangeKind,
     ) -> bool {
         if self.cached_range_contains(offset)
+            || (range_kind == HttpCacheRangeKind::Playback
+                && self.active_playback_download_may_produce(offset))
             || self
                 .restart_request
                 .is_some_and(|request| request.offset == offset && request.range_kind == range_kind)
-            || self.side_download_request_exists(offset, range_kind)
         {
             return false;
         }
-        tracing::debug!(
-            offset,
-            ?range_kind,
-            active_base_offset = self.base_offset,
-            active_next_offset = self.next_offset,
-            "queueing HTTP side download range"
-        );
-        let request = CacheRestartRequest {
-            offset,
-            range_kind,
-            generation: self.request_generation,
-        };
-        if range_kind == HttpCacheRangeKind::Playback {
-            let insertion = self
-                .side_download_requests
-                .iter()
-                .position(|request| request.range_kind == HttpCacheRangeKind::TailMetadataProbe)
-                .unwrap_or(self.side_download_requests.len());
-            self.side_download_requests.insert(insertion, request);
-        } else {
-            self.side_download_requests.push_back(request);
-        }
-        true
+        self.queue_side_download(offset, range_kind)
+    }
+
+    fn active_playback_download_may_produce(&self, offset: u64) -> bool {
+        self.config.continuous_playback_requests
+            && (self.restart_request.is_some_and(|request| {
+                request.range_kind == HttpCacheRangeKind::Playback && offset >= request.offset
+            }) || (self.active_range_kind == HttpCacheRangeKind::Playback
+                && self.continuous_request_active
+                && !self.eof
+                && self.error.is_none()
+                && offset >= self.next_offset))
     }
 
     pub(in crate::backend::ffmpeg::avio::cache) fn request_active_playback_restart_at(
@@ -175,6 +185,9 @@ impl HttpRingCacheState {
             generation: self.request_generation,
             ..request
         });
+        self.side_download_requests.clear();
+        self.side_download_active.clear();
+        self.side_download_errors.clear();
         self.continuous_request_active = false;
         self.short_seek_target = None;
         self.eof = false;
@@ -209,25 +222,6 @@ impl HttpRingCacheState {
             && offset < self.next_offset
     }
 
-    pub(in crate::backend::ffmpeg::avio::cache) fn side_download_request_exists(
-        &self,
-        offset: u64,
-        range_kind: HttpCacheRangeKind,
-    ) -> bool {
-        self.side_download_requests
-            .iter()
-            .chain(self.side_download_active.iter())
-            .any(|request| {
-                let request_bytes = self.side_range_request_bytes(request.range_kind);
-                request.range_kind == range_kind
-                    && request.offset <= offset
-                    && offset < request.offset.saturating_add(request_bytes)
-                    && self
-                        .content_len
-                        .is_none_or(|content_len| request.offset < content_len)
-            })
-    }
-
     pub(in crate::backend::ffmpeg::avio::cache) fn cached_range_contains(
         &self,
         offset: u64,
@@ -251,18 +245,13 @@ impl HttpRingCacheState {
             .iter()
             .chain(self.side_download_active.iter())
             .any(|request| {
-                let request_bytes = self.side_range_request_bytes(request.range_kind);
-                offset >= request.offset
-                    && offset < request.offset.saturating_add(request_bytes)
-                    && self
-                        .content_len
-                        .is_none_or(|content_len| offset < content_len)
+                request.generation == self.request_generation && request.contains(offset)
             })
     }
 
     pub(in crate::backend::ffmpeg::avio::cache) fn finish_side_download_request(
         &mut self,
-        request: CacheRestartRequest,
+        request: SideDownloadRequest,
         completed: bool,
     ) {
         if request.generation != self.request_generation
@@ -280,7 +269,7 @@ impl HttpRingCacheState {
             self.side_download_active.remove(index);
         }
         if completed {
-            self.schedule_playback_continuation_after_side_download(request);
+            self.schedule_playback_continuation_after_side_download(request.restart_request());
         }
     }
 
@@ -299,7 +288,9 @@ impl HttpRingCacheState {
                     && request.offset >= range.base_offset
                     && request.offset < range.next_offset
                     && self.reader_offset >= range.base_offset
-                    && self.reader_offset < range.next_offset
+                    // The reader can reach the append edge before the side
+                    // worker reports completion; it still needs continuation.
+                    && self.reader_offset <= range.next_offset
             })
             .map(|range| range.next_offset)
         else {
@@ -324,9 +315,8 @@ impl HttpRingCacheState {
             return;
         }
         if self.offset_in_active_range(continuation_offset)
-            || self
-                .restart_request
-                .is_some_and(|pending| pending.offset == continuation_offset)
+            || self.restart_request.is_some()
+            || self.active_playback_download_may_produce(continuation_offset)
         {
             return;
         }
@@ -336,13 +326,7 @@ impl HttpRingCacheState {
             reader_offset = self.reader_offset,
             "scheduling HTTP active playback continuation after side range"
         );
-        self.restart_request = Some(CacheRestartRequest {
-            generation: self.request_generation,
-            offset: continuation_offset,
-            range_kind: HttpCacheRangeKind::Playback,
-        });
-        self.eof = false;
-        self.prefetch_paused = false;
+        self.request_active_playback_restart_at(continuation_offset);
     }
 
     pub(in crate::backend::ffmpeg::avio::cache) fn offset_in_active_range(
@@ -353,6 +337,9 @@ impl HttpRingCacheState {
     }
 
     pub(in crate::backend::ffmpeg) fn is_tail_metadata_probe_seek(&self, offset: u64) -> bool {
+        if !self.metadata_probe_active {
+            return false;
+        }
         let Some(content_len) = self.content_len else {
             return false;
         };

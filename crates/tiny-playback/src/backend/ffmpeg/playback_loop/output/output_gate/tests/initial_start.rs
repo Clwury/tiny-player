@@ -9,12 +9,13 @@ use super::super::{
     InitialAudioPreparePhase, InitialAudioPrepareToken, InitialAudioStartAction,
     InitialAudioTransientRetry, InitialAvStartDecision, InitialStartAdmission,
     InitialStartAdmissionInput, InitialSyncLogDecision, InitialSyncLogObservation,
-    OutputGateResumeStatus, OutputServiceDemand, PlaybackOutputScheduler, PlaybackOutputState,
-    PlaybackScheduler, PositionReporter, PrestartAudioOwnership, PrestartAudioOwnershipInput,
-    SubtitlePipeline, abort_initial_audio_stage_for_test,
-    abort_initial_av_start_for_discontinuity_change, audio_output_contiguous_start_timeline_nsecs,
-    audio_output_flush_until_timeline_nsecs, classify_prestart_audio_ownership,
-    commit_initial_audio_stage_with_checkpoints_for_test, commit_initial_av_start, duration_nsecs,
+    OUTPUT_GATE_PERIODIC_PROBE_INTERVAL, OutputGateResumeStatus, OutputServiceDemand,
+    PlaybackOutputScheduler, PlaybackOutputState, PlaybackScheduler, PositionReporter,
+    PrestartAudioOwnership, PrestartAudioOwnershipInput, SubtitlePipeline,
+    abort_initial_audio_stage_for_test, abort_initial_av_start_for_discontinuity_change,
+    audio_output_contiguous_start_timeline_nsecs, audio_output_flush_until_timeline_nsecs,
+    classify_prestart_audio_ownership, commit_initial_audio_stage_with_checkpoints_for_test,
+    commit_initial_av_start, demux_watermark_with_initial_combined_coverage, duration_nsecs,
     expire_initial_av_start_hard_deadline, fail_initial_av_start_after_unstable_snapshot_deadline,
     initial_audio_clock_reset_required, initial_audio_no_payload_disposition,
     initial_audio_start_action, initial_audio_start_ammunition_ready, initial_start_admission,
@@ -649,6 +650,8 @@ fn exact_184_700_vulkan_pair_primes_without_demux_waterline() {
         require_strict_fast_lookahead: false,
         cached_exact_landing_nsecs: None,
         startup_sync_elapsed: Some(Duration::from_millis(800)),
+        prefetch_target_nsecs: None,
+        demux_watermark: Default::default(),
     });
     let InitialStartAdmission::Prime { pair, .. } = evaluation.admission else {
         panic!("exact Vulkan A/V pair should enter bounded prime admission");
@@ -665,6 +668,257 @@ fn exact_184_700_vulkan_pair_primes_without_demux_waterline() {
         transaction.hard_deadline_at,
         pair_observed_at + Duration::from_secs(3)
     );
+}
+
+#[test]
+fn network_seek_coordinator_waits_for_packet_prefetch_then_starts_retained_frames() {
+    use super::super::service_output_gate_resume_if_ready;
+    use crate::backend::ffmpeg::playback_loop::{
+        DemuxReaderWatermark, video_decode_pipeline::HevcDecodeChainStats,
+        video_decode_worker::VideoDecodeWorkerSnapshot,
+        video_output_gate::service_audio_clocked_decoded_video_frame,
+    };
+
+    const TARGET: u64 = 3_546_585_000_000;
+    const FRAME_DURATION: u64 = 41_708_333;
+    let session_id = PlaybackSessionId(55);
+    let control = Arc::new(FfmpegControl::new(session_id));
+    let generation = control.request_seek();
+    control.finish_seek(generation);
+    control.set_audio_output_lifecycle(AudioOutputLifecycle::Ready);
+    let output = AudioOutput::stopped_for_test(Arc::clone(&control), 96_000, 48_000, 2);
+    output.reset_clock(TARGET);
+    let mut output_scheduler = PlaybackOutputScheduler::new();
+    output_scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.25; 28_800],
+            duration_nsecs: 300_000_000,
+        },
+        TARGET,
+        TARGET + 300_000_000,
+    );
+    let vo_queue = VideoOutputQueue::default();
+    vo_queue.begin_session(session_id);
+    let frame_presented = AtomicBool::new(false);
+    let mut position_reporter = PositionReporter::default();
+    let (event_tx, _event_rx) = mpsc::channel();
+    let mut subtitles = SubtitlePipeline::empty_for_test();
+    let mut buffered_reporter = BufferedReporter::new_with_events(false, true);
+    let mut scheduler = PlaybackScheduler::new(TARGET);
+    let mut start_position = TARGET;
+    for index in 0..2 {
+        let timeline = TARGET + index * FRAME_DURATION;
+        service_audio_clocked_decoded_video_frame(
+            &mut output_scheduler,
+            &output,
+            &control,
+            session_id,
+            &vo_queue,
+            &frame_presented,
+            &mut position_reporter,
+            &event_tx,
+            &mut subtitles,
+            &mut buffered_reporter,
+            test_queued_video_frame(timeline).frame,
+            timeline,
+            FRAME_DURATION,
+            &mut start_position,
+        )
+        .unwrap();
+    }
+    let mut service =
+        |output_scheduler: &mut PlaybackOutputScheduler, forward_nsecs, audio_underrun| {
+            let demand = if output_scheduler.initial_av_start_transaction().is_some() {
+                OutputServiceDemand::AudioStartDue
+            } else {
+                OutputServiceDemand::OutputStateChanged
+            };
+            let raw = DemuxReaderWatermark {
+                video_forward_nsecs: Some(forward_nsecs),
+                audio_forward_nsecs: Some(forward_nsecs),
+                selected_min_forward_nsecs: Some(forward_nsecs),
+                audio_underrun,
+                underrun: audio_underrun,
+                ..DemuxReaderWatermark::default()
+            };
+            // Packet consumption can lead output while decoded frames remain in
+            // flight. A gap must neither hide readable packets nor count twice.
+            let watermark = demux_watermark_with_initial_combined_coverage(
+                raw,
+                TARGET,
+                output_scheduler
+                    .scheduled_video_queue
+                    .buffered_until_from_nsecs(TARGET),
+                Some(TARGET + 2_000_000_000),
+                output_scheduler.pending_audio_contiguous_range_nsecs(),
+                Some(TARGET + 2_000_000_000),
+                true,
+            );
+            service_output_gate_resume_if_ready(
+                output_scheduler,
+                Some(&output),
+                None,
+                &control,
+                session_id,
+                &vo_queue,
+                &frame_presented,
+                &mut position_reporter,
+                &event_tx,
+                &mut subtitles,
+                &mut buffered_reporter,
+                TARGET,
+                &mut start_position,
+                &mut scheduler,
+                false,
+                Some(0),
+                0,
+                Some(0),
+                None,
+                0,
+                VideoDecodeWorkerSnapshot::default(),
+                false,
+                false,
+                None,
+                HevcDecodeChainStats::default(),
+                demand,
+                Some(1_000_000_000),
+                || watermark,
+            )
+            .unwrap()
+        };
+
+    service(&mut output_scheduler, 0, false);
+    assert!(output_scheduler.initial_av_start_transaction().is_none());
+    assert!(!frame_presented.load(Ordering::Acquire));
+    assert!(!output.stream_active_for_test());
+    assert_eq!(output_scheduler.scheduled_video_queue.len(), 2);
+
+    // Decoding continues while the network gate waits, so the eventual audio
+    // commit has enough video coverage for its 200 ms native prefill.
+    for index in 2..8 {
+        let mut frame = test_queued_video_frame(TARGET + index * FRAME_DURATION);
+        frame.duration_nsecs = FRAME_DURATION;
+        output_scheduler.push_decoded_video_for_test(frame);
+    }
+    service(&mut output_scheduler, 999_999_999, false);
+    assert!(output_scheduler.initial_av_start_transaction().is_none());
+    assert!(!frame_presented.load(Ordering::Acquire));
+
+    // A stale duration with no readable audio head must still wait for data;
+    // the shorter downstream prefix cannot satisfy a one-second prefetch.
+    service(&mut output_scheduler, 20_000_000_000, true);
+    assert!(output_scheduler.initial_av_start_transaction().is_none());
+    assert!(!frame_presented.load(Ordering::Acquire));
+    assert!(!output.stream_active_for_test());
+
+    assert_eq!(
+        retry_initial_prefill(|| service(&mut output_scheduler, 1_000_000_000, false)),
+        OutputGateResumeStatus::Resumed
+    );
+    assert_eq!(output_scheduler.initial_start_phase(), "playing");
+    assert!(frame_presented.load(Ordering::Acquire));
+    assert!(output.stream_active_for_test());
+}
+
+#[test]
+fn network_seek_with_short_decoded_prefix_enters_bounded_output_transaction() {
+    use crate::backend::ffmpeg::playback_loop::DemuxReaderWatermark;
+
+    const TARGET: u64 = 2_085_730_000_000;
+    const FIRST_VIDEO: u64 = 2_085_750_000_000;
+    let watermark = demux_watermark_with_initial_combined_coverage(
+        DemuxReaderWatermark {
+            video_forward_nsecs: Some(20_728_000_000),
+            audio_forward_nsecs: Some(20_341_000_000),
+            selected_min_forward_nsecs: Some(20_341_000_000),
+            ..DemuxReaderWatermark::default()
+        },
+        TARGET,
+        Some(2_087_084_708_333),
+        Some(2_087_544_249_998),
+        Some((FIRST_VIDEO, 2_085_919_303_816)),
+        Some(2_087_798_000_000),
+        true,
+    );
+    let evaluation = initial_start_admission(InitialStartAdmissionInput {
+        expected_target_nsecs: TARGET,
+        first_video_nsecs: Some(FIRST_VIDEO),
+        first_audio_nsecs: Some(TARGET),
+        decoded_video_forward_nsecs: Some(1_334_708_333),
+        strict_video_forward_nsecs: Some(1_334_708_333),
+        decoded_audio_forward_nsecs: Some(169_303_816),
+        contiguous_video_frames: 32,
+        first_video_duration_nsecs: Some(41_708_333),
+        first_following_video_gap_nsecs: Some(0),
+        first_frame_is_vulkan: true,
+        first_frame_confirmed_clean: true,
+        active_recovery: false,
+        require_strict_fast_lookahead: false,
+        cached_exact_landing_nsecs: None,
+        startup_sync_elapsed: Some(Duration::from_secs(10)),
+        prefetch_target_nsecs: Some(1_000_000_000),
+        demux_watermark: watermark,
+    });
+    let InitialStartAdmission::Prime { pair, .. } = evaluation.admission else {
+        panic!("readable packet cache must admit the short decoded A/V prefix");
+    };
+    assert!(evaluation.pair.is_some());
+
+    let mut scheduler = PlaybackOutputScheduler::new();
+    let now = Instant::now();
+    scheduler.note_initial_av_pair(now);
+    let transaction = scheduler.begin_initial_av_start_transaction(
+        pair.video_anchor_nsecs,
+        pair.audio_start_target_nsecs,
+        now,
+    );
+    assert_eq!(transaction.video_anchor_nsecs, FIRST_VIDEO);
+    assert_eq!(transaction.audio_start_target_nsecs, FIRST_VIDEO);
+    assert_eq!(transaction.hard_deadline_at, now + Duration::from_secs(3));
+    assert!(!scheduler.initial_av_pair_watchdog_expired(now + Duration::from_secs(2)));
+    assert_eq!(
+        scheduler.output_service_demand(transaction.hard_deadline_at),
+        OutputServiceDemand::HardDeadline
+    );
+
+    let session_id = PlaybackSessionId(56);
+    let control = FfmpegControl::new(session_id);
+    assert!(expire_initial_av_start_hard_deadline(
+        &mut scheduler,
+        None,
+        transaction.hard_deadline_at,
+        &control,
+        session_id,
+    ));
+    assert!(scheduler.initial_av_start_transaction().is_none());
+    assert_eq!(scheduler.snapshot().state, PlaybackOutputState::Rebuffering);
+}
+
+#[test]
+fn startup_prefetch_wait_remains_serviceable_without_commit_watchdog() {
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.push_decoded_video_for_test(test_queued_video_frame(3_078_158_000_000));
+    let after_network_wait = Instant::now() + Duration::from_secs(10);
+    scheduler.mark_output_housekeeping_serviced_at(after_network_wait);
+
+    assert!(!scheduler.initial_av_pair_watchdog_expired(after_network_wait));
+    assert_eq!(
+        scheduler.output_service_demand(after_network_wait + Duration::from_millis(5)),
+        OutputServiceDemand::None
+    );
+    let deadline = scheduler
+        .output_housekeeping_deadline()
+        .expect("cache fill must be polled");
+    assert!(deadline > after_network_wait);
+    assert_eq!(
+        deadline,
+        after_network_wait + OUTPUT_GATE_PERIODIC_PROBE_INTERVAL
+    );
+    assert_eq!(
+        scheduler.output_service_demand(deadline),
+        OutputServiceDemand::PeriodicProbe
+    );
+    assert!(!scheduler.initial_av_pair_watchdog_expired(deadline));
 }
 
 #[test]
@@ -1780,6 +2034,89 @@ fn hard_deadline_without_audio_preserves_original_resume_anchor() {
     assert!(
         first_retained_video_nsecs.saturating_sub(audio_target_nsecs) <= 500_000_000,
         "failure must not advance to the decoder frontier"
+    );
+}
+
+#[test]
+fn failed_initial_av_start_restores_subtitles_when_fallback_video_is_admitted() {
+    use crate::backend::BackendSubtitleCue;
+    use crate::backend::ffmpeg::playback_loop::video_output_gate::service_video_clocked_video_queue;
+
+    // Session 7 in the playback log aborted audio preparation before publishing
+    // its 51:36.302 target frame, then resumed through the ordinary video queue.
+    let target_nsecs = 3_096_302_000_000;
+    let session_id = PlaybackSessionId(7);
+    let control = FfmpegControl::new(session_id);
+    let mut output_scheduler = PlaybackOutputScheduler::new();
+    output_scheduler.push_decoded_video_for_test(test_queued_video_frame(target_nsecs));
+    output_scheduler.begin_initial_av_start_transaction(target_nsecs, target_nsecs, Instant::now());
+    let cue = BackendSubtitleCue {
+        text: "current".into(),
+        bitmaps: Vec::new(),
+        start_nsecs: 3_096_510_000_000,
+        end_nsecs: 3_099_388_000_000,
+    };
+    let mut subtitles = SubtitlePipeline::with_external_cues_for_test(vec![cue.clone()]);
+    subtitles.defer_overlay_updates();
+    let (event_tx, event_rx) = mpsc::channel();
+    let vo_queue = VideoOutputQueue::default();
+    vo_queue.begin_session(session_id);
+    let frame_presented = AtomicBool::new(false);
+    let mut position_reporter = PositionReporter::default();
+    let mut buffered_reporter = BufferedReporter::new_with_events(false, false);
+    let mut scheduler = PlaybackScheduler::new(target_nsecs);
+
+    output_scheduler.fail_initial_av_start_transaction(
+        &control,
+        session_id,
+        "initial_audio_stage_no_payload_terminal",
+    );
+    assert!(!output_scheduler.snapshot().first_frame_presented);
+    assert_eq!(
+        output_scheduler.snapshot().state,
+        PlaybackOutputState::Rebuffering
+    );
+    output_scheduler.set_state(PlaybackOutputState::Playing);
+    control.set_output_rebuffer_paused(false);
+    assert!(service_video_clocked_video_queue(
+        &scheduler,
+        &control,
+        &mut output_scheduler,
+        session_id,
+        &vo_queue,
+        &frame_presented,
+        &mut position_reporter,
+        &event_tx,
+        &mut subtitles,
+        &mut buffered_reporter,
+    ));
+    assert!(frame_presented.load(Ordering::Relaxed));
+    assert!(
+        !event_rx
+            .try_iter()
+            .any(|event| matches!(event.kind, BackendEventKind::SubtitleChanged(Some(_))))
+    );
+
+    output_scheduler.push_decoded_video_for_test(test_queued_video_frame(3_096_552_000_000));
+    scheduler.reset(3_096_552_000_000);
+    assert!(service_video_clocked_video_queue(
+        &scheduler,
+        &control,
+        &mut output_scheduler,
+        session_id,
+        &vo_queue,
+        &frame_presented,
+        &mut position_reporter,
+        &event_tx,
+        &mut subtitles,
+        &mut buffered_reporter,
+    ));
+    assert!(
+        event_rx.try_iter().any(|event| matches!(
+            event.kind,
+            BackendEventKind::SubtitleChanged(Some(actual)) if actual == cue
+        )),
+        "the fallback frame must release the deferred subtitle overlay"
     );
 }
 

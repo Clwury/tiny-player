@@ -3,8 +3,8 @@ use std::{error::Error as StdError, sync::Arc, time::Duration};
 use super::{
     HTTP_CACHE_NETWORK_READ_TIMEOUT,
     cache::{
-        CacheAppendPermit, CacheAppendResult, CacheRestartRequest, CacheRetryPermit,
-        HttpRingCacheShared,
+        CacheAppendPermit, CacheAppendResult, CacheRetryPermit, HttpRingCacheShared,
+        SideDownloadRequest,
     },
     http::{
         content_len_from_response, content_range_from_headers,
@@ -441,7 +441,7 @@ fn download_http_side_cache_range(
     url: &str,
     headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
     shared: Arc<HttpRingCacheShared>,
-    request: CacheRestartRequest,
+    request: SideDownloadRequest,
     mut offset: u64,
 ) -> std::result::Result<HttpDownloadOutcome, HttpDownloadError> {
     let known_content_len = shared.content_len_now();
@@ -449,9 +449,8 @@ fn download_http_side_cache_range(
         return Ok(HttpDownloadOutcome::Eof);
     }
 
-    let range_request_bytes = shared.side_range_request_bytes(request);
-    let Some(request_bytes) =
-        side_request_remaining_bytes(request, offset, known_content_len, range_request_bytes)
+    let range_request_bytes = request.end_offset.saturating_sub(request.offset);
+    let Some(request_bytes) = side_request_remaining_bytes(request, offset, known_content_len)
     else {
         return Ok(HttpDownloadOutcome::Eof);
     };
@@ -503,8 +502,7 @@ fn download_http_side_cache_range(
         if shared.should_stop() {
             return Ok(HttpDownloadOutcome::Stopped);
         }
-        let Some(request_remaining) =
-            side_request_remaining_bytes(request, offset, content_len, range_request_bytes)
+        let Some(request_remaining) = side_request_remaining_bytes(request, offset, content_len)
         else {
             return Ok(HttpDownloadOutcome::Eof);
         };
@@ -531,9 +529,7 @@ fn download_http_side_cache_range(
         match shared.append_side_download_or_stop(request, offset, &chunk[..read]) {
             CacheAppendResult::Appended => {
                 offset = offset.saturating_add(read as u64);
-                if side_request_remaining_bytes(request, offset, content_len, range_request_bytes)
-                    .is_none()
-                {
+                if side_request_remaining_bytes(request, offset, content_len).is_none() {
                     return Ok(HttpDownloadOutcome::Eof);
                 }
             }
@@ -621,14 +617,13 @@ fn validate_http_response(
 }
 
 fn side_request_remaining_bytes(
-    request: CacheRestartRequest,
+    request: SideDownloadRequest,
     offset: u64,
     content_len: Option<u64>,
-    range_request_bytes: u64,
 ) -> Option<u64> {
-    let request_end = request.offset.saturating_add(range_request_bytes.max(1));
+    let request_end = request.end_offset;
     let request_end = content_len.map_or(request_end, |content_len| request_end.min(content_len));
-    (offset < request_end).then_some(request_end - offset)
+    (offset < request_end).then(|| request_end - offset)
 }
 
 fn http_cache_request_should_retry(error: &reqwest::Error) -> bool {
@@ -689,7 +684,7 @@ mod tests {
     use super::super::super::{
         HTTP_CACHE_RANGE_REQUEST_BYTES, HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES,
     };
-    use super::super::cache::{CacheRestartRequest, HttpCacheRangeKind};
+    use super::super::cache::{HttpCacheRangeKind, SideDownloadRequest};
     use super::super::{HttpRingCache, HttpRingCacheState};
     use super::{
         HTTP_CACHE_MAX_RETRIES, HttpDownloadOutcome, HttpRetryState, download_http_cache_range,
@@ -711,6 +706,46 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (url, server)
+    }
+
+    #[test]
+    fn permanent_tail_probe_failure_unblocks_avio_and_does_not_requeue() {
+        use super::super::cache::CacheReadResult;
+        use std::sync::mpsc;
+
+        let (url, server) = serve_response(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        );
+        let cache = test_download_cache(1_000_000);
+        cache.note_reader_offset(900_000, HttpCacheRangeKind::TailMetadataProbe);
+        let reading = cache.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let result = reading.read_at_for_test(900_000, &mut [0; 1]);
+            result_tx.send(result).unwrap();
+        });
+        let shared = cache.shared_for_download_test();
+        let worker =
+            thread::spawn(move || super::http_ring_cache_side_download_loop(shared, url, vec![]));
+        let result = result_rx.recv_timeout(Duration::from_secs(2));
+        // Repeat the same read before shutdown: the recorded terminal error
+        // must be returned immediately, without starting a fresh retry budget.
+        if result.is_ok() {
+            assert!(matches!(
+                cache.read_at_for_test(900_001, &mut [0; 1]),
+                CacheReadResult::Error(_)
+            ));
+            assert!(cache.side_download_requests_for_test().is_empty());
+            assert!(matches!(
+                cache.read_at_for_test(0, &mut [0; 1]),
+                CacheReadResult::Data(1)
+            ));
+        }
+        cache.shutdown();
+        reader.join().unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+        assert!(matches!(result.unwrap(), CacheReadResult::Error(_)));
     }
 
     #[test]
@@ -748,12 +783,15 @@ mod tests {
     #[test]
     fn side_download_continues_a_short_valid_206_without_retrying_it_as_a_failure() {
         let (url, server) = spawn_partial_content_server(500, 256, 256, 1_000_000);
-        let cache = test_download_cache(1_000_000);
+        let mut state = HttpRingCacheState::new_with_cache_capacity(1_000, 4_096)
+            .with_content_len_hint(Some(1_000_000));
+        assert!(state.append_at(1_000, &[1; 1_024]));
+        let cache = HttpRingCache::from_state_for_test(state);
         let shared = cache.shared_for_download_test();
         // Exercise the same queue admission used by the side worker.
         cache.note_reader_offset(500, HttpCacheRangeKind::TailMetadataProbe);
-        let mut bytes = [0; 1];
-        let _ = cache.read_cached_at(500, &mut bytes);
+        let reading = cache.clone();
+        let reader = thread::spawn(move || reading.read_at_for_test(500, &mut [0; 1]));
         let queued = shared.wait_for_side_download_request().unwrap();
         assert_eq!(queued.offset, 500);
         let client = HttpClient::new().unwrap();
@@ -761,6 +799,10 @@ mod tests {
             super::download_http_side_cache_range(&client, &url, &[], shared, queued, 500).unwrap();
         assert!(matches!(outcome, HttpDownloadOutcome::Restart(756)));
         assert!(cache.has_cached_byte_at(755));
+        assert!(matches!(
+            reader.join().unwrap(),
+            super::super::cache::CacheReadResult::Data(1)
+        ));
         server.join().unwrap();
     }
 
@@ -885,6 +927,66 @@ mod tests {
                 Some(500_000)
             );
             assert!(!cache.has_cached_byte_at(500_000));
+        }
+    }
+
+    #[test]
+    fn low_forward_cache_cancels_background_side_headers_and_body_without_a_seek() {
+        use std::sync::mpsc;
+
+        for send_headers in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/video", listener.local_addr().unwrap());
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                if send_headers {
+                    stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 8192\r\nContent-Range: bytes 500000-508191/1000000\r\n\r\n").unwrap();
+                }
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            });
+            let mut state = HttpRingCacheState::new_with_cache_capacity(0, 64 * 1024)
+                .with_content_len_hint(Some(1_000_000));
+            assert!(state.append_at(0, &[1; 16 * 1024]));
+            let cache = HttpRingCache::from_state_for_test(state);
+            cache.note_reader_offset(500_000, HttpCacheRangeKind::TailMetadataProbe);
+            let _ = cache.read_cached_at(500_000, &mut [0; 1]);
+            let shared = cache.shared_for_download_test();
+            let request = shared.wait_for_side_download_request().unwrap();
+            let generation = shared.download_generation();
+            let downloading = cache.clone();
+            let (result_tx, result_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let client = HttpClient::new().unwrap();
+                result_tx
+                    .send(super::download_http_side_cache_range(
+                        &client,
+                        &url,
+                        &[],
+                        downloading.shared_for_download_test(),
+                        request,
+                        request.offset,
+                    ))
+                    .unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            cache.note_reader_offset(16 * 1024 - 1, HttpCacheRangeKind::Playback);
+            assert_eq!(shared.download_generation(), generation);
+            let result = result_rx.recv_timeout(Duration::from_secs(1));
+            cache.shutdown();
+            release_tx.send(()).unwrap();
+            worker.join().unwrap();
+            server.join().unwrap();
+            assert!(result.unwrap().unwrap_err().cancelled);
         }
     }
 
@@ -1060,6 +1162,158 @@ mod tests {
     }
 
     #[test]
+    fn cached_backward_seek_resumes_one_continuous_response_after_the_retained_prefix() {
+        use super::super::cache::CacheAppendPermit;
+
+        let seek_offset = 100;
+        let prefix_end = seek_offset + 64 * 1024;
+        let total_len = prefix_end + 64 * 1024;
+        let (url, server) = spawn_partial_content_server(
+            prefix_end,
+            total_len - prefix_end,
+            total_len - prefix_end,
+            total_len,
+        );
+        let mut state =
+            HttpRingCacheState::new(total_len - 1).with_content_len_hint(Some(total_len));
+        assert!(state.append_at(total_len - 1, &[0x5a]));
+        assert!(state.append_retained_at(
+            seek_offset,
+            &vec![0x5a; 64 * 1024],
+            HttpCacheRangeKind::Playback,
+        ));
+        let cache = HttpRingCache::from_state_for_test(state);
+        let shared = cache.shared_for_download_test();
+
+        cache.note_reader_offset(seek_offset, HttpCacheRangeKind::Playback);
+        assert_eq!(shared.take_restart_offset(), Some(seek_offset));
+        assert!(matches!(
+            shared.wait_for_append_capacity(seek_offset),
+            CacheAppendPermit::Restart(offset) if offset == prefix_end
+        ));
+        assert!(matches!(
+            shared.wait_for_append_capacity(prefix_end),
+            CacheAppendPermit::Ready(_)
+        ));
+        let client = HttpClient::new().expect("test HTTP client builds");
+        let outcome = download_http_cache_range(&client, &url, &[], shared, prefix_end)
+            .expect("cached playback seek starts one continuous response after the prefix");
+
+        assert!(matches!(outcome, HttpDownloadOutcome::Restart(offset) if offset == total_len));
+        let mut bytes = vec![0; (total_len - seek_offset) as usize];
+        assert!(matches!(
+            cache.read_cached_at(seek_offset, &mut bytes),
+            super::super::cache::CacheReadResult::Data(read) if read == bytes.len()
+        ));
+        assert!(bytes.iter().all(|byte| *byte == 0x5a));
+        let request = server.join().expect("test HTTP server joins");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("range: bytes={prefix_end}-{}\r\n", total_len - 1))
+        );
+    }
+
+    #[test]
+    fn consuming_retained_forward_bytes_keeps_one_continuous_http_response() {
+        let range_start = 1;
+        let range_len = 1024 * 1024;
+        let total_len = range_start + range_len;
+        let (url, server) =
+            spawn_partial_content_server(range_start, range_len, range_len, total_len);
+        let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(total_len));
+        assert!(state.append_at(0, &[0x5a]));
+        assert!(state.append_retained_at(
+            range_start,
+            &vec![0x5a; 219_585],
+            HttpCacheRangeKind::Playback,
+        ));
+        let cache = HttpRingCache::from_state_for_test(state);
+        let shared = cache.shared_for_download_test();
+        let generation = shared.download_generation();
+        // Reproduce 47:48: ordinary reading of retained bytes moves AVIO
+        // 114,688 bytes ahead of the main cursor without an explicit seek.
+        let mut cached = vec![0; 114_688];
+        assert!(matches!(
+            cache.read_at(range_start, &mut cached),
+            super::super::cache::CacheReadResult::Data(114_688)
+        ));
+        assert!(cached.iter().all(|byte| *byte == 0x5a));
+        assert_eq!(cache.reader_offset_for_test(), range_start + 114_688);
+        let downloading = cache.clone();
+        let worker = thread::spawn(move || {
+            let client = HttpClient::new().unwrap();
+            download_http_cache_range(&client, &url, &[], shared, range_start)
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !worker.is_finished() && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        if !worker.is_finished() {
+            downloading.shutdown();
+        }
+        let outcome = worker
+            .join()
+            .unwrap()
+            .expect("continuous response finishes");
+
+        assert!(matches!(outcome, HttpDownloadOutcome::Restart(offset) if offset == total_len));
+        assert_eq!(cache.next_offset_for_test(), total_len);
+        assert_eq!(
+            cache.shared_for_download_test().download_generation(),
+            generation
+        );
+        assert!(!cache.has_restart_request_for_test());
+        assert!(cache.side_download_requests_for_test().is_empty());
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.contains(&format!("range: bytes={range_start}-{}\r\n", total_len - 1)));
+    }
+
+    #[test]
+    fn continuous_response_survives_overlap_with_small_retained_seek_range() {
+        let range_start = 1;
+        let range_len = 1024 * 1024;
+        let total_len = range_start + range_len;
+        let (url, server) =
+            spawn_partial_content_server(range_start, range_len, range_len, total_len);
+        let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(total_len));
+        assert!(state.append_at(0, &[0x5a]));
+        // The 51:18 seek regression spliced a 219,585-byte retained suffix,
+        // abandoned the live response, and waited for another Range request.
+        assert!(state.append_retained_at(
+            range_start,
+            &vec![0x5a; 219_585],
+            HttpCacheRangeKind::Playback,
+        ));
+        let cache = HttpRingCache::from_state_for_test(state);
+        let shared = cache.shared_for_download_test();
+        let generation = shared.download_generation();
+        let client = HttpClient::new().expect("test HTTP client builds");
+
+        let outcome = download_http_cache_range(&client, &url, &[], shared, range_start)
+            .expect("retained seek bytes do not interrupt a continuous response");
+
+        assert!(matches!(outcome, HttpDownloadOutcome::Restart(offset) if offset == total_len));
+        assert_eq!(cache.next_offset_for_test(), total_len);
+        assert_eq!(
+            cache.shared_for_download_test().download_generation(),
+            generation
+        );
+        let mut output = vec![0; usize::try_from(total_len).unwrap()];
+        assert!(matches!(
+            cache.read_cached_at(0, &mut output),
+            super::super::cache::CacheReadResult::Data(read) if read == output.len()
+        ));
+        assert!(output.iter().all(|byte| *byte == 0x5a));
+        let request = server.join().expect("test HTTP server joins");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("range: bytes={range_start}-{}\r\n", total_len - 1))
+        );
+    }
+
+    #[test]
     fn active_range_waits_at_demux_limit_without_new_range_seam() {
         let range_start = 1;
         let range_len = 256 * 1024;
@@ -1179,29 +1433,25 @@ mod tests {
 
     #[test]
     fn side_request_remaining_bytes_stops_at_side_range_boundary() {
-        let request = CacheRestartRequest {
+        let request = SideDownloadRequest {
+            id: 1,
             generation: 0,
             offset: 500,
+            end_offset: 628,
             range_kind: HttpCacheRangeKind::Playback,
+            deadline: std::time::Instant::now() + Duration::from_secs(30),
         };
 
+        assert_eq!(side_request_remaining_bytes(request, 500, None), Some(128));
+        assert_eq!(side_request_remaining_bytes(request, 627, None), Some(1));
+        assert_eq!(side_request_remaining_bytes(request, 628, None), None);
+        assert_eq!(side_request_remaining_bytes(request, 629, None), None);
+        assert_eq!(side_request_remaining_bytes(request, 600, Some(550)), None);
         assert_eq!(
-            side_request_remaining_bytes(request, 500, None, 128),
-            Some(128)
-        );
-        assert_eq!(
-            side_request_remaining_bytes(request, 627, None, 128),
-            Some(1)
-        );
-        assert_eq!(side_request_remaining_bytes(request, 628, None, 128), None);
-        assert_eq!(
-            side_request_remaining_bytes(request, 500, Some(550), 128),
+            side_request_remaining_bytes(request, 500, Some(550)),
             Some(50)
         );
-        assert_eq!(
-            side_request_remaining_bytes(request, 550, Some(550), 128),
-            None
-        );
+        assert_eq!(side_request_remaining_bytes(request, 550, Some(550)), None);
     }
 
     #[test]

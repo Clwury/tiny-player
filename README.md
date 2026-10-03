@@ -151,7 +151,7 @@ These shortcuts are active when the playback page has keyboard focus:
 | `R` / `T` | Move subtitles up / down by 1% of the displayed video height |
 | `I` | Show / hide playback information |
 
-Playback speed ranges from **0.25× to 4×**. Volume shortcuts also support the numeric keypad's divide and multiply keys. Holding a volume or speed adjustment key repeats the adjustment. Arrow keys trigger one seek per key press.
+Playback speed ranges from **0.25× to 4×**. Volume shortcuts also support the numeric keypad's divide and multiply keys. Holding a volume or speed adjustment key repeats the adjustment. Holding an arrow key repeats seeking: left and right seek 5 seconds per repeat, while up and down seek 60 seconds per repeat. Toggle shortcuts still run once per press.
 
 Mouse controls over the playback area:
 

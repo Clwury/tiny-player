@@ -4,7 +4,7 @@ use reqwest::{RequestBuilder, Response};
 use tokio::runtime::Runtime;
 
 use super::{
-    CacheRestartRequest, HTTP_CACHE_NETWORK_READ_TIMEOUT, HttpDownloadError, HttpRingCacheShared,
+    HTTP_CACHE_NETWORK_READ_TIMEOUT, HttpDownloadError, HttpRingCacheShared, SideDownloadRequest,
     http_cache_request_should_retry,
 };
 
@@ -40,7 +40,7 @@ impl HttpClient {
         &self,
         request: RequestBuilder,
         shared: Arc<HttpRingCacheShared>,
-        side: Option<CacheRestartRequest>,
+        side: Option<SideDownloadRequest>,
         offset: u64,
         generation: u64,
     ) -> Result<HttpResponse<'_>, HttpDownloadError> {
@@ -68,7 +68,7 @@ impl HttpClient {
         &self,
         shared: &HttpRingCacheShared,
         generation: u64,
-        side: Option<CacheRestartRequest>,
+        side: Option<SideDownloadRequest>,
         offset: u64,
         future: impl Future<Output = Result<T, reqwest::Error>>,
     ) -> Result<T, HttpDownloadError> {
@@ -124,7 +124,7 @@ pub(super) struct HttpResponse<'a> {
     client: &'a HttpClient,
     shared: Arc<HttpRingCacheShared>,
     generation: u64,
-    side: Option<CacheRestartRequest>,
+    side: Option<SideDownloadRequest>,
     pending: Vec<u8>,
     pending_pos: usize,
 }

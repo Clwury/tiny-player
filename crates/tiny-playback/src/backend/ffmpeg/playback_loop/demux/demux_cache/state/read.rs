@@ -761,6 +761,9 @@ impl DemuxPacketCacheState {
             prefetch_limit_bytes: self.media_limits().0,
             read_index: self.read_index,
             exact_seek_target_nsecs: self.exact_seek_target_nsecs,
+            cache_pause_wait_nsecs: self
+                .cache_pause_enabled
+                .then(|| self.effective_cache_pause_wait_nsecs()),
             streams,
         }
     }

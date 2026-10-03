@@ -40,6 +40,7 @@ pub(in crate::backend::ffmpeg::avio::cache) use events::{
 };
 pub(super) use model::{
     CacheAppendPermit, CacheAppendResult, CacheRetryPermit, HttpRingCacheShared,
+    SideDownloadRequest,
 };
 pub(in crate::backend::ffmpeg) use model::{
     CacheReadResult, CacheRestartRequest, HttpCacheRangeKind, HttpRingCache, HttpRingCacheState,
@@ -48,5 +49,5 @@ pub(in crate::backend::ffmpeg::avio::cache) use model::{
     HttpCacheConfig, HttpCacheReadError, HttpCachedByteRange, HttpDiskCache,
     HttpPlaybackBufferRange, HttpReadWaitLogDecision, HttpReadWaitLogState,
     HttpReadWaitObservation, HttpReadWaitPosition, InputRateSample, PendingHttpDiskCacheWrite,
-    RetainedCacheRange, RetainedPlaybackSpliceSource,
+    RetainedCacheRange, RetainedPlaybackSpliceSource, SideDownloadError,
 };

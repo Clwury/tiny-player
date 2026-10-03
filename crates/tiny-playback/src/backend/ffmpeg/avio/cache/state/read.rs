@@ -166,28 +166,11 @@ impl HttpRingCacheState {
             self.byte_level_seeks = self.byte_level_seeks.saturating_add(1);
         }
         self.pending_seek_range_kind = Some((offset, range_kind));
+        self.reader_range_kind = range_kind;
         if range_kind == HttpCacheRangeKind::Playback {
             self.restart_request = None;
             self.short_seek_target = None;
-            let short_seek_limit =
-                HTTP_SHORT_SEEK_MAX_BYTES.min(self.active_memory_capacity() / 4) as u64;
-            let healthy_response = self.config.continuous_playback_requests
-                && self.continuous_request_active
-                && !self.eof
-                && self.error.is_none()
-                && self.buffer.len() > 0
-                && self
-                    .input_rate_samples
-                    .back()
-                    .is_some_and(|sample| sample.at.elapsed() < HTTP_SHORT_SEEK_WAIT);
-            if !offset_cached
-                && offset > self.next_offset
-                && offset - self.next_offset <= short_seek_limit
-                && healthy_response
-            {
-                self.short_seek_target = Some((offset, Instant::now()));
-                self.reader_offset = offset;
-                self.prefetch_paused = false;
+            if !offset_cached && self.try_short_forward_read_through(offset) {
                 return;
             }
             if !offset_in_active_range {
@@ -195,13 +178,46 @@ impl HttpRingCacheState {
                 self.continuous_request_active = false;
                 self.side_download_requests.clear();
                 self.side_download_active.clear();
+                self.side_download_errors.clear();
                 self.demote_active_range_to_retained();
             }
             self.set_reader_offset(offset);
-            if !offset_cached {
+            if !offset_in_active_range || !offset_cached {
+                // A cached seek still needs the live response to follow the
+                // reader. The downloader splices retained playback bytes at
+                // this cursor before opening a response at their end.
                 self.request_active_playback_restart_at(offset);
             }
         }
+    }
+
+    pub(in crate::backend::ffmpeg::avio::cache) fn try_short_forward_read_through(
+        &mut self,
+        offset: u64,
+    ) -> bool {
+        let short_seek_limit =
+            HTTP_SHORT_SEEK_MAX_BYTES.min(self.active_memory_capacity() / 4) as u64;
+        let healthy_response = self.config.continuous_playback_requests
+            && self.active_range_kind == HttpCacheRangeKind::Playback
+            && self.continuous_request_active
+            && self.restart_request.is_none()
+            && !self.eof
+            && self.error.is_none()
+            && self.buffer.len() > 0
+            && self
+                .input_rate_samples
+                .back()
+                .is_some_and(|sample| sample.at.elapsed() < HTTP_SHORT_SEEK_WAIT);
+        if offset <= self.next_offset
+            || offset - self.next_offset > short_seek_limit
+            || !healthy_response
+        {
+            return false;
+        }
+        self.short_seek_target = Some((offset, Instant::now()));
+        self.reader_offset = offset;
+        self.prefetch_paused = false;
+        true
     }
 
     pub(in crate::backend::ffmpeg::avio::cache) fn short_seek_may_produce(

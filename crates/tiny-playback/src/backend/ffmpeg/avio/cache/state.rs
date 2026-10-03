@@ -11,7 +11,8 @@ pub(in crate::backend::ffmpeg::avio::cache) use super::{
     HttpDiskCache, HttpPlaybackBufferRange, HttpReadWaitLogDecision, HttpReadWaitLogState,
     HttpReadWaitObservation, HttpReadWaitPosition, HttpRingCacheState, InputRateSample,
     PendingHttpDiskCacheWrite, PreparedByteAppend, RetainedCacheRange,
-    RetainedPlaybackSpliceSource, http_stream_cache_status_changed,
+    RetainedPlaybackSpliceSource, SideDownloadError, SideDownloadRequest,
+    http_stream_cache_status_changed,
 };
 
 pub(in crate::backend::ffmpeg::avio::cache) use progress::{
@@ -28,6 +29,8 @@ mod range;
 mod read;
 #[path = "state/report.rs"]
 mod report;
+#[path = "state/side_download.rs"]
+mod side_download;
 
 impl HttpRingCacheState {
     #[cfg(test)]
@@ -96,6 +99,9 @@ impl HttpRingCacheState {
             config,
             active_range_kind: HttpCacheRangeKind::Playback,
             pending_seek_range_kind: None,
+            metadata_probe_active: true,
+            reader_range_kind: HttpCacheRangeKind::Playback,
+            side_read_demand: None,
             reader_offset: start_offset,
             request_generation: 0,
             continuous_request_active: false,
@@ -111,6 +117,8 @@ impl HttpRingCacheState {
             restart_request: None,
             side_download_requests: VecDeque::new(),
             side_download_active: Vec::new(),
+            next_side_request_id: 0,
+            side_download_errors: VecDeque::new(),
             error: None,
             last_reported_status: None,
             read_wait_log_state: None,

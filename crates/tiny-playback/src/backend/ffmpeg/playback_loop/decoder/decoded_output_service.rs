@@ -116,12 +116,7 @@ impl SubtitleDecodeOutputService {
         context
             .pipeline
             .subtitle_pipeline
-            .drain_ready_decode_output(
-                context.pipeline.audio_output.as_ref(),
-                context.control,
-                context.session_id,
-                context.event_tx,
-            )
+            .drain_ready_decode_output(context.control, context.session_id)
     }
 }
 
@@ -129,5 +124,4 @@ pub(super) struct SubtitleDecodeOutputServiceContext<'a> {
     pub(super) pipeline: &'a mut PlaybackPipelineState,
     pub(super) control: &'a FfmpegControl,
     pub(super) session_id: PlaybackSessionId,
-    pub(super) event_tx: &'a Sender<BackendEvent>,
 }

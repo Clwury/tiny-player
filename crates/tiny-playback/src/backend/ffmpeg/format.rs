@@ -80,6 +80,9 @@ impl FormatContext {
 
     pub(super) fn find_stream_info(&mut self) -> std::result::Result<(), String> {
         let result = unsafe { ffi::avformat_find_stream_info(self.ptr, ptr::null_mut()) };
+        if let Some(cache) = self.cached_io_cache() {
+            cache.finish_metadata_probe();
+        }
         if result < 0 {
             return Err(format!("FFmpeg 探测媒体流失败：{}", ffmpeg_error(result)));
         }
@@ -232,6 +235,9 @@ impl FormatContext {
         stream: StreamInfo,
         position_seconds: f64,
     ) -> std::result::Result<(), String> {
+        if let Some(cache) = self.cached_io_cache() {
+            cache.finish_metadata_probe();
+        }
         let target_nsecs =
             seconds_to_nsecs(position_seconds).saturating_add(stream.start_nsecs.unwrap_or(0));
         let timestamp = nsecs_to_timestamp(target_nsecs, stream.time_base);

@@ -43,6 +43,9 @@ pub(in crate::backend::ffmpeg) struct HttpRingCacheState {
     pub(in crate::backend::ffmpeg::avio::cache) active_range_kind: HttpCacheRangeKind,
     pub(in crate::backend::ffmpeg::avio::cache) pending_seek_range_kind:
         Option<(u64, HttpCacheRangeKind)>,
+    pub(in crate::backend::ffmpeg::avio::cache) metadata_probe_active: bool,
+    pub(in crate::backend::ffmpeg::avio::cache) reader_range_kind: HttpCacheRangeKind,
+    pub(in crate::backend::ffmpeg::avio::cache) side_read_demand: Option<u64>,
     pub(in crate::backend::ffmpeg::avio::cache) reader_offset: u64,
     pub(in crate::backend::ffmpeg::avio::cache) request_generation: u64,
     pub(in crate::backend::ffmpeg::avio::cache) continuous_request_active: bool,
@@ -57,8 +60,10 @@ pub(in crate::backend::ffmpeg) struct HttpRingCacheState {
     pub(in crate::backend::ffmpeg::avio::cache) shutdown: bool,
     pub(in crate::backend::ffmpeg::avio::cache) restart_request: Option<CacheRestartRequest>,
     pub(in crate::backend::ffmpeg::avio::cache) side_download_requests:
-        VecDeque<CacheRestartRequest>,
-    pub(in crate::backend::ffmpeg::avio::cache) side_download_active: Vec<CacheRestartRequest>,
+        VecDeque<SideDownloadRequest>,
+    pub(in crate::backend::ffmpeg::avio::cache) side_download_active: Vec<SideDownloadRequest>,
+    pub(in crate::backend::ffmpeg::avio::cache) next_side_request_id: u64,
+    pub(in crate::backend::ffmpeg::avio::cache) side_download_errors: VecDeque<SideDownloadError>,
     pub(in crate::backend::ffmpeg::avio::cache) error: Option<HttpCacheReadError>,
     pub(in crate::backend::ffmpeg::avio::cache) last_reported_status: Option<ByteCacheState>,
     pub(in crate::backend::ffmpeg::avio::cache) read_wait_log_state: Option<HttpReadWaitLogState>,
@@ -167,6 +172,37 @@ pub(in crate::backend::ffmpeg) struct CacheRestartRequest {
     pub(in crate::backend::ffmpeg) generation: u64,
     pub(in crate::backend::ffmpeg) offset: u64,
     pub(in crate::backend::ffmpeg) range_kind: HttpCacheRangeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::backend::ffmpeg::avio) struct SideDownloadRequest {
+    pub(in crate::backend::ffmpeg::avio) id: u64,
+    pub(in crate::backend::ffmpeg::avio) generation: u64,
+    pub(in crate::backend::ffmpeg::avio) offset: u64,
+    pub(in crate::backend::ffmpeg::avio) end_offset: u64,
+    pub(in crate::backend::ffmpeg::avio) range_kind: HttpCacheRangeKind,
+    pub(in crate::backend::ffmpeg::avio) deadline: Instant,
+}
+
+impl SideDownloadRequest {
+    pub(in crate::backend::ffmpeg::avio) fn contains(self, offset: u64) -> bool {
+        self.offset <= offset && offset < self.end_offset
+    }
+
+    pub(in crate::backend::ffmpeg::avio::cache) fn restart_request(self) -> CacheRestartRequest {
+        CacheRestartRequest {
+            generation: self.generation,
+            offset: self.offset,
+            range_kind: self.range_kind,
+        }
+    }
+}
+
+pub(in crate::backend::ffmpeg::avio::cache) struct SideDownloadError {
+    pub(in crate::backend::ffmpeg::avio::cache) start: u64,
+    pub(in crate::backend::ffmpeg::avio::cache) end: u64,
+    pub(in crate::backend::ffmpeg::avio::cache) range_kind: HttpCacheRangeKind,
+    pub(in crate::backend::ffmpeg::avio::cache) message: String,
 }
 
 pub(in crate::backend::ffmpeg::avio::cache) struct RetainedCacheRange {

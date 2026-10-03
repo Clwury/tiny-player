@@ -213,3 +213,68 @@ fn rejected_first_video_frame_does_not_publish_subtitles() {
     assert!(playback.subtitle_changes().is_empty());
     assert!(playback.output_scheduler.restart_pending());
 }
+
+#[test]
+fn audio_clocked_subtitles_resume_after_current_video_presentation_feedback() {
+    let mut playback = VideoOnlyPlayback::new(
+        3_096_302_000_000,
+        vec![
+            cue("current", 3_096_510_000_000, 3_099_388_000_000),
+            cue("future", 3_100_000_000_000, 3_102_000_000_000),
+        ],
+    );
+    playback.subtitles.defer_overlay_updates();
+    let output = AudioOutput::stopped_for_test(
+        std::sync::Arc::new(FfmpegControl::new(playback.session_id)),
+        96_000,
+        48_000,
+        2,
+    );
+    output.reset_clock(3_100_010_000_000);
+
+    let service = |playback: &mut VideoOnlyPlayback| {
+        service_audio_clocked_video_queue(
+            &output,
+            &playback.control,
+            &mut playback.output_scheduler.scheduled_video_queue,
+            playback.session_id,
+            &playback.vo_queue,
+            &playback.frame_presented,
+            &mut playback.position_reporter,
+            &playback.event_tx,
+            &mut playback.subtitles,
+        )
+        .unwrap();
+    };
+    service(&mut playback);
+    assert!(playback.subtitle_changes().is_empty());
+
+    assert!(
+        playback
+            .vo_queue
+            .record_presentation(playback.vo_queue.presentation_identity(), 3_096_552_000_000,)
+    );
+    service(&mut playback);
+    assert_eq!(playback.subtitle_changes(), vec![Some("current".into())]);
+}
+
+#[test]
+fn rejected_fallback_video_frame_does_not_release_deferred_subtitles() {
+    let mut playback = VideoOnlyPlayback::new(
+        3_096_552_000_000,
+        vec![cue("current", 3_096_510_000_000, 3_099_388_000_000)],
+    );
+    playback.admit(3_096_552_000_000);
+    assert_eq!(playback.subtitle_changes(), vec![Some("current".into())]);
+    playback
+        .subtitles
+        .reset_cues_for_position(3_096_552_000_000);
+    playback.subtitles.defer_overlay_updates();
+    playback.admit(3_096_594_000_000);
+    playback.vo_queue.begin_session(PlaybackSessionId(72));
+    playback.present_at(3_096_594_000_000);
+    playback
+        .subtitles
+        .update_overlay(3_096_594_000_000, playback.session_id, &playback.event_tx);
+    assert!(playback.subtitle_changes().is_empty());
+}

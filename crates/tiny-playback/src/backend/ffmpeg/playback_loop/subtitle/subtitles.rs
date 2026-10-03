@@ -4,7 +4,7 @@ use ffmpeg_sys_next as ffi;
 
 use crate::{
     backend::{BackendEvent, BackendEventKind, BackendSubtitleCue},
-    render_host::{PlaybackSessionId, RenderSize},
+    render_host::{PlaybackSessionId, RenderSize, VideoOutputQueue},
 };
 
 use super::decode::{DecodeInputRetryStatus, DecodePacketAdmissionStatus};
@@ -15,9 +15,9 @@ use super::subtitle_decode_worker::{
     SubtitleDecodeWorkerState,
 };
 use super::{
-    AudioOutput, AvPacket, DECODE_PACKET_SLOW_LOG_AFTER, Decoder, FfmpegControl,
-    FfmpegPlaybackInput, PlaybackBlockReason, PlaybackGeneration, StreamCatalog, StreamInfo,
-    TimestampMapper, load_external_subtitle_cue_list, open_subtitle_decoder, push_subtitle_cue,
+    AvPacket, DECODE_PACKET_SLOW_LOG_AFTER, Decoder, FfmpegControl, FfmpegPlaybackInput,
+    PlaybackBlockReason, PlaybackGeneration, StreamCatalog, StreamInfo, TimestampMapper,
+    load_external_subtitle_cue_list, open_subtitle_decoder, push_subtitle_cue,
     refresh_playback_timeline_origin, select_subtitle_stream_for_selection_from_catalog,
     subtitle_cue_queue_from_external, trim_overlapping_subtitle_cues_at, update_subtitle_overlay,
 };
@@ -32,6 +32,7 @@ pub(super) struct SubtitlePipeline {
     cues: VecDeque<BackendSubtitleCue>,
     active: Option<BackendSubtitleCue>,
     needs_prefetch: bool,
+    overlay_updates_deferred: bool,
 }
 
 pub(super) struct PendingSubtitleDecodePacket {
@@ -55,6 +56,7 @@ impl SubtitlePipeline {
             cues: VecDeque::new(),
             active: None,
             needs_prefetch: false,
+            overlay_updates_deferred: false,
         }
     }
 
@@ -103,6 +105,7 @@ impl SubtitlePipeline {
             cues,
             active: None,
             needs_prefetch: subtitle_needs_prefetch(stream),
+            overlay_updates_deferred: true,
         })
     }
 
@@ -153,6 +156,7 @@ impl SubtitlePipeline {
         self.cues.clear();
         self.active = None;
         self.needs_prefetch = false;
+        self.overlay_updates_deferred = false;
         let _ = event_tx.send(BackendEvent::new(
             session_id,
             BackendEventKind::SubtitleChanged(None),
@@ -187,6 +191,53 @@ impl SubtitlePipeline {
     pub(super) fn reset_cues_for_position(&mut self, start_position_nsecs: u64) {
         self.cues = subtitle_cue_queue_from_external(&self.external_cues, start_position_nsecs);
         self.active = None;
+    }
+
+    pub(super) fn defer_overlay_updates(&mut self) {
+        self.overlay_updates_deferred = true;
+    }
+
+    pub(super) fn resume_overlay_updates_at(
+        &mut self,
+        timeline_nsecs: u64,
+        session_id: PlaybackSessionId,
+        event_tx: &Sender<BackendEvent>,
+    ) {
+        if self.overlay_updates_deferred {
+            tracing::debug!(
+                session_id = ?session_id,
+                timeline_nsecs,
+                queued_cues = self.cues.len(),
+                "resumed FFmpeg subtitle overlay updates after video presentation"
+            );
+        }
+        self.overlay_updates_deferred = false;
+        self.update_overlay(timeline_nsecs, session_id, event_tx);
+    }
+
+    pub(super) fn update_overlay_from_audio_clock(
+        &mut self,
+        timeline_nsecs: u64,
+        vo_queue: &VideoOutputQueue,
+        session_id: PlaybackSessionId,
+        event_tx: &Sender<BackendEvent>,
+    ) {
+        if self.overlay_updates_deferred {
+            // A failed initial A/V transaction can recover through the deadline
+            // service instead of the normal first-frame commit. Only current VO
+            // presentation feedback may release the seek/start subtitle fence;
+            // the audio clock alone can already be ahead of the visible frame.
+            let snapshot = vo_queue.snapshot();
+            if snapshot.active_session_id != session_id {
+                return;
+            }
+            let Some(presentation) = snapshot.last_presentation else {
+                return;
+            };
+            self.resume_overlay_updates_at(presentation.timeline_nsecs, session_id, event_tx);
+            return;
+        }
+        self.update_overlay(timeline_nsecs, session_id, event_tx);
     }
 
     pub(super) fn realign_cues_for_position(&mut self, start_position_nsecs: u64) {
@@ -368,9 +419,7 @@ impl SubtitlePipeline {
     pub(super) fn poll_packet_status(
         &mut self,
         generation: u64,
-        audio_output: Option<&AudioOutput>,
         session_id: PlaybackSessionId,
-        event_tx: &Sender<BackendEvent>,
     ) -> std::result::Result<Option<SubtitleDecodePacketStatus>, String> {
         let Some(worker) = self.worker.as_mut() else {
             return Ok(None);
@@ -380,9 +429,6 @@ impl SubtitlePipeline {
         };
         for update in std::mem::take(&mut status.updates) {
             self.apply_decode_update(update, session_id);
-        }
-        if let Some(output) = audio_output {
-            self.update_overlay_from_audio_clock(output, session_id, event_tx)?;
         }
         Ok(Some(status))
     }
@@ -414,10 +460,8 @@ impl SubtitlePipeline {
     #[allow(clippy::while_let_loop)]
     pub(super) fn drain_ready_decode_output(
         &mut self,
-        audio_output: Option<&AudioOutput>,
         control: &FfmpegControl,
         session_id: PlaybackSessionId,
-        event_tx: &Sender<BackendEvent>,
     ) -> std::result::Result<bool, String> {
         // A seek clears the tracked packets, but flush retries and acknowledgements
         // must still advance before decoder backpressure can admit new packets.
@@ -431,9 +475,7 @@ impl SubtitlePipeline {
                 break;
             };
 
-            let Some(status) =
-                self.poll_packet_status(front_generation, audio_output, session_id, event_tx)?
-            else {
+            let Some(status) = self.poll_packet_status(front_generation, session_id)? else {
                 break;
             };
             let pending_packet = self
@@ -503,26 +545,15 @@ impl SubtitlePipeline {
         }
     }
 
-    pub(super) fn update_overlay_from_audio_clock(
-        &mut self,
-        output: &AudioOutput,
-        session_id: PlaybackSessionId,
-        event_tx: &Sender<BackendEvent>,
-    ) -> std::result::Result<(), String> {
-        self.update_overlay(
-            output.snapshot()?.played_timeline_nsecs,
-            session_id,
-            event_tx,
-        );
-        Ok(())
-    }
-
     pub(super) fn update_overlay(
         &mut self,
         timeline_nsecs: u64,
         session_id: PlaybackSessionId,
         event_tx: &Sender<BackendEvent>,
     ) {
+        if self.overlay_updates_deferred {
+            return;
+        }
         update_subtitle_overlay(
             timeline_nsecs,
             &mut self.cues,
@@ -557,6 +588,7 @@ mod tests {
     use super::{
         PlaybackBlockReason, SUBTITLE_DECODE_PENDING_INPUT_QUEUE_CAPACITY, StreamInfo,
         SubtitleDecodeWorkerSnapshot, SubtitleDecodeWorkerState, SubtitlePipeline,
+        push_subtitle_cue, trim_overlapping_subtitle_cues_at,
     };
 
     fn cue(text: &str, start_nsecs: u64, end_nsecs: u64) -> BackendSubtitleCue {
@@ -581,6 +613,7 @@ mod tests {
             cues,
             active: None,
             needs_prefetch: stream.is_some(),
+            overlay_updates_deferred: false,
         }
     }
 
@@ -681,5 +714,72 @@ mod tests {
         pipeline.realign_cues_for_position(2_000_000_000);
 
         assert_eq!(pipeline.cues, VecDeque::from([earlier, later]));
+    }
+
+    #[test]
+    fn deferred_overlay_does_not_flash_cue_before_seek_target() {
+        let stale = cue("stale", 100, 1_000);
+        let current = cue("current", 400, 800);
+        let mut pipeline = subtitle_pipeline(None, Vec::new(), VecDeque::from([stale]));
+        let session = super::PlaybackSessionId(2);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        pipeline.defer_overlay_updates();
+        pipeline.update_overlay(500, session, &tx);
+        assert!(rx.try_recv().is_err());
+
+        trim_overlapping_subtitle_cues_at(&mut pipeline.cues, 350);
+        push_subtitle_cue(&mut pipeline.cues, current.clone());
+        pipeline.resume_overlay_updates_at(500, session, &tx);
+
+        let event = rx.try_recv().expect("seek target subtitle is published");
+        assert!(matches!(
+            event.kind,
+            super::BackendEventKind::SubtitleChanged(Some(actual)) if actual == current
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn audio_clock_waits_for_new_video_presentation_after_seek() {
+        let current = cue("current", 400, 800);
+        let mut pipeline = SubtitlePipeline::with_external_cues_for_test(vec![current.clone()]);
+        let session = super::PlaybackSessionId(3);
+        let vo_queue = super::VideoOutputQueue::default();
+        vo_queue.begin_session(session);
+        let before_seek = vo_queue.presentation_identity();
+        assert!(vo_queue.record_presentation(before_seek, 100));
+        vo_queue.begin_session(session);
+        pipeline.defer_overlay_updates();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        pipeline.update_overlay_from_audio_clock(500, &vo_queue, session, &tx);
+        assert!(rx.try_recv().is_err());
+        assert!(!vo_queue.record_presentation(before_seek, 500));
+        pipeline.update_overlay_from_audio_clock(500, &vo_queue, session, &tx);
+        assert!(rx.try_recv().is_err());
+
+        assert!(vo_queue.record_presentation(vo_queue.presentation_identity(), 500));
+        pipeline.update_overlay_from_audio_clock(500, &vo_queue, session, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap().kind,
+            super::BackendEventKind::SubtitleChanged(Some(actual)) if actual == current
+        ));
+    }
+
+    #[test]
+    fn another_video_session_cannot_release_deferred_subtitles() {
+        let mut pipeline =
+            SubtitlePipeline::with_external_cues_for_test(vec![cue("current", 400, 800)]);
+        pipeline.defer_overlay_updates();
+        let session = super::PlaybackSessionId(3);
+        let vo_queue = super::VideoOutputQueue::default();
+        vo_queue.begin_session(super::PlaybackSessionId(4));
+        assert!(vo_queue.record_presentation(vo_queue.presentation_identity(), 500));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        pipeline.update_overlay_from_audio_clock(500, &vo_queue, session, &tx);
+        pipeline.update_overlay(500, session, &tx);
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -1396,6 +1396,7 @@ mod tests {
             prefetch_limit_bytes: 1024 * 1024,
             read_index: 0,
             exact_seek_target_nsecs: 0,
+            cache_pause_wait_nsecs: None,
             streams,
         }
     }

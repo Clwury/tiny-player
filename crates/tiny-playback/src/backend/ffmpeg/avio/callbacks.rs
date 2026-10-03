@@ -6,7 +6,7 @@ use std::{
 use ffmpeg_sys_next as ffi;
 
 use super::super::HTTP_CACHE_MAX_READ_CHUNK_BYTES;
-use super::cache::{CacheReadResult, HttpCacheRangeKind, HttpRingCache};
+use super::cache::{CacheReadResult, HttpRingCache};
 
 pub(super) struct CachedAvioReader {
     pub(super) cache: HttpRingCache,
@@ -102,13 +102,9 @@ pub(super) unsafe extern "C" fn cached_avio_seek(
     let next = next as u64;
     let previous_read_pos = reader.read_pos;
     reader.read_pos = next;
-    let range_kind = if seek_mode == ffi::SEEK_END
-        || (seek_mode == ffi::SEEK_SET && reader.cache.is_tail_metadata_probe_seek(next))
-    {
-        HttpCacheRangeKind::TailMetadataProbe
-    } else {
-        HttpCacheRangeKind::Playback
-    };
+    let range_kind = reader
+        .cache
+        .range_kind_for_seek(next, seek_mode == ffi::SEEK_END);
     tracing::debug!(
         previous_read_pos,
         next_read_pos = next,
@@ -134,7 +130,75 @@ mod tests {
     use ffmpeg_sys_next as ffi;
 
     use super::super::{HttpRingCache, HttpRingCacheState};
-    use super::{CachedAvioReader, cached_avio_read_packet};
+    use super::{CachedAvioReader, cached_avio_read_packet, cached_avio_seek};
+
+    #[test]
+    fn file_tail_seeks_after_probe_follow_the_main_playback_response() {
+        for whence in [ffi::SEEK_SET | ffi::AVSEEK_FORCE, ffi::SEEK_END] {
+            let len = 128 * 1024 * 1024;
+            let target = len - 4096;
+            let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(len));
+            assert!(state.append_at(0, &[1; 1024]));
+            let cache = HttpRingCache::from_state_for_test(state);
+            cache.finish_metadata_probe();
+            let mut reader = Box::new(CachedAvioReader {
+                cache: cache.clone(),
+                read_pos: 0,
+            });
+            let offset = if whence == ffi::SEEK_END {
+                -4096
+            } else {
+                target as i64
+            };
+            let result = unsafe {
+                cached_avio_seek(
+                    (&mut *reader as *mut CachedAvioReader).cast::<c_void>(),
+                    offset,
+                    whence,
+                )
+            };
+            assert_eq!(result, target as i64);
+            assert_eq!(
+                cache.shared_for_download_test().take_restart_offset(),
+                Some(target)
+            );
+            assert!(cache.side_download_requests_for_test().is_empty());
+        }
+    }
+
+    #[test]
+    fn opening_tail_probe_preserves_main_response_and_is_cancelled_when_probe_finishes() {
+        let len = 128 * 1024 * 1024;
+        let target = len - 4096;
+        let mut state = HttpRingCacheState::new(0).with_content_len_hint(Some(len));
+        assert!(state.append_at(0, &[1; 1024]));
+        let cache = HttpRingCache::from_state_for_test(state);
+        let mut reader = Box::new(CachedAvioReader {
+            cache: cache.clone(),
+            read_pos: 0,
+        });
+        assert_eq!(
+            unsafe {
+                cached_avio_seek(
+                    (&mut *reader as *mut CachedAvioReader).cast::<c_void>(),
+                    target as i64,
+                    ffi::SEEK_SET,
+                )
+            },
+            target as i64
+        );
+        let _ = cache.read_cached_at(target, &mut [0; 1]);
+        assert_eq!(cache.shared_for_download_test().download_offset(), 1024);
+        assert!(
+            cache
+                .shared_for_download_test()
+                .take_restart_offset()
+                .is_none()
+        );
+        assert_eq!(cache.side_download_requests_for_test().len(), 1);
+        cache.finish_metadata_probe();
+        assert!(cache.side_download_requests_for_test().is_empty());
+    }
 
     #[test]
     fn pending_cached_seek_does_not_inject_eio_from_avio_callback() {

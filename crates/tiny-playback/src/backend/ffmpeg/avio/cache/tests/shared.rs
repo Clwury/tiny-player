@@ -76,6 +76,98 @@ fn an_avio_read_unblocks_http_despite_a_stale_demux_pause() {
 }
 
 #[test]
+fn reading_a_retained_forward_prefix_keeps_main_download_catching_up() {
+    let mut state = HttpRingCacheState::new_with_cache_capacity(0, 64 * 1024)
+        .with_content_len_hint(Some(1_000_000));
+    assert!(state.append_at(0, &[1; 4096]));
+    assert!(state.append_retained_at(4096, &[2; 16_384], HttpCacheRangeKind::Playback));
+    state.continuous_request_active = true;
+    let cache = HttpRingCache::from_state_for_test(state);
+    let generation = cache.shared.download_generation();
+    let mut bytes = [0; 4096];
+
+    assert!(matches!(
+        cache.read_at(4096, &mut bytes),
+        CacheReadResult::Data(4096)
+    ));
+    assert_eq!(bytes, [2; 4096]);
+    {
+        let mut guard = cache.shared.state.lock().unwrap();
+        assert_eq!(guard.reader_offset, 8192);
+        assert_eq!(guard.next_offset, 4096);
+        assert!(guard.append_capacity_from(4096) > 0);
+        assert!(!guard.prefetch_paused);
+    }
+    assert!(matches!(
+        cache
+            .shared
+            .wait_for_download_capacity(4096, Some(generation)),
+        CacheAppendPermit::Ready(_)
+    ));
+    assert!(matches!(
+        cache
+            .shared
+            .append_download_bytes(generation, 4096, &[2; 20_480]),
+        super::super::CacheAppendResult::Appended
+    ));
+    let guard = cache.shared.state.lock().unwrap();
+    assert_eq!(guard.request_generation, generation);
+    assert_eq!(guard.reader_offset, 8192);
+    assert_eq!(guard.next_offset, 24_576);
+    assert!(guard.restart_request.is_none());
+    assert!(guard.side_download_requests.is_empty());
+    assert!(guard.cached_bytes() <= 64 * 1024);
+}
+
+#[test]
+fn cached_playback_seek_reuses_the_prefix_and_restarts_continuous_prefetch() {
+    for (active_offset, seek_offset) in [(600, 100), (0, 600)] {
+        let mut state = HttpRingCacheState::new_with_cache_capacity(active_offset, 128)
+            .with_content_len_hint(Some(1_000));
+        assert!(state.append_at(active_offset, &[1; 20]));
+        assert!(state.append_retained_at(seek_offset, &[2; 20], HttpCacheRangeKind::Playback));
+        let cache = HttpRingCache::from_state_for_test(state);
+        let target = seek_offset + 5;
+
+        cache.note_reader_offset(target, HttpCacheRangeKind::Playback);
+
+        assert_eq!(cache.shared.take_restart_offset(), Some(target));
+        let prefix_end = seek_offset + 20;
+        assert!(matches!(
+            cache.shared.append_capacity_now(target),
+            CacheAppendPermit::Restart(offset) if offset == prefix_end
+        ));
+        assert!(matches!(
+            cache.shared.append_capacity_now(prefix_end),
+            CacheAppendPermit::Ready(_)
+        ));
+        let generation = cache.shared.download_generation();
+        assert!(matches!(
+            cache
+                .shared
+                .append_download_bytes(generation, prefix_end, &[3; 20]),
+            super::super::CacheAppendResult::Appended
+        ));
+        let mut bytes = [0; 35];
+        assert!(matches!(
+            cache.read_cached_at(target, &mut bytes),
+            CacheReadResult::Data(35)
+        ));
+        assert_eq!(&bytes[..15], &[2; 15]);
+        assert_eq!(&bytes[15..], &[3; 20]);
+        assert!(
+            cache
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .side_download_requests
+                .is_empty()
+        );
+    }
+}
+
+#[test]
 fn a_new_playback_position_interrupts_retry_backoff_and_resets_the_active_range() {
     let cache = HttpRingCache::from_state_for_test(HttpRingCacheState::new(0));
     let retry = cache.clone();
@@ -121,25 +213,23 @@ fn an_old_side_completion_cannot_remove_a_replacement_request_at_the_same_offset
         offset: 900,
         range_kind: HttpCacheRangeKind::TailMetadataProbe,
     };
-    cache
+    let old = cache
         .shared
         .state
         .lock()
         .unwrap()
-        .side_download_active
-        .push(old);
+        .activate_side_download_for_test(old);
     cache.note_reader_offset(500_000, HttpCacheRangeKind::Playback);
     let replacement = CacheRestartRequest {
         generation: cache.shared.download_generation(),
-        ..old
+        ..old.restart_request()
     };
-    cache
+    let replacement = cache
         .shared
         .state
         .lock()
         .unwrap()
-        .side_download_active
-        .push(replacement);
+        .activate_side_download_for_test(replacement);
     assert!(cache.shared.request_cancelled(old.generation, Some(old)));
     assert!(matches!(
         cache.shared.append_side_download_or_stop(old, 900, b"old"),
@@ -226,13 +316,12 @@ fn http_cache_read_error_waits_while_side_range_can_recover_gap() {
         offset: 500,
         range_kind: HttpCacheRangeKind::Playback,
     };
-    cache
+    let _request = cache
         .shared
         .state
         .lock()
         .expect("state locks")
-        .side_download_active
-        .push(request);
+        .activate_side_download_for_test(request);
 
     let mut output = [0; 1];
     assert!(matches!(
@@ -252,13 +341,12 @@ fn http_cache_successful_side_append_clears_matching_read_error() {
         offset: 500,
         range_kind: HttpCacheRangeKind::Playback,
     };
-    cache
+    let request = cache
         .shared
         .state
         .lock()
         .expect("state locks")
-        .side_download_active
-        .push(request);
+        .activate_side_download_for_test(request);
 
     assert!(matches!(
         cache
@@ -296,16 +384,50 @@ fn http_cache_tail_side_failure_does_not_set_playback_error() {
         offset: 900,
         range_kind: HttpCacheRangeKind::TailMetadataProbe,
     };
-    shared
+    let request = shared
         .state
         .lock()
         .expect("state locks")
-        .side_download_active
-        .push(request);
+        .activate_side_download_for_test(request);
 
     shared.finish_side_download_with_error(request, 900, "tail failed".to_string());
 
     assert!(shared.state.lock().expect("state locks").error.is_none());
+}
+
+#[test]
+fn tail_probe_reads_preserve_playback_cursor_and_forward_watermark() {
+    let mut state = HttpRingCacheState::new_with_cache_capacity(0, 64 * 1024)
+        .with_content_len_hint(Some(1_000_000));
+    assert!(state.append_at(0, &[1; 16 * 1024]));
+    assert!(state.append_retained_at(900_000, b"tail", HttpCacheRangeKind::TailMetadataProbe));
+    let cache = HttpRingCache::from_state_for_test(state);
+    cache.note_reader_offset(900_000, HttpCacheRangeKind::TailMetadataProbe);
+    let mut bytes = [0; 4];
+    assert!(matches!(
+        cache.read_at_for_test(900_000, &mut bytes),
+        CacheReadResult::Data(4)
+    ));
+    assert_eq!(&bytes, b"tail");
+    assert_eq!(cache.shared.reader_offset_now(), 0);
+    assert!(
+        cache
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .append_capacity_from(16 * 1024)
+            > 0
+    );
+
+    cache.finish_metadata_probe();
+    cache.note_reader_offset(900_000, HttpCacheRangeKind::Playback);
+    cache.shared.take_restart_offset();
+    assert!(matches!(
+        cache.read_at_for_test(900_000, &mut bytes),
+        CacheReadResult::Data(4)
+    ));
+    assert_eq!(cache.shared.reader_offset_now(), 900_004);
 }
 
 #[test]
@@ -327,12 +449,12 @@ fn http_cache_playback_side_failure_only_sets_error_for_active_reader_range() {
         offset: 500,
         range_kind: HttpCacheRangeKind::Playback,
     };
-    {
+    let request = {
         let mut guard = shared.state.lock().expect("state locks");
         guard.reader_offset = 500;
-        guard.side_download_active.push(request);
         assert!(guard.append_retained_at_protected(500, &[0; 20], request));
-    }
+        guard.activate_side_download_for_test(request)
+    };
 
     shared.finish_side_download_with_error(request, 520, "playback failed".to_string());
 
@@ -361,12 +483,11 @@ fn http_cache_playback_side_failure_ahead_of_reader_stays_background_only() {
         offset: 500,
         range_kind: HttpCacheRangeKind::Playback,
     };
-    shared
+    let request = shared
         .state
         .lock()
         .expect("state locks")
-        .side_download_active
-        .push(request);
+        .activate_side_download_for_test(request);
 
     shared.finish_side_download_with_error(request, 500, "prefetch failed".to_string());
 
@@ -422,8 +543,8 @@ fn http_cache_shared_reports_idle_after_last_side_download_finishes() {
     let request = {
         let mut guard = shared.state.lock().expect("state locks");
         assert!(guard.append_at(100, b"abcdef"));
-        guard.set_reader_offset(500);
-        assert!(guard.request_side_download_at(500, HttpCacheRangeKind::Playback));
+        guard.set_reader_offset(50);
+        assert!(guard.request_side_download_at(50, HttpCacheRangeKind::Playback));
         assert_eq!(guard.append_capacity_from(106), 0);
         assert!(!guard.stream_cache_status().idle);
         assert!(guard.take_stream_cache_status_report().is_some());
@@ -652,6 +773,30 @@ fn http_cache_shared_splices_retained_playback_range_on_capacity_check() {
 }
 
 #[test]
+fn bounded_live_response_can_still_splice_proactive_continuation() {
+    let config = HttpCacheConfig {
+        continuous_playback_requests: false,
+        ..HttpCacheConfig::for_test(128)
+    };
+    let mut state = HttpRingCacheState::new_with_config(0, config).with_content_len_hint(Some(64));
+    assert!(state.append_at(0, b"abcdef"));
+    assert!(state.append_retained_at(6, b"ghijkl", HttpCacheRangeKind::Playback));
+    let cache = HttpRingCache::from_state_for_test(state);
+    let generation = cache.shared.download_generation();
+
+    assert!(matches!(
+        cache.shared.wait_for_download_capacity(6, Some(generation)),
+        CacheAppendPermit::Restart(12)
+    ));
+    let mut output = [0; 12];
+    assert!(matches!(
+        cache.read_cached_at(0, &mut output),
+        CacheReadResult::Data(12)
+    ));
+    assert_eq!(&output, b"abcdefghijkl");
+}
+
+#[test]
 fn http_cache_shared_external_disk_write_preserves_trimmed_backseek_bytes() {
     let directory = tempfile::tempdir().unwrap();
     let cache = HttpRingCache::from_state_for_test(
@@ -683,7 +828,7 @@ fn http_cache_shared_external_disk_write_preserves_trimmed_backseek_bytes() {
 }
 
 #[test]
-fn http_cache_shared_dispatches_multiple_side_downloads_to_active_set() {
+fn http_cache_shared_preempts_background_range_for_blocked_read() {
     let (event_tx, _) = mpsc::channel();
     let shared = HttpRingCacheShared {
         state: Mutex::new(
@@ -701,9 +846,13 @@ fn http_cache_shared_dispatches_multiple_side_downloads_to_active_set() {
     };
     {
         let mut guard = shared.state.lock().expect("state locks");
-        guard.request_side_download_at(1_000, HttpCacheRangeKind::TailMetadataProbe);
+        assert!(guard.append_at(100, &vec![0; HTTP_CACHE_SMALL_RANGE_REQUEST_BYTES as usize]));
         guard.request_side_download_at(
-            1_000 + HTTP_CACHE_RANGE_REQUEST_BYTES + 1,
+            HTTP_CACHE_RANGE_REQUEST_BYTES,
+            HttpCacheRangeKind::TailMetadataProbe,
+        );
+        guard.request_side_download_at(
+            HTTP_CACHE_RANGE_REQUEST_BYTES * 2,
             HttpCacheRangeKind::TailMetadataProbe,
         );
     }
@@ -711,6 +860,11 @@ fn http_cache_shared_dispatches_multiple_side_downloads_to_active_set() {
     let first = shared
         .wait_for_side_download_request()
         .expect("first request dequeues");
+    {
+        let mut guard = shared.state.lock().expect("state locks");
+        assert!(guard.take_side_download_request().is_none());
+        guard.side_read_demand = Some(HTTP_CACHE_RANGE_REQUEST_BYTES * 2);
+    }
     let second = shared
         .wait_for_side_download_request()
         .expect("second request dequeues");
@@ -718,7 +872,7 @@ fn http_cache_shared_dispatches_multiple_side_downloads_to_active_set() {
     {
         let guard = shared.state.lock().expect("state locks");
         assert!(guard.side_download_requests.is_empty());
-        assert_eq!(guard.side_download_active, vec![first, second]);
+        assert_eq!(guard.side_download_active, vec![second]);
     }
     shared.finish_side_download(first, true);
     let guard = shared.state.lock().expect("state locks");

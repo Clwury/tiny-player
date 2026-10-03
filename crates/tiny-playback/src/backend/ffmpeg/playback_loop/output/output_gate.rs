@@ -96,6 +96,7 @@ pub(in crate::backend::ffmpeg::playback_loop::output_gate) use audio_pressure::{
     audio_output_flush_until_timeline_nsecs, playing_pending_audio_limit_duration,
     playing_pending_audio_pressure_clear_duration, playing_pending_audio_warn_entry_duration,
 };
+pub(in crate::backend::ffmpeg::playback_loop) use demux_watermark::demux_watermark_with_initial_combined_coverage;
 pub(in crate::backend::ffmpeg::playback_loop::output_gate) use demux_watermark::timed_output_gate_demux_watermark;
 pub(in crate::backend::ffmpeg::playback_loop::output_gate) use discard::discard_decoded_video_before_output_gate_resume_if_ready;
 pub(in crate::backend::ffmpeg::playback_loop::output_gate) use initial_admission::{

@@ -95,7 +95,6 @@ impl DecodePipelineService {
                     pipeline: &mut *context.pipeline,
                     control: context.control,
                     session_id: context.session_id,
-                    event_tx: context.event_tx,
                 })?,
         );
         timing.subtitle_output = stage_started_at.elapsed();

@@ -36,6 +36,7 @@ pub(in crate::backend::ffmpeg::playback_loop) struct DemuxPacketQueueSnapshot {
     pub(in crate::backend::ffmpeg::playback_loop) prefetch_limit_bytes: usize,
     pub(in crate::backend::ffmpeg::playback_loop) read_index: usize,
     pub(in crate::backend::ffmpeg::playback_loop) exact_seek_target_nsecs: u64,
+    pub(in crate::backend::ffmpeg::playback_loop) cache_pause_wait_nsecs: Option<u64>,
     pub(in crate::backend::ffmpeg::playback_loop) streams: Vec<DemuxStreamPacketQueueSnapshot>,
 }
 
