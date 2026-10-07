@@ -13,7 +13,8 @@ pub(crate) fn prevent_playback_idle(
     window: &Window,
     reason: &str,
 ) -> anyhow::Result<gpui::ActivityGuard> {
-    let handle = HasWindowHandle::window_handle(window)?;
+    let handle = HasWindowHandle::window_handle(window)
+        .map_err(|error| anyhow::anyhow!("Could not get the playback window handle: {error}"))?;
     let RawWindowHandle::Win32(handle) = handle.as_raw() else {
         anyhow::bail!("Playback idle inhibition requires a Windows window");
     };
