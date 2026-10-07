@@ -91,7 +91,7 @@ fn user_settings_keep_the_sidebar_and_titlebar_fixed_while_switching_pages(
         assert_eq!(sidebar.size.width, px(226.0));
         assert_eq!(sidebar.top(), panel.top());
         assert_eq!(sidebar.bottom(), panel.bottom());
-        let pages: [(&str, &[&str]); 4] = [
+        let pages: [(&str, &[&str]); 5] = [
             (
                 "settings-category-外观",
                 &["user-setting-theme", "color-theme-dropdown"],
@@ -120,6 +120,16 @@ fn user_settings_keep_the_sidebar_and_titlebar_fixed_while_switching_pages(
                     "disk-cache",
                 ],
             ),
+            (
+                "settings-category-关于",
+                &[
+                    "settings-about-icon",
+                    "settings-about-name",
+                    "settings-about-description",
+                    "settings-about-version",
+                    "settings-about-github",
+                ],
+            ),
         ];
         for (category, controls) in pages {
             click(cx, category);
@@ -135,6 +145,9 @@ fn user_settings_keep_the_sidebar_and_titlebar_fixed_while_switching_pages(
                 assert!(bounds.top() >= scroll.bounds().top(), "{selector}");
                 assert!(bounds.bottom() <= scroll.bounds().bottom(), "{selector}");
             }
+            if category == "settings-category-关于" {
+                crate::settings::view::test_support::assert_about_centered(scroll.bounds(), cx);
+            }
             assert_eq!(cx.debug_bounds("settings-sidebar").unwrap(), sidebar);
             assert_eq!(cx.debug_bounds("window-control-close").unwrap(), close);
         }
@@ -148,6 +161,26 @@ fn user_settings_keep_the_sidebar_and_titlebar_fixed_while_switching_pages(
         }
     }
     assert_eq!(root.read_with(cx, |root, _| root.changes), 0);
+}
+
+#[gpui::test]
+fn about_opens_the_project_link_without_changing_preferences(cx: &mut TestAppContext) {
+    let (root, cx) = settings_window(cx, PlaybackCacheConfig::default());
+    let original = root.read_with(cx, |root, cx| root.dialog.read(cx).snapshot());
+    click(cx, "settings-category-关于");
+    click(cx, "settings-about-github");
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some(env!("CARGO_PKG_REPOSITORY"))
+    );
+    click(cx, "settings-category-外观");
+    assert!(cx.debug_bounds("settings-about-github").is_none());
+    assert!(cx.debug_bounds("color-theme-dropdown").is_some());
+    assert_eq!(root.read_with(cx, |root, _| root.changes), 0);
+    assert_eq!(
+        root.read_with(cx, |root, cx| root.dialog.read(cx).snapshot()),
+        original
+    );
 }
 
 #[gpui::test]

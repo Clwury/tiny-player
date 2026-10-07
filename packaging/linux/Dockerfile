@@ -14,11 +14,15 @@ ARG RUST_VERSION=1.97.0
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
 ENV PATH=/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin
 RUN curl --fail --location --retry 3 https://sh.rustup.rs -o /tmp/rustup-init.sh \
-    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$RUST_VERSION" \
+    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$RUST_VERSION" --component clippy \
     && chmod -R a+rX /opt/rustup /opt/cargo
 
 COPY build-native.sh /opt/packaging/build-native.sh
 RUN bash /opt/packaging/build-native.sh
+
+COPY build-ffmpeg.sh /opt/packaging/build-ffmpeg.sh
+ARG FFMPEG_REF=n9.0.1
+RUN bash /opt/packaging/build-ffmpeg.sh
 
 ENV PKG_CONFIG_PATH=/opt/tiny-player/lib/pkgconfig:/opt/tiny-player/share/pkgconfig
 ENV LD_LIBRARY_PATH=/opt/tiny-player/lib

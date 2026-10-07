@@ -19,6 +19,7 @@ impl PlaybackPage {
         }
         self.poll_video_presenter(window, cx);
         self.schedule_paused_backend_poll(cx);
+        self.sync_playback_power(window, cx);
     }
 
     fn poll_backend_events(&mut self) -> Vec<BackendEvent> {
@@ -87,6 +88,7 @@ impl PlaybackPage {
                 }
             }
         }
+        self.release_power_if_idle();
     }
 
     fn schedule_paused_backend_poll(&mut self, cx: &mut Context<Self>) {

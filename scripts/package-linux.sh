@@ -3,15 +3,22 @@ set -euo pipefail
 
 if [[ ${1:-} == --help ]]; then
     cat <<'EOF'
-Usage: scripts/package-linux.sh
+Usage: scripts/package-linux.sh [--skip-image-build]
 Build an x86_64 Linux tar.gz with a glibc 2.39 baseline using Docker.
 Outputs: dist/*.tar.gz, dist/*.sha256 and dist/*.manifest.json
 Environment: CONTAINER_ENGINE (docker), BUILD_JOBS (4),
              TINY_LINUX_IMAGE (tiny-player-builder:glibc2.39)
+--skip-image-build uses an already built image (for CI's cached Buildx build).
 EOF
     exit 0
 fi
-[[ $# == 0 ]] || { echo 'Unexpected arguments; use --help.' >&2; exit 2; }
+skip_image_build=0
+if [[ $# == 1 && $1 == --skip-image-build ]]; then
+    skip_image_build=1
+elif [[ $# != 0 ]]; then
+    echo 'Unexpected arguments; use --help.' >&2
+    exit 2
+fi
 [[ $(uname -m) == x86_64 ]] || { echo 'Build on an x86_64 Linux host.' >&2; exit 1; }
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 engine=${CONTAINER_ENGINE:-docker}
@@ -20,7 +27,9 @@ build_jobs=${BUILD_JOBS:-4}
 [[ $build_jobs =~ ^[1-9][0-9]*$ ]] || { echo 'BUILD_JOBS must be positive.' >&2; exit 2; }
 command -v "$engine" >/dev/null
 mkdir -p "$repo_dir/dist" "$repo_dir/target/linux-x86_64-glibc2.39"
-"$engine" build --platform linux/amd64 --tag "$builder_image" "$repo_dir/packaging/linux"
+if [[ $skip_image_build == 0 ]]; then
+    "$engine" build --platform linux/amd64 --tag "$builder_image" "$repo_dir/packaging/linux"
+fi
 "$engine" run --rm --interactive --platform linux/amd64 --user "$(id -u):$(id -g)" \
     --mount "type=bind,src=$repo_dir,dst=/src,readonly" \
     --mount "type=bind,src=$repo_dir/target/linux-x86_64-glibc2.39,dst=/build" \

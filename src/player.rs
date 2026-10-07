@@ -6,6 +6,7 @@ mod media_metadata;
 mod model;
 mod page;
 mod ports;
+mod power;
 mod profile;
 mod queue;
 pub(crate) mod reporting;

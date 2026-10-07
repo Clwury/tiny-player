@@ -7,6 +7,21 @@ use windows::Win32::{
 
 use crate::theme::{self, ColorTheme};
 
+mod playback_power;
+
+pub(crate) fn prevent_playback_idle(
+    window: &Window,
+    reason: &str,
+) -> anyhow::Result<gpui::ActivityGuard> {
+    let handle = HasWindowHandle::window_handle(window)?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        anyhow::bail!("Playback idle inhibition requires a Windows window");
+    };
+    let request =
+        playback_power::PlaybackPowerRequest::new(HWND(handle.hwnd.get() as *mut _), reason)?;
+    Ok(gpui::ActivityGuard::new(move || drop(request)))
+}
+
 /// Keep DWM in sync with the app's theme, which can differ from Windows settings.
 pub(in crate::app) fn sync_window_theme(window: &mut Window, cx: &mut App) {
     let Ok(handle) = HasWindowHandle::window_handle(window) else {

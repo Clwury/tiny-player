@@ -82,6 +82,7 @@ impl PlaybackPage {
         failed: bool,
         ended: bool,
     ) -> PlaybackStateUpdate {
+        self.power.stop();
         let transition = self.dispatch_reporting(ReportingIntent::Close { failed, ended });
         self.report_effects.periodic.cancel();
         if let Some(command) = transition.command {

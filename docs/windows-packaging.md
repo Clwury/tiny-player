@@ -32,6 +32,13 @@
 - MSYS2 UCRT64 libplacebo 7.360.1-2 及匹配的 Vulkan、shaderc、色彩管理等依赖。
 - libclang 18.1.1，用于项目和 ffmpeg-sys-next 的 bindgen。
 
+`master` 推送的 GitHub Actions 发布每次下载 BtbN `latest` 的 **FFmpeg 9.0 LGPL shared**
+x64 构建及上游 `checksums.sha256`，校验后生成 `target/windows-x86_64/native-lock.json`。
+环境变量 `TINY_WINDOWS_NATIVE_LOCK` 指定本次构建使用的依赖清单，不修改仓库中锁定的
+本地开发版本。工具和 MSYS2 依赖继续固定；运行时清单记录实际 FFmpeg 版本、SHA256
+和源码位置，并随 ZIP 保存。Cargo 缓存按 FFmpeg SHA256 区分，避免复用旧头文件的绑定。
+流程不依赖旧每日构建地址或长期归档。整体发布步骤见 [Linux 打包说明](linux-packaging.md#github-actions-发布)。
+
 Rust 应用仍使用 MSVC。对原生 DLL 的 C ABI，脚本从导出表生成 `.def`，再通过
 MSVC `lib.exe` 生成导入库，并正确标记数据导出；不链接 MinGW 静态库，也不引入
 MinGW CRT 头文件。FFmpeg 的头文件和 DLL 来自同一归档。生成的 pkg-config 文件

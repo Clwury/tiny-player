@@ -73,6 +73,7 @@ impl PlaybackPage {
             title: "Series S1E1".into(),
             video: PlaybackBackendAdapter::empty(),
             backend_poll: Default::default(),
+            power: power::PlaybackPower::for_tests(),
             session: crate::player::session::PlaybackSessionController::new(
                 PlaybackTimelineState {
                     loaded: true,

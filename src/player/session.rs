@@ -73,6 +73,15 @@ impl PlaybackSessionController {
     pub(super) fn source_view(&self) -> &PlaybackSourceState {
         &self.source
     }
+    pub(super) fn should_inhibit_idle(&self, has_backend: bool, has_video: bool) -> bool {
+        has_backend
+            && has_video
+            && self.timeline.loaded
+            && !self.timeline.paused
+            && !self.timeline.user_paused
+            && !self.timeline.ended
+            && !self.reporting.is_closed()
+    }
     pub(super) fn take_start_subtitle_preference(&mut self) -> bool {
         std::mem::take(&mut self.source.remember_subtitle_on_start)
     }

@@ -1,0 +1,254 @@
+name: Build and release
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "4"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  TINY_TEST_LIBPLACEBO: "0"
+
+jobs:
+  checks:
+    name: Check release version and sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Read application version
+        id: version
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\ntag=v{version}\n")
+          PY
+      - name: Reject an existing release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          refs=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --jq '.[].ref')
+          if grep -Fxq "refs/tags/$RELEASE_TAG" <<< "$refs"; then
+            echo "::error::Tag $RELEASE_TAG already exists. Update Cargo.toml and Cargo.lock before pushing."
+            exit 1
+          fi
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component rustfmt
+          rustup default 1.97.0
+      - name: Cache Cargo sources
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-sources-linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-sources-linux-
+      - name: Check formatting, boundaries and packaging helpers
+        run: |
+          cargo fmt --all -- --check
+          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
+          python3 -B scripts/check_ui_boundaries.py --metadata "$RUNNER_TEMP/cargo-metadata.json"
+          python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
+
+  linux:
+    name: Build Linux x86_64 package
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      TINY_LINUX_IMAGE: tiny-player-builder:glibc2.39
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Resolve latest FFmpeg 9.0 source
+        id: ffmpeg
+        run: |
+          ref=$(git ls-remote https://github.com/FFmpeg/FFmpeg.git refs/heads/release/9.0)
+          commit=${ref%%[[:space:]]*}
+          [[ $commit =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - name: Build native dependencies with persistent Docker layers
+        uses: docker/build-push-action@v7
+        with:
+          context: packaging/linux
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.TINY_LINUX_IMAGE }}
+          build-args: FFMPEG_REF=${{ steps.ffmpeg.outputs.commit }}
+          cache-from: type=gha,version=2,scope=linux-native-glibc2.39
+          cache-to: type=gha,version=2,scope=linux-native-glibc2.39,mode=max
+      - name: Cache Linux Cargo build
+        uses: actions/cache@v6
+        with:
+          path: target/linux-x86_64-glibc2.39
+          key: linux-cargo-${{ hashFiles('packaging/linux/Dockerfile', 'packaging/linux/build-*.sh') }}-${{ steps.ffmpeg.outputs.commit }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: linux-cargo-${{ hashFiles('packaging/linux/Dockerfile', 'packaging/linux/build-*.sh') }}-${{ steps.ffmpeg.outputs.commit }}-
+      - name: Run Linux tests and Clippy
+        run: |
+          mkdir -p target/linux-x86_64-glibc2.39
+          docker run --rm --user "$(id -u):$(id -g)" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/src,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/target/linux-x86_64-glibc2.39,dst=/build" \
+            --env CARGO_BUILD_JOBS --env CARGO_INCREMENTAL \
+            --env CARGO_PROFILE_DEV_DEBUG --env CARGO_PROFILE_TEST_DEBUG \
+            --env TINY_TEST_LIBPLACEBO \
+            --env 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64' \
+            "$TINY_LINUX_IMAGE" bash -c '
+              set -euo pipefail
+              python3 -B -m unittest discover -s packaging/linux -p "test_*.py" -v
+              cargo test --workspace --locked --target x86_64-unknown-linux-gnu
+              cargo clippy --workspace --locked --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
+            '
+      - name: Assemble and audit Linux package
+        run: ./scripts/package-linux.sh --skip-image-build
+      - name: Upload Linux release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-linux
+          path: |
+            dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.tar.gz
+            dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.tar.gz.sha256
+            dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.manifest.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  windows:
+    name: Build Windows x86_64 portable package
+    needs: checks
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      TINY_WINDOWS_NATIVE_LOCK: ${{ github.workspace }}/target/windows-x86_64/native-lock.json
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Install Rust MSVC
+        run: |
+          rustup toolchain install 1.98.1-x86_64-pc-windows-msvc --profile minimal --component clippy
+          if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed.' }
+          rustup default 1.98.1-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain selection failed.' }
+      - name: Download and verify latest FFmpeg 9.0 LGPL shared build
+        id: ffmpeg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $downloads = Join-Path $env:RUNNER_TEMP 'ffmpeg-latest'
+          gh release download latest --repo BtbN/FFmpeg-Builds `
+            --pattern ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip `
+            --pattern checksums.sha256 --dir $downloads
+          if ($LASTEXITCODE -ne 0) { throw 'Latest FFmpeg download failed.' }
+          $buildCommit = gh api repos/BtbN/FFmpeg-Builds/commits/latest --jq .sha
+          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg build recipe resolution failed.' }
+          python scripts/resolve_windows_ffmpeg.py --downloads $downloads `
+            --build-commit $buildCommit --output $env:TINY_WINDOWS_NATIVE_LOCK
+          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg checksum or metadata verification failed.' }
+      - name: Cache Windows Cargo build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+            target/release
+            target/x86_64-pc-windows-msvc
+          key: windows-msvc-1.98.1-${{ hashFiles('packaging/windows/native-lock.json', 'packaging/windows/cargo.toml', 'packaging/windows/prepare.py', 'crates/tiny-playback/build.rs') }}-${{ steps.ffmpeg.outputs.sha256 }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: windows-msvc-1.98.1-${{ hashFiles('packaging/windows/native-lock.json', 'packaging/windows/cargo.toml', 'packaging/windows/prepare.py', 'crates/tiny-playback/build.rs') }}-${{ steps.ffmpeg.outputs.sha256 }}-
+      - name: Run Windows tests and Clippy
+        run: |
+          ./scripts/package-windows.ps1 -Mode Test
+          ./scripts/package-windows.ps1 -Mode Clippy
+      - name: Assemble and audit Windows portable package
+        run: ./scripts/package-windows.ps1
+      - name: Upload Windows release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-windows
+          path: |
+            dist/tiny-player-${{ needs.checks.outputs.version }}-windows-x86_64.zip
+            dist/tiny-player-${{ needs.checks.outputs.version }}-windows-x86_64.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    name: Publish complete release
+    needs: [checks, linux, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.checks.outputs.tag }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.checks.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.checks.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify both packages and publish
+        working-directory: dist
+        run: |
+          assets=(
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.tar.gz"
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.tar.gz.sha256"
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.manifest.json"
+            "tiny-player-$RELEASE_VERSION-windows-x86_64.zip"
+            "tiny-player-$RELEASE_VERSION-windows-x86_64.zip.sha256"
+          )
+          for asset in "${assets[@]}"; do test -s "$asset"; done
+          sha256sum --check --strict \
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.tar.gz.sha256" \
+            "tiny-player-$RELEASE_VERSION-windows-x86_64.zip.sha256"
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Linux: x86_64 GNU/Linux, glibc 2.39 or newer; extract the entire tar.gz.
+          Windows: Windows 10 22H2 / Windows 11 x64; extract the entire ZIP and run tiny-player.exe.
+
+          Built from commit $GITHUB_SHA. Both packages include their native dependencies, assets and build metadata.
+          SHA256 checksum files are attached.
+          EOF
+          gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
+            --title "Tiny Player $RELEASE_TAG" --draft --generate-notes \
+            --notes-file "$RUNNER_TEMP/release-notes.md" "${assets[@]}"
+          release_id=$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)
+          # Concurrent pushes may finish out of order; select Latest by version.
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false -f make_latest=legacy --silent

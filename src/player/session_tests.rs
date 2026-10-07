@@ -75,6 +75,26 @@ fn report(transition: &BackendTransition, index: usize) -> &PlaybackReport {
 }
 
 #[test]
+fn idle_inhibition_requires_a_live_loaded_video_session() {
+    let mut session = controller();
+    assert!(!session.should_inhibit_idle(true, true));
+    session.reduce_backend(BackendEventKind::PlaybackRestart, context());
+    assert!(session.should_inhibit_idle(true, true));
+    assert!(!session.should_inhibit_idle(false, true));
+    assert!(!session.should_inhibit_idle(true, false));
+    session.reduce_backend(BackendEventKind::PausedForCacheChanged(true), context());
+    assert!(!session.should_inhibit_idle(true, true));
+    session.reduce_backend(BackendEventKind::PausedForCacheChanged(false), context());
+    assert!(session.should_inhibit_idle(true, true));
+    session.reduce_backend(BackendEventKind::Pause(true), context());
+    assert!(!session.should_inhibit_idle(true, true));
+    session.reduce_backend(BackendEventKind::Pause(false), context());
+    assert!(session.should_inhibit_idle(true, true));
+    session.reduce_backend(BackendEventKind::PlaybackEnded, context());
+    assert!(!session.should_inhibit_idle(true, true));
+}
+
+#[test]
 fn restart_reduces_timeline_before_start_report_and_only_starts_once() {
     let mut controller = controller();
     controller.timeline.pending_seek_position = Some(2.5);

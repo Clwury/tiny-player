@@ -29,6 +29,7 @@ mod diagnostics;
 mod episodes;
 mod fullscreen;
 mod lifecycle;
+mod power;
 mod presentation;
 mod progress;
 mod queue;
@@ -118,6 +119,7 @@ pub struct PlaybackPage {
     session: super::session::PlaybackSessionController,
     // Page-owned continuation; the session owns poll eligibility and token.
     backend_poll: crate::effects::EffectHandle<gpui::Task<()>>,
+    power: power::PlaybackPower,
     emby: EmbyPlaybackContext,
     report_effects: reporting::ReportingEffects,
     queue_effects: queue::QueueEffects,

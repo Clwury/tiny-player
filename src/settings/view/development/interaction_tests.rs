@@ -101,6 +101,39 @@ fn settle_menu_frames(cx: &mut VisualTestContext) {
 }
 
 #[gpui::test]
+fn about_clears_settings_search_and_opens_the_project_link_without_saving(cx: &mut TestAppContext) {
+    let (root, cx) = settings_window(cx);
+    cx.simulate_resize(size(px(900.0), px(600.0)));
+    cx.run_until_parked();
+    let dialog = root.read_with(cx, |root, _| root.dialog.clone());
+    let original = dialog.read_with(cx, |dialog, _| dialog.snapshot());
+    let search = dialog.read_with(cx, |dialog, _| dialog.search.clone());
+    search.update(cx, |search, cx| search.set_value("HTTP", cx));
+    cx.run_until_parked();
+    click(cx, "settings-category-关于");
+    assert!(search.read_with(cx, |search, _| search.value()).is_empty());
+    let scroll = dialog.read_with(cx, |dialog, _| dialog.scroll_handle.clone());
+    for (width, height) in [(900.0, 600.0), (960.0, 680.0), (1100.0, 720.0)] {
+        cx.simulate_resize(size(px(width), px(height)));
+        cx.run_until_parked();
+        crate::settings::view::test_support::assert_about_centered(scroll.bounds(), cx);
+    }
+    click(cx, "settings-about-github");
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some(env!("CARGO_PKG_REPOSITORY"))
+    );
+    assert_eq!(root.read_with(cx, |root, _| root.change_count), 0);
+    assert_eq!(
+        dialog.read_with(cx, |dialog, _| dialog.snapshot()),
+        original
+    );
+    click(cx, "settings-category-外观");
+    assert!(cx.debug_bounds("settings-about-github").is_none());
+    assert!(cx.debug_bounds("color-theme-dropdown").is_some());
+}
+
+#[gpui::test]
 fn latte_selected_categories_dropdowns_and_switches_have_hover_feedback(cx: &mut TestAppContext) {
     let (root, cx) = settings_window(cx);
     cx.update(|_, cx| theme::set(ColorTheme::Latte, cx));

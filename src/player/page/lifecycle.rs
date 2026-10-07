@@ -95,6 +95,7 @@ impl PlaybackPage {
                 error_message,
             ),
             backend_poll: Default::default(),
+            power: Default::default(),
             emby: request.emby,
             report_effects,
             queue_effects,

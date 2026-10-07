@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tomllib
@@ -159,10 +160,15 @@ def build_bundle():
     shutil.copy2(LOCK_PATH, build_info / LOCK_PATH.name)
     shutil.copy2(ROOT / "Cargo.lock", build_info / "Cargo.lock")
     shutil.copytree(CACHE / "native/package-info", build_info / "native-packages")
+    ffmpeg_commit = re.search(r"-g([0-9a-f]+)", lock["ffmpeg"]["version"])
+    ffmpeg_source = lock["ffmpeg"].get("source_url") or (
+        "https://github.com/FFmpeg/FFmpeg/tree/" + ffmpeg_commit[1]
+        if ffmpeg_commit else "https://github.com/FFmpeg/FFmpeg/tree/release/9.0"
+    )
     (licenses / "SOURCES.txt").write_text(
         "Native library source and build recipes:\n"
         + lock["ffmpeg"]["build_source"] + "\n"
-        + "https://github.com/FFmpeg/FFmpeg/tree/946fcce07b\n"
+        + ffmpeg_source + "\n"
         + "https://github.com/msys2/MINGW-packages\n"
         + "MSYS2 package build metadata and recipe SHA256: ../build-info/native-packages/*/BUILDINFO\n"
         + "Exact binary versions, URLs and hashes: ../build-info/native-lock.json\n"

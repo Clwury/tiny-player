@@ -155,6 +155,7 @@ impl UserSettingsDialogState {
         );
         match self.controller.view_model().category {
             SettingsCategory::General | SettingsCategory::Readahead => unreachable!("development category in user settings"),
+            SettingsCategory::About => super::about::render_about(cx),
             SettingsCategory::Appearance => content.child(section("主题", cx).child(setting_row(
                 "user-setting-theme",
                 "颜色主题",

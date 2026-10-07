@@ -171,6 +171,7 @@ def build_bundle(binary, output):
         shutil.copytree("/opt/tiny-player/share/build-info", root / "build-info")
         shutil.copy2(repo / "Cargo.lock", root / "build-info/Cargo.lock")
         shutil.copy2(repo / "packaging/linux/build-native.sh", root / "build-info/build-native.sh")
+        shutil.copy2(repo / "packaging/linux/build-ffmpeg.sh", root / "build-info/build-ffmpeg.sh")
         shutil.copy2(repo / "packaging/linux/install.sh", root / "install.sh")
         (root / "install.sh").chmod(0o755)
         shutil.copy2(repo / "packaging/linux/README.txt", root / "README.txt")

@@ -44,17 +44,25 @@ pub(crate) enum SettingsCategory {
     Memory,
     Disk,
     Readahead,
+    About,
 }
 
 impl SettingsCategory {
-    pub(crate) const USER: [Self; 4] = [Self::Appearance, Self::Playback, Self::Memory, Self::Disk];
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const USER: [Self; 5] = [
+        Self::Appearance,
+        Self::Playback,
+        Self::Memory,
+        Self::Disk,
+        Self::About,
+    ];
+    pub(crate) const ALL: [Self; 7] = [
         Self::Appearance,
         Self::Playback,
         Self::General,
         Self::Memory,
         Self::Disk,
         Self::Readahead,
+        Self::About,
     ];
 
     pub(crate) fn title(self) -> &'static str {
@@ -65,6 +73,7 @@ impl SettingsCategory {
             Self::Memory => "内存缓存",
             Self::Disk => "磁盘缓存",
             Self::Readahead => "预读策略",
+            Self::About => "关于",
         }
     }
 }

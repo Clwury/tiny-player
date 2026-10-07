@@ -18,9 +18,24 @@ glibc 2.39 是发布基线，包内所有 ELF 的实际版本需求均不得高�
 构建缓存保存在 `target/linux-x86_64-glibc2.39/`，源码以只读方式挂入容器。
 
 打包入口只执行 release 构建、依赖收集、ELF 检查和归档；开发检查单独运行。
-依赖版本由 `Cargo.lock` 和 `packaging/linux/build-native.sh` 固定：
+依赖版本由 `Cargo.lock`、`packaging/linux/build-native.sh` 和 `build-ffmpeg.sh` 固定：
 FFmpeg 9.0.1、libplacebo 7.360.1、Vulkan-Headers 1.4.357；Rust 为 1.97.0。
 Ubuntu 安全更新随构建时的仓库更新，镜像不承诺逐字节可复现。
+
+## GitHub Actions 发布
+
+推送到 `master` 后，`.github/workflows/release.yml` 从根 `Cargo.toml` 读取版本，
+以 `v<version>` 为标签创建 Release。推送前需修改应用版本并同步提交 `Cargo.lock`；
+已有标签会使检查失败，不覆盖已有发布。检查通过后，两端并行构建、运行测试与 Clippy，
+完成 ELF/PE 审计并上传构建产物；只有两端都成功才发布包含全部附件的 Release。
+上传过程先创建草稿，附件上传成功后才公开。CI 不要求桌面会话或真实 GPU 播放验收。
+不同版本的推送独立构建，不取消先前推送；Latest 按 GitHub 的版本及创建时间规则选择。
+
+Linux CI 每次解析 FFmpeg `release/9.0` 分支最新提交，并通过 Docker 构建参数
+`FFMPEG_REF` 固定本次构建源码。Buildx 使用 GitHub Actions 的 `type=gha` 缓存持久化
+原生构建层；FFmpeg 是独立层，源码更新不重建 Rust 工具链、Vulkan-Headers 或 libplacebo。
+已加载的构建镜像通过 `package-linux.sh --skip-image-build` 用于打包，避免再次构建镜像。
+实际 FFmpeg 提交及构建脚本保存在包内 `build-info/`。
 
 输出到 `dist/`，其中 `<version>` 由 `Cargo.toml` 中的应用版本自动生成：
 

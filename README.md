@@ -12,6 +12,7 @@ Tiny Player is a native Emby desktop client for Linux and Windows, built with Ru
 - **Playback and track selection**: Choose video versions, audio tracks, and subtitles, set language preferences, and sync playback progress.
 - **Video processing**: Software decoding, Vulkan hardware decoding, and HDR tone mapping. Hardware decoding support depends on the GPU, driver, and video codec.
 - **Playback controls**: Fullscreen, playback speed adjustment, subtitle positioning, a playback information overlay, and configurable memory and disk caches.
+- **Keep awake during video playback**: Request inhibition of automatic screen locking, display power saving, and sleep; release the request when paused, buffering pauses playback, playback ends, or the player closes.
 
 ## Screenshots
 
@@ -30,6 +31,8 @@ Tiny Player is a native Emby desktop client for Linux and Windows, built with Ru
 The Linux prebuilt bundle includes FFmpeg, libplacebo, and selected dependencies. The system must also provide a Vulkan loader, ALSA and audio configuration, Fontconfig, FreeType, fonts, XKB keyboard data, system CA certificates, and GCC/C++ runtime libraries compatible with Ubuntu 24.04 (GCC 13) or later. The glibc 2.39 baseline applies to the prebuilt bundle; requirements for other builds depend on their build environment and dependencies.
 
 The Windows portable bundle includes multimedia dependencies and a Vulkan loader. The system must provide the GPU's Vulkan driver. Running the portable bundle does not require Rust, Python, Visual Studio, or a separate FFmpeg installation.
+
+On Linux, playback idle inhibition requires `xdg-desktop-portal` and a desktop portal backend that implements the Inhibit interface. If the desktop rejects the request, playback continues and the failure is logged. Manual locking and user-initiated sleep remain controlled by the system.
 
 ## Installation
 

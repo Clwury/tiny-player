@@ -88,6 +88,7 @@ impl PlaybackPage {
             cx.notify();
             return;
         }
+        self.release_power_if_idle();
         self.report_playback_progress(true);
         let languages = crate::player::PlaybackLanguagePreferences::get(cx);
         let saved_tracks = effect::preference_key(&command.queue)

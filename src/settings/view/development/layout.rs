@@ -165,11 +165,9 @@ impl PlaybackSettingsDialogState {
     fn render_settings(&self, dialog: Entity<Self>, query: &str, cx: &App) -> impl IntoElement {
         let theme = theme::get(cx);
         let searching = !query.is_empty();
-        let items: Vec<_> = self
-            .setting_items(dialog, cx)
-            .into_iter()
-            .filter(|item| self.controller.view_model().includes(&item.descriptor))
-            .collect();
+        if !searching && self.controller.view_model().category == SettingsCategory::About {
+            return super::super::about::render_about(cx);
+        }
         let mut content = div().flex().flex_col().min_w_0().child(
             div()
                 .mt_2()
@@ -182,6 +180,11 @@ impl PlaybackSettingsDialogState {
                     self.controller.view_model().category.title()
                 }),
         );
+        let items: Vec<_> = self
+            .setting_items(dialog, cx)
+            .into_iter()
+            .filter(|item| self.controller.view_model().includes(&item.descriptor))
+            .collect();
         if items.is_empty() {
             return content
                 .pt_8()

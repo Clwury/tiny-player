@@ -47,6 +47,7 @@ impl PlaybackPage {
             }
             self.video.command(effect.command)
         });
+        self.release_power_if_idle();
         if update.close_track_menu {
             self.presentation.track_select_open = None;
         }

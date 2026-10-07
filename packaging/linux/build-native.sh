@@ -33,21 +33,5 @@ mkdir -p "$prefix/share/licenses/libplacebo"
 cp libplacebo/LICENSE "$prefix/share/licenses/libplacebo/"
 cp libplacebo/3rdparty/fast_float/LICENSE* "$prefix/share/licenses/libplacebo/"
 
-git clone --depth 1 --branch n9.0.1 https://github.com/FFmpeg/FFmpeg.git ffmpeg
-cd ffmpeg
-./configure --prefix="$prefix" --libdir="$prefix/lib" \
-    --arch=x86_64 --cpu=x86-64 --enable-shared --disable-static \
-    --disable-debug --disable-doc --disable-programs --disable-avdevice \
-    --disable-autodetect --disable-encoders --disable-muxers \
-    --enable-pthreads --enable-vulkan --glslc=glslangValidator \
-    --enable-libdav1d --enable-gnutls --enable-zlib --enable-bzlib --enable-lzma
-make -j "$jobs"
-make install
-git rev-parse HEAD > "$prefix/share/build-info/ffmpeg.commit"
-cp ffbuild/config.mak "$prefix/share/build-info/ffmpeg-config.mak"
-mkdir -p "$prefix/share/licenses/ffmpeg"
-cp COPYING* LICENSE.md "$prefix/share/licenses/ffmpeg/"
-printf '%s\n' "$prefix/lib" > /etc/ld.so.conf.d/tiny-player.conf
-/sbin/ldconfig
 cd /
 rm -rf /tmp/native

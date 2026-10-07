@@ -1,4 +1,5 @@
 //! Settings window presentation; pure settings policy remains in the controller.
+mod about;
 pub(crate) mod controls;
 mod development;
 mod dialog;

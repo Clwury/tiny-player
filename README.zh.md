@@ -12,6 +12,7 @@ Tiny Player 是使用 Rust 和 GPUI 构建的原生 Emby 桌面客户端，面�
 - **播放与选轨**：选择视频版本、音轨和字幕，设置语言偏好，同步播放进度。
 - **视频处理**：软件解码、Vulkan 硬件解码，以及 HDR 色调映射；硬解能力取决于显卡、驱动和视频编码。
 - **播放体验**：全屏、倍速、字幕位置调整、播放信息面板，以及可配置的内存和磁盘缓存。
+- **播放时保持唤醒**：播放视频时自动请求禁止自动锁屏、屏幕节能与睡眠；暂停、缓冲导致暂停、播放结束或关闭播放器时自动释放请求。
 
 ## 应用截图
 
@@ -30,6 +31,8 @@ Tiny Player 是使用 Rust 和 GPUI 构建的原生 Emby 桌面客户端，面�
 Linux 预编译包包含 FFmpeg、libplacebo 及部分依赖，系统还需提供 Vulkan loader、ALSA 及音频配置、Fontconfig、FreeType、字体、XKB 键盘数据、系统 CA 证书，以及与 Ubuntu 24.04（GCC 13）或更新版本兼容的 GCC/C++ 运行库。glibc 2.39 是预编译包的运行基线，其他方式构建时以构建环境和依赖要求为准。
 
 Windows 便携包包含多媒体依赖与 Vulkan loader，显卡的 Vulkan 驱动由系统提供。运行便携包无需安装 Rust、Python、Visual Studio 或 FFmpeg。
+
+Linux 的播放抑制功能需要 `xdg-desktop-portal` 及实现 Inhibit 接口的桌面门户后端。桌面拒绝请求时会记录日志，播放仍继续。手动锁屏与用户主动触发的睡眠由系统控制。
 
 ## 安装
 
