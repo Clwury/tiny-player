@@ -11,7 +11,6 @@ use crate::{
 
 use super::{
     TinyApp, app_window_options,
-    resize::resize_handles,
     window::{
         WindowCornersExt, WindowFrameColors, sync_window_decorations, window_corner_radii,
         window_frame, window_has_rounded_corners, window_uses_system_decorations,
@@ -114,8 +113,7 @@ impl Render for SettingsWindow {
                         )
                     })
                     .child(div().flex_1().min_h_0().child(self.settings.clone())),
-            )
-            .when(rounded_window, |this| this.children(resize_handles()));
+            );
 
         window_frame(
             content,
@@ -124,6 +122,7 @@ impl Render for SettingsWindow {
                 top: theme.title_bar,
                 bottom_left: theme.panel_background,
             },
+            true,
             window,
             cx,
         )

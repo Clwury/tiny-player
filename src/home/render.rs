@@ -7,14 +7,14 @@ use gpui::{
 };
 
 use crate::{
-    app::{WINDOW_RESIZE_EDGE_WIDTH_PX, window_corner_radii, window_has_rounded_corners},
+    app::{window_content_size, window_corner_radii},
     theme,
     ui::scrollbar::Scrollbar,
 };
 
 use super::{
     HomeContent, HomeDashboard, HomePage,
-    carousel::home_main_content_width,
+    carousel::{HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX, home_main_content_width},
     components::home_section_title,
     navigation::{HomeRoot, HomeRoute},
 };
@@ -22,11 +22,6 @@ use super::{
 impl HomeContent {
     fn render_main_content(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let corners = window_corner_radii(window, cx);
-        let scrollbar_right_inset = if window_has_rounded_corners(window) {
-            px(WINDOW_RESIZE_EDGE_WIDTH_PX)
-        } else {
-            px(0.0)
-        };
 
         let current = self.controller.route();
         let is_home = current == &HomeRoute::Root(HomeRoot::Home);
@@ -119,8 +114,7 @@ impl HomeContent {
                 this.child(
                     Scrollbar::vertical(scroll_handle)
                         .id("home-main-scrollbar")
-                        .edge_inset(px(8.0))
-                        .right_inset(scrollbar_right_inset),
+                        .edge_inset(px(8.0)),
                 )
             })
             .when_some(self.item_context_menu.clone(), |this, menu| {
@@ -192,7 +186,8 @@ impl HomeContent {
             .right_0()
             .bottom_0()
             .left_0()
-            .p_6()
+            .px(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
+            .py_6()
             .flex()
             .flex_col()
             .gap_2()
@@ -257,7 +252,7 @@ impl Render for HomeDashboard {
 }
 
 fn window_size_key(window: &Window) -> (u32, u32) {
-    let size = window.viewport_size();
+    let size = window_content_size(window);
     (
         f32::from(size.width).round().max(0.0) as u32,
         f32::from(size.height).round().max(0.0) as u32,

@@ -7,11 +7,17 @@ use crate::{
     emby::{EmbyClient, UserItems},
     home::{
         HomeContent, UserViewItemsRow,
-        carousel::{HOME_MAIN_SCROLLBAR_WIDTH_PX, HOME_SIDEBAR_WIDTH_PX},
+        carousel::{
+            HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX, HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX,
+            HOME_SIDEBAR_WIDTH_PX,
+        },
     },
     server::CachedServer,
     theme,
-    ui::titlebar::APP_TITLEBAR_HEIGHT_PX,
+    ui::{
+        scrollbar::{SCROLLBAR_RIGHT_INSET_PX, SCROLLBAR_WIDTH_PX},
+        titlebar::APP_TITLEBAR_HEIGHT_PX,
+    },
 };
 
 struct DashboardWindow {
@@ -290,6 +296,22 @@ fn assert_dashboard_insets(
     assert_eq!(f32::from(viewport.right()), width);
     assert_eq!(f32::from(viewport.bottom()), height);
 
+    let thumb = cx.update(|window, cx| {
+        let scale = window.scale_factor();
+        window
+            .painted_quads()
+            .iter()
+            .find(|quad| quad.background == theme::get(cx).scrollbar_thumb.into())
+            .map(|quad| quad.bounds.map(|value| px(value.0 / scale)))
+    });
+    if let Some(thumb) = thumb {
+        assert_eq!(thumb.size.width, px(SCROLLBAR_WIDTH_PX));
+        assert_eq!(
+            viewport.right() - thumb.right(),
+            px(SCROLLBAR_RIGHT_INSET_PX)
+        );
+    }
+
     for selector in [
         "user-views-row",
         "resume-items-row",
@@ -297,16 +319,30 @@ fn assert_dashboard_insets(
         "view-all-library-0",
     ] {
         let bounds = cx.debug_bounds(selector).expect("visible Home row");
+        if selector != "view-all-library-0" {
+            assert_eq!(
+                f32::from(bounds.left() - viewport.left()),
+                HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX,
+                "left inset changed for {selector} at {width}x{height}",
+            );
+        }
         assert_eq!(
             width - f32::from(bounds.right()),
-            24.0 + HOME_MAIN_SCROLLBAR_WIDTH_PX,
+            HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX,
             "right inset changed for {selector} at {width}x{height}",
         );
+        if let Some(thumb) = thumb {
+            assert_eq!(
+                thumb.left() - bounds.right(),
+                px(HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX),
+                "content overlaps the scrollbar for {selector} at {width}x{height}",
+            );
+        }
     }
 }
 
 #[gpui::test]
-fn home_right_padding_stays_constant_through_resize_steps(cx: &mut TestAppContext) {
+fn home_horizontal_padding_stays_constant_through_resize_steps(cx: &mut TestAppContext) {
     cx.update(theme::init);
     let (root, cx) = cx.add_window_view(|_, cx| dashboard_window(cx));
 

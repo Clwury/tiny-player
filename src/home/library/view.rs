@@ -12,7 +12,10 @@ use crate::{
 
 use crate::home::{
     HomeContent,
-    carousel::HOME_MAIN_SCROLLBAR_WIDTH_PX,
+    carousel::{
+        HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX, HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX,
+        HOME_MAIN_SCROLLBAR_GUTTER_PX,
+    },
     library::{LibraryView, available_library_sorts},
     navigation::HomeRoute,
 };
@@ -77,7 +80,7 @@ impl HomeContent {
                     .items_start()
                     .gap_3()
                     .bg(theme.background)
-                    .px_4()
+                    .px(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
                     .pt_3()
                     .child(workspace_back_button(back, cx))
                     .child(
@@ -106,9 +109,10 @@ impl HomeContent {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
+                    .scrollbar_width(px(HOME_MAIN_SCROLLBAR_GUTTER_PX))
                     .track_scroll(&state.presentation.grid.scroll_handle)
-                    .px_6()
+                    .px(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
+                    .pr(px(HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX))
                     .pb_6()
                     .when(state.model.empty, |this| {
                         this.child(self.render_center_message("该媒体库暂无内容", false, cx))

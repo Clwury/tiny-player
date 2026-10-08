@@ -30,8 +30,12 @@ pub(super) const DETAIL_PERSON_CARD_IMAGE_HEIGHT_PX: f32 = 210.0;
 pub(super) const DETAIL_PERSON_CARD_PADDING_PX: f32 = 4.0;
 pub(super) const DETAIL_PERSON_CARD_GAP_PX: f32 = 16.0;
 pub(super) const HOME_SIDEBAR_WIDTH_PX: f32 = 252.0;
-pub(super) const HOME_MAIN_SCROLLBAR_WIDTH_PX: f32 = crate::ui::scrollbar::SCROLLBAR_WIDTH_PX;
-const HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX: f32 = 48.0;
+pub(super) const HOME_MAIN_SCROLLBAR_GUTTER_PX: f32 =
+    crate::ui::scrollbar::SCROLLBAR_WIDTH_PX + crate::ui::scrollbar::SCROLLBAR_RIGHT_INSET_PX;
+// The right inset includes both the scrollbar and its gap to the window frame.
+pub(super) const HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX: f32 = 16.0;
+pub(super) const HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX: f32 =
+    HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX - HOME_MAIN_SCROLLBAR_GUTTER_PX;
 const HOME_ITEM_SCROLL_CARD_COUNT: f32 = 4.0;
 const HOME_ITEM_CARD_OUTER_WIDTH_PX: f32 =
     HOME_ITEM_CARD_WIDTH_PX + HOME_ITEM_CARD_PADDING_PX * 2.0;
@@ -53,15 +57,13 @@ const DETAIL_PERSON_SCROLL_STEP_PX: f32 =
     DETAIL_PERSON_CARD_STEP_PX * DETAIL_PERSON_SCROLL_CARD_COUNT;
 
 pub(super) fn home_main_content_width(window: &Window) -> f32 {
-    home_main_content_width_for_window_width(f32::from(window.viewport_size().width))
+    home_main_content_width_for_window_width(f32::from(
+        crate::app::window_content_size(window).width,
+    ))
 }
 
 pub(super) fn home_main_content_width_for_window_width(window_width: f32) -> f32 {
-    (window_width
-        - HOME_SIDEBAR_WIDTH_PX
-        - HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX
-        - HOME_MAIN_SCROLLBAR_WIDTH_PX)
-        .max(0.0)
+    (window_width - HOME_SIDEBAR_WIDTH_PX - HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX * 2.0).max(0.0)
 }
 
 pub(super) fn carousel_content_width(total: usize) -> f32 {

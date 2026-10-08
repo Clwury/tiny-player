@@ -9,6 +9,9 @@ use crate::theme;
 
 use crate::home::{
     HomeContent,
+    carousel::{
+        HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX, HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX,
+    },
     favorites::{favorite_section_title, view::favorite_action},
     navigation::HomeRoute,
 };
@@ -71,7 +74,7 @@ impl HomeContent {
                     .flex_none()
                     .items_center()
                     .gap_3()
-                    .px_4()
+                    .px(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
                     .pt_3()
                     .pb_4()
                     .child(workspace_back_button(
@@ -104,9 +107,12 @@ impl HomeContent {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .px_6()
+                    .px(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
                     .pb_6()
-                    .when(!state.items.is_empty(), |this| this.child(grid))
+                    .when(!state.items.is_empty(), |this| {
+                        this.pr(px(HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX))
+                            .child(grid)
+                    })
                     .when(
                         state.can_auto_load_more() && self.layout.view_model().auto_paginate,
                         |this| this.child(observer),

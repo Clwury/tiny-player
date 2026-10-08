@@ -246,7 +246,7 @@ jobs:
           SHA256 checksum files are attached.
           EOF
           gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
-            --title "Tiny Player $RELEASE_TAG" --draft --generate-notes \
+            --title "$RELEASE_TAG" --draft --generate-notes \
             --notes-file "$RUNNER_TEMP/release-notes.md" "${assets[@]}"
           release_id=$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)
           # Concurrent pushes may finish out of order; select Latest by version.

@@ -1,8 +1,8 @@
 use gpui::{
-    App, BorderStyle, Bounds, Context, Corners, Decorations, Edges, Hsla, IntoElement,
-    ParentElement, Pixels, SharedString, Size, Styled, Tiling, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, canvas, div, point,
-    px, quad,
+    App, BorderStyle, Bounds, Context, Corners, Decorations, Edges, Hsla, InteractiveElement,
+    IntoElement, ParentElement, Pixels, SharedString, Size, Styled, Tiling, TitlebarOptions,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions, canvas,
+    div, point, prelude::FluentBuilder, px, quad,
 };
 
 use crate::{
@@ -11,7 +11,10 @@ use crate::{
     ui::paint::{device_bounds, device_mask},
 };
 
-use super::{Page, TinyApp};
+use super::{
+    Page, TinyApp,
+    resize::{WINDOW_RESIZE_OUTSET, resize_handles},
+};
 
 #[cfg(target_os = "windows")]
 pub(super) mod windows;
@@ -127,13 +130,36 @@ fn window_frame_borders(window: &Window) -> Edges<Pixels> {
     untiled_border_widths(tiling, window_border_width(window))
 }
 
-fn untiled_border_widths(tiling: Tiling, border_width: Pixels) -> Edges<Pixels> {
+pub(super) fn untiled_border_widths(tiling: Tiling, border_width: Pixels) -> Edges<Pixels> {
     let width = |tiled| if tiled { px(0.0) } else { border_width };
     Edges {
         top: width(tiling.top),
         right: width(tiling.right),
         bottom: width(tiling.bottom),
         left: width(tiling.left),
+    }
+}
+
+fn window_frame_outsets(window: &Window) -> Edges<Pixels> {
+    if cfg!(target_os = "linux") && window_has_rounded_corners(window) && window.is_resizable() {
+        let Decorations::Client { tiling } = window.window_decorations() else {
+            return Edges::default();
+        };
+        untiled_border_widths(tiling, WINDOW_RESIZE_OUTSET)
+    } else {
+        Edges::default()
+    }
+}
+
+pub(crate) fn window_content_size(window: &Window) -> Size<Pixels> {
+    let outsets = window_frame_outsets(window);
+    let borders = window_frame_borders(window);
+    let viewport = window.viewport_size();
+    Size {
+        width: (viewport.width - outsets.left - outsets.right - borders.left - borders.right)
+            .max(px(0.0)),
+        height: (viewport.height - outsets.top - outsets.bottom - borders.top - borders.bottom)
+            .max(px(0.0)),
     }
 }
 
@@ -147,12 +173,59 @@ pub(super) struct WindowFrameColors {
 pub(super) fn window_frame(
     content: impl IntoElement,
     colors: WindowFrameColors,
-    window: &Window,
+    allow_resize: bool,
+    window: &mut Window,
     cx: &App,
 ) -> impl IntoElement {
+    let outsets = window_frame_outsets(window);
+    let client_inset = outsets
+        .top
+        .max(outsets.right)
+        .max(outsets.bottom)
+        .max(outsets.left);
+    // Register the transparent exterior with Wayland/X11 so tiling and window
+    // geometry refer to the visible frame while pointer input covers the ring.
+    if window.client_inset() != Some(client_inset) {
+        window.set_client_inset(client_inset);
+    }
     let borders = window_frame_borders(window);
     let corners = window_frame_corner_radii(window, cx);
-    window_frame_surface(content, borders, corners, colors, cx)
+    window_frame_container(
+        content,
+        borders,
+        corners,
+        colors,
+        outsets,
+        allow_resize && client_inset > px(0.0),
+        cx,
+    )
+}
+
+fn window_frame_container(
+    content: impl IntoElement,
+    borders: Edges<Pixels>,
+    corners: Corners<Pixels>,
+    colors: WindowFrameColors,
+    outsets: Edges<Pixels>,
+    allow_resize: bool,
+    cx: &App,
+) -> impl IntoElement {
+    div()
+        .relative()
+        .size_full()
+        .pt(outsets.top)
+        .pr(outsets.right)
+        .pb(outsets.bottom)
+        .pl(outsets.left)
+        .child(window_frame_surface(content, borders, corners, colors, cx))
+        .when(allow_resize, |this| {
+            this.child(resize_handles(Edges {
+                top: outsets.top + borders.top,
+                right: outsets.right + borders.right,
+                bottom: outsets.bottom + borders.bottom,
+                left: outsets.left + borders.left,
+            }))
+        })
 }
 
 fn window_frame_surface(
@@ -168,6 +241,7 @@ fn window_frame_surface(
     // layout. Div paints its fill and border separately; paint both in the
     // same quad to avoid repeatedly blending the outer arc's coverage.
     div()
+        .debug_selector(|| "window-frame-surface".to_string())
         .relative()
         .size_full()
         .border_t(borders.top)
@@ -627,6 +701,75 @@ mod tests {
                     cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
                     cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::default());
                 }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn exterior_resize_ring_preserves_content_clicks_and_frame_geometry(cx: &mut TestAppContext) {
+        use gpui::{InteractiveElement, Modifiers, MouseButton, Render};
+
+        struct ClientFrame {
+            clicks: usize,
+        }
+        impl Render for ClientFrame {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = theme::get(cx);
+                window_frame_container(
+                    div()
+                        .debug_selector(|| "resize-test-content".to_string())
+                        .size_full()
+                        .rounded(px(9.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, _| this.clicks += 1),
+                        ),
+                    Edges::all(window_border_width(window)),
+                    linux_window_corner_radii(Tiling::default()),
+                    WindowFrameColors {
+                        background: theme.background,
+                        top: theme.background,
+                        bottom_left: theme.background,
+                    },
+                    Edges::all(WINDOW_RESIZE_OUTSET),
+                    true,
+                    cx,
+                )
+            }
+        }
+        cx.update(theme::init);
+        let (root, cx) = cx.add_window_view(|_, _| ClientFrame { clicks: 0 });
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            cx.simulate_resize(size(px(900.0), px(600.0)));
+            cx.update(|window, _| window.set_scale_factor(scale));
+            cx.run_until_parked();
+            let frame = cx.debug_bounds("window-frame-surface").unwrap();
+            let content = cx.debug_bounds("resize-test-content").unwrap();
+            let border = cx.update(|window, _| window_border_width(window));
+            assert_eq!(
+                frame,
+                Bounds::new(point(px(8.0), px(8.0)), size(px(884.0), px(584.0)))
+            );
+            assert_eq!(content, frame.inset(border));
+            cx.update(|window, _| {
+                let frame = frame.scale(scale);
+                for quad in window.painted_quads() {
+                    let painted = quad.bounds.intersect(&quad.content_mask.bounds);
+                    assert_eq!(painted.intersect(&frame), painted);
+                }
+            });
+            for position in [
+                point(content.left() + px(0.5), content.center().y),
+                point(content.right() - px(0.5), content.center().y),
+                point(content.center().x, content.top() + px(0.5)),
+                point(content.center().x, content.bottom() - px(0.5)),
+                point(content.left() + px(4.0), content.top() + px(4.0)),
+                point(content.right() - px(4.0), content.bottom() - px(4.0)),
+            ] {
+                let before = root.read_with(cx, |root, _| root.clicks);
+                cx.simulate_click(position, Modifiers::default());
+                assert_eq!(root.read_with(cx, |root, _| root.clicks), before + 1);
             }
         }
     }

@@ -20,12 +20,10 @@ use std::collections::HashMap;
 
 use gpui::{Context, Entity, SharedString, Task, WindowHandle};
 
-pub(crate) use resize::WINDOW_RESIZE_EDGE_WIDTH_PX;
 #[cfg(target_os = "windows")]
 pub(crate) use window::windows::prevent_playback_idle;
 pub(crate) use window::{
-    app_window_options, window_corner_radii, window_has_rounded_corners,
-    window_uses_system_decorations,
+    app_window_options, window_content_size, window_corner_radii, window_uses_system_decorations,
 };
 
 use crate::server::view::ServerContextMenu;

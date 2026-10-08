@@ -6,7 +6,12 @@ use gpui::{
 use crate::theme;
 use crate::ui::radius;
 
-use crate::home::HomeContent;
+use crate::home::{
+    HomeContent,
+    carousel::{
+        HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX, HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX,
+    },
+};
 
 use crate::home::grid::*;
 
@@ -65,7 +70,7 @@ impl HomeContent {
                     .gap_3()
                     .flex_none()
                     .bg(theme.background)
-                    .px_6()
+                    .px(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
                     .pt_6()
                     .pb_5()
                     .child(div().w_full().child(self.search_input.clone()))
@@ -80,13 +85,14 @@ impl HomeContent {
                     .flex_1()
                     .min_h_0()
                     .relative()
-                    .px_6()
+                    .px(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
                     .pb_6()
                     .when(self.controller.search_view().empty_results, |this| {
                         this.child(self.render_center_message("未找到相关电影或剧集", false, cx))
                     })
                     .when(!self.controller.search_view().items.is_empty(), |this| {
-                        this.child(grid)
+                        this.pr(px(HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX))
+                            .child(grid)
                     })
                     .when(
                         self.controller.search_view().can_load_more

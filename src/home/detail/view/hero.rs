@@ -48,7 +48,8 @@ impl HomeContent {
         window: &Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let hero_height = (f32::from(window.bounds().size.height) * 0.6).max(260.0);
+        let hero_height =
+            (f32::from(crate::app::window_content_size(window).height) * 0.6).max(260.0);
         let theme = theme::get(cx);
         let main_content_width = home_main_content_width(window);
 
@@ -60,7 +61,8 @@ impl HomeContent {
             .left_0()
             .id("home-media-detail")
             .overflow_y_scroll()
-            .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
+            // The scrollbar overlays the artwork instead of reserving a gutter.
+            .scrollbar_width(px(0.0))
             .track_scroll(
                 &self
                     .detail_view()
@@ -79,7 +81,8 @@ impl HomeContent {
                     this.child(self.render_series_detail_hero(detail, hero_height, cx))
                         .child(
                             div()
-                                .p_6()
+                                .px(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
+                                .py_6()
                                 .flex()
                                 .flex_col()
                                 .gap_5()
@@ -201,7 +204,7 @@ impl HomeContent {
             .id("series-detail-back-button")
             .debug_selector(|| "series-detail-back-button".to_string())
             .absolute()
-            .left_4()
+            .left(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
             // Match sidebar p_3 and its 32px button centered in a 36px title row.
             .top_3()
             .mt(px(2.0))
@@ -310,8 +313,8 @@ impl HomeContent {
             .child(
                 div()
                     .absolute()
-                    .left_6()
-                    .right_6()
+                    .left(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
+                    .right(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
                     .bottom_6()
                     .flex()
                     .max_w(px(760.0))

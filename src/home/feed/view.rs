@@ -13,10 +13,11 @@ use crate::home::{
     HomeContent,
     carousel::{
         CarouselVisibleRange, HOME_ITEM_CARD_GAP_PX, HOME_ITEM_CARD_PADDING_PX,
-        HOME_ITEM_CARD_WIDTH_PX, HOME_MAIN_SCROLLBAR_WIDTH_PX, USER_VIEW_CARD_GAP_PX,
-        USER_VIEW_CARD_PADDING_PX, USER_VIEW_CARD_WIDTH_PX, carousel_content_width,
-        carousel_content_width_for, carousel_visible_range_between_for, max_carousel_scroll_offset,
-        max_carousel_scroll_offset_for,
+        HOME_ITEM_CARD_WIDTH_PX, HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX,
+        HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX, HOME_MAIN_SCROLLBAR_GUTTER_PX,
+        USER_VIEW_CARD_GAP_PX, USER_VIEW_CARD_PADDING_PX, USER_VIEW_CARD_WIDTH_PX,
+        carousel_content_width, carousel_content_width_for, carousel_visible_range_between_for,
+        max_carousel_scroll_offset, max_carousel_scroll_offset_for,
     },
     components::{
         carousel_button, home_section_more_button, home_section_title, home_section_title_text,
@@ -47,9 +48,11 @@ impl HomeContent {
             .left_0()
             .id("home-main-content")
             .overflow_y_scroll()
-            .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
+            .scrollbar_width(px(HOME_MAIN_SCROLLBAR_GUTTER_PX))
             .track_scroll(&self.home_scroll_handle)
-            .p_6()
+            .px(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
+            .pr(px(HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX))
+            .py_6()
             .when(show_user_views_section, |this| {
                 this.child(
                     div()

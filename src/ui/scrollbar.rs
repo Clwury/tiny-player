@@ -10,8 +10,10 @@ use gpui::{
 use crate::theme;
 
 pub(crate) const SCROLLBAR_WIDTH_PX: f32 = 6.0;
+pub(crate) const SCROLLBAR_RIGHT_INSET_PX: f32 = 4.0;
 
 const SCROLLBAR_WIDTH: Pixels = px(SCROLLBAR_WIDTH_PX);
+const SCROLLBAR_RADIUS: Pixels = px(SCROLLBAR_WIDTH_PX / 2.0);
 const MIN_THUMB_HEIGHT_PX: f32 = 32.0;
 const DEFAULT_EDGE_INSET: Pixels = px(4.0);
 
@@ -79,7 +81,7 @@ impl Scrollbar {
             id: ElementId::CodeLocation(*Location::caller()),
             scroll_handle: scroll_handle.clone(),
             edge_inset: DEFAULT_EDGE_INSET,
-            right_inset: px(0.0),
+            right_inset: px(SCROLLBAR_RIGHT_INSET_PX),
         }
     }
 
@@ -263,8 +265,12 @@ impl Element for Scrollbar {
             hitbox,
         );
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            window.paint_quad(fill(geometry.track_bounds, track_color).corner_radii(px(6.0)));
-            window.paint_quad(fill(geometry.thumb_bounds, thumb_color).corner_radii(px(6.0)));
+            window.paint_quad(
+                fill(geometry.track_bounds, track_color).corner_radii(SCROLLBAR_RADIUS),
+            );
+            window.paint_quad(
+                fill(geometry.thumb_bounds, thumb_color).corner_radii(SCROLLBAR_RADIUS),
+            );
         });
 
         let view_id = window.current_view();

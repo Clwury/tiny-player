@@ -11,7 +11,6 @@ use crate::{
 
 use super::{
     Page, TinyApp,
-    resize::resize_handles,
     shell::AppRoute,
     window::{
         WindowCornersExt, WindowFrameColors, sync_window_decorations, window_corner_radii,
@@ -184,11 +183,8 @@ impl Render for TinyApp {
                     cx,
                 ))
             })
-            .when_some(icon_picker, |this, picker| this.child(picker))
-            .when(rounded_window && !modal_open, |this| {
-                this.children(resize_handles())
-            });
+            .when_some(icon_picker, |this, picker| this.child(picker));
 
-        window_frame(content, frame_colors, window, cx)
+        window_frame(content, frame_colors, !modal_open, window, cx)
     }
 }

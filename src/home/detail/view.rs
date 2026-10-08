@@ -22,7 +22,7 @@ use super::super::{
         DETAIL_EPISODE_CARD_GAP_PX, DETAIL_EPISODE_CARD_PADDING_PX, DETAIL_EPISODE_CARD_WIDTH_PX,
         DETAIL_PERSON_CARD_GAP_PX, DETAIL_PERSON_CARD_PADDING_PX, DETAIL_PERSON_CARD_WIDTH_PX,
         HOME_ITEM_CARD_GAP_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
-        HOME_MAIN_SCROLLBAR_WIDTH_PX, carousel_content_width_for,
+        HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX, carousel_content_width_for,
         carousel_visible_range_between_for, home_main_content_width,
         max_carousel_scroll_offset_for,
     },

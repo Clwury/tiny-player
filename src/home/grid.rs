@@ -15,7 +15,7 @@ use crate::home::{
     carousel::{
         DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX, DETAIL_EPISODE_CARD_WIDTH_PX, HOME_ITEM_CARD_GAP_PX,
         HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
-        HOME_MAIN_SCROLLBAR_WIDTH_PX, home_main_content_width_for_window_width,
+        HOME_MAIN_SCROLLBAR_GUTTER_PX, home_main_content_width,
     },
     components::{favorite_episode_card, user_episode_card, user_item_card},
     item_context_menu::ItemContextMenuSource,
@@ -139,7 +139,7 @@ impl HomeContent {
             .min_h_0()
             .overflow_y_scroll()
             .overflow_x_hidden()
-            .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
+            .scrollbar_width(px(HOME_MAIN_SCROLLBAR_GUTTER_PX))
             .track_scroll(&scroll_handle)
             .child(
                 div()
@@ -460,10 +460,7 @@ pub(in crate::home) fn user_item_grid_columns(window: &Window, route: &HomeRoute
         HomeRoute::FavoriteItems { item_type } => UserItemGridSource::Favorites(*item_type),
         _ => UserItemGridSource::Search,
     };
-    user_item_grid_columns_for_width(
-        home_main_content_width_for_window_width(f32::from(window.bounds().size.width)),
-        source.card_width(),
-    )
+    user_item_grid_columns_for_width(home_main_content_width(window), source.card_width())
 }
 
 pub(in crate::home) fn responsive_user_item_grid_columns(measured: usize) -> usize {

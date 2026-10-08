@@ -8,7 +8,7 @@ use gpui::{
     TestAppContext, VisualTestContext, Window, div, point, px, size,
 };
 
-use super::super::carousel::HOME_SIDEBAR_WIDTH_PX;
+use super::super::carousel::{HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX, HOME_SIDEBAR_WIDTH_PX};
 use super::*;
 use crate::{emby::EmbyClient, server::CachedServer, theme};
 
@@ -77,6 +77,14 @@ fn favorites_shows_three_rows_and_more_preserves_category_scroll(cx: &mut TestAp
     assert!(movie.bottom() < series.top());
     assert!(series.bottom() < episode.top());
     assert_eq!(movie.left(), series.left());
+    assert_eq!(
+        movie.left(),
+        px(HOME_SIDEBAR_WIDTH_PX + HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX)
+    );
+    assert_eq!(
+        movie.right(),
+        px(1100.0 - HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX)
+    );
     assert_eq!(movie.right(), series.right());
     assert_eq!(series.right(), episode.right());
     assert!(episode.size.height < movie.size.height);
@@ -293,7 +301,13 @@ fn favorite_episode_cards_keep_detail_dimensions_in_rows_and_responsive_grids(
     ];
     for (width, columns) in [
         (900.0, 2),
+        (999.0, 2),
+        (1000.0, 3),
+        (1001.0, 3),
         (1100.0, 3),
+        (1243.0, 3),
+        (1244.0, 4),
+        (1245.0, 4),
         (1400.0, 4),
         (1100.0, 3),
         (900.0, 2),
@@ -306,7 +320,11 @@ fn favorite_episode_cards_keep_detail_dimensions_in_rows_and_responsive_grids(
         assert_eq!(first.size.width, px(228.0));
         assert!(first.size.height <= px(186.0));
         assert_eq!(last.top(), first.top());
-        assert!(last.right() <= px(width - 24.0));
+        assert_eq!(
+            first.left(),
+            px(HOME_SIDEBAR_WIDTH_PX + HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX)
+        );
+        assert!(last.right() <= px(width - HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX));
         assert_eq!(next_row.left(), first.left());
         assert_eq!(next_row.top() - first.top(), px(202.0));
         content.read_with(cx, |page, _| {

@@ -10,7 +10,8 @@ use crate::home::favorites::{FAVORITE_ITEM_TYPES, FAVORITES_PAGE_LIMIT, favorite
 use crate::home::{
     HomeContent,
     carousel::{
-        HOME_ITEM_CARD_GAP_PX, HOME_ITEM_CARD_PADDING_PX, HOME_MAIN_SCROLLBAR_WIDTH_PX,
+        HOME_ITEM_CARD_GAP_PX, HOME_ITEM_CARD_PADDING_PX, HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX,
+        HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX, HOME_MAIN_SCROLLBAR_GUTTER_PX,
         carousel_content_width_for, carousel_visible_range_between_for, home_main_content_width,
         max_carousel_scroll_offset_for,
     },
@@ -34,9 +35,11 @@ impl HomeContent {
             .left_0()
             .id("home-favorites-content")
             .overflow_y_scroll()
-            .scrollbar_width(px(HOME_MAIN_SCROLLBAR_WIDTH_PX))
+            .scrollbar_width(px(HOME_MAIN_SCROLLBAR_GUTTER_PX))
             .track_scroll(&self.favorites_presentation.scroll_handle)
-            .p_6()
+            .px(px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX))
+            .pr(px(HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX))
+            .py_6()
             .flex()
             .flex_col()
             .gap_8()

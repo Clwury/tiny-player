@@ -7,6 +7,7 @@ use serde_json::json;
 use super::*;
 use crate::{
     emby::{EmbyClient, MediaSource},
+    home::carousel::HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX,
     theme,
 };
 
@@ -65,6 +66,83 @@ fn click_episode_line(cx: &mut VisualTestContext) {
     // Include deferred frame callbacks when checking that the page stays in place.
     cx.update(|window, cx| window.simulate_next_frame(cx));
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn hero_reaches_the_right_edge_and_overlay_scrollbar_remains_draggable(cx: &mut TestAppContext) {
+    use gpui::MouseButton;
+
+    let (page, cx) = episode_line_window(cx);
+    for width in [900.0, 1000.0, 1280.0, 1600.0] {
+        cx.simulate_resize(size(px(width), px(500.0)));
+        page.update(cx, |page, cx| {
+            page.detail_view()
+                .unwrap()
+                .presentation
+                .scroll_handle
+                .set_offset(point(px(0.0), px(0.0)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let hero = cx.debug_bounds("series-detail-hero").unwrap();
+        let viewport = page.read_with(cx, |page, _| {
+            page.detail_view()
+                .unwrap()
+                .presentation
+                .scroll_handle
+                .bounds()
+        });
+        assert_eq!(hero.left(), viewport.left());
+        assert_eq!(hero.right(), viewport.right());
+        assert_eq!(hero.right(), px(width));
+        let thumb = cx.update(|window, cx| {
+            let theme = theme::get(cx);
+            let scale = window.scale_factor();
+            window
+                .painted_quads()
+                .iter()
+                .find(|quad| quad.background == theme.scrollbar_thumb.into())
+                .expect("overflowing details must have a scrollbar")
+                .bounds
+                .map(|value| px(value.0 / scale))
+        });
+        assert_eq!(thumb.right(), viewport.right() - px(4.0));
+        // Dragging in the gap must leave scrolling alone; the thumb itself
+        // must remain draggable after the same window resize.
+        let gap_start = point(viewport.right() - px(2.0), thumb.center().y);
+        let gap_end = point(gap_start.x, viewport.bottom() - px(16.0));
+        cx.simulate_mouse_down(gap_start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(gap_end, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(gap_end, MouseButton::Left, Modifiers::default());
+        page.read_with(cx, |page, _| {
+            assert_eq!(
+                page.detail_view()
+                    .unwrap()
+                    .presentation
+                    .scroll_handle
+                    .offset()
+                    .y,
+                px(0.0)
+            );
+        });
+        let start = thumb.center();
+        let end = point(start.x, viewport.bottom() - px(16.0));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert!(
+                page.detail_view()
+                    .unwrap()
+                    .presentation
+                    .scroll_handle
+                    .offset()
+                    .y
+                    < px(0.0)
+            );
+        });
+    }
 }
 
 #[gpui::test]
@@ -390,8 +468,8 @@ fn logos_adapt_to_aspect_ratio_and_stay_inside_small_heroes(cx: &mut TestAppCont
             let logo = cx.debug_bounds("series-detail-logo").unwrap();
             let hero = cx.debug_bounds("series-detail-hero").unwrap();
             assert!(logo.size.width > px(0.0) && logo.size.height > px(0.0));
-            assert!(logo.left() >= hero.left() + px(24.0));
-            assert!(logo.right() <= hero.right() - px(24.0));
+            assert!(logo.left() >= hero.left() + px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX));
+            assert!(logo.right() <= hero.right() - px(HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX));
             assert!(logo.top() >= hero.top());
             assert!(logo.bottom() <= hero.bottom() - px(24.0));
             assert!(logo.size.height <= px(200.0));
@@ -501,6 +579,17 @@ fn hero_image_and_scrims_share_device_edges_at_different_heights_and_scroll_offs
                     });
                     let hero = cx.debug_bounds("series-detail-hero").unwrap();
                     let backdrop = cx.debug_bounds("series-detail-backdrop").unwrap();
+                    page.read_with(cx, |page, _| {
+                        assert_eq!(
+                            hero.right(),
+                            page.detail_view()
+                                .unwrap()
+                                .presentation
+                                .scroll_handle
+                                .bounds()
+                                .right()
+                        );
+                    });
                     cx.update(|window, cx| {
                         let hero_pixels = crate::ui::paint::device_bounds(window, hero);
                         let image_pixels = crate::ui::paint::device_bounds(window, backdrop);
@@ -523,12 +612,17 @@ fn hero_image_and_scrims_share_device_edges_at_different_heights_and_scroll_offs
                             assert!(quad.bounds.contains(&last_pixel));
                             assert!(quad.content_mask.bounds.contains(&last_pixel));
                         }
-                        // The image stops with its scrims. Only the page surface
-                        // may cover the very next physical pixel row.
-                        for x in [hero_pixels.left() + 8, hero_pixels.center().x, hero_pixels.right() - 8] {
+                        // Outside the overlay scrollbar, the image stops with
+                        // its scrims and the next pixel row is the page surface.
+                        let scrollbar_extent = ((crate::ui::scrollbar::SCROLLBAR_WIDTH_PX + crate::ui::scrollbar::SCROLLBAR_RIGHT_INSET_PX) * scale).ceil() as i32;
+                        for x in [hero_pixels.left() + 8, hero_pixels.center().x, hero_pixels.right() - scrollbar_extent - 8] {
                             let pixel = point(ScaledPixels(x as f32 + 0.5), bottom + ScaledPixels(0.5));
                             let covering = quads.iter().rev().find(|quad| {
-                                quad.bounds.contains(&pixel) && quad.content_mask.bounds.contains(&pixel)
+                                // The overlay scrollbar's transparent track does
+                                // not cover the page surface below the artwork.
+                                !quad.background.is_transparent()
+                                    && quad.bounds.contains(&pixel)
+                                    && quad.content_mask.bounds.contains(&pixel)
                             }).unwrap();
                             assert_eq!(covering.background.as_solid(), Some(theme::get(cx).background));
                         }

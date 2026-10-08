@@ -71,34 +71,34 @@ pub(in crate::home) fn carousel_button(
         .justify_center()
         .when(!align_right, |this| this.left_0())
         .when(align_right, |this| this.right_0())
-        .occlude()
-        .cursor_default()
-        .on_hover(on_hover)
-        .child(
-            div()
-                .id((gpui::ElementId::from(id), "button"))
-                .flex()
-                .size(px(32.0))
-                .items_center()
-                .justify_center()
-                .rounded(radius::CONTROL)
-                .bg(background.opacity(0.96))
-                .shadow_sm()
-                .opacity(if visible { 1.0 } else { 0.0 })
-                .when(visible, |this| this.cursor_pointer())
-                .hover(move |style| style.bg(hover))
-                .active(move |style| style.bg(pressed))
-                .child(svg().path(icon_path).size(px(18.0)).text_color(foreground))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                    cx.stop_propagation();
-                })
-                .on_click(move |event, window, cx| {
-                    cx.stop_propagation();
-                    if visible {
+        // Only the visible button should intercept input; the positioning
+        // wrapper must leave the cards underneath interactive.
+        .when(visible, |this| {
+            this.child(
+                div()
+                    .id((gpui::ElementId::from(id), "button"))
+                    .flex()
+                    .size(px(32.0))
+                    .items_center()
+                    .justify_center()
+                    .rounded(radius::CONTROL)
+                    .bg(background.opacity(0.96))
+                    .shadow_sm()
+                    .occlude()
+                    .cursor_pointer()
+                    .on_hover(on_hover)
+                    .hover(move |style| style.bg(hover))
+                    .active(move |style| style.bg(pressed))
+                    .child(svg().path(icon_path).size(px(18.0)).text_color(foreground))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click(move |event, window, cx| {
+                        cx.stop_propagation();
                         on_click(event, window, cx);
-                    }
-                }),
-        )
+                    }),
+            )
+        })
 }
 
 pub(in crate::home) fn workspace_back_button(
