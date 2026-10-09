@@ -164,6 +164,7 @@ impl HomeContent {
     pub(super) fn render_series_detail_controls(
         &self,
         detail: DetailView<'_>,
+        window: &Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = theme::get(cx);
@@ -332,9 +333,12 @@ impl HomeContent {
                                         deferred(detail_select_menu(
                                             "series-detail-video-menu",
                                             source_count,
-                                            DETAIL_SELECT_WIDTH_PX,
-                                            DETAIL_TWO_LINE_OPTION_HEIGHT_PX,
+                                            gpui::size(
+                                                px(DETAIL_SELECT_WIDTH_PX),
+                                                px(DETAIL_TWO_LINE_OPTION_HEIGHT_PX),
+                                            ),
                                             &detail.presentation.media_source_scroll_handle,
+                                            window,
                                             cx,
                                             media_sources.iter().enumerate().map(
                                                 |(index, source)| {
@@ -389,9 +393,12 @@ impl HomeContent {
                                         deferred(detail_select_menu(
                                             "series-detail-subtitle-menu",
                                             subtitle_count + 1,
-                                            DETAIL_SELECT_WIDTH_PX,
-                                            DETAIL_TWO_LINE_OPTION_HEIGHT_PX,
+                                            gpui::size(
+                                                px(DETAIL_SELECT_WIDTH_PX),
+                                                px(DETAIL_TWO_LINE_OPTION_HEIGHT_PX),
+                                            ),
                                             &detail.presentation.subtitle_scroll_handle,
+                                            window,
                                             cx,
                                             std::iter::once(
                                                 detail_select_option_with_subtitle(
@@ -484,9 +491,9 @@ impl HomeContent {
                     deferred(detail_select_menu(
                         "series-detail-season-menu",
                         season_count,
-                        select_width,
-                        DETAIL_SELECT_OPTION_HEIGHT_PX,
+                        gpui::size(px(select_width), px(DETAIL_SELECT_OPTION_HEIGHT_PX)),
                         &detail.presentation.season_scroll_handle,
+                        window,
                         cx,
                         seasons.items.iter().enumerate().map(|(index, season)| {
                             let season_id = season.id.clone();

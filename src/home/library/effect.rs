@@ -1,7 +1,7 @@
 use super::controller::LibraryRequest;
 use crate::{emby::UserItems, home::gateway::HomeGateway};
 
-pub(super) fn run_library(
+pub(in crate::home) fn run_library(
     gateway: &(impl HomeGateway + ?Sized),
     request: &LibraryRequest,
 ) -> anyhow::Result<UserItems> {
@@ -77,6 +77,15 @@ mod tests {
         }
         fn search_items(&self, _: &str, _: u32, _: u32) -> anyhow::Result<UserItems> {
             panic!("library must use the user items endpoint")
+        }
+        fn persons(
+            &self,
+            _: &crate::emby::UserItemsQuery,
+        ) -> anyhow::Result<crate::emby::UserItems> {
+            Ok(crate::emby::UserItems {
+                items: Vec::new(),
+                total_record_count: 0,
+            })
         }
         fn user_items(&self, query: &UserItemsQuery) -> anyhow::Result<UserItems> {
             self.calls.lock().unwrap().push(query.clone());

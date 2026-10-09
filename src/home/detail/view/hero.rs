@@ -87,7 +87,9 @@ impl HomeContent {
                                 .flex_col()
                                 .gap_5()
                                 .when(detail.model.item.is_some(), |this| {
-                                    this.child(self.render_series_detail_controls(detail, cx))
+                                    this.child(
+                                        self.render_series_detail_controls(detail, window, cx),
+                                    )
                                 })
                                 .when(detail.model.is_movie(), |this| {
                                     this.when_some(
@@ -411,11 +413,7 @@ impl HomeContent {
             .map(str::trim)
             .filter(|rating| !rating.is_empty())
             .map(ToString::to_string);
-        let genres = item
-            .genres
-            .as_ref()
-            .filter(|genres| !genres.is_empty())
-            .map(|genres| genres.join(", "));
+        let genres = item.genre_tags();
 
         div()
             .flex()
@@ -456,16 +454,26 @@ impl HomeContent {
                         .child(rating),
                 )
             })
-            .when_some(genres, |this, genres| {
-                this.child(
-                    div()
-                        .rounded(radius::CONTROL)
-                        .bg(theme.dialog_background.opacity(0.86))
-                        .px_3()
-                        .py_1()
-                        .text_color(theme.foreground)
-                        .child(genres),
-                )
-            })
+            .children(genres.into_iter().enumerate().map(|(index, genre)| {
+                let label = genre.name.clone();
+                div()
+                    .id((
+                        gpui::ElementId::from("series-detail-genre-tag"),
+                        index.to_string(),
+                    ))
+                    .debug_selector(move || format!("series-detail-genre-tag-{index}"))
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("查看{label}类型"))
+                    .cursor_pointer()
+                    .rounded(radius::CONTROL)
+                    .bg(theme.dialog_background.opacity(0.86))
+                    .px_3()
+                    .py_1()
+                    .text_color(theme.foreground)
+                    .hover(move |style| style.bg(theme.secondary_hover))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |page, _, _, cx| page.open_genre_page(&genre, cx)))
+                    .child(label)
+            }))
     }
 }

@@ -4,34 +4,47 @@ use crate::home::model::{
 };
 use crate::{
     effects::{RequestScope, RequestToken, WorkspaceIdentity},
-    emby::{SortOrder, UserItems, UserItemsQuery, UserItemsSort, VideoItemType},
+    emby::{MediaGenre, SortOrder, UserItems, UserItemsQuery, UserItemsSort, VideoItemType},
+    media::ItemSortOptions,
 };
 
-pub(crate) const LIBRARY_SORT_OPTIONS: [UserItemsSort; 11] = [
-    UserItemsSort::SortName,
-    UserItemsSort::DateCreated,
-    UserItemsSort::PremiereDate,
-    UserItemsSort::ProductionYear,
-    UserItemsSort::CommunityRating,
-    UserItemsSort::CriticRating,
-    UserItemsSort::DatePlayed,
-    UserItemsSort::DateLastContentAdded,
-    UserItemsSort::PlayCount,
-    UserItemsSort::Random,
-    UserItemsSort::OfficialRating,
-];
+const GENRE_ITEMS_FIELDS: &str = "BasicSyncInfo,CommunityRating,ProviderIds,ProductionYear,EndDate,PrimaryImageAspectRatio,Container";
 
 pub(crate) fn available_library_sorts(
-    item_types: &[VideoItemType],
-) -> impl Iterator<Item = UserItemsSort> + '_ {
-    LIBRARY_SORT_OPTIONS
-        .iter()
-        .copied()
-        .filter(move |sort_by| library_sort_is_available(*sort_by, item_types))
+    options: ItemSortOptions,
+) -> impl Iterator<Item = UserItemsSort> {
+    options.iter()
 }
 
-fn library_sort_is_available(sort_by: UserItemsSort, item_types: &[VideoItemType]) -> bool {
-    sort_by != UserItemsSort::DateLastContentAdded || matches!(item_types, [VideoItemType::Series])
+/// Libraries and person filmographies share sorting and paging policy while
+/// keeping distinct request scopes and API filters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::home) enum LibrarySource {
+    View(String),
+    Person(String),
+    Genre(String),
+}
+
+impl LibrarySource {
+    pub(in crate::home) fn id(&self) -> &str {
+        match self {
+            Self::View(id) | Self::Person(id) | Self::Genre(id) => id,
+        }
+    }
+
+    fn scope(&self) -> RequestScope {
+        match self {
+            Self::View(id) => RequestScope::Library {
+                view_id: id.clone(),
+            },
+            Self::Person(id) => RequestScope::PersonItems {
+                person_id: id.clone(),
+            },
+            Self::Genre(key) => RequestScope::GenreItems {
+                genre_key: key.clone(),
+            },
+        }
+    }
 }
 
 /// One library owns its metadata, sort and paging scope. The page keeps only
@@ -39,10 +52,10 @@ fn library_sort_is_available(sort_by: UserItemsSort, item_types: &[VideoItemType
 /// dispatch here; accepted results leave here before user-data/image side effects.
 #[derive(Debug)]
 pub(crate) struct LibraryController {
-    view_id: String,
+    source: LibrarySource,
+    genre: Option<MediaGenre>,
     item_types: Vec<VideoItemType>,
-    sort_by: UserItemsSort,
-    sort_order: SortOrder,
+    sort: crate::media::ItemSortPreferences,
     paged: PagedItemsState,
 }
 
@@ -63,7 +76,7 @@ pub(crate) struct LibraryTransition {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LibraryRequest {
-    pub(crate) view_id: String,
+    pub(in crate::home) source: LibrarySource,
     pub(crate) token: RequestToken,
     pub(crate) start_index: u32,
     pub(crate) initial: bool,
@@ -86,6 +99,7 @@ pub(crate) struct LibraryUpdate {
 pub(crate) struct LibraryVm<'a> {
     pub(crate) paged: &'a PagedItemsState,
     pub(crate) item_types: &'a [VideoItemType],
+    pub(crate) sort_options: ItemSortOptions,
     pub(crate) sort_by: UserItemsSort,
     pub(crate) sort_order: SortOrder,
     pub(crate) empty: bool,
@@ -97,73 +111,116 @@ impl LibraryController {
         view_id: String,
         identity: WorkspaceIdentity,
     ) -> Self {
+        Self::from_source(item_types, LibrarySource::View(view_id), identity)
+    }
+
+    pub(in crate::home) fn for_person(person_id: String, identity: WorkspaceIdentity) -> Self {
+        Self::from_source(
+            vec![VideoItemType::Movie, VideoItemType::Series],
+            LibrarySource::Person(person_id),
+            identity,
+        )
+    }
+
+    pub(in crate::home) fn for_genre(genre: MediaGenre, identity: WorkspaceIdentity) -> Self {
+        let mut controller = Self::from_source(
+            vec![VideoItemType::Movie, VideoItemType::Series],
+            LibrarySource::Genre(genre.key()),
+            identity,
+        );
+        controller.genre = Some(genre);
+        controller
+    }
+
+    fn from_source(
+        item_types: Vec<VideoItemType>,
+        source: LibrarySource,
+        identity: WorkspaceIdentity,
+    ) -> Self {
         Self {
-            paged: PagedItemsState::new(
-                RequestScope::Library {
-                    view_id: view_id.clone(),
-                },
-                identity,
-            ),
-            view_id,
+            paged: PagedItemsState::new(source.scope(), identity),
+            source,
+            genre: None,
             item_types,
-            sort_by: UserItemsSort::SortName,
-            sort_order: SortOrder::Ascending,
+            sort: crate::media::ItemSortPreferences::default(),
         }
     }
     pub(crate) fn view_model(&self) -> LibraryVm<'_> {
+        let sort_options = self.sort_options();
+        let sort = self.sort.for_options(sort_options);
         LibraryVm {
             paged: &self.paged,
             item_types: &self.item_types,
-            sort_by: self.sort_by,
-            sort_order: self.sort_order,
+            sort_options,
+            sort_by: sort.sort_by,
+            sort_order: sort.sort_order,
             empty: self.paged.initial != LoadState::Loading
                 && self.paged.initial_error.is_none()
                 && self.paged.items.is_empty(),
         }
     }
+    fn sort_options(&self) -> ItemSortOptions {
+        if matches!(self.source, LibrarySource::Genre(_)) {
+            ItemSortOptions::ALL
+        } else {
+            ItemSortOptions::for_item_types(&self.item_types)
+        }
+    }
+    pub(crate) fn set_sort(&mut self, preferences: crate::media::ItemSortPreferences) -> bool {
+        if self.sort == preferences {
+            return false;
+        }
+        self.sort = preferences;
+        self.paged.reset_for_sort();
+        true
+    }
+
     pub(crate) fn dispatch(&mut self, intent: LibraryIntent, revision: u64) -> LibraryTransition {
         let mut transition = LibraryTransition::default();
         let clear = match intent {
             LibraryIntent::Open(item_types) => {
+                let changed_types = self.item_types != item_types;
                 self.item_types = item_types;
                 transition.close_menu = true;
                 transition.notify = true;
-                let reset = !library_sort_is_available(self.sort_by, &self.item_types);
-                if reset {
-                    self.sort_by = UserItemsSort::SortName;
-                    self.paged.mark_dirty();
+                if changed_types {
+                    self.paged.reset_for_sort();
                     transition.cancel = true;
                 }
-                if !(reset
+                if !(self.paged.dirty
                     || self.paged.initial == LoadState::Idle
                     || (self.paged.initial == LoadState::Failed && self.paged.items.is_empty()))
                 {
                     return transition;
                 }
-                Some(reset)
+                Some(self.paged.dirty)
             }
             LibraryIntent::SortBy(sort_by) => {
-                if !library_sort_is_available(sort_by, &self.item_types) {
+                if !self.sort_options().contains(sort_by) {
                     return transition;
                 }
                 transition.close_menu = true;
                 transition.notify = true;
-                if self.sort_by == sort_by {
+                if self.sort.sort_by == sort_by {
                     return transition;
                 }
-                self.sort_by = sort_by;
-                self.paged.mark_dirty();
+                self.set_sort(crate::media::ItemSortPreferences {
+                    sort_by,
+                    ..self.sort
+                });
                 transition.cancel = true;
                 Some(true)
             }
             LibraryIntent::SortOrder(sort_order) => {
                 transition.close_menu = true;
                 transition.notify = true;
-                if self.sort_order == sort_order {
+                if self.sort.sort_order == sort_order {
                     return transition;
                 }
-                self.sort_order = sort_order;
-                self.paged.mark_dirty();
+                self.set_sort(crate::media::ItemSortPreferences {
+                    sort_order,
+                    ..self.sort
+                });
                 transition.cancel = true;
                 Some(true)
             }
@@ -184,7 +241,7 @@ impl LibraryController {
         if let Some((token, start_index)) = issued {
             transition.notify = true;
             transition.request = Some(LibraryRequest {
-                view_id: self.view_id.clone(),
+                source: self.source.clone(),
                 token,
                 start_index,
                 initial: clear.is_some(),
@@ -195,16 +252,35 @@ impl LibraryController {
         transition
     }
     fn query(&self, start_index: u32) -> UserItemsQuery {
-        UserItemsQuery {
-            parent_id: Some(self.view_id.clone()),
+        let sort = self.sort.for_options(self.sort_options());
+        let mut query = UserItemsQuery {
+            parent_id: match &self.source {
+                LibrarySource::View(id) => Some(id.clone()),
+                LibrarySource::Person(_) | LibrarySource::Genre(_) => None,
+            },
+            person_ids: match &self.source {
+                LibrarySource::Person(id) => vec![id.clone()],
+                LibrarySource::View(_) | LibrarySource::Genre(_) => Vec::new(),
+            },
             include_item_types: self.item_types.clone(),
             recursive: true,
             start_index,
             limit: PAGED_ITEMS_LIMIT,
-            sort_by: Some(self.sort_by),
-            sort_order: self.sort_order,
+            sort_by: Some(sort.sort_by),
+            sort_order: sort.sort_order,
             ..Default::default()
+        };
+        if let Some(genre) = &self.genre {
+            query.fields = Some(GENRE_ITEMS_FIELDS.to_string());
+            query.collapse_box_set_items = Some(false);
+            query.group_programs_by_series = true;
+            if let Some(id) = &genre.id {
+                query.genre_ids.push(id.clone());
+            } else {
+                query.genres.push(genre.name.clone());
+            }
         }
+        query
     }
     pub(crate) fn complete(
         &mut self,
@@ -212,7 +288,7 @@ impl LibraryController {
         mut result: anyhow::Result<UserItems>,
         current_workspace: &WorkspaceIdentity,
     ) -> Option<LibraryUpdate> {
-        if request.view_id != self.view_id
+        if request.source != self.source
             || !request.token.is_for(current_workspace)
             || !(if request.initial {
                 self.paged.accepts_initial(&request.token)

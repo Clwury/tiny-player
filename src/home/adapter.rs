@@ -75,6 +75,9 @@ impl HomeGateway for EmbyHomeGateway {
     fn user_items(&self, query: &crate::emby::UserItemsQuery) -> anyhow::Result<UserItems> {
         self.client.query_user_items(&self.server, query)
     }
+    fn persons(&self, query: &crate::emby::UserItemsQuery) -> anyhow::Result<UserItems> {
+        self.client.query_persons(&self.server, query)
+    }
     fn search_items(&self, query: &str, start_index: u32, limit: u32) -> anyhow::Result<UserItems> {
         self.client
             .search_items(&self.server, query, start_index, limit)

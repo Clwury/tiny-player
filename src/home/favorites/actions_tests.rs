@@ -81,7 +81,7 @@ fn failed_removal_restores_the_exact_override_category_position_and_total() {
         ..Default::default()
     };
     data.overrides.insert("episode".into(), original.clone());
-    let section = favorites.test_state_mut(VideoItemType::Episode);
+    let section = favorites.test_state_mut(FavoriteItemType::Episode);
     section.items = ["before", "episode", "after"]
         .into_iter()
         .map(|id| {
@@ -91,6 +91,16 @@ fn failed_removal_restores_the_exact_override_category_position_and_total() {
         .collect();
     section.initial = LoadState::Loaded;
     section.total_record_count = Some(3);
+    let row = favorites.test_overview_state_mut(FavoriteItemType::Episode);
+    row.items = ["episode", "before", "after"]
+        .into_iter()
+        .map(|id| {
+            serde_json::from_value(serde_json::json!({"Id": id, "Name": id, "Type": "Episode"}))
+                .unwrap()
+        })
+        .collect();
+    row.initial = LoadState::Loaded;
+    row.total_record_count = Some(3);
     let command = actions
         .toggle(
             intent("episode", true, None),
@@ -102,15 +112,18 @@ fn failed_removal_restores_the_exact_override_category_position_and_total() {
     assert!(!command.desired && !data.overrides["episode"].is_favorite);
     assert_eq!(
         favorites
-            .view_model(VideoItemType::Episode)
+            .view_model(FavoriteItemType::Episode)
             .paged
             .total_record_count,
         Some(2)
     );
     assert_eq!(
-        favorites.view_model(VideoItemType::Episode).paged.items[1].id,
+        favorites.view_model(FavoriteItemType::Episode).paged.items[1].id,
         "after"
     );
+    let row = favorites.overview_view_model(FavoriteItemType::Episode);
+    assert_eq!(row.paged.items[0].id, "before");
+    assert_eq!(row.paged.total_record_count, Some(2));
     let update = actions
         .complete(
             &command,
@@ -125,10 +138,15 @@ fn failed_removal_restores_the_exact_override_category_position_and_total() {
     assert_eq!(notification.key, "favorites:favorite:episode");
     assert_eq!(error, "offline");
     assert_eq!(data.overrides["episode"], original);
-    let section = favorites.view_model(VideoItemType::Episode);
+    let section = favorites.view_model(FavoriteItemType::Episode);
     assert_eq!(section.paged.items[1].id, "episode");
     assert_eq!(section.paged.total_record_count, Some(3));
     assert!(section.paged.dirty);
+    let row = favorites.overview_view_model(FavoriteItemType::Episode);
+    assert_eq!(row.paged.items[0].id, "episode");
+    assert_eq!(row.paged.items[1].id, "before");
+    assert_eq!(row.paged.total_record_count, Some(3));
+    assert!(row.paged.dirty);
     assert_eq!(data.revision, 2);
     assert!(!actions.has_pending());
 }

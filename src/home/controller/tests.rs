@@ -17,7 +17,10 @@ use serde_json::json;
 mod boundaries;
 mod cards;
 mod detail_controls;
+mod genre;
+mod items_sort;
 mod navigation;
+mod person;
 
 fn identity() -> WorkspaceIdentity {
     WorkspaceIdentity {
@@ -95,7 +98,9 @@ fn lookup_prioritizes_the_visible_list_and_playback_uses_the_original_data_order
     );
     home.feed.state.resume_items = Some(resume());
     home.search.test_state_mut().items = items("Search", 60).items;
-    home.favorites.test_state_mut(VideoItemType::Movie).items = items("Favorite", 50).items;
+    home.favorites
+        .test_overview_state_mut(VideoItemType::Movie.into())
+        .items = items("Favorite", 50).items;
     home.open_library(&view()).unwrap();
     home.libraries
         .get_mut("library")
@@ -172,7 +177,7 @@ fn lookup_prioritizes_the_visible_list_and_playback_uses_the_original_data_order
         Some(50)
     );
     home.favorites
-        .test_state_mut(VideoItemType::Movie)
+        .test_overview_state_mut(VideoItemType::Movie.into())
         .items
         .clear();
     assert_eq!(

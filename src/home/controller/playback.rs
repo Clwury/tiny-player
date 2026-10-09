@@ -27,7 +27,13 @@ impl HomeController {
                 .chain(
                     self.libraries
                         .values()
+                        .chain(self.genres.values())
                         .flat_map(|library| &library.view_model().paged.items),
+                )
+                .chain(
+                    self.persons
+                        .values()
+                        .flat_map(|person| &person.items.view_model().paged.items),
                 )
                 .chain(
                     self.feed

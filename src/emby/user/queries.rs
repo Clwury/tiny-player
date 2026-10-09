@@ -54,6 +54,20 @@ impl EmbyClient {
         self.send_authenticated_json_url(server, Method::GET, url, "解析 Emby 用户项目响应失败")
     }
 
+    #[instrument(skip(self, server, query), fields(server = %server.endpoint.display_url()))]
+    pub fn query_persons(
+        &self,
+        server: &CachedServer,
+        query: &UserItemsQuery,
+    ) -> Result<UserItems> {
+        let user_id = authenticated_user_id(server)?;
+        query.validate()?;
+        let mut url = api_url(&server.endpoint, &["Persons"])?;
+        url.query_pairs_mut().append_pair("UserId", user_id);
+        add_query_user_items_query(&mut url, query);
+        self.send_authenticated_json_url(server, Method::GET, url, "解析 Emby 演职人员响应失败")
+    }
+
     #[instrument(skip(self, server), fields(server = %server.endpoint.display_url(), search_term = %search_term))]
     pub fn search_items(
         &self,
@@ -84,3 +98,6 @@ impl EmbyClient {
         self.send_authenticated_json_url(server, Method::GET, url, "解析 Emby 最新项目响应失败")
     }
 }
+
+#[cfg(test)]
+mod tests;

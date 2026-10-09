@@ -12,6 +12,9 @@ use super::{
     user::{UserItemData, UserItems},
 };
 
+mod genre;
+pub use genre::MediaGenre;
+
 const SHOW_SEASONS_FIELDS: &str = "BasicSyncInfo,CommunityRating,ProductionYear,EndDate,Container";
 const SHOW_NEXT_UP_LIMIT: u32 = 1;
 const SHOW_EPISODES_ENABLE_IMAGE_TYPES: &str = "Primary,Backdrop,Thumb";
@@ -154,6 +157,7 @@ pub struct MediaItem {
     pub community_rating: Option<f32>,
     pub official_rating: Option<String>,
     pub genres: Option<Vec<String>>,
+    pub genre_items: Option<Vec<MediaGenre>>,
     pub overview: Option<String>,
     pub series_name: Option<String>,
     pub series_id: Option<String>,

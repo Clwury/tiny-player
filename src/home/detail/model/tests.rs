@@ -85,6 +85,7 @@ fn media_item(id: &str, name: &str) -> MediaItem {
         community_rating: None,
         official_rating: None,
         genres: None,
+        genre_items: None,
         overview: None,
         series_name: None,
         series_id: None,

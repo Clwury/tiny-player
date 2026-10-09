@@ -106,6 +106,9 @@ fn favorite_method(favorite: bool) -> Method {
 
 fn add_query_user_items_query(url: &mut url::Url, query: &UserItemsQuery) {
     let ids = stable_non_empty_ids(&query.ids);
+    let person_ids = stable_non_empty_ids(&query.person_ids);
+    let genre_ids = stable_non_empty_ids(&query.genre_ids);
+    let genres = stable_non_empty_ids(&query.genres);
     let include_types = item_types_query(&query.include_item_types);
     let fields = query
         .fields
@@ -129,6 +132,21 @@ fn add_query_user_items_query(url: &mut url::Url, query: &UserItemsQuery) {
     if !ids.is_empty() {
         pairs.append_pair("Ids", &ids.join(","));
     }
+    if !person_ids.is_empty() {
+        pairs.append_pair("PersonIds", &person_ids.join(","));
+    }
+    if !genre_ids.is_empty() {
+        pairs.append_pair("GenreIds", &genre_ids.join(","));
+    }
+    if !genres.is_empty() {
+        pairs.append_pair("Genres", &genres.join("|"));
+    }
+    if let Some(collapse) = query.collapse_box_set_items {
+        pairs.append_pair(
+            "CollapseBoxSetItems",
+            if collapse { "true" } else { "false" },
+        );
+    }
     if !include_types.is_empty() {
         pairs.append_pair("IncludeItemTypes", &include_types);
     }
@@ -150,8 +168,16 @@ fn add_query_user_items_query(url: &mut url::Url, query: &UserItemsQuery) {
     {
         pairs.append_pair("SearchTerm", search_term);
     }
-    if let Some(sort_by) = query.sort_by {
-        pairs.append_pair("SortBy", sort_by.as_str());
+    let mut sort_fields = Vec::new();
+    for sort in query.sort_by.iter().chain(&query.secondary_sort_by) {
+        for field in sort.as_str().split(',') {
+            if !sort_fields.contains(&field) {
+                sort_fields.push(field);
+            }
+        }
+    }
+    if !sort_fields.is_empty() {
+        pairs.append_pair("SortBy", &sort_fields.join(","));
     }
 }
 
@@ -213,7 +239,7 @@ impl VideoItemType {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UserItemsSort {
     SortName,
     DateLastContentAdded,
@@ -232,16 +258,16 @@ impl UserItemsSort {
     fn as_str(self) -> &'static str {
         match self {
             Self::SortName => "SortName",
-            Self::DateLastContentAdded => "DateLastContentAdded,DateCreated,SortName",
-            Self::DateCreated => "DateCreated,DateLastContentAdded,SortName",
-            Self::PremiereDate => "PremiereDate",
-            Self::ProductionYear => "ProductionYear",
-            Self::CommunityRating => "CommunityRating",
-            Self::CriticRating => "CriticRating",
-            Self::DatePlayed => "DatePlayed",
-            Self::PlayCount => "PlayCount",
+            Self::DateLastContentAdded => "DateLastContentAdded,SortName",
+            Self::DateCreated => "DateCreated",
+            Self::PremiereDate => "ProductionYear,PremiereDate,SortName",
+            Self::ProductionYear => "ProductionYear,SortName",
+            Self::CommunityRating => "CommunityRating,SortName",
+            Self::CriticRating => "CriticRating,SortName",
+            Self::DatePlayed => "DatePlayed,SortName",
+            Self::PlayCount => "PlayCount,SortName",
             Self::Random => "Random",
-            Self::OfficialRating => "OfficialRating",
+            Self::OfficialRating => "OfficialRating,SortName",
         }
     }
 }
@@ -250,6 +276,10 @@ impl UserItemsSort {
 pub struct UserItemsQuery {
     pub parent_id: Option<String>,
     pub ids: Vec<String>,
+    pub person_ids: Vec<String>,
+    pub genre_ids: Vec<String>,
+    pub genres: Vec<String>,
+    pub collapse_box_set_items: Option<bool>,
     pub fields: Option<String>,
     pub include_item_types: Vec<VideoItemType>,
     pub is_favorite: Option<bool>,
@@ -259,6 +289,8 @@ pub struct UserItemsQuery {
     pub start_index: u32,
     pub limit: u32,
     pub sort_by: Option<UserItemsSort>,
+    /// Additional sorting choices appended in precedence order.
+    pub secondary_sort_by: Vec<UserItemsSort>,
     pub sort_order: SortOrder,
 }
 
@@ -267,6 +299,10 @@ impl Default for UserItemsQuery {
         Self {
             parent_id: None,
             ids: Vec::new(),
+            person_ids: Vec::new(),
+            genre_ids: Vec::new(),
+            genres: Vec::new(),
+            collapse_box_set_items: None,
             fields: None,
             include_item_types: Vec::new(),
             is_favorite: None,
@@ -276,6 +312,7 @@ impl Default for UserItemsQuery {
             start_index: 0,
             limit: 60,
             sort_by: None,
+            secondary_sort_by: Vec::new(),
             sort_order: SortOrder::Ascending,
         }
     }
@@ -300,7 +337,7 @@ impl UserItemsQuery {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortOrder {
     Ascending,
     Descending,
@@ -793,24 +830,161 @@ mod tests {
     }
 
     #[test]
-    fn serializes_library_sort_options() {
-        assert_eq!(UserItemsSort::SortName.as_str(), "SortName");
+    fn user_items_urls_use_requested_sort_fields_in_order() {
+        let endpoint = ServerEndpoint {
+            protocol: Protocol::Https,
+            address: "example.com".into(),
+            port: 443,
+            path: "/emby".into(),
+        };
+        for (sort_by, fields) in [
+            (UserItemsSort::SortName, "SortName"),
+            (UserItemsSort::DateCreated, "DateCreated"),
+            (
+                UserItemsSort::PremiereDate,
+                "ProductionYear,PremiereDate,SortName",
+            ),
+            (UserItemsSort::ProductionYear, "ProductionYear,SortName"),
+            (UserItemsSort::CommunityRating, "CommunityRating,SortName"),
+            (UserItemsSort::CriticRating, "CriticRating,SortName"),
+            (UserItemsSort::DatePlayed, "DatePlayed,SortName"),
+            (
+                UserItemsSort::DateLastContentAdded,
+                "DateLastContentAdded,SortName",
+            ),
+            (UserItemsSort::PlayCount, "PlayCount,SortName"),
+            (UserItemsSort::Random, "Random"),
+            (UserItemsSort::OfficialRating, "OfficialRating,SortName"),
+        ] {
+            for sort_order in [SortOrder::Ascending, SortOrder::Descending] {
+                let mut url = crate::emby::api_url(&endpoint, &["Users", "user", "Items"]).unwrap();
+                add_query_user_items_query(
+                    &mut url,
+                    &UserItemsQuery {
+                        sort_by: Some(sort_by),
+                        sort_order,
+                        start_index: 60,
+                        ..Default::default()
+                    },
+                );
+                let pairs = url.query_pairs().collect::<HashMap<_, _>>();
+                assert_eq!(
+                    pairs.get("SortBy").map(|value| value.as_ref()),
+                    Some(fields)
+                );
+                assert_eq!(
+                    pairs.get("SortOrder").map(|value| value.as_ref()),
+                    Some(sort_order.as_str())
+                );
+                assert_eq!(
+                    pairs.get("StartIndex").map(|value| value.as_ref()),
+                    Some("60")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn favorite_overview_urls_use_compound_date_sort_descending_for_all_categories() {
+        let endpoint = ServerEndpoint {
+            protocol: Protocol::Https,
+            address: "example.com".into(),
+            port: 443,
+            path: "/emby".into(),
+        };
+        for item_type in [
+            Some(VideoItemType::Movie),
+            Some(VideoItemType::Series),
+            Some(VideoItemType::Episode),
+            None,
+        ] {
+            let segments: &[&str] = if item_type.is_some() {
+                &["Users", "user", "Items"]
+            } else {
+                &["Persons"]
+            };
+            let mut url = crate::emby::api_url(&endpoint, segments).unwrap();
+            add_query_user_items_query(
+                &mut url,
+                &UserItemsQuery {
+                    include_item_types: item_type.into_iter().collect(),
+                    is_favorite: Some(true),
+                    limit: 30,
+                    sort_by: Some(UserItemsSort::DateCreated),
+                    secondary_sort_by: vec![
+                        UserItemsSort::DateLastContentAdded,
+                        UserItemsSort::SortName,
+                    ],
+                    sort_order: SortOrder::Descending,
+                    ..Default::default()
+                },
+            );
+            let pairs = url.query_pairs().collect::<HashMap<_, _>>();
+            assert_eq!(
+                pairs.get("SortBy").map(|value| value.as_ref()),
+                Some("DateCreated,DateLastContentAdded,SortName")
+            );
+            assert_eq!(
+                pairs.get("SortOrder").map(|value| value.as_ref()),
+                Some("Descending")
+            );
+            assert_eq!(
+                pairs.get("Filters").map(|value| value.as_ref()),
+                Some("IsFavorite")
+            );
+            assert_eq!(pairs.get("Limit").map(|value| value.as_ref()), Some("30"));
+            assert_eq!(
+                pairs.get("IncludeItemTypes").map(|value| value.as_ref()),
+                item_type.map(VideoItemType::as_str)
+            );
+        }
+    }
+
+    #[test]
+    fn person_items_url_uses_stable_person_ids_without_a_parent_filter() {
+        let endpoint = ServerEndpoint {
+            protocol: Protocol::Https,
+            address: "example.com".into(),
+            port: 443,
+            path: "/emby".into(),
+        };
+        let mut url = crate::emby::api_url(&endpoint, &["Users", "user", "Items"]).unwrap();
+        add_query_user_items_query(
+            &mut url,
+            &UserItemsQuery {
+                person_ids: vec![
+                    " person-1 ".into(),
+                    "".into(),
+                    "person-1".into(),
+                    "person-2".into(),
+                ],
+                include_item_types: vec![VideoItemType::Movie, VideoItemType::Series],
+                start_index: 60,
+                sort_by: Some(UserItemsSort::ProductionYear),
+                sort_order: SortOrder::Descending,
+                ..Default::default()
+            },
+        );
+        let pairs = url.query_pairs().collect::<HashMap<_, _>>();
         assert_eq!(
-            UserItemsSort::DateLastContentAdded.as_str(),
-            "DateLastContentAdded,DateCreated,SortName"
+            pairs.get("PersonIds").map(|v| v.as_ref()),
+            Some("person-1,person-2")
+        );
+        assert!(!pairs.contains_key("ParentId"));
+        assert_eq!(
+            pairs.get("IncludeItemTypes").map(|v| v.as_ref()),
+            Some("Movie,Series")
+        );
+        assert_eq!(pairs.get("Recursive").map(|v| v.as_ref()), Some("true"));
+        assert_eq!(
+            pairs.get("SortBy").map(|v| v.as_ref()),
+            Some("ProductionYear,SortName")
         );
         assert_eq!(
-            UserItemsSort::DateCreated.as_str(),
-            "DateCreated,DateLastContentAdded,SortName"
+            pairs.get("SortOrder").map(|v| v.as_ref()),
+            Some("Descending")
         );
-        assert_eq!(UserItemsSort::PremiereDate.as_str(), "PremiereDate");
-        assert_eq!(UserItemsSort::ProductionYear.as_str(), "ProductionYear");
-        assert_eq!(UserItemsSort::CommunityRating.as_str(), "CommunityRating");
-        assert_eq!(UserItemsSort::CriticRating.as_str(), "CriticRating");
-        assert_eq!(UserItemsSort::DatePlayed.as_str(), "DatePlayed");
-        assert_eq!(UserItemsSort::PlayCount.as_str(), "PlayCount");
-        assert_eq!(UserItemsSort::Random.as_str(), "Random");
-        assert_eq!(UserItemsSort::OfficialRating.as_str(), "OfficialRating");
+        assert_eq!(pairs.get("StartIndex").map(|v| v.as_ref()), Some("60"));
     }
 
     #[test]
@@ -860,6 +1034,78 @@ mod tests {
     }
 
     #[test]
+    fn genre_items_url_matches_movie_and_series_feed_parameters() {
+        let endpoint = ServerEndpoint {
+            protocol: Protocol::Https,
+            address: "example.com".into(),
+            port: 443,
+            path: "/emby".into(),
+        };
+        for start_index in [0, 60] {
+            let mut url = crate::emby::api_url(&endpoint, &["Users", "user", "Items"]).unwrap();
+            add_query_user_items_query(&mut url, &UserItemsQuery {
+                genre_ids: vec![" g18 ".into(), "".into(), "g18".into()],
+                collapse_box_set_items: Some(false),
+                fields: Some("BasicSyncInfo,CommunityRating,ProviderIds,ProductionYear,EndDate,PrimaryImageAspectRatio,Container".into()),
+                group_programs_by_series: true,
+                include_item_types: vec![VideoItemType::Movie, VideoItemType::Series],
+                limit: 60,
+                start_index,
+                sort_by: Some(UserItemsSort::PremiereDate),
+                sort_order: SortOrder::Descending,
+                ..Default::default()
+            });
+            let pairs = url.query_pairs().collect::<HashMap<_, _>>();
+            for (name, expected) in [
+                ("GenreIds", "g18"),
+                ("CollapseBoxSetItems", "false"),
+                ("EnableImageTypes", "Primary,Backdrop,Thumb"),
+                (
+                    "Fields",
+                    "BasicSyncInfo,CommunityRating,ProviderIds,ProductionYear,EndDate,PrimaryImageAspectRatio,Container",
+                ),
+                ("GroupProgramsBySeries", "true"),
+                ("IncludeItemTypes", "Movie,Series"),
+                ("Limit", "60"),
+                ("Recursive", "true"),
+                ("SortBy", "ProductionYear,PremiereDate,SortName"),
+                ("SortOrder", "Descending"),
+            ] {
+                assert_eq!(pairs.get(name).map(|value| value.as_ref()), Some(expected));
+            }
+            assert_eq!(pairs.get("StartIndex").unwrap(), &start_index.to_string());
+            for unrelated_filter in ["ParentId", "PersonIds", "Genres", "Filters"] {
+                assert!(!pairs.contains_key(unrelated_filter));
+            }
+        }
+    }
+
+    #[test]
+    fn genre_name_filter_uses_pipe_separators_for_legacy_details() {
+        let endpoint = ServerEndpoint {
+            protocol: Protocol::Https,
+            address: "example.com".into(),
+            port: 443,
+            path: "/emby".into(),
+        };
+        let mut url = crate::emby::api_url(&endpoint, &["Users", "user", "Items"]).unwrap();
+        add_query_user_items_query(
+            &mut url,
+            &UserItemsQuery {
+                genres: vec![" 科幻 ".into(), "".into(), "Drama".into(), "科幻".into()],
+                ..Default::default()
+            },
+        );
+        let pairs = url.query_pairs().collect::<HashMap<_, _>>();
+        assert_eq!(
+            pairs.get("Genres").map(|value| value.as_ref()),
+            Some("科幻|Drama")
+        );
+        assert!(!pairs.contains_key("GenreIds"));
+        assert!(!pairs.contains_key("CollapseBoxSetItems"));
+    }
+
+    #[test]
     fn builds_search_user_items_url() {
         let endpoint = ServerEndpoint {
             protocol: Protocol::Https,
@@ -902,7 +1148,7 @@ mod tests {
         );
         assert_eq!(
             pairs.get("SortBy").map(|value| value.as_ref()),
-            Some("DateCreated,DateLastContentAdded,SortName")
+            Some("DateCreated")
         );
         assert_eq!(
             pairs.get("SortOrder").map(|value| value.as_ref()),
@@ -1011,7 +1257,7 @@ mod tests {
             ("IncludeItemTypes", "Series"),
             ("Limit", "30"),
             ("Recursive", "true"),
-            ("SortBy", "DateCreated,DateLastContentAdded,SortName"),
+            ("SortBy", "DateCreated"),
             ("SortOrder", "Descending"),
             ("EnableImageTypes", "Primary,Backdrop,Thumb"),
             (

@@ -4,7 +4,8 @@ use crate::{
     emby::{UserItems, UserView},
     home::{
         library::controller::{
-            LibraryController, LibraryIntent, LibraryRequest, LibraryTransition, LibraryUpdate,
+            LibraryController, LibraryIntent, LibraryRequest, LibrarySource, LibraryTransition,
+            LibraryUpdate,
         },
         library::model::library_item_types,
         model::navigation::NavigationChange,
@@ -29,6 +30,7 @@ impl HomeController {
         let library = self.libraries.entry(view.id.clone()).or_insert_with(|| {
             LibraryController::new(item_types.clone(), view.id.clone(), self.identity.clone())
         });
+        library.set_sort(self.items_sort);
         let transition = library.dispatch(
             LibraryIntent::Open(item_types.clone()),
             self.user_data.revision,
@@ -44,6 +46,30 @@ impl HomeController {
         view_id: &str,
         intent: LibraryIntent,
     ) -> Option<LibraryTransition> {
+        let item_types = self
+            .libraries
+            .get(view_id)?
+            .view_model()
+            .item_types
+            .to_vec();
+        if let Some(changed) = self.apply_sort_intent(
+            &intent,
+            crate::media::ItemSortOptions::for_item_types(&item_types),
+        ) {
+            if !changed {
+                return Some(LibraryTransition {
+                    close_menu: true,
+                    notify: true,
+                    ..Default::default()
+                });
+            }
+            let mut transition = self
+                .libraries
+                .get_mut(view_id)?
+                .dispatch(LibraryIntent::Open(item_types), self.user_data.revision);
+            transition.cancel = true;
+            return Some(transition);
+        }
         Some(
             self.libraries
                 .get_mut(view_id)?
@@ -57,9 +83,12 @@ impl HomeController {
         result: anyhow::Result<UserItems>,
         identity: &WorkspaceIdentity,
     ) -> Option<LibraryUpdate> {
+        let LibrarySource::View(id) = &request.source else {
+            return None;
+        };
         let mut update = self
             .libraries
-            .get_mut(&request.view_id)?
+            .get_mut(id)?
             .complete(request, result, identity)?;
         if let Some(items) = update.received.take() {
             self.absorb_user_items_user_data(&items, request.user_data_revision);

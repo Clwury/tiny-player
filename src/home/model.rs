@@ -1,6 +1,7 @@
 //! Pure Home state and transitions. No GPUI entities, handles, IO or tasks.
 
 pub(crate) mod cards;
+pub(crate) mod favorites;
 pub(crate) mod layout;
 pub(crate) mod navigation;
 pub(crate) mod notification;
@@ -26,10 +27,11 @@ impl LoadState {
     }
 }
 
-pub(crate) fn favorite_section_title(item_type: crate::emby::VideoItemType) -> &'static str {
+pub(crate) fn favorite_section_title(item_type: favorites::FavoriteItemType) -> &'static str {
     match item_type {
-        crate::emby::VideoItemType::Movie => "电影",
-        crate::emby::VideoItemType::Series => "剧集",
-        crate::emby::VideoItemType::Episode => "集",
+        favorites::FavoriteItemType::Movie => "电影",
+        favorites::FavoriteItemType::Series => "剧集",
+        favorites::FavoriteItemType::Episode => "集",
+        favorites::FavoriteItemType::Person => "演职人员",
     }
 }

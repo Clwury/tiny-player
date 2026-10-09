@@ -1,12 +1,12 @@
 use super::HomeController;
 use crate::{
-    emby::VideoItemType,
+    home::model::favorites::FavoriteItemType,
     home::model::navigation::{HomeRoot, HomeRoute, NavigationChange},
 };
 
 pub(in crate::home) enum NavigationIntent {
     Root(HomeRoot),
-    Favorites(VideoItemType),
+    Favorites(FavoriteItemType),
     Back,
 }
 impl HomeController {

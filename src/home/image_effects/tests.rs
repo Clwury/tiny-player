@@ -3,6 +3,51 @@ use crate::home::test_support::content as page;
 use std::time::Duration;
 
 #[gpui::test]
+fn favorite_people_share_detail_portrait_cache_and_skip_missing_images(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::{
+        emby::{MediaItem, MediaPerson},
+        images::test_support::FakeItemImages,
+    };
+    let page = page(cx);
+    let repository = Arc::new(FakeItemImages::default());
+    let items: UserItems = serde_json::from_value(serde_json::json!({
+        "Items":[
+            {"Id":"person", "Name":"Actor", "Type":"Person", "ImageTags":{"Primary":"portrait", "Thumb":"thumb"}},
+            {"Id":"no-image", "Name":"Missing", "Type":"Person"}
+        ], "TotalRecordCount":2
+    })).unwrap();
+    let detail: MediaItem = serde_json::from_value(serde_json::json!({
+        "Id":"movie", "Name":"Movie", "Type":"Movie",
+        "People":[{"Id":"person", "Name":"Actor", "PrimaryImageTag":"portrait"}]
+    }))
+    .unwrap();
+    page.update(cx, |page, cx| {
+        page.image_repository = repository.clone();
+        page.ensure_favorite_items_images(&items, cx);
+        page.ensure_series_media_item_images(&detail, cx);
+    });
+    cx.run_until_parked();
+    let requests = repository.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].request.item_id, "person");
+    assert_eq!(requests[0].request.image_type, EmbyImageType::Primary);
+    assert_eq!(requests[0].request.tag.as_deref(), Some("portrait"));
+    assert_eq!(requests[0].request.max_width, Some(320));
+    let person: &MediaPerson = &detail.people.as_ref().unwrap()[0];
+    page.read_with(cx, |page, _| {
+        let path = page.image_path_for_favorite_person(&items.items[0]);
+        assert!(path.is_some());
+        assert_eq!(path, page.image_path_for_person_primary(person));
+        assert!(
+            page.image_path_for_favorite_person(&items.items[1])
+                .is_none()
+        );
+    });
+}
+
+#[gpui::test]
 fn image_runner_drains_the_queue_through_the_port_and_only_notifies_ready_paths(
     cx: &mut gpui::TestAppContext,
 ) {

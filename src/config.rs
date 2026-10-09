@@ -1,7 +1,7 @@
 //! Shell-owned global configuration. Server records have a single feature owner;
 //! persistence composes both into the unchanged ServerCache document.
 use crate::{
-    media::PlaybackLanguagePreferences,
+    media::{ItemSortPreferences, PlaybackLanguagePreferences},
     search_history::SearchHistory,
     server::feature::ServerCatalog,
     storage::{ServerCache, WindowState},
@@ -19,6 +19,7 @@ pub(crate) struct GlobalConfig {
     pub(crate) track_languages: PlaybackLanguagePreferences,
     pub(crate) playback_volume: PlaybackVolumeSettings,
     pub(crate) search_history: SearchHistory,
+    pub(crate) items_sort: ItemSortPreferences,
 }
 
 impl GlobalConfig {
@@ -32,6 +33,7 @@ impl GlobalConfig {
             track_languages,
             playback_volume,
             search_history,
+            items_sort,
             servers,
             auto_start_server_id,
         } = cache;
@@ -45,6 +47,7 @@ impl GlobalConfig {
                 track_languages,
                 playback_volume,
                 search_history,
+                items_sort,
             },
             ServerCatalog {
                 servers,
@@ -63,6 +66,7 @@ impl GlobalConfig {
             track_languages: self.track_languages,
             playback_volume: self.playback_volume,
             search_history: self.search_history.clone(),
+            items_sort: self.items_sort,
             servers: catalog.servers.clone(),
             auto_start_server_id: catalog.auto_start_server_id.clone(),
         }
@@ -91,6 +95,10 @@ mod tests {
         cache.auto_start_server_id = Some("local".into());
         cache.playback.cache_secs = 42.125;
         cache.playback_volume.level = 0.47;
+        cache.items_sort = ItemSortPreferences {
+            sort_by: crate::emby::UserItemsSort::PremiereDate,
+            sort_order: crate::emby::SortOrder::Descending,
+        };
         cache.set_window_size(1234, 789);
         cache.servers.push(
             serde_json::from_value(serde_json::json!({

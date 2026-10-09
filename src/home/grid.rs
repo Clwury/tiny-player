@@ -5,37 +5,38 @@ use gpui::{
     ScrollHandle, StatefulInteractiveElement, Styled, Window, div, point, px,
 };
 
-use crate::{
-    emby::{UserItem, VideoItemType},
-    theme,
-};
+use crate::{emby::UserItem, theme};
 
 use crate::home::{
     HomeContent,
     carousel::{
-        DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX, DETAIL_EPISODE_CARD_WIDTH_PX, HOME_ITEM_CARD_GAP_PX,
-        HOME_ITEM_CARD_IMAGE_HEIGHT_PX, HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX,
-        HOME_MAIN_SCROLLBAR_GUTTER_PX, home_main_content_width,
+        DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX, DETAIL_EPISODE_CARD_WIDTH_PX,
+        DETAIL_PERSON_CARD_WIDTH_PX, HOME_ITEM_CARD_GAP_PX, HOME_ITEM_CARD_IMAGE_HEIGHT_PX,
+        HOME_ITEM_CARD_PADDING_PX, HOME_ITEM_CARD_WIDTH_PX, HOME_MAIN_SCROLLBAR_GUTTER_PX,
+        home_main_content_width,
     },
-    components::{favorite_episode_card, user_episode_card, user_item_card},
+    components::{favorite_episode_card, person_card, user_episode_card, user_item_card},
     item_context_menu::ItemContextMenuSource,
+    model::{cards::PersonCardVm, favorites::FavoriteItemType},
     navigation::HomeRoute,
 };
 
 const WORKSPACE_AUTO_LOAD_MIN_THRESHOLD_PX: f32 = 480.0;
 const USER_ITEM_GRID_ROW_HEIGHT_PX: f32 = 302.0;
 const USER_ITEM_GRID_ROW_STEP_PX: f32 = USER_ITEM_GRID_ROW_HEIGHT_PX + HOME_ITEM_CARD_GAP_PX;
+const PERSON_ITEM_GRID_ROW_HEIGHT_PX: f32 = 250.0;
 
 #[derive(Clone, Copy)]
 pub(super) enum UserItemGridSource {
-    Favorites(VideoItemType),
+    Favorites(FavoriteItemType),
     Search,
 }
 
 impl UserItemGridSource {
     pub(super) fn card_width(self) -> f32 {
         match self {
-            Self::Favorites(VideoItemType::Episode) => DETAIL_EPISODE_CARD_WIDTH_PX,
+            Self::Favorites(FavoriteItemType::Episode) => DETAIL_EPISODE_CARD_WIDTH_PX,
+            Self::Favorites(FavoriteItemType::Person) => DETAIL_PERSON_CARD_WIDTH_PX,
             _ => HOME_ITEM_CARD_WIDTH_PX,
         }
     }
@@ -43,9 +44,12 @@ impl UserItemGridSource {
     fn row_step(self) -> f32 {
         match self {
             // Episode covers are 16:9, with the same padding and two text lines.
-            Self::Favorites(VideoItemType::Episode) => {
+            Self::Favorites(FavoriteItemType::Episode) => {
                 USER_ITEM_GRID_ROW_STEP_PX - HOME_ITEM_CARD_IMAGE_HEIGHT_PX
                     + DETAIL_EPISODE_CARD_IMAGE_HEIGHT_PX
+            }
+            Self::Favorites(FavoriteItemType::Person) => {
+                PERSON_ITEM_GRID_ROW_HEIGHT_PX + HOME_ITEM_CARD_GAP_PX
             }
             _ => USER_ITEM_GRID_ROW_STEP_PX,
         }
@@ -228,7 +232,14 @@ impl HomeContent {
         // click handler so a late event from a removed/reordered result cannot
         // open the wrong item.
         let item_id = gpui::ElementId::from((id_prefix, item_fingerprint));
-        let card = if item.item_type.as_deref() == Some("Episode") {
+        let card = if item.item_type.as_deref() == Some("Person") {
+            person_card(
+                PersonCardVm::from(item),
+                self.image_path_for_favorite_person(item),
+                cx,
+            )
+            .id(item_id)
+        } else if item.item_type.as_deref() == Some("Episode") {
             let card = if matches!(source, UserItemGridSource::Favorites(_)) {
                 favorite_episode_card(
                     self.controller.user_episode_card_vm(item),
@@ -266,7 +277,23 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         if let Some(item_id) = self.user_item_grid_id(source, index, expected_fingerprint) {
-            self.open_media_detail_by_id(item_id, cx);
+            if let UserItemGridSource::Favorites(FavoriteItemType::Person) = source {
+                let item = &self
+                    .controller
+                    .favorite_section(FavoriteItemType::Person)
+                    .paged
+                    .items[index];
+                let person = crate::emby::MediaPerson {
+                    id: Some(item_id),
+                    name: Some(item.name.clone()),
+                    primary_image_tag: item.primary_image_tag().map(str::to_string),
+                    role: None,
+                    person_type: None,
+                };
+                self.open_person_page(&person, cx);
+            } else {
+                self.open_media_detail_by_id(item_id, cx);
+            }
         }
     }
     pub(in crate::home) fn user_item_grid_id(

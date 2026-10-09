@@ -1,5 +1,5 @@
 //! GPUI intent binding and cancellable delivery for this feature.
-use super::{controller, effect};
+use super::{ItemsSortTarget, controller, effect};
 #[cfg(test)]
 use crate::emby::VideoItemType;
 use crate::emby::{SortOrder, UserItems, UserItemsSort, UserView};
@@ -13,7 +13,7 @@ use crate::home::{
 };
 #[cfg(test)]
 use controller::LibraryController;
-use controller::{LibraryFailure, LibraryIntent, LibraryRequest, LibraryTransition};
+use controller::{LibraryFailure, LibraryIntent, LibraryRequest, LibrarySource, LibraryTransition};
 use gpui::{AppContext as _, Context};
 
 impl HomeContent {
@@ -41,27 +41,57 @@ impl HomeContent {
         }
     }
 
-    pub(in crate::home) fn toggle_current_library_sort_menu(&mut self, cx: &mut Context<Self>) {
-        let HomeRoute::Library { view_id, .. } = self.controller.route() else {
-            return;
+    pub(in crate::home) fn toggle_current_items_sort_menu(&mut self, cx: &mut Context<Self>) {
+        let menu = match self.controller.route() {
+            HomeRoute::Library { view_id, .. } => self
+                .library_resources
+                .get_mut(view_id)
+                .map(|state| &mut state.presentation.sort_menu_open),
+            HomeRoute::Genre { genre_key, .. } => self
+                .genre_resources
+                .get_mut(genre_key)
+                .map(|state| &mut state.presentation.sort_menu_open),
+            HomeRoute::Person { person_id, .. } => self
+                .person_resources
+                .get_mut(person_id)
+                .map(|person| &mut person.items.presentation.sort_menu_open),
+            HomeRoute::FavoriteItems { item_type } => {
+                Some(&mut self.favorites_presentation[*item_type].sort_menu_open)
+            }
+            _ => None,
         };
-        let Some(state) = self.library_resources.get_mut(view_id) else {
+        let Some(menu) = menu else {
             return;
         };
 
-        state.presentation.sort_menu_open = !state.presentation.sort_menu_open;
+        *menu = !*menu;
         cx.notify();
     }
 
-    pub(in crate::home) fn close_current_library_sort_menu(&mut self, cx: &mut Context<Self>) {
-        let HomeRoute::Library { view_id, .. } = self.controller.route() else {
+    pub(in crate::home) fn close_current_items_sort_menu(&mut self, cx: &mut Context<Self>) {
+        let menu = match self.controller.route() {
+            HomeRoute::Library { view_id, .. } => self
+                .library_resources
+                .get_mut(view_id)
+                .map(|state| &mut state.presentation.sort_menu_open),
+            HomeRoute::Genre { genre_key, .. } => self
+                .genre_resources
+                .get_mut(genre_key)
+                .map(|state| &mut state.presentation.sort_menu_open),
+            HomeRoute::Person { person_id, .. } => self
+                .person_resources
+                .get_mut(person_id)
+                .map(|person| &mut person.items.presentation.sort_menu_open),
+            HomeRoute::FavoriteItems { item_type } => {
+                Some(&mut self.favorites_presentation[*item_type].sort_menu_open)
+            }
+            _ => None,
+        };
+        let Some(menu) = menu else {
             return;
         };
-        let Some(state) = self.library_resources.get_mut(view_id) else {
-            return;
-        };
-        if state.presentation.sort_menu_open {
-            state.presentation.sort_menu_open = false;
+        if *menu {
+            *menu = false;
             cx.notify();
         }
     }
@@ -72,7 +102,11 @@ impl HomeContent {
         sort_by: UserItemsSort,
         cx: &mut Context<Self>,
     ) {
-        self.dispatch_library(&view_id, LibraryIntent::SortBy(sort_by), cx);
+        self.select_items_sort_by(
+            &ItemsSortTarget::Library(LibrarySource::View(view_id)),
+            sort_by,
+            cx,
+        );
     }
     pub(in crate::home) fn select_library_sort_order(
         &mut self,
@@ -80,7 +114,11 @@ impl HomeContent {
         sort_order: SortOrder,
         cx: &mut Context<Self>,
     ) {
-        self.dispatch_library(&view_id, LibraryIntent::SortOrder(sort_order), cx);
+        self.select_items_sort_order(
+            &ItemsSortTarget::Library(LibrarySource::View(view_id)),
+            sort_order,
+            cx,
+        );
     }
     pub(in crate::home) fn auto_load_more_library(
         &mut self,
@@ -93,6 +131,80 @@ impl HomeContent {
         }
         self.dispatch_library(view_id, LibraryIntent::LoadMore { automatic: true }, cx);
     }
+    pub(in crate::home) fn select_items_sort_by(
+        &mut self,
+        target: &ItemsSortTarget,
+        sort_by: UserItemsSort,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.items_sort_target_is_current(target)
+            || !self.controller.current_items_sort_is_available(sort_by)
+        {
+            return;
+        }
+        self.close_current_items_sort_menu(cx);
+        let preferences = crate::media::ItemSortPreferences {
+            sort_by,
+            ..crate::media::ItemSortPreferences::get(cx)
+        };
+        self.apply_shared_items_sort(preferences, cx);
+        preferences.apply(cx);
+    }
+
+    pub(in crate::home) fn select_items_sort_order(
+        &mut self,
+        target: &ItemsSortTarget,
+        sort_order: SortOrder,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.items_sort_target_is_current(target) {
+            return;
+        }
+        self.close_current_items_sort_menu(cx);
+        let preferences = crate::media::ItemSortPreferences {
+            sort_order,
+            ..crate::media::ItemSortPreferences::get(cx)
+        };
+        self.apply_shared_items_sort(preferences, cx);
+        preferences.apply(cx);
+    }
+
+    pub(in crate::home) fn dispatch_items_source(
+        &mut self,
+        source: &LibrarySource,
+        intent: LibraryIntent,
+        cx: &mut Context<Self>,
+    ) {
+        match source {
+            LibrarySource::View(id) => match intent {
+                LibraryIntent::SortBy(sort) => self.select_library_sort_by(id.clone(), sort, cx),
+                LibraryIntent::SortOrder(order) => {
+                    self.select_library_sort_order(id.clone(), order, cx)
+                }
+                LibraryIntent::LoadMore { automatic: true } => self.auto_load_more_library(id, cx),
+                intent => self.dispatch_library(id, intent, cx),
+            },
+            LibrarySource::Person(id) => self.dispatch_person_items(id, intent, cx),
+            LibrarySource::Genre(key) => self.dispatch_genre_items(key, intent, cx),
+        }
+    }
+
+    pub(in crate::home) fn auto_load_more_items_source(
+        &mut self,
+        source: &LibrarySource,
+        cx: &mut Context<Self>,
+    ) {
+        match (source, self.controller.route()) {
+            (LibrarySource::View(id), HomeRoute::Library { view_id, .. }) if id == view_id => {}
+            (LibrarySource::Person(id), HomeRoute::Person { person_id, .. }) if id == person_id => {
+            }
+            (LibrarySource::Genre(key), HomeRoute::Genre { genre_key, .. }) if key == genre_key => {
+            }
+            _ => return,
+        }
+        self.dispatch_items_source(source, LibraryIntent::LoadMore { automatic: true }, cx);
+    }
+
     fn dispatch_library(&mut self, view_id: &str, intent: LibraryIntent, cx: &mut Context<Self>) {
         let Some(transition) = self.controller.dispatch_library(view_id, intent) else {
             return;
@@ -162,24 +274,24 @@ impl HomeContent {
         if let Some(failure) = update.failure {
             let (key, message) = match failure {
                 LibraryFailure::Initial(error) => (
-                    library_initial_notification_key(&request.view_id),
+                    library_initial_notification_key(request.source.id()),
                     format!("加载媒体库失败：{error}"),
                 ),
                 LibraryFailure::Refresh(error) => {
-                    (library_refresh_notification_key(&request.view_id), error)
+                    (library_refresh_notification_key(request.source.id()), error)
                 }
                 LibraryFailure::More(error) => (
-                    library_load_more_notification_key(&request.view_id),
+                    library_load_more_notification_key(request.source.id()),
                     format!("加载更多媒体库内容失败：{error}"),
                 ),
             };
             self.push_error_notification(NotificationScope::Library, key, message, cx);
         } else if request.initial {
-            self.clear_library_notifications(&request.view_id);
+            self.clear_library_notifications(request.source.id());
         } else {
             self.clear_notification(
                 NotificationScope::Library,
-                &library_load_more_notification_key(&request.view_id),
+                &library_load_more_notification_key(request.source.id()),
             );
         }
         cx.notify();

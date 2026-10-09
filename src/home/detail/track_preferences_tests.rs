@@ -3,7 +3,7 @@ use crate::home::track_preferences::detail_track_choices;
 use crate::settings::binding::PlaybackTrackPreferences;
 use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
-use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
+use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, point, px, size};
 
 use crate::player::{PlaybackTrackKind, SavedTrackChoice, TrackLanguage};
 
@@ -360,6 +360,144 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
     let bounds = cx.debug_bounds(selector).expect(selector);
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
+}
+
+fn set_subtitle_menu_tracks(page: &Entity<HomeContent>, cx: &mut VisualTestContext, count: usize) {
+    page.update(cx, |page, cx| {
+        let detail = detail_binding(
+            page.controller.test_state_mut().navigation,
+            &mut page.detail_resources,
+        )
+        .unwrap();
+        let source = &mut detail
+            .controller
+            .state
+            .item
+            .as_mut()
+            .unwrap()
+            .media_sources
+            .as_mut()
+            .unwrap()[0];
+        let template = source.media_streams.as_ref().unwrap()[0].clone();
+        source.media_streams = Some(
+            (0..count)
+                .map(|index| {
+                    let mut stream = template.clone();
+                    stream.index = Some(index as u32 + 9);
+                    stream
+                })
+                .collect(),
+        );
+        page.select_series_subtitle(Some(count - 1), cx);
+    });
+    cx.run_until_parked();
+}
+
+fn scroll_subtitle_menu(cx: &mut VisualTestContext, delta: f32) {
+    let menu = cx.debug_bounds("series-detail-subtitle-menu").unwrap();
+    cx.simulate_mouse_move(menu.center(), None, Modifiers::default());
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: menu.center(),
+        delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(delta))),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn subtitle_menu_fits_short_windows_and_keeps_all_options_selectable(cx: &mut TestAppContext) {
+    let (page, cx) = detail_menu_window(cx);
+    for (count, last_id) in [
+        (2, "series-detail-subtitle-option-1"),
+        (4, "series-detail-subtitle-option-3"),
+        (8, "series-detail-subtitle-option-7"),
+    ] {
+        set_subtitle_menu_tracks(&page, cx, count);
+        for height in [400.0, 160.0] {
+            cx.simulate_resize(size(px(1100.0), px(height)));
+            cx.run_until_parked();
+            let trigger = cx.debug_bounds("series-detail-subtitle-select").unwrap();
+            page.update(cx, |page, cx| {
+                let handle = &page.detail_view().unwrap().presentation.scroll_handle;
+                let mut offset = handle.offset();
+                offset.y -= trigger.center().y - px(height / 2.0);
+                handle.set_offset(offset);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            click(cx, "series-detail-subtitle-select");
+            let menu = cx.debug_bounds("series-detail-subtitle-menu").unwrap();
+            assert!(menu.top() >= px(0.0), "menu: {menu:?}");
+            assert!(
+                menu.bottom() <= px(height),
+                "menu: {menu:?}, height: {height}"
+            );
+            let selected = cx.debug_bounds(last_id).unwrap();
+            assert!(
+                selected.top() >= menu.top(),
+                "selected: {selected:?}, menu: {menu:?}"
+            );
+            assert!(
+                selected.bottom() <= menu.bottom(),
+                "selected: {selected:?}, menu: {menu:?}"
+            );
+
+            scroll_subtitle_menu(cx, 2000.0);
+            let off = cx
+                .debug_bounds("series-detail-subtitle-off-option")
+                .unwrap();
+            assert!(off.top() >= menu.top());
+            assert!(off.bottom() <= menu.bottom());
+            click(cx, "series-detail-subtitle-off-option");
+            assert!(cx.debug_bounds("series-detail-subtitle-menu").is_none());
+            page.read_with(cx, |page, cx| {
+                assert_eq!(
+                    selection(page, cx).selected_tracks.subtitle_stream_index,
+                    None
+                );
+            });
+
+            click(cx, "series-detail-subtitle-select");
+            scroll_subtitle_menu(cx, -2000.0);
+            let last = cx.debug_bounds(last_id).unwrap();
+            let menu = cx.debug_bounds("series-detail-subtitle-menu").unwrap();
+            assert!(last.top() >= menu.top());
+            assert!(last.bottom() <= menu.bottom());
+            cx.simulate_click(last.center(), Modifiers::default());
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("series-detail-subtitle-menu").is_none());
+            page.read_with(cx, |page, cx| {
+                assert_eq!(
+                    selection(page, cx).selected_tracks.subtitle_stream_index,
+                    Some(count + 8)
+                );
+            });
+        }
+    }
+}
+
+#[gpui::test]
+fn subtitle_menu_stays_in_bounds_when_resizing_an_open_menu(cx: &mut TestAppContext) {
+    let (page, cx) = detail_menu_window(cx);
+    set_subtitle_menu_tracks(&page, cx, 8);
+    click(cx, "series-detail-subtitle-select");
+    for height in [400.0, 160.0, 900.0] {
+        cx.simulate_resize(size(px(1100.0), px(height)));
+        cx.run_until_parked();
+        let menu = cx.debug_bounds("series-detail-subtitle-menu").unwrap();
+        assert!(menu.top() >= px(0.0), "menu: {menu:?}");
+        assert!(
+            menu.bottom() <= px(height),
+            "menu: {menu:?}, height: {height}"
+        );
+        scroll_subtitle_menu(cx, -2000.0);
+        let last = cx.debug_bounds("series-detail-subtitle-option-7").unwrap();
+        assert!(last.top() >= menu.top());
+        assert!(last.bottom() <= menu.bottom());
+    }
+    click(cx, "series-detail-subtitle-option-7");
+    assert!(cx.debug_bounds("series-detail-subtitle-menu").is_none());
 }
 
 #[gpui::test]

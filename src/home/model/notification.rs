@@ -4,6 +4,8 @@ pub(crate) enum NotificationScope {
     Favorites,
     Search,
     Library,
+    Person,
+    Genre,
     Detail,
 }
 

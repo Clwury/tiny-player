@@ -153,7 +153,7 @@ fn virtual_grid_anticipates_scroll_clamp_on_height_expansion() {
 
 #[test]
 fn episode_favorites_grid_uses_landscape_row_height_for_scrolling_and_resize() {
-    let step = UserItemGridSource::Favorites(VideoItemType::Episode).row_step();
+    let step = UserItemGridSource::Favorites(FavoriteItemType::Episode).row_step();
     assert_eq!(step, 202.0);
     assert_eq!(
         user_item_grid_visible_rows(100, 10.0 * step, 600.0, 1, step),

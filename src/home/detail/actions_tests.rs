@@ -142,6 +142,11 @@ impl MockEmby {
                         ("200 OK", serde_json::to_string(&data[id]).unwrap())
                     } else if path.ends_with("/HideFromResume?Hide=true") {
                         ("204 No Content", String::new())
+                    } else if method == "GET" && path.starts_with("/emby/Persons?") {
+                        (
+                            "200 OK",
+                            json!({"Items": [], "TotalRecordCount": 0}).to_string(),
+                        )
                     } else if method == "GET"
                         && path.starts_with("/emby/Users/user-1/Items?")
                         && path.contains("Filters=IsFavorite")
@@ -346,7 +351,7 @@ fn cover_and_resume_menus_toggle_the_clicked_item_favorite_without_removing_it(
             );
             assert!(
                 page.controller
-                    .favorite_section(VideoItemType::Movie)
+                    .favorite_section(VideoItemType::Movie.into())
                     .paged
                     .dirty
             );

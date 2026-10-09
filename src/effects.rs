@@ -65,8 +65,20 @@ pub(crate) enum RequestScope {
     Library {
         view_id: String,
     },
+    Person {
+        person_id: String,
+    },
+    PersonItems {
+        person_id: String,
+    },
+    GenreItems {
+        genre_key: String,
+    },
     Favorites {
-        item_type: crate::emby::VideoItemType,
+        item_type: crate::home::FavoriteItemType,
+    },
+    FavoriteOverview {
+        item_type: crate::home::FavoriteItemType,
     },
     FavoriteMutation {
         item_id: String,
@@ -134,7 +146,11 @@ impl RequestScope {
             Self::ServerCounts { .. } => "request.server_counts",
             Self::Search => "request.search",
             Self::Library { .. } => "request.library",
+            Self::Person { .. } => "request.person",
+            Self::PersonItems { .. } => "request.person_items",
+            Self::GenreItems { .. } => "request.genre_items",
             Self::Favorites { .. } => "request.favorites",
+            Self::FavoriteOverview { .. } => "request.favorite_overview",
             Self::FavoriteMutation { .. } => "request.favorite_mutation",
             Self::ResumeMutation { .. } => "request.resume_mutation",
             Self::PlayedMutation { .. } => "request.played_mutation",

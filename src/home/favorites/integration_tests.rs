@@ -1,5 +1,6 @@
-use super::controller::FavoritesRequest;
-use crate::emby::{UserItem, UserItemData, UserItems, VideoItemType};
+use super::controller::{FavoritesRequest, FavoritesSource};
+use crate::emby::{UserItem, UserItemData, UserItems};
+use crate::home::model::favorites::FavoriteItemType;
 use crate::home::{HomeContent, HomeRoot, HomeRoute, LoadState};
 use std::collections::HashMap;
 
@@ -30,7 +31,7 @@ impl Render for FavoritesWindow {
     }
 }
 
-fn item(item_type: VideoItemType, index: usize) -> UserItem {
+fn item(item_type: FavoriteItemType, index: usize) -> UserItem {
     serde_json::from_value(serde_json::json!({
         "Id": format!("{}-{index}", item_type.as_str()), "Name": format!("Item {index}"),
         "Type": item_type.as_str(), "SeriesId": "series-parent", "SeriesName": "Series",
@@ -51,6 +52,12 @@ fn favorites_window(cx: &mut TestAppContext) -> (Entity<HomeContent>, &mut Visua
             let mut content = HomeContent::new(server, EmbyClient::new("favorites-test".into()).unwrap(), cx);
             content.controller.test_state_mut().navigation.select_root(HomeRoot::Favorites);
             for item_type in FAVORITE_ITEM_TYPES {
+                let state = content.controller.test_state_mut().favorites.test_overview_state_mut(item_type);
+                state.items = (0..30).map(|index| item(item_type, index)).collect();
+                state.initial = LoadState::Loaded;
+                state.total_record_count = Some(30);
+                state.next_start_index = 30;
+                state.exhausted = true;
                 let state = content.controller.test_state_mut().favorites.test_state_mut(item_type);
                 state.items = (0..30).map(|index| item(item_type, index)).collect();
                 state.initial = LoadState::Loaded;
@@ -69,13 +76,17 @@ fn favorites_window(cx: &mut TestAppContext) -> (Entity<HomeContent>, &mut Visua
 }
 
 #[gpui::test]
-fn favorites_shows_three_rows_and_more_preserves_category_scroll(cx: &mut TestAppContext) {
+fn favorites_shows_four_rows_and_more_preserves_category_scroll(cx: &mut TestAppContext) {
     let (content, cx) = favorites_window(cx);
     let movie = cx.debug_bounds("favorite-row-Movie").unwrap();
     let series = cx.debug_bounds("favorite-row-Series").unwrap();
     let episode = cx.debug_bounds("favorite-row-Episode").unwrap();
+    let person = cx.debug_bounds("favorite-row-Person").unwrap();
     assert!(movie.bottom() < series.top());
     assert!(series.bottom() < episode.top());
+    assert!(episode.bottom() < person.top());
+    assert_eq!(person.left(), movie.left());
+    assert_eq!(person.right(), movie.right());
     assert_eq!(movie.left(), series.left());
     assert_eq!(
         movie.left(),
@@ -100,10 +111,10 @@ fn favorites_shows_three_rows_and_more_preserves_category_scroll(cx: &mut TestAp
         assert_eq!(
             page.controller.route(),
             &HomeRoute::FavoriteItems {
-                item_type: VideoItemType::Series
+                item_type: FavoriteItemType::Series
             }
         );
-        page.favorites_presentation[VideoItemType::Series]
+        page.favorites_presentation[FavoriteItemType::Series]
             .presentation
             .scroll_handle
             .set_offset(point(px(0.0), px(-320.0)));
@@ -111,7 +122,7 @@ fn favorites_shows_three_rows_and_more_preserves_category_scroll(cx: &mut TestAp
     });
     cx.run_until_parked();
     let saved_offset = content.read_with(cx, |page, _| {
-        page.favorites_presentation[VideoItemType::Series]
+        page.favorites_presentation[FavoriteItemType::Series]
             .presentation
             .scroll_handle
             .offset()
@@ -124,7 +135,7 @@ fn favorites_shows_three_rows_and_more_preserves_category_scroll(cx: &mut TestAp
             page.controller.route(),
             &HomeRoute::Root(HomeRoot::Favorites)
         );
-        page.open_favorite_items(VideoItemType::Series, cx);
+        page.open_favorite_items(FavoriteItemType::Series, cx);
         page.controller
             .test_state_mut()
             .navigation
@@ -133,25 +144,25 @@ fn favorites_shows_three_rows_and_more_preserves_category_scroll(cx: &mut TestAp
         assert_eq!(
             page.controller.route(),
             &HomeRoute::FavoriteItems {
-                item_type: VideoItemType::Series
+                item_type: FavoriteItemType::Series
             }
         );
         assert!(page.controller.test_state_mut().navigation.pop().changed);
-        page.open_favorite_items(VideoItemType::Movie, cx);
+        page.open_favorite_items(FavoriteItemType::Movie, cx);
         assert_eq!(
-            page.favorites_presentation[VideoItemType::Movie]
+            page.favorites_presentation[FavoriteItemType::Movie]
                 .presentation
                 .scroll_handle
                 .offset(),
             point(px(0.0), px(0.0))
         );
         assert!(page.controller.test_state_mut().navigation.pop().changed);
-        page.open_favorite_items(VideoItemType::Series, cx);
+        page.open_favorite_items(FavoriteItemType::Series, cx);
     });
     cx.run_until_parked();
     content.read_with(cx, |page, _| {
         assert_eq!(
-            page.favorites_presentation[VideoItemType::Series]
+            page.favorites_presentation[FavoriteItemType::Series]
                 .presentation
                 .scroll_handle
                 .offset(),
@@ -170,18 +181,18 @@ fn empty_favorite_sections_leave_no_gaps_during_loading_or_after_empty_responses
         page.controller
             .test_state_mut()
             .favorites
-            .test_state_mut(VideoItemType::Movie)
+            .test_overview_state_mut(FavoriteItemType::Movie)
             .items
             .clear();
         page.controller
             .test_state_mut()
             .favorites
-            .test_state_mut(VideoItemType::Movie)
+            .test_overview_state_mut(FavoriteItemType::Movie)
             .initial = LoadState::Loading;
         page.controller
             .test_state_mut()
             .favorites
-            .test_state_mut(VideoItemType::Episode)
+            .test_overview_state_mut(FavoriteItemType::Episode)
             .items
             .clear();
         cx.notify();
@@ -202,7 +213,7 @@ fn empty_favorite_sections_leave_no_gaps_during_loading_or_after_empty_responses
                     .controller
                     .test_state_mut()
                     .favorites
-                    .test_state_mut(item_type);
+                    .test_overview_state_mut(item_type);
                 state.items.clear();
                 state.initial = initial;
                 state.total_record_count = Some(0);
@@ -214,6 +225,7 @@ fn empty_favorite_sections_leave_no_gaps_during_loading_or_after_empty_responses
             "favorite-section-Movie",
             "favorite-section-Series",
             "favorite-section-Episode",
+            "favorite-section-Person",
         ] {
             assert!(cx.debug_bounds(selector).is_none());
         }
@@ -224,13 +236,13 @@ fn empty_favorite_sections_leave_no_gaps_during_loading_or_after_empty_responses
             .controller
             .test_state_mut()
             .favorites
-            .test_state_mut(VideoItemType::Episode);
-        state.items.push(item(VideoItemType::Episode, 0));
+            .test_overview_state_mut(FavoriteItemType::Episode);
+        state.items.push(item(FavoriteItemType::Episode, 0));
         state.total_record_count = Some(1);
         page.controller
             .test_state_mut()
             .favorites
-            .test_state_mut(VideoItemType::Movie)
+            .test_overview_state_mut(FavoriteItemType::Movie)
             .initial = LoadState::Failed;
         cx.notify();
     });
@@ -242,27 +254,27 @@ fn empty_favorite_sections_leave_no_gaps_during_loading_or_after_empty_responses
 }
 
 #[gpui::test]
-fn empty_favorite_more_page_hides_its_title_and_keeps_back_navigation(cx: &mut TestAppContext) {
+fn empty_favorite_more_page_hides_its_count_and_keeps_back_navigation(cx: &mut TestAppContext) {
     let (content, cx) = favorites_window(cx);
     content.update(cx, |page, cx| {
-        page.open_favorite_items(VideoItemType::Series, cx)
+        page.open_favorite_items(FavoriteItemType::Series, cx)
     });
     cx.run_until_parked();
-    assert!(cx.debug_bounds("favorite-items-title").is_some());
+    assert!(cx.debug_bounds("favorite-items-count").is_some());
     for initial in [LoadState::Loading, LoadState::Loaded] {
         content.update(cx, |page, cx| {
             let state = page
                 .controller
                 .test_state_mut()
                 .favorites
-                .test_state_mut(VideoItemType::Series);
+                .test_state_mut(FavoriteItemType::Series);
             state.items.clear();
             state.initial = initial;
             state.total_record_count = Some(0);
             cx.notify();
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("favorite-items-title").is_none());
+        assert!(cx.debug_bounds("favorite-items-count").is_none());
         assert!(cx.debug_bounds("home-library-back-button").is_some());
     }
     let back = cx.debug_bounds("home-library-back-button").unwrap();
@@ -274,7 +286,7 @@ fn empty_favorite_more_page_hides_its_title_and_keeps_back_navigation(cx: &mut T
             &HomeRoute::Root(HomeRoot::Favorites)
         );
     });
-    assert!(cx.debug_bounds("favorite-section-Series").is_none());
+    assert!(cx.debug_bounds("favorite-section-Series").is_some());
     assert!(cx.debug_bounds("favorite-row-Movie").is_some());
 }
 
@@ -288,7 +300,7 @@ fn favorite_episode_cards_keep_detail_dimensions_in_rows_and_responsive_grids(
     assert_eq!(first.size.width, px(228.0));
     assert_eq!(second.left() - first.right(), px(16.0));
     content.update(cx, |page, cx| {
-        page.open_favorite_items(VideoItemType::Episode, cx)
+        page.open_favorite_items(FavoriteItemType::Episode, cx)
     });
     cx.run_until_parked();
 
@@ -329,7 +341,7 @@ fn favorite_episode_cards_keep_detail_dimensions_in_rows_and_responsive_grids(
         assert_eq!(next_row.top() - first.top(), px(202.0));
         content.read_with(cx, |page, _| {
             assert_eq!(
-                page.favorites_presentation[VideoItemType::Episode]
+                page.favorites_presentation[FavoriteItemType::Episode]
                     .presentation
                     .grid_columns
                     .get(),
@@ -344,7 +356,7 @@ fn downloaded_favorite_episode_primary_is_found_by_the_card_image_lookup(cx: &mu
     use crate::{emby::EmbyImageRequest, images::cache::CachedImageKey};
     let (content, cx) = favorites_window(cx);
     content.update(cx, |page, _| {
-        let mut episode = item(VideoItemType::Episode, 0);
+        let mut episode = item(FavoriteItemType::Episode, 0);
         episode.image_tags = Some(HashMap::from([
             ("Primary".into(), "episode-primary".into()),
             ("Thumb".into(), "episode-thumb".into()),
@@ -374,21 +386,21 @@ fn category_responses_filter_items_and_advance_by_raw_count_without_mixing_pages
             .controller
             .test_state_mut()
             .favorites
-            .test_state_mut(VideoItemType::Movie)
+            .test_overview_state_mut(FavoriteItemType::Movie)
             .begin_initial(true)
             .unwrap();
         let series_generation = page
             .controller
             .test_state_mut()
             .favorites
-            .test_state_mut(VideoItemType::Series)
+            .test_overview_state_mut(FavoriteItemType::Series)
             .begin_initial(true)
             .unwrap();
         let mut items = (0..28)
-            .map(|index| item(VideoItemType::Series, index))
+            .map(|index| item(FavoriteItemType::Series, index))
             .collect::<Vec<_>>();
-        items.push(item(VideoItemType::Movie, 0));
-        let mut blank = item(VideoItemType::Series, 99);
+        items.push(item(FavoriteItemType::Movie, 0));
+        let mut blank = item(FavoriteItemType::Series, 99);
         blank.id.clear();
         items.push(blank);
         page.controller
@@ -403,8 +415,11 @@ fn category_responses_filter_items_and_advance_by_raw_count_without_mixing_pages
             .insert("Series-0".into(), 1);
         page.finish_favorites_page(
             FavoritesRequest {
-                item_type: VideoItemType::Series,
+                source: FavoritesSource::Overview,
+                item_type: FavoriteItemType::Series,
                 user_data_revision: 0,
+                sort_by: crate::emby::UserItemsSort::SortName,
+                sort_order: crate::emby::SortOrder::Ascending,
                 token: series_generation,
                 start_index: 0,
                 initial: true,
@@ -417,7 +432,7 @@ fn category_responses_filter_items_and_advance_by_raw_count_without_mixing_pages
         );
         let series = &page
             .controller
-            .favorite_section(VideoItemType::Series)
+            .favorite_section(FavoriteItemType::Series)
             .paged;
         assert_eq!(series.items.len(), 27);
         assert_eq!(series.next_start_index, 30);
@@ -430,7 +445,7 @@ fn category_responses_filter_items_and_advance_by_raw_count_without_mixing_pages
         );
         assert_eq!(
             page.controller
-                .favorite_section(VideoItemType::Movie)
+                .favorite_section(FavoriteItemType::Movie)
                 .paged
                 .initial,
             LoadState::Loading
@@ -440,21 +455,24 @@ fn category_responses_filter_items_and_advance_by_raw_count_without_mixing_pages
             .controller
             .test_state_mut()
             .favorites
-            .test_state_mut(VideoItemType::Series)
+            .test_overview_state_mut(FavoriteItemType::Series)
             .begin_load_more()
             .unwrap();
         page.finish_favorites_page(
             FavoritesRequest {
-                item_type: VideoItemType::Series,
+                source: FavoritesSource::Overview,
+                item_type: FavoriteItemType::Series,
                 user_data_revision: 0,
+                sort_by: crate::emby::UserItemsSort::SortName,
+                sort_order: crate::emby::SortOrder::Ascending,
                 token: generation.clone(),
                 start_index,
                 initial: false,
             },
             Ok(UserItems {
                 items: vec![
-                    item(VideoItemType::Series, 27),
-                    item(VideoItemType::Series, 30),
+                    item(FavoriteItemType::Series, 27),
+                    item(FavoriteItemType::Series, 30),
                 ],
                 total_record_count: 32,
             }),
@@ -462,7 +480,7 @@ fn category_responses_filter_items_and_advance_by_raw_count_without_mixing_pages
         );
         assert_eq!(
             page.controller
-                .favorite_section(VideoItemType::Series)
+                .favorite_section(FavoriteItemType::Series)
                 .paged
                 .items
                 .len(),
@@ -470,21 +488,24 @@ fn category_responses_filter_items_and_advance_by_raw_count_without_mixing_pages
         );
         assert_eq!(
             page.controller
-                .favorite_section(VideoItemType::Series)
+                .favorite_section(FavoriteItemType::Series)
                 .paged
                 .next_start_index,
             32
         );
         assert!(
             page.controller
-                .favorite_section(VideoItemType::Series)
+                .favorite_section(FavoriteItemType::Series)
                 .paged
                 .exhausted
         );
         page.finish_favorites_page(
             FavoritesRequest {
-                item_type: VideoItemType::Movie,
+                source: FavoritesSource::Overview,
+                item_type: FavoriteItemType::Movie,
                 user_data_revision: 0,
+                sort_by: crate::emby::UserItemsSort::SortName,
+                sort_order: crate::emby::SortOrder::Ascending,
                 token: movie_generation,
                 start_index: 0,
                 initial: true,
@@ -494,14 +515,14 @@ fn category_responses_filter_items_and_advance_by_raw_count_without_mixing_pages
         );
         assert_eq!(
             page.controller
-                .favorite_section(VideoItemType::Movie)
+                .favorite_section(FavoriteItemType::Movie)
                 .paged
                 .initial,
             LoadState::Failed
         );
         assert_eq!(
             page.controller
-                .favorite_section(VideoItemType::Series)
+                .favorite_section(FavoriteItemType::Series)
                 .paged
                 .items
                 .len(),
@@ -520,28 +541,31 @@ fn dirty_favorites_reject_old_pages_and_rollback_restores_the_original_category(
             .controller
             .test_state_mut()
             .favorites
-            .test_state_mut(VideoItemType::Episode);
+            .test_overview_state_mut(FavoriteItemType::Episode);
         state.exhausted = false;
         state.total_record_count = Some(60);
         let (generation, start_index) = state.begin_load_more().unwrap();
-        let (item_type, index, removed) = page
+        let item_type = FavoriteItemType::Episode;
+        let removed = page
             .controller
             .test_state_mut()
             .favorites
-            .remove_item("Episode-5")
-            .unwrap();
-        assert_eq!(item_type, VideoItemType::Episode);
+            .remove_item("Episode-5");
+        assert_eq!(removed.len(), 2);
         page.invalidate_favorites();
         page.finish_favorites_page(
             FavoritesRequest {
+                source: FavoritesSource::Overview,
                 item_type,
                 user_data_revision: 0,
+                sort_by: crate::emby::UserItemsSort::SortName,
+                sort_order: crate::emby::SortOrder::Ascending,
                 token: generation.clone(),
                 start_index,
                 initial: false,
             },
             Ok(UserItems {
-                items: vec![item(VideoItemType::Episode, 30)],
+                items: vec![item(FavoriteItemType::Episode, 30)],
                 total_record_count: 60,
             }),
             cx,
@@ -557,7 +581,7 @@ fn dirty_favorites_reject_old_pages_and_rollback_restores_the_original_category(
         page.controller
             .test_state_mut()
             .favorites
-            .restore_item(item_type, index, removed);
+            .restore_item(removed);
         assert_eq!(
             page.controller.favorite_section(item_type).paged.items[5].id,
             "Episode-5"
@@ -571,7 +595,7 @@ fn dirty_favorites_reject_old_pages_and_rollback_restores_the_original_category(
         );
         assert_eq!(
             page.controller
-                .favorite_section(VideoItemType::Movie)
+                .favorite_section(FavoriteItemType::Movie)
                 .paged
                 .items
                 .len(),
@@ -579,7 +603,7 @@ fn dirty_favorites_reject_old_pages_and_rollback_restores_the_original_category(
         );
         assert_eq!(
             page.controller
-                .favorite_section(VideoItemType::Series)
+                .favorite_section(FavoriteItemType::Series)
                 .paged
                 .items
                 .len(),
@@ -594,19 +618,22 @@ fn failed_category_pagination_retries_the_same_offset_without_discarding_items(
 ) {
     let (content, cx) = favorites_window(cx);
     content.update(cx, |page, cx| {
-        let item_type = VideoItemType::Movie;
+        let item_type = FavoriteItemType::Movie;
         let state = page
             .controller
             .test_state_mut()
             .favorites
-            .test_state_mut(item_type);
+            .test_overview_state_mut(item_type);
         state.exhausted = false;
         state.total_record_count = Some(60);
         let (generation, start_index) = state.begin_load_more().unwrap();
         page.finish_favorites_page(
             FavoritesRequest {
+                source: FavoritesSource::Overview,
                 item_type,
                 user_data_revision: 0,
+                sort_by: crate::emby::UserItemsSort::SortName,
+                sort_order: crate::emby::SortOrder::Ascending,
                 token: generation.clone(),
                 start_index,
                 initial: false,
@@ -618,7 +645,7 @@ fn failed_category_pagination_retries_the_same_offset_without_discarding_items(
             .controller
             .test_state_mut()
             .favorites
-            .test_state_mut(item_type);
+            .test_overview_state_mut(item_type);
         assert_eq!(state.items.len(), 30);
         assert!(!state.can_auto_load_more());
         let (retry, retry_start) = state.begin_load_more().unwrap();
@@ -627,8 +654,11 @@ fn failed_category_pagination_retries_the_same_offset_without_discarding_items(
         let generation = retry;
         page.finish_favorites_page(
             FavoritesRequest {
+                source: FavoritesSource::Overview,
                 item_type,
                 user_data_revision: 0,
+                sort_by: crate::emby::UserItemsSort::SortName,
+                sort_order: crate::emby::SortOrder::Ascending,
                 token: generation.clone(),
                 start_index: 30,
                 initial: false,
@@ -650,10 +680,13 @@ fn failed_category_pagination_retries_the_same_offset_without_discarding_items(
         assert!(page.controller.favorite_section(item_type).paged.exhausted);
         assert_eq!(
             page.controller
-                .favorite_section(VideoItemType::Series)
+                .favorite_section(FavoriteItemType::Series)
                 .paged
                 .next_start_index,
             30
         );
     });
 }
+
+mod people;
+mod sorting;

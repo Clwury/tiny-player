@@ -74,6 +74,11 @@ impl TinyApp {
     ) -> Self {
         let persistence = crate::persistence::PersistenceService::get(cx);
         cache.track_languages.apply(cx);
+        cache.items_sort.apply(cx);
+        cx.observe_global::<crate::media::ItemSortPreferences>(|app, cx| {
+            app.update_items_sort(crate::media::ItemSortPreferences::get(cx), cx);
+        })
+        .detach();
         let (cache, catalog) = crate::config::GlobalConfig::split(cache);
         let server_feature = crate::server::feature::ServerController::new(catalog);
         let window_persistence_enabled = startup_error.is_none();

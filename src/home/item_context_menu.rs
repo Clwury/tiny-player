@@ -74,7 +74,7 @@ impl HomeContent {
                 .filter(|item| {
                     matches!(
                         item.item_type.as_deref(),
-                        Some("Movie" | "Series" | "Episode")
+                        Some("Movie" | "Series" | "Episode" | "Person")
                     )
                 })
                 .map(|item| item.user_data.unwrap_or_default()),
@@ -133,6 +133,11 @@ impl HomeContent {
         let pending = self.controller.user_data_pending() || data.is_none();
         let favorite = data.is_some_and(|data| data.is_favorite);
         let resume = menu.source == ItemContextMenuSource::Resume;
+        let person = !resume
+            && self
+                .controller
+                .user_item_by_id(&menu.item_id)
+                .is_some_and(|item| item.item_type.as_deref() == Some("Person"));
         let menu_id = if resume {
             "resume-item-context-menu"
         } else {
@@ -186,21 +191,30 @@ impl HomeContent {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                     .on_mouse_down_out(cx.listener(Self::close_item_context_menu))
-                    .children(options.into_iter().take(if resume { 3 } else { 2 }).map(
-                        |(id, label, action)| {
-                            item_context_menu_option(
-                                id,
-                                label,
-                                matches!(action, ItemContextMenuAction::HideFromResume),
-                                pending,
-                                cx.listener(move |page, _: &MouseDownEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    page.activate_item_context_menu_action(action, cx);
-                                }),
-                                cx,
-                            )
-                        },
-                    )),
+                    .children(
+                        options
+                            .into_iter()
+                            .take(if resume {
+                                3
+                            } else if person {
+                                1
+                            } else {
+                                2
+                            })
+                            .map(|(id, label, action)| {
+                                item_context_menu_option(
+                                    id,
+                                    label,
+                                    matches!(action, ItemContextMenuAction::HideFromResume),
+                                    pending,
+                                    cx.listener(move |page, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        page.activate_item_context_menu_action(action, cx);
+                                    }),
+                                    cx,
+                                )
+                            }),
+                    ),
             )
     }
 }

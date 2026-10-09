@@ -10,6 +10,18 @@ use crate::{persistence::SETTINGS_DEBOUNCE as CACHE_SAVE_DEBOUNCE, storage};
 use std::time::Duration;
 
 impl TinyApp {
+    pub(super) fn update_items_sort(
+        &mut self,
+        preferences: crate::media::ItemSortPreferences,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cache.items_sort == preferences {
+            return;
+        }
+        self.cache.items_sort = preferences;
+        self.schedule_cache_save("保存排序设置失败", cx);
+    }
+
     pub(super) fn update_playback_volume(
         &mut self,
         settings: crate::player::PlaybackVolumeSettings,
@@ -488,6 +500,74 @@ mod tests {
                 .cache_secs,
             75.0
         );
+    }
+
+    #[gpui::test]
+    fn shared_sort_changes_are_coalesced_flushed_on_close_and_restored_on_restart(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::{
+            emby::{SortOrder, UserItemsSort},
+            media::ItemSortPreferences,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let app = cx.new(|cx| {
+            let mut app = TinyApp::new(ServerCache::empty(), None, cx);
+            app.cache_save_path = Some(path.clone());
+            app
+        });
+        cx.run_until_parked();
+        assert!(!path.exists());
+        assert!(app.read_with(cx, |app, _| !app.persistence.is_dirty(&DirtyKey::Settings)));
+
+        for sort_by in [UserItemsSort::DateCreated, UserItemsSort::PremiereDate] {
+            cx.update(|cx| {
+                ItemSortPreferences {
+                    sort_by,
+                    sort_order: SortOrder::Ascending,
+                }
+                .apply(cx)
+            });
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            assert!(!path.exists());
+        }
+        cx.executor().advance_clock(CACHE_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        assert_eq!(
+            storage::load_or_init_from(&path).unwrap().items_sort,
+            ItemSortPreferences {
+                sort_by: UserItemsSort::PremiereDate,
+                sort_order: SortOrder::Ascending,
+            }
+        );
+
+        let selected = ItemSortPreferences {
+            sort_by: UserItemsSort::ProductionYear,
+            sort_order: SortOrder::Descending,
+        };
+        cx.update(|cx| selected.apply(cx));
+        cx.run_until_parked();
+        assert_eq!(app.read_with(cx, |app, _| app.cache.items_sort), selected);
+        drop(app);
+        cx.update(|_| {});
+        cx.run_until_parked();
+        let saved = storage::load_or_init_from(&path).unwrap();
+        assert_eq!(saved.items_sort, selected);
+        cx.update(|cx| ItemSortPreferences::default().apply(cx));
+        let reopened = cx.new(|cx| {
+            let mut app = TinyApp::new(saved, None, cx);
+            app.cache_save_path = Some(path.clone());
+            app
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| ItemSortPreferences::get(cx)), selected);
+        cx.update(|cx| selected.apply(cx));
+        cx.run_until_parked();
+        assert!(reopened.read_with(cx, |app, _| !app.persistence.is_dirty(&DirtyKey::Settings)));
     }
 
     #[gpui::test]

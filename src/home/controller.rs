@@ -6,9 +6,12 @@ mod detail;
 mod detail_controls;
 mod favorites;
 mod feed;
+mod genre;
+mod items_sort;
 mod library;
 mod mutations;
 mod navigation;
+mod person;
 mod playback;
 mod search;
 mod selectors;
@@ -41,7 +44,10 @@ pub(super) struct HomeController {
     navigation: HomeNavigation,
     feed: FeedController,
     libraries: HashMap<String, LibraryController>,
+    genres: HashMap<String, LibraryController>,
+    persons: HashMap<String, super::person::controller::PersonController>,
     favorites: FavoritesController,
+    items_sort: crate::media::ItemSortPreferences,
     search: SearchController,
     user_data: UserDataState,
     played_video_versions: HashMap<String, VideoVersion>,
@@ -58,7 +64,10 @@ impl HomeController {
             navigation: HomeNavigation::default(),
             feed: FeedController::new(identity.clone()),
             libraries: HashMap::new(),
+            genres: HashMap::new(),
+            persons: HashMap::new(),
             favorites: FavoritesController::new(identity.clone()),
+            items_sort: crate::media::ItemSortPreferences::default(),
             search: SearchController::new(identity.clone()),
             user_data: UserDataState::default(),
             played_video_versions: HashMap::new(),

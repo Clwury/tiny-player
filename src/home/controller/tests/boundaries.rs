@@ -77,7 +77,9 @@ fn search_result_checks_mounted_account_before_merging_shared_user_data() {
 fn favorite_intent_derives_route_and_rolls_back_both_owned_states() {
     let mut home = HomeController::new(identity());
     home.navigation.select_root(HomeRoot::Favorites);
-    home.favorites.test_state_mut(VideoItemType::Movie).items = items("Favorite", 10).items;
+    home.favorites
+        .test_overview_state_mut(VideoItemType::Movie.into())
+        .items = items("Favorite", 10).items;
     let command = home
         .dispatch_favorite(FavoriteIntent {
             fallback: Some(UserItemData {
@@ -107,7 +109,10 @@ fn favorite_intent_derives_route_and_rolls_back_both_owned_states() {
     assert!(update.failure.is_some());
     assert!(!home.user_data_pending());
     assert_eq!(
-        home.favorite_section(VideoItemType::Movie).paged.items[0].id,
+        home.favorite_overview_section(VideoItemType::Movie.into())
+            .paged
+            .items[0]
+            .id,
         "movie"
     );
     assert!(home.effective_user_data("movie", None).is_none());

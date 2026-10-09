@@ -82,6 +82,15 @@ mod tests {
         ) -> anyhow::Result<Vec<crate::emby::UserItem>> {
             panic!("unexpected endpoint")
         }
+        fn persons(
+            &self,
+            _: &crate::emby::UserItemsQuery,
+        ) -> anyhow::Result<crate::emby::UserItems> {
+            Ok(crate::emby::UserItems {
+                items: Vec::new(),
+                total_record_count: 0,
+            })
+        }
         fn user_items(&self, _: &crate::emby::UserItemsQuery) -> anyhow::Result<UserItems> {
             panic!("search must use the search endpoint");
         }

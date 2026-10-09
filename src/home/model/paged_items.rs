@@ -71,6 +71,17 @@ impl PagedItemsState {
         self.refresh_checkpoint = None;
     }
 
+    pub(crate) fn reset_for_sort(&mut self) {
+        self.mark_dirty();
+        self.items.clear();
+        self.total_record_count = None;
+        self.next_start_index = 0;
+        self.exhausted = false;
+        self.initial = LoadState::Idle;
+        self.initial_error = None;
+        self.refresh_error = None;
+    }
+
     pub(crate) fn begin_initial(&mut self, clear_items: bool) -> Option<RequestToken> {
         if self.initial == LoadState::Loading {
             return None;
@@ -286,7 +297,7 @@ mod tests {
         );
         let mut favorites = PagedItemsState::new(
             RequestScope::Favorites {
-                item_type: crate::emby::VideoItemType::Movie,
+                item_type: crate::home::FavoriteItemType::Movie,
             },
             identity,
         );

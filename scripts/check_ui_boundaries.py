@@ -127,6 +127,7 @@ PURE_GLOBS = (
     'src/home/feed/controller.rs', 'src/home/feed/model.rs', 'src/home/feed/selectors.rs',
     'src/home/search/controller.rs', 'src/home/search/model.rs',
     'src/home/library/controller.rs', 'src/home/library/model.rs',
+    'src/home/person/controller.rs',
     'src/home/sidebar/controller.rs', 'src/home/sidebar/controller/**/*.rs',
     'src/home/favorites/controller.rs', 'src/home/favorites/actions.rs',
     'src/home/detail/controller.rs', 'src/home/detail/model.rs', 'src/home/detail/playback.rs',

@@ -1,6 +1,9 @@
 use crate::{
     emby::VideoItemType,
-    home::detail::controller::{DetailController, DetailId},
+    home::{
+        detail::controller::{DetailController, DetailId},
+        model::favorites::FavoriteItemType,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -25,12 +28,20 @@ impl HomeRoot {
 pub(crate) enum HomeRoute {
     Root(HomeRoot),
     FavoriteItems {
-        item_type: VideoItemType,
+        item_type: FavoriteItemType,
     },
     Library {
         view_id: String,
         title: String,
         item_types: Vec<VideoItemType>,
+    },
+    Person {
+        person_id: String,
+        title: String,
+    },
+    Genre {
+        genre_key: String,
+        title: String,
     },
     Detail {
         root_item_id: String,
@@ -43,7 +54,9 @@ impl HomeRoute {
         match self {
             Self::Root(root) => Some(root.title()),
             Self::FavoriteItems { item_type } => Some(super::favorite_section_title(*item_type)),
-            Self::Library { title, .. } => Some(title),
+            Self::Library { title, .. }
+            | Self::Person { title, .. }
+            | Self::Genre { title, .. } => Some(title),
             Self::Detail { .. } => None,
         }
     }
@@ -177,11 +190,7 @@ impl HomeNavigation {
             changed: true,
             ..Default::default()
         };
-        if let Some(mut current) = self.detail.take() {
-            current.deactivate();
-            change.hidden = Some(current.id());
-            self.history.push(current);
-        }
+        change.hidden = self.hide_detail();
         self.stack.push(HomeRoute::Detail {
             root_item_id: detail.view_model().series_id.clone(),
             episode_id: detail.view_model().preferred_episode_id.clone(),
@@ -190,11 +199,39 @@ impl HomeNavigation {
         change
     }
 
-    pub(crate) fn push_favorite_items(&mut self, item_type: VideoItemType) -> NavigationChange {
+    fn hide_detail(&mut self) -> Option<DetailId> {
+        let mut current = self.detail.take()?;
+        current.deactivate();
+        let id = current.id();
+        self.history.push(current);
+        Some(id)
+    }
+
+    pub(crate) fn push_person(&mut self, person_id: String, title: String) -> NavigationChange {
+        let hidden = self.hide_detail();
+        self.stack.push(HomeRoute::Person { person_id, title });
+        NavigationChange {
+            changed: true,
+            hidden,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn push_favorite_items(&mut self, item_type: FavoriteItemType) -> NavigationChange {
         self.stack.push(HomeRoute::FavoriteItems { item_type });
         NavigationChange {
             changed: true,
             removed: self.retire_details(),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn push_genre(&mut self, genre_key: String, title: String) -> NavigationChange {
+        let hidden = self.hide_detail();
+        self.stack.push(HomeRoute::Genre { genre_key, title });
+        NavigationChange {
+            changed: true,
+            hidden,
             ..Default::default()
         }
     }
@@ -214,7 +251,10 @@ impl HomeNavigation {
             if let Some(detail) = self.detail.as_mut() {
                 detail.activate();
             }
-        } else {
+        } else if !matches!(
+            self.current(),
+            HomeRoute::Person { .. } | HomeRoute::Genre { .. }
+        ) {
             removed.extend(self.retire_details());
         }
         NavigationChange {
@@ -367,13 +407,13 @@ mod tests {
         assert_eq!(navigation.title(), "Library title");
         assert!(navigation.detail().is_none());
         navigation.select_root(HomeRoot::Favorites);
-        navigation.push_favorite_items(VideoItemType::Movie);
+        navigation.push_favorite_items(VideoItemType::Movie.into());
         navigation.open_detail(entry("series"), &Default::default());
         assert_eq!(navigation.pop().removed.len(), 1);
         assert_eq!(
             navigation.current(),
             &HomeRoute::FavoriteItems {
-                item_type: VideoItemType::Movie
+                item_type: VideoItemType::Movie.into()
             }
         );
         assert_eq!(navigation.title(), "电影");
@@ -404,10 +444,72 @@ mod tests {
     }
 
     #[test]
+    fn person_routes_preserve_each_source_detail_through_nested_filmographies() {
+        use crate::home::detail::controller::DetailIntent;
+        let mut navigation = HomeNavigation::default();
+        navigation.push_library(
+            "library".into(),
+            "Library".into(),
+            vec![VideoItemType::Series],
+        );
+        let mut first = entry("first");
+        first
+            .dispatch(DetailIntent::Season("season-2".into()))
+            .unwrap();
+        let first_id = first.id();
+        navigation.open_detail(first, &Default::default());
+        let change = navigation.push_person("person-1".into(), "First person".into());
+        assert_eq!(change.hidden, Some(first_id));
+        assert!(change.removed.is_empty());
+        assert!(navigation.detail().is_none());
+        assert_eq!(navigation.title(), "First person");
+        let second = entry("second");
+        let second_id = second.id();
+        navigation.open_detail(second, &Default::default());
+        navigation.push_person("person-2".into(), "Second person".into());
+        navigation.open_detail(entry("third"), &Default::default());
+        let change = navigation.pop();
+        assert_eq!(change.removed.len(), 1);
+        assert_eq!(navigation.title(), "Second person");
+        assert_eq!(navigation.history.len(), 2);
+        assert!(navigation.pop().removed.is_empty());
+        assert_eq!(navigation.detail().unwrap().id(), second_id);
+        assert!(navigation.detail().unwrap().activation().is_some());
+        let change = navigation.pop();
+        assert_eq!(change.removed[0].id(), second_id);
+        assert_eq!(navigation.title(), "First person");
+        assert_eq!(navigation.history.len(), 1);
+        assert!(navigation.pop().removed.is_empty());
+        let restored = navigation.detail().unwrap();
+        assert_eq!(restored.id(), first_id);
+        assert_eq!(
+            restored.view_model().selected_season_id.as_deref(),
+            Some("season-2")
+        );
+        assert!(restored.activation().is_some());
+        assert_eq!(navigation.pop().removed[0].id(), first_id);
+        assert_eq!(navigation.title(), "Library");
+    }
+
+    #[test]
+    fn switching_root_from_person_retires_all_hidden_details() {
+        let mut navigation = HomeNavigation::default();
+        navigation.open_detail(entry("first"), &Default::default());
+        navigation.push_person("person".into(), "Person".into());
+        navigation.open_detail(entry("second"), &Default::default());
+        navigation.push_person("other".into(), "Other".into());
+        let change = navigation.select_root(HomeRoot::Home);
+        assert_eq!(change.removed.len(), 2);
+        assert!(navigation.history.is_empty());
+        assert!(navigation.detail().is_none());
+        assert_eq!(navigation.current(), &HomeRoute::Root(HomeRoot::Home));
+    }
+
+    #[test]
     fn repeated_back_keeps_the_selected_root() {
         let mut navigation = HomeNavigation::default();
         navigation.select_root(HomeRoot::Favorites);
-        navigation.push_favorite_items(VideoItemType::Movie);
+        navigation.push_favorite_items(VideoItemType::Movie.into());
         navigation.push_detail_route_fixture("movie".into(), None);
         assert!(navigation.pop().changed);
         assert!(navigation.pop().changed);

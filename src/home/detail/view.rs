@@ -2,7 +2,7 @@ use crate::home::model::cards::format_community_rating;
 use gpui::{
     Animation, AnimationExt as _, Context, InteractiveElement, InteractiveText, IntoElement,
     MouseButton, ParentElement, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage,
-    StyledText, Transformation, Window, deferred, div, ease_in_out, img, percentage,
+    StyledText, Transformation, Window, anchored, deferred, div, ease_in_out, img, percentage,
     prelude::FluentBuilder, px, svg,
 };
 
@@ -34,6 +34,7 @@ const DETAIL_SELECT_MAX_VISIBLE_OPTIONS: usize = 5;
 const DETAIL_SELECT_OPTION_HEIGHT_PX: f32 = 28.0;
 const DETAIL_TWO_LINE_OPTION_HEIGHT_PX: f32 = 48.0;
 const DETAIL_SELECT_WIDTH_PX: f32 = 250.0;
+const DETAIL_SELECT_WINDOW_MARGIN_PX: f32 = 8.0;
 const DETAIL_SELECT_TOOLTIP_WIDTH_UNITS: usize = 30;
 const SEASON_SELECT_MIN_WIDTH_PX: f32 = 100.0;
 const SEASON_SELECT_MAX_WIDTH_PX: f32 = 320.0;
@@ -41,11 +42,11 @@ const SEASON_SELECT_HORIZONTAL_PADDING_PX: f32 = 8.0;
 
 pub(super) fn reveal_two_line_option(scroll_handle: &ScrollHandle, option_index: usize) {
     // On first open, GPUI's scroll_to_item has no previous viewport to inspect.
-    // Seed the offset from our fixed row heights; layout clamps it to the content.
-    let first_visible = option_index.saturating_sub(DETAIL_SELECT_MAX_VISIBLE_OPTIONS - 1);
+    // Seed the selected row at the top, since short windows can show fewer rows.
+    // Layout clamps the offset to the content.
     scroll_handle.set_offset(gpui::point(
         px(0.0),
-        px(-(first_visible as f32) * (DETAIL_TWO_LINE_OPTION_HEIGHT_PX + 4.0)),
+        px(-(option_index as f32) * (DETAIL_TWO_LINE_OPTION_HEIGHT_PX + 4.0)),
     ));
 }
 
@@ -235,9 +236,9 @@ fn season_popup_menu_trigger<T>(
 fn detail_select_menu<T, I, E>(
     id: &'static str,
     option_count: usize,
-    width: f32,
-    option_height: f32,
+    option_size: gpui::Size<gpui::Pixels>,
     scroll_handle: &ScrollHandle,
+    window: &Window,
     cx: &Context<T>,
     children: I,
 ) -> impl IntoElement
@@ -246,25 +247,27 @@ where
     E: IntoElement,
 {
     let theme = theme::get(cx);
-    let scrollable = detail_select_menu_is_scrollable(option_count);
+    let available_size = crate::app::window_content_size(window);
+    // Four-pixel gaps and padding, with a one-pixel border on each side.
+    let content_height = |count: usize| {
+        f32::from(option_size.height) * count as f32 + 4.0 * count.saturating_sub(1) as f32 + 10.0
+    };
+    let menu_height = content_height(option_count.min(DETAIL_SELECT_MAX_VISIBLE_OPTIONS))
+        .min((f32::from(available_size.height) - DETAIL_SELECT_WINDOW_MARGIN_PX * 2.0).max(0.0));
+    let scrollable = content_height(option_count) > menu_height;
     let content_scroll_handle = scroll_handle.clone();
     let scrollbar_scroll_handle = scroll_handle.clone();
 
-    div()
+    let menu = div()
         .id(id)
         .debug_selector(move || id.into())
-        .absolute()
-        .top(px(40.0))
-        .left_0()
         .flex()
         .flex_col()
-        .w(px(width))
-        .max_w_full()
-        .when(scrollable, |this| {
-            this.h(px(option_height * DETAIL_SELECT_MAX_VISIBLE_OPTIONS as f32
-                + 4.0 * 4.0
-                + 6.0 * 2.0))
-        })
+        .w(option_size.width)
+        .max_w(px((f32::from(available_size.width)
+            - DETAIL_SELECT_WINDOW_MARGIN_PX * 2.0)
+            .max(0.0)))
+        .h(px(menu_height))
         .overflow_hidden()
         .rounded(radius::SURFACE)
         .border_1()
@@ -298,7 +301,13 @@ where
                     .id((gpui::ElementId::from(id), "scrollbar"))
                     .edge_inset(px(4.0)),
             )
-        })
+        });
+
+    div().absolute().top(px(40.0)).left_0().child(
+        anchored()
+            .snap_to_window_with_margin(px(DETAIL_SELECT_WINDOW_MARGIN_PX))
+            .child(menu),
+    )
 }
 
 fn detail_select_option<T>(
@@ -503,19 +512,9 @@ fn season_select_width<'a>(labels: impl IntoIterator<Item = &'a str>, window: &W
         .clamp(SEASON_SELECT_MIN_WIDTH_PX, SEASON_SELECT_MAX_WIDTH_PX)
 }
 
-fn detail_select_menu_is_scrollable(option_count: usize) -> bool {
-    option_count > DETAIL_SELECT_MAX_VISIBLE_OPTIONS
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detail_select_menu_scrolls_only_after_five_options() {
-        assert!(!detail_select_menu_is_scrollable(5));
-        assert!(detail_select_menu_is_scrollable(6));
-    }
 
     #[test]
     fn detail_select_tooltip_detects_long_ascii_and_cjk_labels() {

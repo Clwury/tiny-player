@@ -131,6 +131,12 @@ impl HomeController {
                 notification,
             } => {
                 let item = self.user_item_by_id(&item_id)?;
+                if !matches!(
+                    item.item_type.as_deref(),
+                    Some("Movie" | "Series" | "Episode")
+                ) {
+                    return None;
+                }
                 let whole_series = item.item_type.as_deref() == Some("Series");
                 PlayedRequest {
                     item_id: item.id,

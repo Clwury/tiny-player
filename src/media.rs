@@ -1,5 +1,6 @@
 //! Media values and deterministic selection shared by browsing and playback.
 pub(crate) mod gateway;
+mod item_sort;
 mod language;
 mod queue;
 mod selection;
@@ -8,6 +9,8 @@ mod track_preferences;
 mod tracks;
 pub(crate) mod video_version;
 
+pub use item_sort::ItemSortPreferences;
+pub(crate) use item_sort::{ItemSortOptions, item_sort_is_available};
 pub(crate) use language::{PlaybackLanguagePreferences, TrackLanguage};
 pub use queue::{PlaybackQueue, PlaybackQueueItem};
 pub(crate) use selection::{

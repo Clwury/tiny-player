@@ -1,9 +1,11 @@
+#[cfg(test)]
+use crate::home::model::favorites::FavoriteItemType;
 use std::collections::HashMap;
 
-use super::controller::FavoritesController;
+use super::controller::{FavoritesController, RemovedFavorite};
 use crate::{
     effects::{RequestScope, RequestSlot, RequestToken, WorkspaceIdentity},
-    emby::{UserItem, UserItemData, VideoItemType},
+    emby::UserItemData,
     home::model::{
         notification::ActionNotification,
         user_data::{PendingFavorites, UserDataState},
@@ -25,7 +27,7 @@ pub(crate) struct FavoriteActions {
 struct FavoriteOperation {
     slot: RequestSlot,
     previous_override: Option<UserItemData>,
-    removed: Option<(VideoItemType, usize, UserItem)>,
+    removed: Vec<RemovedFavorite>,
     notification: ActionNotification,
 }
 
@@ -80,9 +82,11 @@ impl FavoriteActions {
         optimistic.is_favorite = desired;
         data.bump(&intent.item_id);
         let previous_override = data.overrides.insert(intent.item_id.clone(), optimistic);
-        let removed = (intent.in_favorites && !desired)
-            .then(|| favorites.remove_item(&intent.item_id))
-            .flatten();
+        let removed = if intent.in_favorites && !desired {
+            favorites.remove_item(&intent.item_id)
+        } else {
+            Vec::new()
+        };
         favorites.mark_dirty();
         let mut slot = RequestSlot::new(
             RequestScope::FavoriteMutation {
@@ -135,9 +139,7 @@ impl FavoriteActions {
                         data.overrides.remove(&command.item_id);
                     }
                 }
-                if let Some((kind, index, item)) = operation.removed {
-                    favorites.restore_item(kind, index, item);
-                }
+                favorites.restore_item(operation.removed);
                 Some((operation.notification, error.to_string()))
             }
         };

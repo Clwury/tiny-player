@@ -91,10 +91,25 @@ impl HomeContent {
                                             person.id().unwrap_or("unknown").to_string();
                                         let image_path = self.image_path_for_person_primary(person);
 
-                                        person_card(person.into(), image_path, cx).id((
-                                            gpui::ElementId::from("series-detail-person-card"),
-                                            format!("{person_key}-{index}"),
-                                        ))
+                                        let card_selector = format!(
+                                            "series-detail-person-card-{person_key}-{index}"
+                                        );
+                                        person_card(person.into(), image_path, cx)
+                                            .id((
+                                                gpui::ElementId::from("series-detail-person-card"),
+                                                format!("{person_key}-{index}"),
+                                            ))
+                                            .debug_selector(move || card_selector.clone())
+                                            .when(person.id().is_some(), |this| {
+                                                let person = person.clone();
+                                                this.role(gpui::Role::Button)
+                                                    .aria_label("查看人物作品")
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(move |page, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        page.open_person_page(&person, cx);
+                                                    }))
+                                            })
                                     }),
                             )
                             .when(visible_range.trailing_width > 0.0, |this| {

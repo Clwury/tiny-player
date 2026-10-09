@@ -39,7 +39,7 @@ fn reopening_loaded_library_reuses_scroll_and_sort_selection_closes_only_its_men
             .grid
             .scroll_handle
             .set_offset(offset);
-        page.toggle_current_library_sort_menu(cx);
+        page.toggle_current_items_sort_menu(cx);
         assert!(page.library_resources[&view.id].presentation.sort_menu_open);
         page.select_library_sort_by(view.id.clone(), UserItemsSort::SortName, cx);
         assert!(!page.library_resources[&view.id].presentation.sort_menu_open);

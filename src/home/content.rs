@@ -19,6 +19,10 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) -> Self {
         let persistence = crate::persistence::PersistenceService::get(cx);
+        cx.observe_global::<crate::media::ItemSortPreferences>(|page, cx| {
+            page.apply_shared_items_sort(crate::media::ItemSortPreferences::get(cx), cx);
+        })
+        .detach();
         cx.observe_global::<PlaybackTrackPreferences>(|page, cx| {
             if page.sync_track_preferences(cx) {
                 page.schedule_home_snapshot_save(cx);
@@ -68,7 +72,8 @@ impl HomeContent {
         });
         let layout = model::layout::HomeLayoutController::new(identity.clone());
         let notifications = HomeNotificationQueue::new(identity.clone());
-        let controller = HomeController::new(identity);
+        let mut controller = HomeController::new(identity);
+        controller.set_items_sort(crate::media::ItemSortPreferences::get(cx));
         Self {
             current_server,
             emby_client,
@@ -84,6 +89,8 @@ impl HomeContent {
             item_context_menu: None,
             resume_effects: HashMap::new(),
             library_resources: HashMap::new(),
+            genre_resources: HashMap::new(),
+            person_resources: HashMap::new(),
             favorites_presentation: FavoritesPresentation::new(),
             search_effect: EffectHandle::default(),
             search_presentation: SearchPresentation::default(),

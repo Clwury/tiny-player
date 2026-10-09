@@ -128,7 +128,7 @@ fn favorite_grid_menu_rolls_back_failed_removal_and_retargets_after_success(
     page.read_with(cx, |page, _| {
         let items = &page
             .controller
-            .favorite_section(VideoItemType::Episode)
+            .favorite_section(VideoItemType::Episode.into())
             .paged;
         assert_eq!(
             items
@@ -162,13 +162,13 @@ fn favorite_grid_menu_rolls_back_failed_removal_and_retargets_after_success(
             assert!(!page.controller.test_state().user_data.overrides[id].is_favorite);
             let items = &page
                 .controller
-                .favorite_section(VideoItemType::Episode)
+                .favorite_section(VideoItemType::Episode.into())
                 .paged;
             assert_eq!(items.items.len(), remaining);
             assert_eq!(items.total_record_count, Some(remaining as u32));
             assert_eq!(
                 page.controller
-                    .favorite_section(VideoItemType::Movie)
+                    .favorite_overview_section(VideoItemType::Movie.into())
                     .paged
                     .items
                     .len(),

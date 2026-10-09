@@ -1,6 +1,21 @@
 use super::*;
 
 #[test]
+fn favorite_person_cards_only_project_names_even_when_video_metadata_is_present() {
+    for (name, expected) in [("Actor", "Actor"), ("  ", "未知人员")] {
+        let item: UserItem = serde_json::from_value(serde_json::json!({
+            "Id":"person", "Name":name, "Type":"Person", "ProductionYear":2024,
+            "CommunityRating":9.0, "UserData":{"IsFavorite":true}
+        }))
+        .unwrap();
+        let card = PersonCardVm::from(&item);
+        assert_eq!(card.name, expected);
+        assert!(card.role.is_none());
+        assert!(card.kind.is_none());
+    }
+}
+
+#[test]
 fn all_progress_projections_reject_nonfinite_values_and_clamp_valid_percentages() {
     let metadata = serde_json::json!({"Id":"episode","Name":"Episode","Type":"Episode"});
     let item = serde_json::from_value(metadata.clone()).unwrap();
@@ -68,8 +83,12 @@ fn compact_episode_titles_and_zero_badges_preserve_missing_metadata_fallbacks() 
         serde_json::from_value(serde_json::json!({"Name":"  ", "Role":" ", "Type":" "})).unwrap();
     let view = PersonCardVm::from(&person);
     assert_eq!(
-        (view.name.as_str(), view.role.as_str(), view.kind.as_str()),
-        ("未知人员", "暂无角色", "未知类型")
+        (
+            view.name.as_str(),
+            view.role.as_deref(),
+            view.kind.as_deref()
+        ),
+        ("未知人员", Some("暂无角色"), Some("未知类型"))
     );
 }
 

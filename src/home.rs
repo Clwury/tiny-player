@@ -8,14 +8,17 @@ mod detail;
 mod favorites;
 mod feed;
 mod gateway;
+mod genre;
 mod grid;
 mod image_effects;
 mod item_context_menu;
+mod items_sort;
 mod layout;
 mod library;
 mod model;
 mod notification;
 mod page;
+mod person;
 mod playback;
 mod played;
 mod ports;
@@ -31,6 +34,7 @@ mod visible_row;
 #[cfg(test)]
 mod test_support;
 
+pub(crate) use model::favorites::FavoriteItemType;
 pub(crate) use ports::HomePorts;
 
 use std::collections::HashMap;
@@ -136,6 +140,8 @@ struct HomeContent {
     // One cancellable continuation per resume mutation target.
     resume_effects: HashMap<String, EffectHandle<Task<()>>>,
     library_resources: HashMap<String, LibraryResources>,
+    genre_resources: HashMap<String, LibraryResources>,
+    person_resources: HashMap<String, person::binding::PersonResources>,
     favorites_presentation: FavoritesPresentation,
     // Search scope: replace/cancel on query reset; dropping Home cancels delivery.
     search_effect: EffectHandle<Task<()>>,

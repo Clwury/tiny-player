@@ -38,5 +38,6 @@ pub(crate) trait HomeGateway: Send + Sync {
         limit: u32,
     ) -> anyhow::Result<Vec<crate::emby::UserItem>>;
     fn user_items(&self, query: &crate::emby::UserItemsQuery) -> anyhow::Result<UserItems>;
+    fn persons(&self, query: &crate::emby::UserItemsQuery) -> anyhow::Result<UserItems>;
     fn search_items(&self, query: &str, start_index: u32, limit: u32) -> anyhow::Result<UserItems>;
 }

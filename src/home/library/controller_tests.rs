@@ -143,7 +143,7 @@ fn raw_page_count_survives_filtering_deduplication_and_manual_retry() {
 }
 
 #[test]
-fn reopening_preserves_loaded_data_and_resets_an_unavailable_sort() {
+fn reopening_preserves_loaded_data_and_shared_sort_across_item_types() {
     let mut controller = controller(VideoItemType::Series);
     let first = open(&mut controller, VideoItemType::Series);
     assert!(
@@ -192,6 +192,12 @@ fn reopening_preserves_loaded_data_and_resets_an_unavailable_sort() {
         11,
     );
     assert!(!ignored.notify && !ignored.close_menu && ignored.request.is_none());
+    assert!(
+        controller
+            .view_model()
+            .paged
+            .accepts_initial(&current.token)
+    );
     controller
         .complete(
             &current,
@@ -200,6 +206,11 @@ fn reopening_preserves_loaded_data_and_resets_an_unavailable_sort() {
         )
         .unwrap();
     assert_eq!(controller.view_model().paged.items[0].id, "movie");
+    let restored = open(&mut controller, VideoItemType::Series);
+    assert_eq!(
+        restored.query.sort_by,
+        Some(UserItemsSort::DateLastContentAdded)
+    );
 }
 
 #[test]
@@ -257,16 +268,28 @@ fn workspace_and_library_tokens_are_isolated_and_failed_initial_can_retry() {
 }
 
 #[test]
-fn last_content_added_sort_is_available_only_for_series_libraries() {
-    let series_sorts = available_library_sorts(&[VideoItemType::Series]).collect::<Vec<_>>();
+fn last_episode_added_sort_is_only_available_for_series_more_pages() {
+    let series_sorts = available_library_sorts(crate::media::ItemSortOptions::for_item_types(&[
+        VideoItemType::Series,
+    ]))
+    .collect::<Vec<_>>();
     assert!(series_sorts.contains(&UserItemsSort::DateLastContentAdded));
-
-    let movie_sorts = available_library_sorts(&[VideoItemType::Movie]).collect::<Vec<_>>();
-    assert!(!movie_sorts.contains(&UserItemsSort::DateLastContentAdded));
-
-    let mixed_sorts =
-        available_library_sorts(&[VideoItemType::Movie, VideoItemType::Series]).collect::<Vec<_>>();
-    assert!(!mixed_sorts.contains(&UserItemsSort::DateLastContentAdded));
+    let other_sorts = series_sorts
+        .into_iter()
+        .filter(|sort| *sort != UserItemsSort::DateLastContentAdded)
+        .collect::<Vec<_>>();
+    for item_types in [
+        vec![VideoItemType::Movie],
+        vec![VideoItemType::Episode],
+        vec![],
+        vec![VideoItemType::Movie, VideoItemType::Series],
+    ] {
+        assert_eq!(
+            available_library_sorts(crate::media::ItemSortOptions::for_item_types(&item_types))
+                .collect::<Vec<_>>(),
+            other_sorts
+        );
+    }
 }
 
 #[test]
@@ -347,4 +370,32 @@ fn selecting_current_library_sort_only_closes_menu() {
         state.view_model().paged.initial,
         crate::home::LoadState::Idle
     );
+}
+
+#[test]
+fn libraries_default_to_ascending_name_and_selecting_that_order_does_not_reload() {
+    for item_types in [
+        vec![VideoItemType::Movie],
+        vec![VideoItemType::Series],
+        vec![VideoItemType::Movie, VideoItemType::Series],
+    ] {
+        let mut state = LibraryController::new(
+            item_types.clone(),
+            "library".into(),
+            WorkspaceIdentity::default(),
+        );
+        let request = state
+            .dispatch(LibraryIntent::Open(item_types), 0)
+            .request
+            .unwrap();
+        assert_eq!(request.query.sort_by, Some(UserItemsSort::SortName));
+        assert_eq!(request.query.sort_order, SortOrder::Ascending);
+        assert!(
+            state
+                .dispatch(LibraryIntent::SortOrder(SortOrder::Ascending), 0)
+                .request
+                .is_none()
+        );
+        assert!(state.view_model().paged.accepts_initial(&request.token));
+    }
 }

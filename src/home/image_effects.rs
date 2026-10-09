@@ -10,6 +10,7 @@ use std::{path::Path, sync::Arc, time::Instant};
 
 const RESUME_CARD_IMAGE_MAX_WIDTH: u32 = 800;
 const HOME_ITEM_CARD_IMAGE_MAX_WIDTH: u32 = 400;
+const PERSON_IMAGE_MAX_WIDTH: u32 = 320;
 pub(in crate::home) const EPISODE_CARD_IMAGE_MAX_WIDTH: u32 = 640;
 
 impl HomeContent {
@@ -66,10 +67,14 @@ impl HomeContent {
         cx: &mut Context<Self>,
     ) {
         for item in &items.items {
-            if item.item_type.as_deref() == Some("Episode") {
-                self.ensure_image(favorite_episode_image_request(item), cx);
-            } else {
-                self.ensure_user_item_image(item.image_source(), cx);
+            match item.item_type.as_deref() {
+                Some("Episode") => self.ensure_image(favorite_episode_image_request(item), cx),
+                Some("Person") => {
+                    if let Some(request) = favorite_person_image_request(item) {
+                        self.ensure_image(request, cx);
+                    }
+                }
+                _ => self.ensure_user_item_image(item.image_source(), cx),
             }
         }
     }
@@ -231,6 +236,12 @@ impl HomeContent {
     ) -> Option<Arc<Path>> {
         self.image_path_for_request(&favorite_episode_image_request(item))
     }
+    pub(in crate::home) fn image_path_for_favorite_person(
+        &self,
+        item: &UserItem,
+    ) -> Option<Arc<Path>> {
+        self.image_path_for_request(&favorite_person_image_request(item)?)
+    }
     pub(in crate::home) fn image_path_for_request(
         &self,
         request: &EmbyImageRequest,
@@ -260,6 +271,24 @@ fn favorite_episode_image_request(item: &UserItem) -> EmbyImageRequest {
     )
     .with_max_width(EPISODE_CARD_IMAGE_MAX_WIDTH)
     .with_quality(ImageQuality::DEFAULT)
+}
+
+fn favorite_person_image_request(item: &UserItem) -> Option<EmbyImageRequest> {
+    person_image_request(&item.id, item.primary_image_tag())
+}
+
+pub(in crate::home) fn person_image_request(
+    item_id: &str,
+    primary_tag: Option<&str>,
+) -> Option<EmbyImageRequest> {
+    if item_id.trim().is_empty() {
+        return None;
+    }
+    Some(
+        EmbyImageRequest::primary(item_id, Some(primary_tag?.to_string()))
+            .with_max_width(PERSON_IMAGE_MAX_WIDTH)
+            .with_quality(ImageQuality::DEFAULT),
+    )
 }
 
 fn resume_image_request(source: ResumeItemImageSource<'_>) -> EmbyImageRequest {

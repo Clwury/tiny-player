@@ -4,7 +4,7 @@ use gpui::{
 };
 
 use crate::ui::radius;
-use crate::{emby::VideoItemType, theme};
+use crate::{home::model::favorites::FavoriteItemType, theme};
 
 use crate::home::favorites::{FAVORITE_ITEM_TYPES, FAVORITES_PAGE_LIMIT, favorite_section_title};
 use crate::home::{
@@ -46,18 +46,22 @@ impl HomeContent {
             .children(
                 FAVORITE_ITEM_TYPES
                     .into_iter()
-                    .filter(|item_type| self.controller.favorite_section(*item_type).show_section)
+                    .filter(|item_type| {
+                        self.controller
+                            .favorite_overview_section(*item_type)
+                            .show_section
+                    })
                     .map(|item_type| self.render_favorite_section(item_type, width, cx)),
             )
     }
 
     fn render_favorite_section(
         &self,
-        item_type: VideoItemType,
+        item_type: FavoriteItemType,
         width: f32,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let state = self.controller.favorite_section(item_type);
+        let state = self.controller.favorite_overview_section(item_type);
         let has_items = state.has_items;
         let title = favorite_section_title(item_type);
         div()
@@ -100,7 +104,7 @@ impl HomeContent {
 
     fn render_favorite_row(
         &self,
-        item_type: VideoItemType,
+        item_type: FavoriteItemType,
         viewport_width: f32,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -110,7 +114,7 @@ impl HomeContent {
         let section = &self.favorites_presentation[item_type];
         let count = self
             .controller
-            .favorite_section(item_type)
+            .favorite_overview_section(item_type)
             .paged
             .items
             .len()
@@ -161,7 +165,11 @@ impl HomeContent {
                     })
                     .children((visible.start..visible.end).map(|index| {
                         self.render_user_item_grid_card(
-                            &self.controller.favorite_section(item_type).paged.items[index],
+                            &self
+                                .controller
+                                .favorite_overview_section(item_type)
+                                .paged
+                                .items[index],
                             index,
                             source,
                             "favorite-row-item",
@@ -215,7 +223,7 @@ impl HomeContent {
 
     fn set_favorite_row_hovered(
         &mut self,
-        item_type: VideoItemType,
+        item_type: FavoriteItemType,
         hovered: bool,
         controls: bool,
         cx: &mut Context<Self>,
@@ -233,7 +241,7 @@ impl HomeContent {
 
     fn scroll_favorite_row(
         &mut self,
-        item_type: VideoItemType,
+        item_type: FavoriteItemType,
         direction: f32,
         window: &Window,
         cx: &mut Context<Self>,
@@ -243,7 +251,7 @@ impl HomeContent {
         let section = &mut self.favorites_presentation[item_type];
         let count = self
             .controller
-            .favorite_section(item_type)
+            .favorite_overview_section(item_type)
             .paged
             .items
             .len()
@@ -256,7 +264,7 @@ impl HomeContent {
             HOME_ITEM_CARD_GAP_PX,
         );
         let step = (card_width + HOME_ITEM_CARD_PADDING_PX * 2.0 + HOME_ITEM_CARD_GAP_PX)
-            * if item_type == VideoItemType::Episode {
+            * if item_type == FavoriteItemType::Episode {
                 3.0
             } else {
                 4.0

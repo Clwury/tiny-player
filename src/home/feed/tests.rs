@@ -112,6 +112,12 @@ impl HomeGateway for FakeGateway {
             .push((id.into(), types.to_vec(), limit));
         Ok(items())
     }
+    fn persons(&self, _: &crate::emby::UserItemsQuery) -> anyhow::Result<crate::emby::UserItems> {
+        Ok(crate::emby::UserItems {
+            items: Vec::new(),
+            total_record_count: 0,
+        })
+    }
     fn user_items(&self, _: &UserItemsQuery) -> anyhow::Result<UserItems> {
         panic!("wrong endpoint")
     }

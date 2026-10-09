@@ -27,6 +27,8 @@ impl HomeContent {
         let is_home = current == &HomeRoute::Root(HomeRoot::Home);
         let is_detail = matches!(current, HomeRoute::Detail { .. });
         let is_library = matches!(current, HomeRoute::Library { .. });
+        let is_person = matches!(current, HomeRoute::Person { .. });
+        let is_genre = matches!(current, HomeRoute::Genre { .. });
         let is_favorites = current == &HomeRoute::Root(HomeRoot::Favorites);
         let is_favorite_items = matches!(current, HomeRoute::FavoriteItems { .. });
         let is_search = current == &HomeRoute::Root(HomeRoot::Search);
@@ -107,6 +109,20 @@ impl HomeContent {
                     cx,
                 ))
             })
+            .when(is_person && !has_authentication_error, |this| {
+                this.child(self.render_workspace_layer(
+                    self.render_person_scrollable_content(cx),
+                    corners,
+                    cx,
+                ))
+            })
+            .when(is_genre && !has_authentication_error, |this| {
+                this.child(self.render_workspace_layer(
+                    self.render_genre_scrollable_content(cx),
+                    corners,
+                    cx,
+                ))
+            })
             .when(is_detail && !has_authentication_error, |this| {
                 this.child(self.render_series_detail_back_button(cx))
             })
@@ -165,6 +181,16 @@ impl HomeContent {
             HomeRoute::Library { view_id, .. } => self
                 .library_resources
                 .get(view_id)
+                .map(|state| &state.presentation.grid.scroll_handle)
+                .unwrap_or(&self.home_scroll_handle),
+            HomeRoute::Person { person_id, .. } => self
+                .person_resources
+                .get(person_id)
+                .map(|state| &state.items.presentation.grid.scroll_handle)
+                .unwrap_or(&self.home_scroll_handle),
+            HomeRoute::Genre { genre_key, .. } => self
+                .genre_resources
+                .get(genre_key)
                 .map(|state| &state.presentation.grid.scroll_handle)
                 .unwrap_or(&self.home_scroll_handle),
             HomeRoute::Detail { .. } => self
@@ -269,9 +295,11 @@ fn main_scrollbar_is_visible(
         HomeRoute::Root(HomeRoot::Home) => home_has_content,
         HomeRoute::Root(HomeRoot::Favorites) => favorites_has_content,
         HomeRoute::Root(HomeRoot::Search) => search_has_content,
-        HomeRoute::FavoriteItems { .. } | HomeRoute::Library { .. } | HomeRoute::Detail { .. } => {
-            true
-        }
+        HomeRoute::FavoriteItems { .. }
+        | HomeRoute::Library { .. }
+        | HomeRoute::Person { .. }
+        | HomeRoute::Genre { .. }
+        | HomeRoute::Detail { .. } => true,
     }
 }
 

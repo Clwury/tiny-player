@@ -1,8 +1,8 @@
 use crate::home::components::workspace_back_button;
 
 use gpui::{
-    Context, InteractiveElement, IntoElement, ParentElement, Styled, Window, canvas, div,
-    prelude::FluentBuilder, px,
+    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled, Window, canvas,
+    div, prelude::FluentBuilder, px,
 };
 
 use crate::theme;
@@ -12,7 +12,8 @@ use crate::home::{
     carousel::{
         HOME_MAIN_CONTENT_HORIZONTAL_PADDING_PX, HOME_MAIN_SCROLL_CONTENT_RIGHT_PADDING_PX,
     },
-    favorites::{favorite_section_title, view::favorite_action},
+    favorites::view::favorite_action,
+    library::{ItemsSortTarget, ItemsSortView},
     navigation::HomeRoute,
 };
 
@@ -30,7 +31,18 @@ impl HomeContent {
         let item_type = *item_type;
         let theme = theme::get(cx);
         let section = &self.favorites_presentation[item_type];
-        let state = self.controller.favorite_section(item_type).paged;
+        let view = self.controller.favorite_section(item_type);
+        let sort_select = self.render_items_sort_select(
+            ItemsSortView {
+                options: crate::media::ItemSortOptions::for_item_types(item_type.video_types()),
+                sort_by: view.sort_by,
+                sort_order: view.sort_order,
+                menu_open: section.sort_menu_open,
+            },
+            ItemsSortTarget::Favorites(item_type),
+            cx,
+        );
+        let state = view.paged;
         let presentation = &section.presentation;
         let page = cx.entity().downgrade();
         let scroll_handle = presentation.scroll_handle.clone();
@@ -68,6 +80,10 @@ impl HomeContent {
             .id("home-favorite-items-content")
             .flex()
             .flex_col()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|page, _, _, cx| page.close_current_items_sort_menu(cx)),
+            )
             .child(
                 div()
                     .flex()
@@ -81,26 +97,22 @@ impl HomeContent {
                         cx.listener(Self::close_series_detail),
                         cx,
                     ))
-                    .when(!state.items.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .debug_selector(|| "favorite-items-title".to_string())
-                                .text_lg()
-                                .text_color(theme.foreground)
-                                .child(favorite_section_title(item_type)),
-                        )
-                        .when_some(
-                            state.total_record_count,
-                            |this, total| {
+                    .child(div().flex().flex_1().min_w_0().items_center().when(
+                        !state.items.is_empty(),
+                        |this| {
+                            this.when_some(state.total_record_count, |this, total| {
                                 this.child(
                                     div()
+                                        .flex_none()
+                                        .debug_selector(|| "favorite-items-count".to_string())
                                         .text_sm()
                                         .text_color(theme.muted_foreground)
                                         .child(format!("共 {total} 项")),
                                 )
-                            },
-                        )
-                    }),
+                            })
+                        },
+                    ))
+                    .child(sort_select),
             )
             .child(
                 div()

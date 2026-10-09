@@ -38,8 +38,8 @@ pub(in crate::home) struct EpisodeCardVm {
 
 pub(in crate::home) struct PersonCardVm {
     pub(in crate::home) name: String,
-    pub(in crate::home) role: String,
-    pub(in crate::home) kind: String,
+    pub(in crate::home) role: Option<String>,
+    pub(in crate::home) kind: Option<String>,
 }
 
 impl ResumeCardVm {
@@ -122,8 +122,22 @@ impl From<&MediaPerson> for PersonCardVm {
     fn from(person: &MediaPerson) -> Self {
         Self {
             name: person.display_name(),
-            role: person.role_label(),
-            kind: person.type_label(),
+            role: Some(person.role_label()),
+            kind: Some(person.type_label()),
+        }
+    }
+}
+
+impl From<&UserItem> for PersonCardVm {
+    fn from(person: &UserItem) -> Self {
+        Self {
+            name: if person.name.trim().is_empty() {
+                "未知人员".into()
+            } else {
+                person.name.clone()
+            },
+            role: None,
+            kind: None,
         }
     }
 }

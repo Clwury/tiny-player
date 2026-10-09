@@ -6,8 +6,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    app_metadata, media::PlaybackLanguagePreferences, search_history::SearchHistory,
-    server::CachedServer, theme::ColorTheme,
+    app_metadata,
+    media::{ItemSortPreferences, PlaybackLanguagePreferences},
+    search_history::SearchHistory,
+    server::CachedServer,
+    theme::ColorTheme,
 };
 
 const CACHE_VERSION: u32 = 1;
@@ -33,6 +36,8 @@ pub struct ServerCache {
     pub playback_volume: PlaybackVolumeSettings,
     #[serde(default)]
     pub search_history: SearchHistory,
+    #[serde(default)]
+    pub items_sort: ItemSortPreferences,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +59,7 @@ impl ServerCache {
             track_languages: PlaybackLanguagePreferences::default(),
             playback_volume: PlaybackVolumeSettings::default(),
             search_history: SearchHistory::default(),
+            items_sort: ItemSortPreferences::default(),
         }
     }
 
@@ -233,6 +239,39 @@ mod tests {
         assert_eq!(cache.version, CACHE_VERSION);
         assert!(!cache.device_id.is_empty());
         assert!(cache.servers.is_empty());
+        assert_eq!(cache.items_sort, ItemSortPreferences::default());
+    }
+
+    #[test]
+    fn old_caches_default_to_ascending_name_and_server_changes_preserve_saved_sort() {
+        use crate::emby::{SortOrder, UserItemsSort};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut json = serde_json::to_value(ServerCache::empty()).unwrap();
+        json.as_object_mut().unwrap().remove("items_sort");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut cache = load_or_init_from(&path).unwrap();
+        assert_eq!(cache.items_sort.sort_by, UserItemsSort::SortName);
+        assert_eq!(cache.items_sort.sort_order, SortOrder::Ascending);
+
+        cache.items_sort = ItemSortPreferences {
+            sort_by: UserItemsSort::PremiereDate,
+            sort_order: SortOrder::Descending,
+        };
+        let mut other_server = server("second", "second-token");
+        other_server.endpoint.path = "/second".into();
+        cache.servers = vec![server("first", "first-token"), other_server];
+        save_to(&cache, &path).unwrap();
+        let mut loaded = load_or_init_from(&path).unwrap();
+        assert_eq!(loaded.servers.len(), 2);
+        assert_eq!(loaded.items_sort, cache.items_sort);
+        assert!(delete_server_by_id(&mut loaded, "first"));
+        save_to(&loaded, &path).unwrap();
+        assert_eq!(
+            load_or_init_from(&path).unwrap().items_sort,
+            cache.items_sort
+        );
     }
 
     #[test]

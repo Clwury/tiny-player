@@ -34,22 +34,26 @@ pub(in crate::home) fn person_card<T>(
                         .text_color(theme.foreground)
                         .child(view.name),
                 )
-                .child(
-                    div()
-                        .w_full()
-                        .truncate()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(view.role),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .truncate()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(view.kind),
-                ),
+                .when_some(view.role, |this, role| {
+                    this.child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(role),
+                    )
+                })
+                .when_some(view.kind, |this, kind| {
+                    this.child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(kind),
+                    )
+                }),
         )
 }
 

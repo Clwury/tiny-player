@@ -1,7 +1,8 @@
 use super::*;
 use crate::home::detail::binding::detail_binding;
 
-use crate::home::navigation::{HomeRoot, HomeRoute};
+#[cfg(test)]
+use crate::home::navigation::HomeRoot;
 use crate::home::{controller::OpenDetailIntent, model::navigation::NavigationChange};
 
 #[cfg(test)]
@@ -109,12 +110,7 @@ impl HomeContent {
         if self.controller.detail_view().is_some() {
             self.load_media_detail_effects(cx);
         }
-        if matches!(
-            self.controller.route(),
-            HomeRoute::Root(HomeRoot::Favorites) | HomeRoute::FavoriteItems { .. }
-        ) {
-            self.enter_favorites_if_needed(cx);
-        }
+        self.enter_current_items_if_needed(cx);
         cx.emit(HomeContentEvent::TitleChanged);
         cx.notify();
     }

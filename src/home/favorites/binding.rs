@@ -2,6 +2,7 @@
 use super::{FAVORITE_ITEM_TYPES, actions, favorite_section_title};
 use super::{controller, effect};
 use crate::home::detail::binding::detail_binding;
+use crate::home::model::favorites::FavoriteItemType;
 
 use crate::home::controller::FavoriteIntent;
 use crate::home::model::notification::ActionNotification;
@@ -10,7 +11,7 @@ use controller::{FavoritesIntent, FavoritesRequest};
 
 use gpui::{AppContext as _, ClickEvent, Context, Window};
 
-use crate::emby::{UserItemData, UserItems, VideoItemType};
+use crate::emby::{UserItemData, UserItems};
 
 use crate::home::{
     HomeContent, HomeContentEvent,
@@ -31,11 +32,12 @@ impl HomeContent {
 
     pub(in crate::home) fn open_favorite_items(
         &mut self,
-        item_type: VideoItemType,
+        item_type: FavoriteItemType,
         cx: &mut Context<Self>,
     ) {
         self.item_context_menu = None;
         self.favorites_presentation.sync_previous_offsets();
+        self.favorites_presentation[item_type].sort_menu_open = false;
         let change = self.controller.dispatch_navigation(
             crate::home::controller::NavigationIntent::Favorites(item_type),
         );
@@ -47,7 +49,7 @@ impl HomeContent {
 
     pub(in crate::home) fn auto_load_more_favorites(
         &mut self,
-        item_type: VideoItemType,
+        item_type: FavoriteItemType,
         cx: &mut Context<Self>,
     ) {
         if self.controller.route() == &(HomeRoute::FavoriteItems { item_type }) {
@@ -57,7 +59,7 @@ impl HomeContent {
 
     pub(in crate::home) fn load_more_favorites(
         &mut self,
-        item_type: VideoItemType,
+        item_type: FavoriteItemType,
         cx: &mut Context<Self>,
     ) {
         self.dispatch_favorites(
@@ -69,7 +71,7 @@ impl HomeContent {
 
     pub(in crate::home) fn load_favorites_initial(
         &mut self,
-        item_type: VideoItemType,
+        item_type: FavoriteItemType,
         cx: &mut Context<Self>,
     ) {
         self.dispatch_favorites(item_type, FavoritesIntent::Refresh, cx);
@@ -80,7 +82,7 @@ impl HomeContent {
         self.favorites_presentation.cancel_effects();
     }
 
-    pub(in crate::home) fn clear_favorite_notifications(&mut self, item_type: VideoItemType) {
+    pub(in crate::home) fn clear_favorite_notifications(&mut self, item_type: FavoriteItemType) {
         for phase in ["initial", "refresh", "load-more"] {
             self.clear_notification(
                 NotificationScope::Favorites,
@@ -91,13 +93,26 @@ impl HomeContent {
 
     pub(in crate::home) fn dispatch_favorites(
         &mut self,
-        item_type: VideoItemType,
+        item_type: FavoriteItemType,
         intent: FavoritesIntent,
         cx: &mut Context<Self>,
     ) {
+        let target = crate::home::library::ItemsSortTarget::Favorites(item_type);
+        match intent {
+            FavoritesIntent::SortBy(sort_by) => {
+                self.select_items_sort_by(&target, sort_by, cx);
+                return;
+            }
+            FavoritesIntent::SortOrder(sort_order) => {
+                self.select_items_sort_order(&target, sort_order, cx);
+                return;
+            }
+            _ => {}
+        }
         let Some(request) = self.controller.dispatch_favorites(item_type, intent) else {
             return;
         };
+        let source = request.source;
         if request.initial {
             self.clear_favorite_notifications(item_type);
         } else {
@@ -121,7 +136,7 @@ impl HomeContent {
             .ok();
         });
         self.favorites_presentation[item_type]
-            .effect
+            .effect_mut(source)
             .replace(handle);
     }
 
@@ -257,6 +272,6 @@ impl HomeContent {
     }
 }
 
-fn favorite_notification_key(item_type: VideoItemType, phase: &str) -> String {
+fn favorite_notification_key(item_type: FavoriteItemType, phase: &str) -> String {
     format!("favorites:{}:{phase}", item_type.as_str())
 }

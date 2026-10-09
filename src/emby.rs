@@ -25,7 +25,8 @@ pub use playback::{
     PlaybackStartReport, PlaybackStopReport,
 };
 pub use show::{
-    MediaExternalUrl, MediaItem, MediaItems, MediaPerson, MediaSource, MediaStream, MediaStudio,
+    MediaExternalUrl, MediaGenre, MediaItem, MediaItems, MediaPerson, MediaSource, MediaStream,
+    MediaStudio,
 };
 pub use system::PublicSystemInfo;
 pub use user::{

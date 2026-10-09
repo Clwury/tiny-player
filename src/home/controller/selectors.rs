@@ -6,9 +6,17 @@ use std::borrow::Cow;
 impl HomeController {
     pub(in crate::home) fn user_item_by_id(&self, item_id: &str) -> Option<UserItem> {
         let current_route_item = match self.navigation.current() {
-            HomeRoute::Root(HomeRoot::Favorites) | HomeRoute::FavoriteItems { .. } => {
-                self.favorites.items().find(|item| item.id == item_id)
-            }
+            HomeRoute::Root(HomeRoot::Favorites) => self
+                .favorites
+                .overview_items()
+                .find(|item| item.id == item_id),
+            HomeRoute::FavoriteItems { item_type } => self
+                .favorites
+                .view_model(*item_type)
+                .paged
+                .items
+                .iter()
+                .find(|item| item.id == item_id),
             HomeRoute::Root(HomeRoot::Search) => self
                 .search
                 .view_model()
@@ -17,6 +25,23 @@ impl HomeController {
                 .find(|item| item.id == item_id),
             HomeRoute::Library { view_id, .. } => self.libraries.get(view_id).and_then(|library| {
                 library
+                    .view_model()
+                    .paged
+                    .items
+                    .iter()
+                    .find(|item| item.id == item_id)
+            }),
+            HomeRoute::Person { person_id, .. } => self.persons.get(person_id).and_then(|person| {
+                person
+                    .items
+                    .view_model()
+                    .paged
+                    .items
+                    .iter()
+                    .find(|item| item.id == item_id)
+            }),
+            HomeRoute::Genre { genre_key, .. } => self.genres.get(genre_key).and_then(|genre| {
+                genre
                     .view_model()
                     .paged
                     .items
@@ -52,7 +77,14 @@ impl HomeController {
             .or_else(|| {
                 self.libraries
                     .values()
+                    .chain(self.genres.values())
                     .flat_map(|library| library.view_model().paged.items.iter())
+                    .find(|item| item.id == item_id)
+            })
+            .or_else(|| {
+                self.persons
+                    .values()
+                    .flat_map(|person| person.items.view_model().paged.items.iter())
                     .find(|item| item.id == item_id)
             })?;
 
@@ -105,9 +137,22 @@ impl HomeController {
                 return Some(data);
             }
         }
-        for library in self.libraries.values() {
+        for library in self.libraries.values().chain(self.genres.values()) {
             if let Some(data) = library
                 .view_model()
+                .paged
+                .items
+                .iter()
+                .find(|item| item.id == item_id)
+                .and_then(|item| item.user_data.as_ref())
+            {
+                return Some(data);
+            }
+        }
+        for person in self.persons.values() {
+            let vm = person.view_model();
+            if let Some(data) = vm
+                .items
                 .paged
                 .items
                 .iter()

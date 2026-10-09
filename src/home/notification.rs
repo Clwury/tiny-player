@@ -55,6 +55,8 @@ impl HomeContent {
     ) -> (NotificationScope, SharedString) {
         let prefix = match self.controller.route() {
             HomeRoute::Library { view_id, .. } => format!("library:{view_id}"),
+            HomeRoute::Person { person_id, .. } => format!("person:{person_id}"),
+            HomeRoute::Genre { genre_key, .. } => format!("genre:{genre_key}"),
             HomeRoute::FavoriteItems { item_type } => format!("favorites:{}", item_type.as_str()),
             HomeRoute::Root(HomeRoot::Favorites) => "favorites".into(),
             HomeRoute::Root(HomeRoot::Search) => "search".into(),
@@ -161,6 +163,14 @@ fn notification_matches_route(key: &HomeNotificationKey, route: &HomeRoute) -> b
             .name
             .as_ref()
             .starts_with(&format!("library:{view_id}:")),
+        HomeRoute::Person { person_id, .. } => key
+            .name
+            .as_ref()
+            .starts_with(&format!("person:{person_id}:")),
+        HomeRoute::Genre { genre_key, .. } => key
+            .name
+            .as_ref()
+            .starts_with(&format!("genre:{genre_key}:")),
         HomeRoute::Root(_) | HomeRoute::Detail { .. } => true,
     }
 }
@@ -172,6 +182,8 @@ fn notification_scope_for_route(route: &HomeRoute) -> Option<NotificationScope> 
         HomeRoute::FavoriteItems { .. } => Some(NotificationScope::Favorites),
         HomeRoute::Root(HomeRoot::Search) => Some(NotificationScope::Search),
         HomeRoute::Library { .. } => Some(NotificationScope::Library),
+        HomeRoute::Person { .. } => Some(NotificationScope::Person),
+        HomeRoute::Genre { .. } => Some(NotificationScope::Genre),
         HomeRoute::Detail { .. } => Some(NotificationScope::Detail),
     }
 }
@@ -195,13 +207,13 @@ mod tests {
         assert!(notification_matches_route(
             &key,
             &HomeRoute::FavoriteItems {
-                item_type: crate::emby::VideoItemType::Movie
+                item_type: crate::home::FavoriteItemType::Movie
             }
         ));
         assert!(!notification_matches_route(
             &key,
             &HomeRoute::FavoriteItems {
-                item_type: crate::emby::VideoItemType::Series
+                item_type: crate::home::FavoriteItemType::Series
             }
         ));
     }

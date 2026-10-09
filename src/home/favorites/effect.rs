@@ -12,7 +12,12 @@ pub(super) fn run_favorites(
     gateway: &(impl HomeGateway + ?Sized),
     request: &FavoritesRequest,
 ) -> anyhow::Result<UserItems> {
-    gateway.user_items(&favorite_query(request.item_type, request.start_index))
+    let query = favorite_query(request);
+    if request.item_type == crate::home::model::favorites::FavoriteItemType::Person {
+        gateway.persons(&query)
+    } else {
+        gateway.user_items(&query)
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +106,15 @@ mod tests {
         fn search_items(&self, _: &str, _: u32, _: u32) -> anyhow::Result<UserItems> {
             panic!("favorites must use the user items endpoint")
         }
+        fn persons(
+            &self,
+            _: &crate::emby::UserItemsQuery,
+        ) -> anyhow::Result<crate::emby::UserItems> {
+            Ok(crate::emby::UserItems {
+                items: Vec::new(),
+                total_record_count: 0,
+            })
+        }
         fn user_items(&self, query: &UserItemsQuery) -> anyhow::Result<UserItems> {
             self.calls.lock().unwrap().push(query.clone());
             let kind = query.include_item_types[0].as_str();
@@ -176,12 +190,12 @@ mod tests {
         let gateway = FakeGateway::default();
         let kind = VideoItemType::Episode;
         let old = controller
-            .dispatch(kind, FavoritesIntent::Enter, 0)
+            .dispatch(kind.into(), FavoritesIntent::Enter, 0)
             .unwrap();
         let delayed = run_favorites(&gateway, &old);
         controller.mark_dirty();
         let current = controller
-            .dispatch(kind, FavoritesIntent::Refresh, 1)
+            .dispatch(kind.into(), FavoritesIntent::Refresh, 1)
             .unwrap();
         assert!(
             controller
@@ -209,8 +223,8 @@ mod tests {
             assert_eq!(query.parent_id, None);
             assert_eq!(query.start_index, 0);
             assert_eq!(query.limit, 30);
-            assert_eq!(query.sort_by, Some(UserItemsSort::DateCreated));
-            assert_eq!(query.sort_order, SortOrder::Descending);
+            assert_eq!(query.sort_by, Some(UserItemsSort::SortName));
+            assert_eq!(query.sort_order, SortOrder::Ascending);
             assert_eq!(
                 query.fields.as_deref(),
                 Some(
