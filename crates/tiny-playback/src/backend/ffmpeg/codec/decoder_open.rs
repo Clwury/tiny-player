@@ -132,12 +132,12 @@ impl Decoder {
             (*context).pkt_timebase = stream.time_base;
             (*context).thread_count = requested_thread_count;
             (*context).thread_type = ffi::FF_THREAD_FRAME | ffi::FF_THREAD_SLICE;
-            if (*context).codec_type == ffi::AVMediaType::AVMEDIA_TYPE_VIDEO
-                && let Some(error_recognition) = video_error_recognition(stream.codec_id)
-            {
+            if (*context).codec_type == ffi::AVMediaType::AVMEDIA_TYPE_VIDEO {
+                // Keep libavcodec's default error recognition, like mpv's
+                // vd_lavc. EXPLODE makes a malformed HEVC SEI abort the whole
+                // access unit before its valid slice can become a reference.
                 (*context).flags &= !(ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT as c_int);
                 (*context).flags2 &= !ffi::AV_CODEC_FLAG2_SHOW_ALL;
-                (*context).err_recognition |= error_recognition;
             }
         }
         if unsafe { (*context).codec_type } == ffi::AVMediaType::AVMEDIA_TYPE_SUBTITLE

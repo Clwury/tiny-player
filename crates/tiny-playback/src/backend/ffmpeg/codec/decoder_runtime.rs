@@ -45,7 +45,7 @@ impl Decoder {
                 continue;
             }
             if result < 0 {
-                if self.continue_after_h264_invalid_data(result, "send_packet") {
+                if self.continue_after_video_invalid_data(result, "send_packet") {
                     return self.receive_frames(frame, &mut on_frame);
                 }
                 return Err(format!(
@@ -147,7 +147,7 @@ impl Decoder {
                 return Ok(());
             }
             if result < 0 {
-                if self.continue_after_h264_invalid_data(result, "receive_frame") {
+                if self.continue_after_video_invalid_data(result, "receive_frame") {
                     // The error belongs to buffered input. Drain again before
                     // offering another packet, as mpv's decoder wrapper does,
                     // so a receive error cannot discard the caller's input.
@@ -165,9 +165,13 @@ impl Decoder {
         }
     }
 
-    fn continue_after_h264_invalid_data(&self, result: c_int, operation: &str) -> bool {
+    fn continue_after_video_invalid_data(&self, result: c_int, operation: &str) -> bool {
+        let codec_id = unsafe { (*self.ptr).codec_id };
         if result != ffi::AVERROR_INVALIDDATA
-            || unsafe { (*self.ptr).codec_id } != ffi::AVCodecID::AV_CODEC_ID_H264
+            || !matches!(
+                codec_id,
+                ffi::AVCodecID::AV_CODEC_ID_H264 | ffi::AVCodecID::AV_CODEC_ID_HEVC
+            )
         {
             return false;
         }
@@ -177,36 +181,13 @@ impl Decoder {
         tracing::debug!(
             operation,
             code = result,
-            "continuing H.264 decode after invalid data without flushing references"
+            codec = ?codec_id,
+            "continuing video decode after invalid data without flushing references"
         );
         true
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn h264_invalid_packets_do_not_abort_decoding_or_swallow_resource_errors() {
-        let decoder = Decoder::open_h264_for_test();
-        assert_eq!(
-            unsafe { (*decoder.ptr).err_recognition } & ffi::AV_EF_EXPLODE,
-            0
-        );
-        let props = AvPacket::new().unwrap();
-        let invalid = AvPacket::from_data_and_props(&[0, 0, 1], &props).unwrap();
-        let mut frame = AvFrame::new().unwrap();
-        for _ in 0..2 {
-            decoder
-                .decode_packet(invalid.as_ptr(), &mut frame, |_| {
-                    panic!("an incomplete NAL must not produce a frame")
-                })
-                .expect("invalid H.264 input must allow the next packet");
-        }
-        for error in [ffi::AVERROR(ffi::ENOMEM), ffi::AVERROR(ffi::EIO)] {
-            assert!(!decoder.continue_after_h264_invalid_data(error, "send_packet"));
-            assert!(!decoder.continue_after_h264_invalid_data(error, "receive_frame"));
-        }
-    }
-}
+#[path = "tests/decoder_runtime.rs"]
+mod tests;

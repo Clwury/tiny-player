@@ -20,15 +20,18 @@ impl VideoDecodePipeline {
         match result {
             Ok(()) => Ok(false),
             Err(error)
-                if codec_id == ffi::AVCodecID::AV_CODEC_ID_H264
-                    && error == CORRUPT_VIDEO_FRAME_RECOVERY_ERROR =>
+                if matches!(
+                    codec_id,
+                    ffi::AVCodecID::AV_CODEC_ID_H264 | ffi::AVCodecID::AV_CODEC_ID_HEVC
+                ) && error == CORRUPT_VIDEO_FRAME_RECOVERY_ERROR =>
             {
                 // The presentation path already discarded this frame. Keep
-                // H.264's references and queued input so open-GOP recovery can
+                // the decoder's references and queued input so recovery can
                 // converge, just as for invalid data in mpv's vd_lavc.
                 tracing::debug!(
+                    codec = ?codec_id,
                     packet_pts = ?packet.best_timestamp(),
-                    "continuing H.264 decode after dropping a corrupt frame"
+                    "continuing video decode after dropping a corrupt frame"
                 );
                 Ok(false)
             }
@@ -186,48 +189,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discarded_h264_frame_preserves_generation_and_pending_input() {
+    fn discarded_h264_and_hevc_frames_preserve_generation_and_pending_input() {
         for realign_after_recovery in [true, false] {
-            let mut pipeline = VideoDecodePipeline::spawn(Decoder::open_h264_for_test()).unwrap();
-            let mut generation = PlaybackGeneration::default();
-            let current_generation = generation.advance();
-            let mut recovery = VideoDecodeRecovery::default();
-            let mut packet = AvPacket::new().unwrap();
-            unsafe { (*packet.as_mut_ptr()).pts = 40 };
-            pipeline
-                .packets
-                .push_pending_input_back(PendingVideoDecodePacket {
-                    generation: current_generation,
-                    packet: AvPacket::ref_from(&packet).unwrap(),
-                    drop_policy: VideoDecodeDropPolicy::None,
-                    realign_after_decode_recovery: realign_after_recovery,
-                    hevc_startup_in_flight_watchdog: false,
-                    from_hevc_hw_replay: false,
-                    hevc_decode_recovery_evidence_scoped: false,
-                });
+            for (codec_id, decoder) in [
+                (
+                    ffi::AVCodecID::AV_CODEC_ID_H264,
+                    Decoder::open_h264_for_test(),
+                ),
+                (
+                    ffi::AVCodecID::AV_CODEC_ID_HEVC,
+                    Decoder::open_hevc_for_test(),
+                ),
+            ] {
+                let mut pipeline = VideoDecodePipeline::spawn(decoder).unwrap();
+                let mut generation = PlaybackGeneration::default();
+                let current_generation = generation.advance();
+                let mut recovery = VideoDecodeRecovery::default();
+                let mut packet = AvPacket::new().unwrap();
+                unsafe { (*packet.as_mut_ptr()).pts = 40 };
+                pipeline
+                    .packets
+                    .push_pending_input_back(PendingVideoDecodePacket {
+                        generation: current_generation,
+                        packet: AvPacket::ref_from(&packet).unwrap(),
+                        drop_policy: VideoDecodeDropPolicy::None,
+                        realign_after_decode_recovery: realign_after_recovery,
+                        hevc_startup_in_flight_watchdog: false,
+                        from_hevc_hw_replay: false,
+                        hevc_decode_recovery_evidence_scoped: false,
+                    });
 
-            assert!(
-                !pipeline
-                    .recover_error_if_needed(
-                        Err(CORRUPT_VIDEO_FRAME_RECOVERY_ERROR.to_string()),
-                        &mut generation,
-                        ffi::AVCodecID::AV_CODEC_ID_H264,
-                        &packet,
-                        &mut recovery,
-                        realign_after_recovery,
-                        None,
-                    )
-                    .unwrap()
-            );
+                assert!(
+                    !pipeline
+                        .recover_error_if_needed(
+                            Err(CORRUPT_VIDEO_FRAME_RECOVERY_ERROR.to_string()),
+                            &mut generation,
+                            codec_id,
+                            &packet,
+                            &mut recovery,
+                            realign_after_recovery,
+                            None,
+                        )
+                        .unwrap()
+                );
 
-            assert_eq!(generation.current(), current_generation);
-            assert!(!recovery.waiting_for_keyframe());
-            assert!(!recovery.take_realign_on_next_frame());
-            let pending = pipeline
-                .take_pending_input()
-                .expect("queued input is retained");
-            assert_eq!(pending.generation, current_generation);
-            assert_eq!(pending.packet.pts(), Some(40));
+                assert_eq!(generation.current(), current_generation);
+                assert!(!recovery.waiting_for_keyframe());
+                assert!(!recovery.take_realign_on_next_frame());
+                let pending = pipeline
+                    .take_pending_input()
+                    .expect("queued input is retained");
+                assert_eq!(pending.generation, current_generation);
+                assert_eq!(pending.packet.pts(), Some(40));
+            }
         }
     }
 }

@@ -41,6 +41,14 @@ mod decoder_runtime;
 #[cfg(test)]
 impl Decoder {
     pub(super) fn open_h264_for_test() -> Self {
+        Self::open_video_for_test(ffi::AVCodecID::AV_CODEC_ID_H264)
+    }
+
+    pub(super) fn open_hevc_for_test() -> Self {
+        Self::open_video_for_test(ffi::AVCodecID::AV_CODEC_ID_HEVC)
+    }
+
+    fn open_video_for_test(codec_id: ffi::AVCodecID) -> Self {
         let mut format = unsafe { ffi::avformat_alloc_context() };
         assert!(!format.is_null());
         let stream = unsafe { ffi::avformat_new_stream(format, ptr::null()) };
@@ -49,7 +57,6 @@ impl Decoder {
             panic!("test video stream allocates");
         }
         let time_base = ffi::AVRational { num: 1, den: 1_000 };
-        let codec_id = ffi::AVCodecID::AV_CODEC_ID_H264;
         unsafe {
             let parameters = &mut *(*stream).codecpar;
             parameters.codec_type = ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
@@ -70,7 +77,7 @@ impl Decoder {
             HardwareDecodeMode::Off,
         );
         unsafe { ffi::avformat_close_input(&mut format) };
-        decoder.expect("H.264 test decoder opens without media or GPU")
+        decoder.expect("test video decoder opens without media or GPU")
     }
 }
 
@@ -114,22 +121,6 @@ fn configured_vulkan_decode_thread_count() -> c_int {
         );
         DEFAULT_VULKAN_DECODE_THREADS
     })
-}
-
-fn video_error_recognition(codec_id: ffi::AVCodecID) -> Option<c_int> {
-    // Like mpv's vd_lavc, leave H.264 at libavcodec's default error
-    // recognition. Open-GOP starts can lack pre-roll references: EXPLODE
-    // turns their MMCO warnings into errors before the decoder converges.
-    match codec_id {
-        // FFmpeg otherwise logs a missing HEVC reference, swallows
-        // AVERROR_INVALIDDATA at the NAL boundary, and reports the packet as
-        // consumed. That hides a broken RPS from tiny until the next IDR makes
-        // the multi-second output hole observable. EXPLODE preserves FFmpeg's
-        // normal bitstream checks while surfacing this error immediately to
-        // the existing flush-and-realign recovery path.
-        ffi::AVCodecID::AV_CODEC_ID_HEVC => Some(ffi::AV_EF_EXPLODE),
-        _ => None,
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -658,7 +649,7 @@ mod tests {
         VideoRecoveryPointKind, audio_codec_requires_recovery_point,
         packet_is_audio_recovery_point, packet_is_video_recovery_point, packet_is_video_seek_point,
         packet_video_recovery_point_kind, parse_vulkan_decode_thread_count,
-        video_error_recognition, vulkan_decode_codec_needs_single_thread,
+        vulkan_decode_codec_needs_single_thread,
     };
 
     fn packet_from_data(data: &[u8]) -> AvPacket {
@@ -897,22 +888,6 @@ mod tests {
                 expected
             );
         }
-    }
-
-    #[test]
-    fn video_error_recognition_surfaces_hevc_rps_failures() {
-        assert_eq!(
-            video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_H264),
-            None
-        );
-        assert_eq!(
-            video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_HEVC),
-            Some(ffi::AV_EF_EXPLODE)
-        );
-        assert_eq!(
-            video_error_recognition(ffi::AVCodecID::AV_CODEC_ID_MPEG4),
-            None
-        );
     }
 
     #[test]
