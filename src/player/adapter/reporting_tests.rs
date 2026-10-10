@@ -30,6 +30,8 @@ fn report_gateway_preserves_all_post_endpoints_bodies_and_http_failures() {
                     Err(error) => panic!("mock accept failed: {error}"),
                 }
             };
+            // Accepted sockets inherit nonblocking mode on Windows.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
