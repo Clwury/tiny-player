@@ -34,6 +34,7 @@ depends=(
     'libplacebo>=7'
     'libxcb'
     'libxkbcommon'
+    'systemd-libs'
     'vulkan-icd-loader'
     'wayland'
 )

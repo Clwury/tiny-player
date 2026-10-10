@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential ca-certificates clang cmake curl desktop-file-utils git \
     glslang-dev glslang-tools libasound2-dev libbz2-dev libdav1d-dev \
     libfontconfig1-dev libfreetype-dev libgnutls28-dev liblcms2-dev liblzma-dev \
-    libshaderc-dev libvulkan-dev libwayland-dev libxcb1-dev libxkbcommon-x11-dev \
+    libshaderc-dev libudev-dev libvulkan-dev libwayland-dev libxcb1-dev libxkbcommon-x11-dev \
     meson nasm ninja-build patchelf pkg-config python3 python3-jinja2 \
     spirv-headers xz-utils zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*

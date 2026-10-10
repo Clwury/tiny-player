@@ -1,6 +1,7 @@
 pub(crate) mod adapter;
 mod backend;
 mod cache;
+mod gamepad;
 mod image_resources;
 mod media_metadata;
 mod model;

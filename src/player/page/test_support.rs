@@ -109,6 +109,7 @@ impl PlaybackPage {
             report_effects,
             queue_effects,
             emby,
+            gamepad: gamepad::PlaybackGamepad::disabled(),
         }
     }
 }

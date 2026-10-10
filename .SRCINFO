@@ -21,6 +21,7 @@ pkgbase = tiny-player-git
 	depends = libplacebo>=7
 	depends = libxcb
 	depends = libxkbcommon
+	depends = systemd-libs
 	depends = vulkan-icd-loader
 	depends = wayland
 	provides = tiny-player=0.1.3.r131.g259cb70

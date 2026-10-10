@@ -126,6 +126,7 @@ impl PlaybackPage {
         self.queue_effects.task.cancel();
         match update {
             QueueSwitchUpdate::Replace(mut replacement) => {
+                self.gamepad.stop();
                 let mut update =
                     self.close_playback_reporting(false, self.session.timeline().ended);
                 replacement.apply_close(&mut update);

@@ -22,6 +22,9 @@ glibc 2.39 是发布基线，包内所有 ELF 的实际版本需求均不得高�
 FFmpeg 9.0.1、libplacebo 7.360.1、Vulkan-Headers 1.4.357；Rust 为 1.97.0。
 Ubuntu 安全更新随构建时的仓库更新，镜像不承诺逐字节可复现。
 
+播放页手柄输入使用 gilrs。构建镜像安装 `libudev-dev`，`bundle.py` 自动收集
+libudev 及其链接依赖并执行相同的 ELF 审计；运行时由用户会话提供输入设备访问权限。
+
 ## GitHub Actions 发布
 
 推送到 `master` 后，`.github/workflows/release.yml` 从根 `Cargo.toml` 读取版本，

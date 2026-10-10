@@ -1,6 +1,8 @@
 //! Playback business state; independent of GPUI, backend ownership and IO.
 pub(in crate::player) mod episode_card;
+pub(in crate::player) mod gamepad;
 pub(in crate::player) mod progress;
+pub(in crate::player) mod shortcuts;
 pub(crate) mod source;
 pub(crate) mod time;
 pub(crate) mod timeline;

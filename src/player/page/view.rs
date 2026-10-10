@@ -3,6 +3,7 @@ use super::*;
 
 impl Render for PlaybackPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.start_gamepad_input(window, cx);
         self.poll_backend(window, cx);
         if !self.presentation.focus_handle.is_focused(window) {
             window.focus(&self.presentation.focus_handle, cx);

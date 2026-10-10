@@ -12,7 +12,31 @@ Tiny Player is a native Emby desktop client for Linux and Windows, built with Ru
 - **Playback and track selection**: Choose video versions, audio tracks, and subtitles, set language preferences, and sync playback progress.
 - **Video processing**: Software decoding, Vulkan hardware decoding, and HDR tone mapping. Hardware decoding support depends on the GPU, driver, and video codec.
 - **Playback controls**: Fullscreen, playback speed adjustment, subtitle positioning, a playback information overlay, and configurable memory and disk caches.
+- **Gamepad playback shortcuts**: Standard gamepad buttons control playback, seeking, volume, speed, subtitle position, and returning to media details.
 - **Keep awake during video playback**: Request inhibition of automatic screen locking, display power saving, and sleep; release the request when paused, buffering pauses playback, playback ends, or the player closes.
+
+## Gamepad Playback Controls
+
+Gamepads are detected automatically on the playback page. The active playback window accepts input from the first controller used, until that controller disconnects. On Steam Deck, add Tiny Player to Steam and use a standard gamepad layout in Steam Input.
+
+| Button (Deck / Xbox layout) | Action |
+| --- | --- |
+| A | Play / pause |
+| B | Close the episode list, track/cache menu, or information overlay; otherwise return to media details |
+| D-pad left / right | Seek backward / forward 5 seconds |
+| D-pad down / up | Lower / raise volume by 2 percentage points |
+| LB / RB | Seek backward / forward 60 seconds |
+| X | Toggle mute |
+| Y | Toggle playback information |
+| Menu / Start | Toggle fullscreen |
+| View / Select | Show / hide playback controls |
+| LT / RT | Decrease / increase playback speed |
+| Right stick click | Reset playback speed to 1× |
+| Hold left stick click + D-pad up / down | Raise / lower subtitle position |
+
+Seeking and volume repeat while held; other actions require a new press. Input stops when the window loses focus or playback closes. Playback controls remain visible for three seconds after gamepad actions. B closes open menus; their item selection and media browsing continue to use the existing mouse/keyboard interface. Keyboard shortcuts retain their existing mappings.
+
+Linux source builds also require the libudev development package (`libudev-dev` on Ubuntu; `systemd-libs` on Arch). The user session must have access to the controller's `/dev/input/event*` device.
 
 ## Screenshots
 

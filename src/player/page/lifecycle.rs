@@ -99,6 +99,7 @@ impl PlaybackPage {
             emby: request.emby,
             report_effects,
             queue_effects,
+            gamepad: Default::default(),
         };
         if page.session.controls_view().error.is_some() {
             let _ = page.close_playback_reporting(true, false);
@@ -108,6 +109,7 @@ impl PlaybackPage {
 
     pub(super) fn register_image_cleanup(cx: &Context<Self>) {
         cx.on_release(|page, cx| {
+            page.gamepad.stop();
             let images = page.presentation.release_images();
             defer_drop_released_images(images, cx);
         })
@@ -119,6 +121,7 @@ impl PlaybackPage {
     }
 
     pub(super) fn back_to_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.gamepad.stop();
         self.presentation.presentation_timers.close();
         self.session.cancel_poll();
         self.backend_poll.cancel();

@@ -1,24 +1,9 @@
 use super::subtitles::subtitle_vertical_adjust_step;
 use super::*;
+use crate::player::model::shortcuts::{
+    LONG_SEEK_STEP_SECONDS, PlaybackShortcut, SEEK_STEP_SECONDS,
+};
 use tiny_playback::PlaybackRateChange;
-
-const KEYBOARD_SEEK_STEP_SECONDS: i32 = 5;
-const KEYBOARD_LONG_SEEK_STEP_SECONDS: i32 = 60;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum PlaybackShortcut {
-    TogglePlayback,
-    ToggleFullscreen,
-    ExitFullscreen,
-    SeekRelative(i32),
-    ToggleInfoOverlay,
-    RaiseSubtitle,
-    LowerSubtitle,
-    DecreaseVolume,
-    IncreaseVolume,
-    ToggleMute,
-    ChangeRate(PlaybackRateChange),
-}
 
 impl PlaybackPage {
     pub(super) fn handle_key_down(
@@ -30,15 +15,25 @@ impl PlaybackPage {
         let Some(shortcut) = playback_shortcut_for_event(event) else {
             return;
         };
-        if shortcut == PlaybackShortcut::ExitFullscreen && self.close_episode_list(cx) {
+        if self.dispatch_playback_shortcut(shortcut, window, cx) {
             cx.stop_propagation();
-            return;
         }
-        if shortcut == PlaybackShortcut::ExitFullscreen && !window.is_fullscreen() {
-            return;
-        }
+    }
 
-        cx.stop_propagation();
+    pub(super) fn dispatch_playback_shortcut(
+        &mut self,
+        shortcut: PlaybackShortcut,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if shortcut == PlaybackShortcut::ExitFullscreen {
+            if self.close_episode_list(cx) {
+                return true;
+            }
+            if !window.is_fullscreen() {
+                return false;
+            }
+        }
         match shortcut {
             PlaybackShortcut::TogglePlayback => self.toggle_playback_pause_command(cx),
             PlaybackShortcut::ToggleFullscreen => {
@@ -49,6 +44,28 @@ impl PlaybackPage {
             PlaybackShortcut::ExitFullscreen => {
                 self.reset_fullscreen_controls();
                 window.toggle_fullscreen();
+                cx.notify();
+            }
+            PlaybackShortcut::Back => {
+                if self.close_episode_list(cx) || self.close_track_select(cx) {
+                    self.schedule_fullscreen_controls_hide(cx);
+                } else if self.presentation.playback_details_visible {
+                    self.presentation.playback_details_visible = false;
+                    cx.notify();
+                } else {
+                    self.back_to_detail(window, cx);
+                }
+            }
+            PlaybackShortcut::ToggleControls => {
+                self.presentation.fullscreen.controls_visible =
+                    !self.presentation.fullscreen.controls_visible;
+                if self.presentation.fullscreen.controls_visible {
+                    self.schedule_fullscreen_controls_hide(cx);
+                } else {
+                    self.presentation
+                        .presentation_timers
+                        .cancel(PresentationTimer::Controls);
+                }
                 cx.notify();
             }
             PlaybackShortcut::SeekRelative(seconds) => {
@@ -77,6 +94,7 @@ impl PlaybackPage {
             PlaybackShortcut::ToggleMute => self.toggle_playback_mute(cx),
             PlaybackShortcut::ChangeRate(change) => self.change_playback_rate(change, cx),
         }
+        true
     }
 }
 
@@ -141,17 +159,13 @@ pub(super) fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
     } else if key.eq_ignore_ascii_case("escape") {
         Some(PlaybackShortcut::ExitFullscreen)
     } else if key.eq_ignore_ascii_case("left") {
-        Some(PlaybackShortcut::SeekRelative(-KEYBOARD_SEEK_STEP_SECONDS))
+        Some(PlaybackShortcut::SeekRelative(-SEEK_STEP_SECONDS))
     } else if key.eq_ignore_ascii_case("right") {
-        Some(PlaybackShortcut::SeekRelative(KEYBOARD_SEEK_STEP_SECONDS))
+        Some(PlaybackShortcut::SeekRelative(SEEK_STEP_SECONDS))
     } else if key.eq_ignore_ascii_case("up") {
-        Some(PlaybackShortcut::SeekRelative(
-            KEYBOARD_LONG_SEEK_STEP_SECONDS,
-        ))
+        Some(PlaybackShortcut::SeekRelative(LONG_SEEK_STEP_SECONDS))
     } else if key.eq_ignore_ascii_case("down") {
-        Some(PlaybackShortcut::SeekRelative(
-            -KEYBOARD_LONG_SEEK_STEP_SECONDS,
-        ))
+        Some(PlaybackShortcut::SeekRelative(-LONG_SEEK_STEP_SECONDS))
     } else if key.eq_ignore_ascii_case("i") {
         Some(PlaybackShortcut::ToggleInfoOverlay)
     } else if key.eq_ignore_ascii_case("r") {

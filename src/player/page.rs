@@ -28,6 +28,7 @@ mod controls;
 mod diagnostics;
 mod episodes;
 mod fullscreen;
+mod gamepad;
 mod lifecycle;
 mod power;
 mod presentation;
@@ -123,6 +124,7 @@ pub struct PlaybackPage {
     emby: EmbyPlaybackContext,
     report_effects: reporting::ReportingEffects,
     queue_effects: queue::QueueEffects,
+    gamepad: gamepad::PlaybackGamepad,
 }
 
 impl EventEmitter<PlaybackEvent> for PlaybackPage {}
