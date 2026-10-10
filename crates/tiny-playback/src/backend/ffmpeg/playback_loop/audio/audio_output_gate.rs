@@ -250,6 +250,7 @@ pub(in crate::backend::ffmpeg) fn stage_pending_audio(
     event_tx: &Sender<BackendEvent>,
     buffered_reporter: &mut BufferedReporter,
 ) -> std::result::Result<AudioStageResult, String> {
+    let stage_started_at = Instant::now();
     stage_pending_audio_with_checkpoint(
         pending_audio,
         output,
@@ -262,6 +263,7 @@ pub(in crate::backend::ffmpeg) fn stage_pending_audio(
         session_id,
         event_tx,
         buffered_reporter,
+        || stage_started_at.elapsed(),
         |_| {},
     )
 }
@@ -279,9 +281,9 @@ pub(in crate::backend::ffmpeg) fn stage_pending_audio_with_checkpoint(
     session_id: PlaybackSessionId,
     event_tx: &Sender<BackendEvent>,
     buffered_reporter: &mut BufferedReporter,
+    mut stage_elapsed: impl FnMut() -> Duration,
     mut observe_checkpoint: impl FnMut(AudioStageCheckpoint),
 ) -> std::result::Result<AudioStageResult, String> {
-    let stage_started_at = Instant::now();
     let mut result = AudioStageResult::default();
     let dropped_before_start = pending_audio.discard_before(audio_start_timeline_nsecs);
     if dropped_before_start > 0 {
@@ -334,7 +336,7 @@ pub(in crate::backend::ffmpeg) fn stage_pending_audio_with_checkpoint(
     let mut popped_audio_frames = 0usize;
     while let Some(mut frame) = pending_audio.pop_front_until(audio_flush_until_timeline_nsecs) {
         if popped_audio_frames >= AUDIO_STAGE_SERVICE_MAX_FRAMES
-            || stage_started_at.elapsed() >= AUDIO_STAGE_SERVICE_BUDGET
+            || stage_elapsed() >= AUDIO_STAGE_SERVICE_BUDGET
         {
             pending_audio.push_front_frame(frame);
             result.would_block = true;

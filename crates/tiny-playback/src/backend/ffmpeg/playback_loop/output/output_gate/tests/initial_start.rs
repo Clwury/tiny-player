@@ -2537,12 +2537,28 @@ impl ProductionInitialAudioState {
         flush_until_nsecs: u64,
         observe_checkpoint: impl FnMut(AudioStageCheckpoint),
     ) -> super::super::AudioStageResult {
+        // Transaction checkpoints must not depend on host thread scheduling.
+        self.stage_from_until(
+            PRODUCTION_STAGE_TARGET_NSECS,
+            flush_until_nsecs,
+            || Duration::ZERO,
+            observe_checkpoint,
+        )
+    }
+
+    fn stage_from_until(
+        &mut self,
+        start_nsecs: u64,
+        flush_until_nsecs: u64,
+        stage_elapsed: impl FnMut() -> Duration,
+        observe_checkpoint: impl FnMut(AudioStageCheckpoint),
+    ) -> super::super::AudioStageResult {
         let mut buffered_reporter = BufferedReporter::new_with_events(true, false);
         stage_pending_audio_with_checkpoint(
             &mut self.scheduler.pending_start_audio,
             &self.output,
             self.preparing_token.audio_epoch,
-            PRODUCTION_STAGE_TARGET_NSECS,
+            start_nsecs,
             flush_until_nsecs,
             AudioClockMode::AudioStarted,
             DelayedAudioStartSilencePolicy::Skip,
@@ -2550,6 +2566,7 @@ impl ProductionInitialAudioState {
             self.session_id,
             &self.event_tx,
             &mut buffered_reporter,
+            stage_elapsed,
             observe_checkpoint,
         )
         .expect("production audio staging succeeds")
@@ -2620,6 +2637,130 @@ impl ProductionInitialAudioState {
             ))
         );
     }
+}
+
+#[test]
+fn production_stage_budget_yield_before_first_frame_preserves_retry_payload() {
+    const FRAMES: usize = 4;
+    let mut state = ProductionInitialAudioState::new(110, FRAMES);
+    let epoch = state.output.audio_epoch();
+    let flush_until_nsecs =
+        PRODUCTION_STAGE_TARGET_NSECS + FRAMES as u64 * PRODUCTION_STAGE_FRAME_NSECS;
+
+    let result = state.stage_from_until(
+        PRODUCTION_STAGE_TARGET_NSECS,
+        flush_until_nsecs,
+        || Duration::from_secs(1),
+        |checkpoint| panic!("budget exhaustion must precede staging: {checkpoint:?}"),
+    );
+
+    assert!(result.would_block);
+    assert!(!result.made_progress);
+    assert!(!result.interrupted);
+    assert_eq!(result.staged_frames, 0);
+    assert_eq!(result.staged_samples, 0);
+    assert_eq!(result.staged_range_nsecs, None);
+    assert_eq!(state.scheduler.pending_start_audio.len(), FRAMES);
+    assert_eq!(
+        state.scheduler.pending_start_audio.queued_samples(),
+        FRAMES * PRODUCTION_STAGE_SAMPLES_PER_FRAME
+    );
+    assert_eq!(
+        state.scheduler.pending_start_audio.range_nsecs(),
+        Some((PRODUCTION_STAGE_TARGET_NSECS, flush_until_nsecs))
+    );
+    assert_eq!(state.stable_snapshot().total_pending_nsecs, 0);
+    assert_eq!(state.output.audio_epoch(), epoch);
+    assert!(!state.output.stream_active_for_test());
+
+    let resumed = state.stage(|_| {});
+    assert_eq!(resumed.staged_frames, FRAMES);
+    assert_eq!(
+        resumed.staged_samples,
+        FRAMES * PRODUCTION_STAGE_SAMPLES_PER_FRAME
+    );
+    assert_eq!(
+        resumed.staged_range_nsecs,
+        Some((PRODUCTION_STAGE_TARGET_NSECS, flush_until_nsecs))
+    );
+    let token = state.prepared_token(resumed);
+    assert_eq!(token.audio_epoch, epoch);
+    state.abort(token, "budget_yield_before_first_frame_cleanup");
+    state.assert_lossless_retry_state();
+}
+
+#[test]
+fn production_stage_budget_yield_after_first_frame_resumes_contiguously() {
+    const FRAMES: usize = 4;
+    let mut state = ProductionInitialAudioState::new(111, FRAMES);
+    let epoch = state.output.audio_epoch();
+    let first_end_nsecs = PRODUCTION_STAGE_TARGET_NSECS + PRODUCTION_STAGE_FRAME_NSECS;
+    let flush_until_nsecs =
+        PRODUCTION_STAGE_TARGET_NSECS + FRAMES as u64 * PRODUCTION_STAGE_FRAME_NSECS;
+    let elapsed = std::cell::Cell::new(Duration::ZERO);
+
+    let result = state.stage_from_until(
+        PRODUCTION_STAGE_TARGET_NSECS,
+        flush_until_nsecs,
+        || elapsed.get(),
+        |checkpoint| {
+            if checkpoint == AudioStageCheckpoint::FirstEnqueued {
+                elapsed.set(Duration::from_secs(1));
+            }
+        },
+    );
+
+    assert!(result.would_block);
+    assert!(!result.interrupted);
+    assert_eq!(result.staged_frames, 1);
+    assert_eq!(result.staged_samples, PRODUCTION_STAGE_SAMPLES_PER_FRAME);
+    assert_eq!(
+        result.staged_range_nsecs,
+        Some((PRODUCTION_STAGE_TARGET_NSECS, first_end_nsecs))
+    );
+    assert_eq!(state.scheduler.pending_start_audio.len(), FRAMES - 1);
+    assert_eq!(
+        state.scheduler.pending_start_audio.range_nsecs(),
+        Some((first_end_nsecs, flush_until_nsecs))
+    );
+    assert_eq!(state.stable_snapshot().queue_frames, 1);
+
+    let resumed = state.stage_from_until(
+        first_end_nsecs,
+        flush_until_nsecs,
+        || Duration::ZERO,
+        |_| {},
+    );
+    assert!(!resumed.would_block);
+    assert!(!resumed.interrupted);
+    assert_eq!(resumed.staged_frames, FRAMES - 1);
+    assert_eq!(
+        resumed.staged_samples,
+        (FRAMES - 1) * PRODUCTION_STAGE_SAMPLES_PER_FRAME
+    );
+    assert_eq!(
+        resumed.staged_range_nsecs,
+        Some((first_end_nsecs, flush_until_nsecs))
+    );
+    assert!(state.scheduler.pending_start_audio.is_empty());
+    let snapshot = state.stable_snapshot();
+    assert_eq!(snapshot.queue_frames, FRAMES);
+    assert_eq!(
+        snapshot.queue_pending_nsecs,
+        FRAMES as u64 * PRODUCTION_STAGE_FRAME_NSECS
+    );
+    assert_eq!(
+        snapshot.payload_range_nsecs,
+        Some((PRODUCTION_STAGE_TARGET_NSECS, flush_until_nsecs))
+    );
+    assert_eq!(state.output.audio_epoch(), epoch);
+    assert!(!state.output.stream_active_for_test());
+
+    state.abort(
+        state.preparing_token,
+        "budget_yield_after_first_frame_cleanup",
+    );
+    state.assert_lossless_retry_state();
 }
 
 #[test]
