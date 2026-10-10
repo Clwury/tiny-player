@@ -12,7 +12,7 @@ mkdir -p /tmp/ffmpeg
 cd /tmp/ffmpeg
 git init
 git remote add origin https://github.com/FFmpeg/FFmpeg.git
-git fetch --depth 1 origin "${FFMPEG_REF:-n9.0.1}"
+git fetch --depth 1 origin "${FFMPEG_REF:-n9.0.2}"
 git checkout --detach FETCH_HEAD
 ./configure --prefix="$prefix" --libdir="$prefix/lib" \
     --arch=x86_64 --cpu=x86-64 --enable-shared --disable-static \

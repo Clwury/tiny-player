@@ -1,6 +1,6 @@
 pkgbase = tiny-player-git
 	pkgdesc = Native Emby desktop client with FFmpeg and Vulkan playback
-	pkgver = 0.1.3.r131.g259cb70
+	pkgver = 0.1.4.r137.gde2e106
 	pkgrel = 1
 	url = https://github.com/Clwury/tiny-player
 	arch = x86_64
@@ -24,7 +24,7 @@ pkgbase = tiny-player-git
 	depends = systemd-libs
 	depends = vulkan-icd-loader
 	depends = wayland
-	provides = tiny-player=0.1.3.r131.g259cb70
+	provides = tiny-player=0.1.4.r137.gde2e106
 	conflicts = tiny-player
 	options = !lto
 	source = tiny-player::git+https://github.com/Clwury/tiny-player.git

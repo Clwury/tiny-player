@@ -82,12 +82,26 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Resolve latest FFmpeg 9.0 source
+      - name: Resolve latest FFmpeg n9 release
         id: ffmpeg
         run: |
-          ref=$(git ls-remote https://github.com/FFmpeg/FFmpeg.git refs/heads/release/9.0)
-          commit=${ref%%[[:space:]]*}
+          set -euo pipefail
+          refs=$(git ls-remote --tags https://github.com/FFmpeg/FFmpeg.git 'refs/tags/n9*')
+          tag=$(printf '%s\n' "$refs" | awk '
+            $2 ~ /^refs\/tags\/n9(\.[0-9]+){1,2}$/ {
+              sub(/^refs\/tags\//, "", $2)
+              print $2
+            }
+          ' | sort -V | tail -n 1)
+          [[ $tag =~ ^n9(\.[0-9]+){1,2}$ ]]
+          commit=$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$tag" '
+            $2 == ref { tag_commit = $1 }
+            $2 == ref "^{}" { peeled_commit = $1 }
+            END { print peeled_commit ? peeled_commit : tag_commit }
+          ')
           [[ $commit =~ ^[0-9a-f]{40}$ ]]
+          echo "FFmpeg release: $tag ($commit)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v4
       - name: Build native dependencies with persistent Docker layers

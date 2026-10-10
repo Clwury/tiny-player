@@ -21,7 +21,7 @@ COPY build-native.sh /opt/packaging/build-native.sh
 RUN bash /opt/packaging/build-native.sh
 
 COPY build-ffmpeg.sh /opt/packaging/build-ffmpeg.sh
-ARG FFMPEG_REF=n9.0.1
+ARG FFMPEG_REF=n9.0.2
 RUN bash /opt/packaging/build-ffmpeg.sh
 
 ENV PKG_CONFIG_PATH=/opt/tiny-player/lib/pkgconfig:/opt/tiny-player/share/pkgconfig
