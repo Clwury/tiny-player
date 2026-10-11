@@ -131,6 +131,87 @@ fn app_with_cache(
 }
 
 #[gpui::test]
+fn auto_start_cards_and_sidebar_switches_always_refresh_cached_tokens(cx: &mut TestAppContext) {
+    let mock = MockEmby::new();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("servers.json");
+    let mut cache = ServerCache::empty();
+    cache.servers = ["first", "second"]
+        .into_iter()
+        .map(|id| CachedServer {
+            id: id.into(),
+            endpoint: mock.submission.endpoint.clone(),
+            username: format!("{id}-user"),
+            password: mock.submission.password.clone(),
+            icon_url: None,
+            ..saved_server()
+        })
+        .collect();
+    cache.auto_start_server_id = Some("first".into());
+    storage::save_to(&cache, &path).unwrap();
+    cx.update(theme::init);
+    let (app, cx) = cx.add_window_view(|_, cx| {
+        let mut app = TinyApp::new(cache, None, cx);
+        app.cache_save_path = Some(path.clone());
+        app.window_persistence_enabled = false;
+        app
+    });
+    cx.simulate_resize(size(px(1100.0), px(720.0)));
+    cx.run_until_parked();
+    assert_eq!(
+        mock.auth_count(),
+        1,
+        "auto-start must replace the saved token"
+    );
+    assert_eq!(
+        storage::load_or_init_from(&path).unwrap().servers[0]
+            .access_token
+            .as_deref(),
+        Some("token-1")
+    );
+
+    app.update(cx, |app, cx| app.show_servers_page_from_home(cx));
+    cx.run_until_parked();
+    for (selector, id, count) in [
+        ("server-card-first", "first", 2),
+        ("sidebar-server-second", "second", 3),
+        ("sidebar-server-first", "first", 4),
+    ] {
+        let target = cx.debug_bounds(selector).unwrap();
+        cx.simulate_click(target.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(mock.auth_count(), count);
+        let expected_token = format!("token-{count}");
+        app.read_with(cx, |app, cx| {
+            let Page::Home(home) = app.shell.page() else {
+                panic!("authentication must open the requested server");
+            };
+            assert_eq!(home.read(cx).current_server_id(), id);
+            assert_eq!(
+                app.server_feature
+                    .server(id)
+                    .unwrap()
+                    .access_token
+                    .as_deref(),
+                Some(expected_token.as_str())
+            );
+        });
+        let saved = storage::load_or_init_from(&path).unwrap();
+        assert_eq!(saved.servers.len(), 2);
+        assert_eq!(
+            saved
+                .servers
+                .iter()
+                .find(|server| server.id == id)
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some(expected_token.as_str())
+        );
+    }
+}
+
+#[gpui::test]
 fn newly_added_sidebar_server_authenticates_without_returning_to_cards(cx: &mut TestAppContext) {
     let mock = MockEmby::new();
     let temp = tempfile::tempdir().unwrap();
@@ -151,7 +232,7 @@ fn newly_added_sidebar_server_authenticates_without_returning_to_cards(cx: &mut 
         let mut app = TinyApp::new(cache, None, cx);
         app.cache_save_path = Some(path.clone());
         app.window_persistence_enabled = false;
-        app.begin_select_server(&current, cx);
+        app.open_home_for_server_for_test(current.clone(), cx);
         let dialog = cx.new(AddServerDialogState::new);
         app.add_server_dialog = Some(dialog.clone());
         app.finish_save_server(dialog, Ok(added.clone()), cx);
@@ -197,7 +278,7 @@ fn newly_added_sidebar_server_authenticates_without_returning_to_cards(cx: &mut 
 }
 
 #[gpui::test]
-fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_the_cache(
+fn every_entry_reauthenticates_and_edits_preserve_cache_until_the_next_login(
     cx: &mut TestAppContext,
 ) {
     let mock = MockEmby::new();
@@ -249,7 +330,6 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
                 .as_deref(),
             Some("token-1")
         );
-        assert!(!app.server_feature.catalog().servers[0].needs_auth_refresh);
         assert!(
             app.server_feature.catalog().servers[0]
                 .icon_url
@@ -265,12 +345,12 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
 
     app.update(cx, |app, cx| {
         app.show_servers_page_from_home(cx);
-        // An old card snapshot must still reuse the latest saved token.
+        // An old card snapshot must still authenticate using the saved credentials.
         app.begin_select_server(&pending, cx);
         app.flush_scheduled_cache_save(cx);
     });
     cx.run_until_parked();
-    assert_eq!(mock.auth_count(), 1);
+    assert_eq!(mock.auth_count(), 2);
     drop(app);
     cx.run_until_parked();
 
@@ -283,9 +363,11 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
     cx.run_until_parked();
     assert_eq!(
         mock.auth_count(),
-        1,
-        "restarting must reuse the saved login"
+        3,
+        "restarting must authenticate again despite the saved token"
     );
+    let previously_authenticated =
+        app.read_with(cx, |app, _| app.server_feature.catalog().servers[0].clone());
 
     let edited_submission = AddServerSubmission {
         password: "edited-password".into(),
@@ -310,13 +392,9 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
             app.server_feature.catalog().servers[0].server_name,
             previously_authenticated.server_name
         );
-        assert!(app.server_feature.catalog().servers[0].needs_auth_refresh);
-        assert!(
-            app.server_feature.catalog().servers[0]
-                .icon_url
-                .as_deref()
-                .unwrap()
-                .ends_with("/UHD-emby.png")
+        assert_eq!(
+            app.server_feature.catalog().servers[0].icon_url,
+            previously_authenticated.icon_url
         );
         assert_eq!(
             app.server_feature.test_state().counts[&pending.id].movie_count,
@@ -324,9 +402,8 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
         );
     });
     cx.run_until_parked();
-    assert_eq!(mock.auth_count(), 1, "saving an edit must not authenticate");
+    assert_eq!(mock.auth_count(), 3, "saving an edit must not authenticate");
     let cache = storage::load_or_init_from(&path).unwrap();
-    assert!(cache.servers[0].needs_auth_refresh);
     assert_eq!(
         cache.servers[0].access_token,
         previously_authenticated.access_token
@@ -343,7 +420,7 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
         app.begin_select_server(&previously_authenticated, cx)
     });
     cx.run_until_parked();
-    assert_eq!(mock.auth_count(), 2);
+    assert_eq!(mock.auth_count(), 4);
     app.read_with(cx, |app, _| {
         assert!(matches!(app.shell.page(), Page::Home(_)));
         assert_eq!(app.server_feature.catalog().servers[0].id, pending.id);
@@ -351,9 +428,8 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
             app.server_feature.catalog().servers[0]
                 .access_token
                 .as_deref(),
-            Some("token-2")
+            Some("token-4")
         );
-        assert!(!app.server_feature.catalog().servers[0].needs_auth_refresh);
         assert!(
             app.server_feature.catalog().servers[0]
                 .icon_url
@@ -367,10 +443,16 @@ fn first_entry_and_entry_after_edit_authenticate_once_and_later_entries_reuse_th
         app.begin_select_server(&previously_authenticated, cx);
     });
     cx.run_until_parked();
-    assert_eq!(mock.auth_count(), 2);
+    assert_eq!(mock.auth_count(), 5);
     assert_eq!(
         *mock.auth_passwords.lock().unwrap(),
-        ["first-password", "edited-password"]
+        [
+            "first-password",
+            "first-password",
+            "first-password",
+            "edited-password",
+            "edited-password",
+        ]
     );
 }
 
@@ -385,7 +467,6 @@ fn failed_entry_preserves_pending_and_existing_caches_and_can_be_retried(cx: &mu
             CachedServer {
                 endpoint: mock.submission.endpoint.clone(),
                 password: "edited-password".into(),
-                needs_auth_refresh: true,
                 item_counts: Some(CachedItemCounts {
                     movie_count: 10,
                     series_count: 20,
@@ -436,7 +517,6 @@ fn failed_entry_preserves_pending_and_existing_caches_and_can_be_retried(cx: &mu
         assert_eq!(mock.auth_count(), 2);
         app.read_with(cx, |app, _| {
             assert!(matches!(app.shell.page(), Page::Home(_)));
-            assert!(!app.server_feature.catalog().servers[0].needs_auth_refresh);
             assert_eq!(
                 app.server_feature.catalog().servers[0]
                     .access_token
@@ -461,7 +541,6 @@ fn count_refresh_failure_after_edit_preserves_cached_totals_until_success(cx: &m
     cx.update(theme::init);
     let server = CachedServer {
         endpoint: mock.submission.endpoint.clone(),
-        needs_auth_refresh: true,
         item_counts: Some(CachedItemCounts {
             movie_count: 10,
             series_count: 20,
@@ -484,7 +563,6 @@ fn count_refresh_failure_after_edit_preserves_cached_totals_until_success(cx: &m
     assert_eq!(mock.auth_count(), 1);
     app.read_with(cx, |app, _| {
         assert!(matches!(app.shell.page(), Page::Home(_)));
-        assert!(!app.server_feature.catalog().servers[0].needs_auth_refresh);
         assert_eq!(
             app.server_feature.catalog().servers[0]
                 .access_token

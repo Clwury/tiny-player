@@ -93,7 +93,6 @@ pub(crate) struct FavoriteSectionVm<'a> {
     pub(crate) sort_order: SortOrder,
     pub(crate) show_section: bool,
     pub(crate) has_items: bool,
-    pub(crate) can_retry: bool,
 }
 
 impl FavoritesController {
@@ -140,9 +139,8 @@ impl FavoritesController {
             paged,
             sort_by: sort.sort_by,
             sort_order: sort.sort_order,
-            show_section: !paged.items.is_empty() || paged.initial == LoadState::Failed,
+            show_section: !paged.items.is_empty(),
             has_items: !paged.items.is_empty(),
-            can_retry: paged.initial == LoadState::Failed,
         }
     }
 

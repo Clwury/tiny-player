@@ -92,14 +92,6 @@ impl HomeContent {
             .when(has_items, |this| {
                 this.child(self.render_favorite_row(item_type, width, cx))
             })
-            .when(state.can_retry, |this| {
-                this.child(favorite_action(
-                    format!("favorite-retry-{}", item_type.as_str()),
-                    "重试",
-                    cx,
-                    cx.listener(move |page, _, _, cx| page.load_favorites_initial(item_type, cx)),
-                ))
-            })
     }
 
     fn render_favorite_row(

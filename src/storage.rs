@@ -223,7 +223,6 @@ mod tests {
             icon_url: None,
             icon_is_custom: false,
             access_token: Some(token.to_string()),
-            needs_auth_refresh: false,
             item_counts: None,
             added_at_unix: 123,
         }
@@ -327,6 +326,23 @@ mod tests {
         assert_eq!(loaded.device_id, cache.device_id);
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(loaded.servers[0].access_token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn legacy_auth_refresh_flag_is_ignored_and_removed_on_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut cache = ServerCache::empty();
+        cache.servers.push(server("server-local", "token"));
+        let mut legacy = serde_json::to_value(&cache).unwrap();
+        legacy["servers"][0]["needs_auth_refresh"] = serde_json::json!(true);
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let loaded = load_or_init_from(&path).unwrap();
+        assert_eq!(loaded.servers[0].access_token.as_deref(), Some("token"));
+        save_to(&loaded, &path).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved["servers"][0].get("needs_auth_refresh").is_none());
     }
 
     #[test]

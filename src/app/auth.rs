@@ -69,12 +69,6 @@ impl TinyApp {
         self.clear_server_notifications();
         self.server_effects.auth.cancel();
         match command {
-            ServerCommand::Open(server) => {
-                let id = server.id.clone();
-                self.open_home_for_server(*server, cx);
-                self.load_item_counts_for_server_id(&id, cx);
-                cx.notify();
-            }
             ServerCommand::Authenticate(request) => {
                 let Some(client) = self.emby_client.clone() else {
                     self.server_feature.selection_failed();
@@ -112,6 +106,26 @@ impl TinyApp {
         self.server_feature
             .begin_authentication(server.clone())
             .token
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_home_for_server_for_test(
+        &mut self,
+        server: CachedServer,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_home_for_server(server, cx);
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_select_server_for_test(
+        &mut self,
+        requested: CachedServer,
+        token: RequestToken,
+        result: Result<CachedServer>,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_select_server(requested, token, result, cx);
     }
 
     fn finish_select_server(
@@ -374,8 +388,12 @@ mod tests {
     }
 
     #[gpui::test]
-    fn sidebar_switches_with_cached_auth_and_authenticates_without_it(cx: &mut TestAppContext) {
+    fn sidebar_switches_require_authentication_even_with_a_cached_token(cx: &mut TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
         let (app, cx) = sidebar_window(cx);
+        app.update(cx, |app, _| {
+            app.cache_save_path = Some(temp.path().join("servers.json"))
+        });
         let original_home = app.read_with(cx, |app, _| match app.shell.page() {
             Page::Home(home) => home.entity_id(),
             _ => panic!("expected initial home page"),
@@ -391,12 +409,34 @@ mod tests {
 
         let mut previous_home = original_home;
         for selector in ["sidebar-server-second", "sidebar-server-first"] {
-            let target = cx.debug_bounds(selector).unwrap();
-            cx.simulate_click(target.center(), Modifiers::default());
+            app.update(cx, |app, cx| {
+                let id = selector.strip_prefix("sidebar-server-").unwrap();
+                app.dispatch_app_intent(
+                    AppIntent::Home {
+                        source: app.shell.home_token().unwrap(),
+                        event: HomeEvent::SwitchServer(id.into()),
+                    },
+                    cx,
+                );
+                assert_eq!(app.server_feature.selecting_server_id(), Some(id));
+                assert!(matches!(app.shell.page(), Page::Home(home) if home.entity_id() == previous_home));
+                let requested = app.server_feature.server(id).unwrap().clone();
+                let token = app.server_feature.authentication_token().unwrap();
+                app.server_effects.auth.cancel();
+                let authenticated = CachedServer {
+                    access_token: Some(format!("new-token-{id}")),
+                    ..requested.clone()
+                };
+                app.finish_select_server(requested, token, Ok(authenticated), cx);
+                assert_eq!(
+                    app.server_feature.server(id).unwrap().access_token.as_deref(),
+                    Some(format!("new-token-{id}").as_str())
+                );
+            });
             cx.run_until_parked();
             let switched_home = app.read_with(cx, |app, _| {
                 let Page::Home(home) = app.shell.page() else {
-                    panic!("cached authentication must switch directly to Home");
+                    panic!("successful authentication must open the target Home");
                 };
                 assert!(app.server_feature.selecting_server_id().is_none());
                 home.entity_id()

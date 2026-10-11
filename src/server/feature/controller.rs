@@ -153,9 +153,6 @@ impl ServerController {
             return ServerCommand::Ignored;
         }
         self.cancel_selection();
-        if server.can_reuse_auth() {
-            return ServerCommand::Open(Box::new(server));
-        }
         ServerCommand::Authenticate(Box::new(self.begin_authentication(server)))
     }
 
@@ -184,7 +181,6 @@ impl ServerController {
             current.id == request.server.id
                 && request.token.is_for(&current.workspace_identity())
                 && same_credentials(current, &request.server)
-                && current.needs_auth_refresh == request.server.needs_auth_refresh
         });
         slot.commit(&request.token);
         self.selection = if result.is_err() && valid {
@@ -279,7 +275,6 @@ impl ServerController {
             server_name: display.server_name.clone(),
             icon_url: display.icon_url.clone(),
             icon_is_custom: display.icon_is_custom,
-            needs_auth_refresh: true,
             ..current.clone()
         })
     }
@@ -389,7 +384,7 @@ impl ServerController {
             .catalog
             .servers
             .iter()
-            .find(|server| server.id == id && server.can_reuse_auth())?
+            .find(|server| server.id == id && server.has_auth_session())?
             .clone();
         let mut slot = RequestSlot::new(
             RequestScope::ServerCounts {
@@ -413,7 +408,7 @@ impl ServerController {
         if !request.token.is_current(slot)
             || !self.catalog.servers.iter().any(|current| {
                 current.id == *id
-                    && current.can_reuse_auth()
+                    && current.has_auth_session()
                     && request.token.is_for(&current.workspace_identity())
                     && same_credentials(current, &request.server)
                     && current.user_id == request.server.user_id
@@ -455,7 +450,7 @@ impl ServerController {
             .catalog
             .servers
             .iter()
-            .filter(|server| server.can_reuse_auth())
+            .filter(|server| server.has_auth_session())
             .map(|server| server.id.clone())
             .collect::<HashSet<_>>();
         self.count_requests.retain(|id, _| ids.contains(id));

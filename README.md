@@ -31,8 +31,8 @@ Gamepads are detected automatically on the playback page. The active playback wi
 | Menu / Start | Toggle fullscreen |
 | View / Select | Show / hide playback controls |
 | LT / RT | Decrease / increase playback speed |
-| Right stick click | Reset playback speed to 1× |
-| Hold left stick click + D-pad up / down | Raise / lower subtitle position |
+| Left stick click | Reset playback speed to 1× |
+| Hold right stick click + D-pad up / down | Raise / lower subtitle position |
 
 Seeking and volume repeat while held; other actions require a new press. Input stops when the window loses focus or playback closes. Playback controls remain visible for three seconds after gamepad actions. B closes open menus; their item selection and media browsing continue to use the existing mouse/keyboard interface. Keyboard shortcuts retain their existing mappings.
 

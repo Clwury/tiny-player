@@ -43,7 +43,6 @@ pub(crate) enum ServerIntent {
 pub(crate) enum ServerCommand {
     Ignored,
     Cancelled,
-    Open(Box<CachedServer>),
     Authenticate(Box<AuthRequest>),
     CatalogChanged,
     PreviewChanged,

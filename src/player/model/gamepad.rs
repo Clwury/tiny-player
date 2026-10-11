@@ -82,7 +82,7 @@ impl GamepadControls {
             return None;
         }
         let shortcut =
-            shortcut_for_button(button, device.pressed.contains(&GamepadButton::LeftThumb))?;
+            shortcut_for_button(button, device.pressed.contains(&GamepadButton::RightThumb))?;
         if shortcut.gamepad_repeat_interval().is_some() {
             device.repeats.insert(button, now + REPEAT_DELAY);
         }
@@ -103,7 +103,7 @@ impl GamepadControls {
         let Some(device) = self.active_device.and_then(|id| self.devices.get_mut(&id)) else {
             return Vec::new();
         };
-        let subtitle_modifier = device.pressed.contains(&GamepadButton::LeftThumb);
+        let subtitle_modifier = device.pressed.contains(&GamepadButton::RightThumb);
         let mut shortcuts = Vec::new();
         device.repeats.retain(|button, deadline| {
             let Some(shortcut) = shortcut_for_button(*button, subtitle_modifier) else {
@@ -142,8 +142,8 @@ fn shortcut_for_button(button: GamepadButton, subtitle_modifier: bool) -> Option
         Select => PlaybackShortcut::ToggleControls,
         LeftTrigger => PlaybackShortcut::ChangeRate(PlaybackRateChange::Decrease),
         RightTrigger => PlaybackShortcut::ChangeRate(PlaybackRateChange::Increase),
-        RightThumb => PlaybackShortcut::ChangeRate(PlaybackRateChange::Reset),
-        LeftThumb => return None,
+        LeftThumb => PlaybackShortcut::ChangeRate(PlaybackRateChange::Reset),
+        RightThumb => return None,
     })
 }
 

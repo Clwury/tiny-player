@@ -139,9 +139,9 @@ mod tests {
                 34
             );
 
-            // Saving an edit keeps the old display, even when credentials
-            // are unchanged, but prevents using that login for new requests.
-            app.server_feature.test_catalog_mut().servers[0].needs_auth_refresh = true;
+            // Removing the saved login keeps cached counts visible, but prevents
+            // starting new count requests or accepting an older response.
+            app.server_feature.test_catalog_mut().servers[0].access_token = None;
             app.retain_item_count_state();
             app.load_item_counts_for_server_id(&server.id, cx);
             assert!(!app.server_feature.counts_loading(&server.id));

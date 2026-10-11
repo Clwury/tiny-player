@@ -117,7 +117,35 @@ fn selection_coalesces_and_cancelled_same_server_cannot_finish_new_attempt() {
         AuthResult::Ready(Err(_))
     ));
     assert!(controller.selecting_server_id().is_none());
-    assert!(matches!(controller.select("three"), ServerCommand::Open(_)));
+    assert!(matches!(
+        controller.select("three"),
+        ServerCommand::Authenticate(_)
+    ));
+}
+
+#[test]
+fn every_entry_authenticates_even_with_a_complete_cached_session() {
+    let mut controller = controller();
+    let gateway = FakeGateway::default();
+    for id in ["one", "one", "three", "one"] {
+        controller.enter_workspace(None);
+        let ServerCommand::Authenticate(request) = controller.select(id) else {
+            panic!("entry must refresh the cached login");
+        };
+        assert_eq!(request.server.access_token.as_deref(), Some("token"));
+        let authenticated = effect::authenticate_server(&gateway, &request.server).unwrap();
+        assert_eq!(authenticated.access_token.as_deref(), Some("new-token"));
+        assert!(matches!(
+            controller.finish_authentication(&request, Ok(authenticated)),
+            AuthResult::Ready(Ok(_))
+        ));
+    }
+    assert_eq!(
+        *gateway.calls.lock().unwrap(),
+        [
+            "auth", "public", "auth", "public", "auth", "public", "auth", "public"
+        ]
+    );
 }
 
 #[test]
@@ -128,8 +156,8 @@ fn authentication_effect_preserves_metadata_policy_and_credential_fence() {
         panic!("authentication required")
     };
     let result = effect::authenticate_server(&gateway, &request.server).unwrap();
-    assert_eq!(*gateway.calls.lock().unwrap(), ["auth"]);
-    assert_eq!(result.server_name.as_deref(), Some("Cached name"));
+    assert_eq!(*gateway.calls.lock().unwrap(), ["auth", "public"]);
+    assert_eq!(result.server_name.as_deref(), Some("Fresh name"));
     controller.catalog.servers[1].password = "changed".into();
     assert!(matches!(
         controller.finish_authentication(&request, Ok(result)),
@@ -138,13 +166,15 @@ fn authentication_effect_preserves_metadata_policy_and_credential_fence() {
     assert!(controller.catalog.servers[1].access_token.is_none());
     assert_eq!(controller.catalog.servers[1].password, "changed");
 
-    controller.catalog.servers[1].needs_auth_refresh = true;
     let ServerCommand::Authenticate(request) = controller.select("two") else {
         panic!("authentication required")
     };
     let result = effect::authenticate_server(&gateway, &request.server).unwrap();
     assert_eq!(result.server_name.as_deref(), Some("Fresh name"));
-    assert_eq!(*gateway.calls.lock().unwrap(), ["auth", "auth", "public"]);
+    assert_eq!(
+        *gateway.calls.lock().unwrap(),
+        ["auth", "public", "auth", "public"]
+    );
     assert!(matches!(
         controller.finish_authentication(&request, Ok(result)),
         AuthResult::Ready(Ok(_))
@@ -175,7 +205,7 @@ fn edited_or_cancelled_submission_never_commits_a_late_result() {
         "editing defers login and metadata refresh"
     );
     assert_eq!(edited.id, "one");
-    assert!(edited.needs_auth_refresh);
+    assert_eq!(edited.username, "edited");
     assert!(controller.finish_submission(&current));
     assert!(!controller.finish_submission(&current));
 }
@@ -297,7 +327,7 @@ fn edit_conflict_preserves_latest_metadata_and_snapshot_assembly_keeps_global_va
     controller.toggle_auto_start("three");
     let edited = controller.merge_edited_server(edit).unwrap();
     assert_eq!(edited.server_name.as_deref(), Some("Destination"));
-    assert!(edited.needs_auth_refresh && edited.icon_is_custom);
+    assert!(edited.icon_is_custom);
     let (candidate, id) = controller.proposed_save(edited, true).unwrap();
     assert_eq!(id, "one");
     assert_eq!(

@@ -249,7 +249,8 @@ fn empty_favorite_sections_leave_no_gaps_during_loading_or_after_empty_responses
     cx.run_until_parked();
     assert!(cx.debug_bounds("favorite-row-Episode").is_some());
     assert!(cx.debug_bounds("favorite-more-Episode").is_some());
-    assert!(cx.debug_bounds("favorite-retry-Movie").is_some());
+    assert!(cx.debug_bounds("favorite-section-Movie").is_none());
+    assert!(cx.debug_bounds("favorite-retry-Movie").is_none());
     assert!(cx.debug_bounds("favorite-section-Series").is_none());
 }
 

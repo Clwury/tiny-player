@@ -186,7 +186,24 @@ mod tests {
         // Ordering does not change the selected startup server.
         cache.servers.reverse();
         storage::save_to(&cache, &path).unwrap();
-        let (app, cx) = servers_window_with_cache(cx, storage::load_or_init_from(&path).unwrap());
+        let cache = storage::load_or_init_from(&path).unwrap();
+        cx.update(theme::init);
+        let (app, cx) = cx.add_window_view(|_, cx| {
+            let mut app = TinyApp::new(cache, None, cx);
+            app.cache_save_path = Some(path.clone());
+            app.window_persistence_enabled = false;
+            assert_eq!(app.server_feature.selecting_server_id(), Some("second"));
+            assert!(matches!(app.shell.page(), Page::Servers));
+            let requested = app.server_feature.server("second").unwrap().clone();
+            let token = app.server_feature.authentication_token().unwrap();
+            app.server_effects.auth.cancel();
+            let authenticated = crate::server::CachedServer {
+                access_token: Some("new-startup-token".into()),
+                ..requested.clone()
+            };
+            app.finish_select_server_for_test(requested, token, Ok(authenticated), cx);
+            app
+        });
         cx.simulate_resize(size(px(1100.0), px(720.0)));
         cx.run_until_parked();
         let home_id = app.read_with(cx, |app, _| match app.shell.page() {
@@ -555,7 +572,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn loading_cards_block_context_menu_and_left_click_still_opens_the_server(
+    fn loading_cards_block_context_menu_and_left_click_attempts_authentication(
         cx: &mut TestAppContext,
     ) {
         let (app, cx) = servers_window(cx);
@@ -587,6 +604,9 @@ mod tests {
             Modifiers::default(),
         );
         cx.run_until_parked();
-        assert!(app.read_with(cx, |app, _| matches!(app.shell.page(), Page::Home(_))));
+        app.read_with(cx, |app, _| {
+            assert!(matches!(app.shell.page(), Page::Servers));
+            assert!(app.has_server_page_notifications());
+        });
     }
 }

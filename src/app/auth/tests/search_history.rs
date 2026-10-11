@@ -6,6 +6,14 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
     cx.run_until_parked();
 }
 
+fn switch_to_second_server(app: &Entity<TinyApp>, cx: &mut VisualTestContext) {
+    app.update(cx, |app, cx| {
+        app.open_home_for_server(app.server_feature.catalog().servers[1].clone(), cx);
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
 #[gpui::test]
 fn search_history_persists_across_server_switches_reopening_and_clear(cx: &mut TestAppContext) {
     let temp = tempfile::tempdir().unwrap();
@@ -29,7 +37,7 @@ fn search_history_persists_across_server_switches_reopening_and_clear(cx: &mut T
         ["沙丘"]
     );
 
-    click(cx, "sidebar-server-second");
+    switch_to_second_server(&app, cx);
     click(cx, "search-section");
     assert!(cx.debug_bounds("search-history-tag-0").is_some());
     cx.simulate_input("星际穿越");
@@ -62,7 +70,7 @@ fn search_history_persists_across_server_switches_reopening_and_clear(cx: &mut T
             .entries()
             .is_empty()
     );
-    click(cx, "sidebar-server-second");
+    switch_to_second_server(&app, cx);
     click(cx, "search-section");
     assert!(cx.debug_bounds("search-history").is_none());
 }

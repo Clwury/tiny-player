@@ -89,7 +89,6 @@ fn adding_matches_public_icons_and_editing_preserves_cached_data_without_request
     assert_eq!(added.server_name.as_deref(), Some("UHD"));
     assert!(added.user_id.is_none());
     assert!(added.access_token.is_none());
-    assert!(!added.needs_auth_refresh);
     assert!(
         added
             .icon_url
@@ -124,8 +123,7 @@ fn adding_matches_public_icons_and_editing_preserves_cached_data_without_request
     assert_eq!(edited.access_token, authenticated.access_token);
     assert_eq!(edited.icon_url, authenticated.icon_url);
     assert_eq!(edited.item_counts, authenticated.item_counts);
-    assert!(edited.needs_auth_refresh);
-    assert!(!edited.can_reuse_auth());
+    assert!(edited.has_auth_session());
     let requests = requests.join().unwrap();
     assert_eq!(requests.len(), 1);
     for request in requests {
@@ -221,7 +219,6 @@ fn authenticating_refreshes_name_icon_and_token_and_preserves_identity() {
         &client,
         &CachedServer {
             password: submission.password.clone(),
-            needs_auth_refresh: true,
             ..added.clone()
         },
     )
@@ -232,7 +229,6 @@ fn authenticating_refreshes_name_icon_and_token_and_preserves_identity() {
     assert_eq!(edited.server_name.as_deref(), Some("我的私人影院"));
     assert!(edited.icon_url.is_none());
     assert_eq!(edited.item_counts, added.item_counts);
-    assert!(!edited.needs_auth_refresh);
 
     for (request, password) in requests
         .join()
@@ -299,13 +295,16 @@ fn missing_auth_server_name_uses_public_info_instead_of_session_id() {
 }
 
 #[test]
-fn authentication_reuses_the_public_name_without_an_extra_metadata_request() {
-    let (submission, requests) = mock_server(vec![(
-        200,
-        serde_json::json!({
-            "AccessToken": "token", "SessionInfo": {"Id": "session-not-a-name", "UserId": "user-1"}
-        }),
-    )]);
+fn authentication_keeps_cached_name_when_public_metadata_refresh_fails() {
+    let (submission, requests) = mock_server(vec![
+        (
+            200,
+            serde_json::json!({
+                "AccessToken": "token", "SessionInfo": {"Id": "session-not-a-name", "UserId": "user-1"}
+            }),
+        ),
+        (503, serde_json::json!({"Message": "Unavailable"})),
+    ]);
     let server = CachedServer {
         server_name: Some("UHD".into()),
         ..pending_server(&submission)
@@ -320,7 +319,7 @@ fn authentication_reuses_the_public_name_without_an_extra_metadata_request() {
             .unwrap()
             .ends_with("/UHD-emby.png")
     );
-    assert_eq!(requests.join().unwrap().len(), 1);
+    assert_eq!(requests.join().unwrap().len(), 2);
 }
 
 #[test]
@@ -337,7 +336,6 @@ fn entry_after_edit_refreshes_public_metadata_when_authentication_omits_the_name
     ]);
     let server = CachedServer {
         server_name: Some("Old server".into()),
-        needs_auth_refresh: true,
         ..pending_server(&submission)
     };
     let authenticated =
@@ -351,7 +349,6 @@ fn entry_after_edit_refreshes_public_metadata_when_authentication_omits_the_name
             .unwrap()
             .ends_with("/AlphaTV-emby.png")
     );
-    assert!(!authenticated.needs_auth_refresh);
     let requests = requests.join().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests[0].starts_with("POST /emby/Users/AuthenticateByName "));
@@ -473,7 +470,6 @@ fn editing_preserves_cache_updates_received_while_the_dialog_was_open(cx: &mut T
         ));
         app.finish_save_server(dialog, Ok(edited), cx);
         assert!(app.add_server_dialog.is_none());
-        assert!(app.server_feature.catalog().servers[0].needs_auth_refresh);
         assert_eq!(
             app.server_feature.catalog().servers[0].password,
             "edited-password"
@@ -583,7 +579,6 @@ fn duplicate_edit_overwrites_saved_card_and_rolls_back_on_save_failure(cx: &mut 
             saved_server().icon_url
         );
         assert!(!app.server_feature.catalog().servers[0].icon_is_custom);
-        assert!(app.server_feature.catalog().servers[0].needs_auth_refresh);
         assert_eq!(app.server_feature.test_state().counts.len(), 1);
         assert!(
             app.server_feature
@@ -697,7 +692,6 @@ fn failed_server_save_keeps_the_edit_dialog_and_saved_login(cx: &mut TestAppCont
             app.server_feature.catalog().servers[0].password,
             saved_server().password
         );
-        assert!(!app.server_feature.catalog().servers[0].needs_auth_refresh);
         assert_eq!(
             app.server_feature.catalog().servers[0]
                 .access_token
@@ -708,6 +702,5 @@ fn failed_server_save_keeps_the_edit_dialog_and_saved_login(cx: &mut TestAppCont
             app.server_feature.catalog().servers[0].icon_url,
             saved_server().icon_url
         );
-        assert!(!storage::load_or_init_from(&path).unwrap().servers[0].needs_auth_refresh);
     });
 }

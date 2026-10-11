@@ -141,7 +141,6 @@ fn debug_server() -> CachedServer {
         icon_url: None,
         icon_is_custom: false,
         access_token: Some("secret-token".to_string()),
-        needs_auth_refresh: false,
         item_counts: None,
         added_at_unix: 1,
     }

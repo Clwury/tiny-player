@@ -150,11 +150,9 @@ fn cancelling_or_replacing_sidebar_switch_ignores_its_late_response(cx: &mut Tes
             );
             match app.shell.page() {
                 Page::Home(home) => {
-                    if action == "other" {
-                        assert_eq!(home.read(cx).current_server_id(), "second");
-                    } else {
-                        assert_eq!(home.entity_id(), original_home);
-                    }
+                    // Both attempted switches fail at the invalid fixture endpoint;
+                    // the cancelled response must not replace the retained Home.
+                    assert_eq!(home.entity_id(), original_home);
                 }
                 Page::Servers => assert_eq!(action, "back"),
                 Page::Playback { .. } => panic!("unexpected playback"),

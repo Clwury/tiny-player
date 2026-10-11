@@ -40,7 +40,7 @@ fn held_toggle_buttons_execute_once_until_released() {
         GamepadButton::North,
         GamepadButton::Start,
         GamepadButton::Select,
-        GamepadButton::RightThumb,
+        GamepadButton::LeftThumb,
     ] {
         let shortcut = controls.button_value(0, button, 1.0, now).unwrap();
         assert_eq!(controls.button_value(0, button, 1.0, now), None);
@@ -147,11 +147,29 @@ fn analog_trigger_hysteresis_ignores_jitter_and_does_not_repeat_rate_changes() {
 }
 
 #[test]
-fn left_stick_click_modifies_subtitle_position_without_adjusting_volume() {
+fn left_stick_click_resets_rate_without_modifying_volume_repeat() {
     let mut controls = enabled_controls();
     let now = Instant::now();
     assert_eq!(
+        controls.button_value(0, GamepadButton::Up, 1.0, now),
+        Some(PlaybackShortcut::IncreaseVolume)
+    );
+    assert_eq!(
         controls.button_value(0, GamepadButton::LeftThumb, 1.0, now),
+        Some(PlaybackShortcut::ChangeRate(PlaybackRateChange::Reset))
+    );
+    assert_eq!(
+        controls.repeats(now + REPEAT_DELAY),
+        vec![PlaybackShortcut::IncreaseVolume]
+    );
+}
+
+#[test]
+fn right_stick_click_modifies_subtitle_position_without_adjusting_volume() {
+    let mut controls = enabled_controls();
+    let now = Instant::now();
+    assert_eq!(
+        controls.button_value(0, GamepadButton::RightThumb, 1.0, now),
         None
     );
     assert_eq!(
@@ -163,7 +181,7 @@ fn left_stick_click_modifies_subtitle_position_without_adjusting_volume() {
         Some(PlaybackShortcut::LowerSubtitle)
     );
     assert!(controls.repeats(now + Duration::from_secs(10)).is_empty());
-    controls.button_value(0, GamepadButton::LeftThumb, 0.0, now);
+    controls.button_value(0, GamepadButton::RightThumb, 0.0, now);
     assert!(controls.repeats(now + Duration::from_secs(20)).is_empty());
 }
 
@@ -172,8 +190,8 @@ fn pressing_subtitle_modifier_cancels_existing_volume_repeat() {
     let mut controls = enabled_controls();
     let now = Instant::now();
     controls.button_value(0, GamepadButton::Up, 1.0, now);
-    controls.button_value(0, GamepadButton::LeftThumb, 1.0, now);
+    controls.button_value(0, GamepadButton::RightThumb, 1.0, now);
     assert!(controls.repeats(now + REPEAT_DELAY).is_empty());
-    controls.button_value(0, GamepadButton::LeftThumb, 0.0, now);
+    controls.button_value(0, GamepadButton::RightThumb, 0.0, now);
     assert!(controls.repeats(now + Duration::from_secs(10)).is_empty());
 }

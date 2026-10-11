@@ -1,9 +1,12 @@
 use super::*;
 
 fn sidebar_window(cx: &mut TestAppContext) -> (Entity<TinyApp>, &mut VisualTestContext) {
-    let mut cache = server_cache_with_ids(&["first", "second", "third"]);
-    cache.auto_start_server_id = Some("first".into());
+    let cache = server_cache_with_ids(&["first", "second", "third"]);
     let (app, cx) = servers_window_with_cache(cx, cache);
+    app.update(cx, |app, cx| {
+        app.server_feature.test_catalog_mut().auto_start_server_id = Some("first".into());
+        app.open_home_for_server_for_test(app.server_feature.catalog().servers[0].clone(), cx);
+    });
     cx.simulate_resize(size(px(1100.0), px(600.0)));
     cx.run_until_parked();
     (app, cx)
@@ -193,10 +196,12 @@ fn sidebar_can_scroll_during_drag_and_drop_on_a_previously_hidden_server(cx: &mu
     let ids = (0..20)
         .map(|index| format!("server-{index}"))
         .collect::<Vec<_>>();
-    let mut cache = server_cache_with_ids(&ids.iter().map(String::as_str).collect::<Vec<_>>());
-    cache.auto_start_server_id = Some(ids[0].clone());
+    let cache = server_cache_with_ids(&ids.iter().map(String::as_str).collect::<Vec<_>>());
     let (app, cx) = servers_window_with_cache(cx, cache);
-    app.update(cx, |app, _| app.cache_save_path = Some(path.clone()));
+    app.update(cx, |app, cx| {
+        app.cache_save_path = Some(path.clone());
+        app.open_home_for_server_for_test(app.server_feature.catalog().servers[0].clone(), cx);
+    });
     cx.simulate_resize(size(px(1100.0), px(500.0)));
     cx.run_until_parked();
     let home = home_id(&app, cx);

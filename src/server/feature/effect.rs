@@ -14,7 +14,6 @@ pub(crate) fn prepare_server(
             endpoint: submission.endpoint.clone(),
             username: submission.username.clone(),
             password: submission.password.clone(),
-            needs_auth_refresh: true,
             ..existing.clone()
         });
     }
@@ -34,7 +33,6 @@ pub(crate) fn prepare_server(
         icon_url,
         icon_is_custom: false,
         access_token: None,
-        needs_auth_refresh: false,
         item_counts: None,
         added_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     })
@@ -59,14 +57,9 @@ pub(crate) fn authenticate_server(
         "Emby 认证响应缺少访问令牌"
     );
 
-    // Public metadata fetched on add is reusable. After edits it may describe
-    // a different endpoint, so refresh it on entry when authentication omits it.
-    let server_name = session.server_name().or_else(|| {
-        server
-            .server_name
-            .clone()
-            .filter(|name| !server.needs_auth_refresh && !name.trim().is_empty())
-    });
+    // Entry always authenticates. Refresh metadata when login omits it, because
+    // the cached name may describe a previous endpoint after an edit.
+    let server_name = session.server_name();
     let info = if server_name.is_none() {
         client.public_system_info(&submission).ok()
     } else {
@@ -92,7 +85,6 @@ pub(crate) fn authenticate_server(
         server_name,
         icon_url,
         access_token: Some(session.access_token),
-        needs_auth_refresh: false,
         ..server.clone()
     })
 }

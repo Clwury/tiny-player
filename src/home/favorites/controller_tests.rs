@@ -89,7 +89,13 @@ fn categories_commit_independently_and_do_not_share_request_tokens() {
         LoadState::Loading
     );
     h.complete(&movie, Err(anyhow::anyhow!("offline"))).unwrap();
-    assert!(h.controller.view_model(FavoriteItemType::Movie).can_retry);
+    assert_eq!(
+        h.controller
+            .view_model(FavoriteItemType::Movie)
+            .paged
+            .initial,
+        LoadState::Failed
+    );
     assert_eq!(
         h.controller
             .view_model(FavoriteItemType::Series)
