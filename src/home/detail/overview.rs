@@ -193,7 +193,7 @@ impl HomeContent {
                                     div()
                                         .text_lg()
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child("剧情简介"),
+                                        .child(crate::i18n::tr("剧情简介", cx)),
                                 )
                                 .child(
                                     div()

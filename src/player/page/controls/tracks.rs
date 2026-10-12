@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(test)]
+mod interaction_tests;
+
 impl PlaybackPage {
     pub(in super::super) fn toggle_audio_track_select(
         &mut self,
@@ -8,18 +11,7 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if !self.session.controls_view().audio.enabled() {
-            return;
-        }
-        self.presentation.timeline_presentation.cache_status_open = false;
-        self.close_episode_list(cx);
-        self.presentation.track_select_open =
-            if self.presentation.track_select_open == Some(PlaybackTrackKind::Audio) {
-                None
-            } else {
-                Some(PlaybackTrackKind::Audio)
-            };
-        cx.notify();
+        self.toggle_track_select(PlaybackTrackKind::Audio, cx);
     }
 
     pub(in super::super) fn toggle_subtitle_track_select(
@@ -29,17 +21,34 @@ impl PlaybackPage {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if !self.session.controls_view().subtitles.enabled() {
+        self.toggle_track_select(PlaybackTrackKind::Subtitle, cx);
+    }
+
+    fn toggle_track_select(&mut self, kind: PlaybackTrackKind, cx: &mut Context<Self>) {
+        let view = self.session.controls_view();
+        let choice = match kind {
+            PlaybackTrackKind::Audio => view.audio,
+            PlaybackTrackKind::Subtitle => view.subtitles,
+        };
+        if !choice.enabled() {
             return;
         }
+        let selected_option = choice
+            .tracks
+            .iter()
+            .position(|track| Some(track.stream_index) == choice.selected)
+            .map_or(0, |index| index + 1);
         self.presentation.timeline_presentation.cache_status_open = false;
         self.close_episode_list(cx);
-        self.presentation.track_select_open =
-            if self.presentation.track_select_open == Some(PlaybackTrackKind::Subtitle) {
-                None
-            } else {
-                Some(PlaybackTrackKind::Subtitle)
-            };
+        self.presentation.track_select_open = if self.presentation.track_select_open == Some(kind) {
+            None
+        } else {
+            components::reveal_track_select_option(
+                &self.presentation.track_select_scroll_handle,
+                selected_option,
+            );
+            Some(kind)
+        };
         cx.notify();
     }
 

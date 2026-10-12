@@ -118,6 +118,7 @@ mod tests {
         let snapshot = crate::settings::SettingsSnapshot {
             playback: crate::player::PlaybackCacheConfig::default(),
             color_theme,
+            app_language: crate::settings::AppLanguage::English,
             track_languages: crate::media::PlaybackLanguagePreferences {
                 audio: crate::media::TrackLanguage::Japanese,
                 subtitle: crate::media::TrackLanguage::ChineseTraditional,

@@ -4,6 +4,7 @@ use crate::{
     media::{ItemSortPreferences, PlaybackLanguagePreferences},
     search_history::SearchHistory,
     server::feature::ServerCatalog,
+    settings::AppLanguage,
     storage::{ServerCache, WindowState},
     theme::ColorTheme,
 };
@@ -16,6 +17,7 @@ pub(crate) struct GlobalConfig {
     window: Option<WindowState>,
     pub(crate) playback: PlaybackCacheConfig,
     pub(crate) color_theme: ColorTheme,
+    pub(crate) app_language: AppLanguage,
     pub(crate) track_languages: PlaybackLanguagePreferences,
     pub(crate) playback_volume: PlaybackVolumeSettings,
     pub(crate) search_history: SearchHistory,
@@ -30,6 +32,7 @@ impl GlobalConfig {
             window,
             playback,
             color_theme,
+            app_language,
             track_languages,
             playback_volume,
             search_history,
@@ -44,6 +47,7 @@ impl GlobalConfig {
                 window,
                 playback,
                 color_theme,
+                app_language,
                 track_languages,
                 playback_volume,
                 search_history,
@@ -63,6 +67,7 @@ impl GlobalConfig {
             window: self.window.clone(),
             playback: self.playback.clone(),
             color_theme: self.color_theme,
+            app_language: self.app_language,
             track_languages: self.track_languages,
             playback_volume: self.playback_volume,
             search_history: self.search_history.clone(),
@@ -95,6 +100,7 @@ mod tests {
         cache.auto_start_server_id = Some("local".into());
         cache.playback.cache_secs = 42.125;
         cache.playback_volume.level = 0.47;
+        cache.app_language = AppLanguage::English;
         cache.items_sort = ItemSortPreferences {
             sort_by: crate::emby::UserItemsSort::PremiereDate,
             sort_order: crate::emby::SortOrder::Descending,

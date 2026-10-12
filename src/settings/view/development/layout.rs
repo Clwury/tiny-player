@@ -60,14 +60,14 @@ impl SettingItem {
                         div()
                             .text_sm()
                             .text_color(theme.foreground)
-                            .child(self.descriptor.title),
+                            .child(crate::i18n::tr(self.descriptor.title, cx)),
                     )
                     .child(
                         div()
                             .text_xs()
                             .line_height(relative(1.5))
                             .text_color(theme.muted_foreground)
-                            .child(self.descriptor.description),
+                            .child(crate::i18n::tr(self.descriptor.description, cx)),
                     ),
             )
             .child(div().flex_shrink_0().child(self.control))
@@ -174,11 +174,14 @@ impl PlaybackSettingsDialogState {
                 .mb_3()
                 .text_base()
                 .text_color(theme.foreground)
-                .child(if searching {
-                    "搜索结果"
-                } else {
-                    self.controller.view_model().category.title()
-                }),
+                .child(crate::i18n::tr(
+                    if searching {
+                        "搜索结果"
+                    } else {
+                        self.controller.view_model().category.title()
+                    },
+                    cx,
+                )),
         );
         let items: Vec<_> = self
             .setting_items(dialog, cx)
@@ -193,13 +196,13 @@ impl PlaybackSettingsDialogState {
                     div()
                         .text_sm()
                         .text_color(theme.foreground)
-                        .child("没有找到匹配的设置"),
+                        .child(crate::i18n::tr("没有找到匹配的设置", cx)),
                 )
                 .child(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("试试“内存”“预读”或“HTTP”等关键词。"),
+                        .child(crate::i18n::tr("试试“内存”“预读”或“HTTP”等关键词。", cx)),
                 );
         }
         let mut previous_section = None;
@@ -215,15 +218,18 @@ impl PlaybackSettingsDialogState {
                         .text_xs()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.muted_foreground)
-                        .child(if searching {
-                            format!(
-                                "{} / {}",
-                                item.descriptor.category.title(),
-                                item.descriptor.section
-                            )
-                        } else {
-                            item.descriptor.section.to_string()
-                        }),
+                        .child(crate::i18n::tr(
+                            if searching {
+                                format!(
+                                    "{} / {}",
+                                    item.descriptor.category.title(),
+                                    item.descriptor.section
+                                )
+                            } else {
+                                item.descriptor.section.to_string()
+                            },
+                            cx,
+                        )),
                 );
                 previous_section = Some(section);
             }

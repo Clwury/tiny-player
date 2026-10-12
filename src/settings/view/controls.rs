@@ -5,7 +5,7 @@ use crate::ui::{
     editor::{Editor, EditorEvent},
     number_input::{NumberControl, NumberRange},
 };
-use crate::{theme, ui::radius};
+use crate::{settings::AppLanguage, theme, ui::radius};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext as _, Context, Entity, InteractiveElement, IntoElement, ParentElement,
@@ -16,6 +16,21 @@ use tiny_playback::HardwareDecodeMode;
 pub(crate) const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
 pub(crate) const HARDWARE_DECODE_DESCRIPTION: &str = "自动优先使用硬件解码，失败时回退到软件。";
+
+pub(crate) fn app_language_selector(
+    state: Entity<DropdownState>,
+    selected: AppLanguage,
+    on_select: impl Fn(AppLanguage, &mut App) + 'static,
+) -> impl IntoElement {
+    selector_row(
+        ("app-language-dropdown", "应用界面语言"),
+        state,
+        AppLanguage::ALL.map(|language| (language.id(), language.label(), language)),
+        selected,
+        on_select,
+    )
+    .localize_options(false)
+}
 
 pub(crate) fn hardware_decode_selector(
     state: Entity<DropdownState>,
@@ -73,7 +88,7 @@ pub(crate) fn settings_category_button(
     div()
         .id(title)
         .role(gpui::Role::Button)
-        .aria_label(title)
+        .aria_label(crate::i18n::tr(title, cx))
         .debug_selector(move || format!("settings-category-{title}"))
         .flex()
         .items_center()
@@ -105,7 +120,7 @@ pub(crate) fn settings_category_button(
                     theme.foreground
                 })
         })
-        .child(title)
+        .child(crate::i18n::tr(title, cx))
 }
 
 pub(crate) fn disk_cache_capacity_input<T: 'static>(

@@ -139,6 +139,7 @@ fn latte_selected_categories_dropdowns_and_switches_have_hover_feedback(cx: &mut
     cx.update(|_, cx| theme::set(ColorTheme::Latte, cx));
     cx.simulate_resize(size(px(1100.0), px(720.0)));
     cx.run_until_parked();
+    click(cx, "settings-category-外观");
     for selector in ["settings-category-外观", "color-theme-dropdown"] {
         let bounds = cx.debug_bounds(selector).unwrap();
         cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
@@ -203,6 +204,34 @@ fn search_matches_chinese_and_multiple_case_insensitive_keywords() {
 }
 
 #[gpui::test]
+fn interface_language_is_available_in_general_and_localized_search(cx: &mut TestAppContext) {
+    use crate::settings::AppLanguage;
+    let (root, cx) = settings_window(cx);
+    cx.simulate_resize(size(px(900.0), px(600.0)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("app-language-dropdown").is_some());
+    assert!(cx.debug_bounds("color-theme-dropdown").is_none());
+    for language in AppLanguage::ALL {
+        click(cx, "app-language-dropdown");
+        for option in AppLanguage::ALL {
+            let bounds = cx.debug_bounds(option.id()).unwrap();
+            assert!(bounds.bottom() <= px(600.0));
+            assert!(bounds.right() <= px(900.0));
+        }
+        click(cx, language.id());
+        assert_eq!(cx.update(|_, cx| AppLanguage::get(cx)), language);
+    }
+    let search = root.read_with(cx, |root, cx| root.dialog.read(cx).search.clone());
+    search.update(cx, |search, cx| {
+        search.set_value("Application interface", cx)
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("app-language-dropdown").is_some());
+    assert!(cx.debug_bounds("hardware-decode-dropdown").is_none());
+    assert_eq!(root.read_with(cx, |root, _| root.change_count), 2);
+}
+
+#[gpui::test]
 fn decoder_framedrop_toggle_is_off_by_default_and_saves_each_change(cx: &mut TestAppContext) {
     let (root, cx) = settings_window(cx);
     cx.simulate_resize(size(px(960.0), px(760.0)));
@@ -257,6 +286,7 @@ fn theme_selection_applies_and_autosaves_without_reverting_on_close(cx: &mut Tes
     let (root, cx) = settings_window(cx);
     cx.simulate_resize(size(px(1100.0), px(720.0)));
     cx.run_until_parked();
+    click(cx, "settings-category-外观");
     click(cx, "color-theme-dropdown");
     // Exercise a fourth option, including wrapping and Home/End navigation.
     assert!(cx.debug_bounds("theme-mocha").is_some());

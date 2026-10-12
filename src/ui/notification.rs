@@ -219,7 +219,7 @@ pub(crate) fn error_notification(
                 .text_sm()
                 .whitespace_normal()
                 .text_color(theme.foreground)
-                .child(message),
+                .child(crate::i18n::tr(message, cx)),
         )
         .child(
             div()

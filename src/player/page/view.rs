@@ -122,7 +122,9 @@ impl Render for PlaybackPage {
             })
             .when(self.presentation.playback_details_visible, |this| {
                 // Keep stats above subtitles, controls, and deferred playback menus.
-                this.child(deferred(self.render_playback_details_overlay(window)).with_priority(3))
+                this.child(
+                    deferred(self.render_playback_details_overlay(window, cx)).with_priority(3),
+                )
             })
     }
 }

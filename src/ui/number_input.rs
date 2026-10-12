@@ -118,12 +118,12 @@ impl RenderOnce for NumberControl {
                 .debug_selector(move || format!("{}-{suffix}", self.id))
                 .role(gpui::Role::Button)
                 .aria_label(format!(
-                    "{}{}",
-                    if increment { "增加" } else { "减少" },
-                    self.label
+                    "{} {}",
+                    crate::i18n::tr(if increment { "增加" } else { "减少" }, cx),
+                    crate::i18n::tr(self.label, cx)
                 ))
-                .aria_description(step_hint)
-                .tooltip(move |_, cx| text_tooltip(step_hint, cx))
+                .aria_description(crate::i18n::tr(step_hint, cx))
+                .tooltip(move |_, cx| text_tooltip(crate::i18n::tr(step_hint, cx), cx))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -180,7 +180,7 @@ impl RenderOnce for NumberControl {
                     .id(self.id)
                     .debug_selector(move || self.id.into())
                     .role(gpui::Role::SpinButton)
-                    .aria_label(self.label)
+                    .aria_label(crate::i18n::tr(self.label, cx))
                     .aria_numeric_value(value)
                     .aria_min_numeric_value(self.range.min)
                     .aria_max_numeric_value(self.range.max)
@@ -211,7 +211,7 @@ impl RenderOnce for NumberControl {
                     .w(px(28.0))
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(self.unit),
+                    .child(crate::i18n::tr(self.unit, cx)),
             )
     }
 }

@@ -97,13 +97,13 @@ pub(crate) fn icon_picker<T: 'static>(
                 .text_lg()
                 .text_color(theme.foreground)
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child("选择图标"),
+                .child(crate::i18n::tr("选择图标", cx)),
         )
         .child(
             div()
                 .id("close-server-icon-picker")
                 .debug_selector(|| "close-server-icon-picker".into())
-                .aria_label("关闭")
+                .aria_label(crate::i18n::tr("关闭图标选择器", cx))
                 .cursor_pointer()
                 .flex()
                 .flex_none()
@@ -154,11 +154,14 @@ pub(crate) fn icon_picker<T: 'static>(
             div()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child(if query.is_empty() {
-                    format!("共 {match_count} 个图标")
-                } else {
-                    format!("找到 {match_count} 个图标")
-                }),
+                .child(crate::i18n::tr(
+                    if query.is_empty() {
+                        format!("共 {match_count} 个图标")
+                    } else {
+                        format!("找到 {match_count} 个图标")
+                    },
+                    cx,
+                )),
         )
         .child(
             div()
@@ -180,7 +183,7 @@ pub(crate) fn icon_picker<T: 'static>(
                             .justify_center()
                             .text_sm()
                             .text_color(theme.muted_foreground)
-                            .child("没有找到匹配的图标"),
+                            .child(crate::i18n::tr("没有找到匹配的图标", cx)),
                     )
                 }),
         )
@@ -189,11 +192,16 @@ pub(crate) fn icon_picker<T: 'static>(
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child("正在应用图标…"),
+                    .child(crate::i18n::tr("正在应用图标…", cx)),
             )
         })
         .when_some(vm.error.map(str::to_owned), |this, error| {
-            this.child(div().text_sm().text_color(theme.error).child(error))
+            this.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.error)
+                    .child(crate::i18n::tr(error, cx)),
+            )
         });
 
     div()

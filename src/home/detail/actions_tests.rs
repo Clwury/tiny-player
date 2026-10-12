@@ -620,6 +620,68 @@ fn library_cover_menu_uses_library_item_and_shows_failure_in_that_library(cx: &m
 }
 
 #[gpui::test]
+fn series_actions_menu_fits_translated_labels_in_both_states(cx: &mut TestAppContext) {
+    use crate::i18n::AppLanguage;
+
+    let server = MockEmby::new();
+    let (page, cx) = detail_window(cx, &server);
+    for language in [
+        AppLanguage::English,
+        AppLanguage::ChineseTraditional,
+        AppLanguage::ChineseSimplified,
+    ] {
+        cx.update(|_, cx| language.apply(cx));
+        for selected in [false, true] {
+            page.update(cx, |page, cx| {
+                page.controller.test_state_mut().user_data.overrides.insert(
+                    "series-1".into(),
+                    UserItemData {
+                        is_favorite: selected,
+                        played: selected,
+                        ..UserItemData::default()
+                    },
+                );
+                cx.notify();
+            });
+            for width in [1200.0, 900.0, 360.0] {
+                cx.simulate_resize(size(px(width), px(1000.0)));
+                cx.run_until_parked();
+                click(cx, "series-detail-more-button");
+                let menu = cx.debug_bounds("series-detail-actions-menu").unwrap();
+                assert!(
+                    menu.left() >= px(0.0) && menu.right() <= px(width),
+                    "{language:?}, selected={selected}, width={width}: {menu:?}"
+                );
+                for (id, label_id) in [
+                    (
+                        "series-detail-series-favorite",
+                        "series-detail-series-favorite-label",
+                    ),
+                    (
+                        "series-detail-series-played",
+                        "series-detail-series-played-label",
+                    ),
+                ] {
+                    let row = cx.debug_bounds(id).unwrap();
+                    let label = cx.debug_bounds(label_id).unwrap();
+                    assert!(
+                        label.left() >= row.left() + px(8.0)
+                            && label.right() <= row.right() - px(8.0)
+                            && label.top() >= row.top()
+                            && label.bottom() <= row.bottom(),
+                        "{language:?}, selected={selected}, width={width}, {id}: label={label:?}, row={row:?}"
+                    );
+                }
+                cx.simulate_keystrokes("escape");
+                cx.run_until_parked();
+                assert!(cx.debug_bounds("series-detail-actions-menu").is_none());
+            }
+        }
+    }
+    assert!(server.mutations().is_empty());
+}
+
+#[gpui::test]
 fn episode_buttons_use_selected_id_and_series_menu_uses_series_id(cx: &mut TestAppContext) {
     let server = MockEmby::new();
     let (page, cx) = detail_window(cx, &server);

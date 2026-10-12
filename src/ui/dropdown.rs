@@ -91,7 +91,7 @@ pub(crate) fn selector_row<T: Copy + PartialEq + 'static>(
     options: impl IntoIterator<Item = (&'static str, &'static str, T)>,
     selected: T,
     on_select: impl Fn(T, &mut App) + 'static,
-) -> impl IntoElement {
+) -> Dropdown {
     let options: Vec<_> = options.into_iter().collect();
     let selected_index = options
         .iter()
@@ -118,6 +118,7 @@ pub(crate) struct Dropdown {
     selected: usize,
     state: Entity<DropdownState>,
     on_select: SelectCallback,
+    localize_options: bool,
 }
 
 impl Dropdown {
@@ -141,7 +142,13 @@ impl Dropdown {
             selected,
             state,
             on_select: Rc::new(on_select),
+            localize_options: true,
         }
+    }
+
+    pub(crate) fn localize_options(mut self, localize: bool) -> Self {
+        self.localize_options = localize;
+        self
     }
 }
 
@@ -179,12 +186,20 @@ impl RenderOnce for Dropdown {
         let mouse_state = self.state.clone();
         let mouse_focus = focus.clone();
         let bounds = trigger_bounds.clone();
+        let option_label = |label| {
+            if self.localize_options {
+                crate::i18n::tr(label, cx)
+            } else {
+                gpui::SharedString::from(label)
+            }
+        };
+        let selected_label = option_label(self.options[selected].1);
         let trigger = div()
             .id(id)
             .debug_selector(move || id.into())
             .role(gpui::Role::ComboBox)
-            .aria_label(self.label)
-            .aria_value(self.options[selected].1)
+            .aria_label(crate::i18n::tr(self.label, cx))
+            .aria_value(selected_label.clone())
             .aria_expanded(open)
             .track_focus(&focus)
             .relative()
@@ -206,7 +221,7 @@ impl RenderOnce for Dropdown {
             .text_sm()
             .text_color(foreground)
             .hover(move |style| style.bg(hover))
-            .child(self.options[selected].1)
+            .child(selected_label)
             .child(
                 svg()
                     .path("icons/chevron-up-down.svg")
@@ -271,7 +286,7 @@ impl RenderOnce for Dropdown {
                     .id((gpui::ElementId::from(id), "menu"))
                     .debug_selector(move || format!("{id}-menu"))
                     .role(gpui::Role::ListBox)
-                    .aria_label(self.label)
+                    .aria_label(crate::i18n::tr(self.label, cx))
                     .track_focus(&self.state.read(cx).focus)
                     .occlude()
                     .cursor_default()
@@ -332,6 +347,7 @@ impl RenderOnce for Dropdown {
                     })
                     .children(self.options.into_iter().enumerate().map(
                         |(index, (option_id, label))| {
+                            let label = option_label(label);
                             let state = self.state.clone();
                             let on_select = self.on_select.clone();
                             let focus = focus.clone();
@@ -340,7 +356,7 @@ impl RenderOnce for Dropdown {
                                 .id(option_id)
                                 .debug_selector(move || option_id.into())
                                 .role(gpui::Role::ListBoxOption)
-                                .aria_label(label)
+                                .aria_label(label.clone())
                                 .aria_selected(index == selected)
                                 .flex()
                                 .items_center()

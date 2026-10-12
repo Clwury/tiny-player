@@ -2,7 +2,7 @@
 use super::*;
 
 pub(in crate::home) fn home_section_title<T>(title: &'static str, cx: &Context<T>) -> gpui::Div {
-    home_section_title_text(title, cx)
+    home_section_title_text(crate::i18n::tr(title, cx), cx)
 }
 
 pub(in crate::home) fn home_section_title_text<T>(
@@ -27,8 +27,8 @@ pub(in crate::home) fn home_section_more_button(
     div()
         .id(id)
         .role(gpui::Role::Button)
-        .aria_label("更多")
-        .tooltip(|_, cx| text_tooltip("更多", cx))
+        .aria_label(crate::i18n::tr("更多", cx))
+        .tooltip(|_, cx| text_tooltip(crate::i18n::tr("更多", cx), cx))
         .flex()
         .flex_none()
         .size(px(28.0))

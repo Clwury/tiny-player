@@ -3,12 +3,14 @@ use super::controls::{mode_selector, seekable_selector, unlink_selector};
 use super::layout::SettingItem;
 use super::*;
 mod cache;
+mod general;
 mod playback;
 
 impl PlaybackSettingsDialogState {
     pub(super) fn setting_items(&self, dialog: Entity<Self>, cx: &App) -> Vec<SettingItem> {
-        self.playback_items(dialog.clone(), cx)
+        self.general_items(dialog.clone())
             .into_iter()
+            .chain(self.playback_items(dialog.clone(), cx))
             .chain(self.cache_items(dialog, cx))
             .collect()
     }
@@ -38,7 +40,7 @@ impl PlaybackSettingsDialogState {
                                 div()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
-                                    .child(label),
+                                    .child(crate::i18n::tr(label, cx)),
                             )
                         })
                         .child(
@@ -46,7 +48,7 @@ impl PlaybackSettingsDialogState {
                                 .id(("cache-directory", index))
                                 .debug_selector(move || format!("cache-directory-{index}"))
                                 .role(gpui::Role::Label)
-                                .aria_label(format!("{label}（只读）：{path}"))
+                                .aria_label(crate::i18n::tr(format!("{label}（只读）：{path}"), cx))
                                 .flex()
                                 .items_center()
                                 .h(px(32.0))

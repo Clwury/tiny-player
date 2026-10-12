@@ -15,6 +15,7 @@ fn controller(mode: SettingsMode) -> SettingsController {
         },
         mode,
         ColorTheme::ALL[0],
+        AppLanguage::default(),
         PlaybackLanguagePreferences::default(),
     )
 }
@@ -24,6 +25,63 @@ fn edit(controller: &mut SettingsController, field: NumericSetting, input: &str)
         field,
         input: input.into(),
     })
+}
+
+#[test]
+fn interface_language_changes_save_once_and_preserve_playback_and_track_preferences() {
+    for mode in [SettingsMode::Development, SettingsMode::User] {
+        let mut controller = controller(mode);
+        assert_eq!(controller.view_model().category, SettingsCategory::General);
+        let original = controller.snapshot();
+        for language in [
+            AppLanguage::ChineseTraditional,
+            AppLanguage::English,
+            AppLanguage::ChineseSimplified,
+        ] {
+            let change = controller.dispatch(SettingsIntent::AppLanguage(language));
+            assert!(change.persist && change.view_changed);
+            assert_eq!(change.app_language, Some(language));
+            assert_eq!(
+                controller.snapshot(),
+                SettingsSnapshot {
+                    app_language: language,
+                    ..original.clone()
+                }
+            );
+            let repeated = controller.dispatch(SettingsIntent::AppLanguage(language));
+            assert!(!repeated.persist && !repeated.view_changed);
+        }
+        controller.dispatch(SettingsIntent::Close);
+        assert!(
+            !controller
+                .dispatch(SettingsIntent::AppLanguage(AppLanguage::English))
+                .persist
+        );
+        assert_eq!(controller.snapshot(), original);
+    }
+}
+
+#[test]
+fn settings_search_accepts_the_current_interface_language() {
+    let mut controller = controller(SettingsMode::Development);
+    let item = SettingDescriptor {
+        category: SettingsCategory::General,
+        section: "界面",
+        title: "语言",
+        description: "应用界面语言",
+        keywords: "app_language locale",
+    };
+    for (language, query) in [
+        (AppLanguage::English, "Application interface"),
+        (AppLanguage::ChineseTraditional, "應用介面"),
+        (AppLanguage::ChineseSimplified, "应用界面"),
+    ] {
+        controller.dispatch(SettingsIntent::AppLanguage(language));
+        controller.dispatch(SettingsIntent::Search(query.into()));
+        assert!(controller.view_model().includes(&item));
+        controller.dispatch(SettingsIntent::Search("not a setting".into()));
+        assert!(!controller.view_model().includes(&item));
+    }
 }
 
 #[test]
@@ -166,6 +224,7 @@ fn integer_edit_normalizes_dependencies_without_changing_the_requested_value() {
         },
         SettingsMode::Development,
         ColorTheme::ALL[0],
+        AppLanguage::default(),
         PlaybackLanguagePreferences::default(),
     );
     assert!(edit(&mut controller, NumericSetting::HttpCacheChunkMib, "16").persist);

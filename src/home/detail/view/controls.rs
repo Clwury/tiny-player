@@ -17,8 +17,8 @@ fn detail_icon_button(
         .group(id)
         .debug_selector(move || id.into())
         .role(gpui::Role::Button)
-        .aria_label(label)
-        .tooltip(move |_, cx| text_tooltip(label, cx))
+        .aria_label(crate::i18n::tr(label, cx))
+        .tooltip(move |_, cx| text_tooltip(crate::i18n::tr(label, cx), cx))
         .flex()
         .flex_none()
         .size(px(32.0))
@@ -54,17 +54,16 @@ impl HomeContent {
         } else {
             colors.disabled_foreground
         };
-        div()
+        let menu = div()
             .id("series-detail-actions-menu")
             .cursor_default()
             .debug_selector(|| "series-detail-actions-menu".into())
-            .absolute()
-            .top(px(34.0))
-            .left_0()
-            .w(px(164.0))
+            .min_w(px(164.0))
             .p_1()
             .flex()
             .flex_col()
+            .flex_none()
+            .whitespace_nowrap()
             .gap_1()
             .rounded(radius::SURFACE)
             .border_1()
@@ -126,7 +125,7 @@ impl HomeContent {
                         .id(id)
                         .debug_selector(move || id.into())
                         .role(gpui::Role::MenuItem)
-                        .aria_label(label)
+                        .aria_label(crate::i18n::tr(label, cx))
                         .h(px(30.0))
                         .px_2()
                         .flex()
@@ -142,7 +141,12 @@ impl HomeContent {
                                 .flex_none()
                                 .text_color(foreground),
                         )
-                        .child(label)
+                        .child(
+                            div()
+                                .debug_selector(move || format!("{id}-label"))
+                                .flex_none()
+                                .child(crate::i18n::tr(label, cx)),
+                        )
                         .when(enabled, |this| {
                             this.cursor_pointer()
                                 .hover(move |style| style.bg(colors.hover_background))
@@ -158,7 +162,13 @@ impl HomeContent {
                         })
                         .when(!enabled, |this| this.cursor_default())
                 }),
-            )
+            );
+
+        div().absolute().top(px(34.0)).left_0().child(
+            anchored()
+                .snap_to_window_with_margin(px(DETAIL_SELECT_WINDOW_MARGIN_PX))
+                .child(menu),
+        )
     }
 
     pub(super) fn render_series_detail_controls(
@@ -226,7 +236,7 @@ impl HomeContent {
                             detail.model.playback_loading,
                             theme,
                         ))
-                        .child(play_label)
+                        .child(crate::i18n::tr(play_label, cx))
                         .when(can_play, |this| {
                             this.cursor_pointer()
                                 .hover(move |style| style.bg(theme.accent_hover))
@@ -467,7 +477,7 @@ impl HomeContent {
         let selected_id = selected_season.map(|season| season.id.as_str());
         let selected_label = selected_season
             .map(|season| season.name.clone())
-            .unwrap_or_else(|| "请选择".to_string());
+            .unwrap_or_else(|| crate::i18n::tr("请选择", cx).to_string());
         let season_count = seasons.items.len();
         let select_width = season_select_width(
             seasons.items.iter().map(|season| season.name.as_str()),

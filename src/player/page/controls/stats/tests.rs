@@ -351,7 +351,7 @@ fn grouped_stats_wrap_without_overlapping_sections_at_narrow_widths(cx: &mut gpu
     struct StatsPreview;
 
     impl Render for StatsPreview {
-        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div().relative().size_full().child(playback_details_overlay(
                 [
                     Some(playback_file_detail_section(
@@ -368,6 +368,7 @@ fn grouped_stats_wrap_without_overlapping_sections_at_narrow_widths(cx: &mut gpu
                     playback_audio_detail_section(Some(&audio_info()), 0.75),
                 ],
                 window,
+                cx,
             ))
         }
     }
@@ -436,6 +437,7 @@ fn stats_forward_pointer_events_to_the_playback_surface_without_copying(
                         playback_video_detail_section(Some(&video_info())),
                     ],
                     window,
+                    cx,
                 ))
         }
     }

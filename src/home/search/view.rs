@@ -116,7 +116,7 @@ impl HomeContent {
                     .justify_between()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child("搜索历史")
+                    .child(crate::i18n::tr("搜索历史", cx))
                     .child(
                         div()
                             .id("search-history-clear")
@@ -130,7 +130,12 @@ impl HomeContent {
                             .hover(move |style| {
                                 style.bg(theme.secondary_hover).text_color(theme.foreground)
                             })
-                            .tooltip(|_, cx| crate::ui::tooltip::text_tooltip("清空搜索历史", cx))
+                            .tooltip(|_, cx| {
+                                crate::ui::tooltip::text_tooltip(
+                                    crate::i18n::tr("清空搜索历史", cx),
+                                    cx,
+                                )
+                            })
                             .child(
                                 svg()
                                     .path("icons/trash.svg")

@@ -45,6 +45,7 @@ impl TinyApp {
         let snapshot = crate::settings::SettingsSnapshot {
             playback: self.cache.playback.clone(),
             color_theme: theme::get(cx).selection,
+            app_language: self.cache.app_language,
             track_languages: crate::media::PlaybackLanguagePreferences::get(cx),
         };
         let settings = cx.new(|cx| SettingsDialogState::new(snapshot, mode, cx));
@@ -68,10 +69,10 @@ impl TinyApp {
         let initial_size = size(px(960.0), px(680.0));
         let minimum_size = size(px(900.0), px(600.0));
         let bounds = Bounds::centered(None, initial_size, cx);
-        match cx.open_window(
-            app_window_options(mode.title().into(), bounds, minimum_size),
-            |_, cx| cx.new(|_| SettingsWindow { settings }),
-        ) {
+        let title = crate::i18n::tr(mode.title(), cx);
+        match cx.open_window(app_window_options(title, bounds, minimum_size), |_, cx| {
+            cx.new(|_| SettingsWindow { settings })
+        }) {
             Ok(window) => self.settings_window = Some(window),
             Err(error) => {
                 self.push_app_error_notification(format!("打开设置窗口失败：{error}"), cx)
@@ -88,8 +89,8 @@ impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(target_os = "windows")]
         super::window::windows::sync_window_theme(window, cx);
-        let title = self.settings.read(cx).mode().title();
-        sync_window_decorations(window, title.into(), cx);
+        let title = crate::i18n::tr(self.settings.read(cx).mode().title(), cx);
+        sync_window_decorations(window, title.clone(), cx);
         let theme = theme::get(cx);
         let rounded_window = window_has_rounded_corners(window);
         let corners = window_corner_radii(window, cx);
@@ -109,7 +110,7 @@ impl Render for SettingsWindow {
                         this.child(
                             div()
                                 .flex_none()
-                                .child(app_titlebar(window, cx, title.into())),
+                                .child(app_titlebar(window, cx, title.clone())),
                         )
                     })
                     .child(div().flex_1().min_h_0().child(self.settings.clone())),

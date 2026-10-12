@@ -305,7 +305,7 @@ mod tests {
             player::{
                 HardwareDecodeMode, PlaybackCacheConfig, PlaybackLanguagePreferences, TrackLanguage,
             },
-            settings::view::SettingsDialogMode,
+            settings::{AppLanguage, view::SettingsDialogMode},
         };
 
         let temp = tempfile::tempdir().unwrap();
@@ -346,11 +346,19 @@ mod tests {
             Some(handle)
         );
 
+        click(cx, "settings-category-外观");
         click(cx, "color-theme-dropdown");
         click(cx, "theme-latte");
         cx.executor().advance_clock(CACHE_SAVE_DEBOUNCE);
         cx.run_until_parked();
         assert_eq!(storage::load_or_init_from(&path).unwrap().playback, custom);
+        click(cx, "settings-category-常规");
+        click(cx, "app-language-dropdown");
+        click(cx, "app-language-english");
+        assert_eq!(
+            cx.update(|_, cx| AppLanguage::get(cx)),
+            AppLanguage::English
+        );
         click(cx, "settings-category-播放");
         click(cx, "audio-language-dropdown");
         click(cx, "language-japanese");
@@ -390,6 +398,7 @@ mod tests {
         };
         let saved = storage::load_or_init_from(&path).unwrap();
         assert_eq!(saved.playback, expected);
+        assert_eq!(saved.app_language, AppLanguage::English);
         assert_eq!(saved.color_theme, ColorTheme::Latte);
         assert_eq!(saved.track_languages, languages);
         assert!(app.read_with(cx, |app, _| app.settings_window.is_none()));
@@ -401,6 +410,7 @@ mod tests {
                 .read_with(cx, |window, cx| {
                     let settings = window.settings.read(cx);
                     assert_eq!(settings.mode(), mode);
+                    assert_eq!(settings.snapshot(cx).app_language, AppLanguage::English);
                     assert_eq!(settings.playback_config(cx), expected);
                     assert_eq!(settings.color_theme(cx), ColorTheme::Latte);
                     assert_eq!(settings.track_languages(cx), languages);
@@ -416,6 +426,39 @@ mod tests {
             expected
         );
         assert_eq!(cx.windows().len(), 1);
+    }
+
+    #[gpui::test]
+    fn startup_restores_interface_language_before_rendering(cx: &mut TestAppContext) {
+        use crate::settings::AppLanguage;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut cache = ServerCache::empty();
+        cache.app_language = AppLanguage::ChineseTraditional;
+        storage::save_to(&cache, &path).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            Editor::bind_keys(cx);
+            AppLanguage::English.apply(cx);
+        });
+        let (app, cx) = cx.add_window_view(|_, cx| {
+            let mut app = TinyApp::new(storage::load_or_init_from(&path).unwrap(), None, cx);
+            app.cache_save_path = Some(path.clone());
+            app.window_persistence_enabled = false;
+            app
+        });
+        assert_eq!(
+            cx.update(|_, cx| AppLanguage::get(cx)),
+            AppLanguage::ChineseTraditional
+        );
+        assert_eq!(
+            app.read_with(cx, |app, _| app.cache.app_language),
+            AppLanguage::ChineseTraditional
+        );
+        assert_eq!(
+            cx.update(|_, cx| crate::i18n::tr("应用界面语言", cx)),
+            "應用介面語言"
+        );
     }
 
     #[gpui::test]

@@ -5,6 +5,7 @@ mod config;
 mod effects;
 pub mod emby;
 mod home;
+mod i18n;
 mod images;
 mod media;
 mod observability;

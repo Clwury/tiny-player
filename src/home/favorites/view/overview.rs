@@ -290,7 +290,7 @@ pub(in crate::home) fn favorite_action(
         .text_color(theme.foreground)
         .hover(move |style| style.bg(theme.secondary_hover))
         .cursor_pointer()
-        .child(label)
+        .child(crate::i18n::tr(label, cx))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(on_click)
 }

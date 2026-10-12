@@ -62,7 +62,7 @@ impl HomeContent {
                     .text_lg()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.foreground)
-                    .child("演职人员"),
+                    .child(crate::i18n::tr("演职人员", cx)),
             )
             .child(
                 div()
@@ -103,7 +103,7 @@ impl HomeContent {
                                             .when(person.id().is_some(), |this| {
                                                 let person = person.clone();
                                                 this.role(gpui::Role::Button)
-                                                    .aria_label("查看人物作品")
+                                                    .aria_label(crate::i18n::tr("查看人物作品", cx))
                                                     .cursor_pointer()
                                                     .on_click(cx.listener(move |page, _, _, cx| {
                                                         cx.stop_propagation();

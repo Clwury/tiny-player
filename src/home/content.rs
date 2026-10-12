@@ -118,8 +118,16 @@ impl HomeContent {
         self.load_home_snapshot_if_needed(cx);
     }
 
-    pub(super) fn title(&self) -> SharedString {
-        self.controller.title().to_owned().into()
+    pub(super) fn title(&self, cx: &gpui::App) -> SharedString {
+        let title: SharedString = self.controller.title().to_owned().into();
+        if matches!(
+            self.controller.route(),
+            HomeRoute::Root(_) | HomeRoute::FavoriteItems { .. }
+        ) {
+            crate::i18n::tr(title, cx)
+        } else {
+            title
+        }
     }
 
     pub(super) fn detail_view(&self) -> Option<detail::binding::DetailView<'_>> {

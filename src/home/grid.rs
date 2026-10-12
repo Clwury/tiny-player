@@ -368,7 +368,7 @@ impl HomeContent {
             } else {
                 theme.muted_foreground
             })
-            .child(message)
+            .child(crate::i18n::tr(message, cx))
     }
 }
 

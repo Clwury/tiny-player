@@ -280,7 +280,7 @@ fn sidebar_nav_item(
         } else {
             theme.foreground
         }))
-        .child(label)
+        .child(crate::i18n::tr(label, cx))
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
@@ -350,7 +350,7 @@ fn server_list_item(
                 div()
                     .id("sidebar-server-loading")
                     .debug_selector(move || format!("sidebar-server-loading-{id}"))
-                    .aria_label("正在连接服务器")
+                    .aria_label(crate::i18n::tr("正在连接服务器", cx))
                     .flex()
                     .flex_none()
                     .size(px(16.0))
@@ -401,7 +401,7 @@ fn add_server_item(on_intent: SidebarListener, cx: &App) -> impl IntoElement {
     div()
         .id("sidebar-add-server")
         .debug_selector(|| "sidebar-add-server".into())
-        .aria_label("添加服务器")
+        .aria_label(crate::i18n::tr("添加服务器", cx))
         .flex()
         .flex_none()
         .h(px(36.0))

@@ -68,21 +68,37 @@ impl PlaybackDetailLine {
 }
 
 impl PlaybackDetailSection {
+    #[cfg(test)]
     fn lines(&self) -> Vec<PlaybackDetailLine> {
+        self.localized_lines(crate::i18n::AppLanguage::English)
+    }
+
+    fn localized_lines(&self, language: crate::i18n::AppLanguage) -> Vec<PlaybackDetailLine> {
         let mut header = PlaybackDetailLine::default();
-        header.push(self.title, &self.summary);
+        header.push(&crate::i18n::translate(language, self.title), &self.summary);
         let mut lines = vec![header];
         for row in &self.rows {
             if !row.inline {
                 lines.push(PlaybackDetailLine::default());
             }
-            lines.last_mut().unwrap().push(&row.label, &row.value);
+            let value = if matches!(row.label.as_str(), "Title" | "Device") {
+                std::borrow::Cow::Borrowed(row.value.as_str())
+            } else {
+                crate::i18n::translate(language, &row.value)
+            };
+            lines
+                .last_mut()
+                .unwrap()
+                .push(&crate::i18n::translate(language, &row.label), &value);
         }
         lines
     }
 }
 
-fn playback_detail_section_element(section: PlaybackDetailSection) -> impl IntoElement {
+fn playback_detail_section_element(
+    section: PlaybackDetailSection,
+    cx: &gpui::App,
+) -> impl IntoElement {
     div()
         .debug_selector(move || format!("playback-stats-{}", section.title))
         .flex()
@@ -90,7 +106,7 @@ fn playback_detail_section_element(section: PlaybackDetailSection) -> impl IntoE
         .flex_none()
         .children(
             section
-                .lines()
+                .localized_lines(crate::i18n::AppLanguage::get(cx))
                 .into_iter()
                 .enumerate()
                 .map(|(index, line)| {
@@ -119,6 +135,7 @@ fn playback_detail_section_element(section: PlaybackDetailSection) -> impl IntoE
 pub(super) fn playback_details_overlay(
     sections: impl IntoIterator<Item = Option<PlaybackDetailSection>>,
     window: &Window,
+    cx: &gpui::App,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id("playback-details-overlay")
@@ -148,7 +165,7 @@ pub(super) fn playback_details_overlay(
             sections
                 .into_iter()
                 .flatten()
-                .map(playback_detail_section_element),
+                .map(|section| playback_detail_section_element(section, cx)),
         )
 }
 

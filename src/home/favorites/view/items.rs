@@ -107,7 +107,7 @@ impl HomeContent {
                                         .debug_selector(|| "favorite-items-count".to_string())
                                         .text_sm()
                                         .text_color(theme.muted_foreground)
-                                        .child(format!("共 {total} 项")),
+                                        .child(crate::i18n::tr(format!("共 {total} 项"), cx)),
                                 )
                             })
                         },

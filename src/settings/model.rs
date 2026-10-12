@@ -1,4 +1,4 @@
-use super::memory_budget::MemoryBudget;
+use super::{AppLanguage, memory_budget::MemoryBudget};
 use crate::{
     media::{PlaybackLanguagePreferences, TrackLanguage},
     theme::ColorTheme,
@@ -38,9 +38,10 @@ impl SettingsMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SettingsCategory {
     #[default]
+    General,
     Appearance,
     Playback,
-    General,
+    Cache,
     Memory,
     Disk,
     Readahead,
@@ -48,17 +49,19 @@ pub(crate) enum SettingsCategory {
 }
 
 impl SettingsCategory {
-    pub(crate) const USER: [Self; 5] = [
+    pub(crate) const USER: [Self; 6] = [
+        Self::General,
         Self::Appearance,
         Self::Playback,
         Self::Memory,
         Self::Disk,
         Self::About,
     ];
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
+        Self::General,
         Self::Appearance,
         Self::Playback,
-        Self::General,
+        Self::Cache,
         Self::Memory,
         Self::Disk,
         Self::Readahead,
@@ -67,9 +70,10 @@ impl SettingsCategory {
 
     pub(crate) fn title(self) -> &'static str {
         match self {
+            Self::General => "常规",
             Self::Appearance => "外观",
             Self::Playback => "播放",
-            Self::General => "缓存策略",
+            Self::Cache => "缓存策略",
             Self::Memory => "内存缓存",
             Self::Disk => "磁盘缓存",
             Self::Readahead => "预读策略",
@@ -114,6 +118,7 @@ pub(crate) enum SettingValidation {
 }
 
 pub(crate) enum SettingsIntent {
+    AppLanguage(AppLanguage),
     Theme(ColorTheme),
     Language {
         language: TrackLanguage,
@@ -138,6 +143,7 @@ pub(crate) enum SettingsIntent {
 pub(crate) struct SettingsSnapshot {
     pub(crate) playback: PlaybackCacheConfig,
     pub(crate) color_theme: ColorTheme,
+    pub(crate) app_language: AppLanguage,
     pub(crate) track_languages: PlaybackLanguagePreferences,
 }
 
@@ -146,6 +152,7 @@ pub(crate) struct SettingsChange {
     pub(crate) persist: bool,
     pub(crate) view_changed: bool,
     pub(crate) theme: Option<ColorTheme>,
+    pub(crate) app_language: Option<AppLanguage>,
     pub(crate) languages: Option<PlaybackLanguagePreferences>,
 }
 

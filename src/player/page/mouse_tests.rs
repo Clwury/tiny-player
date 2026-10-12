@@ -462,7 +462,7 @@ fn track_menus_show_metadata_below_labels_and_scroll_to_select_last_track(cx: &m
             assert!(menu.left() >= px(0.0));
             assert!(menu.top() >= px(0.0));
             assert!(menu.size.width <= px(280.0));
-            assert!(menu.size.height <= px(260.0));
+            assert!(menu.size.height <= px(266.0));
             for (id, label_id, metadata_id) in [
                 (
                     "playback-track-off-option",

@@ -62,7 +62,7 @@ impl HomeContent {
                                 .text_lg()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(theme.foreground)
-                                .child("我的媒体"),
+                                .child(crate::i18n::tr("我的媒体", cx)),
                         )
                         .when_some(vm.views, |this, views| {
                             this.child(self.render_user_views_row(views, main_content_width, cx))
@@ -72,7 +72,7 @@ impl HomeContent {
                                 div()
                                     .text_sm()
                                     .text_color(theme.muted_foreground)
-                                    .child("暂无可浏览的视频媒体库"),
+                                    .child(crate::i18n::tr("暂无可浏览的视频媒体库", cx)),
                             )
                         }),
                 )
@@ -94,7 +94,10 @@ impl HomeContent {
                                     .mt_2()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
-                                    .child("部分单集缺少剧集信息，暂时无法打开"),
+                                    .child(crate::i18n::tr(
+                                        "部分单集缺少剧集信息，暂时无法打开",
+                                        cx,
+                                    )),
                             )
                         }),
                 )

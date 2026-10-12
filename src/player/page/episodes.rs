@@ -10,7 +10,10 @@ use crate::{
         controller::{ImageController, ImageUpdate, ItemImageCommand, ItemImageRequest},
         item_images::EmbyImageRepository,
     },
-    ui::{scrollbar::Scrollbar, tooltip::text_tooltip},
+    ui::{
+        scrollbar::{SCROLLBAR_RIGHT_INSET_PX, SCROLLBAR_WIDTH_PX, Scrollbar},
+        tooltip::text_tooltip,
+    },
 };
 
 use super::*;
@@ -19,6 +22,7 @@ mod components;
 
 const EPISODE_LIST_WIDTH_PX: f32 = 420.0;
 const EPISODE_ROW_HEIGHT_PX: f32 = 120.0;
+const EPISODE_LIST_SCROLLBAR_GAP_PX: f32 = 8.0;
 // Match the detail page's cached episode covers.
 const EPISODE_IMAGE_MAX_WIDTH: u32 = 640;
 
@@ -162,8 +166,8 @@ impl PlaybackPage {
             enabled,
             cx,
         )
-        .aria_label("剧集列表")
-        .tooltip(|_, cx| text_tooltip("剧集列表", cx))
+        .aria_label(crate::i18n::tr("剧集列表", cx))
+        .tooltip(|_, cx| text_tooltip(crate::i18n::tr("剧集列表", cx), cx))
         .when(self.presentation.episode_list.open, |this| {
             this.bg(theme.element_selected)
         })
@@ -243,7 +247,7 @@ impl PlaybackPage {
                             true,
                             cx,
                         )
-                        .aria_label("关闭剧集列表")
+                        .aria_label(crate::i18n::tr("关闭剧集列表", cx))
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::dismiss_episode_list)),
                     )
                     .child(
@@ -251,7 +255,7 @@ impl PlaybackPage {
                             .flex_1()
                             .text_right()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("剧集列表 · {count} 集")),
+                            .child(crate::i18n::tr(format!("剧集列表 · {count} 集"), cx)),
                     ),
             )
             .child(
@@ -259,7 +263,8 @@ impl PlaybackPage {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .m_2()
+                    .my_2()
+                    .ml_2()
                     .child(
                         uniform_list(
                             "playback-episodes-list",
@@ -272,7 +277,9 @@ impl PlaybackPage {
                         )
                         .debug_selector(|| "playback-episodes-list".into())
                         .size_full()
-                        .pr(px(8.0))
+                        .pr(px(SCROLLBAR_RIGHT_INSET_PX
+                            + SCROLLBAR_WIDTH_PX
+                            + EPISODE_LIST_SCROLLBAR_GAP_PX))
                         .track_scroll(scroll),
                     )
                     .child(

@@ -73,6 +73,7 @@ impl TinyApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let persistence = crate::persistence::PersistenceService::get(cx);
+        cache.app_language.apply(cx);
         cache.track_languages.apply(cx);
         cache.items_sort.apply(cx);
         cx.observe_global::<crate::media::ItemSortPreferences>(|app, cx| {

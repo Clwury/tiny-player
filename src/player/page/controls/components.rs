@@ -1,5 +1,5 @@
 //! Stateless playback elements. The page supplies display values and binds
-//! intents; components never read the page, session, backend or preferences.
+//! intents; components never read the page, session or backend.
 use super::playback_volume_percent;
 use crate::{
     player::model::track_menu::{TrackMenuIntent, TrackMenuVm},
@@ -7,15 +7,31 @@ use crate::{
     ui::radius,
 };
 use gpui::{
-    App, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, relative, rgba,
-    svg,
+    App, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder,
+    px, relative, rgba, svg,
 };
 use std::rc::Rc;
 use tiny_playback::clamp_playback_volume;
 
-const TRACK_SELECT_MENU_MAX_HEIGHT_PX: f32 = 260.0;
+const TRACK_SELECT_MAX_VISIBLE_OPTIONS: usize = 5;
+const TRACK_SELECT_OPTION_HEIGHT_PX: f32 = 48.0;
+const TRACK_SELECT_OPTION_GAP_PX: f32 = 4.0;
+const TRACK_SELECT_MENU_PADDING_PX: f32 = 4.0;
+const TRACK_SELECT_MENU_BORDER_PX: f32 = 1.0;
 const VOLUME_INDICATOR_BAR_HEIGHT_PX: f32 = 192.0;
+
+pub(super) fn reveal_track_select_option(scroll_handle: &ScrollHandle, option_index: usize) {
+    // A newly opened menu has no viewport for scroll_to_item to inspect yet.
+    // Keep the first five rows in view, or seed the selected row at the bottom.
+    // Layout clamps the offset to the content.
+    let first_visible_option = option_index.saturating_sub(TRACK_SELECT_MAX_VISIBLE_OPTIONS - 1);
+    scroll_handle.set_offset(point(
+        px(0.0),
+        px(-(first_visible_option as f32)
+            * (TRACK_SELECT_OPTION_HEIGHT_PX + TRACK_SELECT_OPTION_GAP_PX)),
+    ));
+}
 
 pub(in crate::player::page) fn playback_control_button(
     id: &'static str,
@@ -51,6 +67,7 @@ pub(in crate::player::page) fn playback_control_button(
 
 pub(super) fn track_select_menu(
     vm: TrackMenuVm,
+    scroll_handle: &ScrollHandle,
     cx: &App,
     on_select: impl Fn(&TrackMenuIntent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -58,31 +75,27 @@ pub(super) fn track_select_menu(
     let on_select = Rc::new(on_select);
     let select_off = on_select.clone();
     let id = vm.id;
-    let menu = div()
-        .id(id)
-        .debug_selector(move || id.to_string())
-        .absolute()
-        .right_0()
-        .bottom(px(32.0))
+    let option_count = vm.options.len() + 1;
+    let visible_options = option_count.min(TRACK_SELECT_MAX_VISIBLE_OPTIONS);
+    let height = visible_options as f32 * TRACK_SELECT_OPTION_HEIGHT_PX
+        + (visible_options - 1) as f32 * TRACK_SELECT_OPTION_GAP_PX
+        + 2.0 * (TRACK_SELECT_MENU_PADDING_PX + TRACK_SELECT_MENU_BORDER_PX);
+    let content = div()
+        .id("playback-track-menu-content")
         .flex()
         .flex_col()
-        .min_w(px(190.0))
-        .max_w(px(280.0))
-        .max_h(px(TRACK_SELECT_MENU_MAX_HEIGHT_PX))
-        .gap_1()
-        .overflow_y_scroll()
-        .rounded(radius::SURFACE)
-        .border_1()
-        .border_color(theme.input_border.opacity(0.72))
-        .bg(rgba(0x000000e6))
-        .p(px(4.0))
-        .shadow_lg()
-        .occlude()
-        .cursor_default()
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .gap(px(TRACK_SELECT_OPTION_GAP_PX))
+        .overflow_hidden()
+        .when(option_count > TRACK_SELECT_MAX_VISIBLE_OPTIONS, |this| {
+            this.overflow_y_scroll()
+        })
+        .track_scroll(scroll_handle)
         .child(
             track_select_option(
-                "Off",
+                crate::i18n::tr("关闭", cx),
                 "off",
                 vm.off_selected,
                 "playback-track-off-option".into(),
@@ -93,14 +106,15 @@ pub(super) fn track_select_menu(
                 select_off(&vm.off_intent, window, cx);
             }),
         );
-    vm.options
+    let content = vm
+        .options
         .into_iter()
         .enumerate()
-        .fold(menu, |menu, (index, option)| {
+        .fold(content, |content, (index, option)| {
             let on_select = on_select.clone();
-            menu.child(
+            content.child(
                 track_select_option(
-                    option.label,
+                    crate::i18n::tr(option.label, cx),
                     option.metadata,
                     option.selected,
                     format!("playback-track-option-{index}"),
@@ -111,7 +125,29 @@ pub(super) fn track_select_menu(
                     on_select(&option.intent, window, cx);
                 }),
             )
-        })
+        });
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .absolute()
+        .right_0()
+        .bottom(px(32.0))
+        .flex()
+        .flex_col()
+        .min_w(px(190.0))
+        .max_w(px(280.0))
+        .h(px(height))
+        .rounded(radius::SURFACE)
+        .border(px(TRACK_SELECT_MENU_BORDER_PX))
+        .border_color(theme.input_border.opacity(0.72))
+        .bg(rgba(0x000000e6))
+        .p(px(TRACK_SELECT_MENU_PADDING_PX))
+        .shadow_lg()
+        .occlude()
+        .cursor_default()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .child(content)
 }
 
 pub(in crate::player::page) fn volume_indicator(volume: f32, cx: &App) -> impl IntoElement {
@@ -195,7 +231,7 @@ pub(super) fn cache_status_popover(segments: Vec<String>, cx: &App) -> impl Into
                     .px_2()
                     .text_xs()
                     .text_color(theme.foreground.opacity(0.9))
-                    .child(segment),
+                    .child(crate::i18n::tr(segment, cx)),
             )
         },
     )
@@ -224,8 +260,8 @@ fn track_select_option(
         .debug_selector(move || id.clone())
         .flex()
         .flex_none()
-        .h(px(48.0))
-        .min_h(px(48.0))
+        .h(px(TRACK_SELECT_OPTION_HEIGHT_PX))
+        .min_h(px(TRACK_SELECT_OPTION_HEIGHT_PX))
         .items_center()
         .rounded(radius::CONTROL)
         .px_2()
@@ -269,7 +305,7 @@ fn track_select_option(
                         .line_height(px(14.0))
                         .font_weight(gpui::FontWeight::NORMAL)
                         .text_color(theme.foreground.opacity(if selected { 0.9 } else { 0.72 }))
-                        .child(metadata),
+                        .child(crate::i18n::tr(metadata, cx)),
                 ),
         )
 }

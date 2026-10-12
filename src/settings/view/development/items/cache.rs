@@ -14,7 +14,7 @@ impl PlaybackSettingsDialogState {
         );
         [
             SettingItem::new(
-                General,
+                Cache,
                 "缓存模式",
                 "普通缓存",
                 "自动模式根据媒体来源决定是否启用缓存。",
@@ -26,7 +26,7 @@ impl PlaybackSettingsDialogState {
                 ),
             ),
             SettingItem::new(
-                General,
+                Cache,
                 "缓存模式",
                 "回看缓存",
                 "保留已读取的数据，以便向后跳转和重复播放。",
@@ -38,7 +38,7 @@ impl PlaybackSettingsDialogState {
                 ),
             ),
             SettingItem::new(
-                General,
+                Cache,
                 "缓冲与暂停",
                 "缓冲不足时暂停",
                 "等待缓存补充后再继续播放，减少断续播放。",
@@ -52,7 +52,7 @@ impl PlaybackSettingsDialogState {
                 ),
             ),
             SettingItem::new(
-                General,
+                Cache,
                 "缓冲与暂停",
                 "启动时等待缓存",
                 "启用缓冲暂停时，先积累缓存再开始播放。",
@@ -66,7 +66,7 @@ impl PlaybackSettingsDialogState {
                 ),
             ),
             SettingItem::new(
-                General,
+                Cache,
                 "缓冲与暂停",
                 "恢复播放阈值",
                 "缓冲暂停后，至少缓存多少秒再恢复播放。",
@@ -80,7 +80,7 @@ impl PlaybackSettingsDialogState {
                 ),
             ),
             SettingItem::new(
-                General,
+                Cache,
                 "缓冲与暂停",
                 "等待预读完成",
                 "开始播放前，等待解复用缓存达到预读目标。",

@@ -199,7 +199,7 @@ impl PlaybackPage {
             .text_color(theme.error)
             .text_align(gpui::TextAlign::Center)
             .occlude()
-            .child(error)
+            .child(crate::i18n::tr(error, cx))
             .into_any_element()
     }
 }

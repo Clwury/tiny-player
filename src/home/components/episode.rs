@@ -111,7 +111,11 @@ fn user_episode_card_with_image<T>(
                         .text_center()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(view.subtitle),
+                        .child(if view.subtitle_is_placeholder {
+                            crate::i18n::tr(view.subtitle, cx)
+                        } else {
+                            view.subtitle.into()
+                        }),
                 ),
         )
 }
@@ -198,8 +202,8 @@ fn episode_played_badge(cx: &gpui::App) -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .aria_label("已观看")
-        .tooltip(|_, cx| text_tooltip("已观看", cx))
+        .aria_label(crate::i18n::tr("已观看", cx))
+        .tooltip(|_, cx| text_tooltip(crate::i18n::tr("已观看", cx), cx))
         .child(
             svg()
                 .path("icons/circle-check-filled.svg")

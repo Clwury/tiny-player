@@ -1,5 +1,9 @@
 //! Fixtures and layout assertions for settings presentation tests.
-use crate::{media::PlaybackLanguagePreferences, settings::SettingsSnapshot, theme};
+use crate::{
+    media::PlaybackLanguagePreferences,
+    settings::{AppLanguage, SettingsSnapshot},
+    theme,
+};
 use gpui::{Bounds, Pixels, VisualTestContext, px, size};
 
 pub(crate) fn settings_snapshot(
@@ -9,6 +13,7 @@ pub(crate) fn settings_snapshot(
     SettingsSnapshot {
         playback: config.clone(),
         color_theme: theme::get(cx).selection,
+        app_language: AppLanguage::default(),
         track_languages: PlaybackLanguagePreferences::get(cx),
     }
 }

@@ -121,7 +121,7 @@ impl HomeContent {
                                                 div()
                                                     .text_sm()
                                                     .text_color(theme.muted_foreground)
-                                                    .child(warning),
+                                                    .child(crate::i18n::tr(warning, cx)),
                                             )
                                         },
                                     )
@@ -152,7 +152,7 @@ impl HomeContent {
                                                 div()
                                                     .text_sm()
                                                     .text_color(theme.muted_foreground)
-                                                    .child("暂无剧集"),
+                                                    .child(crate::i18n::tr("暂无剧集", cx)),
                                             )
                                         },
                                     )
@@ -350,7 +350,7 @@ impl HomeContent {
                                     .text_sm()
                                     .line_height(px(24.0))
                                     .truncate()
-                                    .when_some(metadata, |this, metadata| this.child(metadata)),
+                                    .when_some(metadata, |this, metadata| this.child(crate::i18n::tr(metadata, cx))),
                             )
                             // Reserve the episode line before asynchronous episode data arrives.
                             // This bottom-aligned stack must keep the logo at the same height.
@@ -463,7 +463,7 @@ impl HomeContent {
                     ))
                     .debug_selector(move || format!("series-detail-genre-tag-{index}"))
                     .role(gpui::Role::Button)
-                    .aria_label(format!("查看{label}类型"))
+                    .aria_label(crate::i18n::tr(format!("查看{label}类型"), cx))
                     .cursor_pointer()
                     .rounded(radius::CONTROL)
                     .bg(theme.dialog_background.opacity(0.86))

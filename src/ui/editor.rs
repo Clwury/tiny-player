@@ -629,8 +629,9 @@ impl Editor {
 
     /// Return the placeholder when one has been configured.
     #[allow(dead_code)]
-    pub fn placeholder_text(&self, _: &mut App) -> Option<String> {
-        (!self.placeholder.is_empty()).then(|| self.placeholder.to_string())
+    pub fn placeholder_text(&self, cx: &mut App) -> Option<String> {
+        (!self.placeholder.is_empty())
+            .then(|| crate::i18n::tr(self.placeholder.clone(), cx).to_string())
     }
 
     /// Replace the complete buffer text and move the cursor to its end.
@@ -1535,7 +1536,7 @@ impl Element for EditorElement {
         let style = window.text_style();
 
         let display_text: SharedString = if raw_content.is_empty() {
-            input.placeholder.clone()
+            crate::i18n::tr(input.placeholder.clone(), cx)
         } else if input.masked {
             "•".repeat(grapheme_count(&raw_content)).into()
         } else {

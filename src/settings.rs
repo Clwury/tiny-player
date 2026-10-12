@@ -4,6 +4,7 @@ pub(crate) mod memory_budget;
 mod model;
 pub(crate) mod values;
 pub(crate) mod view;
+pub(crate) use crate::i18n::AppLanguage;
 pub(crate) use controller::SettingsController;
 pub(crate) use model::{
     NumericSetting, SettingDescriptor, SettingValidation, SettingsCategory, SettingsIntent,
@@ -26,6 +27,7 @@ impl SettingsPersistenceAdapter {
     pub(crate) fn apply(snapshot: SettingsSnapshot, config: &mut crate::config::GlobalConfig) {
         config.playback = snapshot.playback;
         config.color_theme = snapshot.color_theme;
+        config.app_language = snapshot.app_language;
         config.track_languages = snapshot.track_languages;
     }
 }

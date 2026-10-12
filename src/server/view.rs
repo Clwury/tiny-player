@@ -365,7 +365,7 @@ fn server_card_content(
                                 div()
                                     .id("server-auto-start")
                                     .debug_selector(|| "server-auto-start".into())
-                                    .aria_label("自动启动")
+                                    .aria_label(crate::i18n::tr("自动启动", cx))
                                     .flex()
                                     .flex_none()
                                     .size(px(16.0))
@@ -555,7 +555,7 @@ fn menu_item(
             colors.foreground
         })
         .hover(move |style| style.bg(hover_background))
-        .child(label)
+        .child(crate::i18n::tr(label, cx))
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             cx.stop_propagation();
             action(window, cx);

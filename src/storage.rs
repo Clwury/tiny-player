@@ -10,6 +10,7 @@ use crate::{
     media::{ItemSortPreferences, PlaybackLanguagePreferences},
     search_history::SearchHistory,
     server::CachedServer,
+    settings::AppLanguage,
     theme::ColorTheme,
 };
 
@@ -30,6 +31,8 @@ pub struct ServerCache {
     pub playback: PlaybackCacheConfig,
     #[serde(default)]
     pub color_theme: ColorTheme,
+    #[serde(default)]
+    pub(crate) app_language: AppLanguage,
     #[serde(default)]
     pub track_languages: PlaybackLanguagePreferences,
     #[serde(default)]
@@ -56,6 +59,7 @@ impl ServerCache {
             window: None,
             playback: PlaybackCacheConfig::default(),
             color_theme: ColorTheme::default(),
+            app_language: AppLanguage::default(),
             track_languages: PlaybackLanguagePreferences::default(),
             playback_volume: PlaybackVolumeSettings::default(),
             search_history: SearchHistory::default(),
@@ -407,6 +411,37 @@ mod tests {
             cache.color_theme = selection;
             save_to(&cache, &path).unwrap();
             assert_eq!(load_or_init_from(&path).unwrap().color_theme, selection);
+        }
+    }
+
+    #[test]
+    fn interface_language_round_trips_and_old_or_unknown_values_keep_other_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut cache = ServerCache::empty();
+        cache.device_id = "existing-device".into();
+        cache.playback.cache_secs = 42.123456789;
+        cache.servers.push(server("server-local", "token"));
+        for language in AppLanguage::ALL {
+            cache.app_language = language;
+            save_to(&cache, &path).unwrap();
+            let loaded = load_or_init_from(&path).unwrap();
+            assert_eq!(loaded.app_language, language);
+            assert_eq!(loaded.playback, cache.playback);
+            assert_eq!(loaded.servers[0].id, "server-local");
+        }
+        for value in [None, Some("unknown-locale")] {
+            let mut json = serde_json::to_value(&cache).unwrap();
+            json.as_object_mut().unwrap().remove("app_language");
+            if let Some(value) = value {
+                json["app_language"] = value.into();
+            }
+            fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+            let loaded = load_or_init_from(&path).unwrap();
+            assert_eq!(loaded.app_language, AppLanguage::ChineseSimplified);
+            assert_eq!(loaded.device_id, "existing-device");
+            assert_eq!(loaded.playback, cache.playback);
+            assert_eq!(loaded.servers[0].id, "server-local");
         }
     }
 

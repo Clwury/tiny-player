@@ -258,6 +258,6 @@ fn item_context_menu_option(
         .child(
             div()
                 .debug_selector(move || format!("{id}-{label}"))
-                .child(label),
+                .child(crate::i18n::tr(label, cx)),
         )
 }

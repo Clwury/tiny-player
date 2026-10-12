@@ -16,7 +16,7 @@ pub(crate) fn toggle_switch(
     div()
         .id(label)
         .role(gpui::Role::Switch)
-        .aria_label(label)
+        .aria_label(crate::i18n::tr(label, cx))
         .aria_toggled(if selected {
             gpui::Toggled::True
         } else {

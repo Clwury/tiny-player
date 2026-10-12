@@ -6,6 +6,7 @@ impl PlaybackPage {
     pub(in super::super) fn render_playback_details_overlay(
         &self,
         window: &Window,
+        cx: &Context<Self>,
     ) -> impl IntoElement {
         let presenter_snapshot = self.video.presenter_snapshot();
         let viewport_size = window.viewport_size();
@@ -35,6 +36,7 @@ impl PlaybackPage {
                 ),
             ],
             window,
+            cx,
         )
     }
 
@@ -50,6 +52,7 @@ impl PlaybackPage {
         };
         components::track_select_menu(
             track_menu(kind, choice.tracks, choice.selected),
+            &self.presentation.track_select_scroll_handle,
             cx,
             cx.listener(|page, intent: &TrackMenuIntent, window, cx| match intent {
                 TrackMenuIntent::Audio(index) => page.select_audio_track(*index, window, cx),

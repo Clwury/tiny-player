@@ -49,7 +49,7 @@ pub(super) fn render_playback_status(status: PlaybackStatus, cx: &gpui::App) -> 
         }
         PlaybackStatus::Error(message) => div()
             .debug_selector(|| "playback-error-message".to_string())
-            .child(message)
+            .child(crate::i18n::tr(message, cx))
             .into_any_element(),
     };
 

@@ -386,6 +386,52 @@ mod tests {
     }
 
     #[test]
+    fn cache_status_stream_states_follow_the_interface_language_for_every_stream_kind() {
+        use crate::i18n::{AppLanguage, translate};
+
+        for (kind, label) in [
+            (StreamCacheKind::Video, "V"),
+            (StreamCacheKind::Audio, "A"),
+            (StreamCacheKind::Subtitle, "S"),
+            (StreamCacheKind::Unknown, "?"),
+        ] {
+            for (underrun, idle, simplified, english, traditional) in [
+                (false, false, "", "", ""),
+                (false, true, " 空闲", " Idle", " 閒置"),
+                (true, false, " 断供", " Starved", " 斷供"),
+                (true, true, " 断供", " Starved", " 斷供"),
+            ] {
+                let state = PlaybackCacheState {
+                    demux: DemuxCacheState {
+                        streams: vec![StreamCacheState {
+                            kind,
+                            cache_end: Some(3.0),
+                            reader_pts: Some(1.0),
+                            cache_duration: Some(2.0),
+                            underrun,
+                            idle,
+                        }],
+                        ..DemuxCacheState::default()
+                    },
+                    ..PlaybackCacheState::default()
+                };
+                let segments = cache_status_segments(Some(&state));
+                for (language, suffix) in [
+                    (AppLanguage::ChineseSimplified, simplified),
+                    (AppLanguage::English, english),
+                    (AppLanguage::ChineseTraditional, traditional),
+                ] {
+                    assert_eq!(
+                        translate(language, &segments[0]),
+                        format!("{label} 2.0s{suffix}"),
+                        "{kind:?}, underrun={underrun}, idle={idle}, {language:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cache_status_segments_expose_effective_prefetch_pressure() {
         let state = PlaybackCacheState {
             demux: DemuxCacheState {

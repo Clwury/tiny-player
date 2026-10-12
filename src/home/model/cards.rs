@@ -24,6 +24,7 @@ pub(in crate::home) struct UserItemCardVm {
 pub(in crate::home) struct UserEpisodeCardVm {
     pub(in crate::home) title: String,
     pub(in crate::home) subtitle: String,
+    pub(in crate::home) subtitle_is_placeholder: bool,
     pub(in crate::home) played_fraction: Option<f32>,
     pub(in crate::home) played: bool,
 }
@@ -40,6 +41,9 @@ pub(in crate::home) struct PersonCardVm {
     pub(in crate::home) name: String,
     pub(in crate::home) role: Option<String>,
     pub(in crate::home) kind: Option<String>,
+    pub(in crate::home) name_is_placeholder: bool,
+    pub(in crate::home) role_is_placeholder: bool,
+    pub(in crate::home) kind_is_placeholder: bool,
 }
 
 impl ResumeCardVm {
@@ -87,6 +91,7 @@ impl UserEpisodeCardVm {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or(&item.name)
             .to_string();
+        let subtitle_is_placeholder = episode_number.is_none() && title == item.name;
         let subtitle = match episode_number {
             Some(number) if title != item.name => format!("{number} · {}", item.name),
             Some(number) => number,
@@ -96,6 +101,7 @@ impl UserEpisodeCardVm {
         Self {
             title,
             subtitle,
+            subtitle_is_placeholder,
             played_fraction: played_fraction(data),
             played: data.is_some_and(|data| data.played),
         }
@@ -124,6 +130,18 @@ impl From<&MediaPerson> for PersonCardVm {
             name: person.display_name(),
             role: Some(person.role_label()),
             kind: Some(person.type_label()),
+            name_is_placeholder: person
+                .name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty()),
+            role_is_placeholder: person
+                .role
+                .as_deref()
+                .is_none_or(|role| role.trim().is_empty()),
+            kind_is_placeholder: person
+                .person_type
+                .as_deref()
+                .is_none_or(|kind| kind.trim().is_empty()),
         }
     }
 }
@@ -138,6 +156,9 @@ impl From<&UserItem> for PersonCardVm {
             },
             role: None,
             kind: None,
+            name_is_placeholder: person.name.trim().is_empty(),
+            role_is_placeholder: false,
+            kind_is_placeholder: false,
         }
     }
 }

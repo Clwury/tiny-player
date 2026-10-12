@@ -104,6 +104,7 @@ fn detail_select_box_with_width<T>(
     cx: &Context<T>,
 ) -> gpui::Div {
     let theme = theme::get(cx);
+    let value = crate::i18n::tr(value, cx).to_string();
     let text = StyledText::new(value.clone());
     let text_layout = text.layout().clone();
     let text = InteractiveText::new((gpui::ElementId::from("detail-select-value"), label), text)
@@ -157,7 +158,7 @@ fn detail_select_box_with_width<T>(
                         .flex_none()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(label),
+                        .child(crate::i18n::tr(label, cx)),
                 )
                 .child(
                     div()
@@ -374,7 +375,12 @@ fn detail_select_option_with_subtitle<T>(
     cx: &Context<T>,
 ) -> gpui::Stateful<gpui::Div> {
     let theme = theme::get(cx);
-    let subtitle = subtitle.map(str::trim).filter(|title| !title.is_empty());
+    let label = crate::i18n::tr(label, cx).to_string();
+    let localized_subtitle = subtitle.map(|text| crate::i18n::tr(text.to_owned(), cx));
+    let subtitle = localized_subtitle
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
     let show_tooltip = detail_select_label_needs_tooltip(&label)
         || subtitle.is_some_and(detail_select_label_needs_tooltip);
     let tooltip_label = subtitle.map_or_else(|| label.clone(), |title| format!("{label}\n{title}"));

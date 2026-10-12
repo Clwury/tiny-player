@@ -91,7 +91,11 @@ fn user_settings_keep_the_sidebar_and_titlebar_fixed_while_switching_pages(
         assert_eq!(sidebar.size.width, px(226.0));
         assert_eq!(sidebar.top(), panel.top());
         assert_eq!(sidebar.bottom(), panel.bottom());
-        let pages: [(&str, &[&str]); 5] = [
+        let pages: [(&str, &[&str]); 6] = [
+            (
+                "settings-category-常规",
+                &["user-setting-app-language", "app-language-dropdown"],
+            ),
             (
                 "settings-category-外观",
                 &["user-setting-theme", "color-theme-dropdown"],
@@ -161,6 +165,41 @@ fn user_settings_keep_the_sidebar_and_titlebar_fixed_while_switching_pages(
         }
     }
     assert_eq!(root.read_with(cx, |root, _| root.changes), 0);
+}
+
+#[gpui::test]
+fn interface_language_menu_updates_immediately_and_fits_the_minimum_window(
+    cx: &mut TestAppContext,
+) {
+    let (root, cx) = settings_window(cx, PlaybackCacheConfig::default());
+    cx.simulate_resize(size(px(900.0), px(600.0)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("app-language-dropdown").is_some());
+    assert!(cx.debug_bounds("color-theme-dropdown").is_none());
+    for language in AppLanguage::ALL {
+        click(cx, "app-language-dropdown");
+        for option in AppLanguage::ALL {
+            let bounds = cx
+                .debug_bounds(option.id())
+                .expect("all three interface languages");
+            assert!(bounds.top() >= px(0.0));
+            assert!(bounds.bottom() <= px(600.0));
+            assert!(bounds.right() <= px(900.0));
+        }
+        click(cx, language.id());
+        assert_eq!(cx.update(|_, cx| AppLanguage::get(cx)), language);
+        root.read_with(cx, |root, cx| {
+            assert_eq!(root.dialog.read(cx).snapshot().app_language, language)
+        });
+        let control = cx.debug_bounds("app-language-dropdown").unwrap();
+        let row = cx.debug_bounds("user-setting-app-language").unwrap();
+        assert!(control.right() <= row.right());
+        assert!(row.bottom() <= px(600.0));
+    }
+    assert_eq!(root.read_with(cx, |root, _| root.changes), 2);
+    click(cx, "app-language-dropdown");
+    click(cx, "app-language-english");
+    assert_eq!(root.read_with(cx, |root, _| root.changes), 2);
 }
 
 #[gpui::test]
@@ -370,6 +409,7 @@ fn disk_cache_switch_preserves_custom_capacity_and_capacity_can_be_edited_while_
 #[gpui::test]
 fn switching_sidebar_pages_dismisses_menus_and_blurs_hidden_editors(cx: &mut TestAppContext) {
     let (root, cx) = settings_window(cx, PlaybackCacheConfig::default());
+    click(cx, "settings-category-外观");
     click(cx, "color-theme-dropdown");
     click(cx, "settings-category-磁盘缓存");
     assert!(cx.debug_bounds("color-theme-dropdown-menu").is_none());

@@ -223,7 +223,7 @@ impl AddServerDialogState {
                             .text_lg()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme.foreground)
-                            .child(view.title),
+                            .child(crate::i18n::tr(view.title, cx)),
                     )
                     .child(self.render_form(dialog.clone(), cx))
                     .child(
@@ -340,7 +340,7 @@ fn field(label: &'static str, input: impl IntoElement, cx: &App) -> impl IntoEle
                 .text_sm()
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.foreground)
-                .child(label),
+                .child(crate::i18n::tr(label, cx)),
         )
         .child(input)
 }
@@ -495,7 +495,7 @@ fn dialog_button(
                 style.bg(theme.secondary_hover).text_color(theme.foreground)
             }
         })
-        .child(label)
+        .child(crate::i18n::tr(label, cx))
 }
 
 #[cfg(test)]

@@ -50,7 +50,7 @@ impl HomePage {
     }
 
     pub fn title(&self, cx: &App) -> SharedString {
-        self.home_content.read(cx).title()
+        self.home_content.read(cx).title(cx)
     }
 
     pub(crate) fn set_servers(

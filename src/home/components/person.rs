@@ -32,7 +32,11 @@ pub(in crate::home) fn person_card<T>(
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.foreground)
-                        .child(view.name),
+                        .child(if view.name_is_placeholder {
+                            crate::i18n::tr(view.name, cx)
+                        } else {
+                            view.name.into()
+                        }),
                 )
                 .when_some(view.role, |this, role| {
                     this.child(
@@ -41,7 +45,11 @@ pub(in crate::home) fn person_card<T>(
                             .truncate()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(role),
+                            .child(if view.role_is_placeholder {
+                                crate::i18n::tr(role, cx)
+                            } else {
+                                role.into()
+                            }),
                     )
                 })
                 .when_some(view.kind, |this, kind| {
@@ -51,7 +59,11 @@ pub(in crate::home) fn person_card<T>(
                             .truncate()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(kind),
+                            .child(if view.kind_is_placeholder {
+                                crate::i18n::tr(kind, cx)
+                            } else {
+                                kind.into()
+                            }),
                     )
                 }),
         )

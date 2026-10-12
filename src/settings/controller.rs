@@ -1,5 +1,5 @@
 use super::{
-    SettingValidation,
+    AppLanguage, SettingValidation,
     model::*,
     values::{BYTES_PER_MIB, parse_seconds},
 };
@@ -22,6 +22,7 @@ pub(crate) struct SettingsController {
 pub(crate) struct SettingsVm<'a> {
     pub(crate) config: &'a PlaybackCacheConfig,
     pub(crate) color_theme: ColorTheme,
+    pub(crate) app_language: AppLanguage,
     pub(crate) track_languages: PlaybackLanguagePreferences,
     pub(crate) category: SettingsCategory,
     pub(crate) query: &'a str,
@@ -45,16 +46,19 @@ impl SettingsVm<'_> {
         if self.query.is_empty() {
             item.category == self.category
         } else {
-            super::values::matches_search(
-                self.query,
-                &[
-                    item.category.title(),
-                    item.section,
-                    item.title,
-                    item.description,
-                    item.keywords,
-                ],
-            )
+            let fields = [
+                item.category.title(),
+                item.section,
+                item.title,
+                item.description,
+                item.keywords,
+            ];
+            let localized = fields.map(|text| crate::i18n::translate(self.app_language, text));
+            let fields: Vec<_> = fields
+                .into_iter()
+                .chain(localized.iter().map(|text| text.as_ref()))
+                .collect();
+            super::values::matches_search(self.query, &fields)
         }
     }
 }
@@ -65,6 +69,7 @@ impl SettingsController {
             &snapshot.playback,
             mode,
             snapshot.color_theme,
+            snapshot.app_language,
             snapshot.track_languages,
         )
     }
@@ -73,12 +78,14 @@ impl SettingsController {
         config: &PlaybackCacheConfig,
         mode: SettingsMode,
         color_theme: ColorTheme,
+        app_language: AppLanguage,
         track_languages: PlaybackLanguagePreferences,
     ) -> Self {
         Self {
             snapshot: SettingsSnapshot {
                 playback: config.clone().normalized(),
                 color_theme,
+                app_language,
                 track_languages,
             },
             mode,
@@ -93,6 +100,7 @@ impl SettingsController {
         SettingsVm {
             config: &self.snapshot.playback,
             color_theme: self.snapshot.color_theme,
+            app_language: self.snapshot.app_language,
             track_languages: self.snapshot.track_languages,
             category: self.category,
             query: &self.query,
@@ -135,7 +143,7 @@ impl SettingsController {
                 if self.mode == SettingsMode::User
                     && matches!(
                         category,
-                        SettingsCategory::General | SettingsCategory::Readahead
+                        SettingsCategory::Cache | SettingsCategory::Readahead
                     )
                 {
                     return SettingsChange::default();
@@ -159,6 +167,7 @@ impl SettingsController {
         };
         let config = &mut self.snapshot.playback;
         match intent {
+            SettingsIntent::AppLanguage(language) => self.snapshot.app_language = language,
             SettingsIntent::Theme(theme) => self.snapshot.color_theme = theme,
             SettingsIntent::Language { language, audio } => {
                 if audio {
@@ -207,6 +216,8 @@ impl SettingsController {
         SettingsChange {
             persist: changed,
             view_changed: changed || validation_changed,
+            app_language: (self.snapshot.app_language != previous.app_language)
+                .then_some(self.snapshot.app_language),
             theme: (self.snapshot.color_theme != previous.color_theme)
                 .then_some(self.snapshot.color_theme),
             languages: (self.snapshot.track_languages != previous.track_languages)

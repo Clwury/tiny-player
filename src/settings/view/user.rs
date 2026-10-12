@@ -1,7 +1,8 @@
 //! User-facing preferences. Advanced cache tuning stays in the development dialog.
 use super::controls::{
-    HARDWARE_DECODE_DESCRIPTION, disk_cache_capacity_control, disk_cache_capacity_input,
-    hardware_decode_selector, settings_category_button, settings_sidebar, track_language_selector,
+    HARDWARE_DECODE_DESCRIPTION, app_language_selector, disk_cache_capacity_control,
+    disk_cache_capacity_input, hardware_decode_selector, settings_category_button,
+    settings_sidebar, track_language_selector,
 };
 use super::dialog::SettingsChanged;
 use crate::ui::{
@@ -28,8 +29,8 @@ use crate::{
 use tiny_playback::HardwareDecodeMode;
 
 use crate::settings::{
-    NumericSetting, SettingsCategory, SettingsController, SettingsIntent, SettingsMode,
-    SettingsSnapshot, ToggleSetting, memory_budget::MemoryBudget,
+    AppLanguage, NumericSetting, SettingsCategory, SettingsController, SettingsIntent,
+    SettingsMode, SettingsSnapshot, ToggleSetting, memory_budget::MemoryBudget,
 };
 use crate::ui::{editor::Editor, scrollbar::Scrollbar};
 
@@ -87,6 +88,9 @@ impl UserSettingsDialogState {
 
     fn dispatch(&mut self, intent: SettingsIntent, cx: &mut Context<Self>) {
         let change = self.controller.dispatch(intent);
+        if let Some(language) = change.app_language {
+            language.apply(cx);
+        }
         if let Some(selection) = change.theme {
             theme::set(selection, cx);
             self.controller
@@ -104,6 +108,9 @@ impl UserSettingsDialogState {
     }
     fn select_theme(&mut self, selection: ColorTheme, cx: &mut Context<Self>) {
         self.dispatch(SettingsIntent::Theme(selection), cx);
+    }
+    fn select_app_language(&mut self, language: AppLanguage, cx: &mut Context<Self>) {
+        self.dispatch(SettingsIntent::AppLanguage(language), cx);
     }
     fn select_language(&mut self, language: TrackLanguage, audio: bool, cx: &mut Context<Self>) {
         self.dispatch(SettingsIntent::Language { language, audio }, cx);
@@ -142,6 +149,7 @@ impl UserSettingsDialogState {
         let theme = theme::get(cx);
         let budget = MemoryBudget::current(self.controller.view_model().config);
         let theme_dialog = cx.entity();
+        let language_dialog = cx.entity();
         let budget_dialog = cx.entity();
         let disk_dialog = cx.entity();
         let decode_dialog = cx.entity();
@@ -151,10 +159,26 @@ impl UserSettingsDialogState {
                 .mb_3()
                 .text_base()
                 .text_color(theme.foreground)
-                .child(self.controller.view_model().category.title()),
+                .child(crate::i18n::tr(
+                    self.controller.view_model().category.title(),
+                    cx,
+                )),
         );
         match self.controller.view_model().category {
-            SettingsCategory::General | SettingsCategory::Readahead => unreachable!("development category in user settings"),
+            SettingsCategory::Cache | SettingsCategory::Readahead => unreachable!("development category in user settings"),
+            SettingsCategory::General => content.child(section("界面", cx).child(setting_row(
+                "user-setting-app-language",
+                "语言",
+                "应用界面语言",
+                app_language_selector(
+                    self.dropdown.clone(),
+                    self.controller.view_model().app_language,
+                    move |language, cx| {
+                        language_dialog.update(cx, |dialog, cx| dialog.select_app_language(language, cx))
+                    },
+                ),
+                cx,
+            ))),
             SettingsCategory::About => super::about::render_about(cx),
             SettingsCategory::Appearance => content.child(section("主题", cx).child(setting_row(
                 "user-setting-theme",
@@ -319,7 +343,7 @@ fn section(title: &'static str, cx: &App) -> gpui::Div {
             .border_color(theme.title_bar_border)
             .text_xs()
             .text_color(theme.muted_foreground)
-            .child(title),
+            .child(crate::i18n::tr(title, cx)),
     )
 }
 
@@ -347,13 +371,18 @@ fn setting_row(
                 .flex_1()
                 .min_w_0()
                 .gap_1()
-                .child(div().text_sm().text_color(theme.foreground).child(title))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .child(crate::i18n::tr(title, cx)),
+                )
                 .child(
                     div()
                         .text_xs()
                         .line_height(relative(1.5))
                         .text_color(theme.muted_foreground)
-                        .child(description),
+                        .child(crate::i18n::tr(description, cx)),
                 ),
         )
         .child(div().flex_shrink_0().child(control))

@@ -143,7 +143,7 @@ impl HomeContent {
                                             .flex_none()
                                             .text_sm()
                                             .text_color(theme.muted_foreground)
-                                            .child(total),
+                                            .child(crate::i18n::tr(total, cx)),
                                     )
                                 },
                             ))
@@ -399,7 +399,13 @@ pub(in crate::home) fn library_sort_trigger<T>(
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
-        .child(div().flex_1().min_w_0().truncate().child(label))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(crate::i18n::tr(label, cx)),
+        )
         .child(
             svg()
                 .path("icons/chevron-up-down.svg")
@@ -425,7 +431,7 @@ pub(in crate::home) fn library_sort_group_label<T>(
         .line_height(px(16.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.muted_foreground)
-        .child(label)
+        .child(crate::i18n::tr(label, cx))
 }
 
 pub(in crate::home) fn library_sort_option<T>(
@@ -471,7 +477,13 @@ pub(in crate::home) fn library_sort_option<T>(
                 theme.secondary_hover
             })
         })
-        .child(div().flex_1().min_w_0().truncate().child(label))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(crate::i18n::tr(label, cx)),
+        )
         .child(
             div()
                 .flex()

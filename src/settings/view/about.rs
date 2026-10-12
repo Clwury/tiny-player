@@ -54,7 +54,7 @@ pub(super) fn render_about(cx: &App) -> gpui::Div {
                         .text_sm()
                         .line_height(relative(1.5))
                         .text_color(theme.muted_foreground)
-                        .child("原生 Emby 桌面客户端"),
+                        .child(crate::i18n::tr("原生 Emby 桌面客户端", cx)),
                 )
                 .child(
                     div()
@@ -63,14 +63,17 @@ pub(super) fn render_about(cx: &App) -> gpui::Div {
                         .mt_3()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(format!("版本 {}", env!("CARGO_PKG_VERSION"))),
+                        .child(crate::i18n::tr(
+                            format!("版本 {}", env!("CARGO_PKG_VERSION")),
+                            cx,
+                        )),
                 )
                 .child(
                     div()
                         .id("settings-about-github")
                         .debug_selector(|| "settings-about-github".into())
                         .role(gpui::Role::Link)
-                        .aria_label("GitHub 项目链接")
+                        .aria_label(crate::i18n::tr("GitHub 项目链接", cx))
                         .aria_description(env!("CARGO_PKG_REPOSITORY"))
                         .mt_6()
                         .text_sm()

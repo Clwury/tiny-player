@@ -3,8 +3,9 @@ mod controls;
 mod items;
 mod layout;
 use super::controls::{
-    HARDWARE_DECODE_DESCRIPTION, disk_cache_capacity_control, disk_cache_capacity_input,
-    hardware_decode_selector, settings_category_button, settings_sidebar, track_language_selector,
+    HARDWARE_DECODE_DESCRIPTION, app_language_selector, disk_cache_capacity_control,
+    disk_cache_capacity_input, hardware_decode_selector, settings_category_button,
+    settings_sidebar, track_language_selector,
 };
 use super::dialog::SettingsChanged;
 use crate::ui::number_input::{NumberControl, NumberRange};
@@ -47,8 +48,8 @@ use crate::ui::{
 use crate::settings::values::{BYTES_PER_MIB, parse_seconds};
 use crate::settings::values::{bytes_to_mib, format_seconds, resolved_cache_directories};
 use crate::settings::{
-    NumericSetting, SettingDescriptor, SettingsCategory, SettingsController, SettingsIntent,
-    SettingsMode, SettingsSnapshot, ToggleSetting,
+    AppLanguage, NumericSetting, SettingDescriptor, SettingsCategory, SettingsController,
+    SettingsIntent, SettingsMode, SettingsSnapshot, ToggleSetting,
 };
 
 pub struct PlaybackSettingsDialogState {
@@ -219,6 +220,9 @@ impl PlaybackSettingsDialogState {
 
     fn dispatch(&mut self, intent: SettingsIntent, cx: &mut Context<Self>) {
         let change = self.controller.dispatch(intent);
+        if let Some(language) = change.app_language {
+            language.apply(cx);
+        }
         if let Some(selection) = change.theme {
             theme::set(selection, cx);
             self.controller
@@ -244,6 +248,9 @@ impl PlaybackSettingsDialogState {
     }
     fn select_color_theme(&mut self, selection: ColorTheme, cx: &mut Context<Self>) {
         self.dispatch(SettingsIntent::Theme(selection), cx);
+    }
+    fn select_app_language(&mut self, language: AppLanguage, cx: &mut Context<Self>) {
+        self.dispatch(SettingsIntent::AppLanguage(language), cx);
     }
     fn select_hardware_decode(&mut self, mode: HardwareDecodeMode, cx: &mut Context<Self>) {
         self.dispatch(SettingsIntent::HardwareDecode(mode), cx);

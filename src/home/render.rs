@@ -218,7 +218,12 @@ impl HomeContent {
             .flex_col()
             .gap_2()
             .child(home_section_title("需要重新登录", cx))
-            .child(div().text_sm().text_color(theme.error).child(error))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.error)
+                    .child(crate::i18n::tr(error, cx)),
+            )
     }
 }
 
