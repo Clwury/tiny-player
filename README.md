@@ -102,7 +102,27 @@ To build the prebuilt bundle yourself, set up Docker on an x86_64 Linux host and
 ./scripts/package-linux.sh
 ```
 
-The archive, checksum file, and build manifest are written to `dist/`. See the [Linux packaging guide](docs/linux-packaging.md) for details.
+By default, the tar.gz, AppImage, their SHA256 files, and build manifest are written to `dist/` from the same audited payload. See the [Linux packaging guide](docs/linux-packaging.md) for details.
+
+#### AppImage
+
+Alternatively, download `tiny-player-<version>-linux-x86_64.AppImage` and its `.sha256` file from the same release. Replace `<version>` with the downloaded version:
+
+```sh
+sha256sum --check "tiny-player-<version>-linux-x86_64.AppImage.sha256"
+chmod +x "tiny-player-<version>-linux-x86_64.AppImage"
+./tiny-player-<version>-linux-x86_64.AppImage
+```
+
+Without FUSE, use extraction mode:
+
+```sh
+./tiny-player-<version>-linux-x86_64.AppImage --appimage-extract-and-run
+```
+
+The static musl runtime does not require `libfuse2`, but normal AppImage mounting still requires working FUSE. The application still requires **glibc 2.39 or later** and the same host Vulkan loader/driver, audio configuration, fonts, Wayland/X11 session and desktop portal support described above. Software decoding still requires Vulkan for rendering; AppImage does not bundle GPU drivers or bypass portal requirements.
+
+Double-click launching, automatic desktop menu installation and automatic updates are not guaranteed. To update, close Tiny Player and replace the AppImage file. AppImage and tar.gz builds share the existing user settings and cache locations; settings are not stored beside the AppImage.
 
 ### Windows Portable Bundle
 

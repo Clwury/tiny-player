@@ -24,6 +24,13 @@ COPY build-ffmpeg.sh /opt/packaging/build-ffmpeg.sh
 ARG FFMPEG_REF=n9.0.2
 RUN bash /opt/packaging/build-ffmpeg.sh
 
+# Keep tool/runtime downloads in their own cached layer. Both are pinned by
+# SHA256, and appimagetool is run in extraction mode rather than using FUSE.
+RUN apt-get update && apt-get install -y --no-install-recommends file \
+    && rm -rf /var/lib/apt/lists/*
+COPY appimage.py appimage-tools.json /opt/packaging/
+RUN python3 /opt/packaging/appimage.py --prepare-tools /opt/appimage
+
 ENV PKG_CONFIG_PATH=/opt/tiny-player/lib/pkgconfig:/opt/tiny-player/share/pkgconfig
 ENV LD_LIBRARY_PATH=/opt/tiny-player/lib
 ENV CARGO_HOME=/build/cargo CARGO_TARGET_DIR=/build/target

@@ -102,7 +102,27 @@ tar -xzf "tiny-player-<version>-linux-x86_64.tar.gz"
 ./scripts/package-linux.sh
 ```
 
-归档、校验文件和构建清单输出到 `dist/`。更多信息见 [Linux 打包说明](docs/linux-packaging.md)。
+默认复用同一已审计 payload，同时将 tar.gz、AppImage、各自的 SHA256 校验文件和构建清单输出到 `dist/`。更多信息见 [Linux 打包说明](docs/linux-packaging.md)。
+
+#### AppImage
+
+也可从同一发布页下载 `tiny-player-<version>-linux-x86_64.AppImage` 及其 `.sha256` 文件。请替换为实际版本号：
+
+```sh
+sha256sum --check "tiny-player-<version>-linux-x86_64.AppImage.sha256"
+chmod +x "tiny-player-<version>-linux-x86_64.AppImage"
+./tiny-player-<version>-linux-x86_64.AppImage
+```
+
+无 FUSE 时使用解压运行模式：
+
+```sh
+./tiny-player-<version>-linux-x86_64.AppImage --appimage-extract-and-run
+```
+
+静态 musl runtime 无需 `libfuse2`，但正常挂载 AppImage 仍需要可用的 FUSE。应用仍要求 **glibc 2.39 或更新版本**，并依赖上述宿主 Vulkan loader/驱动、音频配置、字体、Wayland/X11 会话与桌面 portal 支持。软件解码仍需要 Vulkan 渲染；AppImage 不包含显卡驱动，也不绕过 portal 要求。
+
+不保证双击启动、自动安装桌面菜单或自动更新。更新时关闭 Tiny Player，再替换 AppImage 文件。AppImage 与 tar.gz 共用原有用户配置与缓存路径，不将配置存放在 AppImage 旁。
 
 ### Windows 便携包
 

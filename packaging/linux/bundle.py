@@ -13,6 +13,8 @@ import tarfile
 import tempfile
 import tomllib
 
+import appimage
+
 
 BASELINE = (2, 39)
 # These libraries must match the host's libc, drivers, fonts and audio plugins.
@@ -134,67 +136,146 @@ def audit_bundle(root):
     return manifest
 
 
+def assemble_payload(binary, repo, root, package):
+    """Collect native dependencies once, independently of the output format."""
+    for folder in ("bin", "lib", "licenses", "share/applications"):
+        (root / folder).mkdir(parents=True)
+    shutil.copy2(binary, root / "bin/tiny-player")
+    subprocess.run(["strip", "--strip-unneeded", str(root / "bin/tiny-player")], check=True)
+    for name, source in sorted(parse_ldd(run("ldd", str(binary))).items()):
+        if name in HOST_LIBRARIES:
+            continue
+        inspect_elf(source)
+        target = root / "lib" / name
+        shutil.copy2(source, target)
+        subprocess.run(["patchelf", "--set-rpath", "$ORIGIN", str(target)], check=True)
+        copy_package_copyright(source, root / "licenses")
+    subprocess.run([
+        "patchelf", "--set-rpath", "$ORIGIN/../lib", str(root / "bin/tiny-player")
+    ], check=True)
+    shutil.copytree(repo / "assets", root / "share/tiny-player/assets")
+    shutil.copy2(repo / "tiny-player.desktop", root / "share/applications")
+    for size, extension in (("256x256", "png"), ("scalable", "svg")):
+        icons = root / "share/icons/hicolor" / size / "apps"
+        icons.mkdir(parents=True)
+        shutil.copy2(repo / f"assets/icons/tiny-player.{extension}", icons)
+    shutil.copy2(repo / "LICENSE", root / f"licenses/tiny-player-{package['license']}.txt")
+    shutil.copytree("/opt/tiny-player/share/licenses", root / "licenses/native", dirs_exist_ok=True)
+    shutil.copytree("/opt/tiny-player/share/build-info", root / "build-info")
+    shutil.copy2(repo / "Cargo.lock", root / "build-info/Cargo.lock")
+    shutil.copy2(repo / "packaging/linux/build-native.sh", root / "build-info/build-native.sh")
+    shutil.copy2(repo / "packaging/linux/build-ffmpeg.sh", root / "build-info/build-ffmpeg.sh")
+    subprocess.run(["desktop-file-validate", str(root / "share/applications/tiny-player.desktop")], check=True)
+
+
+def write_checksum(path):
+    checksum = path.with_name(path.name + ".sha256")
+    checksum.write_text(f"{appimage.sha256(path)}  {path.name}\n")
+    return checksum
+
+
+def publish_artifacts(artifacts, output):
+    """Stage on the output filesystem and restore the previous set on failure."""
+    transaction = Path(tempfile.mkdtemp(prefix=".tiny-player-publish-", dir=output))
+    clean_up = True
+    replaced = []
+    try:
+        new = transaction / "new"
+        previous = transaction / "previous"
+        new.mkdir()
+        previous.mkdir()
+        for source in artifacts:
+            target = output / source.name
+            if target.is_dir():
+                raise ValueError(f"Refusing to replace an output directory: {target}")
+            shutil.copy2(source, new / source.name)
+        try:
+            for source in artifacts:
+                target = output / source.name
+                backup = previous / source.name
+                had_original = target.exists() or target.is_symlink()
+                replaced.append((target, backup, had_original))
+                if had_original:
+                    os.replace(target, backup)
+                os.replace(new / source.name, target)
+        except BaseException as error:
+            recovery_failed = False
+            for target, backup, had_original in reversed(replaced):
+                try:
+                    if backup.exists() or backup.is_symlink():
+                        os.replace(backup, target)
+                    elif not had_original:
+                        target.unlink(missing_ok=True)
+                except OSError:
+                    recovery_failed = True
+            if recovery_failed:
+                clean_up = False
+                raise RuntimeError(f"Could not restore release files; recovery files remain in {transaction}") from error
+            raise
+    finally:
+        if clean_up:
+            shutil.rmtree(transaction)
+
+
 def build_bundle(binary, output):
     repo = Path(__file__).resolve().parents[2]
     if run("getconf", "GNU_LIBC_VERSION").strip() != "glibc 2.39":
         raise ValueError("Build inside the Ubuntu 24.04 / glibc 2.39 container")
     inspect_elf(binary)
+    tools = appimage.TOOLS_DIR
+    tool_lock = appimage.verify_tools(tools)
+    runtime = tools / "runtime-x86_64"
+    runtime_info = inspect_elf(runtime)
+    if (runtime_info["needed"] or runtime_info["glibc_required"] != "0.0"
+            or re.search(r"\bINTERP\b", run("readelf", "--program-headers", "--wide", str(runtime)))):
+        raise ValueError("Expected a statically linked AppImage runtime without a glibc requirement")
     package = tomllib.loads((repo / "Cargo.toml").read_text())["package"]
     version = package["version"]
     artifact_name = f"tiny-player-{version}-linux-x86_64"
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="tiny-player-bundle-") as staging:
-        root = Path(staging) / "tiny-player"
-        for folder in ("bin", "lib", "licenses", "share/applications"):
-            (root / folder).mkdir(parents=True)
-        shutil.copy2(binary, root / "bin/tiny-player")
-        subprocess.run(["strip", "--strip-unneeded", str(root / "bin/tiny-player")], check=True)
-        for name, source in sorted(parse_ldd(run("ldd", str(binary))).items()):
-            if name in HOST_LIBRARIES:
-                continue
-            inspect_elf(source)
-            target = root / "lib" / name
-            shutil.copy2(source, target)
-            subprocess.run(["patchelf", "--set-rpath", "$ORIGIN", str(target)], check=True)
-            copy_package_copyright(source, root / "licenses")
-        subprocess.run([
-            "patchelf", "--set-rpath", "$ORIGIN/../lib", str(root / "bin/tiny-player")
-        ], check=True)
-        shutil.copytree(repo / "assets", root / "share/tiny-player/assets")
-        shutil.copy2(repo / "tiny-player.desktop", root / "share/applications")
-        for size, extension in (("256x256", "png"), ("scalable", "svg")):
-            icons = root / "share/icons/hicolor" / size / "apps"
-            icons.mkdir(parents=True)
-            shutil.copy2(repo / f"assets/icons/tiny-player.{extension}", icons)
-        shutil.copy2(repo / "LICENSE", root / f"licenses/tiny-player-{package['license']}.txt")
-        shutil.copytree("/opt/tiny-player/share/licenses", root / "licenses/native", dirs_exist_ok=True)
-        shutil.copytree("/opt/tiny-player/share/build-info", root / "build-info")
-        shutil.copy2(repo / "Cargo.lock", root / "build-info/Cargo.lock")
-        shutil.copy2(repo / "packaging/linux/build-native.sh", root / "build-info/build-native.sh")
-        shutil.copy2(repo / "packaging/linux/build-ffmpeg.sh", root / "build-info/build-ffmpeg.sh")
-        shutil.copy2(repo / "packaging/linux/install.sh", root / "install.sh")
-        (root / "install.sh").chmod(0o755)
-        shutil.copy2(repo / "packaging/linux/README.txt", root / "README.txt")
-        subprocess.run(["desktop-file-validate", str(root / "share/applications/tiny-player.desktop")], check=True)
+        staging = Path(staging)
+        root = staging / "tiny-player"
+        assemble_payload(binary, repo, root, package)
+        shutil.copy2(tools / "appimage-tools.json", root / "build-info/appimage-tools.json")
+        runtime_licenses = root / "licenses/appimage-runtime"
+        runtime_licenses.mkdir()
+        for relative, _ in appimage.tool_files(tool_lock):
+            if relative.startswith("licenses/"):
+                shutil.copy2(tools / relative, runtime_licenses / Path(relative).name)
         manifest = {
             "version": version,
             "architecture": "x86_64",
             "glibc_baseline": "2.39",
             "runtime_host_libraries": RUNTIME_HOST_LIBRARIES,
             "elf_files": audit_bundle(root),
+            "appimage_tools": tool_lock,
         }
         manifest_text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         (root / "manifest.json").write_text(manifest_text)
-        archive = output / f"{artifact_name}.tar.gz"
-        temporary_archive = Path(staging) / archive.name
-        with tarfile.open(temporary_archive, "w:gz") as tar:
+        appdir = appimage.create_appdir(root, staging / "TinyPlayer.AppDir")
+        image = staging / f"{artifact_name}.AppImage"
+        appimage.build_appimage(appdir, image, tools)
+        extracted = appimage.extract_appimage(image, staging / "extracted")
+        if audit_bundle(extracted) != manifest["elf_files"]:
+            raise ValueError("AppImage payload differs from the audited Linux bundle")
+        # Only the tar.gz installs a directory. Never copy that installer or its
+        # archive-specific instructions into the read-only AppImage payload.
+        shutil.copy2(repo / "packaging/linux/install.sh", root / "install.sh")
+        (root / "install.sh").chmod(0o755)
+        shutil.copy2(repo / "packaging/linux/README.txt", root / "README.txt")
+        archive = staging / f"{artifact_name}.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
             tar.add(root, arcname="tiny-player")
-        shutil.move(temporary_archive, archive)
-        (output / f"{artifact_name}.manifest.json").write_text(manifest_text)
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        (output / f"{artifact_name}.tar.gz.sha256").write_text(f"{digest}  {archive.name}\n")
-        print(f"Created {archive} ({archive.stat().st_size / 1024**2:.1f} MiB)")
-        print(f"Audited {len(manifest['elf_files'])} x86_64 ELF files: glibc <= 2.39")
+        manifest_file = staging / f"{artifact_name}.manifest.json"
+        manifest_file.write_text(manifest_text)
+        artifacts = [archive, write_checksum(archive), image, write_checksum(image), manifest_file]
+        # Complete both formats and the extraction audit before publishing files.
+        publish_artifacts(artifacts, output)
+        for name in (archive.name, image.name):
+            path = output / name
+            print(f"Created {path} ({path.stat().st_size / 1024**2:.1f} MiB)")
+        print(f"Audited {len(manifest['elf_files'])} x86_64 ELF files in both formats: glibc <= 2.39")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 name: Build and release
 
 on:
+  workflow_dispatch:
   push:
-    branches: [master]
+    branches: [master, dev]
 
 permissions:
   contents: read
@@ -42,6 +43,7 @@ jobs:
               output.write(f"version={version}\ntag=v{version}\n")
           PY
       - name: Reject an existing release tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
@@ -138,6 +140,15 @@ jobs:
             '
       - name: Assemble and audit Linux package
         run: ./scripts/package-linux.sh --skip-image-build
+      - name: Verify Linux package checksums
+        working-directory: dist
+        env:
+          RELEASE_VERSION: ${{ needs.checks.outputs.version }}
+        run: |
+          test -s "tiny-player-$RELEASE_VERSION-linux-x86_64.manifest.json"
+          sha256sum --check --strict \
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.tar.gz.sha256" \
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.AppImage.sha256"
       - name: Upload Linux release files
         uses: actions/upload-artifact@v7
         with:
@@ -146,6 +157,8 @@ jobs:
             dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.tar.gz
             dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.tar.gz.sha256
             dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.manifest.json
+            dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.AppImage
+            dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.AppImage.sha256
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -219,6 +232,7 @@ jobs:
 
   release:
     name: Publish complete release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: [checks, linux, windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -245,18 +259,24 @@ jobs:
             "tiny-player-$RELEASE_VERSION-linux-x86_64.tar.gz"
             "tiny-player-$RELEASE_VERSION-linux-x86_64.tar.gz.sha256"
             "tiny-player-$RELEASE_VERSION-linux-x86_64.manifest.json"
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.AppImage"
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.AppImage.sha256"
             "tiny-player-$RELEASE_VERSION-windows-x86_64.zip"
             "tiny-player-$RELEASE_VERSION-windows-x86_64.zip.sha256"
           )
           for asset in "${assets[@]}"; do test -s "$asset"; done
           sha256sum --check --strict \
             "tiny-player-$RELEASE_VERSION-linux-x86_64.tar.gz.sha256" \
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.AppImage.sha256" \
             "tiny-player-$RELEASE_VERSION-windows-x86_64.zip.sha256"
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          Linux: x86_64 GNU/Linux, glibc 2.39 or newer; extract the entire tar.gz.
+          Linux: x86_64 GNU/Linux, glibc 2.39 or newer; extract the entire tar.gz or chmod +x the AppImage and run it.
+          Without FUSE, run the AppImage with --appimage-extract-and-run. The static runtime needs no libfuse2, but normal mounting still needs FUSE.
+          Both Linux formats use the same audited payload; host Vulkan drivers, audio/font configuration and desktop portals are still required as applicable.
+          AppImage updates: close the app and replace the file; settings and caches are shared with the tar.gz package. No automatic menu installation or updates, or double-click support, are guaranteed.
           Windows: Windows 10 22H2 / Windows 11 x64; extract the entire ZIP and run tiny-player.exe.
 
-          Built from commit $GITHUB_SHA. Both packages include their native dependencies, assets and build metadata.
+          Built from commit $GITHUB_SHA. Linux and Windows packages include their native dependencies, assets and build metadata.
           SHA256 checksum files are attached.
           EOF
           gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \

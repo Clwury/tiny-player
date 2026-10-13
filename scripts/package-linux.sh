@@ -4,8 +4,8 @@ set -euo pipefail
 if [[ ${1:-} == --help ]]; then
     cat <<'EOF'
 Usage: scripts/package-linux.sh [--skip-image-build]
-Build an x86_64 Linux tar.gz with a glibc 2.39 baseline using Docker.
-Outputs: dist/*.tar.gz, dist/*.sha256 and dist/*.manifest.json
+Build x86_64 Linux tar.gz and AppImage packages with a glibc 2.39 baseline using Docker.
+Outputs: dist/*.tar.gz, dist/*.AppImage, their *.sha256 and dist/*.manifest.json
 Environment: CONTAINER_ENGINE (docker), BUILD_JOBS (4),
              TINY_LINUX_IMAGE (tiny-player-builder:glibc2.39)
 --skip-image-build uses an already built image (for CI's cached Buildx build).
@@ -38,6 +38,7 @@ fi
     "$builder_image" bash -s <<'BUILD'
 set -euo pipefail
 [[ $(uname -m) == x86_64 && $(getconf GNU_LIBC_VERSION) == 'glibc 2.39' ]]
+python3 -B packaging/linux/appimage.py --verify-tools /opt/appimage
 unset TINY_ASSET_DIR RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-C target-cpu=x86-64'
 cargo build --locked --release --target x86_64-unknown-linux-gnu
