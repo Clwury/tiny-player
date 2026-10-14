@@ -1,6 +1,7 @@
 //! Stateless playback elements. The page supplies display values and binds
 //! intents; components never read the page, session or backend.
 use super::playback_volume_percent;
+use super::{PLAYBACK_BACK_BUTTON_OFFSET_PX, PLAYBACK_BACK_BUTTON_SIZE_PX};
 use crate::{
     player::model::track_menu::{TrackMenuIntent, TrackMenuVm},
     theme,
@@ -148,6 +149,30 @@ pub(super) fn track_select_menu(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
         .child(content)
+}
+
+pub(in crate::player::page) fn track_switch_indicator(
+    label: SharedString,
+    cx: &App,
+) -> impl IntoElement {
+    let theme = theme::get(cx);
+    div()
+        .id("playback-track-switch-indicator")
+        .debug_selector(|| "playback-track-switch-indicator".to_string())
+        .absolute()
+        .left(px(PLAYBACK_BACK_BUTTON_OFFSET_PX
+            + PLAYBACK_BACK_BUTTON_SIZE_PX
+            + 12.0))
+        .top(px(PLAYBACK_BACK_BUTTON_OFFSET_PX))
+        .h(px(PLAYBACK_BACK_BUTTON_SIZE_PX))
+        .flex()
+        .items_center()
+        .max_w(relative(0.75))
+        .text_color(theme.accent)
+        .text_sm()
+        .line_height(px(20.0))
+        .truncate()
+        .child(label)
 }
 
 pub(in crate::player::page) fn volume_indicator(volume: f32, cx: &App) -> impl IntoElement {

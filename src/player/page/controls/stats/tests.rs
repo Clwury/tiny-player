@@ -523,7 +523,10 @@ fn progress_drag_across_stats_does_not_move_the_playback_window(cx: &mut gpui::T
         cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
         cx.run_until_parked();
         view.read_with(cx, |page, _| {
-            assert!(page.presentation.playback_details_visible);
+            assert_eq!(
+                page.presentation.active_overlay,
+                Some(PlaybackOverlay::Info)
+            );
             assert!(page.session.timeline().progress_drag_position.is_none());
         });
     }

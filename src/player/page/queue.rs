@@ -63,7 +63,7 @@ impl PlaybackPage {
         self.session.queue.cancel();
         self.queue_effects.task.cancel();
     }
-    fn begin_queue_switch(
+    pub(super) fn begin_queue_switch(
         &mut self,
         action: QueueAction,
         automatic: bool,

@@ -25,6 +25,10 @@ pub(in crate::player) enum PlaybackIntent {
     PreviewSeek(f64),
     SelectAudio(Option<usize>),
     SelectSubtitle(Option<PlaybackTrack>),
+    CycleTrack {
+        kind: PlaybackTrackKind,
+        backwards: bool,
+    },
 }
 
 // Produced and consumed synchronously within dispatch_control. No callback can
@@ -71,6 +75,21 @@ pub(in crate::player) struct TrackChoices<'a> {
 impl TrackChoices<'_> {
     pub(in crate::player) fn enabled(&self) -> bool {
         !self.tracks.is_empty() || self.selected.is_some()
+    }
+
+    fn cycled_track(&self, backwards: bool) -> Option<&PlaybackTrack> {
+        let current = self
+            .tracks
+            .iter()
+            .position(|track| Some(track.stream_index) == self.selected);
+        // Off is part of the cycle, as in mpv. Missing selections start from Off.
+        let next = match (current, backwards) {
+            (Some(index), true) => index.checked_sub(1)?,
+            (Some(index), false) => index + 1,
+            (None, true) => self.tracks.len().checked_sub(1)?,
+            (None, false) => 0,
+        };
+        self.tracks.get(next)
     }
 }
 
@@ -308,6 +327,23 @@ impl PlaybackSessionController {
                 track,
                 execute,
             ),
+            PlaybackIntent::CycleTrack { kind, backwards } => {
+                let view = self.controls_view();
+                let choice = match kind {
+                    PlaybackTrackKind::Audio => view.audio,
+                    PlaybackTrackKind::Subtitle => view.subtitles,
+                };
+                if !choice.enabled() {
+                    return ControlUpdate::default();
+                }
+                let track = choice.cycled_track(backwards).cloned();
+                self.select_track(
+                    kind,
+                    track.as_ref().map(|track| track.stream_index),
+                    track,
+                    execute,
+                )
+            }
         }
     }
 

@@ -3,6 +3,11 @@ use super::*;
 const SUBTITLE_VERTICAL_ADJUST_STEP_FRACTION: f32 = 0.01;
 
 impl PlaybackPage {
+    pub(super) fn toggle_subtitle_visibility(&mut self, cx: &mut Context<Self>) {
+        self.presentation.subtitle.hidden = !self.presentation.subtitle.hidden;
+        cx.notify();
+    }
+
     pub(super) fn adjust_subtitle_vertical_offset_fraction(
         &mut self,
         delta: f32,
@@ -20,6 +25,11 @@ impl PlaybackPage {
     }
 
     pub(super) fn render_subtitle_overlay(&self) -> impl IntoElement {
+        if self.presentation.subtitle.hidden {
+            return div()
+                .id("playback-subtitle-overlay-empty")
+                .into_any_element();
+        }
         let Some(cue) = self.presentation.subtitle.active.as_ref() else {
             return div()
                 .id("playback-subtitle-overlay-empty")
@@ -81,6 +91,7 @@ impl PlaybackPage {
         let bitmap_overlay = cue.bitmaps.iter().fold(
             div()
                 .id("playback-subtitle-bitmap-overlay")
+                .debug_selector(|| "playback-subtitle-bitmap-overlay".to_string())
                 .absolute()
                 .left(bitmap_bounds.origin.x)
                 .top(bitmap_top)
@@ -123,6 +134,7 @@ impl PlaybackPage {
             .child(
                 div()
                     .id("playback-subtitle-text-overlay")
+                    .debug_selector(|| "playback-subtitle-text-overlay".to_string())
                     .absolute()
                     .left(text_overlay_bounds.origin.x)
                     .top(text_overlay_bounds.origin.y)

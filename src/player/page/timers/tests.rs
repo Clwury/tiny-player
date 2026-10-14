@@ -113,7 +113,8 @@ fn stale_callbacks_keep_current_task_and_back_release_cancel_all_tasks(
 ) {
     let (page, cx) = test_support::playback_window(cx);
     let replaced = Arc::new(AtomicBool::new(false));
-    let on_back: [_; 4] = std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
+    let on_back: [_; PresentationTimer::ALL.len()] =
+        std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
     page.update(cx, |page, cx| {
         let old = page
             .presentation
@@ -133,6 +134,7 @@ fn stale_callbacks_keep_current_task_and_back_release_cancel_all_tasks(
             PresentationTimer::Controls,
             PresentationTimer::Rate,
             PresentationTimer::DownloadSpeed,
+            PresentationTimer::TrackSwitch,
         ] {
             page.presentation
                 .presentation_timers
@@ -149,7 +151,8 @@ fn stale_callbacks_keep_current_task_and_back_release_cancel_all_tasks(
     cx.update(|window, cx| page.update(cx, |page, cx| page.back_to_detail(window, cx)));
     cx.run_until_parked();
     assert!(on_back.iter().all(|flag| flag.load(Ordering::SeqCst)));
-    let on_release: [_; 4] = std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
+    let on_release: [_; PresentationTimer::ALL.len()] =
+        std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
     page.update(cx, |page, cx| {
         for kind in PresentationTimer::ALL {
             page.presentation.presentation_timers.tasks[kind.index()]

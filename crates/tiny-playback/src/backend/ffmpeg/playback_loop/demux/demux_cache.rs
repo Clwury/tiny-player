@@ -85,7 +85,10 @@ pub(super) use telemetry::{
 
 pub(super) struct DemuxPacketCache {
     shared: Arc<DemuxPacketCacheShared>,
-    handle: Option<JoinHandle<()>>,
+    // StreamInfo borrows AVStreams from this input. Retain a stopped worker's
+    // input in the join result until the cache is released: decoder startup
+    // and track queries may still use its stream parameters after demux stops.
+    handle: Option<JoinHandle<FormatContext>>,
 }
 
 struct DemuxPacketCacheShared {

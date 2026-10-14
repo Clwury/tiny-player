@@ -28,19 +28,22 @@ libudev 及其链接依赖并执行相同的 ELF 审计；运行时由用户会�
 
 ## GitHub Actions 发布
 
-推送到 `master` 后，`.github/workflows/release.yml` 从根 `Cargo.toml` 读取版本，
-以 `v<version>` 为标签创建 Release。推送前需修改应用版本并同步提交 `Cargo.lock`；
+推送到 `master` 或在 `master` 上手动运行时，`.github/workflows/release.yml` 执行相同的
+完整发布流程：从根 `Cargo.toml` 读取版本，以 `v<version>` 为标签创建 Release。
+触发发布前需修改应用版本并同步提交 `Cargo.lock`；
 已有标签会使检查失败，不覆盖已有发布。检查通过后，两端并行构建、运行测试与 Clippy，
 完成 ELF/PE 审计并上传构建产物；只有两端都成功才发布包含全部附件的 Release。
 上传过程先创建草稿，附件上传成功后才公开。CI 不要求桌面会话或真实 GPU 播放验收。
-不同版本的推送独立构建，不取消先前推送；Latest 按 GitHub 的版本及创建时间规则选择。
+不同版本的发布运行独立构建，不取消先前运行；Latest 按 GitHub 的版本及创建时间规则选择。
 
-推送到 `dev` 时自动运行同一套来源检查、Linux 和 Windows 测试、Clippy、打包及 artifact
-上传，用于开发分支验证。`dev` 不检查标签是否已存在，不要求每次推送都增加版本号，
-也不创建标签或发布 Release；标签冲突检查与正式发布仅在 `master` push 时执行。
+推送到 `dev` 不会自动触发构建。开发分支验证需在 GitHub Actions 页面选择
+`Build and release`，点击 `Run workflow`，选择 `dev` 分支后手动运行；构建会执行
+同一套来源检查、Linux 和 Windows 测试、Clippy、打包及 artifact 上传。
 
-也可通过 `workflow_dispatch` 手动构建任意包含该 workflow 的分支；手动运行执行相同
-验证和 artifact 上传，不创建标签或发布 Release，包括在 `master` 上手动运行时。
+`workflow_dispatch` 支持手动运行任意包含该 workflow 的分支。选择 `master` 时，
+会执行标签冲突检查，并在两端构建成功后创建标签和发布 Release，与 `master` push 相同。
+选择 `dev` 或其他分支时，只执行验证、打包和 artifact 上传，不检查标签是否已存在，
+不要求增加版本号，也不创建标签或发布 Release。
 Linux 上传前校验 tar.gz 与 AppImage 的 SHA256；artifact 保留 7 天。GitHub 的手动运行
 入口需要默认分支已包含此 workflow。
 

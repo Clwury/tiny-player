@@ -343,7 +343,7 @@ fn episode_drawer_hides_controls_and_restores_them_when_dismissed(cx: &mut TestA
     }
 
     page.update(cx, |page, cx| {
-        page.presentation.playback_details_visible = true;
+        page.presentation.active_overlay = Some(PlaybackOverlay::Info);
         cx.notify();
     });
     for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {

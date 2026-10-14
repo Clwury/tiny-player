@@ -7,7 +7,7 @@ pub(super) use crate::player::model::timers::{PresentationTimer, PresentationTim
 // these local timers have no IO failures or user-facing error notification key.
 pub(super) struct PresentationEffects {
     model: PresentationTimers,
-    tasks: [EffectHandle<gpui::Task<()>>; 4],
+    tasks: [EffectHandle<gpui::Task<()>>; PresentationTimer::ALL.len()],
 }
 
 impl PresentationEffects {
@@ -77,7 +77,8 @@ impl PlaybackPage {
             PresentationTimer::Rate => {
                 std::mem::take(&mut self.presentation.rate_indicator_visible)
             }
-            PresentationTimer::DownloadSpeed => self.progress_bar_visible(),
+            PresentationTimer::DownloadSpeed => self.overlay_toolbar_visible(),
+            PresentationTimer::TrackSwitch => self.presentation.track_switch_label.take().is_some(),
         };
         if changed {
             cx.notify();

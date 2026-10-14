@@ -46,7 +46,7 @@ impl PlaybackPage {
         }
     }
 
-    pub(in super::super) fn render_download_speed(&self, cx: &Context<Self>) -> impl IntoElement {
+    pub(in super::super) fn render_download_speed(&self, cx: &Context<Self>) -> Option<gpui::Div> {
         download_speed_indicator(self.presentation.download_speed.label.clone(), cx)
     }
 }
@@ -73,28 +73,24 @@ fn http_download_speed_label(
     Some(speed)
 }
 
-fn download_speed_indicator(label: Option<String>, cx: &gpui::App) -> impl IntoElement {
-    let Some(label) = label else {
-        return div().into_any_element();
-    };
+fn download_speed_indicator(label: Option<String>, cx: &gpui::App) -> Option<gpui::Div> {
+    let label = label?;
     let theme = theme::get(cx);
 
-    div()
-        .debug_selector(|| "playback-download-speed".to_string())
-        .absolute()
-        .right(px(PLAYBACK_BACK_BUTTON_OFFSET_PX))
-        .top(px(PLAYBACK_BACK_BUTTON_OFFSET_PX))
-        .h(px(PLAYBACK_BACK_BUTTON_SIZE_PX))
-        .min_w(px(112.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .px_3()
-        .text_sm()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(theme.accent)
-        .child(label)
-        .into_any_element()
+    Some(
+        div()
+            .debug_selector(|| "playback-download-speed".to_string())
+            .h(px(PLAYBACK_BACK_BUTTON_SIZE_PX))
+            .min_w(px(112.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .px_3()
+            .text_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.accent)
+            .child(label),
+    )
 }
 
 #[cfg(test)]
@@ -303,7 +299,13 @@ mod tests {
                     .size_full()
                     .overflow_hidden()
                     .child(div().size_full().bg(rgb(0x000000)))
-                    .child(download_speed_indicator(Some("—".into()), cx))
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(PLAYBACK_BACK_BUTTON_OFFSET_PX))
+                            .top(px(PLAYBACK_BACK_BUTTON_OFFSET_PX))
+                            .children(download_speed_indicator(Some("—".into()), cx)),
+                    )
             }
         }
 

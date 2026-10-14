@@ -27,8 +27,9 @@ struct PlaybackControlsRenderState {
 mod download_speed;
 pub(super) use download_speed::DownloadSpeedDisplay;
 mod components;
+mod overlays;
 mod progress;
-pub(super) use components::{playback_control_button, volume_indicator};
+pub(super) use components::{playback_control_button, track_switch_indicator, volume_indicator};
 mod render;
 mod stats;
 use stats::*;
@@ -53,6 +54,7 @@ impl PlaybackPage {
         }
         if let Some(kind) = update.remember_track {
             self.remember_track_choice(kind, cx);
+            self.show_track_switch_indicator(kind, cx);
         }
         if let Some(settings) = update.volume_changed {
             cx.emit(PlaybackEvent::VolumeChanged { settings });

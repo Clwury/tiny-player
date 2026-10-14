@@ -3,7 +3,11 @@ use super::*;
 use crate::player::model::shortcuts::{
     LONG_SEEK_STEP_SECONDS, PlaybackShortcut, SEEK_STEP_SECONDS,
 };
+use crate::player::queue::QueueAction;
 use tiny_playback::PlaybackRateChange;
+
+#[cfg(test)]
+mod interaction_tests;
 
 impl PlaybackPage {
     pub(super) fn handle_key_down(
@@ -26,14 +30,6 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if shortcut == PlaybackShortcut::ExitFullscreen {
-            if self.close_episode_list(cx) {
-                return true;
-            }
-            if !window.is_fullscreen() {
-                return false;
-            }
-        }
         match shortcut {
             PlaybackShortcut::TogglePlayback => self.toggle_playback_pause_command(cx),
             PlaybackShortcut::ToggleFullscreen => {
@@ -41,16 +37,22 @@ impl PlaybackPage {
                 window.toggle_fullscreen();
                 cx.notify();
             }
-            PlaybackShortcut::ExitFullscreen => {
-                self.reset_fullscreen_controls();
-                window.toggle_fullscreen();
-                cx.notify();
+            PlaybackShortcut::Escape => {
+                if self.close_episode_list(cx) {
+                    return true;
+                }
+                if window.is_fullscreen() {
+                    self.reset_fullscreen_controls();
+                    window.toggle_fullscreen();
+                    cx.notify();
+                } else {
+                    self.back_to_detail(window, cx);
+                }
             }
             PlaybackShortcut::Back => {
                 if self.close_episode_list(cx) || self.close_track_select(cx) {
                     self.schedule_fullscreen_controls_hide(cx);
-                } else if self.presentation.playback_details_visible {
-                    self.presentation.playback_details_visible = false;
+                } else if self.presentation.active_overlay.take().is_some() {
                     cx.notify();
                 } else {
                     self.back_to_detail(window, cx);
@@ -74,10 +76,23 @@ impl PlaybackPage {
                 self.seek_relative(f64::from(seconds), window, cx);
                 cx.notify();
             }
-            PlaybackShortcut::ToggleInfoOverlay => {
-                self.presentation.playback_details_visible =
-                    !self.presentation.playback_details_visible;
-                cx.notify();
+            PlaybackShortcut::ToggleInfoOverlay => self.toggle_overlay(PlaybackOverlay::Info, cx),
+            PlaybackShortcut::ToggleEpisodeList => self.toggle_episode_list_command(cx),
+            PlaybackShortcut::NextSubtitleTrack => {
+                self.cycle_playback_track(PlaybackTrackKind::Subtitle, false, window, cx);
+            }
+            PlaybackShortcut::PreviousSubtitleTrack => {
+                self.cycle_playback_track(PlaybackTrackKind::Subtitle, true, window, cx);
+            }
+            PlaybackShortcut::ToggleSubtitleVisibility => self.toggle_subtitle_visibility(cx),
+            PlaybackShortcut::CycleAudioTrack => {
+                self.cycle_playback_track(PlaybackTrackKind::Audio, false, window, cx);
+            }
+            PlaybackShortcut::PreviousEpisode => {
+                self.begin_queue_switch(QueueAction::Previous, false, window, cx);
+            }
+            PlaybackShortcut::NextEpisode => {
+                self.begin_queue_switch(QueueAction::Next, false, window, cx);
             }
             PlaybackShortcut::RaiseSubtitle => {
                 self.adjust_subtitle_vertical_offset_fraction(subtitle_vertical_adjust_step(), cx);
@@ -113,7 +128,11 @@ fn playback_shortcut_for_event(event: &KeyDownEvent) -> Option<PlaybackShortcut>
             .or(match keystroke.key.as_str() {
                 "[" => Some("{"),
                 "]" => Some("}"),
-                "/" | "*" | "{" | "}" => Some(keystroke.key.as_str()),
+                "j" | "J" => Some("J"),
+                "3" => Some("#"),
+                "," => Some("<"),
+                "." => Some(">"),
+                "/" | "*" | "{" | "}" | "#" | "<" | ">" => Some(keystroke.key.as_str()),
                 _ => None,
             })?
     } else {
@@ -125,7 +144,10 @@ fn playback_shortcut_for_event(event: &KeyDownEvent) -> Option<PlaybackShortcut>
         PlaybackShortcut::DecreaseVolume | PlaybackShortcut::IncreaseVolume
     );
     let adjusts_rate = matches!(shortcut, PlaybackShortcut::ChangeRate(_));
-    if modifiers.shift && !adjusts_volume && !(adjusts_rate && matches!(key, "[" | "]" | "{" | "}"))
+    if modifiers.shift
+        && !adjusts_volume
+        && !(adjusts_rate && matches!(key, "[" | "]" | "{" | "}"))
+        && !matches!(key, "J" | "#" | "<" | ">")
     {
         return None;
     }
@@ -157,7 +179,7 @@ pub(super) fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
     } else if key.eq_ignore_ascii_case("f") {
         Some(PlaybackShortcut::ToggleFullscreen)
     } else if key.eq_ignore_ascii_case("escape") {
-        Some(PlaybackShortcut::ExitFullscreen)
+        Some(PlaybackShortcut::Escape)
     } else if key.eq_ignore_ascii_case("left") {
         Some(PlaybackShortcut::SeekRelative(-SEEK_STEP_SECONDS))
     } else if key.eq_ignore_ascii_case("right") {
@@ -168,6 +190,20 @@ pub(super) fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
         Some(PlaybackShortcut::SeekRelative(-LONG_SEEK_STEP_SECONDS))
     } else if key.eq_ignore_ascii_case("i") {
         Some(PlaybackShortcut::ToggleInfoOverlay)
+    } else if key.eq_ignore_ascii_case("f8") {
+        Some(PlaybackShortcut::ToggleEpisodeList)
+    } else if key == "j" {
+        Some(PlaybackShortcut::NextSubtitleTrack)
+    } else if key == "J" {
+        Some(PlaybackShortcut::PreviousSubtitleTrack)
+    } else if key.eq_ignore_ascii_case("v") {
+        Some(PlaybackShortcut::ToggleSubtitleVisibility)
+    } else if key == "#" {
+        Some(PlaybackShortcut::CycleAudioTrack)
+    } else if key == "<" {
+        Some(PlaybackShortcut::PreviousEpisode)
+    } else if key == ">" || key.eq_ignore_ascii_case("enter") {
+        Some(PlaybackShortcut::NextEpisode)
     } else if key.eq_ignore_ascii_case("r") {
         Some(PlaybackShortcut::RaiseSubtitle)
     } else if key.eq_ignore_ascii_case("t") {
@@ -304,6 +340,51 @@ mod tests {
     }
 
     #[test]
+    fn mpv_track_and_playlist_shortcuts_support_typed_and_shifted_keys() {
+        for (keys, shortcut) in [
+            (vec!["f8", "F8"], PlaybackShortcut::ToggleEpisodeList),
+            (vec!["j"], PlaybackShortcut::NextSubtitleTrack),
+            (
+                vec!["J", "shift-j", "shift-j->J", "shift-J"],
+                PlaybackShortcut::PreviousSubtitleTrack,
+            ),
+            (vec!["v"], PlaybackShortcut::ToggleSubtitleVisibility),
+            (
+                vec!["#", "shift-3", "shift-3->#", "shift-#"],
+                PlaybackShortcut::CycleAudioTrack,
+            ),
+            (
+                vec!["<", "shift-,", "shift-,-><", "shift-<"],
+                PlaybackShortcut::PreviousEpisode,
+            ),
+            (
+                vec![">", "shift-.", "shift-.->>", "shift->", "enter"],
+                PlaybackShortcut::NextEpisode,
+            ),
+        ] {
+            for key in keys {
+                assert_eq!(shortcut_for_keystroke(key, false), Some(shortcut), "{key}");
+                assert_eq!(shortcut_for_keystroke(key, true), None, "held {key}");
+            }
+        }
+        for key in [
+            ",",
+            ".",
+            "3",
+            "shift-3->£",
+            "shift-,->;",
+            "shift-.->:",
+            "shift-v->V",
+            "shift-enter",
+            "shift-enter->enter",
+            "shift-f8",
+            "shift-f8->f8",
+        ] {
+            assert_eq!(shortcut_for_keystroke(key, false), None, "{key}");
+        }
+    }
+
+    #[test]
     fn playback_shortcuts_ignore_control_alt_platform_and_function_modifiers() {
         for modifier in ["ctrl", "alt", "super", "fn"] {
             for key in [
@@ -317,6 +398,15 @@ mod tests {
                 "right",
                 "up",
                 "down",
+                "j",
+                "shift-j->J",
+                "v",
+                "#",
+                "shift-3->#",
+                "<",
+                ">",
+                "enter",
+                "f8",
             ] {
                 let keystroke = format!("{modifier}-{key}");
                 assert_eq!(
@@ -376,7 +466,7 @@ mod tests {
         );
         assert_eq!(
             playback_shortcut_for_key("escape"),
-            Some(PlaybackShortcut::ExitFullscreen)
+            Some(PlaybackShortcut::Escape)
         );
         assert_eq!(
             playback_shortcut_for_key("left"),
@@ -398,6 +488,9 @@ mod tests {
             playback_shortcut_for_key("t"),
             Some(PlaybackShortcut::LowerSubtitle)
         );
-        assert_eq!(playback_shortcut_for_key("enter"), None);
+        assert_eq!(
+            playback_shortcut_for_key("enter"),
+            Some(PlaybackShortcut::NextEpisode)
+        );
     }
 }

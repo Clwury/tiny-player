@@ -66,7 +66,8 @@ use super::model::source::{PlaybackSourceState, PlaybackTrackState, playback_pro
 use super::model::timeline::PlaybackTimelineState;
 use super::session::PlaybackIntent;
 use presentation::{
-    PlaybackPresentationState, PlaybackTimelinePresentation, SubtitleOverlayState, WindowDragState,
+    PlaybackOverlay, PlaybackPresentationState, PlaybackTimelinePresentation, SubtitleOverlayState,
+    WindowDragState,
 };
 use progress::{
     ProgressBarDrag, clamp_playback_position, format_playback_time, progress_fraction_for_cursor,

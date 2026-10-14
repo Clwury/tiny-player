@@ -80,7 +80,11 @@ impl PlaybackPage {
                                 .as_ref()
                                 .is_some_and(|input| input.accepts(&message))
                         {
-                            page.handle_gamepad_shortcut(message.shortcut, window, cx);
+                            if let Some(shortcut) = message.shortcut {
+                                page.handle_gamepad_shortcut(shortcut, window, cx);
+                            } else {
+                                page.record_gamepad_press(cx);
+                            }
                         }
                     })
                     .is_err()
@@ -97,6 +101,7 @@ impl PlaybackPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.record_gamepad_press(cx);
         // Menus retain their existing mouse interaction. B dismisses them;
         // directional shortcuts must not seek while a menu is being inspected.
         let menu_open = self.presentation.episode_list.open
@@ -107,7 +112,7 @@ impl PlaybackPage {
         }
         let returning_to_detail = shortcut == PlaybackShortcut::Back
             && !menu_open
-            && !self.presentation.playback_details_visible;
+            && self.presentation.active_overlay.is_none();
         if !self.dispatch_playback_shortcut(shortcut, window, cx) || returning_to_detail {
             return;
         }
@@ -122,6 +127,12 @@ impl PlaybackPage {
             );
         }
         cx.notify();
+    }
+
+    fn record_gamepad_press(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::replace(&mut self.presentation.gamepad_help_first, true) {
+            cx.notify();
+        }
     }
 }
 

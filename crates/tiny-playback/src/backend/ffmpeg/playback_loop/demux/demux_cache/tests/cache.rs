@@ -10,6 +10,8 @@ mod forward_cache;
 mod h264_ranges;
 #[path = "cache/hevc_ranges.rs"]
 mod hevc_ranges;
+#[path = "cache/input_lifetime.rs"]
+mod input_lifetime;
 #[path = "cache/pause_read.rs"]
 mod pause_read;
 #[path = "cache/pruning_storage.rs"]

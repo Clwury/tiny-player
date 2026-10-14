@@ -1,5 +1,9 @@
 use super::*;
 
+const TRACK_SWITCH_INDICATOR_HIDE_DELAY: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+mod indicator_tests;
 #[cfg(test)]
 mod interaction_tests;
 
@@ -71,6 +75,55 @@ impl PlaybackPage {
         if update.clear_subtitle {
             defer_drop_subtitle(&mut self.presentation.subtitle, window);
         }
+    }
+
+    pub(in super::super) fn cycle_playback_track(
+        &mut self,
+        kind: PlaybackTrackKind,
+        backwards: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let update = self.dispatch_control(PlaybackIntent::CycleTrack { kind, backwards }, cx);
+        if update.clear_subtitle {
+            defer_drop_subtitle(&mut self.presentation.subtitle, window);
+        }
+    }
+
+    pub(super) fn show_track_switch_indicator(
+        &mut self,
+        kind: PlaybackTrackKind,
+        cx: &mut Context<Self>,
+    ) {
+        let view = self.session.controls_view();
+        let (prefix, choice) = match kind {
+            PlaybackTrackKind::Audio => ("音轨", view.audio),
+            PlaybackTrackKind::Subtitle => ("字幕", view.subtitles),
+        };
+        let name = match choice.selected {
+            None => crate::i18n::tr("关闭", cx),
+            Some(index) => {
+                let track = choice
+                    .tracks
+                    .iter()
+                    .find(|track| track.stream_index == index);
+                match track {
+                    Some(track) if track.is_external => {
+                        crate::i18n::tr(format!("{} 外挂", track.label), cx)
+                    }
+                    Some(track) => crate::i18n::tr(track.label.clone(), cx),
+                    None => format!("#{index}").into(),
+                }
+            }
+        };
+        self.presentation.track_switch_label =
+            Some(crate::i18n::tr(format!("{prefix}：{name}"), cx));
+        self.schedule_presentation_timer(
+            PresentationTimer::TrackSwitch,
+            TRACK_SWITCH_INDICATOR_HIDE_DELAY,
+            cx,
+        );
+        cx.notify();
     }
 
     pub(in crate::player::page) fn remember_track_choice(

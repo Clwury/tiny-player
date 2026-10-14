@@ -7,14 +7,16 @@ pub(in crate::player) enum PresentationTimer {
     Volume,
     Rate,
     DownloadSpeed,
+    TrackSwitch,
 }
 
 impl PresentationTimer {
-    pub(in crate::player) const ALL: [Self; 4] = [
+    pub(in crate::player) const ALL: [Self; 5] = [
         Self::Controls,
         Self::Volume,
         Self::Rate,
         Self::DownloadSpeed,
+        Self::TrackSwitch,
     ];
 
     pub(in crate::player) fn index(self) -> usize {
@@ -23,6 +25,7 @@ impl PresentationTimer {
             Self::Volume => 1,
             Self::Rate => 2,
             Self::DownloadSpeed => 3,
+            Self::TrackSwitch => 4,
         }
     }
 
@@ -32,6 +35,7 @@ impl PresentationTimer {
             Self::Volume => RequestScope::PlaybackVolumeHide,
             Self::Rate => RequestScope::PlaybackRateHide,
             Self::DownloadSpeed => RequestScope::PlaybackSpeedRefresh,
+            Self::TrackSwitch => RequestScope::PlaybackTrackSwitchHide,
         }
     }
 }
@@ -39,7 +43,7 @@ impl PresentationTimer {
 // One page owns these slots. Input/render schedules deadlines; hover/reset
 // cancels controls; back closes all slots permanently; release invalidates Drop.
 pub(in crate::player) struct PresentationTimers {
-    slots: [RequestSlot; 4],
+    slots: [RequestSlot; PresentationTimer::ALL.len()],
     closed: bool,
 }
 
@@ -94,6 +98,7 @@ mod tests {
             PresentationTimer::Controls,
             PresentationTimer::Volume,
             PresentationTimer::Rate,
+            PresentationTimer::TrackSwitch,
         ] {
             let first = timers.begin(kind).unwrap();
             let mut last = first.clone();

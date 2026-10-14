@@ -22,17 +22,19 @@ Gamepads are detected automatically on the playback page. The active playback wi
 | Button (Deck / Xbox layout) | Action |
 | --- | --- |
 | A | Play / pause |
-| B | Close the episode list, track/cache menu, or information overlay; otherwise return to media details |
-| D-pad left / right | Seek backward / forward 5 seconds |
-| D-pad down / up | Lower / raise volume by 2 percentage points |
+| B | Close the episode list, track/cache menu, or information/shortcut overlay; otherwise return to media details |
+| ← / → | Seek backward / forward 5 seconds |
+| ↓ / ↑ | Lower / raise volume by 2 percentage points |
 | LB / RB | Seek backward / forward 60 seconds |
 | X | Toggle mute |
 | Y | Toggle playback information |
 | Menu / Start | Toggle fullscreen |
 | View / Select | Show / hide playback controls |
 | LT / RT | Decrease / increase playback speed |
-| Left stick click | Reset playback speed to 1× |
-| Hold right stick click + D-pad up / down | Raise / lower subtitle position |
+| L3 | Reset playback speed to 1× |
+| R3-↑ / R3-↓ | Hold R3 to raise / lower subtitle position |
+
+L3 / R3 refer to clicking the left / right stick, and arrows refer to the D-pad. The playback shortcut overlay also includes the full gamepad button reference. After gamepad button input, gamepad help appears above keyboard help for the current playback page.
 
 Seeking and volume repeat while held; other actions require a new press. Input stops when the window loses focus or playback closes. Playback controls remain visible for three seconds after gamepad actions. B closes open menus; their item selection and media browsing continue to use the existing mouse/keyboard interface. Keyboard shortcuts retain their existing mappings.
 
@@ -181,13 +183,21 @@ cargo run --locked
 
 These shortcuts are active when the playback page has keyboard focus:
 
+The keyboard and information icons to the right of the cache speed toggle keyboard and gamepad shortcut help and playback information. Both overlays share the same position; opening either closes the other. Keys appear as italic tags with a translucent accent color background. Key combinations use `-`, and alternative keys for the same action appear in separate tags with `/` between them. Descriptions follow the interface language.
+
 | Key | Action |
 | --- | --- |
 | `Space` / `P` | Play / pause |
 | `F` | Toggle fullscreen |
-| `Esc` | Close the episode list if open; otherwise, exit fullscreen |
+| `Esc` | Close the episode list if open; otherwise exit fullscreen, or return to media details when windowed |
 | `←` / `→` | Seek backward / forward 5 seconds |
 | `↓` / `↑` | Seek backward / forward 60 seconds |
+| `j` / `Shift` + `J` | Cycle to the next / previous subtitle track, including Off |
+| `v` | Show / hide subtitles while keeping the selected track |
+| `#` | Cycle audio tracks, including Off (usually `Shift` + `3`) |
+| `<` / `>` | Previous / next playlist episode (usually `Shift` + `,` / `.`) |
+| `Enter` | Next playlist episode |
+| `F8` | Show / hide the playlist (episode list) |
 | `9` / `/` | Decrease volume by 2 percentage points |
 | `0` / `*` | Increase volume by 2 percentage points |
 | `M` | Mute / unmute |
@@ -198,7 +208,9 @@ These shortcuts are active when the playback page has keyboard focus:
 | `R` / `T` | Move subtitles up / down by 1% of the displayed video height |
 | `I` | Show / hide playback information |
 
-Playback speed ranges from **0.25× to 4×**. Volume shortcuts also support the numeric keypad's divide and multiply keys. Holding a volume or speed adjustment key repeats the adjustment. Holding an arrow key repeats seeking: left and right seek 5 seconds per repeat, while up and down seek 60 seconds per repeat. Toggle shortcuts still run once per press.
+Playback speed ranges from **0.25× to 4×**. Volume shortcuts also support the numeric keypad's divide and multiply keys. Holding a volume or speed adjustment key repeats the adjustment. Holding an arrow key repeats seeking: left and right seek 5 seconds per repeat, while up and down seek 60 seconds per repeat. Playback, fullscreen, mute, subtitle and playlist visibility, track switching, and episode switching run once per press. Episode switching stops at the first and last playlist entries without wrapping.
+
+After a successful subtitle or audio track change through a shortcut or menu, “Subtitles: track name” or “Audio: track name” appears beside the Back button in the theme accent color for two seconds. Further changes update the name and restart the timer. Disabling a track displays Off.
 
 Mouse controls over the playback area:
 

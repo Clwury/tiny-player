@@ -24,6 +24,7 @@ impl PlaybackPage {
         self.presentation.fullscreen.controls_visible = false;
         self.presentation.fullscreen.mouse_in_controls = false;
         self.presentation.fullscreen.mouse_in_back_button = false;
+        self.presentation.fullscreen.mouse_in_toolbar = false;
         self.presentation
             .timeline_presentation
             .progress_hover_cursor = None;
@@ -44,6 +45,7 @@ impl PlaybackPage {
 
     pub(super) fn hide_idle_fullscreen_controls(&mut self, cx: &mut Context<Self>) {
         if self.presentation.episode_list.open
+            || self.presentation.fullscreen.mouse_in_toolbar
             || !playback_controls_should_hide(
                 self.presentation.fullscreen.mouse_in_controls,
                 self.presentation.fullscreen.mouse_in_back_button,

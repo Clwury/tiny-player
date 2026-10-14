@@ -70,7 +70,7 @@ fn back_dismisses_overlays_before_returning_and_stops_retained_page_input(
     page.update(cx, |page, _| {
         page.presentation.episode_list.open = true;
         page.presentation.track_select_open = Some(PlaybackTrackKind::Audio);
-        page.presentation.playback_details_visible = true;
+        page.presentation.active_overlay = Some(PlaybackOverlay::Info);
     });
     for _ in 0..3 {
         dispatch(&page, cx, PlaybackShortcut::Back);
@@ -101,6 +101,7 @@ fn open_menus_consume_gamepad_transport_shortcuts(cx: &mut gpui::TestAppContext)
         dispatch(&page, cx, shortcut);
     }
     assert!(backend.borrow().commands.is_empty());
+    assert!(page.read_with(cx, |page, _| page.presentation.gamepad_help_first));
     dispatch(&page, cx, PlaybackShortcut::Back);
     dispatch(&page, cx, PlaybackShortcut::SeekRelative(5));
     assert_eq!(
@@ -160,6 +161,7 @@ fn delivery_rejects_actions_queued_before_focus_loss_and_back(cx: &mut gpui::Tes
     cx.update(|window, _| window.activate_window());
     cx.run_until_parked();
     assert!(backend.borrow().commands.is_empty());
+    assert!(!page.read_with(cx, |page, _| page.presentation.gamepad_help_first));
     let message = page.read_with(cx, |page, _| {
         page.gamepad
             .input
@@ -170,6 +172,7 @@ fn delivery_rejects_actions_queued_before_focus_loss_and_back(cx: &mut gpui::Tes
     sender.try_send(message).unwrap();
     cx.run_until_parked();
     assert!(page.read_with(cx, |page, _| page.session.timeline().user_paused));
+    assert!(page.read_with(cx, |page, _| page.presentation.gamepad_help_first));
     cx.update(|window, cx| {
         page.update(cx, |page, cx| {
             let message = page
@@ -188,6 +191,56 @@ fn delivery_rejects_actions_queued_before_focus_loss_and_back(cx: &mut gpui::Tes
         Some(45.0)
     );
     assert!(sender.is_closed());
+}
+
+#[gpui::test]
+fn modifier_input_moves_gamepad_help_above_keyboard_and_keeps_that_order_when_reopened(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (page, cx) = test_support::playback_window(cx);
+    cx.simulate_resize(gpui::size(px(1280.0), px(1100.0)));
+    cx.run_until_parked();
+    let button = cx
+        .debug_bounds("playback-keyboard-button")
+        .unwrap()
+        .center();
+    cx.simulate_click(button, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let keyboard = cx.debug_bounds("playback-shortcut-section").unwrap();
+    let gamepad = cx.debug_bounds("playback-gamepad-section").unwrap();
+    assert!(keyboard.bottom() < gamepad.top());
+
+    let backend = Rc::new(RefCell::new(FakeState::default()));
+    let (input, sender, receiver) = GamepadInput::test_channel();
+    cx.update(|window, cx| {
+        window.activate_window();
+        page.update(cx, |page, cx| {
+            page.video = adapter(backend.clone(), false);
+            page.attach_gamepad_input(input, receiver, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let message = page.read_with(cx, |page, _| {
+        page.gamepad.input.as_ref().unwrap().message_for_test(None)
+    });
+    sender.try_send(message).unwrap();
+    cx.run_until_parked();
+    let keyboard = cx.debug_bounds("playback-shortcut-section").unwrap();
+    let gamepad = cx.debug_bounds("playback-gamepad-section").unwrap();
+    assert!(gamepad.bottom() < keyboard.top());
+    assert!(backend.borrow().commands.is_empty());
+    page.read_with(cx, |page, _| {
+        assert!(page.presentation.gamepad_help_first);
+        assert!(!page.session.timeline().user_paused);
+    });
+
+    cx.simulate_keystrokes("i");
+    cx.run_until_parked();
+    cx.simulate_click(button, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let keyboard = cx.debug_bounds("playback-shortcut-section").unwrap();
+    let gamepad = cx.debug_bounds("playback-gamepad-section").unwrap();
+    assert!(gamepad.bottom() < keyboard.top());
 }
 
 #[gpui::test]

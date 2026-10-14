@@ -21,6 +21,28 @@ pub(super) struct FormatContext {
 }
 
 impl FormatContext {
+    #[cfg(test)]
+    pub(super) fn with_streams_for_test(streams: &[(ffi::AVMediaType, ffi::AVCodecID)]) -> Self {
+        let input = Self {
+            ptr: unsafe { ffi::avformat_alloc_context() },
+            _cached_io: None,
+        };
+        assert!(!input.ptr.is_null(), "test format context allocates");
+        for &(kind, codec_id) in streams {
+            let stream = unsafe { ffi::avformat_new_stream(input.ptr, ptr::null()) };
+            assert!(!stream.is_null(), "test stream allocates");
+            unsafe {
+                (*stream).time_base = ffi::AVRational { num: 1, den: 1_000 };
+                let parameters = &mut *(*stream).codecpar;
+                parameters.codec_type = kind;
+                parameters.codec_id = codec_id;
+                parameters.width = 16;
+                parameters.height = 16;
+            }
+        }
+        input
+    }
+
     pub(super) fn open(
         url: &str,
         http_headers: &[(String, String)],

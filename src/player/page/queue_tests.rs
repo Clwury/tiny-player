@@ -69,6 +69,76 @@ fn pending_task(cx: &mut Context<PlaybackPage>, cancelled: Arc<AtomicBool>) -> g
 }
 
 #[gpui::test]
+fn playlist_keys_resolve_the_adjacent_episode_and_emit_a_replacement(
+    cx: &mut gpui::TestAppContext,
+) {
+    for (key, target) in [("shift-,-><", 0), ("shift-.->>", 2), ("enter", 2)] {
+        let (page, cx) = test_support::playback_window(cx);
+        let gateway = Arc::new(FakeGateway::default());
+        let recorded = events(&page, cx);
+        page.update(cx, |page, _| {
+            page.queue_effects.gateway = gateway.clone();
+            page.session.queue.queue_mut().current_index = 1;
+        });
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        assert_eq!(
+            *gateway.calls.lock().unwrap(),
+            [(format!("episode-{target}"), format!("source-{target}"))],
+            "{key}"
+        );
+        let recorded = recorded.borrow();
+        let [PlaybackEvent::Replace { request, update }] = recorded.as_slice() else {
+            panic!("{key}: expected one page replacement");
+        };
+        assert_eq!(request.queue.current_index, target);
+        assert_eq!(request.emby.item_id, format!("episode-{target}-resolved"));
+        assert_eq!(update.selected_item_id, Some(format!("episode-{target}")));
+    }
+}
+
+#[gpui::test]
+fn playlist_keys_do_not_wrap_or_interrupt_a_pending_switch(cx: &mut gpui::TestAppContext) {
+    use crate::player::backend::test_support::{FakeState, adapter};
+    let (page, cx) = test_support::playback_window(cx);
+    let gateway = Arc::new(FakeGateway::default());
+    let backend = Rc::new(RefCell::new(FakeState::default()));
+    let recorded = events(&page, cx);
+    page.update(cx, |page, _| {
+        page.queue_effects.gateway = gateway.clone();
+        page.video = adapter(backend.clone(), false);
+    });
+    for (index, key) in [(0, "<"), (11, ">"), (11, "enter")] {
+        page.update(cx, |page, _| {
+            page.session.queue.queue_mut().current_index = index
+        });
+        cx.simulate_keystrokes(key);
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.session.queue.queue().current_index, index);
+            assert!(!page.session.queue.view_model().loading);
+            assert!(!page.session.timeline().user_paused);
+        });
+    }
+    page.update(cx, |page, _| {
+        page.session.queue.queue_mut().current_index = 1;
+        page.session
+            .queue
+            .begin(QueueAction::Next, false, false, false)
+            .unwrap();
+    });
+    cx.simulate_keystrokes("<");
+    cx.run_until_parked();
+    page.read_with(cx, |page, _| {
+        assert_eq!(page.session.queue.queue().current_index, 1);
+        assert!(page.session.queue.view_model().loading);
+    });
+    assert!(backend.borrow().commands.is_empty());
+    assert!(gateway.calls.lock().unwrap().is_empty());
+    assert!(recorded.borrow().is_empty());
+}
+
+#[gpui::test]
 fn failed_manual_switch_restores_user_pause_and_cache_pause_policy(cx: &mut gpui::TestAppContext) {
     let (page, cx) = test_support::playback_window(cx);
     let gateway = Arc::new(FakeGateway {

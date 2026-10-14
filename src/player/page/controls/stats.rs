@@ -1,9 +1,7 @@
 use std::ops::Range;
 
+use super::overlays::playback_overlay_container;
 use super::*;
-
-const PLAYBACK_DETAILS_WIDTH_PX: f32 = 1100.0;
-const PLAYBACK_DETAILS_TOP_PX: f32 = 56.0;
 
 // Field order and grouping follow mpv's player/lua/stats.lua, page 1.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,30 +135,10 @@ pub(super) fn playback_details_overlay(
     window: &Window,
     cx: &gpui::App,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id("playback-details-overlay")
-        .debug_selector(|| "playback-details-overlay".to_string())
-        .absolute()
-        .left_4()
-        .top(px(if window.is_fullscreen() {
-            16.0
-        } else {
-            PLAYBACK_DETAILS_TOP_PX
-        }))
-        .flex()
-        .flex_col()
-        .w(px(PLAYBACK_DETAILS_WIDTH_PX))
-        .max_w(relative(0.95))
-        .max_h(relative(if window.is_fullscreen() { 0.92 } else { 0.82 }))
+    playback_overlay_container("playback-details-overlay", window)
         .gap_3()
-        .overflow_y_scroll()
-        .p_1()
-        .text_sm()
-        .line_height(px(20.0))
-        .text_color(rgb(0xffffff))
         // Pointer presses and movement reach the full-window playback surface.
         // Keep wheel events here so scrolling stats does not change the volume.
-        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
         .children(
             sections
                 .into_iter()

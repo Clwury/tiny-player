@@ -4,7 +4,7 @@ use ffmpeg_sys_next as ffi;
 
 use super::{
     AvPacket, DEMUX_PACKET_CACHE_WAIT_INTERVAL, DEMUX_READ_SLOW_LOG_AFTER, DemuxPacketCacheShared,
-    DemuxPacketCacheThreadInput, DemuxPacketTimeline, ffmpeg_error,
+    DemuxPacketCacheThreadInput, DemuxPacketTimeline, FormatContext, ffmpeg_error,
     playback_buffered_near_duration, preroll_seek_position_seconds, video_seek_preroll_nsecs,
 };
 
@@ -81,7 +81,7 @@ fn demux_read_error_action(
 pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_cache(
     thread_input: DemuxPacketCacheThreadInput,
     shared: Arc<DemuxPacketCacheShared>,
-) {
+) -> FormatContext {
     let DemuxPacketCacheThreadInput {
         mut input,
         video_stream,
@@ -109,17 +109,17 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
         Ok(packet) => packet,
         Err(error) => {
             shared.set_error(error);
-            return;
+            return input;
         }
     };
 
     loop {
         if shared.should_stop() {
-            return;
+            return input;
         }
         let request = shared.wait_for_demux_permit();
         if shared.should_stop() {
-            return;
+            return input;
         }
         timeline.set_selected_streams(shared.selected_streams());
         if let Some(request) = request {
@@ -389,6 +389,7 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
                 .wait_for_wake_change(observed_generation, DEMUX_PACKET_CACHE_WAIT_INTERVAL);
         }
     }
+    input
 }
 
 #[cfg(test)]

@@ -1,5 +1,42 @@
 use super::*;
 
+impl GamepadControls {
+    fn button_value(
+        &mut self,
+        device_id: usize,
+        button: GamepadButton,
+        value: f32,
+        now: Instant,
+    ) -> Option<PlaybackShortcut> {
+        self.button_press(device_id, button, value, now)
+            .and_then(|press| press.shortcut)
+    }
+}
+
+#[test]
+fn modifier_press_is_reported_only_for_a_fresh_press_from_the_active_device() {
+    let mut controls = enabled_controls();
+    let now = Instant::now();
+    let button = GamepadButton::RightThumb;
+    assert_eq!(controls.button_press(0, button, 0.54, now), None);
+    assert_eq!(
+        controls.button_press(0, button, 1.0, now),
+        Some(GamepadButtonPress { shortcut: None })
+    );
+    assert_eq!(controls.button_press(0, button, 1.0, now), None);
+    assert_eq!(controls.button_press(1, button, 1.0, now), None);
+    assert_eq!(controls.button_press(0, button, 0.0, now), None);
+    controls.set_enabled(false);
+    assert_eq!(controls.button_press(0, button, 1.0, now), None);
+    controls.set_enabled(true);
+    assert_eq!(controls.button_press(0, button, 1.0, now), None);
+    controls.button_press(0, button, 0.0, now);
+    assert_eq!(
+        controls.button_press(0, button, 1.0, now),
+        Some(GamepadButtonPress { shortcut: None })
+    );
+}
+
 fn enabled_controls() -> GamepadControls {
     let mut controls = GamepadControls::default();
     controls.set_enabled(true);

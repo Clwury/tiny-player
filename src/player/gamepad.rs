@@ -11,7 +11,7 @@ use async_channel::{Receiver, Sender};
 use gilrs::{Button, Event, EventType, Gilrs};
 
 use super::model::{
-    gamepad::{GamepadButton, GamepadControls},
+    gamepad::{GamepadButton, GamepadButtonPress, GamepadControls},
     shortcuts::PlaybackShortcut,
 };
 
@@ -19,7 +19,7 @@ const INPUT_WAIT: Duration = Duration::from_millis(16);
 const MAX_DELIVERY_AGE: Duration = Duration::from_millis(250);
 
 pub(super) struct GamepadMessage {
-    pub(super) shortcut: PlaybackShortcut,
+    pub(super) shortcut: Option<PlaybackShortcut>,
     epoch: u64,
     created: Instant,
 }
@@ -100,9 +100,12 @@ impl GamepadInput {
     }
 
     #[cfg(test)]
-    pub(super) fn message_for_test(&self, shortcut: PlaybackShortcut) -> GamepadMessage {
+    pub(super) fn message_for_test(
+        &self,
+        shortcut: impl Into<Option<PlaybackShortcut>>,
+    ) -> GamepadMessage {
         GamepadMessage {
-            shortcut,
+            shortcut: shortcut.into(),
             epoch: self.gate.epoch(),
             created: Instant::now(),
         }
@@ -143,7 +146,7 @@ fn run(gate: Arc<InputGate>, sender: Sender<GamepadMessage>) {
             for (id, gamepad) in gilrs.gamepads() {
                 for button in BUTTONS {
                     let value = gamepad.button_data(button).map_or(0.0, |data| data.value());
-                    controls.button_value(
+                    controls.button_press(
                         usize::from(id),
                         mapped_button(button).unwrap(),
                         value,
@@ -167,13 +170,13 @@ fn run(gate: Arc<InputGate>, sender: Sender<GamepadMessage>) {
             if !gate.accepts(epoch) {
                 controls.set_enabled(false);
             }
-            if let Some(shortcut) = process_event(event, &mut controls, &gate) {
-                send_shortcut(&sender, &gate, epoch, shortcut);
+            if let Some(press) = process_event(event, &mut controls, &gate) {
+                send_input(&sender, &gate, epoch, press.shortcut);
             }
         }
         if gate.accepts(epoch) {
             for shortcut in controls.repeats(Instant::now()) {
-                send_shortcut(&sender, &gate, epoch, shortcut);
+                send_input(&sender, &gate, epoch, Some(shortcut));
             }
         }
         gilrs.inc();
@@ -189,11 +192,11 @@ fn process_event(
     event: Event,
     controls: &mut GamepadControls,
     gate: &InputGate,
-) -> Option<PlaybackShortcut> {
+) -> Option<GamepadButtonPress> {
     match event.event {
         // gilrs emits ButtonChanged for digital buttons too. Reading one event
         // family avoids duplicate edges and competing analog trigger thresholds.
-        EventType::ButtonChanged(button, value, _) => controls.button_value(
+        EventType::ButtonChanged(button, value, _) => controls.button_press(
             usize::from(event.id),
             mapped_button(button)?,
             value,
@@ -214,11 +217,11 @@ fn process_event(
     }
 }
 
-fn send_shortcut(
+fn send_input(
     sender: &Sender<GamepadMessage>,
     gate: &InputGate,
     epoch: u64,
-    shortcut: PlaybackShortcut,
+    shortcut: Option<PlaybackShortcut>,
 ) {
     if gate.accepts(epoch) {
         // A stalled UI must not stall release/disconnection handling or collect
@@ -299,7 +302,7 @@ mod tests {
         };
         input.set_active(true);
         let mut message = GamepadMessage {
-            shortcut: PlaybackShortcut::TogglePlayback,
+            shortcut: Some(PlaybackShortcut::TogglePlayback),
             epoch: input.gate.epoch(),
             created: Instant::now(),
         };

@@ -72,6 +72,10 @@ impl PlaybackPage {
 
     fn toggle_episode_list(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
+        self.toggle_episode_list_command(cx);
+    }
+
+    pub(super) fn toggle_episode_list_command(&mut self, cx: &mut Context<Self>) {
         if self.close_episode_list(cx)
             || !self.session.queue.view_model().has_episode_list()
             || self.session.queue.view_model().loading

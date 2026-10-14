@@ -31,6 +31,11 @@ pub(in crate::player) enum GamepadButton {
     RightThumb,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::player) struct GamepadButtonPress {
+    pub(in crate::player) shortcut: Option<PlaybackShortcut>,
+}
+
 #[derive(Default)]
 struct DeviceButtons {
     pressed: HashSet<GamepadButton>,
@@ -55,13 +60,13 @@ impl GamepadControls {
         // Keep physical button state: reactivation must wait for a fresh press.
     }
 
-    pub(in crate::player) fn button_value(
+    pub(in crate::player) fn button_press(
         &mut self,
         device_id: usize,
         button: GamepadButton,
         value: f32,
         now: Instant,
-    ) -> Option<PlaybackShortcut> {
+    ) -> Option<GamepadButtonPress> {
         if !value.is_finite() {
             return None;
         }
@@ -82,11 +87,11 @@ impl GamepadControls {
             return None;
         }
         let shortcut =
-            shortcut_for_button(button, device.pressed.contains(&GamepadButton::RightThumb))?;
-        if shortcut.gamepad_repeat_interval().is_some() {
+            shortcut_for_button(button, device.pressed.contains(&GamepadButton::RightThumb));
+        if shortcut.is_some_and(|shortcut| shortcut.gamepad_repeat_interval().is_some()) {
             device.repeats.insert(button, now + REPEAT_DELAY);
         }
-        Some(shortcut)
+        Some(GamepadButtonPress { shortcut })
     }
 
     pub(in crate::player) fn disconnect(&mut self, device_id: usize) {

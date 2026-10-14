@@ -536,7 +536,10 @@ fn control_panel_presses_do_not_become_window_drags_outside_the_panel(cx: &mut T
         }
         cx.simulate_mouse_up(stats, MouseButton::Left, Modifiers::default());
         page.read_with(cx, |page, _| {
-            assert!(page.presentation.playback_details_visible);
+            assert_eq!(
+                page.presentation.active_overlay,
+                Some(PlaybackOverlay::Info)
+            );
             assert!(page.session.timeline().progress_drag_position.is_none());
         });
     }

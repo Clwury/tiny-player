@@ -262,6 +262,123 @@ fn track_failures_keep_choices_and_subtitle_resources_and_success_returns_effect
 }
 
 #[test]
+fn subtitle_cycle_includes_off_in_both_directions_and_keeps_external_metadata() {
+    let mut session = ready();
+    let embedded = PlaybackTrack::new(7, "Embedded", false);
+    let external = PlaybackTrack::new(19, "External", true)
+        .with_external_url(Some("https://example.invalid/subtitle.ass".into()))
+        .with_codec(Some("ass".into()));
+    session.source.tracks.subtitles = vec![embedded.clone(), external.clone()];
+    session.source.tracks.selected_subtitle_stream_index = Some(7);
+    session.timeline.progress_drag_position = Some(12.3456789);
+
+    for (backwards, track) in [
+        (false, Some(external.clone())),
+        (false, None),
+        (false, Some(embedded)),
+        (true, None),
+        (true, Some(external)),
+    ] {
+        let index = track.as_ref().map(|track| track.stream_index);
+        let update = session.dispatch_control(
+            PlaybackIntent::CycleTrack {
+                kind: PlaybackTrackKind::Subtitle,
+                backwards,
+            },
+            |effect| {
+                assert_eq!(
+                    effect.command,
+                    BackendCommand::SetSubtitleTrack {
+                        track,
+                        position_seconds: 12.3456789,
+                    }
+                );
+                assert!(!effect.discard_frames);
+                Some(Ok(()))
+            },
+        );
+        assert_eq!(session.controls_view().subtitles.selected, index);
+        assert!(update.clear_subtitle && update.close_track_menu && update.report_progress);
+        assert_eq!(update.remember_track, Some(PlaybackTrackKind::Subtitle));
+    }
+}
+
+#[test]
+fn audio_cycle_uses_stream_ids_and_wraps_through_off() {
+    let mut session = ready();
+    session.source.tracks.audio = vec![
+        PlaybackTrack::new(2, "Original", false),
+        PlaybackTrack::new(17, "Dubbed", false),
+    ];
+    session.source.tracks.selected_audio_stream_index = Some(2);
+    for index in [Some(17), None, Some(2)] {
+        let update = session.dispatch_control(
+            PlaybackIntent::CycleTrack {
+                kind: PlaybackTrackKind::Audio,
+                backwards: false,
+            },
+            |effect| {
+                assert_eq!(
+                    effect.command,
+                    BackendCommand::SetAudioTrack {
+                        track_index: index,
+                        position_seconds: 2.5,
+                    }
+                );
+                Some(Ok(()))
+            },
+        );
+        assert_eq!(session.controls_view().audio.selected, index);
+        assert!(update.report_progress && !update.clear_subtitle);
+        assert_eq!(update.remember_track, Some(PlaybackTrackKind::Audio));
+    }
+}
+
+#[test]
+fn track_cycle_handles_empty_lists_stale_selections_and_rejected_commands() {
+    let mut session = ready();
+    for kind in [PlaybackTrackKind::Audio, PlaybackTrackKind::Subtitle] {
+        session.source.tracks.selected_audio_stream_index = None;
+        session.source.tracks.selected_subtitle_stream_index = None;
+        for backwards in [false, true] {
+            let update = session
+                .dispatch_control(PlaybackIntent::CycleTrack { kind, backwards }, |_| {
+                    panic!("empty tracks must not dispatch a command")
+                });
+            assert!(!update.notify && !update.report_progress);
+        }
+    }
+    session.source.tracks.subtitles = vec![
+        PlaybackTrack::new(7, "First", false),
+        PlaybackTrack::new(19, "Last", false),
+    ];
+    for (backwards, expected) in [(false, 7), (true, 19)] {
+        session.source.tracks.selected_subtitle_stream_index = Some(999);
+        session.dispatch_control(
+            PlaybackIntent::CycleTrack {
+                kind: PlaybackTrackKind::Subtitle,
+                backwards,
+            },
+            |_| Some(Ok(())),
+        );
+        assert_eq!(session.controls_view().subtitles.selected, Some(expected));
+    }
+    for missing in [true, false] {
+        let update = session.dispatch_control(
+            PlaybackIntent::CycleTrack {
+                kind: PlaybackTrackKind::Subtitle,
+                backwards: false,
+            },
+            |effect| if missing { None } else { reject(effect) },
+        );
+        assert_eq!(session.controls_view().subtitles.selected, Some(19));
+        assert!(
+            !update.clear_subtitle && !update.report_progress && update.remember_track.is_none()
+        );
+    }
+}
+
+#[test]
 fn preview_threshold_and_borrowed_view_preserve_controls_and_progress_rules() {
     let mut session = ready();
     session.source.tracks.audio = vec![PlaybackTrack::new(2, "track", false)];

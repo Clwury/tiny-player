@@ -10,12 +10,14 @@ pub(super) struct PlaybackPresentationState {
     pub(super) timeline_presentation: PlaybackTimelinePresentation,
     pub(super) presentation_timers: PresentationEffects,
     pub(super) download_speed: controls::DownloadSpeedDisplay,
-    pub(super) playback_details_visible: bool,
+    pub(super) active_overlay: Option<PlaybackOverlay>,
+    pub(super) gamepad_help_first: bool,
     pub(super) fullscreen: FullscreenControlsState,
     pub(super) window_drag: WindowDragState,
     pub(super) episode_list: episodes::PlaybackEpisodeListState,
     pub(super) track_select_open: Option<PlaybackTrackKind>,
     pub(super) track_select_scroll_handle: gpui::ScrollHandle,
+    pub(super) track_switch_label: Option<SharedString>,
     pub(super) subtitle: SubtitleOverlayState,
     pub(super) volume_indicator_visible: bool,
     pub(super) rate_indicator_visible: bool,
@@ -33,12 +35,14 @@ impl PlaybackPresentationState {
             timeline_presentation: Default::default(),
             presentation_timers: PresentationEffects::new(identity),
             download_speed: Default::default(),
-            playback_details_visible: false,
+            active_overlay: None,
+            gamepad_help_first: false,
             fullscreen: Default::default(),
             window_drag: Default::default(),
             episode_list,
             track_select_open: None,
             track_select_scroll_handle: Default::default(),
+            track_switch_label: None,
             subtitle: Default::default(),
             volume_indicator_visible: false,
             rate_indicator_visible: false,
@@ -52,6 +56,12 @@ impl PlaybackPresentationState {
         images.extend(self.frame.current.take());
         images
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlaybackOverlay {
+    Info,
+    Shortcuts,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -84,6 +94,7 @@ pub(super) struct FullscreenControlsState {
     pub(super) controls_visible: bool,
     pub(super) mouse_in_controls: bool,
     pub(super) mouse_in_back_button: bool,
+    pub(super) mouse_in_toolbar: bool,
 }
 
 #[derive(Default)]
@@ -91,6 +102,7 @@ pub(super) struct SubtitleOverlayState {
     pub(super) active: Option<BackendSubtitleCue>,
     pub(super) images: SubtitleImages,
     pub(super) vertical_offset_fraction: Option<f32>,
+    pub(super) hidden: bool,
 }
 
 impl PlaybackPage {

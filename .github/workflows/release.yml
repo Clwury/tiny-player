@@ -3,7 +3,7 @@ name: Build and release
 on:
   workflow_dispatch:
   push:
-    branches: [master, dev]
+    branches: [master]
 
 permissions:
   contents: read
@@ -43,7 +43,7 @@ jobs:
               output.write(f"version={version}\ntag=v{version}\n")
           PY
       - name: Reject an existing release tag
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        if: github.ref == 'refs/heads/master'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
@@ -51,7 +51,7 @@ jobs:
           git check-ref-format "refs/tags/$RELEASE_TAG"
           refs=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --jq '.[].ref')
           if grep -Fxq "refs/tags/$RELEASE_TAG" <<< "$refs"; then
-            echo "::error::Tag $RELEASE_TAG already exists. Update Cargo.toml and Cargo.lock before pushing."
+            echo "::error::Tag $RELEASE_TAG already exists. Update Cargo.toml and Cargo.lock before releasing."
             exit 1
           fi
       - name: Install Rust
@@ -232,7 +232,7 @@ jobs:
 
   release:
     name: Publish complete release
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/master'
     needs: [checks, linux, windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -283,6 +283,6 @@ jobs:
             --title "$RELEASE_TAG" --draft --generate-notes \
             --notes-file "$RUNNER_TEMP/release-notes.md" "${assets[@]}"
           release_id=$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)
-          # Concurrent pushes may finish out of order; select Latest by version.
+          # Concurrent release runs may finish out of order; select Latest by version.
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             -F draft=false -f make_latest=legacy --silent

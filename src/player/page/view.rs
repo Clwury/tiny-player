@@ -21,7 +21,8 @@ impl Render for PlaybackPage {
             self.session.controls_view().error,
         );
         let progress_bar_visible = self.progress_bar_visible();
-        if progress_bar_visible {
+        let toolbar_visible = self.overlay_toolbar_visible();
+        if toolbar_visible {
             self.update_download_speed(cx);
         }
         let corners = window_corner_radii(window, cx);
@@ -99,16 +100,20 @@ impl Render for PlaybackPage {
                     cx,
                 ))
             })
-            .when(self.presentation.rate_indicator_visible, |this| {
-                this.child(self.render_playback_rate_indicator(cx))
-            })
+            .when(
+                self.presentation.rate_indicator_visible
+                    && self.presentation.track_switch_label.is_none(),
+                |this| this.child(self.render_playback_rate_indicator(cx)),
+            )
             .child(self.render_queue_switch_error(cx))
             .when(self.presentation.episode_list.open, |this| {
                 this.child(self.render_episode_list_backdrop(cx))
             })
             .when(progress_bar_visible, |this| {
                 this.child(self.render_progress_bar(window, cx))
-                    .child(self.render_download_speed(cx))
+            })
+            .when(toolbar_visible, |this| {
+                this.child(deferred(self.render_overlay_toolbar(cx)).with_priority(4))
             })
             .when(
                 fullscreen::playback_back_button_visible(
@@ -120,11 +125,27 @@ impl Render for PlaybackPage {
             .when(self.presentation.episode_list.open, |this| {
                 this.child(deferred(self.render_episode_list(window, cx)).with_priority(2))
             })
-            .when(self.presentation.playback_details_visible, |this| {
-                // Keep stats above subtitles, controls, and deferred playback menus.
+            .when_some(self.presentation.active_overlay, |this, overlay| {
+                // Keep the active overlay above subtitles, controls, and playback menus.
                 this.child(
-                    deferred(self.render_playback_details_overlay(window, cx)).with_priority(3),
+                    deferred(match overlay {
+                        PlaybackOverlay::Info => self
+                            .render_playback_details_overlay(window, cx)
+                            .into_any_element(),
+                        PlaybackOverlay::Shortcuts => {
+                            self.render_shortcuts_overlay(window, cx).into_any_element()
+                        }
+                    })
+                    .with_priority(3),
                 )
             })
+            .when_some(
+                self.presentation.track_switch_label.clone(),
+                |this, label| {
+                    this.child(
+                        deferred(controls::track_switch_indicator(label, cx)).with_priority(4),
+                    )
+                },
+            )
     }
 }
