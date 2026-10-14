@@ -185,6 +185,8 @@ These shortcuts are active when the playback page has keyboard focus:
 
 The keyboard and information icons to the right of the cache speed toggle keyboard and gamepad shortcut help and playback information. Both overlays share the same position; opening either closes the other. Keys appear as italic tags with a translucent accent color background. Key combinations use `-`, and alternative keys for the same action appear in separate tags with `/` between them. Descriptions follow the interface language.
 
+The wheel adjusts volume over the top-right icons and overlays whose content fits. When overlay content exceeds the visible height, the wheel scrolls the content without changing volume, including at the scroll boundaries.
+
 | Key | Action |
 | --- | --- |
 | `Space` / `P` | Play / pause |
@@ -220,6 +222,10 @@ Mouse controls over the playback area:
 | Right-click the video | Play / pause |
 | Scroll up / down | Increase / decrease volume |
 | Click or drag the progress bar | Seek to the selected position |
+
+Seeking while paused displays the frame at the selected position and keeps playback paused. Seeking to the video end displays the final frame and finishes loading. Resuming continues from the current position.
+
+In fullscreen, mouse movement anywhere in the playback area reveals the controls. They hide after one second without movement, except while hovering over the controls or top-right icons, dragging the progress bar, or viewing the episode list.
 
 ## License
 

@@ -5,8 +5,10 @@ use ffmpeg_sys_next as ffi;
 use super::{
     AvPacket, DEMUX_PACKET_CACHE_WAIT_INTERVAL, DEMUX_READ_SLOW_LOG_AFTER, DemuxPacketCacheShared,
     DemuxPacketCacheThreadInput, DemuxPacketTimeline, FormatContext, ffmpeg_error,
-    playback_buffered_near_duration, preroll_seek_position_seconds, video_seek_preroll_nsecs,
+    playback_buffered_near_duration,
 };
+
+use crate::backend::ffmpeg::playback_loop::seek::paused_seek_preroll_position_seconds;
 
 const DEMUX_READ_MAX_CONSECUTIVE_ERRORS: u32 = 10;
 const DEMUX_PRODUCER_ERROR_LOW_WATER_NSECS: u64 = 250_000_000;
@@ -135,22 +137,21 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
             }
             let demux_input_generation = shared.demux_input_generation();
             let seek_generation = request.seek_generation;
+            let seek_position_seconds = paused_seek_preroll_position_seconds(
+                video_stream.codec_id,
+                request.position_seconds,
+                shared.control.is_user_paused(),
+            );
             tracing::debug!(
                 ?request.session_id,
                 position_seconds = request.position_seconds,
-                seek_position_seconds = preroll_seek_position_seconds(
-                    video_stream.codec_id,
-                    request.position_seconds
-                ),
-                preroll_nsecs = video_seek_preroll_nsecs(video_stream.codec_id),
+                seek_position_seconds,
+                preroll_seconds = request.position_seconds - seek_position_seconds,
                 demux_input_generation,
                 seek_generation,
                 "FFmpeg demux thread applying low-level seek"
             );
-            if let Err(error) = input.seek_stream(
-                video_stream,
-                preroll_seek_position_seconds(video_stream.codec_id, request.position_seconds),
-            ) {
+            if let Err(error) = input.seek_stream(video_stream, seek_position_seconds) {
                 if shared.should_discard_demux_seek_result(demux_input_generation, seek_generation)
                 {
                     tracing::debug!(
@@ -183,10 +184,7 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
             tracing::debug!(
                 ?request.session_id,
                 position_seconds = request.position_seconds,
-                seek_position_seconds = preroll_seek_position_seconds(
-                    video_stream.codec_id,
-                    request.position_seconds
-                ),
+                seek_position_seconds,
                 demux_input_generation,
                 seek_generation,
                 "FFmpeg demux thread low-level seek applied"

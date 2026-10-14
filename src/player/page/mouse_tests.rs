@@ -71,6 +71,41 @@ fn dispatch_left_release(
     })
 }
 
+#[gpui::test]
+fn fullscreen_mouse_movement_reveals_controls_across_the_viewport_and_restarts_idle_hide(
+    cx: &mut TestAppContext,
+) {
+    let (page, cx) = test_support::playback_window(cx);
+    cx.simulate_keystrokes("f");
+    cx.run_until_parked();
+    assert!(cx.update(|window, _| window.is_fullscreen()));
+    assert!(cx.debug_bounds("playback-progress").is_none());
+    for position in [
+        point(px(2.0), px(2.0)),
+        point(px(550.0), px(100.0)),
+        point(px(100.0), px(250.0)),
+        point(px(1000.0), px(250.0)),
+        point(px(550.0), px(400.0)),
+        point(px(100.0), px(750.0)),
+        point(px(1000.0), px(750.0)),
+    ] {
+        cx.simulate_mouse_move(position, None, Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("playback-progress").is_some(),
+            "movement at {position:?} should reveal the controls"
+        );
+        assert!(page.read_with(cx, |page, _| page.presentation.fullscreen.cursor_visible));
+        cx.executor().advance_clock(Duration::from_millis(999));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("playback-progress").is_some());
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("playback-progress").is_none());
+        assert!(!page.read_with(cx, |page, _| page.presentation.fullscreen.cursor_visible));
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[gpui::test]
 fn playback_controls_do_not_consume_native_caption_clicks(cx: &mut TestAppContext) {

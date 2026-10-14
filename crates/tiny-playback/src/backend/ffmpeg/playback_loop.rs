@@ -234,7 +234,8 @@ pub(super) use scheduled_video_queue::{
     should_drop_late_video_frame, video_output_rebuffer_low_water,
 };
 use seek::{
-    preroll_seek_position_seconds, video_cached_seek_preroll_nsecs, video_seek_preroll_nsecs,
+    paused_seek_preroll_position_seconds, preroll_seek_position_seconds,
+    video_cached_seek_preroll_nsecs, video_seek_preroll_nsecs,
 };
 use session::PlaybackSession;
 use subtitle_timeline::{

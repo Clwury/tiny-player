@@ -49,7 +49,7 @@ impl PlaybackPage {
             .on_mouse_down(MouseButton::Middle, |_, _, cx| cx.stop_propagation())
             .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(cx.listener(Self::handle_surface_scroll_wheel))
             .children(self.render_download_speed(cx))
             .child(self.render_overlay_button(
                 "playback-keyboard-button",
@@ -130,14 +130,21 @@ impl PlaybackPage {
         window: &Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        shortcuts::shortcuts_overlay(self.presentation.gamepad_help_first, window, cx)
+        shortcuts::shortcuts_overlay(
+            self.presentation.gamepad_help_first,
+            &self.presentation.shortcuts_overlay_scroll_handle,
+            window,
+            cx,
+        )
     }
 }
 
 pub(super) fn playback_overlay_container(
     id: &'static str,
+    scroll_handle: &gpui::ScrollHandle,
     window: &Window,
 ) -> gpui::Stateful<gpui::Div> {
+    let scroll = scroll_handle.clone();
     div()
         .id(id)
         .debug_selector(move || id.into())
@@ -154,9 +161,16 @@ pub(super) fn playback_overlay_container(
         .max_w(relative(0.95))
         .max_h(relative(if window.is_fullscreen() { 0.92 } else { 0.82 }))
         .overflow_y_scroll()
+        .track_scroll(scroll_handle)
         .p_1()
         .text_sm()
         .line_height(px(20.0))
         .text_color(rgb(0xffffff))
-        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        // Only scrollable content owns the wheel, including at its boundaries.
+        // Fitting overlays let the playback surface adjust volume.
+        .on_scroll_wheel(move |_, _, cx| {
+            if scroll.max_offset().y > px(0.0) {
+                cx.stop_propagation();
+            }
+        })
 }

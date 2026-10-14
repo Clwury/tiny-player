@@ -7,7 +7,6 @@ const PLAYBACK_PROGRESS_BAR_MIN_WIDTH_PX: f32 = 480.0;
 pub(super) const PLAYBACK_BACK_BUTTON_OFFSET_PX: f32 = 16.0;
 pub(super) const PLAYBACK_BACK_BUTTON_SIZE_PX: f32 = 32.0;
 const FULLSCREEN_CONTROLS_HIDE_DELAY: Duration = Duration::from_secs(1);
-const FULLSCREEN_CONTROLS_HOT_ZONE_FRACTION: f32 = 0.5;
 
 impl PlaybackPage {
     pub(super) fn progress_bar_visible(&self) -> bool {
@@ -78,11 +77,8 @@ impl PlaybackPage {
         let is_fullscreen = window.is_fullscreen();
         let bounds = window_viewport_bounds(window);
         let in_controls = playback_controls_contains(event.position, bounds, is_fullscreen);
-        let in_hot_zone =
-            playback_controls_hot_zone_contains(event.position, bounds, is_fullscreen);
-
         let controls_visible =
-            self.presentation.fullscreen.controls_visible || in_controls || in_hot_zone;
+            self.presentation.fullscreen.controls_visible || bounds.contains(&event.position);
         let changed = !self.presentation.fullscreen.cursor_visible
             || self.presentation.fullscreen.controls_visible != controls_visible
             || self.presentation.fullscreen.mouse_in_controls != in_controls;
@@ -165,20 +161,6 @@ pub(super) fn playback_back_button_visible(is_fullscreen: bool, controls_visible
     !is_fullscreen && controls_visible
 }
 
-pub(super) fn playback_controls_hot_zone_contains(
-    position: Point<Pixels>,
-    viewport_bounds: Bounds<Pixels>,
-    is_fullscreen: bool,
-) -> bool {
-    if is_fullscreen {
-        position.y
-            >= viewport_bounds.origin.y
-                + viewport_bounds.size.height * FULLSCREEN_CONTROLS_HOT_ZONE_FRACTION
-    } else {
-        viewport_bounds.contains(&position)
-    }
-}
-
 pub(super) fn playback_controls_contains(
     position: Point<Pixels>,
     viewport_bounds: Bounds<Pixels>,
@@ -243,32 +225,6 @@ mod tests {
         assert!(!playback_controls_should_hide(true, false, false));
         assert!(playback_controls_should_hide(false, false, false));
         assert!(!playback_controls_should_hide(false, false, true));
-    }
-
-    #[test]
-    fn playback_controls_hot_zone_uses_full_window_only_when_windowed() {
-        let viewport = Bounds::new(point(px(0.0), px(100.0)), size(px(800.0), px(600.0)));
-
-        assert!(!playback_controls_hot_zone_contains(
-            point(px(400.0), px(399.0)),
-            viewport,
-            true,
-        ));
-        assert!(playback_controls_hot_zone_contains(
-            point(px(400.0), px(400.0)),
-            viewport,
-            true,
-        ));
-        assert!(playback_controls_hot_zone_contains(
-            point(px(400.0), px(101.0)),
-            viewport,
-            false,
-        ));
-        assert!(!playback_controls_hot_zone_contains(
-            point(px(400.0), px(99.0)),
-            viewport,
-            false,
-        ));
     }
 
     #[test]

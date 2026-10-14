@@ -35,6 +35,7 @@ impl PlaybackPage {
                     self.session.controls_view().volume.level,
                 ),
             ],
+            &self.presentation.info_overlay_scroll_handle,
             window,
             cx,
         )

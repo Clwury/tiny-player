@@ -348,7 +348,10 @@ fn grouped_labels_keep_utf8_highlight_boundaries() {
 
 #[gpui::test]
 fn grouped_stats_wrap_without_overlapping_sections_at_narrow_widths(cx: &mut gpui::TestAppContext) {
-    struct StatsPreview;
+    #[derive(Default)]
+    struct StatsPreview {
+        scroll_handle: gpui::ScrollHandle,
+    }
 
     impl Render for StatsPreview {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -367,13 +370,14 @@ fn grouped_stats_wrap_without_overlapping_sections_at_narrow_widths(cx: &mut gpu
                     playback_video_detail_section(Some(&video_info())),
                     playback_audio_detail_section(Some(&audio_info()), 0.75),
                 ],
+                &self.scroll_handle,
                 window,
                 cx,
             ))
         }
     }
 
-    let (_, cx) = cx.add_window_view(|_, _| StatsPreview);
+    let (_, cx) = cx.add_window_view(|_, _| StatsPreview::default());
     for width in [1280.0, 640.0] {
         cx.simulate_resize(gpui::size(px(width), px(720.0)));
         cx.run_until_parked();
@@ -398,6 +402,7 @@ fn stats_forward_pointer_events_to_the_playback_surface_without_copying(
         presses: usize,
         drags: usize,
         scrolls: usize,
+        scroll_handle: gpui::ScrollHandle,
     }
 
     impl Render for StatsPreview {
@@ -436,6 +441,7 @@ fn stats_forward_pointer_events_to_the_playback_surface_without_copying(
                         )),
                         playback_video_detail_section(Some(&video_info())),
                     ],
+                    &self.scroll_handle,
                     window,
                     cx,
                 ))
@@ -447,6 +453,7 @@ fn stats_forward_pointer_events_to_the_playback_surface_without_copying(
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()));
     });
     let mut expected_events = 0;
+    let mut expected_scrolls = 0;
     for width in [1280.0, 640.0] {
         cx.simulate_resize(gpui::size(px(width), px(480.0)));
         cx.run_until_parked();
@@ -480,6 +487,9 @@ fn stats_forward_pointer_events_to_the_playback_surface_without_copying(
                 Some("unchanged")
             );
         }
+        if view.read_with(cx, |view, _| view.scroll_handle.max_offset().y == px(0.0)) {
+            expected_scrolls += 1;
+        }
         cx.simulate_event(ScrollWheelEvent {
             position: points[0],
             delta: ScrollDelta::Lines(gpui::point(0.0, -3.0)),
@@ -487,7 +497,7 @@ fn stats_forward_pointer_events_to_the_playback_surface_without_copying(
             touch_phase: gpui::TouchPhase::Moved,
         });
         cx.run_until_parked();
-        assert_eq!(view.read_with(cx, |view, _| view.scrolls), 0);
+        assert_eq!(view.read_with(cx, |view, _| view.scrolls), expected_scrolls);
     }
 }
 

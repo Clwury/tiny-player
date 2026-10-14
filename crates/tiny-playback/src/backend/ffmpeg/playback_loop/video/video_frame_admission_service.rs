@@ -12,8 +12,9 @@ use crate::backend::ffmpeg::playback_loop::output_gate::DecodeRecoveryPhase;
 
 use super::video_frame_prepare_worker::PreparedVideoFrame;
 use super::video_output_gate::{
-    DecodedVideoAdmissionStatus, service_audio_clocked_decoded_video_frame,
-    service_audio_clocked_drain_decoded_video_frame, service_video_clocked_decoded_video_frame,
+    DecodedVideoAdmissionStatus, report_first_video_frame_presented,
+    service_audio_clocked_decoded_video_frame, service_audio_clocked_drain_decoded_video_frame,
+    service_video_clocked_decoded_video_frame,
 };
 use super::{
     AudioOutput, BufferedReporter, FfmpegControl, PlaybackOutputScheduler, PlaybackScheduler,
@@ -120,6 +121,49 @@ pub(super) fn admit_prepared_video_frame(
         return Ok(());
     }
     Ok(())
+}
+
+/// Publish the retained source frame only after all video decoder output has
+/// ended without a frame at or beyond the paused seek target.
+pub(super) fn admit_paused_final_video_frame(
+    context: PreparedVideoFrameAdmissionContext<'_>,
+) -> bool {
+    if context.control.should_interrupt()
+        || !context.output_scheduler.restart_pending()
+        || !context.output_scheduler.scheduled_video_queue.is_empty()
+    {
+        return false;
+    }
+    let prepared = context.prepared_frame;
+    *context.current_start_position_nsecs = prepared.timeline_nsecs;
+    context
+        .subtitle_pipeline
+        .reset_cues_for_position(prepared.timeline_nsecs);
+    service_video_clocked_decoded_video_frame(
+        context.scheduler,
+        context.control,
+        context.output_scheduler,
+        context.session_id,
+        context.vo_queue,
+        context.frame_presented,
+        context.position_reporter,
+        context.event_tx,
+        context.subtitle_pipeline,
+        context.buffered_reporter,
+        prepared.frame,
+        prepared.timeline_nsecs,
+        prepared.duration_nsecs,
+        context.current_start_position_nsecs,
+        context.decoded_video_frame_count,
+    );
+    if context.output_scheduler.restart_pending() {
+        return false;
+    }
+    if let Some(output) = context.audio_output {
+        output.activate_current_audio_output(context.control);
+    }
+    report_first_video_frame_presented(context.session_id, context.event_tx);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -83,5 +83,7 @@ mod audio_refill;
 mod demux_watermark;
 #[path = "tests/initial_start.rs"]
 mod initial_start;
+#[path = "tests/paused_seek.rs"]
+mod paused_seek;
 #[path = "tests/resume.rs"]
 mod resume;

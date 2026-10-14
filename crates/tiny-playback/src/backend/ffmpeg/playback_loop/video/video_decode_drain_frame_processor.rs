@@ -109,6 +109,7 @@ impl VideoDecodeDrainFrameProcessor {
             output_scheduler,
             video_frame_prepare_worker,
             session_id,
+            control,
         )?;
         made_progress |= self.drain_ready_prepared_frames(
             video_frame_prepare_worker,
@@ -158,6 +159,7 @@ impl VideoDecodeDrainFrameProcessor {
         output_scheduler: &PlaybackOutputScheduler,
         video_frame_prepare_worker: &mut VideoFramePrepareWorker,
         session_id: PlaybackSessionId,
+        control: &FfmpegControl,
     ) -> std::result::Result<bool, String> {
         let mut made_progress = false;
         while let Some(decoded_frame) = self.frames.pop_front() {
@@ -173,6 +175,7 @@ impl VideoDecodeDrainFrameProcessor {
                 output_scheduler,
                 video_frame_prepare_worker,
                 session_id,
+                control,
             )? {
                 DrainedFramePrepareAdmission::Queued => {
                     made_progress = true;
@@ -203,6 +206,7 @@ impl VideoDecodeDrainFrameProcessor {
         output_scheduler: &PlaybackOutputScheduler,
         video_frame_prepare_worker: &mut VideoFramePrepareWorker,
         session_id: PlaybackSessionId,
+        control: &FfmpegControl,
     ) -> std::result::Result<DrainedFramePrepareAdmission, String> {
         let frame = decoded_frame.as_mut_ptr();
         let start_frame = match service_drained_video_frame_start(
@@ -213,6 +217,7 @@ impl VideoDecodeDrainFrameProcessor {
             subtitle_pipeline,
             *current_start_position_nsecs,
             dovi_pipeline,
+            control.is_user_paused() && output_scheduler.restart_pending(),
         ) {
             DecodedVideoFrameStartStatus::Ready(frame) => frame,
             DecodedVideoFrameStartStatus::DroppedBeforeStart
@@ -237,6 +242,9 @@ impl VideoDecodeDrainFrameProcessor {
             frame_pts,
             timeline_nsecs,
             video_frame_duration_nsecs,
+            timeline_nsecs < *current_start_position_nsecs
+                && control.is_user_paused()
+                && output_scheduler.restart_pending(),
             dovi_pipeline,
             video_frame_prepare_worker,
             &video_decode_pipeline.info().convert_context,
@@ -248,6 +256,9 @@ impl VideoDecodeDrainFrameProcessor {
             DecodedVideoFramePrepareStatus::Backpressured => {
                 self.pending_prepares = self.pending_prepares.saturating_add(1);
                 Ok(DrainedFramePrepareAdmission::Backpressured)
+            }
+            DecodedVideoFramePrepareStatus::RetainedPreroll => {
+                Ok(DrainedFramePrepareAdmission::Dropped)
             }
             DecodedVideoFramePrepareStatus::DroppedCorrupt => {
                 Err(CORRUPT_VIDEO_FRAME_RECOVERY_ERROR.to_string())

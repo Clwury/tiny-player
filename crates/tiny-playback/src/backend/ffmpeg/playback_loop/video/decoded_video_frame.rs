@@ -358,6 +358,9 @@ where
         frame_pts,
         timeline_nsecs,
         video_frame_duration_nsecs,
+        timeline_nsecs < *current_start_position_nsecs
+            && control.is_user_paused()
+            && output_scheduler.restart_pending(),
         dovi_pipeline,
         video_frame_prepare_worker,
         &video_decode_pipeline.info().convert_context,
@@ -403,7 +406,8 @@ where
         );
     }
     match prepare_status {
-        DecodedVideoFramePrepareStatus::Queued => Ok(true),
+        DecodedVideoFramePrepareStatus::Queued
+        | DecodedVideoFramePrepareStatus::RetainedPreroll => Ok(true),
         DecodedVideoFramePrepareStatus::Backpressured => Ok(false),
         DecodedVideoFramePrepareStatus::DroppedCorrupt => {
             Err(CORRUPT_VIDEO_FRAME_RECOVERY_ERROR.to_string())

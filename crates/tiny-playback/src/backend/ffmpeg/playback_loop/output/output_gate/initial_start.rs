@@ -702,7 +702,9 @@ fn publish_initial_video_for_audio_commit(
         if control.should_interrupt() {
             return InitialVideoPublishResult::Interrupted;
         }
-        if !scheduler.ready_for(front_timeline_nsecs) {
+        // A paused seek publishes its preview without advancing either clock.
+        // Ordinary playback still waits until the video frame is due.
+        if !control.is_user_paused() && !scheduler.ready_for(front_timeline_nsecs) {
             return InitialVideoPublishResult::WouldBlock;
         }
 
@@ -751,6 +753,11 @@ fn publish_initial_video_for_audio_commit(
             );
         }
         presented_video_frames = presented_video_frames.saturating_add(1);
+        // A delayed audio anchor can cover several video frames. Retain them
+        // for resume instead of advancing past the seek preview while paused.
+        if control.is_user_paused() {
+            break;
+        }
     }
 
     if output_scheduler.first_frame_presented {

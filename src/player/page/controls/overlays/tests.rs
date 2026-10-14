@@ -1,12 +1,142 @@
 use super::*;
+use crate::player::backend::test_support::{FakeState, adapter};
 use crate::{i18n::AppLanguage, player::model::shortcuts::PlaybackShortcut};
 use gpui::{Modifiers, TestAppContext, VisualTestContext, point, size};
+use std::{cell::RefCell, rc::Rc};
 use tiny_playback::ByteCacheState;
 
 fn click(cx: &mut VisualTestContext, selector: &'static str) {
     let bounds = cx.debug_bounds(selector).unwrap();
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn wheel_over_toolbar_and_fitting_overlays_changes_volume_once(cx: &mut TestAppContext) {
+    let (page, cx) = test_support::playback_window(cx);
+    let backend = Rc::new(RefCell::new(FakeState::default()));
+    page.update(cx, |page, _| page.video = adapter(backend.clone(), false));
+    cx.simulate_resize(size(px(1280.0), px(1100.0)));
+    cx.run_until_parked();
+    for fullscreen in [false, true] {
+        cx.update(|window, _| {
+            if window.is_fullscreen() != fullscreen {
+                window.toggle_fullscreen();
+                window.refresh();
+            }
+        });
+        cx.run_until_parked();
+        for (button, overlay) in [
+            ("playback-info-button", "playback-details-overlay"),
+            ("playback-keyboard-button", "playback-shortcuts-overlay"),
+        ] {
+            click(cx, button);
+            let overlay = cx.debug_bounds(overlay).unwrap();
+            let toolbar = cx.debug_bounds(button).unwrap();
+            for position in [toolbar.center(), overlay.origin + point(px(12.0), px(10.0))] {
+                let volume =
+                    page.read_with(cx, |page, _| page.session.controls_view().volume.level);
+                for (delta, expected) in [(-3.0, volume - 0.02), (3.0, volume)] {
+                    let commands = backend.borrow().commands.len();
+                    cx.simulate_event(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Lines(point(0.0, delta)),
+                        modifiers: Modifiers::default(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                    });
+                    cx.run_until_parked();
+                    assert!(
+                        (page.read_with(cx, |page, _| page.session.controls_view().volume.level)
+                            - expected)
+                            .abs()
+                            < f32::EPSILON,
+                        "{position:?}: expected volume {expected}"
+                    );
+                    assert_eq!(backend.borrow().commands.len(), commands + 1);
+                }
+            }
+            click(cx, button);
+        }
+    }
+}
+
+#[gpui::test]
+fn overflowing_overlays_keep_volume_at_scroll_boundaries_then_forward_wheel_after_resize(
+    cx: &mut TestAppContext,
+) {
+    let (page, cx) = test_support::playback_window(cx);
+    page.update(cx, |page, _| {
+        page.video = adapter(Rc::new(RefCell::new(FakeState::default())), false);
+        page.title = "A lengthy media title ".repeat(200).into();
+    });
+    for (kind, button, selector) in [
+        (
+            PlaybackOverlay::Info,
+            "playback-info-button",
+            "playback-details-overlay",
+        ),
+        (
+            PlaybackOverlay::Shortcuts,
+            "playback-keyboard-button",
+            "playback-shortcuts-overlay",
+        ),
+    ] {
+        cx.simulate_resize(size(px(1280.0), px(360.0)));
+        cx.run_until_parked();
+        click(cx, button);
+        let scroll = page.read_with(cx, |page, _| match kind {
+            PlaybackOverlay::Info => page.presentation.info_overlay_scroll_handle.clone(),
+            PlaybackOverlay::Shortcuts => page.presentation.shortcuts_overlay_scroll_handle.clone(),
+        });
+        assert!(scroll.max_offset().y > px(0.0));
+        let position = cx.debug_bounds(selector).unwrap().center();
+        let volume = page.read_with(cx, |page, _| page.session.controls_view().volume.level);
+        for (offset, delta) in [
+            (px(0.0), 3.0),
+            (px(0.0), -3.0),
+            (-scroll.max_offset().y, -3.0),
+        ] {
+            scroll.set_offset(point(px(0.0), offset));
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Lines(point(0.0, delta)),
+                modifiers: Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                page.read_with(cx, |page, _| page.session.controls_view().volume.level),
+                volume
+            );
+            if offset == px(0.0) && delta < 0.0 {
+                assert!(scroll.offset().y < px(0.0));
+            } else {
+                assert_eq!(scroll.offset().y, offset);
+            }
+        }
+        cx.simulate_resize(size(px(1280.0), px(2000.0)));
+        cx.run_until_parked();
+        assert_eq!(scroll.max_offset().y, px(0.0));
+        let position = cx.debug_bounds(selector).unwrap().center();
+        for (delta, expected) in [(-3.0, volume - 0.02), (3.0, volume)] {
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Lines(point(0.0, delta)),
+                modifiers: Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+            assert!(
+                (page.read_with(cx, |page, _| page.session.controls_view().volume.level)
+                    - expected)
+                    .abs()
+                    < f32::EPSILON
+            );
+        }
+        click(cx, button);
+    }
 }
 
 #[gpui::test]

@@ -96,6 +96,7 @@ impl PlaybackCoordinatorGateService {
         }
         let status = coordinator_gate_status(
             context.control,
+            context.output_scheduler.restart_pending(),
             context.output_service_demand,
             context.actual_decode_work,
             context.cached_input_drainable,
@@ -244,12 +245,16 @@ impl PlaybackCoordinatorGateService {
 
 fn coordinator_gate_status(
     control: &FfmpegControl,
+    output_restart_pending: bool,
     output_service_demand: OutputServiceDemand,
     actual_decode_work: bool,
     cached_input_drainable: bool,
     cached_input_admissible: bool,
 ) -> PlaybackCoordinatorGateStatus {
-    if control.is_user_paused() || control.has_pending_seek() {
+    // A paused seek still needs decoder input and the initial output gate to
+    // present its target frame. The user pause keeps both clocks frozen and
+    // audio silent; once restart finishes, stop servicing playback again.
+    if control.has_pending_seek() || (control.is_user_paused() && !output_restart_pending) {
         return PlaybackCoordinatorGateStatus::Wait;
     }
     if control.is_cache_paused() {
@@ -430,19 +435,189 @@ mod tests {
     }
 
     #[test]
+    fn paused_seek_allows_first_frame_work_until_presentation_finishes() {
+        let session_id = PlaybackSessionId(1);
+        let control = Arc::new(FfmpegControl::new(session_id));
+        control.set_user_paused(true);
+        let playback_wait = PlaybackPipelineWaitService::new(Arc::clone(&control));
+        let mut gate = PlaybackCoordinatorGateService::default();
+        let mut scheduler = PlaybackScheduler::new(0);
+        scheduler.set_paused(true);
+        let mut output = PlaybackOutputScheduler::new();
+
+        for target in [3_000_000_000, 1_000_000_000, 4_200_000_000] {
+            output.reset_for_session(&control, session_id);
+            scheduler.reset(target);
+            assert_eq!(
+                service_gate(
+                    &mut gate,
+                    &control,
+                    &mut output,
+                    &mut scheduler,
+                    &playback_wait
+                ),
+                PlaybackCoordinatorGateStatus::Ready
+            );
+            assert_eq!(scheduler.current_timeline_nsecs(), target);
+            assert!(!scheduler.ready_for(target));
+
+            // Queuing a frame must still allow the A/V start gate to present it.
+            output.mark_first_frame_queued();
+            assert_eq!(
+                service_gate(
+                    &mut gate,
+                    &control,
+                    &mut output,
+                    &mut scheduler,
+                    &playback_wait
+                ),
+                PlaybackCoordinatorGateStatus::Ready
+            );
+            output.mark_first_frame_presented();
+            output.set_state(PlaybackOutputState::Playing);
+            assert_eq!(
+                service_gate(
+                    &mut gate,
+                    &control,
+                    &mut output,
+                    &mut scheduler,
+                    &playback_wait
+                ),
+                PlaybackCoordinatorGateStatus::Wait
+            );
+            assert!(control.is_user_paused());
+            assert_eq!(scheduler.current_timeline_nsecs(), target);
+        }
+    }
+
+    #[test]
+    fn newer_pending_seek_blocks_paused_preview_until_its_reset_finishes() {
+        let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
+        control.set_user_paused(true);
+        let playback_wait = PlaybackPipelineWaitService::new(Arc::clone(&control));
+        let mut gate = PlaybackCoordinatorGateService::default();
+        let mut scheduler = PlaybackScheduler::new(4_800_000_000);
+        let mut output = PlaybackOutputScheduler::new();
+        let generation = control.request_seek();
+        assert_eq!(
+            service_gate(
+                &mut gate,
+                &control,
+                &mut output,
+                &mut scheduler,
+                &playback_wait
+            ),
+            PlaybackCoordinatorGateStatus::Wait
+        );
+        control.finish_seek(generation);
+        assert_eq!(
+            service_gate(
+                &mut gate,
+                &control,
+                &mut output,
+                &mut scheduler,
+                &playback_wait
+            ),
+            PlaybackCoordinatorGateStatus::Ready
+        );
+        assert!(control.is_user_paused());
+    }
+
+    #[test]
+    fn paused_seek_keeps_cache_waits_but_allows_decode_input_and_output_work() {
+        let control = FfmpegControl::new(PlaybackSessionId(1));
+        control.set_user_paused(true);
+        control.set_cache_paused(true);
+        for (demand, decode_work, input_drainable, input_admissible, expected) in [
+            (
+                OutputServiceDemand::None,
+                true,
+                false,
+                false,
+                PlaybackCoordinatorGateStatus::DrainDecodeOnly,
+            ),
+            (
+                OutputServiceDemand::None,
+                false,
+                true,
+                true,
+                PlaybackCoordinatorGateStatus::DrainCachedInput,
+            ),
+            (
+                OutputServiceDemand::HardDeadline,
+                false,
+                false,
+                false,
+                PlaybackCoordinatorGateStatus::ServiceOutput,
+            ),
+            (
+                OutputServiceDemand::None,
+                false,
+                false,
+                false,
+                PlaybackCoordinatorGateStatus::WaitForCache,
+            ),
+        ] {
+            assert_eq!(
+                coordinator_gate_status(
+                    &control,
+                    true,
+                    demand,
+                    decode_work,
+                    input_drainable,
+                    input_admissible
+                ),
+                expected
+            );
+            assert_eq!(
+                coordinator_gate_status(
+                    &control,
+                    false,
+                    demand,
+                    decode_work,
+                    input_drainable,
+                    input_admissible
+                ),
+                PlaybackCoordinatorGateStatus::Wait
+            );
+        }
+    }
+
+    #[test]
     fn cache_pause_with_first_frame_work_drains_decode_instead_of_waiting() {
         let control = FfmpegControl::new(PlaybackSessionId(1));
         control.set_cache_paused(true);
         assert_eq!(
-            coordinator_gate_status(&control, OutputServiceDemand::None, true, false, false),
+            coordinator_gate_status(
+                &control,
+                false,
+                OutputServiceDemand::None,
+                true,
+                false,
+                false
+            ),
             PlaybackCoordinatorGateStatus::DrainDecodeOnly
         );
         assert_eq!(
-            coordinator_gate_status(&control, OutputServiceDemand::None, false, true, true),
+            coordinator_gate_status(
+                &control,
+                false,
+                OutputServiceDemand::None,
+                false,
+                true,
+                true
+            ),
             PlaybackCoordinatorGateStatus::DrainCachedInput
         );
         assert_eq!(
-            coordinator_gate_status(&control, OutputServiceDemand::None, false, false, false),
+            coordinator_gate_status(
+                &control,
+                false,
+                OutputServiceDemand::None,
+                false,
+                false,
+                false
+            ),
             PlaybackCoordinatorGateStatus::WaitForCache
         );
     }
@@ -453,7 +628,14 @@ mod tests {
         control.set_cache_paused(true);
 
         assert_eq!(
-            coordinator_gate_status(&control, OutputServiceDemand::None, false, 85 > 0, true,),
+            coordinator_gate_status(
+                &control,
+                false,
+                OutputServiceDemand::None,
+                false,
+                85 > 0,
+                true,
+            ),
             PlaybackCoordinatorGateStatus::DrainCachedInput
         );
     }
@@ -465,6 +647,7 @@ mod tests {
         assert_eq!(
             coordinator_gate_status(
                 &control,
+                false,
                 OutputServiceDemand::PeriodicProbe,
                 false,
                 true,
@@ -481,6 +664,7 @@ mod tests {
         assert_eq!(
             coordinator_gate_status(
                 &control,
+                false,
                 OutputServiceDemand::HardDeadline,
                 true,
                 true,
@@ -497,6 +681,7 @@ mod tests {
         assert_eq!(
             coordinator_gate_status(
                 &control,
+                false,
                 OutputServiceDemand::AudioStartDue,
                 false,
                 true,
@@ -511,7 +696,14 @@ mod tests {
         let control = FfmpegControl::new(PlaybackSessionId(1));
         control.set_cache_paused(true);
         assert_eq!(
-            coordinator_gate_status(&control, OutputServiceDemand::None, false, true, false),
+            coordinator_gate_status(
+                &control,
+                false,
+                OutputServiceDemand::None,
+                false,
+                true,
+                false
+            ),
             PlaybackCoordinatorGateStatus::WaitForStateChange
         );
     }

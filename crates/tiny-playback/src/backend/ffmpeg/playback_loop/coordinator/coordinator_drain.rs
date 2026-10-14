@@ -11,6 +11,9 @@ use crate::{
 
 use super::{AudioOutputLifecycle, DemuxPacketCache, FfmpegControl};
 
+#[path = "coordinator_drain/paused_seek_eof.rs"]
+mod paused_seek_eof;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PlaybackEofDrainStatus {
     Complete,
@@ -58,6 +61,8 @@ pub(super) fn service_playback_eof_drain(
     )?) {
         return Ok(status);
     }
+
+    paused_seek_eof::publish_paused_seek_final_frame(&mut context)?;
 
     context.pipeline.buffered_reporter.report_value(
         context.duration_seconds,

@@ -31,8 +31,8 @@ use super::{
     VideoRecoveryPointKind, audio_codec_requires_recovery_point, duration_nsecs, ffmpeg_error,
     nsecs_to_seconds, optional_buffered_value_changed, packet_duration_nsecs,
     packet_is_audio_recovery_point, packet_is_video_seek_point, packet_video_recovery_point_kind,
-    playback_buffered_near_duration, preroll_seek_position_seconds, seconds_to_nsecs,
-    timestamp_to_nsecs, video_cached_seek_preroll_nsecs, video_seek_preroll_nsecs,
+    playback_buffered_near_duration, seconds_to_nsecs, timestamp_to_nsecs,
+    video_cached_seek_preroll_nsecs,
 };
 
 #[path = "demux_cache/cache.rs"]

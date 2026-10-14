@@ -9,7 +9,7 @@ use crate::{
 
 use super::demux_cache::DemuxSeekResult;
 use super::{
-    BufferedReporter, DemuxPacketCache, FfmpegControl, preroll_seek_position_seconds,
+    BufferedReporter, DemuxPacketCache, FfmpegControl, paused_seek_preroll_position_seconds,
     reset_playback_timeline_state, seconds_to_nsecs,
 };
 use ffmpeg_sys_next as ffi;
@@ -320,9 +320,10 @@ pub(super) fn service_playback_seek_reset(
         event_tx,
     } = context;
     let target_nsecs = seconds_to_nsecs(position_seconds);
-    let seek_position_nsecs = seconds_to_nsecs(preroll_seek_position_seconds(
+    let seek_position_nsecs = seconds_to_nsecs(paused_seek_preroll_position_seconds(
         pipeline.video_stream.codec_id,
         position_seconds,
+        control.is_user_paused(),
     ));
     let repeated_cra_low_level_tuple = pipeline.video_stream.codec_id
         == ffi::AVCodecID::AV_CODEC_ID_HEVC

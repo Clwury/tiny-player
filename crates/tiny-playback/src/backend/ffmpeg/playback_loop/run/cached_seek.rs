@@ -15,7 +15,7 @@ pub(super) fn service_hevc_startup_stall_watchdog_due_if_needed(
     missing_recovery_request_tracker: &mut MissingRecoveryRequestTracker,
     checkpoint: &'static str,
 ) -> std::result::Result<bool, String> {
-    if control.is_user_paused() {
+    if control.is_user_paused() && !pipeline.output_scheduler.restart_pending() {
         return Ok(false);
     }
     let drained_progress = drain_video_decode_results_before_watchdog(
@@ -77,7 +77,7 @@ pub(super) fn service_cached_seek_recovery_fallback_if_needed(
     emit_playback_buffered_events: bool,
     requested_recovery: Option<PlaybackRecoveryRequest>,
 ) -> std::result::Result<bool, String> {
-    if control.is_user_paused() {
+    if control.is_user_paused() && !pipeline.output_scheduler.restart_pending() {
         return Ok(false);
     }
     let (cached_fallback, hevc_fallback, requested_recovery) =

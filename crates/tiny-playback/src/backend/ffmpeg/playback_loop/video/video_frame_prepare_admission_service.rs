@@ -37,6 +37,7 @@ pub(super) enum DecodedVideoFrameStartStatus {
 pub(super) enum DecodedVideoFramePrepareStatus {
     Queued,
     Backpressured,
+    RetainedPreroll,
     DroppedCorrupt,
 }
 
@@ -64,7 +65,11 @@ pub(super) fn service_decoded_video_frame_start(
 ) -> DecodedVideoFrameStartStatus {
     let raw_timestamp = frame_best_effort_timestamp(frame);
     let verified_replay_target_nsecs = video_decode_recovery.verified_replay_target_nsecs();
-    let timestamp = if verified_replay_target_nsecs.is_some() {
+    // Repeated preroll timestamps must stay before the target while paused.
+    // Synthesizing them forward can publish an earlier picture as the target.
+    let timestamp = if verified_replay_target_nsecs.is_some()
+        || (control.is_user_paused() && output_scheduler.restart_pending())
+    {
         video_clock.map_authoritative(raw_timestamp, video_time_base)
     } else {
         video_clock.map(raw_timestamp, video_time_base)
@@ -107,6 +112,15 @@ pub(super) fn service_decoded_video_frame_start(
     );
     match start_action {
         DecodedVideoFrameStartAction::DropBeforeStart => {
+            // Keep one valid source frame until EOF proves that the requested
+            // target is beyond the final video timestamp. Do not publish it yet.
+            if control.is_user_paused() && output_scheduler.restart_pending() {
+                video_decode_recovery.observe_seek_preroll_frame(timestamp.timeline_nsecs);
+                return DecodedVideoFrameStartStatus::Ready(DecodedVideoFrameStartFrame {
+                    timeline_nsecs: timestamp.timeline_nsecs,
+                    frame_pts,
+                });
+            }
             if let Some(progress) =
                 video_decode_recovery.observe_seek_preroll_frame(timestamp.timeline_nsecs)
             {
@@ -203,6 +217,7 @@ pub(super) fn service_decoded_video_frame_start(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn service_drained_video_frame_start(
     frame: *mut ffi::AVFrame,
     video_time_base: ffi::AVRational,
@@ -211,10 +226,15 @@ pub(super) fn service_drained_video_frame_start(
     subtitle_pipeline: &mut SubtitlePipeline,
     current_start_position_nsecs: u64,
     dovi_pipeline: &mut DoviPipeline,
+    retain_paused_preroll: bool,
 ) -> DecodedVideoFrameStartStatus {
-    let timestamp = video_clock.map(frame_best_effort_timestamp(frame), video_time_base);
+    let timestamp = if retain_paused_preroll {
+        video_clock.map_authoritative(frame_best_effort_timestamp(frame), video_time_base)
+    } else {
+        video_clock.map(frame_best_effort_timestamp(frame), video_time_base)
+    };
     subtitle_pipeline.refresh_timeline_origin(playback_timeline_origin_nsecs, video_clock);
-    if timestamp.timeline_nsecs < current_start_position_nsecs {
+    if timestamp.timeline_nsecs < current_start_position_nsecs && !retain_paused_preroll {
         return DecodedVideoFrameStartStatus::DroppedBeforeStart;
     }
     let frame_pts = FramePts {
@@ -237,6 +257,7 @@ pub(super) fn enqueue_decoded_video_frame_prepare(
     frame_pts: FramePts,
     timeline_nsecs: u64,
     duration_nsecs: u64,
+    retain_preroll: bool,
     dovi_pipeline: &mut DoviPipeline,
     video_frame_prepare_worker: &mut VideoFramePrepareWorker,
     convert_context: &VideoFrameConvertContext,
@@ -248,7 +269,7 @@ pub(super) fn enqueue_decoded_video_frame_prepare(
     }
 
     let dovi_metadata = dovi_pipeline.metadata_for_decoded_frame(frame, frame_pts);
-    match video_frame_prepare_worker.try_enqueue(VideoFramePrepareInput {
+    let input = VideoFramePrepareInput {
         generation,
         diagnostic,
         frame_diagnostic,
@@ -258,7 +279,13 @@ pub(super) fn enqueue_decoded_video_frame_prepare(
         duration_nsecs,
         convert_context: convert_context.clone(),
         dovi_metadata,
-    })? {
+    };
+    if retain_preroll {
+        video_frame_prepare_worker.retain_seek_preroll(input);
+        return Ok(DecodedVideoFramePrepareStatus::RetainedPreroll);
+    }
+    drop(video_frame_prepare_worker.take_seek_preroll());
+    match video_frame_prepare_worker.try_enqueue(input)? {
         VideoFramePrepareEnqueueResult::Queued => Ok(DecodedVideoFramePrepareStatus::Queued),
         VideoFramePrepareEnqueueResult::InputFull => {
             Ok(DecodedVideoFramePrepareStatus::Backpressured)
@@ -282,4 +309,36 @@ pub(super) fn drop_corrupt_video_frame_if_needed(
     );
     dovi_pipeline.discard_frame(frame_pts);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::ffmpeg::AvFrame;
+
+    #[test]
+    fn paused_drain_keeps_repeated_preroll_pts_before_the_target() {
+        let mut frame = AvFrame::new().unwrap();
+        unsafe {
+            (*frame.as_mut_ptr()).pts = 24;
+            (*frame.as_mut_ptr()).best_effort_timestamp = 24;
+        }
+        let time_base = ffi::AVRational { num: 1, den: 10 };
+        let mut clock = TimestampMapper::new(Some(0), 3_000_000_000, Some(100_000_000));
+        clock.map(29, time_base);
+        let status = service_drained_video_frame_start(
+            frame.as_mut_ptr(),
+            time_base,
+            &mut clock,
+            &mut Some(0),
+            &mut SubtitlePipeline::empty_for_test(),
+            3_000_000_000,
+            &mut DoviPipeline::default(),
+            true,
+        );
+        let DecodedVideoFrameStartStatus::Ready(actual) = status else {
+            panic!("valid paused preroll is retained");
+        };
+        assert_eq!(actual.timeline_nsecs, 2_400_000_000);
+    }
 }

@@ -31,6 +31,7 @@ pub(super) struct VideoFramePrepareWorker {
     completed: VecDeque<VideoFramePrepareResult>,
     in_flight_by_generation: BTreeMap<u64, usize>,
     generation_floor: u64,
+    retained_seek_preroll: Option<VideoFramePrepareInput>,
 }
 
 pub(super) struct VideoFramePrepareInput {
@@ -203,7 +204,23 @@ impl VideoFramePrepareWorker {
             completed: VecDeque::new(),
             in_flight_by_generation: BTreeMap::new(),
             generation_floor: 0,
+            retained_seek_preroll: None,
         })
+    }
+
+    pub(super) fn retain_seek_preroll(&mut self, input: VideoFramePrepareInput) {
+        if input.generation >= self.generation_floor
+            && self
+                .retained_seek_preroll
+                .as_ref()
+                .is_none_or(|previous| input.timeline_nsecs >= previous.timeline_nsecs)
+        {
+            self.retained_seek_preroll = Some(input);
+        }
+    }
+
+    pub(super) fn take_seek_preroll(&mut self) -> Option<VideoFramePrepareInput> {
+        self.retained_seek_preroll.take()
     }
 
     pub(super) fn try_enqueue(
@@ -322,6 +339,7 @@ impl VideoFramePrepareWorker {
             "flushing FFmpeg video frame prepare worker generation"
         );
         self.generation_floor = self.generation_floor.max(generation);
+        self.retained_seek_preroll = None;
         self.pending_inputs.clear();
         self.completed.clear();
         self.in_flight_by_generation.clear();
@@ -726,6 +744,7 @@ mod tests {
             completed: VecDeque::new(),
             in_flight_by_generation: BTreeMap::new(),
             generation_floor: 0,
+            retained_seek_preroll: None,
         }
     }
 
@@ -812,6 +831,30 @@ mod tests {
             convert_context: VideoFrameConvertContext::new_for_test(size),
             dovi_metadata: None,
         }
+    }
+
+    #[test]
+    fn seek_preroll_keeps_the_latest_pts_and_drops_stale_generations() {
+        let mut worker = test_worker();
+        worker.retain_seek_preroll(test_input(1));
+        let mut later = test_input(1);
+        later.timeline_nsecs = 100;
+        worker.retain_seek_preroll(later);
+        worker.retain_seek_preroll(test_input(1));
+        assert_eq!(worker.take_seek_preroll().unwrap().timeline_nsecs, 100);
+        assert!(worker.take_seek_preroll().is_none());
+        worker.retain_seek_preroll(test_input(1));
+        worker.flush_generation(2);
+        assert!(worker.take_seek_preroll().is_none());
+        worker.retain_seek_preroll(test_input(1));
+        assert!(worker.take_seek_preroll().is_none());
+        worker.retain_seek_preroll(test_input(3));
+        worker.flush_generation(3);
+        worker.retain_seek_preroll(test_input(3));
+        let mut stale = test_input(2);
+        stale.timeline_nsecs = 200;
+        worker.retain_seek_preroll(stale);
+        assert_eq!(worker.take_seek_preroll().unwrap().generation, 3);
     }
 
     #[test]

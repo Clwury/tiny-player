@@ -12,6 +12,8 @@ mod http_cache;
 mod misc;
 #[path = "tests/output.rs"]
 mod output;
+#[path = "tests/paused_seek.rs"]
+mod paused_seek;
 #[path = "tests/timeline.rs"]
 mod timeline;
 #[path = "tests/vulkan.rs"]

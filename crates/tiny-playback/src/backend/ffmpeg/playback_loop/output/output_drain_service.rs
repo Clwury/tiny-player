@@ -63,6 +63,16 @@ pub(super) fn drain_output_until_idle(
     } else {
         drain_video_clocked_output_until_idle(context);
     }
+    // Seeking to the final frame while paused must keep that frame visible,
+    // rather than complete playback (and potentially advance the playlist).
+    while context.control.is_user_paused() && !context.control.should_interrupt() {
+        context
+            .playback_wait
+            .wait_poll_interval_and_delay_scheduler_until(
+                &mut context.pipeline.scheduler,
+                PlaybackLoopDeadline::default(),
+            );
+    }
     Ok(output_drain_stop_or_seek_status(context.control).unwrap_or(OutputDrainStatus::Complete))
 }
 
@@ -295,6 +305,15 @@ fn drain_video_clocked_output_until_idle(context: &mut OutputDrainContext<'_>) {
         .queued_video_frames
         > 0
     {
+        if output_drain_stop_or_seek_status(context.control).is_some() {
+            return;
+        }
+        // EOF draining bypasses the coordinator gate, so it must also thaw
+        // the video clock when playback resumes after a paused seek.
+        context
+            .pipeline
+            .scheduler
+            .set_paused(context.control.is_user_paused());
         context
             .pipeline
             .scheduler

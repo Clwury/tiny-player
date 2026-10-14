@@ -132,13 +132,13 @@ fn playback_detail_section_element(
 
 pub(super) fn playback_details_overlay(
     sections: impl IntoIterator<Item = Option<PlaybackDetailSection>>,
+    scroll_handle: &gpui::ScrollHandle,
     window: &Window,
     cx: &gpui::App,
 ) -> gpui::Stateful<gpui::Div> {
-    playback_overlay_container("playback-details-overlay", window)
+    playback_overlay_container("playback-details-overlay", scroll_handle, window)
         .gap_3()
         // Pointer presses and movement reach the full-window playback surface.
-        // Keep wheel events here so scrolling stats does not change the volume.
         .children(
             sections
                 .into_iter()

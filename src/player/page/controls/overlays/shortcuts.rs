@@ -45,6 +45,7 @@ const GAMEPAD_HINT: &str = "L3 / R3 为左 / 右摇杆按下，箭头为方向�
 
 pub(super) fn shortcuts_overlay(
     gamepad_first: bool,
+    scroll_handle: &gpui::ScrollHandle,
     window: &Window,
     cx: &App,
 ) -> impl IntoElement {
@@ -60,7 +61,7 @@ pub(super) fn shortcuts_overlay(
     } else {
         [keyboard, gamepad]
     };
-    playback_overlay_container("playback-shortcuts-overlay", window)
+    playback_overlay_container("playback-shortcuts-overlay", scroll_handle, window)
         .gap_3()
         .child(
             div()
