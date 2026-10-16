@@ -19,11 +19,13 @@ pkgbase = tiny-player-git
 	depends = glibc
 	depends = hicolor-icon-theme
 	depends = libplacebo>=7
+	depends = libva
 	depends = libxcb
 	depends = libxkbcommon
 	depends = systemd-libs
 	depends = vulkan-icd-loader
 	depends = wayland
+	depends = libdrm
 	provides = tiny-player=0.1.6.r143.g841df15
 	conflicts = tiny-player
 	options = !lto

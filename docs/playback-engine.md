@@ -48,6 +48,66 @@ Vulkan/libplacebo；没有 GPU 的环境可使用 BGRA 等走软件转换路径�
 `vulkan` 或 `force-vulkan` 强制 Vulkan 硬解并禁止显式软解回退。
 软件解码后的常见 YUV 帧仍经由 Vulkan/libplacebo 处理。
 
+Linux 新增显式 `HardwareDecodeMode::ForceVaapi`（配置值 `force_vaapi`）：
+`TINY_HWDEC=vaapi`、`force-vaapi` 或 `vaapi-copy` 选择 VA-API 回传路径。
+`TINY_VAAPI_DEVICE` 可指定 DRM render node；未设置时由 FFmpeg 自动选择。
+引擎选择具有 VA-API 硬件配置的解码器（包括绕过软件专用的 AV1/dav1d 默认解码器），
+在解码 worker 接收输出时立即执行 `av_hwframe_transfer_data`，并复制帧属性及 side data。
+异步队列只保留 CPU 帧，不长期占用 VA-API surface；surface 额外预留为 6 帧。
+回传显式保留源像素格式，P010 不经过 8 位中间帧；不支持的格式明确报错。
+转换结果沿用 `RawVideo`、libplacebo 与 BGRA 输出，不导入 DMA-BUF，也不共享解码设备。
+强制格式协商不接受软件输出；HEVC 有界恢复保留 VA-API 后端，重开后直接重放，
+无需等待 Vulkan 解码设备预热。强制模式失败时不回退软件，默认 `Auto` 行为不变。
+播放信息通过 `PlaybackVideoInfo::hardware_decode_backend` 上报解码器使用的后端，
+面板中 VA-API 回传路径显示 `HW: vaapi-copy`，Vulkan 硬解显示 `HW: vulkan`。
+`Display / Context: vulkan` 表示渲染后端，使用 VA-API 或软件解码时仍为 Vulkan。
+
+Linux 性能路径 `HardwareDecodeMode::ForceVaapiVulkan`（配置值 `force_vaapi_vulkan`）
+由 `TINY_HWDEC=vaapi-vulkan` 或“强制 VA-API（映射 Vulkan）”选择：
+
+- 从 VA-API 设备派生 Vulkan 设备，关闭 multiplane 格式选择，使派生上下文的平面格式匹配 VA 导出的 DRM 分层图像。派生设备用于现有 libplacebo 设备导入及预热。
+- 按源 `AVHWFramesContext` 身份缓存派生帧上下文；源池变化时替换，旧队列帧仍保留自身引用。两次 `av_hwframe_map(READ | DIRECT)` 显式执行 VA-API → DRM PRIME → Vulkan，经 DMA-BUF 导入 NV12/P010，不执行原始 YUV 帧下载。显式导出 DRM 避免 FFmpeg VA-API `map_from` 将 Vulkan 目标误派发到内存映射并返回 EINVAL。
+- FFmpeg 处理 VA surface 完成同步、DMA-BUF modifier、外部内存及队列所有权，并在映射 AVFrame 中保留源 VA surface。渲染继续使用现有 FFmpeg 队列锁与 timeline semaphore 交接。直接映射接口及生命周期遵循 [FFmpeg hwcontext 文档](https://ffmpeg.org/doxygen/trunk/hwcontext_8h.html)。
+- 映射的 VkImage 尺寸使用导入帧尺寸，usage 使用 READ 映射实际创建的 SAMPLED/TRANSFER_SRC 位，而不是派生池的默认能力。映射图像逐帧释放，禁用跨帧纹理包装缓存，并在解映射前完成 libplacebo 对图像和信号量的引用。
+- 队列持有 GPU 帧及 VA surface；映射 AVFrame 附带引用计数租约，跨解码、准备、调度、呈现队列和渲染器统计实际存活映射。达到 8 帧后暂停送包，释放最后一个引用后恢复；控制命令不受此背压阻止。额外 surface 预留为 16，使用单解码线程，为 DPB、最多 4 个已送包和异步输出留出空间，兼容 NVIDIA VA-API 的 32 个解码 picture 限制；回传模式仍为 6。HEVC 重开保持 GPU 映射模式，并等待派生 Vulkan 设备预热后重放。
+- 需要 `VK_KHR_external_memory_fd`、`VK_EXT_external_memory_dma_buf`、`VK_EXT_image_drm_format_modifier`、`VK_KHR_external_semaphore_fd`。设备派生、映射或直接渲染失败均明确报错，不隐式回传内存；可手动选择原有回传模式。
+
+该路径消除的是解码到渲染之间的 YUV CPU 往返；输出仍经 BGRA 回读交给 GPUI，
+不表示显示链路已实现端到端零拷贝。FFmpeg 的 VA surface 同步和当前呈现接口仍包含等待，
+实际收益需在目标 GPU 上对比播放日志、CPU 占用和帧时间。
+
+真机检查需要 FFmpeg 的 VA-API 支持、系统 VA-API 驱动、DRM render node 访问权限及
+可用的 Vulkan 渲染设备：
+
+```sh
+vainfo --display drm --device /dev/dri/renderD128
+TINY_HWDEC=vaapi TINY_VAAPI_DEVICE=/dev/dri/renderD128 \
+  cargo run -p tiny-playback --locked --example headless -- /path/to/video.mkv
+```
+
+下述显式硬件测试检查 NV12/P010 回传、BGRA 渲染、暂停、前后 seek、恢复播放、EOF
+及停止；需要 GPU，默认测试套件将其标为 ignored：
+
+```sh
+TINY_VAAPI_DEVICE=/dev/dri/renderD128 \
+  cargo test -p tiny-playback --locked vaapi_playback -- --ignored --nocapture
+```
+
+GPU 映射模式的测试另外断言输出是 Vulkan GPU 帧，并覆盖相同播放操作及两种 demux 缓存策略：
+硬件用例使用公开生成素材的二十秒无损循环版本，暂停 seek 按新会话与目标 PTS 验证，
+恢复后四倍速排空至 EOF；默认无 GPU 的软件用例仍使用四秒原始素材。
+
+```sh
+TINY_HWDEC=vaapi-vulkan TINY_VAAPI_DEVICE=/dev/dri/renderD128 \
+  cargo run --locked
+TINY_VAAPI_DEVICE=/dev/dri/renderD128 \
+  cargo test -p tiny-playback --locked vaapi_vulkan_playback -- --ignored --nocapture
+```
+
+信息面板应显示 `HW: vaapi-vulkan`；日志应出现 `created VA-API Vulkan DMA-BUF mapping device`、
+`initialized direct VA-API to Vulkan frame mapping` 以及颜色转换日志的 `path: "vaapi-vulkan"`。
+无 GPU 的默认测试覆盖直接映射标志、HDR/时间属性、排队帧持有源 surface 的引用、映射失败清理及帧池切换。
+
 ## 图像与应用适配
 
 `VideoPresenter::render_if_needed` 返回 `Option<BgraImage>`。图像拥有紧密排列、

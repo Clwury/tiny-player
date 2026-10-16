@@ -40,6 +40,7 @@ pub(super) fn playback_video_info_from_worker(
         }),
         bitrate: positive_u64(unsafe { (*codec_parameters).bit_rate }),
         hardware_accelerated: video_decoder.hardware_accelerated,
+        hardware_decode_backend: video_decoder.hardware_decode_backend,
     })
 }
 
@@ -169,6 +170,44 @@ fn non_empty_c_string(value: *const std::os::raw::c_char) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::HardwareDecodeBackend;
+    use crate::backend::ffmpeg::{Decoder, FormatContext, VideoFrameConvertContext};
+
+    #[test]
+    fn video_info_preserves_decoder_backend_and_clears_it_after_software_recovery() {
+        let input = FormatContext::with_streams_for_test(&[(
+            ffi::AVMediaType::AVMEDIA_TYPE_VIDEO,
+            ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        )]);
+        let stream = input
+            .best_stream(ffi::AVMediaType::AVMEDIA_TYPE_VIDEO)
+            .unwrap()
+            .unwrap();
+        let decoder = Decoder::open(stream).unwrap();
+        let mut worker_info = VideoDecodeWorkerInfo {
+            stream_index: stream.index,
+            time_base: stream.time_base,
+            size: decoder.size().ok(),
+            decoder_name: decoder.decoder_name(),
+            hardware_accelerated: true,
+            hardware_decode_backend: Some(HardwareDecodeBackend::Vaapi),
+            vulkan_device: None,
+            convert_context: VideoFrameConvertContext::from_decoder(&decoder),
+        };
+
+        for backend in [
+            Some(HardwareDecodeBackend::Vaapi),
+            Some(HardwareDecodeBackend::VaapiVulkan),
+            Some(HardwareDecodeBackend::Vulkan),
+            None,
+        ] {
+            worker_info.hardware_accelerated = backend.is_some();
+            worker_info.hardware_decode_backend = backend;
+            let info = playback_video_info_from_worker(stream, &worker_info).unwrap();
+            assert_eq!(info.hardware_decode_backend, backend);
+            assert_eq!(info.hardware_accelerated, backend.is_some());
+        }
+    }
 
     #[test]
     fn codec_description_identifies_the_format_instead_of_a_decoder_library() {

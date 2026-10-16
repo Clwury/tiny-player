@@ -557,7 +557,7 @@ mod decode_recovery_tests {
         output.begin_decode_recovery(
             85,
             1_000_000_000,
-            DecodeRecoverySource::VulkanReopenReplay,
+            DecodeRecoverySource::HardwareReopenReplay,
             &control,
             session_id,
         );
@@ -1106,7 +1106,7 @@ mod decode_recovery_tests {
         output.begin_decode_recovery(
             14,
             target_nsecs,
-            DecodeRecoverySource::VulkanReopenReplay,
+            DecodeRecoverySource::HardwareReopenReplay,
             &control,
             session_id,
         );
@@ -1148,7 +1148,7 @@ mod decode_recovery_tests {
         assert_eq!(drop.target_nsecs, target_nsecs);
         assert_eq!(drop.first_frame_nsecs, resume_nsecs);
         assert_eq!(drop.gap_nsecs, 9_000_000_000);
-        assert_eq!(drop.source, DecodeRecoverySource::VulkanReopenReplay);
+        assert_eq!(drop.source, DecodeRecoverySource::HardwareReopenReplay);
         assert!(
             !output.stage_decode_recovery_frame(
                 frame(resume_nsecs + 33_333_333, 33_333_333, false),
@@ -1182,7 +1182,7 @@ mod decode_recovery_tests {
         output.begin_decode_recovery(
             61,
             target_nsecs,
-            DecodeRecoverySource::VulkanReopenReplay,
+            DecodeRecoverySource::HardwareReopenReplay,
             &control,
             session_id,
         );
@@ -1227,7 +1227,7 @@ mod decode_recovery_tests {
         output.begin_decode_recovery(
             63,
             target_nsecs,
-            DecodeRecoverySource::VulkanReopenReplay,
+            DecodeRecoverySource::HardwareReopenReplay,
             &control,
             session_id,
         );
@@ -1267,7 +1267,7 @@ mod decode_recovery_tests {
         output.begin_decode_recovery(
             62,
             target_nsecs,
-            DecodeRecoverySource::VulkanReopenReplay,
+            DecodeRecoverySource::HardwareReopenReplay,
             &control,
             session_id,
         );

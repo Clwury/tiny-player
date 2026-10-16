@@ -12,6 +12,7 @@ pub struct VulkanVideoFrame {
     pub frame: FfmpegFrameRef,
     pub device: Arc<VulkanDecodeDevice>,
     pub format: RawVideoFormat,
+    pub source: VulkanFrameSource,
     /// AVHWFramesContext allocation extent; the visible frame may be smaller.
     pub allocated_size: RenderSize,
     pub usage: u32,
@@ -20,6 +21,23 @@ pub struct VulkanVideoFrame {
     pub chroma_site: RawVideoChromaSite,
     pub metadata: Option<FrameDynamicMetadata>,
     pub planes: Vec<VulkanVideoPlane>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanFrameSource {
+    DecoderPool,
+    /// VkImages exist only as long as this mapped AVFrame, retaining its VA surface.
+    VaapiMapping,
+}
+
+impl VulkanFrameSource {
+    pub fn cache_textures(self) -> bool {
+        self == Self::DecoderPool
+    }
+
+    pub fn allows_download_fallback(self) -> bool {
+        self == Self::DecoderPool
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

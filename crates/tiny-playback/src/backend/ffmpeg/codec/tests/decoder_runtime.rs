@@ -1,6 +1,77 @@
 use super::*;
 
 #[test]
+fn forced_hardware_format_selection_rejects_software_only_negotiation() {
+    let decoder = Decoder::open_h264_for_test();
+    for format in [
+        ffi::AVPixelFormat::AV_PIX_FMT_VULKAN,
+        ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+    ] {
+        let mut selection = VideoHwFormatSelection {
+            pixel_format: format,
+            allow_software_fallback: false,
+            negotiation_failed: AtomicBool::new(false),
+        };
+        unsafe { (*decoder.ptr).opaque = (&mut selection as *mut VideoHwFormatSelection).cast() };
+        let software_only = [
+            ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
+            ffi::AVPixelFormat::AV_PIX_FMT_NONE,
+        ];
+        assert_eq!(
+            unsafe { select_video_hw_format(decoder.ptr, software_only.as_ptr()) },
+            ffi::AVPixelFormat::AV_PIX_FMT_NONE
+        );
+        assert!(selection.negotiation_failed.load(Ordering::Acquire));
+        let mut selection = VideoHwFormatSelection {
+            pixel_format: format,
+            allow_software_fallback: true,
+            negotiation_failed: AtomicBool::new(false),
+        };
+        unsafe { (*decoder.ptr).opaque = (&mut selection as *mut VideoHwFormatSelection).cast() };
+        assert_eq!(
+            unsafe { select_video_hw_format(decoder.ptr, software_only.as_ptr()) },
+            ffi::AVPixelFormat::AV_PIX_FMT_YUV420P
+        );
+        assert!(!selection.negotiation_failed.load(Ordering::Acquire));
+        let supported = [
+            format,
+            ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
+            ffi::AVPixelFormat::AV_PIX_FMT_NONE,
+        ];
+        assert_eq!(
+            unsafe { select_video_hw_format(decoder.ptr, supported.as_ptr()) },
+            format
+        );
+    }
+    unsafe { (*decoder.ptr).opaque = ptr::null_mut() };
+}
+
+#[test]
+fn forced_vaapi_negotiation_failure_is_not_ignored_as_a_corrupt_h264_packet() {
+    let mut decoder = Decoder::open_h264_for_test();
+    decoder.hw_format_selection = Some(Box::new(VideoHwFormatSelection {
+        pixel_format: ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+        allow_software_fallback: false,
+        negotiation_failed: AtomicBool::new(true),
+    }));
+    let mut frame = AvFrame::new().unwrap();
+    unsafe { (*frame.as_mut_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as c_int };
+    assert!(
+        decoder
+            .validate_video_frame_format(frame.as_mut_ptr())
+            .is_err()
+    );
+    assert!(!decoder.continue_after_video_invalid_data(ffi::AVERROR_INVALIDDATA, "send_packet"));
+    let error = decoder
+        .decode_packet(ptr::null(), &mut frame, |_| {
+            panic!("failed negotiation must produce no frame")
+        })
+        .unwrap_err();
+    assert!(error.contains("VA-API"), "{error}");
+    assert!(error.contains("像素格式协商失败"), "{error}");
+}
+
+#[test]
 fn h264_and_hevc_invalid_packets_do_not_abort_decoding_or_swallow_resource_errors() {
     for decoder in [Decoder::open_h264_for_test(), Decoder::open_hevc_for_test()] {
         assert_eq!(

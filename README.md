@@ -10,7 +10,7 @@ Tiny Player is a native Emby desktop client for Linux and Windows, built with Ru
 - **Library browsing**: Browse movie and TV posters, search, manage favorites, continue watching, and select seasons and episodes.
 - **Media details**: View title logos, overviews, ratings, runtime, release dates, resolution, and dynamic range information.
 - **Playback and track selection**: Choose video versions, audio tracks, and subtitles, set language preferences, and sync playback progress.
-- **Video processing**: Software decoding, Vulkan hardware decoding, and HDR tone mapping. Hardware decoding support depends on the GPU, driver, and video codec.
+- **Video processing**: Software decoding, Vulkan hardware decoding, VA-API copyback or direct Vulkan mapping on Linux, and HDR tone mapping. Hardware decoding support depends on the GPU, driver, and video codec.
 - **Playback controls**: Fullscreen, playback speed adjustment, subtitle positioning, a playback information overlay, and configurable memory and disk caches.
 - **Gamepad playback shortcuts**: Standard gamepad buttons control playback, seeking, volume, speed, subtitle position, and returning to media details.
 - **Keep awake during video playback**: Request inhibition of automatic screen locking, display power saving, and sleep; release the request when paused, buffering pauses playback, playback ends, or the player closes.
@@ -57,6 +57,9 @@ Linux source builds also require the libudev development package (`libudev-dev` 
 The Linux prebuilt bundle includes FFmpeg, libplacebo, and selected dependencies. The system must also provide a Vulkan loader, ALSA and audio configuration, Fontconfig, FreeType, fonts, XKB keyboard data, system CA certificates, and GCC/C++ runtime libraries compatible with Ubuntu 24.04 (GCC 13) or later. The glibc 2.39 baseline applies to the prebuilt bundle; requirements for other builds depend on their build environment and dependencies.
 
 The Windows portable bundle includes multimedia dependencies and a Vulkan loader. The system must provide the GPU's Vulkan driver. Running the portable bundle does not require Rust, Python, Visual Studio, or a separate FFmpeg installation.
+
+The Linux bundle also requires host `libva.so.2`, `libva-drm.so.2`, and `libdrm.so.2` compatible with Ubuntu 24.04 or later. Select **Force VA-API (copyback)** in playback settings, or launch with `TINY_HWDEC=vaapi`; optionally set `TINY_VAAPI_DEVICE=/dev/dri/renderD128`. VA-API needs a compatible host driver and device access. Auto continues to prefer Vulkan. See [decoder settings](docs/settings.md) and [hardware verification](docs/playback-engine.md).
+For the GPU performance path, select **Force VA-API (map to Vulkan)** or use `TINY_HWDEC=vaapi-vulkan`. This imports NV12/P010 through DMA-BUF without downloading the decoded YUV frame. It requires Vulkan external memory, DRM modifiers and synchronization support; failures are reported without switching to copyback. Final BGRA output still returns to CPU memory for GPUI.
 
 On Linux, playback idle inhibition requires `xdg-desktop-portal` and a desktop portal backend that implements the Inhibit interface. If the desktop rejects the request, playback continues and the failure is logged. Manual locking and user-initiated sleep remain controlled by the system.
 

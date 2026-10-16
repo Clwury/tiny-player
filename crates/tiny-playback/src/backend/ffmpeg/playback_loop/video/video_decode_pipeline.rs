@@ -173,7 +173,7 @@ enum HevcSameHardwareRecoveryPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HevcSameHardwareRecoveryAttemptKind {
     FlushReplay,
-    VulkanReopenReplay,
+    HardwareReopenReplay,
     CachedSafeIdrRebuild,
 }
 
@@ -181,7 +181,7 @@ impl HevcSameHardwareRecoveryAttemptKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::FlushReplay => "flush_replay",
-            Self::VulkanReopenReplay => "vulkan_reopen_replay",
+            Self::HardwareReopenReplay => "hardware_reopen_replay",
             Self::CachedSafeIdrRebuild => "cached_safe_idr_rebuild",
         }
     }
@@ -583,7 +583,7 @@ impl HevcSameHardwareRecoveryTransaction {
             prewarm_ticket: None,
             original_error: source_error.unwrap_or_else(|| {
                 format!(
-                    "{} requested bounded same-Vulkan recovery at {}ns",
+                    "{} requested bounded same-hardware recovery at {}ns",
                     fallback.reason.as_str(),
                     fallback.target_nsecs
                 )
@@ -666,7 +666,7 @@ impl HevcSameHardwareRecoveryTransaction {
                 resource_pressure_errors = self.resource_pressure_errors,
                 suppressed_resource_pressure_errors = suppressed,
                 same_hw_recovery_phase = self.phase.as_str(),
-                "Vulkan decode resource pressure routed into bounded recovery"
+                "hardware decode resource pressure routed into bounded recovery"
             );
         } else {
             self.suppressed_resource_pressure_errors =
@@ -954,7 +954,8 @@ impl HevcSameHardwareRecoveryTransaction {
                     // Auto moves to software, while ForceVulkan gets one final
                     // authoritative rebuild from the demux cache's safe IDR.
                     self.finish_active_attempt("escalated_to_cache_rebuild", now);
-                    self.last_error = Some(format!("same-Vulkan reopen/replay failed: {failure}"));
+                    self.last_error =
+                        Some(format!("same-hardware reopen/replay failed: {failure}"));
                     self.phase = HevcSameHardwareRecoveryPhase::RebuildingFromCache;
                     self.pending_action(mode)
                 }
@@ -1007,9 +1008,9 @@ impl HevcSameHardwareRecoveryTransaction {
         if replay_packets == 0 {
             let error = "safe HEVC replay journal does not cover the recovery target";
             if after_reopen {
-                // Reopening the Vulkan context is not the final bounded option.
+                // Reopening the hardware context is not the final bounded option.
                 // Keep the reopened worker and rebuild it from the demux cache's
-                // preceding closed-GOP IDR/BLA before ForceVulkan can fail (or
+                // preceding closed-GOP IDR/BLA before a forced mode can fail (or
                 // Auto can fall through to software).
                 self.finish_active_attempt("journal_incomplete", now);
                 self.last_error = Some(error.to_string());
@@ -1101,7 +1102,7 @@ impl HevcSameHardwareRecoveryTransaction {
             .collect::<Vec<_>>()
             .join(" | ");
         format!(
-            "{:?} 同 Vulkan 硬解恢复失败：original_error={}; last_error={}; phase={}; flush_attempts={}; reopen_attempts={}; cached_rebuild_attempts={}; replay_packets={}; root_zero_output_packets={}; root_input_high_water_nsecs={:?}; root_output_high_water_nsecs={:?}; attempts=[{}]; elapsed_ms={:.3}; last_progress_ms={:.3}",
+            "{:?} 同后端硬解恢复失败：original_error={}; last_error={}; phase={}; flush_attempts={}; reopen_attempts={}; cached_rebuild_attempts={}; replay_packets={}; root_zero_output_packets={}; root_input_high_water_nsecs={:?}; root_output_high_water_nsecs={:?}; attempts=[{}]; elapsed_ms={:.3}; last_progress_ms={:.3}",
             mode,
             self.original_error,
             self.last_error
@@ -3195,7 +3196,7 @@ impl HevcDecodeChainWatchdog {
                 // already consumed at least 500 ms beyond its first eligible
                 // output, however, the missing interval is post-target decode
                 // failure evidence. Preserve it so the following PTS gap takes
-                // the bounded same-Vulkan/software recovery path instead of
+                // the bounded same-hardware/software recovery path instead of
                 // becoming a multi-second held frame.
                 self.health_state = HevcDecodeHealthState::Suspected;
                 self.recent_zero_output_packets = seek_zero_output_packets;
@@ -4425,8 +4426,12 @@ fn runtime_hevc_software_fallback_allowed(mode: HardwareDecodeMode) -> bool {
     mode.allows_fallback()
 }
 
-fn hevc_same_hardware_reopen_mode() -> HardwareDecodeMode {
-    HardwareDecodeMode::ForceVulkan
+fn hevc_same_hardware_reopen_mode(requested: HardwareDecodeMode) -> HardwareDecodeMode {
+    match requested {
+        HardwareDecodeMode::ForceVaapi => HardwareDecodeMode::ForceVaapi,
+        HardwareDecodeMode::ForceVaapiVulkan => HardwareDecodeMode::ForceVaapiVulkan,
+        _ => HardwareDecodeMode::ForceVulkan,
+    }
 }
 
 fn hevc_startup_in_flight_packet_should_arm(

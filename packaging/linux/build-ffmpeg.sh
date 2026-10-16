@@ -18,7 +18,7 @@ git checkout --detach FETCH_HEAD
     --arch=x86_64 --cpu=x86-64 --enable-shared --disable-static \
     --disable-debug --disable-doc --disable-programs --disable-avdevice \
     --disable-autodetect --disable-encoders --disable-muxers \
-    --enable-pthreads --enable-vulkan --glslc=glslangValidator \
+    --enable-pthreads --enable-vulkan --enable-vaapi --enable-libdrm --glslc=glslangValidator \
     --enable-libdav1d --enable-gnutls --enable-zlib --enable-bzlib --enable-lzma
 make -j "$jobs"
 make install

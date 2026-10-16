@@ -9,6 +9,7 @@ pub(super) struct UploadedSourceFrame {
 
 struct WrappedVulkanPlane {
     texture: ffi::pl_tex,
+    gpu: ffi::pl_gpu,
     plane_index: usize,
     held_by_user: bool,
     cached: bool,
@@ -182,6 +183,13 @@ impl LibplaceboToneMapper {
                 height: wrap_params.height,
             };
             let texture = unsafe { self.cached_vulkan_texture(input, key, &wrap_params)? };
+            let wrapped_plane = WrappedVulkanPlane {
+                texture,
+                gpu: self.gpu,
+                plane_index: 0,
+                held_by_user: true,
+                cached: input.source.cache_textures(),
+            };
             let format = unsafe { (*texture).params.format };
             let texture_plane_count = if format.is_null() {
                 0
@@ -212,12 +220,7 @@ impl LibplaceboToneMapper {
                 out_plane.component_mapping = layout.component_map;
                 frame.planes[plane_index] = out_plane;
             }
-            wrapped_vulkan_planes.push(WrappedVulkanPlane {
-                texture,
-                plane_index: 0,
-                held_by_user: true,
-                cached: true,
-            });
+            wrapped_vulkan_planes.push(wrapped_plane);
         } else {
             for (plane_index, plane) in input.planes.iter().enumerate() {
                 if plane.image == 0 {
@@ -246,6 +249,13 @@ impl LibplaceboToneMapper {
                     height: wrap_params.height,
                 };
                 let texture = unsafe { self.cached_vulkan_texture(input, key, &wrap_params)? };
+                let wrapped_plane = WrappedVulkanPlane {
+                    texture,
+                    gpu: self.gpu,
+                    plane_index,
+                    held_by_user: true,
+                    cached: input.source.cache_textures(),
+                };
                 let mut out_plane = unsafe { mem::zeroed::<ffi::pl_plane>() };
                 out_plane.texture = texture;
                 out_plane.flipped = false;
@@ -255,12 +265,7 @@ impl LibplaceboToneMapper {
                     .map_err(|_| anyhow!("video frame has too many components"))?;
                 out_plane.component_mapping = layout.component_map;
                 frame.planes[plane_index] = out_plane;
-                wrapped_vulkan_planes.push(WrappedVulkanPlane {
-                    texture,
-                    plane_index,
-                    held_by_user: true,
-                    cached: true,
-                });
+                wrapped_vulkan_planes.push(wrapped_plane);
             }
         }
 
@@ -323,6 +328,12 @@ impl LibplaceboToneMapper {
         key: VulkanTextureKey,
         params: &ffi::pl_vulkan_wrap_params,
     ) -> Result<ffi::pl_tex> {
+        if !input.source.cache_textures() {
+            // Mapped VkImages are destroyed when their AVFrame is released,
+            // independently of the pool. A cached wrapper would dangle, and a
+            // reused VkImage handle could then refer to an unrelated image.
+            return Ok(unsafe { WrappedVulkanTextureGuard::new(self.gpu, params)? }.into_texture());
+        }
         self.vulkan_texture_generation = self.vulkan_texture_generation.wrapping_add(1).max(1);
         let generation = self.vulkan_texture_generation;
         if let Some(entry) = self
@@ -494,19 +505,18 @@ impl UploadedSourceFrame {
     }
 }
 
-impl Drop for UploadedSourceFrame {
+impl Drop for WrappedVulkanPlane {
     fn drop(&mut self) {
-        unsafe {
-            for plane in &mut self.wrapped_vulkan_planes {
-                if !plane.cached
-                    && !plane.texture.is_null()
-                    && !self.gpu.is_null()
-                    && plane.held_by_user
-                {
-                    let mut texture = plane.texture;
-                    ffi::pl_tex_destroy(self.gpu, &mut texture);
-                    plane.texture = ptr::null();
+        if !self.cached && !self.texture.is_null() && !self.gpu.is_null() {
+            unsafe {
+                if !self.held_by_user {
+                    ffi::pl_gpu_finish(self.gpu);
                 }
+                ffi::pl_tex_destroy(self.gpu, &mut self.texture);
+                // FFmpeg unmap destroys the image and its timeline semaphore.
+                // Drain libplacebo references before that can happen, including
+                // error exits and partially constructed multi-plane wrappers.
+                ffi::pl_gpu_finish(self.gpu);
             }
         }
     }

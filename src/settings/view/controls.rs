@@ -15,7 +15,8 @@ use tiny_playback::HardwareDecodeMode;
 
 pub(crate) const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
-pub(crate) const HARDWARE_DECODE_DESCRIPTION: &str = "自动优先使用硬件解码，失败时回退到软件。";
+pub(crate) const HARDWARE_DECODE_DESCRIPTION: &str =
+    "自动优先使用 Vulkan，失败时回退软件；强制模式失败时报错。";
 
 pub(crate) fn app_language_selector(
     state: Entity<DropdownState>,
@@ -51,6 +52,18 @@ pub(crate) fn hardware_decode_selector(
                 "hardware-decode-force-vulkan",
                 "强制 Vulkan",
                 HardwareDecodeMode::ForceVulkan,
+            ),
+            #[cfg(target_os = "linux")]
+            (
+                "hardware-decode-force-vaapi",
+                "强制 VA-API（回传内存）",
+                HardwareDecodeMode::ForceVaapi,
+            ),
+            #[cfg(target_os = "linux")]
+            (
+                "hardware-decode-force-vaapi-vulkan",
+                "强制 VA-API（映射 Vulkan）",
+                HardwareDecodeMode::ForceVaapiVulkan,
             ),
         ],
         selected,

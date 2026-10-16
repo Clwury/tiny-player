@@ -33,6 +33,7 @@ fn video_info() -> PlaybackVideoInfo {
         color_transfer: Some("smpte2084".into()),
         bitrate: Some(18_500_000),
         hardware_accelerated: true,
+        hardware_decode_backend: Some(HardwareDecodeBackend::Vulkan),
     }
 }
 
@@ -229,9 +230,58 @@ fn video_fields_match_mpv_hdr_names_and_grouping() {
 }
 
 #[test]
+fn vaapi_copyback_is_reported_separately_from_vulkan_rendering() {
+    let mut info = video_info();
+    info.hardware_decode_backend = Some(HardwareDecodeBackend::Vaapi);
+    let video = lines(playback_video_detail_section(Some(&info)).unwrap());
+    assert_eq!(
+        video[0],
+        "Video:  HEVC (High Efficiency Video Coding) [Main 10]    HW:  vaapi-copy"
+    );
+    let display = lines(playback_display_detail_section(
+        info.size,
+        VideoPresenterSnapshot {
+            queued: 0,
+            queue_capacity: 1,
+            rendering: false,
+            ready: false,
+            pending_render_requests: 0,
+            last_render_ms: 0.0,
+            average_render_ms: 0.0,
+            dropped_frames: 0,
+            blocked_on: None,
+        },
+    ));
+    assert_eq!(display[0], "Display:  gpui    Context:  vulkan");
+}
+
+#[test]
+fn hardware_flag_without_backend_does_not_guess_vulkan() {
+    let mut info = video_info();
+    info.hardware_decode_backend = None;
+    let video = lines(playback_video_detail_section(Some(&info)).unwrap());
+    assert_eq!(
+        video[0],
+        "Video:  HEVC (High Efficiency Video Coding) [Main 10]"
+    );
+}
+
+#[test]
+fn vaapi_gpu_mapping_is_distinguished_from_copyback_and_vulkan_decode() {
+    let mut info = video_info();
+    info.hardware_decode_backend = Some(HardwareDecodeBackend::VaapiVulkan);
+    let video = lines(playback_video_detail_section(Some(&info)).unwrap());
+    assert_eq!(
+        video[0],
+        "Video:  HEVC (High Efficiency Video Coding) [Main 10]    HW:  vaapi-vulkan"
+    );
+}
+
+#[test]
 fn software_decoder_and_missing_fields_do_not_create_extra_stats_rows() {
     let mut info = video_info();
     info.hardware_accelerated = false;
+    info.hardware_decode_backend = None;
     info.decoder = "hevc_custom".into();
     info.frame_rate = Some(f64::NAN);
     info.pixel_format = None;

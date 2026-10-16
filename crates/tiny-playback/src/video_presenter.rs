@@ -597,7 +597,8 @@ fn render_vulkan_video_frame(
     frame_pts: Option<FramePts>,
 ) -> Result<BgraImage> {
     let fallback_key = VulkanDirectFallbackKey::new(&vulkan);
-    if !vulkan_direct_fallback.contains(&fallback_key) {
+    if !vulkan.source.allows_download_fallback() || !vulkan_direct_fallback.contains(&fallback_key)
+    {
         let direct_result = (|| {
             if tone_mapper
                 .as_ref()
@@ -618,6 +619,10 @@ fn render_vulkan_video_frame(
                 return BgraImage::new(pixels, output_size.width, output_size.height);
             }
             Err(error) => {
+                if !vulkan.source.allows_download_fallback() {
+                    return Err(error)
+                        .context("VA-API/Vulkan GPU 映射帧渲染失败；该模式不回退内存回传");
+                }
                 tracing::warn!(
                     %error,
                     format = ?vulkan.format,

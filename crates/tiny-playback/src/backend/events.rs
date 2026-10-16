@@ -3,7 +3,7 @@ use std::{fmt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::render_host::{PlaybackSessionId, RenderSize};
-use crate::{HardwareDecodeMode, SharedBgraImage};
+use crate::{HardwareDecodeBackend, HardwareDecodeMode, SharedBgraImage};
 
 const CACHE_CHUNK_MIN_BYTES: u64 = 64 * 1024;
 const SHARED_CACHE_LAYER_RESERVE_BYTES: u64 = 64 * 1024;
@@ -25,6 +25,7 @@ pub struct PlaybackVideoInfo {
     pub color_transfer: Option<String>,
     pub bitrate: Option<u64>,
     pub hardware_accelerated: bool,
+    pub hardware_decode_backend: Option<HardwareDecodeBackend>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

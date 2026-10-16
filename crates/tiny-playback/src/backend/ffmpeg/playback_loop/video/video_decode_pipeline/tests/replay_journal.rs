@@ -813,7 +813,25 @@ fn force_vulkan_runtime_failure_does_not_silently_switch_to_software() {
         HardwareDecodeMode::Off
     ));
     assert_eq!(
-        hevc_same_hardware_reopen_mode(),
+        hevc_same_hardware_reopen_mode(HardwareDecodeMode::Auto),
         HardwareDecodeMode::ForceVulkan
     );
+    assert_eq!(
+        hevc_same_hardware_reopen_mode(HardwareDecodeMode::ForceVulkan),
+        HardwareDecodeMode::ForceVulkan
+    );
+    assert_eq!(
+        hevc_same_hardware_reopen_mode(HardwareDecodeMode::ForceVaapi),
+        HardwareDecodeMode::ForceVaapi
+    );
+    assert!(!runtime_hevc_software_fallback_allowed(
+        HardwareDecodeMode::ForceVaapi
+    ));
+    assert_eq!(
+        hevc_same_hardware_reopen_mode(HardwareDecodeMode::ForceVaapiVulkan),
+        HardwareDecodeMode::ForceVaapiVulkan
+    );
+    assert!(!runtime_hevc_software_fallback_allowed(
+        HardwareDecodeMode::ForceVaapiVulkan
+    ));
 }

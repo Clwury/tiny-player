@@ -89,7 +89,8 @@ runtime，也不需要容器 FUSE 或 privileged 模式。
 
 ## 依赖及兼容性检查
 
-FFmpeg 保留软件解码器、解封装器、协议、音频滤镜和 Vulkan 硬解支持；关闭编码器、
+FFmpeg 保留软件解码器、解封装器、协议、音频滤镜、Vulkan 和 VA-API 硬解支持；显式启用
+`--enable-vaapi --enable-libdrm`，构建环境安装 `libva-dev` 和 `libdrm-dev`。关闭编码器、
 封装器、设备采集、命令行工具和无关外部库的自动探测。外部 AV1 解码使用 dav1d，
 HTTPS 支持使用 GnuTLS。libplacebo 保留 Vulkan、LittleCMS 和 Dolby Vision reshaping，
 Dolby Vision 元数据解析继续由项目的 Rust `dolby_vision` 依赖完成。
@@ -111,6 +112,9 @@ AppImage 不携带或调用目录安装脚本。
 
 - glibc 及 ELF 动态加载器。
 - Vulkan loader 和适合显卡的 Vulkan 驱动。
+- Ubuntu 24.04 或更新版本兼容的 `libva.so.2`、`libva-drm.so.2` 和 `libdrm.so.2`；
+  这些库与动态加载的 VA-API 驱动都由宿主提供，避免包内旧版 loader 覆盖宿主驱动。
+  使用 VA-API 时还需要对应驱动和 DRM render node 的访问权限。
 - ALSA、声音设备配置和音频插件。
 - Fontconfig、FreeType、字体及 XKB 键盘数据。
 - Wayland 或 X11 会话；Wayland 客户端库。
@@ -190,7 +194,7 @@ tar -xzf "tiny-player-<version>-linux-x86_64.tar.gz"
 - 分别测试正常 FUSE 启动、`--appimage-extract-and-run`，以及手动解压后的 `AppRun`。
 - 将 AppImage 或完整解压目录移动到含中文和空格的路径，确认启动、图标及资源加载正常。
 - 在 Wayland 与 X11 会话分别检查窗口、全屏、键盘和鼠标交互。
-- 测试软件解码与驱动支持的视频编码的 Vulkan 硬解；软件解码仍需 Vulkan 渲染。
+- 测试软件解码、Vulkan 硬解，以及显式 VA-API 回传和 GPU 映射的 H.264、HEVC 10 位、暂停、seek 和 EOF；各路径仍需 Vulkan 渲染。GPU 映射还要求外部内存、DRM modifier 和同步导入能力，测试命令见播放引擎文档。
 - 验证音频设备/音轨、字幕/字体、HDR 色调映射，以及 portal 播放抑制和释放。
 - 测试手柄设备权限、快捷操作、失焦与断连行为。
 - 关闭应用后替换新版本，在 AppImage 与 tar.gz 之间切换，确认跨版本配置和缓存仍共用原路径。

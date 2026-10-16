@@ -38,6 +38,9 @@ impl Decoder {
         self.receive_frames(frame, &mut on_frame)?;
         loop {
             let result = unsafe { ffi::avcodec_send_packet(self.ptr, packet) };
+            if let Some(error) = self.hardware_format_error(result) {
+                return Err(error);
+            }
             if result == ffi::AVERROR(ffi::EAGAIN) {
                 // A send-side EAGAIN means output must be drained before the
                 // exact same packet is retried; the packet is never discarded.
@@ -117,7 +120,9 @@ impl Decoder {
     }
 
     pub(in super::super) fn vulkan_device(&self) -> Option<Arc<VulkanDecodeDevice>> {
-        self.video_hw.as_ref().map(VideoHwDecodeContext::device)
+        self.video_hw
+            .as_ref()
+            .and_then(VideoHwDecodeContext::device)
     }
 
     pub(in super::super) fn decoder_name(&self) -> String {
@@ -126,11 +131,55 @@ impl Decoder {
     }
 
     pub(in super::super) fn is_hardware_accelerated(&self) -> bool {
-        self.video_hw.is_some()
+        self.hardware_decode_backend().is_some()
+    }
+
+    pub(in super::super) fn hardware_decode_backend(&self) -> Option<HardwareDecodeBackend> {
+        self.video_hw.as_ref().map(VideoHwDecodeContext::backend)
     }
 
     pub(in super::super) fn hardware_decode_mode(&self) -> HardwareDecodeMode {
         self.hardware_decode_mode
+    }
+
+    pub(in super::super) fn mapped_surface_counter(
+        &self,
+    ) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
+        self.video_hw
+            .as_ref()
+            .and_then(VideoHwDecodeContext::mapped_surface_counter)
+    }
+
+    fn hardware_format_error(&self, result: c_int) -> Option<String> {
+        let selection = self.hw_format_selection.as_ref()?;
+        selection
+            .negotiation_failed
+            .load(Ordering::Acquire)
+            .then(|| {
+                let backend = if selection.pixel_format == ffi::AVPixelFormat::AV_PIX_FMT_VAAPI {
+                    "VA-API"
+                } else {
+                    "Vulkan"
+                };
+                format!("FFmpeg {backend} 硬件像素格式协商失败：code={result}, error={}；强制模式不允许回退软件解码", ffmpeg_error(result))
+            })
+    }
+
+    fn validate_video_frame_format(
+        &self,
+        frame: *const ffi::AVFrame,
+    ) -> std::result::Result<(), String> {
+        if let Some(selection) = self.hw_format_selection.as_ref()
+            && !selection.allow_software_fallback
+            && unsafe { (*frame).format } != selection.pixel_format as c_int
+        {
+            return Err(format!(
+                "FFmpeg 强制硬解未输出要求的硬件帧：expected={:?}, actual={}",
+                selection.pixel_format,
+                unsafe { (*frame).format }
+            ));
+        }
+        Ok(())
     }
 
     fn receive_frames<F>(
@@ -143,6 +192,10 @@ impl Decoder {
     {
         loop {
             let result = unsafe { ffi::avcodec_receive_frame(self.ptr, frame.as_mut_ptr()) };
+            if let Some(error) = self.hardware_format_error(result) {
+                frame.unref();
+                return Err(error);
+            }
             if result == ffi::AVERROR(ffi::EAGAIN) || result == ffi::AVERROR_EOF {
                 return Ok(());
             }
@@ -159,7 +212,21 @@ impl Decoder {
                 ));
             }
 
-            let frame_result = on_frame(frame.as_mut_ptr());
+            let frame_result = self
+                .validate_video_frame_format(frame.as_mut_ptr())
+                .and_then(|()| {
+                    if unsafe { (*frame.as_mut_ptr()).format }
+                        == ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as c_int
+                    {
+                        self.video_hw
+                            .as_ref()
+                            .ok_or_else(|| "VA-API 帧缺少硬解上下文".to_string())?
+                            .prepare_vaapi_frame(frame.as_mut_ptr())
+                            .and_then(|mut prepared| on_frame(prepared.as_mut_ptr()))
+                    } else {
+                        on_frame(frame.as_mut_ptr())
+                    }
+                });
             frame.unref();
             frame_result?;
         }
@@ -168,6 +235,10 @@ impl Decoder {
     fn continue_after_video_invalid_data(&self, result: c_int, operation: &str) -> bool {
         let codec_id = unsafe { (*self.ptr).codec_id };
         if result != ffi::AVERROR_INVALIDDATA
+            || self
+                .hw_format_selection
+                .as_ref()
+                .is_some_and(|selection| selection.negotiation_failed.load(Ordering::Acquire))
             || !matches!(
                 codec_id,
                 ffi::AVCodecID::AV_CODEC_ID_H264 | ffi::AVCodecID::AV_CODEC_ID_HEVC

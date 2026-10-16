@@ -24,5 +24,5 @@ pub(crate) use video_output_queue::{
 };
 pub(crate) use vulkan::{
     FfmpegAvBufferRef, FfmpegFrameRef, VulkanDecodeDevice, VulkanDecodeQueue, VulkanDecodeQueues,
-    VulkanVideoFrame, VulkanVideoPlane,
+    VulkanFrameSource, VulkanVideoFrame, VulkanVideoPlane,
 };

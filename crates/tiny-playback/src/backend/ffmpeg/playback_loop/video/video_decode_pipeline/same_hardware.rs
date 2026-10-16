@@ -39,7 +39,7 @@ impl VideoDecodePipeline {
                 result_produced_sequence = snapshot.result_produced_sequence,
                 result_consumed_sequence = snapshot.result_consumed_sequence,
                 oldest_submitted_packet_nsecs = ?snapshot.oldest_submitted_packet_nsecs,
-                "started bounded HEVC same-Vulkan recovery transaction"
+                "started bounded HEVC same-hardware recovery transaction"
             );
             self.hevc_same_hardware_recovery = Some(transaction);
             return HevcDecodeRecoveryAction::DrainPendingResults;
@@ -62,7 +62,7 @@ impl VideoDecodePipeline {
                 root_reason = transaction.reason.as_str(),
                 observed_reason = fallback.reason.as_str(),
                 same_hw_recovery_phase = transaction.phase.as_str(),
-                "kept bounded same-Vulkan transaction across fallback target drift"
+                "kept bounded same-hardware transaction across fallback target drift"
             );
         }
 
@@ -72,7 +72,7 @@ impl VideoDecodePipeline {
             .expect("same-hardware recovery transaction exists");
         transaction.observed_target_nsecs = fallback.target_nsecs;
         if transaction.expired(now) {
-            transaction.fail("same-Vulkan recovery wall-time limit exceeded");
+            transaction.fail("same-hardware recovery wall-time limit exceeded");
             return transaction.terminal_action(self.requested_hardware_mode);
         }
         if transaction.failed_attempt_needs_decoder_drain(snapshot, now) {
@@ -119,7 +119,7 @@ impl VideoDecodePipeline {
                 decoder_epoch = self.decoder_epoch,
                 same_hw_recovery_phase = transaction.phase.as_str(),
                 submitted_not_consumed_packets = snapshot.submitted_not_consumed_packets,
-                "started release-first HEVC Vulkan resource-pressure recovery"
+                "started release-first HEVC hardware resource-pressure recovery"
             );
             self.hevc_same_hardware_recovery = Some(transaction);
             return HevcDecodeRecoveryAction::FlushSameHardware;
@@ -172,7 +172,7 @@ impl VideoDecodePipeline {
                 HevcSameHardwareRecoveryPhase::Recovered | HevcSameHardwareRecoveryPhase::Failed
             )
         {
-            transaction.fail("same-Vulkan recovery wall-time limit exceeded");
+            transaction.fail("same-hardware recovery wall-time limit exceeded");
         }
         if transaction.failed_attempt_needs_decoder_drain(snapshot, now) {
             transaction.observe_result_progress(snapshot.result_produced_sequence, now);
@@ -204,11 +204,11 @@ impl VideoDecodePipeline {
         now: Instant,
     ) -> std::result::Result<(), String> {
         let Some(transaction) = self.hevc_same_hardware_recovery.as_mut() else {
-            return Err("HEVC same-Vulkan flush requested without a transaction".to_string());
+            return Err("HEVC same-hardware flush requested without a transaction".to_string());
         };
         if transaction.phase != HevcSameHardwareRecoveryPhase::Flushing {
             return Err(format!(
-                "HEVC same-Vulkan flush requested in phase {}",
+                "HEVC same-hardware flush requested in phase {}",
                 transaction.phase.as_str()
             ));
         }
@@ -250,19 +250,19 @@ impl VideoDecodePipeline {
         stream: StreamInfo,
         generation: u64,
         now: Instant,
-    ) -> std::result::Result<Arc<VulkanDecodeDevice>, String> {
+    ) -> std::result::Result<Option<Arc<VulkanDecodeDevice>>, String> {
         let Some(transaction) = self.hevc_same_hardware_recovery.as_mut() else {
-            return Err("HEVC same-Vulkan reopen requested without a transaction".to_string());
+            return Err("HEVC same-hardware reopen requested without a transaction".to_string());
         };
         if transaction.phase != HevcSameHardwareRecoveryPhase::Reopening {
             return Err(format!(
-                "HEVC same-Vulkan reopen requested in phase {}",
+                "HEVC same-hardware reopen requested in phase {}",
                 transaction.phase.as_str()
             ));
         }
         if transaction.reopen_attempts >= HEVC_SAME_HARDWARE_MAX_REOPEN_ATTEMPTS {
-            transaction.fail("same-Vulkan reopen attempt limit reached");
-            return Err("HEVC same-Vulkan reopen attempt limit reached".to_string());
+            transaction.fail("same-hardware reopen attempt limit reached");
+            return Err("HEVC same-hardware reopen attempt limit reached".to_string());
         }
         transaction.reopen_attempts = transaction.reopen_attempts.saturating_add(1);
         let release_first = transaction.resource_pressure();
@@ -280,26 +280,27 @@ impl VideoDecodePipeline {
                 .as_mut()
                 .expect("same-hardware transaction survives worker retirement failure")
                 .fail(format!(
-                    "same-Vulkan old worker release-first retirement failed: {error}"
+                    "same-hardware old worker release-first retirement failed: {error}"
                 ));
             return Err(error);
         }
 
         // Force the candidate open to remain hardware-only even when the original
         // policy was Auto. Software fallback is a separate terminal action.
-        let decoder = match Decoder::open_video(stream, hevc_same_hardware_reopen_mode()) {
+        let reopen_mode = hevc_same_hardware_reopen_mode(self.requested_hardware_mode);
+        let decoder = match Decoder::open_video(stream, reopen_mode) {
             Ok(decoder) => decoder,
             Err(error) => {
                 let transaction = self
                     .hevc_same_hardware_recovery
                     .as_mut()
                     .expect("same-hardware transaction survives reopen failure");
-                transaction.fail(format!("same-Vulkan decoder open failed: {error}"));
+                transaction.fail(format!("same-hardware decoder open failed: {error}"));
                 return Err(error);
             }
         };
         if !decoder.is_hardware_accelerated() {
-            let error = "same-Vulkan candidate unexpectedly opened without hardware acceleration"
+            let error = "same-hardware candidate unexpectedly opened without hardware acceleration"
                 .to_string();
             self.hevc_same_hardware_recovery
                 .as_mut()
@@ -307,21 +308,22 @@ impl VideoDecodePipeline {
                 .fail(error.clone());
             return Err(error);
         }
-        let Some(device) = decoder.vulkan_device() else {
-            let error = "same-Vulkan candidate did not expose a Vulkan decode device".to_string();
+        let device = decoder.vulkan_device();
+        if device.is_none() && reopen_mode != HardwareDecodeMode::ForceVaapi {
+            let error = "same-hardware candidate did not expose a Vulkan decode device".to_string();
             self.hevc_same_hardware_recovery
                 .as_mut()
                 .expect("same-hardware transaction survives missing device")
                 .fail(error.clone());
             return Err(error);
-        };
+        }
         let worker = match VideoDecodeWorker::spawn(decoder, self.frame_drop.epoch_handle()) {
             Ok(worker) => worker,
             Err(error) => {
                 self.hevc_same_hardware_recovery
                     .as_mut()
                     .expect("same-hardware transaction survives worker spawn failure")
-                    .fail(format!("same-Vulkan worker spawn failed: {error}"));
+                    .fail(format!("same-hardware worker spawn failed: {error}"));
                 return Err(error);
             }
         };
@@ -335,7 +337,9 @@ impl VideoDecodePipeline {
                 self.hevc_same_hardware_recovery
                     .as_mut()
                     .expect("same-hardware transaction survives worker retirement failure")
-                    .fail(format!("same-Vulkan old worker retirement failed: {error}"));
+                    .fail(format!(
+                        "same-hardware old worker retirement failed: {error}"
+                    ));
                 return Err(error);
             }
         }
@@ -351,7 +355,7 @@ impl VideoDecodePipeline {
             .expect("same-hardware transaction survives atomic worker swap");
         transaction.begin_attempt(
             self.decoder_epoch,
-            HevcSameHardwareRecoveryAttemptKind::VulkanReopenReplay,
+            HevcSameHardwareRecoveryAttemptKind::HardwareReopenReplay,
             generation,
             now,
         );
@@ -636,7 +640,7 @@ impl VideoDecodePipeline {
                 replay_packets = transaction.replay_packets,
                 attempt_ledger = ?transaction.attempt_ledger,
                 elapsed_ms = transaction.started_at.elapsed().as_secs_f64() * 1000.0,
-                "completed bounded HEVC same-Vulkan recovery transaction"
+                "completed bounded HEVC same-hardware recovery transaction"
             );
         }
     }

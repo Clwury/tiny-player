@@ -10,7 +10,7 @@ Tiny Player 是使用 Rust 和 GPUI 构建的原生 Emby 桌面客户端，面�
 - **媒体库浏览**：电影与剧集海报、搜索、收藏、继续观看，以及季和单集选择。
 - **影片详情**：展示影片 Logo、简介、评分、时长、上映日期、分辨率与动态范围信息。
 - **播放与选轨**：选择视频版本、音轨和字幕，设置语言偏好，同步播放进度。
-- **视频处理**：软件解码、Vulkan 硬件解码，以及 HDR 色调映射；硬解能力取决于显卡、驱动和视频编码。
+- **视频处理**：软件解码、Vulkan 硬件解码、Linux VA-API 回传或 Vulkan GPU 映射，以及 HDR 色调映射；硬解能力取决于显卡、驱动和视频编码。
 - **播放体验**：全屏、倍速、字幕位置调整、播放信息面板，以及可配置的内存和磁盘缓存。
 - **手柄播放快捷操作**：标准手柄按键支持暂停、跳转、音量、倍速、字幕位置调整和返回详情。
 - **播放时保持唤醒**：播放视频时自动请求禁止自动锁屏、屏幕节能与睡眠；暂停、缓冲导致暂停、播放结束或关闭播放器时自动释放请求。
@@ -53,6 +53,9 @@ Linux 源码构建还需要 libudev 开发包（Ubuntu 的 `libudev-dev`、Arch 
 | Linux 预编译包 | x86_64 GNU/Linux，glibc 2.39 或更新版本，Wayland 或 X11 桌面会话 |
 | Windows 便携包 | Windows 10 22H2 / Windows 11 x64，支持 Direct3D 11 的显卡与驱动 |
 | 视频处理 | 可用的 Vulkan 显卡驱动；使用软件解码时，视频处理仍需要 Vulkan |
+
+Linux 包还需要与 Ubuntu 24.04 或更新版本兼容的宿主 `libva.so.2`、`libva-drm.so.2` 和 `libdrm.so.2`。在播放设置选择“强制 VA-API（回传内存）”，或设置 `TINY_HWDEC=vaapi` 即可使用显式 VA-API 硬解；可用 `TINY_VAAPI_DEVICE=/dev/dri/renderD128` 指定设备。需要对应系统驱动和设备访问权限，“自动”继续优先尝试 Vulkan。详见[解码设置](docs/settings.md)和[真机验证](docs/playback-engine.md)。
+性能路径选择“强制 VA-API（映射 Vulkan）”，或设置 `TINY_HWDEC=vaapi-vulkan`，通过 DMA-BUF 直接映射 NV12/P010 GPU 帧，省去解码 YUV 帧的 CPU 回传与上传。需要驱动支持 Vulkan 外部内存、DRM modifier 和同步；失败明确报错，可手动切回回传模式。最终 BGRA 输出仍回读到 CPU 供 GPUI 显示。
 
 Linux 预编译包包含 FFmpeg、libplacebo 及部分依赖，系统还需提供 Vulkan loader、ALSA 及音频配置、Fontconfig、FreeType、字体、XKB 键盘数据、系统 CA 证书，以及与 Ubuntu 24.04（GCC 13）或更新版本兼容的 GCC/C++ 运行库。glibc 2.39 是预编译包的运行基线，其他方式构建时以构建环境和依赖要求为准。
 

@@ -38,7 +38,7 @@ pub use backend::{
     PlaybackSeekableCacheMode, PlaybackVideoInfo, Result, StreamCacheKind, StreamCacheState,
 };
 pub use bitmap::{BgraImage, SharedBgraImage};
-pub use hardware_decode::HardwareDecodeMode;
+pub use hardware_decode::{HardwareDecodeBackend, HardwareDecodeMode};
 pub use rate::{MAX_PLAYBACK_RATE, MIN_PLAYBACK_RATE, PlaybackRateChange, clamp_playback_rate};
 pub use render_host::frame::{PlaybackSessionId, RenderSize};
 pub use tracks::{PlaybackTrack, PlaybackTrackKind, PlaybackTrackSelection};

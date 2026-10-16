@@ -23,22 +23,41 @@ impl Decoder {
         hw_mode: HardwareDecodeMode,
     ) -> std::result::Result<Self, String> {
         let decoder = find_decoder(stream)?;
-        let decoder_context = if !hw_mode.should_try_vulkan() {
+        let decoder = if hw_mode.uses_vaapi() {
+            super::super::hw::find_vaapi_decoder(decoder)?
+        } else {
+            decoder
+        };
+        let backend = match hw_mode {
+            HardwareDecodeMode::ForceVaapi => "VA-API",
+            HardwareDecodeMode::ForceVaapiVulkan => "VA-API/Vulkan",
+            _ => "Vulkan",
+        };
+        let decoder_context = if !hw_mode.should_try_hardware() {
             Self::open_with_decoder(stream, decoder, None, hw_mode, None)
         } else {
-            match VideoHwDecodeContext::try_create(decoder) {
+            let hardware = if hw_mode.uses_vaapi() {
+                VideoHwDecodeContext::try_create_vaapi(
+                    decoder,
+                    hw_mode == HardwareDecodeMode::ForceVaapiVulkan,
+                )
+            } else {
+                VideoHwDecodeContext::try_create(decoder)
+            };
+            match hardware {
                 Ok(video_hw) => {
                     match Self::open_with_decoder(stream, decoder, Some(video_hw), hw_mode, None) {
                         Ok(decoder_context) => {
                             tracing::info!(
                                 decoder = %decoder_name(decoder),
                                 requested_hw_mode = ?hw_mode,
+                                backend,
                                 active_hwaccel = true,
                                 hw_pixel_format = ?decoder_context
                                     .video_hw
                                     .as_ref()
                                     .map(|hw| hw.pixel_format()),
-                                "enabled FFmpeg Vulkan hardware video decoder"
+                                "enabled FFmpeg hardware video decoder"
                             );
                             Ok(decoder_context)
                         }
@@ -46,27 +65,31 @@ impl Decoder {
                             tracing::warn!(
                                 %error,
                                 decoder = %decoder_name(decoder),
-                                "FFmpeg Vulkan decoder open failed; falling back to software"
+                                backend,
+                                "FFmpeg hardware decoder open failed; falling back to software"
                             );
                             Self::open_with_decoder(stream, decoder, None, hw_mode, None)
                         }
-                        Err(error) => Err(format!("FFmpeg Vulkan 硬解打开失败：{error}")),
+                        Err(error) => Err(format!("FFmpeg {backend} 硬解打开失败：{error}")),
                     }
                 }
                 Err(error) if hw_mode.allows_fallback() => {
                     tracing::warn!(
                         %error,
                         decoder = %decoder_name(decoder),
-                        "FFmpeg Vulkan hardware decode unavailable; falling back to software"
+                        backend,
+                        "FFmpeg hardware decode unavailable; falling back to software"
                     );
                     Self::open_with_decoder(stream, decoder, None, hw_mode, None)
                 }
-                Err(error) => Err(format!("FFmpeg Vulkan 硬解不可用：{error}")),
+                Err(error) => Err(format!("FFmpeg {backend} 硬解不可用：{error}")),
             }
         }?;
         let active_hwaccel = decoder_context.is_hardware_accelerated();
-        if hw_mode == HardwareDecodeMode::ForceVulkan && !active_hwaccel {
-            return Err("已强制使用 Vulkan 硬件解码，但 FFmpeg 未激活 Vulkan 硬解".to_string());
+        if hw_mode.should_try_hardware() && !hw_mode.allows_fallback() && !active_hwaccel {
+            return Err(format!(
+                "已强制使用 {backend} 硬件解码，但 FFmpeg 未激活硬解"
+            ));
         }
         tracing::info!(
             decoder = %decoder_name(decoder),
@@ -106,6 +129,8 @@ impl Decoder {
             hw_format_selection: video_hw.as_ref().map(|hw| {
                 Box::new(VideoHwFormatSelection {
                     pixel_format: hw.pixel_format(),
+                    allow_software_fallback: hardware_decode_mode.allows_fallback(),
+                    negotiation_failed: AtomicBool::new(false),
                 })
             }),
             video_hw,
@@ -118,7 +143,16 @@ impl Decoder {
             ));
         }
         let libavcodec_version = unsafe { ffi::avcodec_version() };
-        let requested_thread_count = if decoder_context.video_hw.is_none() {
+        let requested_thread_count = if hardware_decode_mode == HardwareDecodeMode::ForceVaapiVulkan
+        {
+            // Reserve surfaces for asynchronous rendering and the codec DPB,
+            // including VA-API drivers with a 32-picture limit.
+            1
+        } else if !decoder_context
+            .video_hw
+            .as_ref()
+            .is_some_and(|hw| hw.pixel_format() == ffi::AVPixelFormat::AV_PIX_FMT_VULKAN)
+        {
             0
         } else if vulkan_decode_needs_single_thread(
             stream.codec_id,

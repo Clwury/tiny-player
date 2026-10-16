@@ -97,6 +97,8 @@ fn worker_info(hardware_accelerated: bool) -> VideoDecodeWorkerInfo {
         size: Some(size),
         decoder_name: "test".to_string(),
         hardware_accelerated,
+        hardware_decode_backend: hardware_accelerated
+            .then_some(crate::HardwareDecodeBackend::Vulkan),
         vulkan_device: None,
         convert_context: VideoFrameConvertContext::new_for_test(size),
     }

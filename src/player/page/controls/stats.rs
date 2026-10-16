@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+use tiny_playback::HardwareDecodeBackend;
+
 use super::overlays::playback_overlay_container;
 use super::*;
 
@@ -234,8 +236,13 @@ pub(super) fn playback_video_detail_section(
 ) -> Option<PlaybackDetailSection> {
     let info = info?;
     let mut rows = Vec::new();
-    if info.hardware_accelerated {
-        rows.push(PlaybackDetailRow::new("HW", "vulkan").inline());
+    if let Some(backend) = info.hardware_decode_backend {
+        let name = match backend {
+            HardwareDecodeBackend::Vulkan => "vulkan",
+            HardwareDecodeBackend::Vaapi => "vaapi-copy",
+            HardwareDecodeBackend::VaapiVulkan => "vaapi-vulkan",
+        };
+        rows.push(PlaybackDetailRow::new("HW", name).inline());
     }
     if let Some(frame_rate) = info
         .frame_rate

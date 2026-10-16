@@ -1,5 +1,7 @@
+use std::sync::atomic::AtomicUsize;
 use std::{env, os::raw::c_int, ptr, sync::Arc};
 
+use crate::HardwareDecodeBackend;
 pub(super) use crate::HardwareDecodeMode;
 use crate::ffmpeg_vulkan as vulkan_ffi;
 use crate::render_host::{
@@ -9,6 +11,9 @@ use crate::render_host::{
 use ffmpeg_sys_next as ffi;
 
 use super::{VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, ffmpeg_error};
+
+mod vaapi;
+pub(super) use vaapi::{download_vaapi_frame, find_vaapi_decoder};
 
 const TINY_VULKAN_EXTRA_HW_FRAMES_ENV: &str = "TINY_VULKAN_EXTRA_HW_FRAMES";
 const MPV_VULKAN_EXTRA_HW_FRAMES: c_int = 6;
@@ -24,10 +29,20 @@ const VK_QUEUE_GRAPHICS_BIT: u32 = 0x0000_0001;
 const VK_QUEUE_COMPUTE_BIT: u32 = 0x0000_0002;
 const VK_QUEUE_TRANSFER_BIT: u32 = 0x0000_0004;
 
-#[derive(Clone)]
 pub(super) struct VideoHwDecodeContext {
     pixel_format: ffi::AVPixelFormat,
-    device: Arc<VulkanDecodeDevice>,
+    device: VideoHwDecodeDevice,
+}
+
+enum VideoHwDecodeDevice {
+    Vulkan(Arc<VulkanDecodeDevice>),
+    #[cfg(target_os = "linux")]
+    Vaapi(FfmpegAvBufferRef),
+    #[cfg(target_os = "linux")]
+    VaapiVulkan {
+        device: FfmpegAvBufferRef,
+        mapper: vaapi::vulkan::VaapiVulkanMapper,
+    },
 }
 
 impl VideoHwDecodeContext {
@@ -62,25 +77,112 @@ impl VideoHwDecodeContext {
 
         Ok(Self {
             pixel_format: config.pixel_format,
-            device: Arc::new(device),
+            device: VideoHwDecodeDevice::Vulkan(Arc::new(device)),
         })
+    }
+
+    pub(super) fn try_create_vaapi(
+        codec: *const ffi::AVCodec,
+        map_to_vulkan: bool,
+    ) -> std::result::Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        {
+            let device = vaapi::create_device(codec)?;
+            let device = if map_to_vulkan {
+                let mapper = vaapi::vulkan::VaapiVulkanMapper::new(&device)?;
+                VideoHwDecodeDevice::VaapiVulkan { device, mapper }
+            } else {
+                VideoHwDecodeDevice::Vaapi(device)
+            };
+            Ok(Self {
+                pixel_format: ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+                device,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (codec, map_to_vulkan);
+            Err("VA-API 硬件解码仅支持 Linux".to_string())
+        }
     }
 
     pub(super) fn pixel_format(&self) -> ffi::AVPixelFormat {
         self.pixel_format
     }
 
-    pub(super) fn device(&self) -> Arc<VulkanDecodeDevice> {
-        self.device.clone()
+    pub(super) fn backend(&self) -> HardwareDecodeBackend {
+        match &self.device {
+            VideoHwDecodeDevice::Vulkan(_) => HardwareDecodeBackend::Vulkan,
+            #[cfg(target_os = "linux")]
+            VideoHwDecodeDevice::Vaapi(_) => HardwareDecodeBackend::Vaapi,
+            #[cfg(target_os = "linux")]
+            VideoHwDecodeDevice::VaapiVulkan { .. } => HardwareDecodeBackend::VaapiVulkan,
+        }
+    }
+
+    pub(super) fn device(&self) -> Option<Arc<VulkanDecodeDevice>> {
+        match &self.device {
+            VideoHwDecodeDevice::Vulkan(device) => Some(device.clone()),
+            #[cfg(target_os = "linux")]
+            VideoHwDecodeDevice::Vaapi(_) => None,
+            #[cfg(target_os = "linux")]
+            VideoHwDecodeDevice::VaapiVulkan { mapper, .. } => Some(mapper.device()),
+        }
+    }
+
+    fn device_ref(&self) -> *mut ffi::AVBufferRef {
+        match &self.device {
+            VideoHwDecodeDevice::Vulkan(device) => device.device_ref(),
+            #[cfg(target_os = "linux")]
+            VideoHwDecodeDevice::Vaapi(device) => device.as_ptr(),
+            #[cfg(target_os = "linux")]
+            VideoHwDecodeDevice::VaapiVulkan { device, .. } => device.as_ptr(),
+        }
+    }
+
+    pub(super) fn prepare_vaapi_frame(
+        &self,
+        frame: *const ffi::AVFrame,
+    ) -> std::result::Result<super::AvFrame, String> {
+        #[cfg(target_os = "linux")]
+        if let VideoHwDecodeDevice::VaapiVulkan { mapper, .. } = &self.device {
+            return mapper.map(frame);
+        }
+        download_vaapi_frame(frame)
     }
 
     pub(super) fn attach_to_decoder(
         &self,
         context: *mut ffi::AVCodecContext,
     ) -> std::result::Result<(), String> {
-        let device_ref = unsafe { ffi::av_buffer_ref(self.device.device_ref()) };
+        let device_ref = unsafe { ffi::av_buffer_ref(self.device_ref()) };
         if device_ref.is_null() {
-            return Err("FFmpeg 复制 Vulkan 硬解设备引用失败".to_string());
+            return Err("FFmpeg 复制硬解设备引用失败".to_string());
+        }
+        #[cfg(target_os = "linux")]
+        if self.pixel_format == ffi::AVPixelFormat::AV_PIX_FMT_VAAPI {
+            // Copyback completes in receive_frames before output is queued, so
+            // asynchronous queues retain CPU buffers instead of VA surfaces.
+            // FFmpeg budgets the decoder DPB and threads; copyback only needs
+            // a small caller reserve, independent of the output queue.
+            const COPYBACK_EXTRA_HW_FRAMES: c_int = 6;
+            // The global eight-frame admission threshold leaves room for
+            // submitted packets and the DPB, including 32-surface drivers.
+            let reserve = if matches!(self.device, VideoHwDecodeDevice::VaapiVulkan { .. }) {
+                16
+            } else {
+                COPYBACK_EXTRA_HW_FRAMES
+            };
+            unsafe {
+                (*context).hw_device_ctx = device_ref;
+                (*context).extra_hw_frames = (*context).extra_hw_frames.max(reserve);
+            }
+            tracing::debug!(
+                extra_hw_frames = unsafe { (*context).extra_hw_frames },
+                backend = ?self.backend(),
+                "configured VA-API decode surface reserve"
+            );
+            return Ok(());
         }
         let decoder_threads = unsafe { (*context).thread_count };
         let requested_extra_hw_frames =
@@ -106,6 +208,14 @@ impl VideoHwDecodeContext {
             "configured Vulkan decode surface reserve for asynchronous output ownership"
         );
         Ok(())
+    }
+
+    pub(super) fn mapped_surface_counter(&self) -> Option<Arc<AtomicUsize>> {
+        #[cfg(target_os = "linux")]
+        if let VideoHwDecodeDevice::VaapiVulkan { mapper, .. } = &self.device {
+            return Some(mapper.surface_counter());
+        }
+        None
     }
 }
 
@@ -151,27 +261,37 @@ struct VulkanHwConfig {
 }
 
 fn find_vulkan_hw_config(codec: *const ffi::AVCodec) -> Option<VulkanHwConfig> {
+    supports_hw_config(
+        codec,
+        ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+        ffi::AVPixelFormat::AV_PIX_FMT_VULKAN,
+    )
+    .then_some(VulkanHwConfig {
+        pixel_format: ffi::AVPixelFormat::AV_PIX_FMT_VULKAN,
+    })
+}
+
+fn supports_hw_config(
+    codec: *const ffi::AVCodec,
+    device_type: ffi::AVHWDeviceType,
+    pixel_format: ffi::AVPixelFormat,
+) -> bool {
     if codec.is_null() {
-        return None;
+        return false;
     }
 
     let mut index = 0;
     loop {
         let config = unsafe { ffi::avcodec_get_hw_config(codec, index) };
         if config.is_null() {
-            return None;
+            return false;
         }
 
         let config = unsafe { &*config };
         let has_device_ctx =
             config.methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as c_int != 0;
-        if has_device_ctx
-            && config.device_type == ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN
-            && config.pix_fmt == ffi::AVPixelFormat::AV_PIX_FMT_VULKAN
-        {
-            return Some(VulkanHwConfig {
-                pixel_format: config.pix_fmt,
-            });
+        if has_device_ctx && config.device_type == device_type && config.pix_fmt == pixel_format {
+            return true;
         }
         index += 1;
     }
@@ -435,15 +555,36 @@ mod tests {
 
     #[test]
     fn hardware_decode_mode_rejects_unknown_values() {
-        assert_eq!(HardwareDecodeMode::parse("vaapi"), None);
+        assert_eq!(HardwareDecodeMode::parse("unsupported"), None);
+    }
+
+    #[test]
+    fn hardware_decode_mode_selects_explicit_vaapi_without_software_fallback() {
+        for value in [
+            "vaapi",
+            "force-vaapi",
+            "vaapi-force",
+            "vaapi-copy",
+            " VAAPI ",
+        ] {
+            assert_eq!(
+                HardwareDecodeMode::parse(value),
+                Some(HardwareDecodeMode::ForceVaapi)
+            );
+        }
+        assert!(HardwareDecodeMode::ForceVaapi.should_try_hardware());
+        assert!(!HardwareDecodeMode::ForceVaapi.allows_fallback());
+        assert!(HardwareDecodeMode::ForceVaapiVulkan.should_try_hardware());
+        assert!(HardwareDecodeMode::ForceVaapiVulkan.uses_vaapi());
+        assert!(!HardwareDecodeMode::ForceVaapiVulkan.allows_fallback());
     }
 
     #[test]
     fn hardware_decode_mode_fallback_policy_matches_mode() {
-        assert!(!HardwareDecodeMode::Off.should_try_vulkan());
-        assert!(HardwareDecodeMode::Auto.should_try_vulkan());
+        assert!(!HardwareDecodeMode::Off.should_try_hardware());
+        assert!(HardwareDecodeMode::Auto.should_try_hardware());
         assert!(HardwareDecodeMode::Auto.allows_fallback());
-        assert!(HardwareDecodeMode::ForceVulkan.should_try_vulkan());
+        assert!(HardwareDecodeMode::ForceVulkan.should_try_hardware());
         assert!(!HardwareDecodeMode::ForceVulkan.allows_fallback());
     }
 

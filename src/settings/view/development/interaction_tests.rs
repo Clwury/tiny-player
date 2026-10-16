@@ -407,6 +407,23 @@ fn hardware_decode_can_be_found_by_search_and_saved_without_changing_cache_setti
         root.read_with(cx, |root, _| root.saved.clone()),
         Some(config.clone())
     );
+    #[cfg(target_os = "linux")]
+    {
+        click(cx, "hardware-decode-dropdown");
+        click(cx, "hardware-decode-force-vaapi");
+        config.hardware_decode = HardwareDecodeMode::ForceVaapi;
+        assert_eq!(
+            root.read_with(cx, |root, _| root.saved.clone()),
+            Some(config.clone())
+        );
+        click(cx, "hardware-decode-dropdown");
+        click(cx, "hardware-decode-force-vaapi-vulkan");
+        config.hardware_decode = HardwareDecodeMode::ForceVaapiVulkan;
+        assert_eq!(
+            root.read_with(cx, |root, _| root.saved.clone()),
+            Some(config.clone())
+        );
+    }
     click(cx, "hardware-decode-dropdown");
     cx.simulate_keystrokes("home enter");
     cx.run_until_parked();
@@ -415,7 +432,10 @@ fn hardware_decode_can_be_found_by_search_and_saved_without_changing_cache_setti
         root.read_with(cx, |root, _| root.saved.clone()),
         Some(config)
     );
-    assert_eq!(root.read_with(cx, |root, _| root.change_count), 2);
+    assert_eq!(
+        root.read_with(cx, |root, _| root.change_count),
+        if cfg!(target_os = "linux") { 4 } else { 2 }
+    );
 }
 
 #[gpui::test]

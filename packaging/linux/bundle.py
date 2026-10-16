@@ -25,11 +25,13 @@ HOST_LIBRARIES = {
     "libfontconfig.so.1", "libfreetype.so.6", "libwayland-client.so.0",
     "libwayland-cursor.so.0", "libwayland-egl.so.1",
     "libstdc++.so.6", "libgcc_s.so.1",
+    "libva.so.2", "libva-drm.so.2", "libva-x11.so.2", "libdrm.so.2",
 }
 RUNTIME_HOST_LIBRARIES = [
     "libasound.so.2", "libvulkan.so.1", "libfontconfig.so.1",
     "libfreetype.so.6", "libwayland-client.so.0",
     "libstdc++.so.6", "libgcc_s.so.1",
+    "libva.so.2", "libva-drm.so.2", "libdrm.so.2",
 ]
 
 

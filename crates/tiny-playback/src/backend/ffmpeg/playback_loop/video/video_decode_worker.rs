@@ -12,6 +12,7 @@ use std::{
 
 use ffmpeg_sys_next as ffi;
 
+use crate::HardwareDecodeBackend;
 use crate::render_host::{FfmpegFrameRef, RenderSize, VulkanDecodeDevice};
 
 use super::video_decode_framedrop::{VideoDecodeDropPolicy, VideoDecodeDropStats};
@@ -99,6 +100,7 @@ pub(super) struct VideoDecodeWorkerInfo {
     pub(super) size: Option<RenderSize>,
     pub(super) decoder_name: String,
     pub(super) hardware_accelerated: bool,
+    pub(super) hardware_decode_backend: Option<HardwareDecodeBackend>,
     pub(super) vulkan_device: Option<Arc<VulkanDecodeDevice>>,
     pub(super) convert_context: VideoFrameConvertContext,
 }
@@ -260,6 +262,7 @@ impl VideoDecodeWorker {
             size: decoder.size().ok(),
             decoder_name: decoder.decoder_name(),
             hardware_accelerated: decoder.is_hardware_accelerated(),
+            hardware_decode_backend: decoder.hardware_decode_backend(),
             vulkan_device: decoder.vulkan_device(),
             convert_context: VideoFrameConvertContext::from_decoder(&decoder),
         };
@@ -422,7 +425,9 @@ impl VideoDecodeWorker {
         if self.recovering {
             return Ok(VideoDecodeEnqueueResult::InputFull);
         }
-        if self.decoded_frames.len() >= self.decoded_frame_queue_capacity {
+        if self.decoded_frames.len() >= self.decoded_frame_queue_capacity
+            || self.info.convert_context.hardware_surface_pressure()
+        {
             return Ok(VideoDecodeEnqueueResult::OutputFull);
         }
 
@@ -710,7 +715,9 @@ impl VideoDecodeWorker {
             && self.submitted_not_consumed_packets == 0
         {
             VideoDecodeWorkerState::Eof
-        } else if self.decoded_frames.len() >= self.decoded_frame_queue_capacity {
+        } else if self.decoded_frames.len() >= self.decoded_frame_queue_capacity
+            || self.info.convert_context.hardware_surface_pressure()
+        {
             VideoDecodeWorkerState::OutputFull
         } else if !self.decoded_frames.is_empty() {
             VideoDecodeWorkerState::HaveFrame
@@ -1051,7 +1058,13 @@ fn log_video_decode_worker_drain_timing(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, os::raw::c_int, sync::mpsc, thread, time::Duration};
+    use std::{
+        collections::VecDeque,
+        os::raw::c_int,
+        sync::{Arc, atomic::Ordering, mpsc},
+        thread,
+        time::Duration,
+    };
 
     use ffmpeg_sys_next as ffi;
 
@@ -1066,6 +1079,41 @@ mod tests {
     fn test_worker() -> (VideoDecodeWorker, mpsc::SyncSender<VideoDecodeResult>) {
         let (worker, result_tx, _command_rx) = test_worker_with_command_rx();
         (worker, result_tx)
+    }
+
+    #[test]
+    fn vaapi_mapped_surfaces_apply_backpressure_across_queues_until_last_frame_ref_drops() {
+        let (mut worker, _result_tx, command_rx) = test_worker_with_command_rx();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(8));
+        worker
+            .info
+            .convert_context
+            .set_mapped_surface_counter_for_test(Arc::clone(&counter));
+        let packet = AvPacket::new().unwrap();
+        assert!(worker.decoded_frames.is_empty());
+        assert_eq!(worker.state(), VideoDecodeWorkerState::OutputFull);
+        assert!(matches!(
+            worker
+                .try_enqueue_packet(&packet, 1, VideoDecodeDropPolicy::None)
+                .unwrap(),
+            VideoDecodeEnqueueResult::OutputFull
+        ));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        counter.store(7, Ordering::Release);
+        assert_eq!(worker.state(), VideoDecodeWorkerState::NeedPacket);
+        assert!(matches!(
+            worker
+                .try_enqueue_packet(&packet, 1, VideoDecodeDropPolicy::None)
+                .unwrap(),
+            VideoDecodeEnqueueResult::Queued
+        ));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(VideoDecodeCommand::Decode { .. })
+        ));
     }
 
     fn test_worker_with_command_rx() -> (
@@ -1091,6 +1139,7 @@ mod tests {
                     size: Some(size),
                     decoder_name: "test".to_string(),
                     hardware_accelerated: false,
+                    hardware_decode_backend: None,
                     vulkan_device: None,
                     convert_context: VideoFrameConvertContext::new_for_test(size),
                 },

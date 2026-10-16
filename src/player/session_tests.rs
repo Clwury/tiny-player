@@ -401,6 +401,7 @@ fn metadata_and_video_size_update_in_session_and_failure_keeps_request_identity(
         color_transfer: None,
         bitrate: None,
         hardware_accelerated: false,
+        hardware_decode_backend: None,
     };
     controller.reduce_backend(
         BackendEventKind::PlaybackInfoChanged(Some(video.clone())),

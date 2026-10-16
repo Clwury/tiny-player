@@ -285,6 +285,10 @@ fn hardware_decode_selection_saves_only_changes_and_preserves_cache_preferences(
         "hardware-decode-auto",
         "hardware-decode-off",
         "hardware-decode-force-vulkan",
+        #[cfg(target_os = "linux")]
+        "hardware-decode-force-vaapi",
+        #[cfg(target_os = "linux")]
+        "hardware-decode-force-vaapi-vulkan",
     ] {
         let bounds = cx.debug_bounds(selector).expect(selector);
         assert!(bounds.top() >= px(0.0));
@@ -295,7 +299,11 @@ fn hardware_decode_selection_saves_only_changes_and_preserves_cache_preferences(
     click(cx, "hardware-decode-dropdown");
     cx.simulate_keystrokes("end enter");
     cx.run_until_parked();
-    config.hardware_decode = HardwareDecodeMode::ForceVulkan;
+    config.hardware_decode = if cfg!(target_os = "linux") {
+        HardwareDecodeMode::ForceVaapiVulkan
+    } else {
+        HardwareDecodeMode::ForceVulkan
+    };
     assert_eq!(root.read_with(cx, |root, _| root.saved.clone()), config);
     click(cx, "settings-category-外观");
     click(cx, "settings-category-播放");

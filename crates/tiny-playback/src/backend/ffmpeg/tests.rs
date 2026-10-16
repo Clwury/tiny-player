@@ -16,6 +16,9 @@ mod output;
 mod paused_seek;
 #[path = "tests/timeline.rs"]
 mod timeline;
+#[cfg(target_os = "linux")]
+#[path = "tests/vaapi.rs"]
+mod vaapi;
 #[path = "tests/vulkan.rs"]
 mod vulkan;
 
@@ -252,6 +255,7 @@ fn test_vulkan_queued_video_frame(timeline_nsecs: u64) -> QueuedVideoFrame {
         frame: FfmpegFrameRef::new_ref(av_frame.as_mut_ptr()).expect("FFmpeg frame refs"),
         device: test_vulkan_device(),
         format: RawVideoFormat::P010Le,
+        source: crate::render_host::VulkanFrameSource::DecoderPool,
         allocated_size: queued.frame.size,
         usage: 0,
         color: FrameColor::Sdr,

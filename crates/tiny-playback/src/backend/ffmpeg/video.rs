@@ -1,4 +1,11 @@
-use std::{os::raw::c_int, slice, sync::Arc};
+use std::{
+    os::raw::c_int,
+    slice,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use ffmpeg_sys_next as ffi;
 
@@ -8,7 +15,8 @@ use crate::{
     render_host::{
         DecodedFrame, FfmpegFrameRef, FrameBufferPool, FrameColor, FrameDynamicMetadata,
         FramePixels, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlane,
-        RawVideoPlanes, RawVideoRange, RenderSize, VulkanDecodeDevice, VulkanVideoFrame,
+        RawVideoPlanes, RawVideoRange, RenderSize, VulkanDecodeDevice, VulkanFrameSource,
+        VulkanVideoFrame,
     },
 };
 
@@ -21,6 +29,8 @@ use super::{
 pub(super) struct VideoFrameConvertContext {
     size: Option<RenderSize>,
     vulkan_device: Option<Arc<VulkanDecodeDevice>>,
+    vulkan_frame_source: VulkanFrameSource,
+    mapped_surface_counter: Option<Arc<AtomicUsize>>,
 }
 
 impl VideoFrameConvertContext {
@@ -28,6 +38,14 @@ impl VideoFrameConvertContext {
         Self {
             size: decoder.size().ok(),
             vulkan_device: decoder.vulkan_device(),
+            mapped_surface_counter: decoder.mapped_surface_counter(),
+            vulkan_frame_source: if decoder.hardware_decode_backend()
+                == Some(crate::HardwareDecodeBackend::VaapiVulkan)
+            {
+                VulkanFrameSource::VaapiMapping
+            } else {
+                VulkanFrameSource::DecoderPool
+            },
         }
     }
 
@@ -36,6 +54,8 @@ impl VideoFrameConvertContext {
         Self {
             size: Some(size),
             vulkan_device: None,
+            vulkan_frame_source: VulkanFrameSource::DecoderPool,
+            mapped_surface_counter: None,
         }
     }
 
@@ -45,6 +65,19 @@ impl VideoFrameConvertContext {
 
     pub(super) fn vulkan_device(&self) -> Option<Arc<VulkanDecodeDevice>> {
         self.vulkan_device.clone()
+    }
+
+    pub(super) fn hardware_surface_pressure(&self) -> bool {
+        // Count mapped AVFrames across every queue and the renderer, leaving
+        // space for four submitted packets, the DPB and one decoder thread.
+        self.mapped_surface_counter
+            .as_ref()
+            .is_some_and(|counter| counter.load(Ordering::Acquire) >= 8)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_mapped_surface_counter_for_test(&mut self, counter: Arc<AtomicUsize>) {
+        self.mapped_surface_counter = Some(counter);
     }
 }
 
@@ -84,11 +117,16 @@ impl VideoFrameConverter {
                 frame,
                 context.vulkan_device(),
                 sw_format,
+                context.vulkan_frame_source,
                 dovi_metadata,
             )?;
             log_video_frame_color_metadata(
                 frame_count,
-                "vulkan",
+                if vulkan.source == VulkanFrameSource::VaapiMapping {
+                    "vaapi-vulkan"
+                } else {
+                    "vulkan"
+                },
                 vulkan.format,
                 vulkan.color,
                 vulkan.range,
@@ -176,6 +214,7 @@ pub(super) fn vulkan_video_frame_from_av_frame_with_device(
     frame: *mut ffi::AVFrame,
     device: Option<Arc<VulkanDecodeDevice>>,
     sw_format: RawVideoFormat,
+    source: VulkanFrameSource,
     dovi_metadata: Option<DoviFrameMetadata>,
 ) -> std::result::Result<VulkanVideoFrame, String> {
     let Some(device) = device else {
@@ -196,13 +235,25 @@ pub(super) fn vulkan_video_frame_from_av_frame_with_device(
     let frame_images = vulkan_frame_planes(frame, sw_format)?;
     let frame_ref = FfmpegFrameRef::new_ref(frame).map_err(|error| error.to_string())?;
     let metadata = dynamic_metadata(dovi_metadata, ffmpeg_dovi);
+    let (allocated_size, usage) = match source {
+        VulkanFrameSource::DecoderPool => (frame_images.allocated_size, frame_images.usage),
+        VulkanFrameSource::VaapiMapping => {
+            // FFmpeg's DRM importer creates images at AVFrame.width/height,
+            // rather than the potentially padded source pool dimensions.
+            let size = frame_size(frame).ok_or("VA-API/Vulkan 映射帧缺少有效尺寸")?;
+            // READ mapping creates SAMPLED | TRANSFER_SRC. The derived pool
+            // advertises additional usage bits absent from imported images.
+            (size, 0x0000_0004 | 0x0000_0001)
+        }
+    };
 
     Ok(VulkanVideoFrame {
         frame: frame_ref,
         device,
         format: sw_format,
-        allocated_size: frame_images.allocated_size,
-        usage: frame_images.usage,
+        source,
+        allocated_size,
+        usage,
         color,
         range,
         chroma_site,

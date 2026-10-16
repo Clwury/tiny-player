@@ -32,11 +32,13 @@ depends=(
     'glibc'
     'hicolor-icon-theme'
     'libplacebo>=7'
+    'libva'
     'libxcb'
     'libxkbcommon'
     'systemd-libs'
     'vulkan-icd-loader'
     'wayland'
+    'libdrm'
 )
 makedepends=(
     'cargo'

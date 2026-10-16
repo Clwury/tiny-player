@@ -4,9 +4,13 @@ use std::{
     mem,
     os::raw::{c_int, c_uint},
     ptr, slice,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
+use crate::HardwareDecodeBackend;
 use crate::render_host::{FrameBufferPool, PooledBytes, RenderSize, VulkanDecodeDevice};
 use ffmpeg_sys_next as ffi;
 
@@ -473,6 +477,8 @@ impl Drop for Decoder {
 
 struct VideoHwFormatSelection {
     pixel_format: ffi::AVPixelFormat,
+    allow_software_fallback: bool,
+    negotiation_failed: AtomicBool,
 }
 
 unsafe extern "C" fn select_video_hw_format(
@@ -498,7 +504,16 @@ unsafe extern "C" fn select_video_hw_format(
         current = unsafe { current.add(1) };
     }
 
-    unsafe { ffi::avcodec_default_get_format(context, formats) }
+    if unsafe { (*selection).allow_software_fallback } {
+        unsafe { ffi::avcodec_default_get_format(context, formats) }
+    } else {
+        unsafe {
+            (*selection)
+                .negotiation_failed
+                .store(true, Ordering::Release)
+        };
+        ffi::AVPixelFormat::AV_PIX_FMT_NONE
+    }
 }
 
 fn find_decoder(stream: StreamInfo) -> std::result::Result<*const ffi::AVCodec, String> {

@@ -1,5 +1,43 @@
 use super::*;
 
+fn replay_hevc_journal_after_hardware_reopen(
+    pipeline: &mut PlaybackPipelineState,
+    session_id: PlaybackSessionId,
+    now: Instant,
+) -> std::result::Result<usize, String> {
+    let target_nsecs = pipeline
+        .video_decode_pipeline
+        .hevc_same_hardware_recovery_target()
+        .ok_or_else(|| "hardware decoder reopen completed without a recovery target".to_string())?;
+    if !pipeline
+        .video_decode_pipeline
+        .mark_hevc_same_hardware_prewarm_ready(now)
+    {
+        return Err("hardware decoder became ready outside same-hardware recovery".to_string());
+    }
+    let replay_packets = pipeline
+        .video_decode_pipeline
+        .requeue_hevc_hw_replay_journal(
+            &mut pipeline.playback_generation,
+            target_nsecs,
+            session_id,
+        )?;
+    pipeline
+        .video_decode_pipeline
+        .record_hevc_same_hardware_replay(replay_packets, true, now);
+    if replay_packets > 0 {
+        pipeline.dovi_pipeline.reset();
+        pipeline
+            .video_decode_recovery
+            .begin_verified_replay_from_safe_anchor(pipeline.video_stream.codec_id, target_nsecs);
+        pipeline
+            .output_scheduler
+            .mark_decode_recovery_replaying(pipeline.active_recovery_transaction_id());
+        pipeline.begin_cached_seek_recovery_watchdog(target_nsecs, session_id);
+    }
+    Ok(replay_packets)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn service_hevc_same_hardware_recovery_if_needed(
     session: &mut PlaybackSession,
@@ -77,37 +115,8 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                     .ok_or_else(|| {
                         "Vulkan prewarm completed without a same-hardware target".to_string()
                     })?;
-                if !pipeline
-                    .video_decode_pipeline
-                    .mark_hevc_same_hardware_prewarm_ready(now)
-                {
-                    return Err(
-                        "Vulkan prewarm completed outside same-hardware recovery".to_string()
-                    );
-                }
-                let replay_packets = pipeline
-                    .video_decode_pipeline
-                    .requeue_hevc_hw_replay_journal(
-                        &mut pipeline.playback_generation,
-                        target_nsecs,
-                        session.id(),
-                    )?;
-                pipeline
-                    .video_decode_pipeline
-                    .record_hevc_same_hardware_replay(replay_packets, true, now);
-                if replay_packets > 0 {
-                    pipeline.dovi_pipeline.reset();
-                    pipeline
-                        .video_decode_recovery
-                        .begin_verified_replay_from_safe_anchor(
-                            pipeline.video_stream.codec_id,
-                            target_nsecs,
-                        );
-                    pipeline
-                        .output_scheduler
-                        .mark_decode_recovery_replaying(pipeline.active_recovery_transaction_id());
-                    pipeline.begin_cached_seek_recovery_watchdog(target_nsecs, session.id());
-                }
+                let replay_packets =
+                    replay_hevc_journal_after_hardware_reopen(pipeline, session.id(), now)?;
                 tracing::info!(
                     session_id = ?session.id(),
                     target_nsecs,
@@ -115,7 +124,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                     replay_packets,
                     vulkan_device = ticket.device_key(),
                     same_hw_reopen_result = "prewarm_ready",
-                    "replayed safe HEVC journal after same-Vulkan renderer prewarm"
+                    "replayed safe HEVC journal after same-hardware renderer prewarm"
                 );
                 return Ok(true);
             }
@@ -157,7 +166,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                 .hevc_same_hardware_recovery_target(),
             requested_hw_mode = ?pipeline.video_decode_pipeline.requested_hardware_mode(),
             suppressed_repeats,
-            "servicing bounded HEVC same-Vulkan recovery action"
+            "servicing bounded HEVC same-hardware recovery action"
         );
     }
 
@@ -233,7 +242,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                     last_worker_progress_ms = ?after.last_result_produced_at.map(|at| {
                         drain_now.saturating_duration_since(at).as_secs_f64() * 1000.0
                     }),
-                    "drained pending decode output for same-Vulkan recovery"
+                    "drained pending decode output for same-hardware recovery"
                 );
             }
             if !advanced {
@@ -249,7 +258,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
             let target_nsecs = pipeline
                 .video_decode_pipeline
                 .hevc_same_hardware_recovery_target()
-                .ok_or_else(|| "same-Vulkan flush has no recovery target".to_string())?;
+                .ok_or_else(|| "same-hardware flush has no recovery target".to_string())?;
             control.set_cache_paused(false);
             let discarded_vo_frames = vo_queue.discard_pending_frames(session.id());
             let generation = pipeline.advance_playback_generation();
@@ -275,7 +284,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                     target_nsecs,
                     %error,
                     same_hw_recovery_phase = "flush_failed",
-                    "same-Vulkan decoder flush could not be scheduled"
+                    "same-hardware decoder flush could not be scheduled"
                 );
                 return Ok(true);
             }
@@ -312,7 +321,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                 replay_packets,
                 recovery_action = HevcDecodeRecoveryAction::ReplaySameHardware.as_str(),
                 same_hw_recovery_phase = "replaying_after_flush",
-                "flushed and replayed the current Vulkan decoder"
+                "flushed and replayed the current hardware decoder"
             );
             Ok(true)
         }
@@ -320,7 +329,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
             let target_nsecs = pipeline
                 .video_decode_pipeline
                 .hevc_same_hardware_recovery_target()
-                .ok_or_else(|| "same-Vulkan reopen has no recovery target".to_string())?;
+                .ok_or_else(|| "same-hardware reopen has no recovery target".to_string())?;
             let generation = pipeline.advance_playback_generation();
             let release_first = pipeline
                 .video_decode_pipeline
@@ -340,7 +349,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                     pipeline
                         .video_decode_pipeline
                         .fail_hevc_same_hardware_recovery(format!(
-                            "same-Vulkan reopen could not retire frame-prepare worker: {error}"
+                            "same-hardware reopen could not retire frame-prepare worker: {error}"
                         ));
                     tracing::error!(
                         session_id = ?session.id(),
@@ -349,14 +358,14 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                         released_scheduler_frames,
                         discarded_vo_frames,
                         %error,
-                        "aborted release-first Vulkan reopen before opening a second frame pool"
+                        "aborted release-first hardware reopen before opening a second frame pool"
                     );
                     return Ok(true);
                 }
                 pipeline.output_scheduler.begin_decode_recovery(
                     pipeline.active_recovery_transaction_id(),
                     target_nsecs,
-                    DecodeRecoverySource::VulkanReopenReplay,
+                    DecodeRecoverySource::HardwareReopenReplay,
                     control,
                     session.id(),
                 );
@@ -375,7 +384,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                         target_nsecs,
                         %error,
                         same_hw_reopen_result = "failed",
-                        "same-Vulkan decoder reopen failed"
+                        "same-hardware decoder reopen failed"
                     );
                     return Ok(true);
                 }
@@ -392,7 +401,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                 pipeline.output_scheduler.begin_decode_recovery(
                     pipeline.active_recovery_transaction_id(),
                     target_nsecs,
-                    DecodeRecoverySource::VulkanReopenReplay,
+                    DecodeRecoverySource::HardwareReopenReplay,
                     control,
                     session.id(),
                 );
@@ -400,17 +409,24 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                     .video_decode_recovery
                     .reset_for_timeline_start(pipeline.video_stream.codec_id, target_nsecs);
             }
-            let Some(ticket) = vo_queue.request_vulkan_prewarm(session.id(), device.clone()) else {
+            if let Some(device) = device.as_ref() {
+                let Some(ticket) = vo_queue.request_vulkan_prewarm(session.id(), device.clone())
+                else {
+                    pipeline
+                        .video_decode_pipeline
+                        .fail_hevc_same_hardware_recovery(
+                            "new Vulkan device prewarm was rejected for the active playback session",
+                        );
+                    return Ok(true);
+                };
                 pipeline
                     .video_decode_pipeline
-                    .fail_hevc_same_hardware_recovery(
-                        "new Vulkan device prewarm was rejected for the active playback session",
-                    );
-                return Ok(true);
-            };
-            pipeline
-                .video_decode_pipeline
-                .record_hevc_same_hardware_prewarm_request(ticket)?;
+                    .record_hevc_same_hardware_prewarm_request(ticket)?;
+            } else {
+                // VA-API copyback emits ordinary software frames. Its renderer
+                // owns an independent device and needs no decoder prewarm.
+                replay_hevc_journal_after_hardware_reopen(pipeline, session.id(), now)?;
+            }
             let playback_video_info = playback_video_info_from_worker(
                 pipeline.video_stream,
                 pipeline.video_decode_pipeline.info(),
@@ -425,10 +441,10 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                 discarded_vo_frames,
                 released_scheduler_frames,
                 release_first,
-                vulkan_device = device.key(),
+                vulkan_device = ?device.as_ref().map(|device| device.key()),
                 same_hw_reopen_attempt = 1,
-                same_hw_reopen_result = "opened_waiting_for_renderer_prewarm",
-                "atomically replaced the HEVC decoder with a new Vulkan worker"
+                same_hw_reopen_result = if device.is_some() { "opened_waiting_for_renderer_prewarm" } else { "opened_replaying_copyback" },
+                "atomically replaced the HEVC hardware decoder"
             );
             Ok(true)
         }
@@ -454,7 +470,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                 require_safe_cached_anchor: true,
                 preserve_hevc_same_hardware_recovery: true,
                 recovery_transaction_id: Some(transaction_id),
-                low_level_seek_reason: Some("same_vulkan_reopen_replay_failed"),
+                low_level_seek_reason: Some("same_hardware_reopen_replay_failed"),
                 session_id: session.id(),
                 vo_queue,
                 demux_cache,
@@ -478,7 +494,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                         target_nsecs,
                         seek_generation,
                         %error,
-                        "cached safe-IDR rebuild reset failed after Vulkan reopen"
+                        "cached safe-IDR rebuild reset failed after hardware reopen"
                     );
                     return Ok(true);
                 }
@@ -519,7 +535,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                         anchor_kind = info.anchor_kind.as_str(),
                         anchor_nsecs = info.anchor_nsecs,
                         preroll_nsecs = info.preroll_nsecs,
-                        "rebuilding reopened Vulkan decoder from cached safe IDR after replay failure"
+                        "rebuilding reopened hardware decoder from cached safe IDR after replay failure"
                     );
                 }
                 DemuxSeekResult::Unavailable => {
@@ -535,7 +551,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
                         transaction_id,
                         target_nsecs,
                         seek_generation,
-                        "cached safe-IDR rebuild was unavailable after Vulkan reopen"
+                        "cached safe-IDR rebuild was unavailable after hardware reopen"
                     );
                 }
                 DemuxSeekResult::Superseded => {
@@ -577,7 +593,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
             let error = pipeline
                 .video_decode_pipeline
                 .hevc_same_hardware_recovery_terminal_error(now)
-                .unwrap_or_else(|| "ForceVulkan 同硬解恢复失败，但缺少终态诊断".to_string());
+                .unwrap_or_else(|| "强制硬解同后端恢复失败，但缺少终态诊断".to_string());
             pipeline
                 .video_decode_pipeline
                 .finish_hevc_same_hardware_recovery_terminal();
@@ -604,7 +620,7 @@ pub(super) fn fallback_to_software_after_same_hardware_recovery(
     let terminal_error = pipeline
         .video_decode_pipeline
         .hevc_same_hardware_recovery_terminal_error(now)
-        .unwrap_or_else(|| "bounded same-Vulkan recovery exhausted".to_string());
+        .unwrap_or_else(|| "bounded same-hardware recovery exhausted".to_string());
     if pipeline.video_decode_pipeline.requested_hardware_mode()
         != super::super::HardwareDecodeMode::Auto
     {

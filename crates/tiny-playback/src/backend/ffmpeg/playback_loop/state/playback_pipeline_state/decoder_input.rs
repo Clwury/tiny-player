@@ -166,6 +166,18 @@ impl PlaybackPipelineState {
         vo_snapshot: VideoOutputQueueSnapshot,
         audio_output_pending_nsecs: Option<u64>,
     ) -> bool {
+        if self
+            .video_decode_pipeline
+            .info()
+            .convert_context
+            .hardware_surface_pressure()
+        {
+            // The VA-API mapping budget is a hard shared-surface constraint,
+            // including while filling the output window. Let the output gate
+            // resume with the available window instead of waiting for a normal
+            // rebuffer waterline that requires more VA surfaces than the pool.
+            return true;
+        }
         let video_decode_snapshot = self.video_decode_pipeline.snapshot();
         let prepare_snapshot = self.video_frame_prepare_worker.snapshot();
         let prepare_worker_frames = prepare_snapshot

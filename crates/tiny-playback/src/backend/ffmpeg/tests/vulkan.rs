@@ -15,7 +15,7 @@ fn vulkan_wrapping_uses_allocated_extent_and_visible_crop_when_enabled() {
     // works on drivers whose Vulkan Video decode path is broken.
     let codec = unsafe { ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_H264) };
     let hardware = VideoHwDecodeContext::try_create(codec).unwrap();
-    let device = hardware.device();
+    let device = hardware.device().unwrap();
     let mut renderer = LibplaceboToneMapper::new_for_vulkan_decode(Arc::clone(&device)).unwrap();
     for format in [RawVideoFormat::Nv12, RawVideoFormat::P010Le] {
         for width in [64, 96] {
@@ -133,6 +133,7 @@ fn check_vulkan_crop(
             hw_ptr,
             Some(Arc::clone(device)),
             format,
+            crate::render_host::VulkanFrameSource::DecoderPool,
             None,
         )
         .unwrap();

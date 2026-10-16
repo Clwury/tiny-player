@@ -258,7 +258,7 @@ fn root_failure_count_does_not_fail_attempt_with_current_epoch_progress() {
     transaction.phase = HevcSameHardwareRecoveryPhase::ReplayingAfterReopen;
     transaction.begin_attempt(
         3,
-        HevcSameHardwareRecoveryAttemptKind::VulkanReopenReplay,
+        HevcSameHardwareRecoveryAttemptKind::HardwareReopenReplay,
         20,
         now,
     );
@@ -691,7 +691,7 @@ fn problem_trace_29_short_vulkan_prefix_escalates_to_bounded_cached_rebuild() {
     transaction.phase = HevcSameHardwareRecoveryPhase::ReplayingAfterReopen;
     transaction.begin_attempt(
         5,
-        HevcSameHardwareRecoveryAttemptKind::VulkanReopenReplay,
+        HevcSameHardwareRecoveryAttemptKind::HardwareReopenReplay,
         generation,
         now,
     );
@@ -937,7 +937,7 @@ fn force_vulkan_orders_flush_reopen_cached_idr_then_explicit_failure() {
     transaction.phase = HevcSameHardwareRecoveryPhase::ReplayingAfterReopen;
     transaction.begin_attempt(
         3,
-        HevcSameHardwareRecoveryAttemptKind::VulkanReopenReplay,
+        HevcSameHardwareRecoveryAttemptKind::HardwareReopenReplay,
         20,
         now + Duration::from_millis(2),
     );
@@ -962,7 +962,7 @@ fn force_vulkan_orders_flush_reopen_cached_idr_then_explicit_failure() {
     assert_eq!(transaction.attempt_ledger[0].outcome, "journal_incomplete");
     assert_eq!(
         transaction.attempt_ledger[1].kind,
-        HevcSameHardwareRecoveryAttemptKind::VulkanReopenReplay
+        HevcSameHardwareRecoveryAttemptKind::HardwareReopenReplay
     );
     assert_eq!(transaction.attempt_ledger[1].outcome, "journal_incomplete");
 
@@ -1008,7 +1008,7 @@ fn same_hardware_reopen_failure_rebuilds_cache_for_force_and_uses_software_for_a
     forced.phase = HevcSameHardwareRecoveryPhase::ReplayingAfterReopen;
     forced.begin_attempt(
         3,
-        HevcSameHardwareRecoveryAttemptKind::VulkanReopenReplay,
+        HevcSameHardwareRecoveryAttemptKind::HardwareReopenReplay,
         20,
         now,
     );
@@ -1032,7 +1032,7 @@ fn same_hardware_reopen_failure_rebuilds_cache_for_force_and_uses_software_for_a
     automatic.phase = HevcSameHardwareRecoveryPhase::ReplayingAfterReopen;
     automatic.begin_attempt(
         3,
-        HevcSameHardwareRecoveryAttemptKind::VulkanReopenReplay,
+        HevcSameHardwareRecoveryAttemptKind::HardwareReopenReplay,
         20,
         now,
     );
@@ -1074,7 +1074,7 @@ fn same_hardware_replay_timeout_advances_flush_then_reopen_once() {
     transaction.phase = HevcSameHardwareRecoveryPhase::ReplayingAfterReopen;
     transaction.begin_attempt(
         3,
-        HevcSameHardwareRecoveryAttemptKind::VulkanReopenReplay,
+        HevcSameHardwareRecoveryAttemptKind::HardwareReopenReplay,
         20,
         timed_out,
     );

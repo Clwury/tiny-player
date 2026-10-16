@@ -1,5 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+/// Hardware backend attached to the video decoder, independent of user preferences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HardwareDecodeBackend {
+    Vulkan,
+    /// VA-API decoding with frames downloaded to system memory.
+    Vaapi,
+    /// VA-API decoding with DMA-BUF frames mapped directly to Vulkan.
+    VaapiVulkan,
+}
+
 /// Video decoder selection, applied when a playback input is opened.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -11,6 +21,10 @@ pub enum HardwareDecodeMode {
     Auto,
     /// Require Vulkan hardware decoding and report failures without fallback.
     ForceVulkan,
+    /// Require VA-API decoding on Linux, downloading frames for video processing.
+    ForceVaapi,
+    /// Require VA-API decoding and direct Vulkan mapping on Linux.
+    ForceVaapiVulkan,
 }
 
 impl HardwareDecodeMode {
@@ -27,12 +41,18 @@ impl HardwareDecodeMode {
             "" | "0" | "off" | "false" | "no" | "disabled" | "software" | "sw" => Some(Self::Off),
             "1" | "on" | "true" | "yes" | "auto" | "vulkan-auto" => Some(Self::Auto),
             "vulkan" | "force" | "force-vulkan" | "vulkan-force" => Some(Self::ForceVulkan),
+            "vaapi" | "force-vaapi" | "vaapi-force" | "vaapi-copy" => Some(Self::ForceVaapi),
+            "vaapi-vulkan" | "force-vaapi-vulkan" | "vaapi-gpu" => Some(Self::ForceVaapiVulkan),
             _ => None,
         }
     }
 
-    pub(crate) fn should_try_vulkan(self) -> bool {
-        matches!(self, Self::Auto | Self::ForceVulkan)
+    pub(crate) fn should_try_hardware(self) -> bool {
+        self != Self::Off
+    }
+
+    pub(crate) fn uses_vaapi(self) -> bool {
+        matches!(self, Self::ForceVaapi | Self::ForceVaapiVulkan)
     }
 
     pub(crate) fn allows_fallback(self) -> bool {
@@ -53,6 +73,8 @@ mod tests {
             (HardwareDecodeMode::Auto, "auto"),
             (HardwareDecodeMode::Off, "off"),
             (HardwareDecodeMode::ForceVulkan, "force_vulkan"),
+            (HardwareDecodeMode::ForceVaapi, "force_vaapi"),
+            (HardwareDecodeMode::ForceVaapiVulkan, "force_vaapi_vulkan"),
         ] {
             let config = PlaybackCacheConfig {
                 hardware_decode: mode,
@@ -71,6 +93,8 @@ mod tests {
             HardwareDecodeMode::Auto,
             HardwareDecodeMode::Off,
             HardwareDecodeMode::ForceVulkan,
+            HardwareDecodeMode::ForceVaapi,
+            HardwareDecodeMode::ForceVaapiVulkan,
         ] {
             assert_eq!(mode.resolve(None), mode);
             assert_eq!(mode.resolve(Some("unsupported")), mode);
@@ -81,6 +105,13 @@ mod tests {
                 mode.resolve(Some("force-vulkan")),
                 HardwareDecodeMode::ForceVulkan
             );
+            assert_eq!(mode.resolve(Some("vaapi")), HardwareDecodeMode::ForceVaapi);
+            for value in ["vaapi-vulkan", "force-vaapi-vulkan", "vaapi-gpu"] {
+                assert_eq!(
+                    mode.resolve(Some(value)),
+                    HardwareDecodeMode::ForceVaapiVulkan
+                );
+            }
         }
     }
 }
