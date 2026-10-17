@@ -1,15 +1,14 @@
-use std::ptr;
-
 use ffmpeg_sys_next as ffi;
 
-use super::{ffmpeg_error, supports_hw_config};
+use super::ffmpeg_error;
 use crate::backend::ffmpeg::{AvFrame, video::ffmpeg_raw_video_format};
 
 #[cfg(target_os = "linux")]
 pub(super) mod vulkan;
 
+#[cfg(any(target_os = "linux", test))]
 fn supports_vaapi(codec: *const ffi::AVCodec) -> bool {
-    supports_hw_config(
+    super::supports_hw_config(
         codec,
         ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
         ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
@@ -41,6 +40,8 @@ pub(super) fn create_device_on(
     codec: *const ffi::AVCodec,
     device: Option<&std::ffi::CStr>,
 ) -> Result<crate::render_host::FfmpegAvBufferRef, String> {
+    use std::ptr;
+
     use crate::render_host::FfmpegAvBufferRef;
 
     if !supports_vaapi(codec) {

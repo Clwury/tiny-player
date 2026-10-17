@@ -1,4 +1,4 @@
-use std::{mem, slice};
+use std::{mem, ptr, slice};
 
 use super::*;
 use crate::{
@@ -151,8 +151,10 @@ fn vaapi_copyback_preserves_bit_depth_hdr_properties_and_visible_crop() {
                 RawVideoFormat::P010Le => assert!(
                     plane
                         .data
-                        .chunks_exact(2)
-                        .all(|sample| u16::from_le_bytes([sample[0], sample[1]]) == 513 << 6)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .all(|sample| u16::from_le_bytes(*sample) == 513 << 6)
                 ),
                 _ => unreachable!(),
             }
