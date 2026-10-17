@@ -331,6 +331,19 @@ fn output_gate_service_status(
         .pipeline
         .output_scheduler
         .check_decode_recovery_deadline(Instant::now(), context.control, context.session_id)?;
+    let hardware_surface_pressure = context
+        .pipeline
+        .video_decode_pipeline
+        .info()
+        .convert_context
+        .hardware_surface_pressure();
+    context
+        .pipeline
+        .output_scheduler
+        .maybe_buffer_decode_recovery_for_surface_pressure(
+            hardware_surface_pressure,
+            context.session_id,
+        );
     let vo_snapshot = context.vo_queue.snapshot();
     let render_backlogged = vo_snapshot.render_backlogged();
     let has_audio_output = context.pipeline.audio_output.is_some();

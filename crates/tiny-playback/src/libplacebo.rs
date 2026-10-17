@@ -14,13 +14,14 @@ use super::{
     ffmpeg_dovi::FfmpegDoviMetadata,
     ffmpeg_vulkan,
     render_host::{
-        FfmpegAvBufferRef, FrameColor, RawVideoChromaSite, RawVideoFormat, RawVideoFrame,
-        RawVideoPlanes, RawVideoRange, RenderSize, VulkanDecodeDevice, VulkanDecodeQueue,
-        VulkanDecodeQueues, VulkanVideoFrame, frame_byte_len,
+        DmaBufVideoFrame, FfmpegAvBufferRef, FrameColor, RawVideoChromaSite, RawVideoFormat,
+        RawVideoFrame, RawVideoPlanes, RawVideoRange, RenderSize, VulkanDecodeDevice,
+        VulkanDecodeQueue, VulkanDecodeQueues, VulkanVideoFrame, frame_byte_len,
     },
 };
 
 mod color;
+mod dmabuf;
 mod dovi;
 mod ffi;
 mod upload;
@@ -76,6 +77,16 @@ struct VulkanTextureCacheEntry {
 }
 
 impl LibplaceboToneMapper {
+    pub fn tone_map_dmabuf_to_bgra8(
+        &mut self,
+        input: &DmaBufVideoFrame,
+        source_size: RenderSize,
+        output_size: RenderSize,
+    ) -> Result<Vec<u8>> {
+        let source = unsafe { self.import_dmabuf_source_frame(input, source_size)? };
+        unsafe { self.render_source_to_bgra8(&source.frame, output_size) }
+    }
+
     pub fn new() -> Result<Self> {
         unsafe {
             let vulkan = ffi::pl_vulkan_create(ptr::null(), ptr::null());
@@ -180,12 +191,25 @@ impl LibplaceboToneMapper {
 
         unsafe {
             let source = self.upload_source_frame(input, source_size)?;
+            self.render_source_to_bgra8(&source.frame, output_size)
+        }
+    }
+
+    unsafe fn render_source_to_bgra8(
+        &mut self,
+        source: &ffi::pl_frame,
+        output_size: RenderSize,
+    ) -> Result<Vec<u8>> {
+        if output_size.width == 0 || output_size.height == 0 {
+            return Err(anyhow!("invalid video frame dimensions"));
+        }
+        unsafe {
             let output_format = self.ensure_target_texture(output_size)?;
             let target = self.target_frame(output_size);
 
             if !ffi::pl_render_image(
                 self.renderer,
-                &source.frame,
+                source,
                 &target,
                 &ffi::pl_render_default_params,
             ) {

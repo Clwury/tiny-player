@@ -51,10 +51,11 @@ fn main() {
     let ffmpeg_vulkan_builder = bindgen::Builder::default()
         .header_contents(
             "ffmpeg_vulkan_wrapper.h",
-            "#include <libavutil/hwcontext_vulkan.h>\n",
+            "#include <libavutil/hwcontext_vulkan.h>\n#include <libavutil/hwcontext_drm.h>\n",
         )
         .allowlist_type("AVVkFrame")
         .allowlist_type("AVVulkan.*")
+        .allowlist_type("AVDRM.*")
         .allowlist_type("Vk.*")
         .allowlist_type("PFN_vkGetPhysicalDeviceProperties2")
         .generate_comments(false)

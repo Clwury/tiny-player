@@ -9,7 +9,7 @@ use std::thread;
 
 use ffmpeg_sys_next as ffi;
 
-use crate::render_host::{DecodedFrame, FramePixels, FramePts};
+use crate::render_host::{DecodedFrame, FramePts};
 
 use super::{
     AUDIO_VIDEO_QUEUE_LIMIT_DURATION, AUDIO_VIDEO_QUEUE_TARGET_DURATION,
@@ -185,7 +185,7 @@ pub(super) fn queued_video_frames_have_vulkan(
 ) -> bool {
     queued_video_frames
         .iter()
-        .any(|frame| matches!(&frame.frame.pixels, FramePixels::VulkanVideo(_)))
+        .any(|frame| frame.frame.pixels.uses_vulkan())
 }
 
 pub(super) fn frame_decode_error_flags(frame: *mut ffi::AVFrame) -> c_int {

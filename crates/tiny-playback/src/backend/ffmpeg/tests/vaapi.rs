@@ -217,25 +217,17 @@ fn exercise_playback_backend(
                         assert!(native.source.cache_textures());
                         assert!(!native.planes.is_empty());
                     }
-                    FramePixels::VulkanVideo(mapped)
+                    FramePixels::DmaBufVideo(mapped)
                         if mode == HardwareDecodeMode::ForceVaapiVulkan =>
                     {
-                        assert_eq!(
-                            mapped.source,
-                            crate::render_host::VulkanFrameSource::VaapiMapping
-                        );
                         assert_eq!(mapped.format, format);
                         assert_eq!(mapped.color, color);
-                        assert_eq!(mapped.planes.len(), 2);
-                        assert_eq!(mapped.allocated_size, frame.size);
-                        assert!(!mapped.source.cache_textures());
-                        assert!(!mapped.source.allows_download_fallback());
-                        assert!(
-                            mapped
-                                .planes
-                                .iter()
-                                .all(|plane| plane.image != 0 && plane.semaphore != 0)
+                        let exported = unsafe { &*mapped.frame.as_ptr() };
+                        assert_eq!(
+                            exported.format,
+                            ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32
                         );
+                        assert!(!exported.data[0].is_null());
                     }
                     FramePixels::RawVideo(raw)
                         if mode == HardwareDecodeMode::ForceVaapi || expected_backend.is_none() =>

@@ -1,6 +1,6 @@
 use super::{
-    FrameColor, PooledBytes, RawVideoChromaSite, RawVideoFormat, RawVideoPlanes, RawVideoRange,
-    VulkanDecodeDevice, VulkanVideoFrame,
+    DmaBufVideoFrame, FrameColor, PooledBytes, RawVideoChromaSite, RawVideoFormat, RawVideoPlanes,
+    RawVideoRange, VulkanDecodeDevice, VulkanVideoFrame,
 };
 use crate::{dovi::DoviFrameMetadata, ffmpeg_dovi::FfmpegDoviMetadata};
 
@@ -37,6 +37,13 @@ pub enum FramePixels {
     Bgra8(PooledBytes),
     RawVideo(RawVideoFrame),
     VulkanVideo(VulkanVideoFrame),
+    DmaBufVideo(DmaBufVideoFrame),
+}
+
+impl FramePixels {
+    pub fn uses_vulkan(&self) -> bool {
+        matches!(self, Self::VulkanVideo(_) | Self::DmaBufVideo(_))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

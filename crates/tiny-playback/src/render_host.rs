@@ -1,3 +1,4 @@
+mod dmabuf;
 pub(crate) mod frame;
 mod image;
 mod raw;
@@ -5,6 +6,7 @@ mod slot;
 mod video_output_queue;
 mod vulkan;
 
+pub(crate) use dmabuf::DmaBufVideoFrame;
 pub(crate) use frame::{
     DecodedFrame, FrameDynamicMetadata, FramePixels, FramePts, PlaybackSessionId, RawVideoFrame,
     RenderSize,

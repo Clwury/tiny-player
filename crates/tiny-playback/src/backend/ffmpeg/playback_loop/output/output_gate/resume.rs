@@ -19,7 +19,6 @@ use super::{
     rebuffer_playback_resume_waterline_after_prolonged_wait,
     service_initial_video_clock_until_audio_start, timed_output_gate_demux_watermark,
 };
-use crate::render_host::FramePixels;
 
 pub(in crate::backend::ffmpeg::playback_loop::output_gate) const MAX_REBUFFER_AUDIO_LEAD_NSECS:
     u64 = 2_000_000_000;
@@ -964,9 +963,7 @@ where
                             )
                         })
                     }),
-                    first.is_some_and(|frame| {
-                        matches!(&frame.frame.pixels, FramePixels::VulkanVideo(_))
-                    }),
+                    first.is_some_and(|frame| frame.frame.pixels.uses_vulkan()),
                     first.is_some(),
                 )
             });

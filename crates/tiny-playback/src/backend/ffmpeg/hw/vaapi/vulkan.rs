@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     ffi::{CStr, c_char},
     ptr,
     sync::{
@@ -19,20 +18,11 @@ const REQUIRED_EXTENSIONS: &[&str] = &[
     "VK_KHR_external_memory_fd",
     "VK_EXT_external_memory_dma_buf",
     "VK_EXT_image_drm_format_modifier",
-    "VK_KHR_external_semaphore_fd",
 ];
 
-// Accessed only by the owning decoder thread. Keeping both references avoids
-// reusing a derived context after FFmpeg replaces a pool during reconfiguration.
 pub(in crate::backend::ffmpeg::hw) struct VaapiVulkanMapper {
     device: Arc<VulkanDecodeDevice>,
-    frames: RefCell<Option<MappedFrames>>,
     queued_surfaces: Arc<AtomicUsize>,
-}
-
-struct MappedFrames {
-    source: FfmpegAvBufferRef,
-    target: FfmpegAvBufferRef,
 }
 
 impl VaapiVulkanMapper {
@@ -40,31 +30,14 @@ impl VaapiVulkanMapper {
         vaapi_device: &FfmpegAvBufferRef,
     ) -> Result<Self, String> {
         let mut device_ref = ptr::null_mut();
-        let mut options = ptr::null_mut();
-        // VA exports separate DRM layers. Their R8/RG8 or R16/RG16 images must
-        // match the plane formats advertised by AVVulkanFramesContext.
-        let option_result = unsafe {
-            ffi::av_dict_set(
-                &mut options,
-                c"disable_multiplane".as_ptr(),
-                c"1".as_ptr(),
+        let result = unsafe {
+            ffi::av_hwdevice_ctx_create_derived(
+                &mut device_ref,
+                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+                vaapi_device.as_ptr(),
                 0,
             )
         };
-        let result = if option_result < 0 {
-            option_result
-        } else {
-            unsafe {
-                ffi::av_hwdevice_ctx_create_derived_opts(
-                    &mut device_ref,
-                    ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
-                    vaapi_device.as_ptr(),
-                    options,
-                    0,
-                )
-            }
-        };
-        unsafe { ffi::av_dict_free(&mut options) };
         if result < 0 {
             unsafe { ffi::av_buffer_unref(&mut device_ref) };
             return Err(format!(
@@ -100,7 +73,6 @@ impl VaapiVulkanMapper {
         );
         Ok(Self {
             device: Arc::new(device),
-            frames: RefCell::new(None),
             queued_surfaces: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -117,59 +89,15 @@ impl VaapiVulkanMapper {
         &self,
         frame: *const ffi::AVFrame,
     ) -> Result<AvFrame, String> {
-        let source = source_frames(frame)?;
-        let target = mapping_frames_with(&mut self.frames.borrow_mut(), source, || {
-            let mut target = ptr::null_mut();
-            let result = unsafe {
-                ffi::av_hwframe_ctx_create_derived(
-                    &mut target,
-                    ffi::AVPixelFormat::AV_PIX_FMT_VULKAN,
-                    self.device.device_ref(),
-                    source,
-                    MAP_FLAGS,
-                )
-            };
-            if result < 0 {
-                unsafe { ffi::av_buffer_unref(&mut target) };
-                return Err(format!(
-                    "FFmpeg 创建 VA-API/Vulkan 帧映射上下文失败：code={result}, error={}",
-                    ffmpeg_error(result)
-                ));
-            }
-            let target_ref = FfmpegAvBufferRef::new_ref(target).map_err(|error| error.to_string());
-            unsafe { ffi::av_buffer_unref(&mut target) };
-            tracing::debug!("initialized direct VA-API to Vulkan frame mapping");
-            target_ref
-        })?;
-        let mut mapped = map_frame_with(frame, target.as_ptr(), |dst, src, flags| unsafe {
-            // Use two explicit hardware mappings: VAAPI's generic map_from
-            // tries to map unknown formats to memory and can return EINVAL
-            // before Vulkan's map_to ever gets a chance. DRM PRIME bypasses
-            // that dispatch, synchronizes decode on export and imports the
-            // DMA-BUF/modifier with external queue ownership on the second map.
+        let mut mapped = map_frame_with(frame, |dst, src, flags| unsafe {
+            // Export synchronizes VA decode. libplacebo imports the DMA-BUF on
+            // the render thread, avoiding FFmpeg's DRM -> Vulkan execution pool
+            // reference cycle when source frame pools are replaced.
             ffi::av_hwframe_map(dst, src, flags)
         })?;
         track_surface(mapped.as_mut_ptr(), &self.queued_surfaces)?;
         Ok(mapped)
     }
-}
-
-fn mapping_frames_with(
-    cached: &mut Option<MappedFrames>,
-    source: *mut ffi::AVBufferRef,
-    create: impl FnOnce() -> Result<FfmpegAvBufferRef, String>,
-) -> Result<FfmpegAvBufferRef, String> {
-    if cached
-        .as_ref()
-        .is_none_or(|cached| unsafe { (*cached.source.as_ptr()).data != (*source).data })
-    {
-        let target = create()?;
-        *cached = Some(MappedFrames {
-            source: FfmpegAvBufferRef::new_ref(source).map_err(|error| error.to_string())?,
-            target,
-        });
-    }
-    Ok(cached.as_ref().unwrap().target.clone())
 }
 
 fn source_frames(frame: *const ffi::AVFrame) -> Result<*mut ffi::AVBufferRef, String> {
@@ -200,15 +128,19 @@ fn source_frames(frame: *const ffi::AVFrame) -> Result<*mut ffi::AVBufferRef, St
 
 fn map_frame_with(
     frame: *const ffi::AVFrame,
-    target: *mut ffi::AVBufferRef,
     mut map: impl FnMut(*mut ffi::AVFrame, *const ffi::AVFrame, i32) -> i32,
 ) -> Result<AvFrame, String> {
-    source_frames(frame)?;
-    if target.is_null() {
-        return Err("VA-API/Vulkan 映射缺少目标帧上下文".to_string());
-    }
+    let source = source_frames(frame)?;
     let mut drm = AvFrame::new()?;
-    unsafe { (*drm.as_mut_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32 };
+    unsafe {
+        (*drm.as_mut_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+        // As in libplacebo's derived AVFrame mapper, retain the source pool for
+        // sw_format and its lifetime; this is not a derived Vulkan context.
+        (*drm.as_mut_ptr()).hw_frames_ctx = ffi::av_buffer_ref(source);
+        if (*drm.as_mut_ptr()).hw_frames_ctx.is_null() {
+            return Err("FFmpeg 复制 VA-API 帧上下文引用失败".to_string());
+        }
+    }
     let result = map(drm.as_mut_ptr(), frame, MAP_FLAGS);
     if result < 0 {
         return Err(mapping_error("VA-API→DRM PRIME", result));
@@ -218,31 +150,14 @@ fn map_frame_with(
     {
         return Err("FFmpeg VA-API 导出未返回 DRM PRIME 帧".to_string());
     }
-    let mut mapped = AvFrame::new()?;
-    unsafe {
-        (*mapped.as_mut_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_VULKAN as i32;
-        (*mapped.as_mut_ptr()).hw_frames_ctx = ffi::av_buffer_ref(target);
-        if (*mapped.as_mut_ptr()).hw_frames_ctx.is_null() {
-            return Err("FFmpeg 复制 Vulkan 映射帧上下文引用失败".to_string());
-        }
-    }
-    let result = map(mapped.as_mut_ptr(), drm.as_mut_ptr(), MAP_FLAGS);
-    if result < 0 {
-        return Err(mapping_error("DRM PRIME→Vulkan", result));
-    }
-    if unsafe { (*mapped.as_mut_ptr()).format } != ffi::AVPixelFormat::AV_PIX_FMT_VULKAN as i32
-        || unsafe { (*mapped.as_mut_ptr()).data[0].is_null() }
-    {
-        return Err("FFmpeg VA-API 映射未输出 Vulkan 硬件帧".to_string());
-    }
-    let result = unsafe { ffi::av_frame_copy_props(mapped.as_mut_ptr(), frame) };
+    let result = unsafe { ffi::av_frame_copy_props(drm.as_mut_ptr(), frame) };
     if result < 0 {
         return Err(format!(
             "FFmpeg 复制 VA-API/Vulkan 帧属性失败：{}",
             ffmpeg_error(result)
         ));
     }
-    Ok(mapped)
+    Ok(drm)
 }
 
 fn mapping_error(stage: &str, result: i32) -> String {

@@ -280,6 +280,61 @@ impl PlaybackOutputScheduler {
             .unwrap_or(true)
     }
 
+    pub(in crate::backend::ffmpeg) fn maybe_buffer_decode_recovery_for_surface_pressure(
+        &mut self,
+        hardware_surface_pressure: bool,
+        session_id: PlaybackSessionId,
+    ) -> bool {
+        if !hardware_surface_pressure {
+            return false;
+        }
+        let Some(transaction) = self.decode_recovery_transaction.as_mut() else {
+            return false;
+        };
+        if !matches!(
+            transaction.phase,
+            DecodeRecoveryPhase::SwitchingDecoder | DecodeRecoveryPhase::Replaying
+        ) {
+            return false;
+        }
+        let Some((_, staged_end_nsecs)) = transaction.staging_queue.range_nsecs() else {
+            return false;
+        };
+        let staging_forward_nsecs = transaction
+            .staging_queue
+            .strict_forward_nsecs_from(transaction.resume_nsecs)
+            .unwrap_or_default();
+        if staging_forward_nsecs == 0
+            || transaction
+                .resume_nsecs
+                .saturating_add(staging_forward_nsecs)
+                < staged_end_nsecs
+        {
+            return false;
+        }
+
+        // Recovery owns these surfaces until atomic commit. A hard shared
+        // surface limit can stop decode before the normal 500 ms waterline;
+        // waiting for more pictures would then prevent every surface from
+        // being presented and released. Commit the validated continuous window
+        // through the normal audio/boundary gates without raising the limit.
+        transaction.phase = DecodeRecoveryPhase::Buffered;
+        tracing::debug!(
+            session_id = ?session_id,
+            transaction_id = transaction.transaction_id,
+            recovery_source = transaction.source.as_str(),
+            target_nsecs = transaction.target_nsecs,
+            resume_nsecs = transaction.resume_nsecs,
+            disposition = ?transaction.disposition,
+            staging_frames = transaction.staging_queue.len(),
+            staging_frame_budget = ?transaction.staging_frame_budget,
+            staging_forward_ms = staging_forward_nsecs as f64 / 1_000_000.0,
+            "buffered continuous HEVC recovery frames under hardware surface pressure"
+        );
+        self.note_output_housekeeping_change();
+        true
+    }
+
     pub(in crate::backend::ffmpeg) fn stage_decode_recovery_frame(
         &mut self,
         mut frame: QueuedVideoFrame,
@@ -910,3 +965,7 @@ impl PlaybackOutputScheduler {
         true
     }
 }
+
+#[cfg(test)]
+#[path = "decode_recovery/surface_pressure_tests.rs"]
+mod surface_pressure_tests;

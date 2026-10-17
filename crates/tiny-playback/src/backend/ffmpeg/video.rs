@@ -13,10 +13,10 @@ use crate::{
     dovi::DoviFrameMetadata,
     ffmpeg_dovi::FfmpegDoviMetadata,
     render_host::{
-        DecodedFrame, FfmpegFrameRef, FrameBufferPool, FrameColor, FrameDynamicMetadata,
-        FramePixels, RawVideoChromaSite, RawVideoFormat, RawVideoFrame, RawVideoPlane,
-        RawVideoPlanes, RawVideoRange, RenderSize, VulkanDecodeDevice, VulkanFrameSource,
-        VulkanVideoFrame,
+        DecodedFrame, DmaBufVideoFrame, FfmpegFrameRef, FrameBufferPool, FrameColor,
+        FrameDynamicMetadata, FramePixels, RawVideoChromaSite, RawVideoFormat, RawVideoFrame,
+        RawVideoPlane, RawVideoPlanes, RawVideoRange, RenderSize, VulkanDecodeDevice,
+        VulkanFrameSource, VulkanVideoFrame,
     },
 };
 
@@ -109,6 +109,48 @@ impl VideoFrameConverter {
         let key_frame = unsafe { (*frame).flags & ffi::AV_FRAME_FLAG_KEY != 0 };
         self.converted_frame_count = self.converted_frame_count.saturating_add(1);
         let frame_count = self.converted_frame_count;
+        if unsafe { (*frame).format } == ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32 {
+            let format = vulkan_sw_format(frame)
+                .and_then(ffmpeg_raw_video_format)
+                .filter(|format| matches!(format, RawVideoFormat::Nv12 | RawVideoFormat::P010Le))
+                .ok_or("VA-API DMA-BUF 帧缺少可识别的软件像素格式")?;
+            let device = context
+                .vulkan_device()
+                .ok_or("VA-API DMA-BUF 帧缺少 Vulkan 渲染设备")?;
+            let ffmpeg_dovi = ffmpeg_dovi_metadata_from_frame(frame);
+            let dovi_metadata = if ffmpeg_dovi
+                .as_ref()
+                .is_some_and(FfmpegDoviMetadata::is_profile5)
+            {
+                None
+            } else {
+                dovi_metadata
+            };
+            let color = frame_color(frame, dovi_metadata.as_ref(), ffmpeg_dovi.as_ref());
+            let metadata = dynamic_metadata(dovi_metadata, ffmpeg_dovi);
+            log_video_frame_color_metadata(
+                frame_count,
+                "vaapi-vulkan",
+                format,
+                color,
+                frame_range(frame),
+                metadata.as_ref(),
+            );
+            return Ok(DecodedFrame {
+                size,
+                pts: None,
+                key_frame,
+                pixels: FramePixels::DmaBufVideo(DmaBufVideoFrame {
+                    frame: FfmpegFrameRef::new_ref(frame).map_err(|error| error.to_string())?,
+                    device,
+                    format,
+                    color,
+                    range: frame_range(frame),
+                    chroma_site: frame_chroma_site(frame),
+                    metadata,
+                }),
+            });
+        }
         if is_vulkan_frame(frame) {
             let sw_format = vulkan_sw_format(frame)
                 .and_then(ffmpeg_raw_video_format)

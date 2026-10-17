@@ -598,6 +598,19 @@ fn render_video_frame(
                 frame_pts,
             )
         }
+        FramePixels::DmaBufVideo(dmabuf) => {
+            prewarm_vulkan_tone_mapper(tone_mapper, dmabuf.device.clone())?;
+            let pixels = tone_mapper
+                .as_mut()
+                .expect("tone mapper initialized")
+                .tone_map_dmabuf_to_bgra8(&dmabuf, request.frame.size, request.output_size)
+                .context("VA-API/Vulkan DMA-BUF 帧渲染失败；该模式不回退内存回传")?;
+            BgraImage::new(
+                pixels,
+                request.output_size.width,
+                request.output_size.height,
+            )
+        }
     }
 }
 

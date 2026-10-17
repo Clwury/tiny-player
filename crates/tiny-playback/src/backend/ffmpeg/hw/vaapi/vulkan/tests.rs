@@ -59,43 +59,30 @@ fn direct_mapping_preserves_hdr_timing_and_retains_surface_until_queued_refs_dro
         ffi::AVPixelFormat::AV_PIX_FMT_P010LE,
     ] {
         let mut source = source_frame(format);
-        let target = buffer(mem::size_of::<ffi::AVHWFramesContext>());
         let surface = FfmpegAvBufferRef::new_ref(unsafe { (*source.as_mut_ptr()).buf[0] }).unwrap();
         let mut map_calls = 0;
-        let mut mapped = map_frame_with(
-            source.as_mut_ptr(),
-            target.as_ptr(),
-            |dst, src, flags| unsafe {
-                assert_eq!(
-                    flags,
-                    ffi::AV_HWFRAME_MAP_READ as i32 | ffi::AV_HWFRAME_MAP_DIRECT as i32
-                );
-                map_calls += 1;
-                if map_calls == 1 {
-                    assert_eq!((*src).format, ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32);
-                    assert_eq!(
-                        (*dst).format,
-                        ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32
-                    );
-                } else {
-                    assert_eq!(
-                        (*src).format,
-                        ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32
-                    );
-                    assert_eq!((*dst).format, ffi::AVPixelFormat::AV_PIX_FMT_VULKAN as i32);
-                    assert_eq!((*(*dst).hw_frames_ctx).data, (*target.as_ptr()).data);
-                }
-                // The native mapping retains the source surface in its map
-                // descriptor. Supply the same reference semantics without a GPU.
-                (*dst).buf[0] = ffi::av_buffer_ref((*src).buf[0]);
-                (*dst).data[0] = (*(*dst).buf[0]).data;
-                (*dst).width = (*src).width;
-                (*dst).height = (*src).height;
-                0
-            },
-        )
+        let mut mapped = map_frame_with(source.as_mut_ptr(), |dst, src, flags| unsafe {
+            assert_eq!(
+                flags,
+                ffi::AV_HWFRAME_MAP_READ as i32 | ffi::AV_HWFRAME_MAP_DIRECT as i32
+            );
+            map_calls += 1;
+            assert_eq!((*src).format, ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32);
+            assert_eq!(
+                (*dst).format,
+                ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32
+            );
+            assert_eq!((*(*dst).hw_frames_ctx).data, (*(*src).hw_frames_ctx).data);
+            // The native mapping retains the source surface in its map
+            // descriptor. Supply the same reference semantics without a GPU.
+            (*dst).buf[0] = ffi::av_buffer_ref((*src).buf[0]);
+            (*dst).data[0] = (*(*dst).buf[0]).data;
+            (*dst).width = (*src).width;
+            (*dst).height = (*src).height;
+            0
+        })
         .unwrap();
-        assert_eq!(map_calls, 2);
+        assert_eq!(map_calls, 1);
         unsafe {
             let output = &*mapped.as_mut_ptr();
             assert_eq!(output.pts, 1_234);
@@ -131,46 +118,25 @@ fn direct_mapping_preserves_hdr_timing_and_retains_surface_until_queued_refs_dro
         assert_eq!(unsafe { ffi::av_buffer_get_ref_count(surface.as_ptr()) }, 2);
         drop(queued);
         assert_eq!(unsafe { ffi::av_buffer_get_ref_count(surface.as_ptr()) }, 1);
-        assert_eq!(unsafe { ffi::av_buffer_get_ref_count(target.as_ptr()) }, 1);
     }
 }
 
 #[test]
-fn mapping_failure_releases_target_refs_and_never_returns_a_cpu_frame() {
+fn export_failure_releases_pool_refs_and_never_returns_a_cpu_frame() {
     let mut source = source_frame(ffi::AVPixelFormat::AV_PIX_FMT_NV12);
-    let target = buffer(mem::size_of::<ffi::AVHWFramesContext>());
+    let pool = FfmpegAvBufferRef::new_ref(unsafe { (*source.as_mut_ptr()).hw_frames_ctx }).unwrap();
     for code in [ffi::AVERROR(ffi::ENOSYS), ffi::AVERROR(ffi::ENOMEM)] {
-        for failing_format in [
-            ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME,
-            ffi::AVPixelFormat::AV_PIX_FMT_VULKAN,
-        ] {
-            let error =
-                match map_frame_with(source.as_mut_ptr(), target.as_ptr(), |dst, src, _| unsafe {
-                    if (*dst).format == failing_format as i32 {
-                        return code;
-                    }
-                    (*dst).buf[0] = ffi::av_buffer_ref((*src).buf[0]);
-                    (*dst).data[0] = (*(*dst).buf[0]).data;
-                    (*dst).width = (*src).width;
-                    (*dst).height = (*src).height;
-                    0
-                }) {
-                    Ok(_) => panic!("failed GPU mapping must not return a downloaded frame"),
-                    Err(error) => error,
-                };
-            assert!(error.contains(&format!("code={code}")), "{error}");
-            assert!(error.contains("不回退"), "{error}");
-            assert_eq!(unsafe { ffi::av_buffer_get_ref_count(target.as_ptr()) }, 1);
-            assert_eq!(
-                unsafe { ffi::av_buffer_get_ref_count((*source.as_mut_ptr()).buf[0]) },
-                1
-            );
-        }
+        let error = map_frame_with(source.as_mut_ptr(), |_, _, _| code)
+            .err()
+            .unwrap();
+        assert!(error.contains(&format!("code={code}")), "{error}");
+        assert!(error.contains("不回退"), "{error}");
+        assert_eq!(unsafe { ffi::av_buffer_get_ref_count(pool.as_ptr()) }, 2);
     }
     let mut unsupported = source_frame(ffi::AVPixelFormat::AV_PIX_FMT_YUV444P);
     assert!(
-        map_frame_with(unsupported.as_mut_ptr(), target.as_ptr(), |_, _, _| panic!(
-            "unsupported layout must be rejected before mapping"
+        map_frame_with(unsupported.as_mut_ptr(), |_, _, _| panic!(
+            "unsupported layout must be rejected before export"
         ))
         .is_err()
     );
@@ -192,41 +158,26 @@ fn surface_budget_counts_mappings_until_the_last_cross_thread_frame_reference_dr
 }
 
 #[test]
-fn mapping_context_tracks_pool_identity_and_survives_failed_reconfiguration() {
-    let source = buffer(mem::size_of::<ffi::AVHWFramesContext>());
-    let same_source = source.clone();
-    let replacement = buffer(mem::size_of::<ffi::AVHWFramesContext>());
-    let mut cached = None;
-    let first = mapping_frames_with(&mut cached, source.as_ptr(), || Ok(buffer(1))).unwrap();
-    let reused = mapping_frames_with(&mut cached, same_source.as_ptr(), || {
-        panic!("same pool must reuse its derived context")
-    })
-    .unwrap();
-    assert_eq!(unsafe { (*first.as_ptr()).data }, unsafe {
-        (*reused.as_ptr()).data
-    });
-    assert!(
-        mapping_frames_with(&mut cached, replacement.as_ptr(), || Err(
-            "unsupported replacement pool".into()
-        ))
-        .is_err()
-    );
-    let retained = mapping_frames_with(&mut cached, source.as_ptr(), || {
-        panic!("failed replacement must preserve the old mapping")
-    })
-    .unwrap();
-    assert_eq!(unsafe { (*first.as_ptr()).data }, unsafe {
-        (*retained.as_ptr()).data
-    });
-    let new = mapping_frames_with(&mut cached, replacement.as_ptr(), || Ok(buffer(1))).unwrap();
-    assert_ne!(unsafe { (*first.as_ptr()).data }, unsafe {
-        (*new.as_ptr()).data
-    });
-    drop(cached);
-    assert_eq!(
-        unsafe { ffi::av_buffer_get_ref_count(replacement.as_ptr()) },
-        1
-    );
+fn replacing_source_pools_releases_every_export_after_the_last_queued_ref() {
+    for _ in 0..128 {
+        let mut source = source_frame(ffi::AVPixelFormat::AV_PIX_FMT_P010LE);
+        let pool =
+            FfmpegAvBufferRef::new_ref(unsafe { (*source.as_mut_ptr()).hw_frames_ctx }).unwrap();
+        let mut exported = map_frame_with(source.as_mut_ptr(), |dst, src, _| unsafe {
+            (*dst).buf[0] = ffi::av_buffer_ref((*src).buf[0]);
+            (*dst).data[0] = (*(*dst).buf[0]).data;
+            (*dst).width = (*src).width;
+            (*dst).height = (*src).height;
+            0
+        })
+        .unwrap();
+        let queued = FfmpegFrameRef::new_ref(exported.as_mut_ptr()).unwrap();
+        drop(exported);
+        drop(source);
+        assert_eq!(unsafe { ffi::av_buffer_get_ref_count(pool.as_ptr()) }, 2);
+        std::thread::spawn(move || drop(queued)).join().unwrap();
+        assert_eq!(unsafe { ffi::av_buffer_get_ref_count(pool.as_ptr()) }, 1);
+    }
 }
 
 #[test]
@@ -316,5 +267,151 @@ fn mapped_images_use_import_extent_and_read_usage_instead_of_decode_pool_default
         assert_eq!(native.usage, 0xff);
         assert!(native.source.cache_textures());
         assert!(native.source.allows_download_fallback());
+    }
+}
+
+#[test]
+#[ignore = "requires VA-API NV12/P010 decode surfaces, Vulkan DMA-BUF import and /proc/self/fd"]
+fn dmabuf_pool_reconfiguration_releases_gpu_resources_and_file_descriptors() {
+    use crate::{libplacebo::LibplaceboToneMapper, render_host::DmaBufVideoFrame};
+
+    fn fds(include_driver_cache: bool) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                include_driver_cache
+                    || std::fs::read_link(entry.path())
+                        .is_ok_and(|target| !target.to_string_lossy().contains("dmabuf"))
+            })
+            .count()
+    }
+
+    let codec = unsafe { ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_HEVC) };
+    let mut after_first_shutdown = None;
+    for restart in 0..3 {
+        let vaapi = super::super::create_device(codec).unwrap();
+        let mapper = VaapiVulkanMapper::new(&vaapi).unwrap();
+        let mut renderer = LibplaceboToneMapper::new_for_vulkan_decode(mapper.device()).unwrap();
+        let mut baseline = None;
+        for pool in 0..128 {
+            let (format, raw_format) = if pool % 2 == 0 {
+                (ffi::AVPixelFormat::AV_PIX_FMT_NV12, RawVideoFormat::Nv12)
+            } else {
+                (
+                    ffi::AVPixelFormat::AV_PIX_FMT_P010LE,
+                    RawVideoFormat::P010Le,
+                )
+            };
+            let mut raw = unsafe { ffi::av_hwframe_ctx_alloc(vaapi.as_ptr()) };
+            assert!(!raw.is_null());
+            unsafe {
+                let context = &mut *((*raw).data as *mut ffi::AVHWFramesContext);
+                context.format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+                context.sw_format = format;
+                context.width = 64;
+                context.height = 64;
+                context.initial_pool_size = 2;
+                assert_eq!(ffi::av_hwframe_ctx_init(raw), 0);
+            }
+            let context = FfmpegAvBufferRef::new_ref(raw).unwrap();
+            unsafe { ffi::av_buffer_unref(&mut raw) };
+            let mut source = AvFrame::new().unwrap();
+            assert_eq!(
+                unsafe { ffi::av_hwframe_get_buffer(context.as_ptr(), source.as_mut_ptr(), 0) },
+                0
+            );
+            // Visible crop differs from pool extent, as in real decoder output.
+            let size = RenderSize {
+                width: 60,
+                height: 48,
+            };
+            unsafe {
+                (*source.as_mut_ptr()).width = size.width as i32;
+                (*source.as_mut_ptr()).height = size.height as i32;
+            }
+            for attempt in 0..4 {
+                let mut exported = mapper.map(source.as_mut_ptr()).unwrap();
+                let input = DmaBufVideoFrame {
+                    frame: FfmpegFrameRef::new_ref(exported.as_mut_ptr()).unwrap(),
+                    device: mapper.device(),
+                    format: raw_format,
+                    color: FrameColor::Hdr10Bt2020,
+                    range: crate::render_host::RawVideoRange::Limited,
+                    chroma_site: crate::render_host::RawVideoChromaSite::Left,
+                    metadata: None,
+                };
+                drop(exported);
+                let descriptor = unsafe {
+                    &*((*input.frame.as_ptr()).data[0]
+                        as *const crate::ffmpeg_vulkan::AVDRMFrameDescriptor)
+                };
+                let exported_fds: Vec<_> = descriptor.objects[..descriptor.nb_objects as usize]
+                    .iter()
+                    .map(|object| object.fd)
+                    .collect();
+                if attempt == 3 {
+                    // Fail after importing plane 0, exercising partial cleanup.
+                    let descriptor = unsafe {
+                        &mut *((*input.frame.as_ptr()).data[0]
+                            as *mut crate::ffmpeg_vulkan::AVDRMFrameDescriptor)
+                    };
+                    descriptor.layers[1].format = 0;
+                    assert!(
+                        renderer
+                            .tone_map_dmabuf_to_bgra8(&input, size, size)
+                            .is_err()
+                    );
+                } else {
+                    let pixels = renderer
+                        .tone_map_dmabuf_to_bgra8(&input, size, size)
+                        .unwrap();
+                    assert_eq!(pixels.len(), 60 * 48 * 4);
+                }
+                drop(input);
+                for fd in exported_fds {
+                    assert!(
+                        !std::path::Path::new(&format!("/proc/self/fd/{fd}")).exists(),
+                        "exported DMA-BUF fd {fd} survived its last frame reference"
+                    );
+                }
+                assert_eq!(mapper.queued_surfaces.load(Ordering::Acquire), 0);
+            }
+            drop(source);
+            assert_eq!(
+                unsafe { ffi::av_buffer_get_ref_count(context.as_ptr()) },
+                1,
+                "export retained source pool {pool}"
+            );
+            drop(context);
+            // NVIDIA retains a bounded detached-surface DMA-BUF cache until
+            // VA device shutdown. Check exported FDs above, and Vulkan resources
+            // here; include the driver cache again after full shutdown below.
+            let current = fds(false);
+            if let Some(baseline) = baseline {
+                assert!(
+                    current <= baseline + 8,
+                    "FD leak at restart {restart}, pool {pool}: {baseline} -> {current}"
+                );
+            } else {
+                baseline = Some(current);
+            }
+            if pool % 32 == 0 {
+                eprintln!("VA-API DMA-BUF restart={restart} pool={pool} fds={current}");
+            }
+        }
+        drop(renderer);
+        drop(mapper);
+        drop(vaapi);
+        let current = fds(true);
+        if let Some(baseline) = after_first_shutdown {
+            assert!(
+                current <= baseline + 4,
+                "FD leak across playback restarts: {baseline} -> {current}"
+            );
+        } else {
+            after_first_shutdown = Some(current);
+        }
+        eprintln!("VA-API DMA-BUF restart={restart} shutdown_fds={current}");
     }
 }
