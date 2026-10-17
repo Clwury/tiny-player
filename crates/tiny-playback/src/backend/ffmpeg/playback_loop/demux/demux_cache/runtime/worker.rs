@@ -119,12 +119,17 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
         if shared.should_stop() {
             return input;
         }
-        let request = shared.wait_for_demux_permit();
+        let permit = shared.wait_for_demux_permit();
         if shared.should_stop() {
             return input;
         }
+        let Some(permit) = permit else {
+            thread::yield_now();
+            continue;
+        };
+        let demux_input_generation = permit.input_generation;
         timeline.set_selected_streams(shared.selected_streams());
-        if let Some(request) = request {
+        if let Some(request) = permit.seek_request {
             if shared.should_skip_seek_request(&request) {
                 tracing::debug!(
                     ?request.session_id,
@@ -135,7 +140,6 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
                 );
                 continue;
             }
-            let demux_input_generation = shared.demux_input_generation();
             let seek_generation = request.seek_generation;
             let seek_position_seconds = paused_seek_preroll_position_seconds(
                 video_stream.codec_id,
@@ -204,7 +208,6 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
             );
         }
 
-        let demux_input_generation = shared.demux_input_generation();
         let seek_generation = shared.control.seek_generation();
         if shared.control.has_pending_seek() {
             thread::yield_now();
@@ -270,7 +273,7 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
                             "discarding FFmpeg demux packet before append after demux input moved"
                         );
                     } else {
-                        shared.append_packet(cached);
+                        shared.append_packet_for_generation(cached, demux_input_generation);
                     }
                 }
                 Ok(None) => {}
@@ -310,12 +313,13 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
             {
                 shared.clear_producer_recovery();
             }
-            timeline.buffered_reporter.report_value(
-                duration_seconds,
-                timeline.session_id,
-                &shared.event_tx,
-            );
-            shared.mark_eof();
+            if shared.mark_eof(demux_input_generation) {
+                timeline.buffered_reporter.report_value(
+                    duration_seconds,
+                    timeline.session_id,
+                    &shared.event_tx,
+                );
+            }
             continue;
         }
         if read == ffi::AVERROR(ffi::EAGAIN) {

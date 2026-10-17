@@ -416,6 +416,100 @@ fn pending_seek_wakes_cache_pause_without_dropping_linear_demux_read() {
 }
 
 #[test]
+fn eof_from_previous_read_does_not_finish_a_new_seek_range() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
+    let shared = shared_for_test(Arc::clone(&control));
+    let demux_input_generation = shared.demux_input_generation();
+    assert!(!shared.should_discard_demux_read_result(demux_input_generation));
+
+    // The old av_read_frame has returned EOF and passed its early generation
+    // check. Commit a new seek before that result acquires the cache lock.
+    let seek_generation = control.request_seek();
+    shared.state.lock().unwrap().request_seek(
+        1.2,
+        PlaybackSessionId(2),
+        seek_generation,
+        1_200_000_000,
+    );
+    control.finish_seek(seek_generation);
+    assert!(!shared.mark_eof(demux_input_generation));
+
+    let state = shared.state.lock().unwrap();
+    assert!(
+        !state.read_range_eof(),
+        "old EOF must not finish the new range"
+    );
+    assert!(state.seeking);
+    assert!(state.seek_request.is_some());
+}
+
+#[test]
+fn read_permit_keeps_the_input_generation_when_seek_arrives_before_read() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
+    let shared = shared_for_test(Arc::clone(&control));
+    let permit = shared.wait_for_demux_permit().unwrap();
+    assert!(permit.seek_request.is_none());
+
+    // Pause the producer after it has permission to read, before it samples
+    // av_read_frame. The coordinator can finish its reset in that interval.
+    let seek_generation = control.request_seek();
+    shared.state.lock().unwrap().request_seek(
+        1.2,
+        PlaybackSessionId(2),
+        seek_generation,
+        1_200_000_000,
+    );
+    control.finish_seek(seek_generation);
+
+    assert!(shared.should_discard_demux_read_result(permit.input_generation));
+    assert!(!shared.mark_eof(permit.input_generation));
+    let next = shared.wait_for_demux_permit().unwrap();
+    assert!(next.input_generation > permit.input_generation);
+    let request = next.seek_request.unwrap();
+    assert_eq!(request.seek_generation, seek_generation);
+    assert_eq!(request.position_seconds, 1.2);
+    assert_eq!(request.session_id, PlaybackSessionId(2));
+    // EOF produced after applying that seek is still valid, even with no frames.
+    assert!(shared.mark_eof(next.input_generation));
+    let state = shared.state.lock().unwrap();
+    assert!(state.read_range_eof());
+    assert!(!state.seeking);
+}
+
+#[test]
+fn packet_from_previous_read_does_not_enter_a_new_seek_range() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
+    let shared = shared_for_test(Arc::clone(&control));
+    let demux_input_generation = shared.demux_input_generation();
+    assert!(!shared.should_discard_demux_read_result(demux_input_generation));
+    let packet = cached_anchor(5_900_000_000, 6_000_000_000);
+
+    let seek_generation = control.request_seek();
+    shared.state.lock().unwrap().request_seek(
+        1.2,
+        PlaybackSessionId(2),
+        seek_generation,
+        1_200_000_000,
+    );
+    control.finish_seek(seek_generation);
+    shared.append_packet_for_generation(packet, demux_input_generation);
+    {
+        let state = shared.state.lock().unwrap();
+        assert!(state.read_range().global_order.is_empty());
+        assert!(state.seeking);
+        assert!(!state.read_range_eof());
+    }
+
+    shared.append_packet_for_generation(
+        cached_anchor(1_200_000_000, 1_300_000_000),
+        shared.demux_input_generation(),
+    );
+    let state = shared.state.lock().unwrap();
+    assert_eq!(state.read_range().global_order.len(), 1);
+    assert!(!state.seeking);
+}
+
+#[test]
 fn low_level_seek_request_fences_inflight_demux_read() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let shared = shared_for_test(Arc::clone(&control));

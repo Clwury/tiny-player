@@ -72,8 +72,10 @@ fn demux_packet_cache_repeated_forward_seeks_refill_150_mib_during_output_recove
             }
             producer.notify_ready();
             for _ in 0..5 {
-                assert!(producer.wait_for_demux_permit().is_none());
-                producer.append_packet(packet_at(next_second));
+                let permit = producer.wait_for_demux_permit().expect("read permit");
+                assert!(permit.seek_request.is_none());
+                producer
+                    .append_packet_for_generation(packet_at(next_second), permit.input_generation);
                 next_second += 1;
             }
             let state = producer.state.lock().unwrap();

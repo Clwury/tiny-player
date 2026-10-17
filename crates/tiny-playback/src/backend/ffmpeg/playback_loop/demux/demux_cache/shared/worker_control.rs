@@ -7,8 +7,8 @@ use super::{
     DEMUX_CACHE_CONSUMER_LOCK_PRESSURE_AFTER, DEMUX_CACHE_CONSUMER_PRIORITY_HOLD,
     DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_AFTER, DEMUX_PACKET_CACHE_PREFETCH_PAUSE_LOG_INTERVAL,
     DEMUX_PACKET_CACHE_WAIT_INTERVAL, DEMUX_PACKET_RECOVERY_DEMAND_DIAG_INTERVAL,
-    DemuxPacketCacheShared, DemuxSeekRequest, DemuxSelectedStreams, PlaybackSessionId,
-    duration_nsecs, nsecs_to_seconds,
+    DemuxPacketCacheShared, DemuxReadPermit, DemuxSeekRequest, DemuxSelectedStreams,
+    PlaybackSessionId, duration_nsecs, nsecs_to_seconds,
 };
 
 const PLAYBACK_RECOVERY_DEMAND_VIDEO: u8 = 1 << 0;
@@ -73,7 +73,7 @@ impl DemuxPacketCacheShared {
 
     pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn wait_for_demux_permit(
         &self,
-    ) -> Option<DemuxSeekRequest> {
+    ) -> Option<DemuxReadPermit> {
         let mut guard = self
             .state
             .lock()
@@ -87,7 +87,10 @@ impl DemuxPacketCacheShared {
                 return None;
             }
             if let Some(request) = guard.take_seek_request() {
-                return Some(request);
+                return Some(DemuxReadPermit {
+                    input_generation: guard.demux_input_generation,
+                    seek_request: Some(request),
+                });
             }
             if self.control.has_pending_seek() {
                 return None;
@@ -196,7 +199,10 @@ impl DemuxPacketCacheShared {
             }
             let should_pause_demux = guard.should_pause_demux();
             if !should_pause_demux {
-                return None;
+                return Some(DemuxReadPermit {
+                    input_generation: guard.demux_input_generation,
+                    seek_request: None,
+                });
             }
             let now = Instant::now();
             let pause_started = *prefetch_pause_started_at.get_or_insert(now);

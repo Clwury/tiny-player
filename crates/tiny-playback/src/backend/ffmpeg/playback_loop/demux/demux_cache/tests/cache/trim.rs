@@ -746,7 +746,8 @@ fn demux_packet_cache_recovery_does_not_delay_each_packet_when_the_mutex_is_idle
     let thread_shared = Arc::clone(&shared);
     let handle = thread::spawn(move || {
         for _ in 0..20 {
-            assert!(thread_shared.wait_for_demux_permit().is_none());
+            let permit = thread_shared.wait_for_demux_permit().expect("read permit");
+            assert!(permit.seek_request.is_none());
         }
         result_tx.send(()).expect("send demux permit result");
     });
@@ -773,7 +774,8 @@ fn demux_packet_cache_consumer_priority_cannot_starve_forward_refill() {
     let thread_shared = Arc::clone(&shared);
     let handle = thread::spawn(move || {
         for _ in 0..20 {
-            assert!(thread_shared.wait_for_demux_permit().is_none());
+            let permit = thread_shared.wait_for_demux_permit().expect("read permit");
+            assert!(permit.seek_request.is_none());
         }
         result_tx.send(()).expect("send demux permit result");
     });

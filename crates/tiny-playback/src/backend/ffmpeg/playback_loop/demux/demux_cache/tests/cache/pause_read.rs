@@ -474,7 +474,7 @@ fn demux_packet_cache_pause_resumes_on_eof_before_wait_target() {
     assert!(control.is_cache_paused());
     let _ = event_rx.try_iter().collect::<Vec<_>>();
 
-    shared.mark_eof();
+    assert!(shared.mark_eof(shared.demux_input_generation()));
 
     assert!(!control.is_cache_paused());
     assert!(!control.is_paused());

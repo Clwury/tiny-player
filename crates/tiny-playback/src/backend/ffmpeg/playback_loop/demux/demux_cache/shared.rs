@@ -24,6 +24,14 @@ mod storage_worker;
 #[path = "shared/worker_control.rs"]
 mod worker_control;
 
+/// Captured under the cache lock with the decision to read or apply a seek.
+/// A later seek cannot make a read from the old input belong to the new range.
+pub(in crate::backend::ffmpeg::playback_loop::demux_cache) struct DemuxReadPermit {
+    pub(in crate::backend::ffmpeg::playback_loop::demux_cache) input_generation: u64,
+    pub(in crate::backend::ffmpeg::playback_loop::demux_cache) seek_request:
+        Option<DemuxSeekRequest>,
+}
+
 impl DemuxPacketCacheShared {
     /// Publish cache/output availability through both the legacy cache
     /// condition variable and the playback-wide generation. New waits use the

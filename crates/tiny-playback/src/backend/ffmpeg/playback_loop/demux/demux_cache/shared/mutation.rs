@@ -37,9 +37,18 @@ impl DemuxPacketCacheShared {
         self.notify_ready();
     }
 
+    #[cfg(test)]
     pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn append_packet(
         &self,
         packet: CachedDemuxPacket,
+    ) {
+        self.append_packet_for_generation(packet, self.demux_input_generation());
+    }
+
+    pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn append_packet_for_generation(
+        &self,
+        packet: CachedDemuxPacket,
+        demux_input_generation: u64,
     ) {
         let packet_stream_index = packet.stream_index;
         let packet_bytes = packet.byte_len;
@@ -48,6 +57,9 @@ impl DemuxPacketCacheShared {
             .state
             .lock()
             .expect("FFmpeg demux packet cache poisoned");
+        if guard.demux_input_generation != demux_input_generation {
+            return;
+        }
         // Stream selection can change while av_read_frame is in flight. Do
         // not recreate a deselected queue from the producer's older snapshot.
         if !guard.stream_kinds.contains_key(&packet_stream_index) {
@@ -151,12 +163,18 @@ impl DemuxPacketCacheShared {
         );
     }
 
-    pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn mark_eof(&self) {
+    pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn mark_eof(
+        &self,
+        demux_input_generation: u64,
+    ) -> bool {
         let emit = {
             let mut guard = self
                 .state
                 .lock()
                 .expect("FFmpeg demux packet cache poisoned");
+            if guard.demux_input_generation != demux_input_generation {
+                return false;
+            }
             guard.mark_eof();
             self.refresh_cache_pause(&mut guard);
             let emit = self.prepare_cache_state_emit(&mut guard);
@@ -164,6 +182,7 @@ impl DemuxPacketCacheShared {
             emit
         };
         self.send_cache_state_emit(emit.into_emit());
+        true
     }
 
     pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn set_error(&self, error: String) {
