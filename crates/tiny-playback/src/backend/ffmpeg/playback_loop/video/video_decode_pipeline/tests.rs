@@ -63,7 +63,7 @@ use super::{
     hevc_safe_anchor_can_roll_past_preserved_evidence, hevc_same_hardware_reopen_mode,
     hevc_startup_in_flight_packet_should_arm, hevc_startup_zero_output_timeout,
     hevc_zero_output_log_milestone, requeue_backpressured_video_decode_input,
-    runtime_hevc_software_fallback_allowed, take_next_video_decode_input,
+    runtime_auto_fallback_allowed, take_next_video_decode_input,
     video_decode_error_requires_hevc_resource_pressure_recovery,
     video_decode_pending_input_snapshot,
 };

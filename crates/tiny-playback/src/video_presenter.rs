@@ -100,9 +100,7 @@ impl VideoPresenter {
 
     pub fn render_if_needed(&mut self, size: RenderSize) -> Result<Option<BgraImage>> {
         self.sync_vo_queue_session();
-        let mut ready_frame = self
-            .render_worker
-            .take_ready_frame(self.latest_generation)?;
+        let mut ready_frame = self.take_ready_frame()?;
 
         if self.render_worker.can_accept_render()
             && let Some(frame) = self.vo_queue.take_next_frame()
@@ -125,9 +123,7 @@ impl VideoPresenter {
         self.update_render_backpressure();
 
         if ready_frame.is_none() {
-            ready_frame = self
-                .render_worker
-                .take_ready_frame(self.latest_generation)?;
+            ready_frame = self.take_ready_frame()?;
         }
         self.update_render_backpressure();
         Ok(ready_frame.map(|(frame, pts)| {
@@ -142,6 +138,23 @@ impl VideoPresenter {
             }
             frame
         }))
+    }
+
+    fn take_ready_frame(&self) -> Result<Option<(BgraImage, Option<FramePts>)>> {
+        match self.render_worker.take_ready_frame(self.latest_generation) {
+            Err(error)
+                if self.vo_queue.report_hardware_render_error(
+                    (
+                        self.last_seen_session_id,
+                        self.last_seen_presentation_generation,
+                    ),
+                    format!("Vulkan 视频渲染失败：{error:#}"),
+                ) =>
+            {
+                Ok(None)
+            }
+            result => result,
+        }
     }
 
     pub fn discard_pending_frames(&mut self) {
@@ -903,6 +916,41 @@ mod tests {
             last_seen_presentation_generation,
             next_generation: 0,
             latest_generation: 0,
+        }
+    }
+
+    #[test]
+    fn auto_render_failure_requests_backend_fallback_while_forced_mode_returns_the_error() {
+        for automatic in [false, true] {
+            let queue = VideoOutputQueue::default();
+            let session = PlaybackSessionId(1);
+            queue.begin_session(session);
+            queue.set_auto_hardware_fallback(session, automatic);
+            let mut presenter = presenter_with_manual_render_worker(queue.clone());
+            let (tx, rx) = mpsc::channel();
+            presenter.render_worker.results = rx;
+            tx.send(VideoRenderResult {
+                generation: presenter.latest_generation,
+                frame: Err("VA-API/Vulkan import failed".into()),
+                pts: None,
+            })
+            .unwrap();
+            let result = presenter.render_if_needed(RenderSize {
+                width: 2,
+                height: 1,
+            });
+            if automatic {
+                assert!(result.unwrap().is_none());
+                assert!(
+                    queue
+                        .take_hardware_render_error(session)
+                        .unwrap()
+                        .contains("import failed")
+                );
+            } else {
+                assert!(result.is_err());
+                assert!(queue.take_hardware_render_error(session).is_none());
+            }
         }
     }
 

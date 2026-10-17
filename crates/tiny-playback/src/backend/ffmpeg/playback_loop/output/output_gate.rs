@@ -550,7 +550,7 @@ pub(in crate::backend::ffmpeg) enum DecodeRecoverySource {
     FlushReplay,
     HardwareReopenReplay,
     CachedSafeIdrRebuild,
-    SoftwareFallback,
+    AutoFallback,
     LowLevelSeek,
 }
 
@@ -561,7 +561,7 @@ impl DecodeRecoverySource {
             Self::FlushReplay => "flush_replay",
             Self::HardwareReopenReplay => "hardware_reopen_replay",
             Self::CachedSafeIdrRebuild => "cached_safe_idr_rebuild",
-            Self::SoftwareFallback => "software_fallback",
+            Self::AutoFallback => "auto_fallback",
             Self::LowLevelSeek => "low_level_seek",
         }
     }

@@ -1,6 +1,72 @@
 use super::*;
 
 #[test]
+fn auto_exhausts_unavailable_hardware_then_decodes_with_software_without_changing_policy() {
+    let mut format = unsafe { ffi::avformat_alloc_context() };
+    let stream = unsafe { ffi::avformat_new_stream(format, ptr::null()) };
+    assert!(!stream.is_null());
+    unsafe {
+        (*(*stream).codecpar).codec_type = ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+        (*(*stream).codecpar).codec_id = ffi::AVCodecID::AV_CODEC_ID_H264;
+        (*(*stream).codecpar).width = 16;
+        (*(*stream).codecpar).height = 16;
+    }
+    let stream = StreamInfo {
+        index: 0,
+        stream,
+        decoder: unsafe { ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_H264) },
+        codec_id: ffi::AVCodecID::AV_CODEC_ID_H264,
+        time_base: ffi::AVRational { num: 1, den: 1000 },
+        start_nsecs: Some(0),
+        frame_duration_nsecs: Some(40_000_000),
+    };
+    for mode in [
+        HardwareDecodeMode::Auto,
+        HardwareDecodeMode::AutoWithCopyback,
+    ] {
+        let mut plan = super::super::super::hw::AutoDecodePlan::unavailable_for_test(mode);
+        let decoder = Decoder::open_auto_next(stream, &mut plan).unwrap();
+        assert_eq!(decoder.hardware_decode_mode(), mode);
+        assert_eq!(decoder.hardware_decode_backend(), None);
+        assert!(!plan.has_next());
+        let recovery = decoder.auto_decode_plan().unwrap();
+        assert_eq!(recovery.requested_mode(), mode);
+        assert!(!recovery.has_next());
+        assert!(
+            Decoder::open_auto_next(stream, &mut plan)
+                .err()
+                .unwrap()
+                .contains("候选已耗尽")
+        );
+    }
+    unsafe { ffi::avformat_close_input(&mut format) };
+}
+
+#[test]
+fn auto_hardware_candidate_requires_the_requested_frame_format() {
+    let mut decoder = Decoder::open_h264_for_test();
+    decoder.hardware_decode_mode = HardwareDecodeMode::Auto;
+    decoder.hw_format_selection = Some(Box::new(VideoHwFormatSelection {
+        pixel_format: ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+        allow_software_fallback: false,
+        negotiation_failed: AtomicBool::new(true),
+    }));
+    assert!(
+        decoder
+            .hardware_format_error(ffi::AVERROR_INVALIDDATA)
+            .is_some()
+    );
+    assert!(!decoder.continue_after_video_invalid_data(ffi::AVERROR_INVALIDDATA, "send_packet"));
+    let mut frame = AvFrame::new().unwrap();
+    unsafe { (*frame.as_mut_ptr()).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as c_int };
+    assert!(
+        decoder
+            .validate_video_frame_format(frame.as_mut_ptr())
+            .is_err()
+    );
+}
+
+#[test]
 fn forced_hardware_format_selection_rejects_software_only_negotiation() {
     let decoder = Decoder::open_h264_for_test();
     for format in [

@@ -1,6 +1,6 @@
 //! User-facing preferences. Advanced cache tuning stays in the development dialog.
 use super::controls::{
-    HARDWARE_DECODE_DESCRIPTION, app_language_selector, disk_cache_capacity_control,
+    USER_HARDWARE_DECODE_DESCRIPTION, app_language_selector, disk_cache_capacity_control,
     disk_cache_capacity_input, hardware_decode_selector, settings_category_button,
     settings_sidebar, track_language_selector,
 };
@@ -214,9 +214,10 @@ impl UserSettingsDialogState {
             ).child(section("视频解码", cx).mt_5().child(setting_row(
                 "user-setting-hardware-decode",
                 "硬件解码",
-                HARDWARE_DECODE_DESCRIPTION,
+                USER_HARDWARE_DECODE_DESCRIPTION,
                 hardware_decode_selector(
                     self.dropdown.clone(),
+                    SettingsMode::User,
                     self.controller.view_model().config.hardware_decode,
                     move |mode, cx| {
                         decode_dialog.update(cx, |dialog, cx| dialog.select_hardware_decode(mode, cx))

@@ -14,6 +14,8 @@ use super::{VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, ffmpeg_error};
 
 mod vaapi;
 pub(super) use vaapi::{download_vaapi_frame, find_vaapi_decoder};
+mod auto;
+pub(super) use auto::AutoDecodePlan;
 
 const TINY_VULKAN_EXTRA_HW_FRAMES_ENV: &str = "TINY_VULKAN_EXTRA_HW_FRAMES";
 const MPV_VULKAN_EXTRA_HW_FRAMES: c_int = 6;
@@ -49,38 +51,78 @@ impl VideoHwDecodeContext {
     pub(super) fn try_create(codec: *const ffi::AVCodec) -> std::result::Result<Self, String> {
         let config = find_vulkan_hw_config(codec)
             .ok_or_else(|| "FFmpeg 解码器不支持 Vulkan 硬件帧输出".to_string())?;
-        let mut device_ref = ptr::null_mut();
-        let result = unsafe {
-            ffi::av_hwdevice_ctx_create(
-                &mut device_ref,
-                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
-                ptr::null(),
-                ptr::null_mut(),
-                0,
-            )
-        };
-        if result < 0 {
-            return Err(format!(
-                "FFmpeg 创建 Vulkan 硬解设备失败：code={result}, error={}",
-                ffmpeg_error(result)
-            ));
-        }
-
-        let device = match vulkan_decode_device_from_ref(device_ref) {
-            Ok(device) => device,
-            Err(error) => {
-                unsafe { ffi::av_buffer_unref(&mut device_ref) };
-                return Err(error);
-            }
-        };
-        unsafe { ffi::av_buffer_unref(&mut device_ref) };
-
         Ok(Self {
             pixel_format: config.pixel_format,
-            device: VideoHwDecodeDevice::Vulkan(Arc::new(device)),
+            device: VideoHwDecodeDevice::Vulkan(create_vulkan_device()?),
         })
     }
 
+    pub(super) fn try_create_for_auto(
+        codec: *const ffi::AVCodec,
+        candidate: HardwareDecodeMode,
+        plan: &AutoDecodePlan,
+    ) -> Result<Self, String> {
+        if candidate == HardwareDecodeMode::ForceVulkan {
+            let config = find_vulkan_hw_config(codec)
+                .ok_or_else(|| "FFmpeg 解码器不支持 Vulkan 硬件帧输出".to_string())?;
+            return Ok(Self {
+                pixel_format: config.pixel_format,
+                device: VideoHwDecodeDevice::Vulkan(plan.vulkan_device()?),
+            });
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let device = vaapi::create_device_on(codec, plan.vaapi_device_path()?)?;
+            let device = if candidate == HardwareDecodeMode::ForceVaapiVulkan {
+                let mapper = vaapi::vulkan::VaapiVulkanMapper::new(&device)?;
+                VideoHwDecodeDevice::VaapiVulkan { device, mapper }
+            } else {
+                VideoHwDecodeDevice::Vaapi(device)
+            };
+            Ok(Self {
+                pixel_format: ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+                device,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err("VA-API 硬件解码仅支持 Linux".to_string())
+        }
+    }
+}
+
+fn create_vulkan_device() -> Result<Arc<VulkanDecodeDevice>, String> {
+    let mut device_ref = ptr::null_mut();
+    let result = unsafe {
+        ffi::av_hwdevice_ctx_create(
+            &mut device_ref,
+            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+            ptr::null(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if result < 0 {
+        unsafe { ffi::av_buffer_unref(&mut device_ref) };
+        return Err(format!(
+            "FFmpeg 创建 Vulkan 硬解设备失败：code={result}, error={}",
+            ffmpeg_error(result)
+        ));
+    }
+
+    let device = match vulkan_decode_device_from_ref(device_ref) {
+        Ok(device) => device,
+        Err(error) => {
+            unsafe { ffi::av_buffer_unref(&mut device_ref) };
+            return Err(error);
+        }
+    };
+    unsafe { ffi::av_buffer_unref(&mut device_ref) };
+
+    Ok(Arc::new(device))
+}
+
+impl VideoHwDecodeContext {
     pub(super) fn try_create_vaapi(
         codec: *const ffi::AVCodec,
         map_to_vulkan: bool,
@@ -269,6 +311,44 @@ fn find_vulkan_hw_config(codec: *const ffi::AVCodec) -> Option<VulkanHwConfig> {
     .then_some(VulkanHwConfig {
         pixel_format: ffi::AVPixelFormat::AV_PIX_FMT_VULKAN,
     })
+}
+
+pub(super) fn find_hardware_decoder(
+    preferred: *const ffi::AVCodec,
+    mode: HardwareDecodeMode,
+) -> Result<*const ffi::AVCodec, String> {
+    let (device_type, pixel_format, name) = if mode.uses_vaapi() {
+        (
+            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+            "VA-API",
+        )
+    } else {
+        (
+            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+            ffi::AVPixelFormat::AV_PIX_FMT_VULKAN,
+            "Vulkan",
+        )
+    };
+    if preferred.is_null() {
+        return Err(format!("FFmpeg 未找到可用的 {name} 解码器"));
+    }
+    if supports_hw_config(preferred, device_type, pixel_format) {
+        return Ok(preferred);
+    }
+    let codec_id = unsafe { (*preferred).id };
+    let mut state = ptr::null_mut();
+    loop {
+        let codec = unsafe { ffi::av_codec_iterate(&mut state) };
+        if codec.is_null() {
+            return Err(format!("FFmpeg 解码器不支持 {name} 硬件帧输出"));
+        }
+        if unsafe { ffi::av_codec_is_decoder(codec) != 0 && (*codec).id == codec_id }
+            && supports_hw_config(codec, device_type, pixel_format)
+        {
+            return Ok(codec);
+        }
+    }
 }
 
 fn supports_hw_config(
@@ -584,6 +664,8 @@ mod tests {
         assert!(!HardwareDecodeMode::Off.should_try_hardware());
         assert!(HardwareDecodeMode::Auto.should_try_hardware());
         assert!(HardwareDecodeMode::Auto.allows_fallback());
+        assert!(HardwareDecodeMode::AutoWithCopyback.should_try_hardware());
+        assert!(HardwareDecodeMode::AutoWithCopyback.allows_fallback());
         assert!(HardwareDecodeMode::ForceVulkan.should_try_hardware());
         assert!(!HardwareDecodeMode::ForceVulkan.allows_fallback());
     }

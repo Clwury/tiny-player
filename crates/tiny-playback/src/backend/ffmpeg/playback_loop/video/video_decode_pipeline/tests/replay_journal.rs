@@ -803,35 +803,60 @@ fn hevc_hw_replay_reports_matching_pending_capacity() {
 
 #[test]
 fn force_vulkan_runtime_failure_does_not_silently_switch_to_software() {
-    assert!(runtime_hevc_software_fallback_allowed(
-        HardwareDecodeMode::Auto
+    assert!(runtime_auto_fallback_allowed(HardwareDecodeMode::Auto));
+    assert!(runtime_auto_fallback_allowed(
+        HardwareDecodeMode::AutoWithCopyback
     ));
-    assert!(!runtime_hevc_software_fallback_allowed(
+    assert!(!runtime_auto_fallback_allowed(
         HardwareDecodeMode::ForceVulkan
     ));
-    assert!(!runtime_hevc_software_fallback_allowed(
-        HardwareDecodeMode::Off
-    ));
+    assert!(!runtime_auto_fallback_allowed(HardwareDecodeMode::Off));
     assert_eq!(
-        hevc_same_hardware_reopen_mode(HardwareDecodeMode::Auto),
-        HardwareDecodeMode::ForceVulkan
-    );
-    assert_eq!(
-        hevc_same_hardware_reopen_mode(HardwareDecodeMode::ForceVulkan),
+        hevc_same_hardware_reopen_mode(HardwareDecodeMode::Auto, None),
         HardwareDecodeMode::ForceVulkan
     );
     assert_eq!(
-        hevc_same_hardware_reopen_mode(HardwareDecodeMode::ForceVaapi),
+        hevc_same_hardware_reopen_mode(HardwareDecodeMode::ForceVulkan, None),
+        HardwareDecodeMode::ForceVulkan
+    );
+    assert_eq!(
+        hevc_same_hardware_reopen_mode(HardwareDecodeMode::ForceVaapi, None),
         HardwareDecodeMode::ForceVaapi
     );
-    assert!(!runtime_hevc_software_fallback_allowed(
+    assert!(!runtime_auto_fallback_allowed(
         HardwareDecodeMode::ForceVaapi
     ));
     assert_eq!(
-        hevc_same_hardware_reopen_mode(HardwareDecodeMode::ForceVaapiVulkan),
+        hevc_same_hardware_reopen_mode(HardwareDecodeMode::ForceVaapiVulkan, None),
         HardwareDecodeMode::ForceVaapiVulkan
     );
-    assert!(!runtime_hevc_software_fallback_allowed(
+    assert!(!runtime_auto_fallback_allowed(
         HardwareDecodeMode::ForceVaapiVulkan
     ));
+}
+
+#[test]
+fn auto_hevc_recovery_reopens_the_actual_backend_without_advancing_candidates() {
+    use crate::HardwareDecodeBackend;
+    for (backend, expected) in [
+        (
+            HardwareDecodeBackend::Vulkan,
+            HardwareDecodeMode::ForceVulkan,
+        ),
+        (
+            HardwareDecodeBackend::VaapiVulkan,
+            HardwareDecodeMode::ForceVaapiVulkan,
+        ),
+        (HardwareDecodeBackend::Vaapi, HardwareDecodeMode::ForceVaapi),
+    ] {
+        for mode in [
+            HardwareDecodeMode::Auto,
+            HardwareDecodeMode::AutoWithCopyback,
+        ] {
+            assert_eq!(
+                hevc_same_hardware_reopen_mode(mode, Some(backend)),
+                expected
+            );
+        }
+    }
 }

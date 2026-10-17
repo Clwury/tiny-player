@@ -51,10 +51,7 @@ impl Decoder {
                 if self.continue_after_video_invalid_data(result, "send_packet") {
                     return self.receive_frames(frame, &mut on_frame);
                 }
-                return Err(format!(
-                    "FFmpeg 发送解码包失败：code={result}, error={}",
-                    ffmpeg_error(result)
-                ));
+                return Err(self.decode_operation_error("发送解码包", result));
             }
             return self.receive_frames(frame, &mut on_frame);
         }
@@ -69,12 +66,19 @@ impl Decoder {
         F: FnMut(*mut ffi::AVFrame) -> std::result::Result<(), String>,
     {
         let mut on_frame = on_frame;
-        let result = unsafe { ffi::avcodec_send_packet(self.ptr, ptr::null()) };
-        if result < 0 && result != ffi::AVERROR_EOF {
-            return Err(format!(
-                "FFmpeg 刷新解码器失败：code={result}, error={}",
-                ffmpeg_error(result)
-            ));
+        loop {
+            let result = unsafe { ffi::avcodec_send_packet(self.ptr, ptr::null()) };
+            if let Some(error) = self.hardware_format_error(result) {
+                return Err(error);
+            }
+            if result == ffi::AVERROR(ffi::EAGAIN) {
+                self.receive_frames(frame, &mut on_frame)?;
+                continue;
+            }
+            if result < 0 && result != ffi::AVERROR_EOF {
+                return Err(self.decode_operation_error("刷新解码器", result));
+            }
+            break;
         }
         self.receive_frames(frame, &mut on_frame)
     }
@@ -142,6 +146,10 @@ impl Decoder {
         self.hardware_decode_mode
     }
 
+    pub(in super::super) fn auto_decode_plan(&self) -> Option<&super::super::hw::AutoDecodePlan> {
+        self.auto_decode_plan.as_ref()
+    }
+
     pub(in super::super) fn mapped_surface_counter(
         &self,
     ) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
@@ -161,7 +169,7 @@ impl Decoder {
                 } else {
                     "Vulkan"
                 };
-                format!("FFmpeg {backend} 硬件像素格式协商失败：code={result}, error={}；强制模式不允许回退软件解码", ffmpeg_error(result))
+                format!("FFmpeg {backend} 硬件像素格式协商失败：code={result}, error={}；当前候选不接受软件帧", ffmpeg_error(result))
             })
     }
 
@@ -180,6 +188,26 @@ impl Decoder {
             ));
         }
         Ok(())
+    }
+
+    fn decode_operation_error(&self, operation: &str, result: c_int) -> String {
+        let backend =
+            if self.hardware_decode_mode.allows_fallback() && result != ffi::AVERROR_INVALIDDATA {
+                self.hardware_decode_backend()
+                    .map(|backend| match backend {
+                        HardwareDecodeBackend::Vulkan => "Vulkan 硬解后端：",
+                        HardwareDecodeBackend::Vaapi | HardwareDecodeBackend::VaapiVulkan => {
+                            "VA-API 硬解后端："
+                        }
+                    })
+                    .unwrap_or_default()
+            } else {
+                ""
+            };
+        format!(
+            "FFmpeg {backend}{operation}失败：code={result}, error={}",
+            ffmpeg_error(result)
+        )
     }
 
     fn receive_frames<F>(
@@ -206,10 +234,7 @@ impl Decoder {
                     // so a receive error cannot discard the caller's input.
                     continue;
                 }
-                return Err(format!(
-                    "FFmpeg 接收解码帧失败：code={result}, error={}",
-                    ffmpeg_error(result)
-                ));
+                return Err(self.decode_operation_error("接收解码帧", result));
             }
 
             let frame_result = self

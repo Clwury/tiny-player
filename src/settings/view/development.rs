@@ -3,7 +3,7 @@ mod controls;
 mod items;
 mod layout;
 use super::controls::{
-    HARDWARE_DECODE_DESCRIPTION, app_language_selector, disk_cache_capacity_control,
+    DEVELOPMENT_HARDWARE_DECODE_DESCRIPTION, app_language_selector, disk_cache_capacity_control,
     disk_cache_capacity_input, hardware_decode_selector, settings_category_button,
     settings_sidebar, track_language_selector,
 };

@@ -92,6 +92,12 @@ fn poll_decoder_drain_until_complete(
     drain_phase: &mut PlaybackDrainPhase,
 ) -> std::result::Result<DecoderDrainPhaseStatus, String> {
     loop {
+        if let Some(error) = context
+            .vo_queue
+            .take_hardware_render_error(context.session_id)
+        {
+            return Err(error);
+        }
         if let Some(results) = context.pipeline.poll_decoder_drain_phase(drain_phase)? {
             return Ok(DecoderDrainPhaseStatus::Complete(results));
         }
@@ -147,6 +153,12 @@ fn poll_video_drain_frames_until_complete(
     processor: &mut VideoDecodeDrainFrameProcessor,
 ) -> std::result::Result<DecoderDrainStatus, String> {
     loop {
+        if let Some(error) = context
+            .vo_queue
+            .take_hardware_render_error(context.session_id)
+        {
+            return Err(error);
+        }
         match context.pipeline.poll_video_drain_processor(
             processor,
             context.control,

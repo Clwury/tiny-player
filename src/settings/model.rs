@@ -33,6 +33,13 @@ impl SettingsMode {
             Self::User => "设置",
         }
     }
+
+    pub(crate) fn auto_hardware_decode(self) -> HardwareDecodeMode {
+        match self {
+            Self::Development => HardwareDecodeMode::AutoWithCopyback,
+            Self::User => HardwareDecodeMode::Auto,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

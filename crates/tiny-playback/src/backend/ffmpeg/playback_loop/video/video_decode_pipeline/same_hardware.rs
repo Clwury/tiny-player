@@ -287,8 +287,16 @@ impl VideoDecodePipeline {
 
         // Force the candidate open to remain hardware-only even when the original
         // policy was Auto. Software fallback is a separate terminal action.
-        let reopen_mode = hevc_same_hardware_reopen_mode(self.requested_hardware_mode);
-        let decoder = match Decoder::open_video(stream, reopen_mode) {
+        let reopen_mode = hevc_same_hardware_reopen_mode(
+            self.requested_hardware_mode,
+            self.info().hardware_decode_backend,
+        );
+        let decoder = match Decoder::open_video_candidate(
+            stream,
+            reopen_mode,
+            self.requested_hardware_mode,
+            self.auto_decode_plan.as_ref(),
+        ) {
             Ok(decoder) => decoder,
             Err(error) => {
                 let transaction = self

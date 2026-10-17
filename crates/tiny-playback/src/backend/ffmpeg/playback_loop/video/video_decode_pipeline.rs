@@ -138,7 +138,7 @@ pub(super) enum HevcDecodeRecoveryAction {
     ReopenSameHardware,
     ReplaySameHardware,
     RebuildFromCachedSeek,
-    RequestSoftwareFallback,
+    RequestAutoFallback,
     FailExplicitly,
 }
 
@@ -151,7 +151,7 @@ impl HevcDecodeRecoveryAction {
             Self::ReopenSameHardware => "reopen_same_hardware",
             Self::ReplaySameHardware => "replay_same_hardware",
             Self::RebuildFromCachedSeek => "rebuild_from_cached_seek",
-            Self::RequestSoftwareFallback => "request_software_fallback",
+            Self::RequestAutoFallback => "request_auto_fallback",
             Self::FailExplicitly => "fail_explicitly",
         }
     }
@@ -895,7 +895,7 @@ impl HevcSameHardwareRecoveryTransaction {
 
     fn terminal_action(&self, mode: HardwareDecodeMode) -> HevcDecodeRecoveryAction {
         if mode.allows_fallback() {
-            HevcDecodeRecoveryAction::RequestSoftwareFallback
+            HevcDecodeRecoveryAction::RequestAutoFallback
         } else {
             HevcDecodeRecoveryAction::FailExplicitly
         }
@@ -912,7 +912,7 @@ impl HevcSameHardwareRecoveryTransaction {
             }
             HevcSameHardwareRecoveryPhase::RebuildingFromCache => {
                 if mode.allows_fallback() {
-                    HevcDecodeRecoveryAction::RequestSoftwareFallback
+                    HevcDecodeRecoveryAction::RequestAutoFallback
                 } else {
                     HevcDecodeRecoveryAction::RebuildFromCachedSeek
                 }
@@ -951,7 +951,7 @@ impl HevcSameHardwareRecoveryTransaction {
                     // GOP is semantically decodable. A fresh Vulkan context can
                     // reproduce a short prefix and then hit the same missing
                     // references. Match mpv's bounded fallback progression:
-                    // Auto moves to software, while ForceVulkan gets one final
+                    // Auto advances to the next decoder, while forced modes get one final
                     // authoritative rebuild from the demux cache's safe IDR.
                     self.finish_active_attempt("escalated_to_cache_rebuild", now);
                     self.last_error =
@@ -1011,7 +1011,7 @@ impl HevcSameHardwareRecoveryTransaction {
                 // Reopening the hardware context is not the final bounded option.
                 // Keep the reopened worker and rebuild it from the demux cache's
                 // preceding closed-GOP IDR/BLA before a forced mode can fail (or
-                // Auto can fall through to software).
+                // Auto can continue through the remaining candidates).
                 self.finish_active_attempt("journal_incomplete", now);
                 self.last_error = Some(error.to_string());
                 self.phase = HevcSameHardwareRecoveryPhase::RebuildingFromCache;
@@ -3196,7 +3196,7 @@ impl HevcDecodeChainWatchdog {
                 // already consumed at least 500 ms beyond its first eligible
                 // output, however, the missing interval is post-target decode
                 // failure evidence. Preserve it so the following PTS gap takes
-                // the bounded same-hardware/software recovery path instead of
+                // the bounded same-hardware/Auto recovery path instead of
                 // becoming a multi-second held frame.
                 self.health_state = HevcDecodeHealthState::Suspected;
                 self.recent_zero_output_packets = seek_zero_output_packets;
@@ -4392,6 +4392,7 @@ pub(super) struct VideoDecodePipeline {
     worker: VideoDecodeWorker,
     frame_drop: VideoDecodeFrameDrop,
     requested_hardware_mode: HardwareDecodeMode,
+    auto_decode_plan: Option<super::super::hw::AutoDecodePlan>,
     decoder_epoch: u64,
     admitted_video_sequence: u64,
     last_admitted_decoder_epoch: Option<u64>,
@@ -4422,16 +4423,21 @@ mod watchdog;
 #[path = "video_decode_pipeline/worker.rs"]
 mod worker;
 
-fn runtime_hevc_software_fallback_allowed(mode: HardwareDecodeMode) -> bool {
+fn runtime_auto_fallback_allowed(mode: HardwareDecodeMode) -> bool {
     mode.allows_fallback()
 }
 
-fn hevc_same_hardware_reopen_mode(requested: HardwareDecodeMode) -> HardwareDecodeMode {
-    match requested {
-        HardwareDecodeMode::ForceVaapi => HardwareDecodeMode::ForceVaapi,
-        HardwareDecodeMode::ForceVaapiVulkan => HardwareDecodeMode::ForceVaapiVulkan,
-        _ => HardwareDecodeMode::ForceVulkan,
-    }
+fn hevc_same_hardware_reopen_mode(
+    requested: HardwareDecodeMode,
+    active_backend: Option<crate::HardwareDecodeBackend>,
+) -> HardwareDecodeMode {
+    active_backend
+        .map(crate::HardwareDecodeBackend::forced_mode)
+        .unwrap_or(match requested {
+            HardwareDecodeMode::ForceVaapi => HardwareDecodeMode::ForceVaapi,
+            HardwareDecodeMode::ForceVaapiVulkan => HardwareDecodeMode::ForceVaapiVulkan,
+            _ => HardwareDecodeMode::ForceVulkan,
+        })
 }
 
 fn hevc_startup_in_flight_packet_should_arm(

@@ -40,11 +40,30 @@ Vulkan/libplacebo；没有 GPU 的环境可使用 BGRA 等走软件转换路径�
 
 ## 视频解码策略
 
-默认使用 `Auto` 模式：优先尝试 Vulkan 硬解，在硬解不可用或解码器打开失败时回退软件解码。
-播放中的 HEVC 硬解恢复流程也允许在 Vulkan 恢复失败后重建软件解码器，并重放缓存或重新定位。
-其他编码格式及未纳入恢复流程的运行时错误不保证自动回退。
+默认使用 `Auto` 模式，按当前选择的 GPU 和平台依次尝试：
 
-可通过 `TINY_HWDEC` 覆盖默认策略：`auto` 使用上述行为，`off` 强制软件解码，
+| 平台 / GPU | 候选顺序 |
+| --- | --- |
+| Linux NVIDIA | Vulkan → VA-API 映射 Vulkan → 软件解码 |
+| Linux 非 NVIDIA | VA-API 映射 Vulkan → Vulkan → 软件解码 |
+| Windows | Vulkan → 软件解码 |
+
+开发设置的“自动”使用 `AutoWithCopyback`（配置值 `auto_with_copyback`），在 Linux
+软件解码候选之前保留 VA-API 回传内存。普通 Auto 不尝试回传内存。两种策略均随偏好保存，
+打开另一种设置窗口不会切换策略，恢复和 seek 保持原候选列表与策略。
+
+通过选中 Vulkan physical device 的 vendor ID 判断 NVIDIA，不扫描整机显卡列表。
+VA-API 匹配同一 GPU 的 DRM render node；指定 `TINY_VAAPI_DEVICE` 时 Auto 的 Vulkan
+设备也从该 DRM 节点派生。设备选择未知时使用非 NVIDIA 顺序；无法匹配节点则跳过
+对应 VA-API 候选，Vulkan 不可用时允许由 FFmpeg 选择默认 VA-API 设备。
+每个硬解候选严格协商硬件帧，不能在候选内部静默软解。打开失败、格式协商失败、
+VA-API 映射及硬件渲染失败会继续消耗当前播放的候选列表，重新定位输入并同步音轨和字幕。
+普通坏包和队列背压沿用原有处理，不直接触发后端切换。HEVC 有界恢复先重开实际生效的
+硬件后端，耗尽后继续下一候选，通过缓存重放或定位恢复。Seek 不重置已尝试的候选，
+重新打开视频才重新选择。回退不修改保存的 Auto 偏好；播放信息上报实际后端。
+
+可通过 `TINY_HWDEC` 覆盖默认策略：`auto` 使用上述普通 Auto 行为，`auto-copy` 使用开发 Auto，
+`off` 强制软件解码，
 `vulkan` 或 `force-vulkan` 强制 Vulkan 硬解并禁止显式软解回退。
 软件解码后的常见 YUV 帧仍经由 Vulkan/libplacebo 处理。
 
@@ -57,7 +76,7 @@ Linux 新增显式 `HardwareDecodeMode::ForceVaapi`（配置值 `force_vaapi`）
 回传显式保留源像素格式，P010 不经过 8 位中间帧；不支持的格式明确报错。
 转换结果沿用 `RawVideo`、libplacebo 与 BGRA 输出，不导入 DMA-BUF，也不共享解码设备。
 强制格式协商不接受软件输出；HEVC 有界恢复保留 VA-API 后端，重开后直接重放，
-无需等待 Vulkan 解码设备预热。强制模式失败时不回退软件，默认 `Auto` 行为不变。
+无需等待 Vulkan 解码设备预热。强制模式失败时不回退软件，开发 Auto 将 VA-API 回传作为独立候选。
 播放信息通过 `PlaybackVideoInfo::hardware_decode_backend` 上报解码器使用的后端，
 面板中 VA-API 回传路径显示 `HW: vaapi-copy`，Vulkan 硬解显示 `HW: vulkan`。
 `Display / Context: vulkan` 表示渲染后端，使用 VA-API 或软件解码时仍为 Vulkan。
@@ -70,7 +89,7 @@ Linux 性能路径 `HardwareDecodeMode::ForceVaapiVulkan`（配置值 `force_vaa
 - FFmpeg 处理 VA surface 完成同步、DMA-BUF modifier、外部内存及队列所有权，并在映射 AVFrame 中保留源 VA surface。渲染继续使用现有 FFmpeg 队列锁与 timeline semaphore 交接。直接映射接口及生命周期遵循 [FFmpeg hwcontext 文档](https://ffmpeg.org/doxygen/trunk/hwcontext_8h.html)。
 - 映射的 VkImage 尺寸使用导入帧尺寸，usage 使用 READ 映射实际创建的 SAMPLED/TRANSFER_SRC 位，而不是派生池的默认能力。映射图像逐帧释放，禁用跨帧纹理包装缓存，并在解映射前完成 libplacebo 对图像和信号量的引用。
 - 队列持有 GPU 帧及 VA surface；映射 AVFrame 附带引用计数租约，跨解码、准备、调度、呈现队列和渲染器统计实际存活映射。达到 8 帧后暂停送包，释放最后一个引用后恢复；控制命令不受此背压阻止。额外 surface 预留为 16，使用单解码线程，为 DPB、最多 4 个已送包和异步输出留出空间，兼容 NVIDIA VA-API 的 32 个解码 picture 限制；回传模式仍为 6。HEVC 重开保持 GPU 映射模式，并等待派生 Vulkan 设备预热后重放。
-- 需要 `VK_KHR_external_memory_fd`、`VK_EXT_external_memory_dma_buf`、`VK_EXT_image_drm_format_modifier`、`VK_KHR_external_semaphore_fd`。设备派生、映射或直接渲染失败均明确报错，不隐式回传内存；可手动选择原有回传模式。
+- 需要 `VK_KHR_external_memory_fd`、`VK_EXT_external_memory_dma_buf`、`VK_EXT_image_drm_format_modifier`、`VK_KHR_external_semaphore_fd`。设备派生、映射或直接渲染失败在强制模式下明确报错，不隐式回传内存；可在开发设置手动选择回传模式。Auto 按对应策略继续下一候选。
 
 该路径消除的是解码到渲染之间的 YUV CPU 往返；输出仍经 BGRA 回读交给 GPUI，
 不表示显示链路已实现端到端零拷贝。FFmpeg 的 VA surface 同步和当前呈现接口仍包含等待，

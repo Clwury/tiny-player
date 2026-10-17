@@ -165,6 +165,19 @@ fn flush_playback_generation_for_position_reset(
     let scheduler_reset = scheduler_reset_started_at.elapsed();
     let vo_started_at = Instant::now();
     context.vo_queue.begin_session(context.session_id);
+    context.vo_queue.set_auto_hardware_fallback(
+        context.session_id,
+        context
+            .pipeline
+            .video_decode_pipeline
+            .requested_hardware_mode()
+            .allows_fallback()
+            && context
+                .pipeline
+                .video_decode_pipeline
+                .info()
+                .hardware_accelerated,
+    );
     let vo_flush = vo_started_at.elapsed();
     let decoder_flush_started_at = Instant::now();
     if context.preserve_hevc_same_hardware_recovery {

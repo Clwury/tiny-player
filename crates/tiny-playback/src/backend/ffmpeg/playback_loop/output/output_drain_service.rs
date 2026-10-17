@@ -61,11 +61,12 @@ pub(super) fn drain_output_until_idle(
         }
         drain_audio_output_until_idle(context)?;
     } else {
-        drain_video_clocked_output_until_idle(context);
+        drain_video_clocked_output_until_idle(context)?;
     }
     // Seeking to the final frame while paused must keep that frame visible,
     // rather than complete playback (and potentially advance the playlist).
     while context.control.is_user_paused() && !context.control.should_interrupt() {
+        check_hardware_render_error(context)?;
         context
             .playback_wait
             .wait_poll_interval_and_delay_scheduler_until(
@@ -80,6 +81,7 @@ fn drain_audio_clocked_output_until_idle(
     context: &mut OutputDrainContext<'_>,
 ) -> std::result::Result<(), String> {
     loop {
+        check_hardware_render_error(context)?;
         let audio_progress = service_eof_pending_audio(context)?;
         if output_drain_stop_or_seek_status(context.control).is_some() {
             return Ok(());
@@ -266,6 +268,7 @@ fn drain_audio_output_until_idle(
     let mut previous_rate = context.control.playback_rate();
     let mut was_paused = context.control.is_paused();
     loop {
+        check_hardware_render_error(context)?;
         let rate = context.control.playback_rate();
         let paused = context.control.is_paused();
         if rate != previous_rate || was_paused {
@@ -297,7 +300,9 @@ fn drain_audio_output_until_idle(
     Ok(())
 }
 
-fn drain_video_clocked_output_until_idle(context: &mut OutputDrainContext<'_>) {
+fn drain_video_clocked_output_until_idle(
+    context: &mut OutputDrainContext<'_>,
+) -> Result<(), String> {
     while context
         .pipeline
         .output_scheduler
@@ -305,8 +310,9 @@ fn drain_video_clocked_output_until_idle(context: &mut OutputDrainContext<'_>) {
         .queued_video_frames
         > 0
     {
+        check_hardware_render_error(context)?;
         if output_drain_stop_or_seek_status(context.control).is_some() {
-            return;
+            return Ok(());
         }
         // EOF draining bypasses the coordinator gate, so it must also thaw
         // the video clock when playback resumes after a paused seek.
@@ -345,11 +351,22 @@ fn drain_video_clocked_output_until_idle(context: &mut OutputDrainContext<'_>) {
             &mut context.pipeline.buffered_reporter,
         );
         if output_drain_stop_or_seek_status(context.control).is_some() {
-            return;
+            return Ok(());
         }
         if !presented {
             wait_after_output_drain_stall(context, "eof_video_clocked_output_drain");
         }
+    }
+    check_hardware_render_error(context)
+}
+
+fn check_hardware_render_error(context: &OutputDrainContext<'_>) -> Result<(), String> {
+    match context
+        .vo_queue
+        .take_hardware_render_error(context.session_id)
+    {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 

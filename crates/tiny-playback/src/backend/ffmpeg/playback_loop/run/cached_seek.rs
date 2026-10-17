@@ -389,16 +389,16 @@ pub(super) fn service_cached_seek_recovery_fallback_if_needed(
             .video_decode_pipeline
             .request_hevc_same_hardware_recovery(fallback, Instant::now());
         pipeline.video_decode_recovery.reset();
-        if action == HevcDecodeRecoveryAction::RequestSoftwareFallback {
+        if action == HevcDecodeRecoveryAction::RequestAutoFallback {
             tracing::warn!(
                 session_id = ?session.id(),
                 position_seconds,
                 target_nsecs = fallback.target_nsecs,
                 reason = fallback.reason.as_str(),
                 recovery_action = action.as_str(),
-                "routed exhausted bounded HEVC hardware recovery to software fallback"
+                "routed exhausted bounded HEVC hardware recovery to the next Auto candidate"
             );
-            return fallback_to_software_after_same_hardware_recovery(
+            return fallback_after_same_hardware_recovery(
                 session,
                 control,
                 demux_cache,

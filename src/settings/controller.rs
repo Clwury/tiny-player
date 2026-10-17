@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{media::PlaybackLanguagePreferences, theme::ColorTheme};
 use std::collections::HashSet;
-use tiny_playback::PlaybackCacheConfig;
+use tiny_playback::{HardwareDecodeMode, PlaybackCacheConfig};
 
 /// The one editable settings snapshot for the open window. Edits enter through
 /// intents. Editors/dropdowns/scrolling belong to the chosen GPUI presentation;
@@ -176,7 +176,17 @@ impl SettingsController {
                     self.snapshot.track_languages.subtitle = language
                 }
             }
-            SettingsIntent::HardwareDecode(mode) => config.hardware_decode = mode,
+            SettingsIntent::HardwareDecode(mode) => {
+                if self.mode == SettingsMode::User
+                    && matches!(
+                        mode,
+                        HardwareDecodeMode::ForceVaapi | HardwareDecodeMode::AutoWithCopyback
+                    )
+                {
+                    return SettingsChange::default();
+                }
+                config.hardware_decode = mode;
+            }
             SettingsIntent::MemoryBudget(Some(budget)) => *config = budget.apply(config),
             SettingsIntent::MemoryBudget(None) => {}
             SettingsIntent::Mode(mode) => config.mode = mode,

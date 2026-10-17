@@ -21,6 +21,48 @@ const HEVC10: &[u8] = include_bytes!("../codec/tests/data/vaapi_hevc10.mkv");
 // initializes its renderer. EOF seek edge cases have separate regression tests.
 const H264_LONG: &[u8] = include_bytes!("../codec/tests/data/vaapi_h264_long.mkv");
 const HEVC10_LONG: &[u8] = include_bytes!("../codec/tests/data/vaapi_hevc10_long.mkv");
+// 20 seconds of generated gray H.264 High 10, unsupported by the RTX 4070 Ti
+// hardware decoder. libx264 ultrafast/crf=30/g=10/bf=2/yuv420p10le/profile=high10.
+const H264_HIGH10: &[u8] = include_bytes!("../codec/tests/data/auto_h264_high10.mkv");
+
+#[test]
+#[ignore = "requires an NVIDIA GPU without H.264 High 10 hardware decoding and Vulkan rendering"]
+fn auto_nvidia_unsupported_high10_advances_through_hardware_candidates_to_software() {
+    for mode in [
+        HardwareDecodeMode::Auto,
+        HardwareDecodeMode::AutoWithCopyback,
+    ] {
+        exercise_playback_backend(
+            H264_HIGH10,
+            RawVideoFormat::I42010Le,
+            FrameColor::Sdr,
+            mode,
+            None,
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires an NVIDIA GPU with Vulkan H.264 decode and Vulkan rendering"]
+fn auto_nvidia_h264_prefers_vulkan_and_preserves_playback_controls() {
+    for mode in [
+        HardwareDecodeMode::Auto,
+        HardwareDecodeMode::AutoWithCopyback,
+    ] {
+        exercise_playback(H264_LONG, RawVideoFormat::Nv12, FrameColor::Sdr, mode);
+    }
+}
+
+#[test]
+#[ignore = "requires an NVIDIA GPU with Vulkan HEVC Main 10 decode and Vulkan rendering"]
+fn auto_nvidia_hevc10_prefers_vulkan_and_preserves_hdr_and_playback_controls() {
+    exercise_playback(
+        HEVC10_LONG,
+        RawVideoFormat::P010Le,
+        FrameColor::Hdr10Bt2020,
+        HardwareDecodeMode::Auto,
+    );
+}
 
 #[test]
 #[ignore = "requires VA-API H.264 decode, a DRM render node and Vulkan rendering"]
@@ -72,11 +114,23 @@ fn exercise_playback(
     color: FrameColor,
     mode: HardwareDecodeMode,
 ) {
-    let expected_backend = Some(if mode == HardwareDecodeMode::ForceVaapiVulkan {
-        HardwareDecodeBackend::VaapiVulkan
-    } else {
-        HardwareDecodeBackend::Vaapi
+    let expected_backend = Some(match mode {
+        HardwareDecodeMode::Auto | HardwareDecodeMode::AutoWithCopyback => {
+            HardwareDecodeBackend::Vulkan
+        }
+        HardwareDecodeMode::ForceVaapiVulkan => HardwareDecodeBackend::VaapiVulkan,
+        _ => HardwareDecodeBackend::Vaapi,
     });
+    exercise_playback_backend(data, format, color, mode, expected_backend);
+}
+
+fn exercise_playback_backend(
+    data: &[u8],
+    format: RawVideoFormat,
+    color: FrameColor,
+    mode: HardwareDecodeMode,
+    expected_backend: Option<HardwareDecodeBackend>,
+) {
     let mut file = tempfile::Builder::new().suffix(".mkv").tempfile().unwrap();
     file.write_all(data).unwrap();
     file.flush().unwrap();
@@ -107,9 +161,42 @@ fn exercise_playback(
             })
             .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Keep GPU/shader initialization outside the advancing media clock.
+        // Otherwise a cold renderer can let a short fixture reach EOF before
+        // the first paused seek, exercising an unrelated EOF/seek race.
+        backend.pause().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            poll_playback_events(&mut backend, expected_backend);
+            if mode.allows_fallback() && expected_backend.is_none() {
+                // Info may initially announce an opened hardware candidate;
+                // successful first-frame negotiation is what confirms it.
+                for event in backend.poll_events() {
+                    match event.kind {
+                        BackendEventKind::Fatal(error) | BackendEventKind::LoadFailed(error) => {
+                            panic!("Auto fallback failed: {error}")
+                        }
+                        BackendEventKind::PlaybackInfoChanged(Some(info))
+                            if !info.hardware_accelerated =>
+                        {
+                            assert_eq!(info.hardware_decode_backend, None)
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                poll_playback_events(&mut backend, expected_backend);
+            }
+            // Render prewarm failures must be consumed even while waiting for
+            // first-frame negotiation to advance to a later candidate.
+            while let Some((ticket, device)) = backend.video_output_queue.take_vulkan_prewarm() {
+                let result = crate::libplacebo::LibplaceboToneMapper::new_for_vulkan_decode(device)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                backend
+                    .video_output_queue
+                    .complete_vulkan_prewarm(ticket, result);
+            }
             if let Some(frame) = backend.video_output_queue.take_frame() {
                 assert_eq!(
                     frame.size,
@@ -119,6 +206,17 @@ fn exercise_playback(
                     }
                 );
                 match frame.pixels {
+                    FramePixels::VulkanVideo(native)
+                        if mode.allows_fallback() && expected_backend.is_some() =>
+                    {
+                        assert_eq!(
+                            native.source,
+                            crate::render_host::VulkanFrameSource::DecoderPool
+                        );
+                        assert_eq!(native.color, color);
+                        assert!(native.source.cache_textures());
+                        assert!(!native.planes.is_empty());
+                    }
                     FramePixels::VulkanVideo(mapped)
                         if mode == HardwareDecodeMode::ForceVaapiVulkan =>
                     {
@@ -139,11 +237,13 @@ fn exercise_playback(
                                 .all(|plane| plane.image != 0 && plane.semaphore != 0)
                         );
                     }
-                    FramePixels::RawVideo(raw) if mode == HardwareDecodeMode::ForceVaapi => {
+                    FramePixels::RawVideo(raw)
+                        if mode == HardwareDecodeMode::ForceVaapi || expected_backend.is_none() =>
+                    {
                         assert_eq!(raw.format, format);
                         assert_eq!(raw.color, color);
                         let crate::render_host::RawVideoPlanes::Owned(planes) = raw.planes;
-                        assert_eq!(planes.len(), 2);
+                        assert_eq!(planes.len(), format.plane_count());
                     }
                     _ => panic!("VA-API output must match the requested GPU mapping/copyback path"),
                 }
@@ -153,14 +253,16 @@ fn exercise_playback(
             thread::sleep(Duration::from_millis(5));
         }
 
+        // A paused initial frame is consumed by the native-frame assertions
+        // above; request the same target again for the BGRA presenter check.
+        backend.seek_to(0.0).unwrap();
         let mut presenter = VideoPresenter::new(backend.video_output()).unwrap();
         assert_bgra_frame(wait_for_render(
             &mut backend,
             &mut presenter,
             expected_backend,
-            None,
+            Some(0),
         ));
-        backend.pause().unwrap();
         for target in [2.0, 1.0] {
             backend.seek_to(target).unwrap();
             assert_bgra_frame(wait_for_render(

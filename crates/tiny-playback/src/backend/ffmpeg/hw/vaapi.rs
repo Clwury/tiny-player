@@ -19,27 +19,7 @@ fn supports_vaapi(codec: *const ffi::AVCodec) -> bool {
 pub(in crate::backend::ffmpeg) fn find_vaapi_decoder(
     preferred: *const ffi::AVCodec,
 ) -> Result<*const ffi::AVCodec, String> {
-    if preferred.is_null() {
-        return Err("FFmpeg 未找到可用的 VA-API 解码器".to_string());
-    }
-    if supports_vaapi(preferred) {
-        return Ok(preferred);
-    }
-    // av_find_best_stream may prefer a software-only decoder such as libdav1d.
-    // Select another decoder for the same codec before probing VA-API support.
-    let codec_id = unsafe { (*preferred).id };
-    let mut state = ptr::null_mut();
-    loop {
-        let codec = unsafe { ffi::av_codec_iterate(&mut state) };
-        if codec.is_null() {
-            return Err("FFmpeg 解码器不支持 VA-API 硬件帧输出".to_string());
-        }
-        if unsafe { ffi::av_codec_is_decoder(codec) != 0 && (*codec).id == codec_id }
-            && supports_vaapi(codec)
-        {
-            return Ok(codec);
-        }
-    }
+    super::find_hardware_decoder(preferred, super::HardwareDecodeMode::ForceVaapi)
 }
 
 #[cfg(target_os = "linux")]
@@ -48,22 +28,30 @@ pub(super) fn create_device(
 ) -> Result<crate::render_host::FfmpegAvBufferRef, String> {
     use std::{env, ffi::CString};
 
-    use crate::render_host::FfmpegAvBufferRef;
-
-    if !supports_vaapi(codec) {
-        return Err("FFmpeg 解码器不支持 VA-API 硬件帧输出".to_string());
-    }
     let device = env::var_os("TINY_VAAPI_DEVICE")
         .filter(|value| !value.is_empty())
         .map(|value| CString::new(value.as_encoded_bytes()))
         .transpose()
         .map_err(|_| "TINY_VAAPI_DEVICE 包含无效的设备路径".to_string())?;
+    create_device_on(codec, device.as_deref())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn create_device_on(
+    codec: *const ffi::AVCodec,
+    device: Option<&std::ffi::CStr>,
+) -> Result<crate::render_host::FfmpegAvBufferRef, String> {
+    use crate::render_host::FfmpegAvBufferRef;
+
+    if !supports_vaapi(codec) {
+        return Err("FFmpeg 解码器不支持 VA-API 硬件帧输出".to_string());
+    }
     let mut device_ref = ptr::null_mut();
     let result = unsafe {
         ffi::av_hwdevice_ctx_create(
             &mut device_ref,
             ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-            device.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
+            device.map_or(ptr::null(), |value| value.as_ptr()),
             ptr::null_mut(),
             0,
         )

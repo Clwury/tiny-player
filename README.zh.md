@@ -54,8 +54,8 @@ Linux 源码构建还需要 libudev 开发包（Ubuntu 的 `libudev-dev`、Arch 
 | Windows 便携包 | Windows 10 22H2 / Windows 11 x64，支持 Direct3D 11 的显卡与驱动 |
 | 视频处理 | 可用的 Vulkan 显卡驱动；使用软件解码时，视频处理仍需要 Vulkan |
 
-Linux 包还需要与 Ubuntu 24.04 或更新版本兼容的宿主 `libva.so.2`、`libva-drm.so.2` 和 `libdrm.so.2`。在播放设置选择“强制 VA-API（回传内存）”，或设置 `TINY_HWDEC=vaapi` 即可使用显式 VA-API 硬解；可用 `TINY_VAAPI_DEVICE=/dev/dri/renderD128` 指定设备。需要对应系统驱动和设备访问权限，“自动”继续优先尝试 Vulkan。详见[解码设置](docs/settings.md)和[真机验证](docs/playback-engine.md)。
-性能路径选择“强制 VA-API（映射 Vulkan）”，或设置 `TINY_HWDEC=vaapi-vulkan`，通过 DMA-BUF 直接映射 NV12/P010 GPU 帧，省去解码 YUV 帧的 CPU 回传与上传。需要驱动支持 Vulkan 外部内存、DRM modifier 和同步；失败明确报错，可手动切回回传模式。最终 BGRA 输出仍回读到 CPU 供 GPUI 显示。
+Linux 包还需要与 Ubuntu 24.04 或更新版本兼容的宿主 `libva.so.2`、`libva-drm.so.2` 和 `libdrm.so.2`。需要对应系统驱动和设备访问权限；可用 `TINY_VAAPI_DEVICE=/dev/dri/renderD128` 指定设备。用户设置的“自动”在 Linux NVIDIA 上按 Vulkan → VA-API 映射 Vulkan → 软件解码尝试，其他 Linux GPU 交换前两项；Windows 保持 Vulkan → 软件解码。开发设置保留“强制 VA-API（回传内存）”，其“自动”也在软解之前保留回传候选；环境变量 `TINY_HWDEC=vaapi` 和 `auto-copy` 分别选择这两种开发模式。详见[解码设置](docs/settings.md)和[真机验证](docs/playback-engine.md)。
+性能路径选择“强制 VA-API（映射 Vulkan）”，或设置 `TINY_HWDEC=vaapi-vulkan`，通过 DMA-BUF 直接映射 NV12/P010 GPU 帧，省去解码 YUV 帧的 CPU 回传与上传。需要驱动支持 Vulkan 外部内存、DRM modifier 和同步；强制模式失败明确报错，可在开发设置切回回传模式。最终 BGRA 输出仍回读到 CPU 供 GPUI 显示。
 
 Linux 预编译包包含 FFmpeg、libplacebo 及部分依赖，系统还需提供 Vulkan loader、ALSA 及音频配置、Fontconfig、FreeType、字体、XKB 键盘数据、系统 CA 证书，以及与 Ubuntu 24.04（GCC 13）或更新版本兼容的 GCC/C++ 运行库。glibc 2.39 是预编译包的运行基线，其他方式构建时以构建环境和依赖要求为准。
 

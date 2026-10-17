@@ -20,6 +20,12 @@ impl VideoDecodeOutputService {
     where
         F: FnMut() -> DemuxReaderWatermark,
     {
+        if let Some(error) = context
+            .vo_queue
+            .take_hardware_render_error(context.session_id)
+        {
+            return Err(error);
+        }
         drain_ready_video_decode_output(
             &mut context.pipeline.video_decode_pipeline,
             context.pipeline.audio_decode_pipeline.as_mut(),

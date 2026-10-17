@@ -1,5 +1,7 @@
 #[path = "run/audio_realign.rs"]
 mod audio_realign;
+#[path = "run/auto_decode.rs"]
+mod auto_decode;
 #[path = "run/cached_seek.rs"]
 mod cached_seek;
 #[path = "run/hevc_recovery.rs"]
@@ -14,7 +16,7 @@ use cached_seek::{
     service_hevc_startup_stall_watchdog_due_if_needed,
 };
 use hevc_recovery::{
-    drain_video_decode_results_before_watchdog, fallback_to_software_after_same_hardware_recovery,
+    drain_video_decode_results_before_watchdog, fallback_after_same_hardware_recovery,
     service_hevc_same_hardware_recovery_if_needed,
 };
 
@@ -296,6 +298,13 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
     let mut session = PlaybackSession::new(source.session_id, source.start_position_seconds);
     let initial_playback_file_info = input.playback_file_info();
     let mut video_decode_pipeline = VideoDecodePipeline::spawn(video_decoder)?;
+    video_output_queue.set_auto_hardware_fallback(
+        session.id(),
+        video_decode_pipeline
+            .requested_hardware_mode()
+            .allows_fallback()
+            && video_decode_pipeline.info().hardware_accelerated,
+    );
     video_decode_pipeline.set_decoder_framedrop(source.cache_config.decoder_framedrop);
     let initial_playback_video_info =
         playback_video_info_from_worker(video_stream, video_decode_pipeline.info());
@@ -508,6 +517,28 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
     let mut missing_recovery_request_tracker = MissingRecoveryRequestTracker::default();
 
     'playback_coordinator: loop {
+        macro_rules! service_with_auto_fallback {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if auto_decode::fallback_after_hardware_error(
+                            &mut session,
+                            &control,
+                            &demux_cache,
+                            &mut pipeline,
+                            &video_output_queue,
+                            &event_tx,
+                            emit_playback_buffered_events,
+                            &error,
+                        )? {
+                            continue 'playback_coordinator;
+                        }
+                        return Err(error);
+                    }
+                }
+            };
+        }
         while !control.should_stop() {
             match service_playback_commands(PlaybackCommandContext {
                 source: &mut source,
@@ -544,7 +575,11 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                 continue;
             }
 
-            if service_hevc_same_hardware_recovery_if_needed(
+            if let Some(error) = video_output_queue.take_hardware_render_error(session.id()) {
+                service_with_auto_fallback!(Err::<(), _>(error));
+            }
+
+            if service_with_auto_fallback!(service_hevc_same_hardware_recovery_if_needed(
                 &mut session,
                 &control,
                 &demux_cache,
@@ -555,11 +590,11 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                 &pipeline_services.wait,
                 &mut pipeline_services.decode_pipeline,
                 &frame_presented,
-            )? {
+            )) {
                 continue;
             }
 
-            if service_cached_seek_recovery_fallback_if_needed(
+            if service_with_auto_fallback!(service_cached_seek_recovery_fallback_if_needed(
                 &mut session,
                 &control,
                 &demux_cache,
@@ -568,7 +603,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                 &event_tx,
                 emit_playback_buffered_events,
                 None,
-            )? {
+            )) {
                 log_recovery_request_miss_summary(
                     &mut missing_recovery_request_tracker,
                     session.id(),
@@ -589,7 +624,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                 continue;
             }
 
-            if service_hevc_startup_stall_watchdog_due_if_needed(
+            if service_with_auto_fallback!(service_hevc_startup_stall_watchdog_due_if_needed(
                 &mut session,
                 &control,
                 &demux_cache,
@@ -602,7 +637,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                 &frame_presented,
                 &mut missing_recovery_request_tracker,
                 "coordinator_gate_enter",
-            )? {
+            )) {
                 continue;
             }
 
@@ -726,17 +761,20 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                         Some(true)
                     }
                     PlaybackCoordinatorGateStatus::DrainDecodeOnly => {
-                        let drain_status = pipeline_services.decode_pipeline.service_once(
-                            DecodePipelineServiceContext {
-                                pipeline: &mut pipeline,
-                                control: &control,
-                                session_id: session.id(),
-                                event_tx: &event_tx,
-                                vo_queue: &video_output_queue,
-                                frame_presented: &frame_presented,
-                                demux_reader_watermark: || demux_cache.cached_reader_watermark(),
-                            },
-                        )?;
+                        let drain_status = service_with_auto_fallback!(
+                            pipeline_services.decode_pipeline.service_once(
+                                DecodePipelineServiceContext {
+                                    pipeline: &mut pipeline,
+                                    control: &control,
+                                    session_id: session.id(),
+                                    event_tx: &event_tx,
+                                    vo_queue: &video_output_queue,
+                                    frame_presented: &frame_presented,
+                                    demux_reader_watermark: || demux_cache
+                                        .cached_reader_watermark(),
+                                },
+                            )
+                        );
                         let retry_status = pipeline.retry_pending_decoder_inputs(session.id())?;
                         let made_progress =
                             drain_status.made_progress() || retry_status.made_progress();
@@ -792,7 +830,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                     | PlaybackCoordinatorGateStatus::WaitForCache
                     | PlaybackCoordinatorGateStatus::Wait => None,
                 };
-                if service_hevc_startup_stall_watchdog_due_if_needed(
+                if service_with_auto_fallback!(service_hevc_startup_stall_watchdog_due_if_needed(
                     &mut session,
                     &control,
                     &demux_cache,
@@ -805,10 +843,10 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                     &frame_presented,
                     &mut missing_recovery_request_tracker,
                     "coordinator_gate_continue",
-                )? {
+                )) {
                     continue;
                 }
-                if service_cached_seek_recovery_fallback_if_needed(
+                if service_with_auto_fallback!(service_cached_seek_recovery_fallback_if_needed(
                     &mut session,
                     &control,
                     &demux_cache,
@@ -817,7 +855,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                     &event_tx,
                     emit_playback_buffered_events,
                     None,
-                )? {
+                )) {
                     log_recovery_request_miss_summary(
                         &mut missing_recovery_request_tracker,
                         session.id(),
@@ -861,17 +899,18 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                 continue;
             }
 
-            let tick_status = service_playback_tick(PlaybackTickContext {
-                session_id: session.id(),
-                demux_cache: &demux_cache,
-                http_cache: http_cache.as_ref(),
-                services: &mut pipeline_services,
-                pipeline: &mut pipeline,
-                control: &control,
-                event_tx: &event_tx,
-                vo_queue: &video_output_queue,
-                frame_presented: &frame_presented,
-            })?;
+            let tick_status =
+                service_with_auto_fallback!(service_playback_tick(PlaybackTickContext {
+                    session_id: session.id(),
+                    demux_cache: &demux_cache,
+                    http_cache: http_cache.as_ref(),
+                    services: &mut pipeline_services,
+                    pipeline: &mut pipeline,
+                    control: &control,
+                    event_tx: &event_tx,
+                    vo_queue: &video_output_queue,
+                    frame_presented: &frame_presented,
+                }));
             if matches!(tick_status, PlaybackTickStatus::ForceRebufferAudioRealign) {
                 if service_rebuffer_audio_realign_seek_if_needed(
                     &mut session,
@@ -891,7 +930,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                 continue;
             }
             if let PlaybackTickStatus::RecoveryPending(request) = tick_status {
-                if service_cached_seek_recovery_fallback_if_needed(
+                if service_with_auto_fallback!(service_cached_seek_recovery_fallback_if_needed(
                     &mut session,
                     &control,
                     &demux_cache,
@@ -900,7 +939,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                     &event_tx,
                     emit_playback_buffered_events,
                     Some(request),
-                )? {
+                )) {
                     log_recovery_request_miss_summary(
                         &mut missing_recovery_request_tracker,
                         session.id(),
@@ -917,7 +956,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                 );
                 continue;
             }
-            if service_cached_seek_recovery_fallback_if_needed(
+            if service_with_auto_fallback!(service_cached_seek_recovery_fallback_if_needed(
                 &mut session,
                 &control,
                 &demux_cache,
@@ -926,7 +965,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
                 &event_tx,
                 emit_playback_buffered_events,
                 None,
-            )? {
+            )) {
                 log_recovery_request_miss_summary(
                     &mut missing_recovery_request_tracker,
                     session.id(),
@@ -944,7 +983,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
         if control.should_stop() {
             return Ok(());
         }
-        match service_playback_eof_drain(PlaybackEofDrainContext {
+        match service_with_auto_fallback!(service_playback_eof_drain(PlaybackEofDrainContext {
             session_id: session.id(),
             duration_seconds,
             demux_cache: &demux_cache,
@@ -954,7 +993,7 @@ pub(in crate::backend::ffmpeg) fn run_ffmpeg_playback(
             event_tx: &event_tx,
             vo_queue: &video_output_queue,
             frame_presented: &frame_presented,
-        })? {
+        })) {
             PlaybackEofDrainStatus::Complete | PlaybackEofDrainStatus::Stopped => return Ok(()),
             PlaybackEofDrainStatus::SeekPending => continue 'playback_coordinator,
         }

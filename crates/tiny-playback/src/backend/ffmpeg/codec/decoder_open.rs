@@ -22,78 +22,93 @@ impl Decoder {
         stream: StreamInfo,
         hw_mode: HardwareDecodeMode,
     ) -> std::result::Result<Self, String> {
-        let decoder = find_decoder(stream)?;
-        let decoder = if hw_mode.uses_vaapi() {
-            super::super::hw::find_vaapi_decoder(decoder)?
-        } else {
-            decoder
-        };
-        let backend = match hw_mode {
+        if hw_mode.allows_fallback() {
+            let preferred = find_decoder(stream)?;
+            let supports_hardware =
+                super::super::hw::find_hardware_decoder(preferred, HardwareDecodeMode::ForceVulkan)
+                    .is_ok()
+                    || (cfg!(target_os = "linux")
+                        && super::super::hw::find_vaapi_decoder(preferred).is_ok());
+            if !supports_hardware {
+                return Self::open_video_candidate(stream, HardwareDecodeMode::Off, hw_mode, None);
+            }
+            return Self::open_auto_next(
+                stream,
+                &mut super::super::hw::AutoDecodePlan::detect(hw_mode),
+            );
+        }
+        Self::open_video_candidate(stream, hw_mode, hw_mode, None)
+    }
+
+    pub(in super::super) fn open_auto_next(
+        stream: StreamInfo,
+        plan: &mut super::super::hw::AutoDecodePlan,
+    ) -> Result<Self, String> {
+        let mut errors = Vec::new();
+        while let Some(candidate) = plan.next() {
+            match Self::open_video_candidate(stream, candidate, plan.requested_mode(), Some(plan)) {
+                Ok(mut decoder) => {
+                    decoder.auto_decode_plan = Some(plan.clone());
+                    return Ok(decoder);
+                }
+                Err(error) => {
+                    tracing::warn!(?candidate, %error, "Auto decode candidate failed; trying next path");
+                    errors.push(format!("{candidate:?}: {error}"));
+                }
+            }
+        }
+        Err(format!("Auto 解码候选已耗尽：{}", errors.join("；")))
+    }
+
+    pub(in super::super) fn open_video_candidate(
+        stream: StreamInfo,
+        candidate: HardwareDecodeMode,
+        requested_mode: HardwareDecodeMode,
+        plan: Option<&super::super::hw::AutoDecodePlan>,
+    ) -> Result<Self, String> {
+        let preferred = find_decoder(stream)?;
+        let backend = match candidate {
             HardwareDecodeMode::ForceVaapi => "VA-API",
             HardwareDecodeMode::ForceVaapiVulkan => "VA-API/Vulkan",
             _ => "Vulkan",
         };
-        let decoder_context = if !hw_mode.should_try_hardware() {
-            Self::open_with_decoder(stream, decoder, None, hw_mode, None)
+        let decoder = if candidate.uses_vaapi() {
+            super::super::hw::find_vaapi_decoder(preferred)?
+        } else if candidate.should_try_hardware() {
+            super::super::hw::find_hardware_decoder(preferred, candidate)?
         } else {
-            let hardware = if hw_mode.uses_vaapi() {
-                VideoHwDecodeContext::try_create_vaapi(
-                    decoder,
-                    hw_mode == HardwareDecodeMode::ForceVaapiVulkan,
-                )
-            } else {
-                VideoHwDecodeContext::try_create(decoder)
-            };
-            match hardware {
-                Ok(video_hw) => {
-                    match Self::open_with_decoder(stream, decoder, Some(video_hw), hw_mode, None) {
-                        Ok(decoder_context) => {
-                            tracing::info!(
-                                decoder = %decoder_name(decoder),
-                                requested_hw_mode = ?hw_mode,
-                                backend,
-                                active_hwaccel = true,
-                                hw_pixel_format = ?decoder_context
-                                    .video_hw
-                                    .as_ref()
-                                    .map(|hw| hw.pixel_format()),
-                                "enabled FFmpeg hardware video decoder"
-                            );
-                            Ok(decoder_context)
-                        }
-                        Err(error) if hw_mode.allows_fallback() => {
-                            tracing::warn!(
-                                %error,
-                                decoder = %decoder_name(decoder),
-                                backend,
-                                "FFmpeg hardware decoder open failed; falling back to software"
-                            );
-                            Self::open_with_decoder(stream, decoder, None, hw_mode, None)
-                        }
-                        Err(error) => Err(format!("FFmpeg {backend} 硬解打开失败：{error}")),
-                    }
+            preferred
+        };
+        let video_hw = if !candidate.should_try_hardware() {
+            None
+        } else {
+            Some(
+                if let Some(plan) = plan {
+                    VideoHwDecodeContext::try_create_for_auto(decoder, candidate, plan)
+                } else if candidate.uses_vaapi() {
+                    VideoHwDecodeContext::try_create_vaapi(
+                        decoder,
+                        candidate == HardwareDecodeMode::ForceVaapiVulkan,
+                    )
+                } else {
+                    VideoHwDecodeContext::try_create(decoder)
                 }
-                Err(error) if hw_mode.allows_fallback() => {
-                    tracing::warn!(
-                        %error,
-                        decoder = %decoder_name(decoder),
-                        backend,
-                        "FFmpeg hardware decode unavailable; falling back to software"
-                    );
-                    Self::open_with_decoder(stream, decoder, None, hw_mode, None)
-                }
-                Err(error) => Err(format!("FFmpeg {backend} 硬解不可用：{error}")),
-            }
-        }?;
+                .map_err(|error| format!("FFmpeg {backend} 硬解不可用：{error}"))?,
+            )
+        };
+        let decoder_context =
+            Self::open_with_decoder(stream, decoder, video_hw, requested_mode, None)?;
         let active_hwaccel = decoder_context.is_hardware_accelerated();
-        if hw_mode.should_try_hardware() && !hw_mode.allows_fallback() && !active_hwaccel {
+        if candidate.should_try_hardware() && !active_hwaccel {
             return Err(format!(
                 "已强制使用 {backend} 硬件解码，但 FFmpeg 未激活硬解"
             ));
         }
         tracing::info!(
             decoder = %decoder_name(decoder),
-            requested_hw_mode = ?hw_mode,
+            requested_hw_mode = ?requested_mode,
+            ?candidate,
+            backend = ?decoder_context.hardware_decode_backend(),
             active_hwaccel,
             hw_pixel_format = ?decoder_context
                 .video_hw
@@ -126,10 +141,13 @@ impl Decoder {
             stream_index: stream.index,
             time_base: stream.time_base,
             hardware_decode_mode,
+            auto_decode_plan: None,
             hw_format_selection: video_hw.as_ref().map(|hw| {
                 Box::new(VideoHwFormatSelection {
                     pixel_format: hw.pixel_format(),
-                    allow_software_fallback: hardware_decode_mode.allows_fallback(),
+                    // Auto owns the candidate chain. Do not let FFmpeg silently
+                    // select software and skip the remaining hardware paths.
+                    allow_software_fallback: false,
                     negotiation_failed: AtomicBool::new(false),
                 })
             }),
@@ -143,7 +161,8 @@ impl Decoder {
             ));
         }
         let libavcodec_version = unsafe { ffi::avcodec_version() };
-        let requested_thread_count = if hardware_decode_mode == HardwareDecodeMode::ForceVaapiVulkan
+        let requested_thread_count = if decoder_context.hardware_decode_backend()
+            == Some(HardwareDecodeBackend::VaapiVulkan)
         {
             // Reserve surfaces for asynchronous rendering and the codec DPB,
             // including VA-API drivers with a 32-picture limit.

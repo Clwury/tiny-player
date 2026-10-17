@@ -49,16 +49,18 @@ TINY_DEV_SETTINGS=1 ./target/release/tiny-player
 
 两种设置窗口的“播放”页均提供“硬件解码”选项：
 
-- **自动（默认）**：优先使用 Vulkan 硬件解码，不可用或恢复失败时允许回退到软件解码。
+- **自动（默认）**：用户设置下，Linux NVIDIA 按 Vulkan → VA-API 映射 Vulkan → 软件解码尝试；其他 Linux GPU 按 VA-API 映射 Vulkan → Vulkan → 软件解码尝试。开发设置选择“自动”时，在软件解码之前增加 VA-API 回传内存候选。Windows 均保持 Vulkan → 软件解码。
 - **关闭（软件解码）**：使用 CPU 解码视频。
 - **强制 Vulkan**：必须使用 Vulkan 硬件解码，不可用或恢复失败时报错，不回退到软件解码。
-- **强制 VA-API（回传内存，仅 Linux）**：使用 VA-API 解码，将原始位深的 NV12/P010 等 YUV 帧下载到内存后交给现有 Vulkan/libplacebo 渲染；不可用或恢复失败时报错，不切换到 Vulkan 硬解或软件解码。
+- **强制 VA-API（回传内存，仅 Linux 开发设置）**：使用 VA-API 解码，将原始位深的 NV12/P010 等 YUV 帧下载到内存后交给现有 Vulkan/libplacebo 渲染；不可用或恢复失败时报错，不切换到 Vulkan 硬解或软件解码。用户设置不提供此选项。
 - **强制 VA-API（映射 Vulkan，仅 Linux）**：性能路径，通过 DMA-BUF 将 NV12/P010 GPU 帧直接映射到 Vulkan，省去原始 YUV 帧的 CPU 下载和上传。要求驱动支持外部内存、DRM modifier 和同步导入；映射或渲染失败时报错，不自动切换到回传模式。
 
-选择自动保存，重新打开视频后生效；修改选项不会中断当前播放。旧配置缺少该字段时使用“自动”。`TINY_HWDEC` 仍可临时覆盖选择：`auto`、`off`、`force-vulkan`、`vaapi` 分别对应以上模式；VA-API 也接受 `force-vaapi` 和 `vaapi-copy`。有效别名继续兼容，空值表示关闭，无效值采用已保存的选择。环境覆盖不会改写保存的配置。
+选择自动保存，重新打开视频后生效；修改选项不会中断当前播放。普通“自动”保存为 `auto`，开发设置选择“自动”保存为 `auto_with_copyback`；旧配置缺少该字段或保存为 `auto` 时不包含回传内存候选。打开设置或修改其他选项不会改写硬解偏好；已有开发 Auto 或强制回传值在用户设置中显示为“自定义（开发设置）”，重新选择“自动”才切换为普通策略。普通 Auto 在开发设置中显示为“自动（用户设置）”，主动选择“自动”后才启用包含回传内存的开发策略。
+
+`TINY_HWDEC` 仍可临时覆盖选择：`auto` 使用普通 Auto，`auto-copy` 使用开发 Auto，`off`、`force-vulkan`、`vaapi` 分别选择软件、强制 Vulkan、强制 VA-API 回传模式；VA-API 也接受 `force-vaapi` 和 `vaapi-copy`。有效别名继续兼容，空值表示关闭，无效值采用已保存的选择。环境覆盖不会改写保存的配置。
 GPU 映射模式对应配置值 `force_vaapi_vulkan`，环境值为 `vaapi-vulkan`（也接受 `force-vaapi-vulkan`、`vaapi-gpu`）。播放信息显示 `HW: vaapi-vulkan`；回传模式显示 `HW: vaapi-copy`。环境变量优先于设置，切换设置测试时需同时修改或取消 `TINY_HWDEC`。
 
-Linux 下可用 `TINY_VAAPI_DEVICE=/dev/dri/renderD128` 指定 DRM render node；未设置时由 FFmpeg 选择设备。需要系统 VA-API 驱动及设备访问权限，支持的编码、profile、位深和尺寸取决于显卡和驱动。“自动”继续只尝试 Vulkan，不自动尝试 VA-API。
+Linux 下可用 `TINY_VAAPI_DEVICE=/dev/dri/renderD128` 指定 DRM render node。Auto 使用该节点选择 GPU；未指定时按 FFmpeg 选中的 Vulkan GPU 的 vendor ID 排序，并将 VA-API 匹配到同一 GPU 的 render node。无法匹配节点时跳过该 VA-API 候选；Vulkan 设备不可用时仍可尝试 FFmpeg 默认 VA-API 设备。需要系统 VA-API 驱动及设备访问权限，支持的编码、profile、位深和尺寸取决于显卡和驱动。Auto 回退保留用户配置，播放信息显示实际后端；手动强制模式失败时不尝试其他后端。
 
 ## 前向预读与 seek
 

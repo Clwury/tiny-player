@@ -3,11 +3,13 @@ use super::*;
 impl VideoDecodePipeline {
     pub(in super::super) fn spawn(decoder: Decoder) -> std::result::Result<Self, String> {
         let requested_hardware_mode = decoder.hardware_decode_mode();
+        let auto_decode_plan = decoder.auto_decode_plan().cloned();
         let frame_drop = VideoDecodeFrameDrop::default();
         Ok(Self {
             worker: VideoDecodeWorker::spawn(decoder, frame_drop.epoch_handle())?,
             frame_drop,
             requested_hardware_mode,
+            auto_decode_plan,
             decoder_epoch: 1,
             admitted_video_sequence: 0,
             last_admitted_decoder_epoch: None,

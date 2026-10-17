@@ -427,7 +427,7 @@ fn hardware_decode_can_be_found_by_search_and_saved_without_changing_cache_setti
     click(cx, "hardware-decode-dropdown");
     cx.simulate_keystrokes("home enter");
     cx.run_until_parked();
-    config.hardware_decode = HardwareDecodeMode::Auto;
+    config.hardware_decode = HardwareDecodeMode::AutoWithCopyback;
     assert_eq!(
         root.read_with(cx, |root, _| root.saved.clone()),
         Some(config)
@@ -436,6 +436,35 @@ fn hardware_decode_can_be_found_by_search_and_saved_without_changing_cache_setti
         root.read_with(cx, |root, _| root.change_count),
         if cfg!(target_os = "linux") { 4 } else { 2 }
     );
+    click(cx, "hardware-decode-dropdown");
+    click(cx, "hardware-decode-auto");
+    assert_eq!(
+        root.read_with(cx, |root, _| root.change_count),
+        if cfg!(target_os = "linux") { 4 } else { 2 }
+    );
+}
+
+#[gpui::test]
+fn development_auto_replaces_user_auto_only_when_explicitly_selected(cx: &mut TestAppContext) {
+    let config = PlaybackCacheConfig::default();
+    let (root, cx) = settings_window_with_config(cx, config);
+    click(cx, "settings-category-播放");
+    click(cx, "hardware-decode-dropdown");
+    click(cx, "hardware-decode-user-auto");
+    assert_eq!(root.read_with(cx, |root, _| root.change_count), 0);
+    click(cx, "hardware-decode-dropdown");
+    click(cx, "hardware-decode-auto");
+    assert_eq!(root.read_with(cx, |root, _| root.change_count), 1);
+    assert_eq!(
+        root.read_with(cx, |root, _| root.saved.as_ref().unwrap().hardware_decode),
+        HardwareDecodeMode::AutoWithCopyback
+    );
+    click(cx, "settings-category-外观");
+    click(cx, "settings-category-播放");
+    click(cx, "hardware-decode-dropdown");
+    assert!(cx.debug_bounds("hardware-decode-user-auto").is_none());
+    click(cx, "hardware-decode-auto");
+    assert_eq!(root.read_with(cx, |root, _| root.change_count), 1);
 }
 
 #[gpui::test]

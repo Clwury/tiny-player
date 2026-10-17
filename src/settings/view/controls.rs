@@ -5,7 +5,11 @@ use crate::ui::{
     editor::{Editor, EditorEvent},
     number_input::{NumberControl, NumberRange},
 };
-use crate::{settings::AppLanguage, theme, ui::radius};
+use crate::{
+    settings::{AppLanguage, SettingsMode},
+    theme,
+    ui::radius,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext as _, Context, Entity, InteractiveElement, IntoElement, ParentElement,
@@ -15,8 +19,10 @@ use tiny_playback::HardwareDecodeMode;
 
 pub(crate) const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
-pub(crate) const HARDWARE_DECODE_DESCRIPTION: &str =
-    "自动优先使用 Vulkan，失败时回退软件；强制模式失败时报错。";
+pub(crate) const USER_HARDWARE_DECODE_DESCRIPTION: &str =
+    "自动按平台和显卡选择 GPU 硬解，失败后回退软件解码；强制模式失败时报错。";
+pub(crate) const DEVELOPMENT_HARDWARE_DECODE_DESCRIPTION: &str =
+    "自动按平台和显卡选择硬解，Linux 下保留 VA-API 回传内存回退；强制模式失败时报错。";
 
 pub(crate) fn app_language_selector(
     state: Entity<DropdownState>,
@@ -35,37 +41,54 @@ pub(crate) fn app_language_selector(
 
 pub(crate) fn hardware_decode_selector(
     state: Entity<DropdownState>,
+    mode: SettingsMode,
     selected: HardwareDecodeMode,
     on_select: impl Fn(HardwareDecodeMode, &mut App) + 'static,
 ) -> impl IntoElement {
-    selector_row(
-        ("hardware-decode-dropdown", "硬件解码"),
-        state,
-        [
-            ("hardware-decode-auto", "自动", HardwareDecodeMode::Auto),
-            (
-                "hardware-decode-off",
-                "关闭（软件解码）",
-                HardwareDecodeMode::Off,
-            ),
-            (
-                "hardware-decode-force-vulkan",
-                "强制 Vulkan",
-                HardwareDecodeMode::ForceVulkan,
-            ),
-            #[cfg(target_os = "linux")]
+    let mut options = vec![
+        ("hardware-decode-auto", "自动", mode.auto_hardware_decode()),
+        (
+            "hardware-decode-off",
+            "关闭（软件解码）",
+            HardwareDecodeMode::Off,
+        ),
+        (
+            "hardware-decode-force-vulkan",
+            "强制 Vulkan",
+            HardwareDecodeMode::ForceVulkan,
+        ),
+        #[cfg(target_os = "linux")]
+        (
+            "hardware-decode-force-vaapi-vulkan",
+            "强制 VA-API（映射 Vulkan）",
+            HardwareDecodeMode::ForceVaapiVulkan,
+        ),
+    ];
+    #[cfg(target_os = "linux")]
+    if mode == SettingsMode::Development {
+        options.insert(
+            3,
             (
                 "hardware-decode-force-vaapi",
                 "强制 VA-API（回传内存）",
                 HardwareDecodeMode::ForceVaapi,
             ),
-            #[cfg(target_os = "linux")]
-            (
-                "hardware-decode-force-vaapi-vulkan",
-                "强制 VA-API（映射 Vulkan）",
-                HardwareDecodeMode::ForceVaapiVulkan,
-            ),
-        ],
+        );
+    }
+    // Keep preferences from the other settings window visible without changing
+    // their policy until the user explicitly selects this window's Auto option.
+    if !options.iter().any(|(_, _, value)| *value == selected) {
+        let (id, label) = if selected == HardwareDecodeMode::Auto {
+            ("hardware-decode-user-auto", "自动（用户设置）")
+        } else {
+            ("hardware-decode-development", "自定义（开发设置）")
+        };
+        options.push((id, label, selected));
+    }
+    selector_row(
+        ("hardware-decode-dropdown", "硬件解码"),
+        state,
+        options,
         selected,
         on_select,
     )

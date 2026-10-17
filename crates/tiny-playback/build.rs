@@ -56,6 +56,7 @@ fn main() {
         .allowlist_type("AVVkFrame")
         .allowlist_type("AVVulkan.*")
         .allowlist_type("Vk.*")
+        .allowlist_type("PFN_vkGetPhysicalDeviceProperties2")
         .generate_comments(false)
         .derive_debug(false)
         .layout_tests(false);

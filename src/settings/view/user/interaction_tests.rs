@@ -286,14 +286,14 @@ fn hardware_decode_selection_saves_only_changes_and_preserves_cache_preferences(
         "hardware-decode-off",
         "hardware-decode-force-vulkan",
         #[cfg(target_os = "linux")]
-        "hardware-decode-force-vaapi",
-        #[cfg(target_os = "linux")]
         "hardware-decode-force-vaapi-vulkan",
     ] {
         let bounds = cx.debug_bounds(selector).expect(selector);
         assert!(bounds.top() >= px(0.0));
         assert!(bounds.bottom() <= px(600.0));
     }
+    assert!(cx.debug_bounds("hardware-decode-force-vaapi").is_none());
+    assert!(cx.debug_bounds("hardware-decode-development").is_none());
     click(cx, "hardware-decode-off");
     assert_eq!(root.read_with(cx, |root, _| root.changes), 0);
     click(cx, "hardware-decode-dropdown");
@@ -312,6 +312,41 @@ fn hardware_decode_selection_saves_only_changes_and_preserves_cache_preferences(
     config.hardware_decode = HardwareDecodeMode::Auto;
     assert_eq!(root.read_with(cx, |root, _| root.saved.clone()), config);
     assert_eq!(root.read_with(cx, |root, _| root.changes), 2);
+}
+
+#[gpui::test]
+fn user_auto_can_replace_saved_development_values_without_exposing_copyback(
+    cx: &mut TestAppContext,
+) {
+    for hardware_decode in [
+        HardwareDecodeMode::ForceVaapi,
+        HardwareDecodeMode::AutoWithCopyback,
+    ] {
+        let config = PlaybackCacheConfig {
+            hardware_decode,
+            ..PlaybackCacheConfig::default()
+        };
+        let (root, cx) = settings_window(cx, config.clone());
+        click(cx, "settings-category-播放");
+        assert_eq!(root.read_with(cx, |root, _| root.changes), 0);
+        click(cx, "hardware-decode-dropdown");
+        assert!(cx.debug_bounds("hardware-decode-force-vaapi").is_none());
+        click(cx, "hardware-decode-development");
+        assert_eq!(root.read_with(cx, |root, _| root.changes), 0);
+        assert_eq!(root.read_with(cx, |root, _| root.saved.clone()), config);
+        click(cx, "hardware-decode-dropdown");
+        click(cx, "hardware-decode-auto");
+        assert_eq!(root.read_with(cx, |root, _| root.changes), 1);
+        assert_eq!(
+            root.read_with(cx, |root, _| root.saved.hardware_decode),
+            HardwareDecodeMode::Auto
+        );
+        click(cx, "hardware-decode-dropdown");
+        assert!(cx.debug_bounds("hardware-decode-development").is_none());
+        assert!(cx.debug_bounds("hardware-decode-force-vaapi").is_none());
+        click(cx, "hardware-decode-auto");
+        assert_eq!(root.read_with(cx, |root, _| root.changes), 1);
+    }
 }
 
 #[gpui::test]

@@ -266,7 +266,7 @@ mod decode_recovery_tests {
         output.begin_decode_recovery(
             7,
             1_000_000_000,
-            DecodeRecoverySource::SoftwareFallback,
+            DecodeRecoverySource::AutoFallback,
             &control,
             session_id,
         );
@@ -331,7 +331,7 @@ mod decode_recovery_tests {
         output.begin_decode_recovery(
             9,
             2_000_000_000,
-            DecodeRecoverySource::SoftwareFallback,
+            DecodeRecoverySource::AutoFallback,
             &control,
             session_id,
         );
@@ -637,7 +637,7 @@ mod decode_recovery_tests {
         output.begin_decode_recovery(
             11,
             target_nsecs,
-            DecodeRecoverySource::SoftwareFallback,
+            DecodeRecoverySource::AutoFallback,
             &control,
             session_id,
         );
@@ -778,7 +778,7 @@ mod decode_recovery_tests {
         output.begin_decode_recovery(
             12,
             target_nsecs,
-            DecodeRecoverySource::SoftwareFallback,
+            DecodeRecoverySource::AutoFallback,
             &control,
             session_id,
         );
@@ -1307,7 +1307,7 @@ mod decode_recovery_tests {
         output.begin_decode_recovery(
             13,
             4_000_000_000,
-            DecodeRecoverySource::SoftwareFallback,
+            DecodeRecoverySource::AutoFallback,
             &control,
             session_id,
         );

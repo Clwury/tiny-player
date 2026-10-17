@@ -68,10 +68,11 @@ impl PlaybackSettingsDialogState {
                 Playback,
                 "视频解码",
                 "硬件解码",
-                HARDWARE_DECODE_DESCRIPTION,
+                DEVELOPMENT_HARDWARE_DECODE_DESCRIPTION,
                 "hardware_decode hwdec vulkan vaapi va-api 硬解 软解",
                 hardware_decode_selector(
                     self.dropdown.clone(),
+                    SettingsMode::Development,
                     self.controller.view_model().config.hardware_decode,
                     {
                         let dialog = dialog.clone();

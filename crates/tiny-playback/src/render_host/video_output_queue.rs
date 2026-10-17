@@ -174,6 +174,8 @@ struct VideoOutputQueueState {
     dropped_frames: u64,
     presentation_sequence: u64,
     last_presentation: Option<VideoPresentation>,
+    auto_hardware_fallback: bool,
+    hardware_render_error: Option<String>,
 }
 
 struct VulkanPrewarmState {
@@ -209,6 +211,8 @@ impl VideoOutputQueue {
             dropped_frames: 0,
             presentation_sequence: 0,
             last_presentation: None,
+            auto_hardware_fallback: false,
+            hardware_render_error: None,
         };
     }
 
@@ -223,6 +227,7 @@ impl VideoOutputQueue {
         state.frames.clear();
         state.pending_size_change = None;
         state.vulkan_prewarm = None;
+        state.hardware_render_error = None;
         state.presentation_generation = state.presentation_generation.wrapping_add(1);
         state.last_presentation = None;
         discarded
@@ -485,8 +490,45 @@ impl VideoOutputQueue {
         if !active_identity_matches || prewarm.ticket != ticket {
             return false;
         }
-        prewarm.result = Some(result);
+        prewarm.result = Some(result.clone());
+        if state.auto_hardware_fallback
+            && let Err(error) = result
+        {
+            state.hardware_render_error = Some(format!("Vulkan renderer prewarm failed: {error}"));
+        }
         true
+    }
+
+    pub(crate) fn set_auto_hardware_fallback(&self, session: PlaybackSessionId, enabled: bool) {
+        let mut state = self.inner.lock().expect("video output queue poisoned");
+        if state.active_session_id == session {
+            state.auto_hardware_fallback = enabled;
+            state.hardware_render_error = None;
+        }
+    }
+
+    pub(crate) fn report_hardware_render_error(
+        &self,
+        identity: (PlaybackSessionId, u64),
+        error: String,
+    ) -> bool {
+        let mut state = self.inner.lock().expect("video output queue poisoned");
+        if state.active_session_id != identity.0 || state.presentation_generation != identity.1 {
+            // An old render may finish after a seek or backend replacement.
+            return true;
+        }
+        if !state.auto_hardware_fallback {
+            return false;
+        }
+        state.hardware_render_error.get_or_insert(error);
+        true
+    }
+
+    pub(crate) fn take_hardware_render_error(&self, session: PlaybackSessionId) -> Option<String> {
+        let mut state = self.inner.lock().expect("video output queue poisoned");
+        (state.active_session_id == session)
+            .then(|| state.hardware_render_error.take())
+            .flatten()
     }
 
     pub fn vulkan_prewarm_status(&self, ticket: VulkanPrewarmTicket) -> VulkanPrewarmStatus {
@@ -1059,6 +1101,55 @@ mod tests {
         assert_eq!(
             slot.vulkan_prewarm_status(ticket),
             VulkanPrewarmStatus::Stale
+        );
+    }
+
+    #[test]
+    fn automatic_render_failures_are_fenced_across_seeks_and_preserve_forced_errors() {
+        let queue = VideoOutputQueue::default();
+        let session = PlaybackSessionId(1);
+        queue.begin_session(session);
+        let original = queue.presentation_identity();
+        assert!(!queue.report_hardware_render_error(original, "forced error".into()));
+        assert!(queue.take_hardware_render_error(session).is_none());
+        queue.set_auto_hardware_fallback(session, true);
+        assert!(queue.report_hardware_render_error(original, "map failure".into()));
+        assert_eq!(
+            queue.take_hardware_render_error(session).as_deref(),
+            Some("map failure")
+        );
+        queue.discard_pending_frames(session);
+        assert!(queue.report_hardware_render_error(original, "stale error".into()));
+        assert!(queue.take_hardware_render_error(session).is_none());
+        let current = queue.presentation_identity();
+        assert!(queue.report_hardware_render_error(current, "current error".into()));
+        queue.begin_session(PlaybackSessionId(2));
+        assert!(queue.take_hardware_render_error(session).is_none());
+        assert!(!queue.report_hardware_render_error(
+            queue.presentation_identity(),
+            "new forced error".into()
+        ));
+    }
+
+    #[test]
+    fn auto_prewarm_failure_is_available_to_the_playback_coordinator() {
+        let queue = VideoOutputQueue::default();
+        let session = PlaybackSessionId(1);
+        queue.begin_session(session);
+        queue.set_auto_hardware_fallback(session, true);
+        let ticket = queue
+            .request_vulkan_prewarm(session, dummy_vulkan_device(1))
+            .unwrap();
+        assert!(queue.complete_vulkan_prewarm(ticket, Err("import failed".into())));
+        assert!(
+            queue
+                .take_hardware_render_error(session)
+                .unwrap()
+                .contains("import failed")
+        );
+        assert_eq!(
+            queue.vulkan_prewarm_status(ticket),
+            VulkanPrewarmStatus::Failed("import failed".into())
         );
     }
 

@@ -578,17 +578,15 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
             }
             Ok(true)
         }
-        HevcDecodeRecoveryAction::RequestSoftwareFallback => {
-            fallback_to_software_after_same_hardware_recovery(
-                session,
-                control,
-                demux_cache,
-                pipeline,
-                vo_queue,
-                event_tx,
-                emit_playback_buffered_events,
-            )
-        }
+        HevcDecodeRecoveryAction::RequestAutoFallback => fallback_after_same_hardware_recovery(
+            session,
+            control,
+            demux_cache,
+            pipeline,
+            vo_queue,
+            event_tx,
+            emit_playback_buffered_events,
+        ),
         HevcDecodeRecoveryAction::FailExplicitly => {
             let error = pipeline
                 .video_decode_pipeline
@@ -603,7 +601,7 @@ pub(super) fn service_hevc_same_hardware_recovery_if_needed(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn fallback_to_software_after_same_hardware_recovery(
+pub(super) fn fallback_after_same_hardware_recovery(
     session: &mut PlaybackSession,
     control: &FfmpegControl,
     demux_cache: &DemuxPacketCache,
@@ -616,37 +614,49 @@ pub(super) fn fallback_to_software_after_same_hardware_recovery(
     let target_nsecs = pipeline
         .video_decode_pipeline
         .hevc_same_hardware_recovery_target()
-        .ok_or_else(|| "software fallback requested without a same-hardware target".to_string())?;
+        .ok_or_else(|| "Auto fallback requested without a same-hardware target".to_string())?;
     let terminal_error = pipeline
         .video_decode_pipeline
         .hevc_same_hardware_recovery_terminal_error(now)
         .unwrap_or_else(|| "bounded same-hardware recovery exhausted".to_string());
-    if pipeline.video_decode_pipeline.requested_hardware_mode()
-        != super::super::HardwareDecodeMode::Auto
+    if !pipeline
+        .video_decode_pipeline
+        .requested_hardware_mode()
+        .allows_fallback()
     {
         return Err(format!(
-            "software fallback invariant violation for {:?}: {terminal_error}",
+            "Auto fallback invariant violation for {:?}: {terminal_error}",
             pipeline.video_decode_pipeline.requested_hardware_mode()
         ));
     }
 
-    let reopened = pipeline
-        .video_decode_pipeline
-        .reopen_software_decoder(pipeline.video_stream)?;
-    if !reopened {
-        return Err(format!(
-            "HEVC hardware recovery requested software fallback but decoder was already software: {terminal_error}"
-        ));
-    }
-    let discarded_vo_frames = vo_queue.discard_pending_frames(session.id());
     let generation = pipeline.advance_playback_generation();
     pipeline
+        .output_scheduler
+        .release_vulkan_frames_for_resource_pressure(control, session.id());
+    let discarded_vo_frames = vo_queue.discard_pending_frames(session.id());
+    pipeline
         .video_frame_prepare_worker
-        .flush_generation(generation);
+        .restart_after_resource_pressure(generation)?;
+    let reopened = pipeline
+        .video_decode_pipeline
+        .reopen_next_auto_decoder(pipeline.video_stream)?;
+    if !reopened {
+        return Err(format!(
+            "HEVC recovery requested Auto fallback but decoder was already software: {terminal_error}"
+        ));
+    }
+    vo_queue.set_auto_hardware_fallback(
+        session.id(),
+        pipeline.video_decode_pipeline.info().hardware_accelerated,
+    );
+    if let Some(device) = pipeline.video_decode_pipeline.info().vulkan_device.clone() {
+        vo_queue.request_vulkan_prewarm(session.id(), device);
+    }
     pipeline.output_scheduler.begin_decode_recovery(
         pipeline.active_recovery_transaction_id(),
         target_nsecs,
-        DecodeRecoverySource::SoftwareFallback,
+        DecodeRecoverySource::AutoFallback,
         control,
         session.id(),
     );
@@ -678,7 +688,8 @@ pub(super) fn fallback_to_software_after_same_hardware_recovery(
         discarded_vo_frames,
         replay_packets,
         terminal_error,
-        "Auto mode opened the software decoder after HEVC hardware recovery failure"
+        backend = ?pipeline.video_decode_pipeline.info().hardware_decode_backend,
+        "Auto mode selected the next decoder after HEVC hardware recovery failure"
     );
     if replay_packets > 0 {
         pipeline
@@ -729,7 +740,7 @@ pub(super) fn fallback_to_software_after_same_hardware_recovery(
         target_nsecs,
         seek_generation,
         ?demux_seek_result,
-        "software fallback had no replay journal and performed one exact low-level seek"
+        "Auto fallback had no replay journal and performed one exact low-level seek"
     );
     Ok(true)
 }

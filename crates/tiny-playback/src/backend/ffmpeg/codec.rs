@@ -31,6 +31,7 @@ pub(super) struct Decoder {
     pub(super) time_base: ffi::AVRational,
     video_hw: Option<VideoHwDecodeContext>,
     hardware_decode_mode: HardwareDecodeMode,
+    auto_decode_plan: Option<super::hw::AutoDecodePlan>,
     hw_format_selection: Option<Box<VideoHwFormatSelection>>,
 }
 

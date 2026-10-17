@@ -16,15 +16,27 @@ pub enum HardwareDecodeBackend {
 pub enum HardwareDecodeMode {
     /// Decode video on the CPU.
     Off,
-    /// Prefer Vulkan hardware decoding, allowing software fallback.
+    /// Try the platform and GPU's preferred GPU frame paths, then software decoding.
     #[default]
     Auto,
+    /// Development Auto policy, also allowing VA-API system-memory copyback on Linux.
+    AutoWithCopyback,
     /// Require Vulkan hardware decoding and report failures without fallback.
     ForceVulkan,
     /// Require VA-API decoding on Linux, downloading frames for video processing.
     ForceVaapi,
     /// Require VA-API decoding and direct Vulkan mapping on Linux.
     ForceVaapiVulkan,
+}
+
+impl HardwareDecodeBackend {
+    pub(crate) fn forced_mode(self) -> HardwareDecodeMode {
+        match self {
+            Self::Vulkan => HardwareDecodeMode::ForceVulkan,
+            Self::Vaapi => HardwareDecodeMode::ForceVaapi,
+            Self::VaapiVulkan => HardwareDecodeMode::ForceVaapiVulkan,
+        }
+    }
 }
 
 impl HardwareDecodeMode {
@@ -40,6 +52,9 @@ impl HardwareDecodeMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "0" | "off" | "false" | "no" | "disabled" | "software" | "sw" => Some(Self::Off),
             "1" | "on" | "true" | "yes" | "auto" | "vulkan-auto" => Some(Self::Auto),
+            "auto-copy" | "auto-with-copyback" | "auto_with_copyback" => {
+                Some(Self::AutoWithCopyback)
+            }
             "vulkan" | "force" | "force-vulkan" | "vulkan-force" => Some(Self::ForceVulkan),
             "vaapi" | "force-vaapi" | "vaapi-force" | "vaapi-copy" => Some(Self::ForceVaapi),
             "vaapi-vulkan" | "force-vaapi-vulkan" | "vaapi-gpu" => Some(Self::ForceVaapiVulkan),
@@ -56,7 +71,7 @@ impl HardwareDecodeMode {
     }
 
     pub(crate) fn allows_fallback(self) -> bool {
-        matches!(self, Self::Auto)
+        matches!(self, Self::Auto | Self::AutoWithCopyback)
     }
 }
 
@@ -71,6 +86,7 @@ mod tests {
         assert_eq!(legacy.hardware_decode, HardwareDecodeMode::Auto);
         for (mode, value) in [
             (HardwareDecodeMode::Auto, "auto"),
+            (HardwareDecodeMode::AutoWithCopyback, "auto_with_copyback"),
             (HardwareDecodeMode::Off, "off"),
             (HardwareDecodeMode::ForceVulkan, "force_vulkan"),
             (HardwareDecodeMode::ForceVaapi, "force_vaapi"),
@@ -91,6 +107,7 @@ mod tests {
     fn hardware_decode_environment_overrides_only_valid_preferences() {
         for mode in [
             HardwareDecodeMode::Auto,
+            HardwareDecodeMode::AutoWithCopyback,
             HardwareDecodeMode::Off,
             HardwareDecodeMode::ForceVulkan,
             HardwareDecodeMode::ForceVaapi,
@@ -99,6 +116,12 @@ mod tests {
             assert_eq!(mode.resolve(None), mode);
             assert_eq!(mode.resolve(Some("unsupported")), mode);
             assert_eq!(mode.resolve(Some(" AUTO ")), HardwareDecodeMode::Auto);
+            for value in ["auto-copy", "auto-with-copyback", "auto_with_copyback"] {
+                assert_eq!(
+                    mode.resolve(Some(value)),
+                    HardwareDecodeMode::AutoWithCopyback
+                );
+            }
             assert_eq!(mode.resolve(Some("off")), HardwareDecodeMode::Off);
             assert_eq!(mode.resolve(Some("")), HardwareDecodeMode::Off);
             assert_eq!(

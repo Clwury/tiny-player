@@ -952,7 +952,7 @@ fn force_vulkan_orders_flush_reopen_cached_idr_then_explicit_failure() {
     );
     assert_eq!(
         transaction.pending_action(HardwareDecodeMode::Auto),
-        HevcDecodeRecoveryAction::RequestSoftwareFallback
+        HevcDecodeRecoveryAction::RequestAutoFallback
     );
     assert_eq!(transaction.attempt_ledger.len(), 2);
     assert_eq!(
@@ -985,7 +985,7 @@ fn force_vulkan_orders_flush_reopen_cached_idr_then_explicit_failure() {
     );
     assert_eq!(
         transaction.pending_action(HardwareDecodeMode::Auto),
-        HevcDecodeRecoveryAction::RequestSoftwareFallback
+        HevcDecodeRecoveryAction::RequestAutoFallback
     );
     let error = transaction.terminal_error(
         now + Duration::from_millis(5),
@@ -1043,7 +1043,7 @@ fn same_hardware_reopen_failure_rebuilds_cache_for_force_and_uses_software_for_a
         .hard_failure = Some("unbridged continuous decode gap");
     assert_eq!(
         automatic.advance_after_repeated_failure_if_idle(4, now, HardwareDecodeMode::Auto,),
-        HevcDecodeRecoveryAction::RequestSoftwareFallback
+        HevcDecodeRecoveryAction::RequestAutoFallback
     );
     assert_eq!(
         automatic.phase,
@@ -1084,7 +1084,7 @@ fn same_hardware_replay_timeout_advances_flush_then_reopen_once() {
             timed_out + HEVC_SAME_HARDWARE_REPLAY_PROGRESS_TIMEOUT,
             HardwareDecodeMode::Auto,
         ),
-        HevcDecodeRecoveryAction::RequestSoftwareFallback
+        HevcDecodeRecoveryAction::RequestAutoFallback
     );
     assert_eq!(transaction.flush_attempts, 1);
     assert_eq!(transaction.reopen_attempts, 1);

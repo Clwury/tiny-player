@@ -113,6 +113,72 @@ fn both_modes_keep_unedited_precision_when_applying_theme_language_and_decoder()
 }
 
 #[test]
+fn auto_selection_persists_the_settings_modes_copyback_policy() {
+    for (mode, expected) in [
+        (SettingsMode::User, HardwareDecodeMode::Auto),
+        (
+            SettingsMode::Development,
+            HardwareDecodeMode::AutoWithCopyback,
+        ),
+    ] {
+        let mut controller = controller(mode);
+        controller.dispatch(SettingsIntent::HardwareDecode(HardwareDecodeMode::Off));
+        let original = controller.snapshot();
+        let auto = mode.auto_hardware_decode();
+        assert_eq!(auto, expected);
+        let change = controller.dispatch(SettingsIntent::HardwareDecode(auto));
+        assert!(change.persist && change.view_changed);
+        assert_eq!(
+            controller.snapshot().playback,
+            PlaybackCacheConfig {
+                hardware_decode: expected,
+                ..original.playback
+            }
+        );
+        assert!(
+            !controller
+                .dispatch(SettingsIntent::HardwareDecode(auto))
+                .persist
+        );
+        let reopened = SettingsController::from_snapshot(controller.snapshot(), mode);
+        assert_eq!(reopened.view_model().config.hardware_decode, expected);
+    }
+}
+
+#[test]
+fn user_settings_preserve_development_values_until_an_allowed_decoder_is_selected() {
+    for hardware_decode in [
+        HardwareDecodeMode::ForceVaapi,
+        HardwareDecodeMode::AutoWithCopyback,
+    ] {
+        let mut snapshot = controller(SettingsMode::Development).snapshot();
+        snapshot.playback.hardware_decode = hardware_decode;
+        let mut controller =
+            SettingsController::from_snapshot(snapshot.clone(), SettingsMode::User);
+        assert_eq!(controller.snapshot(), snapshot);
+        for hidden in [
+            HardwareDecodeMode::ForceVaapi,
+            HardwareDecodeMode::AutoWithCopyback,
+        ] {
+            let change = controller.dispatch(SettingsIntent::HardwareDecode(hidden));
+            assert!(!change.persist && !change.view_changed);
+            assert_eq!(controller.snapshot(), snapshot);
+        }
+        controller.dispatch(SettingsIntent::Theme(ColorTheme::ALL[1]));
+        assert_eq!(controller.snapshot().playback, snapshot.playback);
+        assert!(
+            controller
+                .dispatch(SettingsIntent::HardwareDecode(HardwareDecodeMode::Auto))
+                .persist
+        );
+        assert_eq!(
+            controller.view_model().config.hardware_decode,
+            HardwareDecodeMode::Auto
+        );
+    }
+}
+
+#[test]
 fn invalid_numeric_edits_never_enter_snapshot_and_retry_updates_only_the_edited_field() {
     let mut controller = controller(SettingsMode::Development);
     let original = controller.snapshot();

@@ -49,28 +49,44 @@ impl VideoDecodePipeline {
         self.packets.pop_completed_packet()
     }
 
-    pub(in super::super) fn reopen_software_decoder(
+    pub(in super::super) fn can_fallback_after_hardware_error(&self, error: &str) -> bool {
+        self.info().hardware_accelerated
+            && self.requested_hardware_mode.allows_fallback()
+            && self
+                .auto_decode_plan
+                .as_ref()
+                .is_some_and(|plan| plan.has_next())
+            && (error.contains("Vulkan")
+                || error.contains("VA-API")
+                || error.contains("libplacebo")
+                || error.contains("硬件像素格式")
+                || error.contains("硬解未输出"))
+    }
+
+    pub(in super::super) fn reopen_next_auto_decoder(
         &mut self,
         stream: StreamInfo,
     ) -> std::result::Result<bool, String> {
         if !self.info().hardware_accelerated {
             return Ok(false);
         }
-        if !runtime_hevc_software_fallback_allowed(self.requested_hardware_mode) {
+        if !runtime_auto_fallback_allowed(self.requested_hardware_mode) {
             return Err(format!(
-                "software decoder reopen blocked by hardware-mode invariant: requested_hw_mode={:?}",
+                "Auto decoder fallback blocked by hardware-mode invariant: requested_hw_mode={:?}",
                 self.requested_hardware_mode
             ));
         }
-        // Match mpv's force_fallback(): completely retire the failed hardware
-        // AVCodecContext before selecting and opening the final software path.
-        // At this point bounded Vulkan recovery is exhausted, so preserving an
-        // already-failed worker for an atomic swap provides no useful rollback.
+        // Consume the playback-local chain instead of starting Auto again and
+        // reopening a failed candidate. Fully retire the old decoder first.
         self.worker
             .shutdown_and_join(HEVC_SAME_HARDWARE_WORKER_RETIRE_TIMEOUT)
             .map_err(|error| format!("FFmpeg 硬解 worker 退役失败：{error}"))?;
-        let decoder = Decoder::open_video(stream, HardwareDecodeMode::Off)
-            .map_err(|error| format!("FFmpeg 重新打开软件视频解码器失败：{error}"))?;
+        let plan = self
+            .auto_decode_plan
+            .as_mut()
+            .ok_or_else(|| "Auto 解码回退缺少候选状态".to_string())?;
+        let decoder = Decoder::open_auto_next(stream, plan)?;
+        self.auto_decode_plan = decoder.auto_decode_plan().cloned();
         let worker = VideoDecodeWorker::spawn(decoder, self.frame_drop.epoch_handle())?;
         self.worker = worker;
         self.decoder_epoch = self.decoder_epoch.saturating_add(1).max(1);
