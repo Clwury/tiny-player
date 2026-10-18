@@ -32,6 +32,11 @@ impl VideoDecodePipeline {
             .complete_startup_watchdog_after_first_frame();
     }
 
+    pub(in super::super) fn reset_hevc_in_flight_stall_watchdog(&mut self) {
+        self.hevc_decode_chain_watchdog
+            .reset_in_flight_stall_watchdog();
+    }
+
     pub(in super::super) fn defer_hevc_startup_stall_watchdog_after_no_action(
         &mut self,
         now: Instant,

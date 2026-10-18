@@ -1143,6 +1143,7 @@ pub(super) enum HevcDecodeChainFallbackReason {
     ZeroOutputRebuffer,
     ResourcePressure,
     StartupInFlightStall,
+    RebufferInFlightStall,
     PtsGapAfterZeroOutput,
     RecoveryWaitRebuffer,
     PostFallbackRebufferUnderfill,
@@ -1154,6 +1155,7 @@ impl HevcDecodeChainFallbackReason {
             Self::ZeroOutputRebuffer => "hevc_decode_chain_zero_output_rebuffer",
             Self::ResourcePressure => "hevc_decode_chain_resource_pressure",
             Self::StartupInFlightStall => "hevc_decode_chain_startup_in_flight_stall",
+            Self::RebufferInFlightStall => "hevc_decode_chain_rebuffer_in_flight_stall",
             Self::PtsGapAfterZeroOutput => "hevc_decode_chain_pts_gap",
             Self::RecoveryWaitRebuffer => "hevc_decode_chain_recovery_wait_rebuffer",
             Self::PostFallbackRebufferUnderfill => {
@@ -1168,6 +1170,7 @@ impl HevcDecodeChainFallbackReason {
             Self::ZeroOutputRebuffer
                 | Self::ResourcePressure
                 | Self::StartupInFlightStall
+                | Self::RebufferInFlightStall
                 | Self::RecoveryWaitRebuffer
                 | Self::PostFallbackRebufferUnderfill
                 | Self::PtsGapAfterZeroOutput
@@ -1178,6 +1181,7 @@ impl HevcDecodeChainFallbackReason {
         matches!(
             self,
             Self::StartupInFlightStall
+                | Self::RebufferInFlightStall
                 | Self::RecoveryWaitRebuffer
                 | Self::PostFallbackRebufferUnderfill
         )
@@ -2773,16 +2777,15 @@ impl HevcDecodeChainWatchdog {
         &mut self,
         input: HevcStartupStallObservation,
     ) -> HevcDecodeChainRecoveryAction {
-        if self.startup_watchdog_completed {
-            return HevcDecodeChainRecoveryAction::None;
-        }
         if input.codec_id != ffi::AVCodecID::AV_CODEC_ID_HEVC {
             self.reset();
             return HevcDecodeChainRecoveryAction::None;
         }
 
         self.observe_startup_in_flight_stall(input);
-        if self.pending_fallback.is_some() {
+        // Completing first-frame recovery only retires the startup zero-output
+        // budget. Later rebuffering still needs an in-flight progress timeout.
+        if self.pending_fallback.is_some() || self.startup_watchdog_completed {
             return HevcDecodeChainRecoveryAction::None;
         }
 
@@ -2824,10 +2827,7 @@ impl HevcDecodeChainWatchdog {
     }
 
     fn arm_startup_in_flight_stall(&mut self, session_id: PlaybackSessionId, now: Instant) {
-        if self.startup_watchdog_completed
-            || self.pending_fallback.is_some()
-            || self.startup_in_flight_stall_started_at.is_some()
-        {
+        if self.pending_fallback.is_some() || self.startup_in_flight_stall_started_at.is_some() {
             return;
         }
         self.startup_in_flight_stall_started_at = Some(now);
@@ -2867,12 +2867,11 @@ impl HevcDecodeChainWatchdog {
         {
             self.last_result_produced_sequence =
                 input.video_decode_snapshot.result_produced_sequence;
-            self.startup_in_flight_stall_started_at = None;
-            self.startup_watchdog_retry_not_before = None;
+            self.reset_in_flight_stall_watchdog();
             return;
         }
         if !hevc_startup_in_flight_stall_context(input) {
-            self.startup_in_flight_stall_started_at = None;
+            self.reset_in_flight_stall_watchdog();
             return;
         }
 
@@ -2884,6 +2883,11 @@ impl HevcDecodeChainWatchdog {
             }
         };
         self.trigger_startup_in_flight_fallback_if_elapsed(input, started_at);
+    }
+
+    fn reset_in_flight_stall_watchdog(&mut self) {
+        self.startup_in_flight_stall_started_at = None;
+        self.startup_watchdog_retry_not_before = None;
     }
 
     fn trigger_startup_in_flight_fallback_if_elapsed(
@@ -2909,7 +2913,11 @@ impl HevcDecodeChainWatchdog {
             return;
         }
 
-        let reason = HevcDecodeChainFallbackReason::StartupInFlightStall;
+        let reason = if self.startup_watchdog_completed {
+            HevcDecodeChainFallbackReason::RebufferInFlightStall
+        } else {
+            HevcDecodeChainFallbackReason::StartupInFlightStall
+        };
         self.pending_fallback = Some(HevcDecodeChainFallback {
             target_nsecs: input.fallback_target_nsecs,
             reason,
@@ -2925,12 +2933,15 @@ impl HevcDecodeChainWatchdog {
             output_state = ?input.output_snapshot.state,
             first_video_frame_pending = input.output_snapshot.first_video_frame_pending,
             output_rebuffering = input.output_snapshot.rebuffering,
+            queued_video_frames = input.output_snapshot.queued_video_frames,
+            queued_video_forward_ms = input.output_snapshot.queued_video_bootstrap_forward_nsecs()
+                as f64 / 1_000_000.0,
             demux_min_forward_ms = ?input
                 .demux_watermark
                 .selected_min_forward_nsecs
                 .map(|duration| duration as f64 / 1_000_000.0),
             fallback_reason = reason.as_str(),
-            "hevc_decode_chain_startup_in_flight_hard"
+            "HEVC in-flight decoder stalled while output waits to resume"
         );
     }
 
@@ -4224,14 +4235,12 @@ impl HevcDecodeChainWatchdog {
     }
 
     fn startup_watchdog_deadline(&self, hardware_accelerated: bool) -> Option<Instant> {
-        if self.startup_watchdog_completed
-            || !hardware_accelerated
-            || self.startup_waiting_for_input
-        {
+        if !hardware_accelerated || self.startup_waiting_for_input {
             return None;
         }
         let deadline = min_instant(
             self.first_zero_output_at
+                .filter(|_| !self.startup_watchdog_completed)
                 .map(|started_at| started_at + HEVC_STARTUP_ZERO_OUTPUT_HARD_AFTER),
             self.startup_in_flight_deadline(),
         );
@@ -4385,7 +4394,19 @@ fn hevc_startup_in_flight_stall_context(input: HevcStartupStallObservation) -> b
         && input.video_decode_snapshot.submitted_not_consumed_packets > 0
         && input.video_decode_snapshot.completed_packets == 0
         && input.video_decode_snapshot.queued_frames == 0
-        && input.output_snapshot.queued_video_frames == 0
+        && hevc_in_flight_stall_output_blocked(input.output_snapshot)
+}
+
+pub(in crate::backend::ffmpeg::playback_loop) fn hevc_in_flight_stall_output_blocked(
+    output_snapshot: PlaybackOutputSnapshot,
+) -> bool {
+    // A short retained queue cannot discharge the rebuffer waterline. Requiring
+    // an empty queue hides a stuck decoder indefinitely (six frames / 240ms in
+    // the VA-API trace). A running output with queued frames remains exempt.
+    output_snapshot.queued_video_frames == 0
+        || (output_snapshot.rebuffering
+            && output_snapshot.queued_video_bootstrap_forward_nsecs()
+                < duration_nsecs(VIDEO_OUTPUT_REBUFFER_RESUME_DURATION))
 }
 
 pub(super) struct VideoDecodePipeline {

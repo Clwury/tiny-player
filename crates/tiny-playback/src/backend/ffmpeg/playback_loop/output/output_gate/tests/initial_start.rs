@@ -2307,6 +2307,122 @@ fn retry_initial_prefill(
 }
 
 #[test]
+fn aac_initial_prefill_crosses_the_two_hundred_ms_frame_boundary_without_rebuffering() {
+    const TARGET: u64 = 1_096_960_000_000;
+    const FRAME_COUNT: u64 = 100;
+    const SAMPLE_RATE: u64 = 44_100;
+    const AUDIO_START: u64 = TARGET - 2_784_646;
+    for prepare_short_prefix_first in [false, true] {
+        let session_id = PlaybackSessionId(1_097);
+        let control = Arc::new(FfmpegControl::new(session_id));
+        let output = AudioOutput::stopped_for_test(Arc::clone(&control), 96_000, 44_100, 2);
+        output.reset_clock(TARGET);
+        let epoch = output.audio_epoch();
+        let mut output_scheduler = PlaybackOutputScheduler::new();
+        for index in 0..5 {
+            output_scheduler
+                .push_decoded_video_for_test(test_queued_video_frame(TARGET + index * 40_000_000));
+        }
+        let push_audio = |scheduler: &mut PlaybackOutputScheduler, index: u64| {
+            let start = AUDIO_START + index * 1_024 * 1_000_000_000 / SAMPLE_RATE;
+            let end = AUDIO_START + (index + 1) * 1_024 * 1_000_000_000 / SAMPLE_RATE;
+            scheduler.push_pending_start_audio_for_test(
+                DecodedAudio {
+                    samples: vec![0.25; 2_048],
+                    duration_nsecs: end - start,
+                },
+                start,
+                end,
+            );
+        };
+        let initial_frames = if prepare_short_prefix_first {
+            8
+        } else {
+            FRAME_COUNT
+        };
+        for index in 0..initial_frames {
+            push_audio(&mut output_scheduler, index);
+        }
+        output_scheduler.begin_initial_av_start_transaction(
+            TARGET,
+            TARGET,
+            Instant::now() - Duration::from_millis(100),
+        );
+        let vo_queue = VideoOutputQueue::default();
+        vo_queue.begin_session(session_id);
+        let frame_presented = AtomicBool::new(false);
+        let (event_tx, event_rx) = mpsc::channel();
+        let mut position = PositionReporter::default();
+        let mut subtitles = SubtitlePipeline::empty_for_test();
+        let mut buffered = BufferedReporter::new_with_events(true, false);
+        let mut current_start = TARGET;
+        let mut playback_scheduler = PlaybackScheduler::new(TARGET);
+        let mut service = |scheduler: &mut PlaybackOutputScheduler| {
+            service_initial_video_clock_until_audio_start(
+                scheduler,
+                &output,
+                None,
+                TARGET,
+                Some(0),
+                &control,
+                session_id,
+                &vo_queue,
+                &frame_presented,
+                &mut position,
+                &event_tx,
+                &mut subtitles,
+                &mut buffered,
+                &mut current_start,
+                &mut playback_scheduler,
+            )
+            .unwrap()
+        };
+        if prepare_short_prefix_first {
+            assert_eq!(
+                service(&mut output_scheduler),
+                OutputGateResumeStatus::WaitingForDecodedAudio
+            );
+            let token = output_scheduler.initial_audio_prepare_token().unwrap();
+            assert_eq!(token.staged_frames, 8);
+            assert!(
+                (182_000_000..184_000_000)
+                    .contains(&output.snapshot().unwrap().queue_pending_nsecs)
+            );
+            assert!(!output.stream_active());
+            assert!(!frame_presented.load(Ordering::Acquire));
+            for index in initial_frames..FRAME_COUNT {
+                push_audio(&mut output_scheduler, index);
+            }
+            output_scheduler.note_output_housekeeping_change();
+        }
+        assert_eq!(
+            retry_initial_prefill(|| service(&mut output_scheduler)),
+            OutputGateResumeStatus::Resumed
+        );
+        let snapshot = output.snapshot().unwrap();
+        assert!((200_000_000..230_000_000).contains(&snapshot.queue_pending_nsecs));
+        assert_eq!(snapshot.queue_frames, 9);
+        assert_eq!(
+            snapshot.queue_frames + output_scheduler.pending_start_audio.len(),
+            FRAME_COUNT as usize
+        );
+        assert_eq!(snapshot.payload_range_nsecs.unwrap().0, TARGET);
+        assert_eq!(output.audio_epoch(), epoch);
+        assert!(output.stream_active());
+        assert!(frame_presented.load(Ordering::Acquire));
+        assert_eq!(
+            output_scheduler.snapshot().state,
+            PlaybackOutputState::Playing
+        );
+        assert!(event_rx.try_iter().all(|event| !matches!(
+            event.kind,
+            BackendEventKind::Diagnostic(diagnostic)
+                if diagnostic.code == "ffmpeg_initial_audio_stage_no_payload_terminal"
+        )));
+    }
+}
+
+#[test]
 fn truehd_initial_start_retains_partial_prefill_until_two_hundred_ms_or_eof() {
     const TARGET: u64 = 541_828_000_000;
     for (input_eof, eof_after_stage) in [(false, false), (true, false), (false, true)] {

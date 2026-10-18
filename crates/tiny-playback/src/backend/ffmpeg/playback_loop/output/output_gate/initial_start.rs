@@ -1413,6 +1413,17 @@ pub(in crate::backend::ffmpeg::playback_loop) fn service_initial_video_clock_unt
     // frames. Retain that ownership and append on the next pass; a successful
     // enqueue alone must never publish video or start AO (mpv's AO prefill).
     let audio_flush_start_timeline_nsecs = preparing_token.staged_until_nsecs;
+    let remaining_prefill_nsecs = duration_nsecs(INITIAL_AUDIO_START_MIN_AMMUNITION)
+        .saturating_sub(ammunition.device_audio_nsecs);
+    // pop_front_until only stages whole frames. A timestamp limit at exactly
+    // 200ms can strand the next AAC frame after a shorter prepared prefix.
+    // Count reachable PCM (excluding PTS holes), then round to its frame end.
+    let prefill_until_nsecs = stage_guard
+        .scheduler()
+        .pending_start_audio
+        .stageable_prefill_coverage(audio_flush_start_timeline_nsecs, remaining_prefill_nsecs)
+        .map(|coverage| coverage.until_nsecs)
+        .unwrap_or(audio_flush_start_timeline_nsecs);
     let audio_flush_until_timeline_nsecs = stage_guard
         .scheduler()
         .scheduled_video_queue
@@ -1436,7 +1447,8 @@ pub(in crate::backend::ffmpeg::playback_loop) fn service_initial_video_clock_unt
             transaction
                 .audio_start_target_nsecs
                 .saturating_add(duration_nsecs(INITIAL_AUDIO_START_MIN_AMMUNITION)),
-        );
+        )
+        .max(prefill_until_nsecs);
     let stage_attempt = {
         let _stage = output.begin_service_stage(AudioOutputServiceStage::StagePending);
         let scheduler = stage_guard.scheduler_mut();

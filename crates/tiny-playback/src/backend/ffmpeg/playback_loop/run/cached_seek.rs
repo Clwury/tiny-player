@@ -16,6 +16,9 @@ pub(super) fn service_hevc_startup_stall_watchdog_due_if_needed(
     checkpoint: &'static str,
 ) -> std::result::Result<bool, String> {
     if control.is_user_paused() && !pipeline.output_scheduler.restart_pending() {
+        pipeline
+            .video_decode_pipeline
+            .reset_hevc_in_flight_stall_watchdog();
         return Ok(false);
     }
     let drained_progress = drain_video_decode_results_before_watchdog(
@@ -682,6 +685,7 @@ pub(super) fn hevc_decode_chain_fallback_requests_same_hardware_recovery(
         reason,
         HevcDecodeChainFallbackReason::ZeroOutputRebuffer
             | HevcDecodeChainFallbackReason::StartupInFlightStall
+            | HevcDecodeChainFallbackReason::RebufferInFlightStall
             | HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput
             | HevcDecodeChainFallbackReason::RecoveryWaitRebuffer
             | HevcDecodeChainFallbackReason::PostFallbackRebufferUnderfill

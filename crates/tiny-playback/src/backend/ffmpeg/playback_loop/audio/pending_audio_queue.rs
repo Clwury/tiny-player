@@ -261,6 +261,25 @@ impl PendingStartAudio {
         start_nsecs: u64,
         limit_nsecs: u64,
     ) -> Option<PendingAudioStageCoverage> {
+        self.stageable_coverage(start_nsecs, limit_nsecs, None)
+    }
+
+    /// Stops at the first whole frame that supplies the requested PCM, or at
+    /// the end of the reachable prefix if more decoded audio is still needed.
+    pub(in crate::backend::ffmpeg) fn stageable_prefill_coverage(
+        &self,
+        start_nsecs: u64,
+        payload_target_nsecs: u64,
+    ) -> Option<PendingAudioStageCoverage> {
+        self.stageable_coverage(start_nsecs, u64::MAX, Some(payload_target_nsecs))
+    }
+
+    fn stageable_coverage(
+        &self,
+        start_nsecs: u64,
+        limit_nsecs: u64,
+        payload_target_nsecs: Option<u64>,
+    ) -> Option<PendingAudioStageCoverage> {
         let mut until_nsecs = start_nsecs;
         let mut payload_nsecs = 0_u64;
         for frame in &self.frames {
@@ -279,7 +298,9 @@ impl PendingStartAudio {
             payload_nsecs = payload_nsecs
                 .saturating_add(end.saturating_sub(frame.start_timeline_nsecs.max(until_nsecs)));
             until_nsecs = end;
-            if until_nsecs >= limit_nsecs {
+            if until_nsecs >= limit_nsecs
+                || payload_target_nsecs.is_some_and(|target| payload_nsecs >= target)
+            {
                 break;
             }
         }
@@ -463,6 +484,35 @@ mod tests {
                 .stageable_coverage_between(900_000_000, 950_000_000)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn prefill_coverage_counts_pcm_instead_of_pts_holes_or_overlaps() {
+        let mut pending = PendingStartAudio::default();
+        pending.push(decoded_audio(100_000_000), 1_000_000_000, 1_100_000_000);
+        pending.push(decoded_audio(100_000_000), 1_080_000_000, 1_180_000_000);
+        pending.push(decoded_audio(100_000_000), 1_230_000_000, 1_330_000_000);
+        pending.push(decoded_audio(100_000_000), 1_330_000_000, 1_430_000_000);
+
+        let coverage = pending
+            .stageable_prefill_coverage(1_050_000_000, 200_000_000)
+            .unwrap();
+        assert_eq!(coverage.payload_nsecs, 230_000_000);
+        assert_eq!(coverage.until_nsecs, 1_330_000_000);
+        assert_eq!(pending.len(), 4, "planning must preserve PCM ownership");
+    }
+
+    #[test]
+    fn prefill_coverage_retains_short_prefix_before_a_large_pts_gap() {
+        let mut pending = PendingStartAudio::default();
+        pending.push(decoded_audio(100_000_000), 1_000_000_000, 1_100_000_000);
+        pending.push(decoded_audio(100_000_000), 1_200_000_001, 1_300_000_001);
+
+        let coverage = pending
+            .stageable_prefill_coverage(1_000_000_000, 200_000_000)
+            .unwrap();
+        assert_eq!(coverage.payload_nsecs, 100_000_000);
+        assert_eq!(coverage.until_nsecs, 1_100_000_000);
     }
 
     #[test]

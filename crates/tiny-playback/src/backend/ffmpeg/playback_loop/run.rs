@@ -1270,6 +1270,13 @@ mod tests {
     }
 
     #[test]
+    fn hevc_rebuffer_in_flight_stall_requests_same_hardware_recovery() {
+        assert!(hevc_decode_chain_fallback_requests_same_hardware_recovery(
+            HevcDecodeChainFallbackReason::RebufferInFlightStall
+        ));
+    }
+
+    #[test]
     fn hevc_recovery_wait_rebuffer_requests_same_hardware_recovery() {
         assert!(hevc_decode_chain_fallback_requests_same_hardware_recovery(
             HevcDecodeChainFallbackReason::RecoveryWaitRebuffer
@@ -1363,6 +1370,7 @@ mod tests {
         for reason in [
             HevcDecodeChainFallbackReason::ZeroOutputRebuffer,
             HevcDecodeChainFallbackReason::StartupInFlightStall,
+            HevcDecodeChainFallbackReason::RebufferInFlightStall,
             HevcDecodeChainFallbackReason::RecoveryWaitRebuffer,
             HevcDecodeChainFallbackReason::PostFallbackRebufferUnderfill,
             HevcDecodeChainFallbackReason::PtsGapAfterZeroOutput,

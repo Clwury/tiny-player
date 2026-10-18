@@ -15,13 +15,13 @@ use super::output_queue_service::{OutputQueueAfterDecoderInputContext, OutputQue
 use super::playback_services::PlaybackPipelineServices;
 use super::video_decode_pipeline::{
     HevcDecodeChainFallback, HevcDecodeChainFallbackReason, HevcDecodeChainRecoveryAction,
-    HevcStartupStallObservation,
+    HevcStartupStallObservation, hevc_in_flight_stall_output_blocked,
 };
 use super::video_decode_worker::{VideoDecodeWorkerSnapshot, VideoDecodeWorkerState};
 use super::{
     DemuxPacketCache, DemuxReaderWatermark, FfmpegControl, HttpRingCache,
     PLAYBACK_COORDINATOR_STAGE_TIMING_LOG_AFTER, PLAYBACK_COORDINATOR_TICK_TIMING_LOG_AFTER,
-    PlaybackBlockReason, PlaybackOutputScheduler, PlaybackPipelineState,
+    PlaybackBlockReason, PlaybackOutputScheduler, PlaybackOutputSnapshot, PlaybackPipelineState,
     VIDEO_OUTPUT_REBUFFER_RESUME_DURATION, duration_nsecs, expire_initial_av_start_hard_deadline,
 };
 use ffmpeg_sys_next as ffi;
@@ -770,6 +770,9 @@ fn service_hevc_startup_stall_watchdog(
         || prepare_snapshot.in_flight_frames > 0
         || prepare_snapshot.completed_frames > 0
     {
+        pipeline
+            .video_decode_pipeline
+            .reset_hevc_in_flight_stall_watchdog();
         return Ok(None);
     }
     let output_snapshot = pipeline.output_scheduler.snapshot();
@@ -869,11 +872,15 @@ pub(super) fn service_hevc_startup_stall_watchdog_if_due(
         .video_decode_pipeline
         .hevc_startup_stall_watchdog_deadline()
     else {
-        return Ok(None);
+        // Observe even without an armed deadline: rebuffer can begin after
+        // first-frame completion while an older native call is still in flight.
+        return service_hevc_startup_stall_watchdog(session_id, pipeline, demux_watermark);
     };
     let now = Instant::now();
     if now < deadline {
-        return Ok(None);
+        // Refresh the progress/context exclusions before the deadline so cache
+        // starvation or pending output cannot count towards a decode timeout.
+        return service_hevc_startup_stall_watchdog(session_id, pipeline, demux_watermark);
     }
 
     let fallback_pending_before = pipeline
@@ -882,7 +889,7 @@ pub(super) fn service_hevc_startup_stall_watchdog_if_due(
     let reject_reason = hevc_startup_watchdog_reject_reason(
         pipeline.video_stream.codec_id,
         pipeline.video_decode_pipeline.info().hardware_accelerated,
-        output_snapshot.queued_video_frames,
+        output_snapshot,
         video_decode_snapshot,
         video_prepare_pending,
     );
@@ -971,7 +978,7 @@ fn hevc_startup_watchdog_waiting_cached_input(
 fn hevc_startup_watchdog_reject_reason(
     codec_id: ffi::AVCodecID,
     hardware_accelerated: bool,
-    queued_video_frames: usize,
+    output_snapshot: PlaybackOutputSnapshot,
     video_decode_snapshot: VideoDecodeWorkerSnapshot,
     video_prepare_pending: bool,
 ) -> &'static str {
@@ -1004,7 +1011,7 @@ fn hevc_startup_watchdog_reject_reason(
     if video_decode_snapshot.queued_frames > 0 {
         return "decoded_frames_queued";
     }
-    if queued_video_frames > 0 {
+    if !hevc_in_flight_stall_output_blocked(output_snapshot) {
         return "output_frames_queued";
     }
     "eligible"
@@ -1506,11 +1513,11 @@ mod tests {
     use ffmpeg_sys_next as ffi;
 
     use super::{
-        HevcDecodeChainFallback, HevcDecodeChainFallbackReason, PlaybackRecoveryRequest,
-        PlaybackRecoverySource, PlaybackTickStatus, PlaybackWatchdogDeadline,
-        VideoDecodeWorkerSnapshot, VideoDecodeWorkerState, hevc_decode_chain_fallback_tick_status,
-        hevc_startup_watchdog_reject_reason, hevc_startup_watchdog_waiting_cached_input,
-        playback_watchdog_deadline_due,
+        HevcDecodeChainFallback, HevcDecodeChainFallbackReason, PlaybackOutputScheduler,
+        PlaybackRecoveryRequest, PlaybackRecoverySource, PlaybackTickStatus,
+        PlaybackWatchdogDeadline, VideoDecodeWorkerSnapshot, VideoDecodeWorkerState,
+        hevc_decode_chain_fallback_tick_status, hevc_startup_watchdog_reject_reason,
+        hevc_startup_watchdog_waiting_cached_input, playback_watchdog_deadline_due,
     };
 
     fn video_decode_snapshot(
@@ -1585,7 +1592,7 @@ mod tests {
             hevc_startup_watchdog_reject_reason(
                 ffi::AVCodecID::AV_CODEC_ID_HEVC,
                 true,
-                0,
+                PlaybackOutputScheduler::new().snapshot(),
                 video_decode_snapshot(VideoDecodeWorkerState::Decoding, 4, 0, 0),
                 false,
             ),
@@ -1599,7 +1606,7 @@ mod tests {
             hevc_startup_watchdog_reject_reason(
                 ffi::AVCodecID::AV_CODEC_ID_H264,
                 true,
-                0,
+                PlaybackOutputScheduler::new().snapshot(),
                 video_decode_snapshot(VideoDecodeWorkerState::Decoding, 4, 0, 0),
                 false,
             ),
@@ -1609,7 +1616,7 @@ mod tests {
             hevc_startup_watchdog_reject_reason(
                 ffi::AVCodecID::AV_CODEC_ID_HEVC,
                 false,
-                0,
+                PlaybackOutputScheduler::new().snapshot(),
                 video_decode_snapshot(VideoDecodeWorkerState::Decoding, 4, 0, 0),
                 false,
             ),
@@ -1619,7 +1626,7 @@ mod tests {
             hevc_startup_watchdog_reject_reason(
                 ffi::AVCodecID::AV_CODEC_ID_HEVC,
                 true,
-                0,
+                PlaybackOutputScheduler::new().snapshot(),
                 video_decode_snapshot(VideoDecodeWorkerState::Decoding, 4, 1, 0),
                 false,
             ),

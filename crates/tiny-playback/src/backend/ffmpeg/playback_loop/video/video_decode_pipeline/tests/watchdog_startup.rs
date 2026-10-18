@@ -464,6 +464,214 @@ fn hevc_startup_in_flight_hard_fallbacks_after_timeout_without_packet_status() {
     );
 }
 
+fn retained_rebuffer_stall_observation(now: Instant) -> HevcStartupStallObservation {
+    let target_nsecs = 1_096_960_000_000;
+    let mut output = output_snapshot(
+        PlaybackOutputState::Rebuffering,
+        true,
+        false,
+        Some((target_nsecs, target_nsecs + 240_000_000)),
+        Some(240_000_000),
+    );
+    output.queued_video_frames = 6;
+    let mut in_flight = snapshot(VideoDecodeWorkerState::Decoding, 0, 4);
+    in_flight.oldest_submitted_packet_nsecs = Some(target_nsecs + 240_000_000);
+    HevcStartupStallObservation {
+        session_id: PlaybackSessionId(1),
+        codec_id: ffi::AVCodecID::AV_CODEC_ID_HEVC,
+        hardware_accelerated: true,
+        video_decode_snapshot: in_flight,
+        now,
+        output_snapshot: output,
+        demux_watermark: demux_watermark(false),
+        has_audio_output: true,
+        fallback_target_nsecs: target_nsecs,
+    }
+}
+
+#[test]
+fn retained_six_frame_rebuffer_triggers_in_flight_recovery_before_and_after_first_frame() {
+    for after_first_frame in [false, true] {
+        let now = Instant::now();
+        let mut watchdog = HevcDecodeChainWatchdog::default();
+        if after_first_frame {
+            watchdog.complete_startup_watchdog_after_first_frame();
+        }
+        let mut input = retained_rebuffer_stall_observation(now);
+        watchdog.observe_startup_stall(input);
+        assert_eq!(
+            watchdog.startup_watchdog_deadline(true),
+            Some(now + HEVC_STARTUP_IN_FLIGHT_HARD_AFTER)
+        );
+        input.now = now + HEVC_STARTUP_IN_FLIGHT_HARD_AFTER - Duration::from_nanos(1);
+        watchdog.observe_startup_stall(input);
+        assert_eq!(watchdog.take_fallback(), None);
+
+        input.now = now + HEVC_STARTUP_IN_FLIGHT_HARD_AFTER;
+        watchdog.observe_startup_stall(input);
+        assert_eq!(
+            watchdog.take_fallback(),
+            Some(HevcDecodeChainFallback {
+                target_nsecs: input.fallback_target_nsecs,
+                reason: if after_first_frame {
+                    HevcDecodeChainFallbackReason::RebufferInFlightStall
+                } else {
+                    HevcDecodeChainFallbackReason::StartupInFlightStall
+                },
+            })
+        );
+    }
+}
+
+#[test]
+fn rebuffer_stall_uses_contiguous_video_coverage_instead_of_queue_span() {
+    let now = Instant::now();
+    let mut watchdog = HevcDecodeChainWatchdog::default();
+    let mut input = retained_rebuffer_stall_observation(now);
+    input.output_snapshot.queued_video_duration_nsecs = 2_000_000_000;
+    input.output_snapshot.queued_video_range_span_nsecs = 10_000_000_000;
+    watchdog.observe_startup_stall(input);
+    input.now += HEVC_STARTUP_IN_FLIGHT_HARD_AFTER;
+    watchdog.observe_startup_stall(input);
+    assert!(watchdog.take_fallback().is_some());
+}
+
+#[test]
+fn rebuffer_in_flight_stall_still_has_a_deadline_when_cached_input_reaches_eof() {
+    let now = Instant::now();
+    let mut watchdog = HevcDecodeChainWatchdog::default();
+    watchdog.complete_startup_watchdog_after_first_frame();
+    let mut input = retained_rebuffer_stall_observation(now);
+    // The final packets are already inside the decoder. EOF is idle rather
+    // than cache underrun, so a short demux tail must not disable their timer.
+    input.demux_watermark.video_forward_nsecs = Some(0);
+    input.demux_watermark.audio_forward_nsecs = Some(0);
+    input.demux_watermark.selected_min_forward_nsecs = Some(0);
+    input.demux_watermark.idle = true;
+    watchdog.observe_startup_stall(input);
+    input.now += HEVC_STARTUP_IN_FLIGHT_HARD_AFTER;
+    watchdog.observe_startup_stall(input);
+    assert_eq!(
+        watchdog.take_fallback().unwrap().reason,
+        HevcDecodeChainFallbackReason::RebufferInFlightStall
+    );
+}
+
+#[test]
+fn queued_video_exempts_running_output_and_fully_prefilled_rebuffer_from_stall_recovery() {
+    for running in [false, true] {
+        let now = Instant::now();
+        let mut watchdog = HevcDecodeChainWatchdog::default();
+        watchdog.complete_startup_watchdog_after_first_frame();
+        watchdog.arm_startup_in_flight_stall(PlaybackSessionId(1), now);
+        let mut input = retained_rebuffer_stall_observation(now);
+        if running {
+            input.output_snapshot.state = PlaybackOutputState::Playing;
+            input.output_snapshot.rebuffering = false;
+        } else {
+            input.output_snapshot.queued_video_contiguous_forward_nsecs = Some(1_000_000_000);
+        }
+        watchdog.observe_startup_stall(input);
+        assert_eq!(watchdog.startup_watchdog_deadline(true), None);
+        input.now += HEVC_STARTUP_IN_FLIGHT_HARD_AFTER;
+        watchdog.observe_startup_stall(input);
+        assert_eq!(watchdog.take_fallback(), None);
+    }
+}
+
+#[test]
+fn rebuffer_worker_result_progress_restarts_the_full_stall_timeout() {
+    let now = Instant::now();
+    let mut watchdog = HevcDecodeChainWatchdog::default();
+    watchdog.complete_startup_watchdog_after_first_frame();
+    let mut input = retained_rebuffer_stall_observation(now);
+    watchdog.observe_startup_stall(input);
+
+    input.now = now + Duration::from_millis(1_500);
+    input.video_decode_snapshot.result_produced_sequence = 1;
+    input.video_decode_snapshot.result_consumed_sequence = 1;
+    watchdog.observe_startup_stall(input);
+    assert_eq!(watchdog.startup_watchdog_deadline(true), None);
+    watchdog.observe_startup_stall(input);
+    let restarted_deadline = input.now + HEVC_STARTUP_IN_FLIGHT_HARD_AFTER;
+    assert_eq!(
+        watchdog.startup_watchdog_deadline(true),
+        Some(restarted_deadline)
+    );
+
+    input.now = now + HEVC_STARTUP_IN_FLIGHT_HARD_AFTER;
+    watchdog.observe_startup_stall(input);
+    assert_eq!(watchdog.take_fallback(), None);
+    input.now = restarted_deadline;
+    watchdog.observe_startup_stall(input);
+    assert_eq!(
+        watchdog.take_fallback().unwrap().reason,
+        HevcDecodeChainFallbackReason::RebufferInFlightStall
+    );
+}
+
+#[test]
+fn admitted_video_progress_invalidates_a_pending_rebuffer_stall_fallback() {
+    let now = Instant::now();
+    let mut watchdog = HevcDecodeChainWatchdog::default();
+    watchdog.complete_startup_watchdog_after_first_frame();
+    let mut input = retained_rebuffer_stall_observation(now);
+    watchdog.observe_startup_stall(input);
+    input.now += HEVC_STARTUP_IN_FLIGHT_HARD_AFTER;
+    watchdog.observe_startup_stall(input);
+    assert_eq!(
+        watchdog.pending_fallback.unwrap().reason,
+        HevcDecodeChainFallbackReason::RebufferInFlightStall
+    );
+
+    watchdog.reset_transient_after_progress(
+        Some(input.fallback_target_nsecs + 240_000_000),
+        Some(input.fallback_target_nsecs + 280_000_000),
+        input.now,
+    );
+    assert_eq!(watchdog.take_fallback(), None);
+    assert_eq!(watchdog.startup_watchdog_deadline(true), None);
+}
+
+#[test]
+fn cache_wait_and_pending_decoder_output_do_not_count_towards_rebuffer_stall_timeout() {
+    for excluded in 0..5 {
+        let now = Instant::now();
+        let mut watchdog = HevcDecodeChainWatchdog::default();
+        watchdog.complete_startup_watchdog_after_first_frame();
+        let input = retained_rebuffer_stall_observation(now);
+        watchdog.observe_startup_stall(input);
+        let mut blocked = input;
+        blocked.now += Duration::from_secs(1);
+        match excluded {
+            0 => blocked.demux_watermark.video_underrun = true,
+            1 => blocked.demux_watermark.audio_underrun = true,
+            2 => blocked.video_decode_snapshot.result_produced_sequence = 1,
+            3 => blocked.video_decode_snapshot.completed_packets = 1,
+            4 => blocked.video_decode_snapshot.queued_frames = 1,
+            _ => unreachable!(),
+        }
+        watchdog.observe_startup_stall(blocked);
+        watchdog.observe_startup_stall(blocked);
+        assert_eq!(watchdog.startup_watchdog_deadline(true), None);
+
+        let mut resumed = HevcStartupStallObservation {
+            now: now + Duration::from_secs(10),
+            ..input
+        };
+        resumed.video_decode_snapshot.result_produced_sequence =
+            blocked.video_decode_snapshot.result_produced_sequence;
+        resumed.video_decode_snapshot.result_consumed_sequence =
+            resumed.video_decode_snapshot.result_produced_sequence;
+        watchdog.observe_startup_stall(resumed);
+        assert_eq!(watchdog.take_fallback(), None);
+        assert_eq!(
+            watchdog.startup_watchdog_deadline(true),
+            Some(resumed.now + HEVC_STARTUP_IN_FLIGHT_HARD_AFTER)
+        );
+    }
+}
+
 #[test]
 fn hevc_startup_in_flight_deadline_can_be_armed_at_enqueue() {
     let mut watchdog = HevcDecodeChainWatchdog::default();
