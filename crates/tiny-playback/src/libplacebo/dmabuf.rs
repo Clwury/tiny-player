@@ -31,7 +31,8 @@ impl LibplaceboToneMapper {
         input: &DmaBufVideoFrame,
         size: RenderSize,
     ) -> Result<DmaBufSourceFrame> {
-        if unsafe { (*self.gpu).import_caps.tex } & u64::from(ffi::pl_handle_type_PL_HANDLE_DMA_BUF)
+        // Bindgen uses a signed C enum on MSVC and an unsigned one on Linux.
+        if unsafe { (*self.gpu).import_caps.tex } & ffi::pl_handle_type_PL_HANDLE_DMA_BUF as u64
             == 0
         {
             return Err(anyhow!("Vulkan 渲染设备不支持 DMA-BUF 纹理导入"));
