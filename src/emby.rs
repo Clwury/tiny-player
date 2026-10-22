@@ -35,11 +35,12 @@ pub use user::{
     UserItemsSort, UserView, UserViewImageTags, UserViews, VideoItemType,
 };
 
-pub(super) const CLIENT_NAME: &str = "Tiny Player";
-pub(super) const VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_CLIENT_NAME: &str = "Tiny Player";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug)]
 pub struct EmbyClient {
+    client_name: String,
     device_id: String,
     device_name: String,
     http: Client,
@@ -47,12 +48,20 @@ pub struct EmbyClient {
 
 impl EmbyClient {
     pub fn new(device_id: String) -> Result<Self> {
+        Self::new_with_args(device_id, std::env::args_os().skip(1))
+    }
+
+    fn new_with_args(
+        device_id: String,
+        args: impl IntoIterator<Item = std::ffi::OsString>,
+    ) -> Result<Self> {
         let http = Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
             .context("创建 Emby HTTP 客户端失败")?;
 
         Ok(Self {
+            client_name: client_name_from_args(args),
             device_id,
             device_name: device_name_from_system_name(sysinfo::System::name().as_deref()),
             http,
@@ -130,7 +139,7 @@ impl EmbyClient {
         let response = self
             .http
             .request(method, url)
-            .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
+            .header("User-Agent", self.user_agent())
             .send()
             .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;
 
@@ -189,7 +198,7 @@ impl EmbyClient {
             .header("Content-Type", "application/json")
             .header("X-Emby-Authorization", authorization)
             .header("X-Emby-Token", access_token)
-            .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
+            .header("User-Agent", self.user_agent())
             .send()
             .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;
 
@@ -254,7 +263,7 @@ impl EmbyClient {
             .header("Content-Type", "application/json")
             .header("X-Emby-Authorization", authorization)
             .header("X-Emby-Token", access_token)
-            .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
+            .header("User-Agent", self.user_agent())
             .body(request_body)
             .send()
             .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;
@@ -313,7 +322,7 @@ impl EmbyClient {
             .header("Accept", "image/*,*/*;q=0.8")
             .header("X-Emby-Authorization", authorization)
             .header("X-Emby-Token", access_token)
-            .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
+            .header("User-Agent", self.user_agent())
             .send()
             .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;
 
@@ -366,23 +375,58 @@ impl EmbyClient {
             ("Accept".to_string(), "*/*".to_string()),
             ("X-Emby-Authorization".to_string(), authorization),
             ("X-Emby-Token".to_string(), access_token.to_string()),
-            ("User-Agent".to_string(), format!("{CLIENT_NAME}/{VERSION}")),
+            ("User-Agent".to_string(), self.user_agent()),
         ])
     }
 
     fn authorization_header(&self) -> String {
         format!(
-            "Emby UserId=\"\", Client=\"{CLIENT_NAME}\", Device=\"{}\", DeviceId=\"{}\", Version=\"{VERSION}\", Token=\"\"",
-            self.device_name, self.device_id
+            "Emby UserId=\"\", Client=\"{}\", Device=\"{}\", DeviceId=\"{}\", Version=\"{VERSION}\", Token=\"\"",
+            self.client_name, self.device_name, self.device_id
         )
     }
 
     fn authenticated_authorization_header(&self, access_token: &str, user_id: &str) -> String {
         format!(
-            "MediaBrowser Token=\"{access_token}\", UserId=\"{user_id}\", Client=\"{CLIENT_NAME}\", Device=\"{}\", DeviceId=\"{}\", Version=\"{VERSION}\"",
-            self.device_name, self.device_id
+            "MediaBrowser Token=\"{access_token}\", UserId=\"{user_id}\", Client=\"{}\", Device=\"{}\", DeviceId=\"{}\", Version=\"{VERSION}\"",
+            self.client_name, self.device_name, self.device_id
         )
     }
+
+    fn user_agent(&self) -> String {
+        format!("{}/{VERSION}", self.client_name)
+    }
+}
+
+fn client_name_from_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> String {
+    let mut args = args.into_iter().peekable();
+    let mut name = None;
+    while let Some(argument) = args.next() {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--client-name" {
+            name = args
+                .next_if(|value| !value.to_string_lossy().starts_with('-'))
+                .and_then(|value| value.into_string().ok());
+        } else if let Some(value) = argument
+            .to_str()
+            .and_then(|argument| argument.strip_prefix("--client-name="))
+        {
+            name = Some(value.to_owned());
+        }
+    }
+    name.as_deref()
+        .map(str::trim)
+        .filter(|name| {
+            // Client is a quoted value in the comma-separated authorization header.
+            !name.is_empty()
+                && !name.chars().any(|character| {
+                    character.is_control() || matches!(character, '"' | '\\' | ',')
+                })
+        })
+        .unwrap_or(DEFAULT_CLIENT_NAME)
+        .to_owned()
 }
 
 fn device_name_from_system_name(system_name: Option<&str>) -> String {
@@ -461,6 +505,85 @@ fn api_url(endpoint: &ServerEndpoint, path_segments: &[&str]) -> Result<url::Url
         .extend(path_segments);
 
     Ok(url)
+}
+
+#[cfg(test)]
+mod client_name_tests {
+    use std::ffi::OsString;
+
+    use super::{DEFAULT_CLIENT_NAME, EmbyClient, VERSION, client_name_from_args};
+
+    fn parse(args: &[&str]) -> String {
+        client_name_from_args(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn client_name_accepts_separate_and_equals_arguments() {
+        assert_eq!(parse(&["--client-name", "My Player"]), "My Player");
+        assert_eq!(parse(&["--client-name=My Player"]), "My Player");
+        assert_eq!(
+            parse(&["--client-name", "  自定义客户端  "]),
+            "自定义客户端"
+        );
+        assert_eq!(
+            parse(&["--client-name=First", "--client-name", "Second"]),
+            "Second"
+        );
+    }
+
+    #[test]
+    fn client_name_falls_back_for_missing_empty_or_invalid_values() {
+        for args in [
+            vec![],
+            vec!["--unrelated"],
+            vec!["--client-name"],
+            vec!["--client-name", "--unrelated"],
+            vec!["--client-name="],
+            vec!["--client-name", " \t "],
+            vec!["--client-name", "Player\r\nOther: value"],
+            vec!["--client-name", "Player\""],
+            vec!["--client-name", "Player\\"],
+            vec!["--client-name", "Player,Other"],
+            vec!["--", "--client-name=Ignored"],
+        ] {
+            assert_eq!(parse(&args), DEFAULT_CLIENT_NAME, "args: {args:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_name_falls_back_for_non_unicode_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        assert_eq!(
+            client_name_from_args([
+                OsString::from("--client-name"),
+                OsString::from_vec(vec![0xff])
+            ]),
+            DEFAULT_CLIENT_NAME
+        );
+    }
+
+    #[test]
+    fn custom_client_name_is_shared_by_authorization_and_user_agent() {
+        let client = EmbyClient::new_with_args(
+            "device-1".into(),
+            ["--client-name", "My Player"].map(OsString::from),
+        )
+        .unwrap();
+
+        assert!(
+            client
+                .authorization_header()
+                .contains("Client=\"My Player\"")
+        );
+        assert!(
+            client
+                .authenticated_authorization_header("token", "user")
+                .contains("Client=\"My Player\"")
+        );
+        assert_eq!(client.user_agent(), format!("My Player/{VERSION}"));
+    }
 }
 
 #[cfg(test)]

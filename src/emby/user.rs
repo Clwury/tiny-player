@@ -7,7 +7,7 @@ use tracing::{debug, instrument};
 
 use crate::server::{AddServerSubmission, CachedServer};
 
-use super::{CLIENT_NAME, EmbyClient, EmbyImageType, VERSION, api_url, log_secrets, url_for_log};
+use super::{EmbyClient, EmbyImageType, api_url, log_secrets, url_for_log};
 
 mod authentication;
 mod mutations;

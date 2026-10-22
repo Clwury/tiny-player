@@ -135,6 +135,12 @@ FFmpeg 创建的 Vulkan 设备通过 `VulkanDecodeDevice` 保留 `queue_flags`�
 内部同步队列必须通过 `vkGetDeviceQueue2` 使用原始创建 flags 获取，否则可能得到空队列，
 在首次 `vkQueueSubmit2` 时崩溃。
 
+Linux 本地开发可先运行 `python3 -B scripts/prepare-linux.py`，在 `target/linux-native/`
+准备与发布包相同的 libplacebo 修复快照，并生成本机 Cargo 环境配置；随后普通
+`cargo run --locked` 和测试命令都会使用匹配的头文件及运行库。脚本不替换系统库，
+也不覆盖其他工具生成的 Cargo 配置。重新准备前若已有自定义配置，需自行合并对应库路径。
+预热及渲染完成日志包含 `succeeded`，任务完成或首帧入队均不代表图像渲染成功。
+
 构建按头文件字段探测能力，兼容发行版回移补丁：FFmpeg 8.1 没有 `queue_flags`，使用零值；
 libplacebo API 365 开始提供 `pl_vulkan_queue.flags`。旧 libplacebo 遇到非零创建 flags 时，
 在调用设备导入前返回明确错误，由现有播放流程回退或报错，不进入不安全的队列提交。

@@ -30,6 +30,8 @@
 
 - BtbN FFmpeg 9.0 分支的 LGPL shared 构建 `n9.0.1-84-g946fcce07b`。
 - MSYS2 UCRT64 libplacebo 7.360.1-2 及匹配的 Vulkan、shaderc、色彩管理等依赖。
+- Vulkan headers、Vulkan loader 和 SPIRV-Cross 同步到 SDK 1.4.363.0 批次
+  （MSYS2 包版本 `1~1.4.363.0-1`），SPIRV-Tools 为 `3~1.4.363.0-1`。
 - libclang 18.1.1，用于项目和 ffmpeg-sys-next 的 bindgen。
 
 `master` 推送的 GitHub Actions 发布每次下载 BtbN `latest` 的 **FFmpeg 9.0 LGPL shared**

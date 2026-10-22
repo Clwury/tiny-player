@@ -36,7 +36,7 @@ impl EmbyClient {
             .post(url)
             .header("X-Emby-Authorization", authorization)
             .header("Content-Type", "application/json")
-            .header("User-Agent", format!("{CLIENT_NAME}/{VERSION}"))
+            .header("User-Agent", self.user_agent())
             .body(request_body_json)
             .send()
             .map_err(|error| anyhow!("连接 Emby 服务器失败：{}", error.without_url()))?;

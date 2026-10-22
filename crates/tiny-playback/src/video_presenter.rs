@@ -288,7 +288,7 @@ impl VideoRenderWorker {
                                 request,
                             )
                             .map_err(|error| error.to_string());
-                            worker_state.finish_render(started.elapsed(), pts);
+                            worker_state.finish_render(started.elapsed(), pts, result.is_ok());
                             worker_state.record_ready_result();
                             if result_tx
                                 .send(VideoRenderResult {
@@ -314,7 +314,7 @@ impl VideoRenderWorker {
                                     "failed to prewarm Vulkan video renderer"
                                 );
                             }
-                            worker_state.finish_prewarm(started.elapsed());
+                            worker_state.finish_prewarm(started.elapsed(), result.is_ok());
                             let accepted = vo_queue.complete_vulkan_prewarm(ticket, result);
                             tracing::debug!(
                                 session_id = ?ticket.session_id(),
@@ -488,7 +488,7 @@ impl VideoRenderState {
         }
     }
 
-    fn finish_render(&self, render_duration: Duration, pts: Option<FramePts>) {
+    fn finish_render(&self, render_duration: Duration, pts: Option<FramePts>, succeeded: bool) {
         let mut slot = self.slot.lock().expect("video render worker poisoned");
         slot.rendering = false;
         slot.completed_frames = slot.completed_frames.saturating_add(1);
@@ -506,17 +506,19 @@ impl VideoRenderState {
                 rendered_pts = ?pts.map(|pts| pts.nsecs),
                 render_ms = render_duration.as_secs_f64() * 1000.0,
                 average_render_ms = slot.average_render_duration.as_secs_f64() * 1000.0,
-                "rendered video frame"
+                succeeded,
+                "completed video render attempt"
             );
         }
     }
 
-    fn finish_prewarm(&self, duration: Duration) {
+    fn finish_prewarm(&self, duration: Duration, succeeded: bool) {
         let mut slot = self.slot.lock().expect("video render worker poisoned");
         slot.rendering = false;
         tracing::debug!(
             prewarm_ms = duration.as_secs_f64() * 1000.0,
-            "prewarmed Vulkan video renderer"
+            succeeded,
+            "completed Vulkan video renderer prewarm"
         );
     }
 
@@ -824,7 +826,7 @@ mod tests {
             ));
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            state.finish_render(Duration::ZERO, None);
+            state.finish_render(Duration::ZERO, None, true);
             state.record_ready_result();
             result_tx
                 .send(VideoRenderResult {

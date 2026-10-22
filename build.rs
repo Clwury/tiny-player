@@ -4,6 +4,16 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=TINY_ASSET_DIR");
+    println!("cargo:rerun-if-env-changed=TINY_LIBPLACEBO_LIB_DIR");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && let Some(directory) = std::env::var_os("TINY_LIBPLACEBO_LIB_DIR")
+    {
+        let directory = std::path::PathBuf::from(directory);
+        // Put the local SDK before transitive dependencies' /usr/lib search
+        // paths, and retain it when launching outside Cargo as well.
+        println!("cargo:rustc-link-search=native={}", directory.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", directory.display());
+    }
     #[cfg(windows)]
     embed_windows_resources();
 }

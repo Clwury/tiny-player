@@ -15,31 +15,6 @@ Tiny Player is a native Emby desktop client for Linux and Windows, built with Ru
 - **Gamepad playback shortcuts**: Standard gamepad buttons control playback, seeking, volume, speed, subtitle position, and returning to media details.
 - **Keep awake during video playback**: Request inhibition of automatic screen locking, display power saving, and sleep; release the request when paused, buffering pauses playback, playback ends, or the player closes.
 
-## Gamepad Playback Controls
-
-Gamepads are detected automatically on the playback page. The active playback window accepts input from the first controller used, until that controller disconnects. On Steam Deck, add Tiny Player to Steam and use a standard gamepad layout in Steam Input.
-
-| Button (Deck / Xbox layout) | Action |
-| --- | --- |
-| A | Play / pause |
-| B | Close the episode list, track/cache menu, or information/shortcut overlay; otherwise return to media details |
-| ← / → | Seek backward / forward 5 seconds |
-| ↓ / ↑ | Lower / raise volume by 2 percentage points |
-| LB / RB | Seek backward / forward 60 seconds |
-| X | Toggle mute |
-| Y | Toggle playback information |
-| Menu / Start | Toggle fullscreen |
-| View / Select | Show / hide playback controls |
-| LT / RT | Decrease / increase playback speed |
-| L3 | Reset playback speed to 1× |
-| R3-↑ / R3-↓ | Hold R3 to raise / lower subtitle position |
-
-L3 / R3 refer to clicking the left / right stick, and arrows refer to the D-pad. The playback shortcut overlay also includes the full gamepad button reference. After gamepad button input, gamepad help appears above keyboard help for the current playback page.
-
-Seeking and volume repeat while held; other actions require a new press. Input stops when the window loses focus or playback closes. Playback controls remain visible for three seconds after gamepad actions. B closes open menus; their item selection and media browsing continue to use the existing mouse/keyboard interface. Keyboard shortcuts retain their existing mappings.
-
-Linux source builds also require the libudev development package (`libudev-dev` on Ubuntu; `systemd-libs` on Arch). The user session must have access to the controller's `/dev/input/event*` device.
-
 ## Screenshots
 
 ![Tiny Player media details and episode selection](docs/tiny-player-1.png)
@@ -162,6 +137,21 @@ After cloning the repository, prepare the following dependencies for Linux devel
 - FFmpeg 8.1 or 9.x, libplacebo 7.x, and their development headers.
 - Vulkan headers, a loader, and a GPU driver, along with ALSA, Wayland/X11, and other dependencies listed in [PKGBUILD](PKGBUILD).
 
+FFmpeg 9 can create internally synchronized Vulkan queues. These require libplacebo
+API 365 with the queue import fixes. If the system provides an older libplacebo,
+prepare the same pinned snapshot as the Linux release bundle:
+
+```sh
+python3 -B scripts/prepare-linux.py
+```
+
+This requires Python 3 with Jinja2, Git, Ninja, shaderc and LittleCMS development packages. It builds
+libplacebo under `target/linux-native/` and generates the ignored `.cargo/config.toml`
+so Cargo uses matching headers and runtime libraries. If Meson is missing, its
+pinned source release is downloaded locally. Existing unrelated Cargo configuration
+is preserved. System libraries are not replaced. Use `cargo run --release --locked`
+to launch optimized builds with this local environment.
+
 Run from the repository root:
 
 ```sh
@@ -180,6 +170,13 @@ For Windows development, meet the Windows build requirements above, then prepare
 ```powershell
 .\scripts\package-windows.ps1 -Mode Prepare
 cargo run --locked
+```
+
+Use `--client-name "My Player"` (or `--client-name=MyPlayer`) to set the client name
+reported to Emby. It defaults to `Tiny Player` when omitted or empty. For example:
+
+```sh
+cargo run --locked -- --client-name "My Player"
 ```
 
 ## Playback Controls and Keyboard Shortcuts
@@ -229,6 +226,31 @@ Mouse controls over the playback area:
 Seeking while paused displays the frame at the selected position and keeps playback paused. Seeking to the video end displays the final frame and finishes loading. Resuming continues from the current position.
 
 In fullscreen, mouse movement anywhere in the playback area reveals the controls. They hide after one second without movement, except while hovering over the controls or top-right icons, dragging the progress bar, or viewing the episode list.
+
+### Gamepad Playback Controls
+
+Gamepads are detected automatically on the playback page. The active playback window accepts input from the first controller used, until that controller disconnects. On Steam Deck, add Tiny Player to Steam and use a standard gamepad layout in Steam Input.
+
+| Button (Deck / Xbox layout) | Action |
+| --- | --- |
+| A | Play / pause |
+| B | Close the episode list, track/cache menu, or information/shortcut overlay; otherwise return to media details |
+| ← / → | Seek backward / forward 5 seconds |
+| ↓ / ↑ | Lower / raise volume by 2 percentage points |
+| LB / RB | Seek backward / forward 60 seconds |
+| X | Toggle mute |
+| Y | Toggle playback information |
+| Menu / Start | Toggle fullscreen |
+| View / Select | Show / hide playback controls |
+| LT / RT | Decrease / increase playback speed |
+| L3 | Reset playback speed to 1× |
+| R3-↑ / R3-↓ | Hold R3 to raise / lower subtitle position |
+
+L3 / R3 refer to clicking the left / right stick, and arrows refer to the D-pad. The playback shortcut overlay also includes the full gamepad button reference. After gamepad button input, gamepad help appears above keyboard help for the current playback page.
+
+Seeking and volume repeat while held; other actions require a new press. Input stops when the window loses focus or playback closes. Playback controls remain visible for three seconds after gamepad actions. B closes open menus; their item selection and media browsing continue to use the existing mouse/keyboard interface. Keyboard shortcuts retain their existing mappings.
+
+Linux source builds also require the libudev development package (`libudev-dev` on Ubuntu; `systemd-libs` on Arch). The user session must have access to the controller's `/dev/input/event*` device.
 
 ## License
 

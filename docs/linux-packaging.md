@@ -16,12 +16,15 @@ glibc 2.39 是发布基线，包内所有 ELF 的实际版本需求均不得高�
 默认并发数为 4，可用 `BUILD_JOBS=8 ./scripts/package-linux.sh` 调整 Cargo 并发。
 `CONTAINER_ENGINE` 可指定兼容 Docker 命令行的引擎，`TINY_LINUX_IMAGE` 可修改镜像名。
 构建缓存保存在 `target/linux-x86_64-glibc2.39/`，源码以只读方式挂入容器。
+容器以 `/build` 为工作目录，通过 `--manifest-path /src/Cargo.toml` 构建，确保 Cargo
+使用镜像内的原生依赖路径。本机开发准备脚本生成的 `.cargo/config.toml` 中的强制环境
+配置留在源码目录，容器打包及 CI 检查从独立工作目录运行。
 
 打包入口只执行 release 构建、依赖收集、ELF 检查和打包；开发检查单独运行。
 默认复用同一已审计 payload，同时输出 tar.gz 与 AppImage，不重复构建应用或改变宿主库排除策略。
 本地构建的依赖版本由 `Cargo.lock`、`packaging/linux/build-native.sh` 和 `build-ffmpeg.sh` 固定：
 FFmpeg 9.0.2、libplacebo API 365 开发快照
-`8c5b8d2fe001336f807a662394d90af396755f20`、Vulkan-Headers 1.4.357；Rust 为 1.97.0。
+`8c5b8d2fe001336f807a662394d90af396755f20`、Vulkan-Headers 1.4.363；Rust 为 1.97.0。
 该 libplacebo 提交包含 `vkGetDeviceQueue2` 及外部设备队列创建 flags 导入修复，
 用于避免 FFmpeg 9 与 RADV 内部同步队列组合在首次渲染时提交空 `VkQueue`。
 它是固定源码快照，不是稳定发布标签；包内 `build-info/libplacebo.commit` 和

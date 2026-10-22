@@ -554,7 +554,11 @@ mod tests {
             port,
             path: String::new(),
         });
-        let client = EmbyClient::new("device-1".to_string()).unwrap();
+        let client = EmbyClient::new_with_args(
+            "device-1".to_string(),
+            ["--client-name", "My Player"].map(std::ffi::OsString::from),
+        )
+        .unwrap();
         let report = PlaybackStartReport::direct_stream(
             "episode-1".to_string(),
             "source-1".to_string(),
@@ -575,6 +579,19 @@ mod tests {
                 .contains("content-type: application/json")
         );
         assert!(request.contains("\"ItemId\":\"episode-1\""));
+        assert!(request.contains("Client=\"My Player\""));
+        let user_agent = format!("My Player/{}", env!("CARGO_PKG_VERSION"));
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(&format!("User-Agent: {user_agent}")))
+        );
+        assert!(
+            client
+                .playback_http_headers(&server)
+                .unwrap()
+                .contains(&("User-Agent".into(), user_agent))
+        );
     }
 
     #[test]

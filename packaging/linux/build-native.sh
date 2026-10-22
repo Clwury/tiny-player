@@ -12,7 +12,7 @@ export CXXFLAGS="-I$prefix/include"
 mkdir -p /tmp/native "$prefix/share/licenses" "$prefix/share/build-info"
 cd /tmp/native
 
-git clone --depth 1 --branch v1.4.357 https://github.com/KhronosGroup/Vulkan-Headers.git
+git clone --depth 1 --branch v1.4.363 https://github.com/KhronosGroup/Vulkan-Headers.git
 cmake -S Vulkan-Headers -B vulkan-build -G Ninja -DCMAKE_INSTALL_PREFIX="$prefix"
 cmake --install vulkan-build
 git -C Vulkan-Headers rev-parse HEAD > "$prefix/share/build-info/vulkan-headers.commit"

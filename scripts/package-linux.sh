@@ -31,6 +31,7 @@ if [[ $skip_image_build == 0 ]]; then
     "$engine" build --platform linux/amd64 --tag "$builder_image" "$repo_dir/packaging/linux"
 fi
 "$engine" run --rm --interactive --platform linux/amd64 --user "$(id -u):$(id -g)" \
+    --workdir /build \
     --mount "type=bind,src=$repo_dir,dst=/src,readonly" \
     --mount "type=bind,src=$repo_dir/target/linux-x86_64-glibc2.39,dst=/build" \
     --mount "type=bind,src=$repo_dir/dist,dst=/out" \
@@ -38,11 +39,13 @@ fi
     "$builder_image" bash -s <<'BUILD'
 set -euo pipefail
 [[ $(uname -m) == x86_64 && $(getconf GNU_LIBC_VERSION) == 'glibc 2.39' ]]
-python3 -B packaging/linux/appimage.py --verify-tools /opt/appimage
+# Cargo discovers configuration from its working directory, independently of
+# --manifest-path. Keep the checkout's machine-local .cargo config out of builds.
+python3 -B /src/packaging/linux/appimage.py --verify-tools /opt/appimage
 unset TINY_ASSET_DIR RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-C target-cpu=x86-64'
-cargo build --locked --release --target x86_64-unknown-linux-gnu
-python3 packaging/linux/bundle.py \
+cargo build --manifest-path /src/Cargo.toml --locked --release --target x86_64-unknown-linux-gnu
+python3 /src/packaging/linux/bundle.py \
     --binary "$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/tiny-player" \
     --output /out
 BUILD

@@ -18,6 +18,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_LIBDIR");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR");
+    println!("cargo:rerun-if-env-changed=TINY_LIBPLACEBO_LIB_DIR");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && let Some(directory) = env::var_os("TINY_LIBPLACEBO_LIB_DIR")
+    {
+        let directory = PathBuf::from(directory);
+        // Engine tests and examples also need the prepared runtime library.
+        println!("cargo:rustc-link-search=native={}", directory.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", directory.display());
+    }
 
     let libplacebo = pkg_config::Config::new()
         .range_version(LIBPLACEBO_MIN_VERSION..LIBPLACEBO_MAX_VERSION)

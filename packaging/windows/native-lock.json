@@ -92,31 +92,31 @@
     },
     {
       "name": "spirv-cross",
-      "version": "1~1.4.357.0-1",
-      "filename": "mingw-w64-ucrt-x86_64-spirv-cross-1~1.4.357.0-1-any.pkg.tar.zst",
-      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-spirv-cross-1~1.4.357.0-1-any.pkg.tar.zst",
-      "sha256": "78f74990ac05623ebbefea310cb9ab96f4058f5c88d68255fc102b89077503d9"
+      "version": "1~1.4.363.0-1",
+      "filename": "mingw-w64-ucrt-x86_64-spirv-cross-1~1.4.363.0-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-spirv-cross-1~1.4.363.0-1-any.pkg.tar.zst",
+      "sha256": "246759d1a8391c67a4180ad4d103a78219182ef7057d70469394fa6c40851187"
     },
     {
       "name": "spirv-tools",
-      "version": "3~1.4.357.0-1",
-      "filename": "mingw-w64-ucrt-x86_64-spirv-tools-3~1.4.357.0-1-any.pkg.tar.zst",
-      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-spirv-tools-3~1.4.357.0-1-any.pkg.tar.zst",
-      "sha256": "ba11b4bad606f6ececc5bf5910f97077071624851c81a25fafc6b0ec88c58b84"
+      "version": "3~1.4.363.0-1",
+      "filename": "mingw-w64-ucrt-x86_64-spirv-tools-3~1.4.363.0-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-spirv-tools-3~1.4.363.0-1-any.pkg.tar.zst",
+      "sha256": "d31d67fe918aeee21d1e930fd96360856a60146d23094e4ae8baf071a4049aaa"
     },
     {
       "name": "vulkan-headers",
-      "version": "1~1.4.357.0-1",
-      "filename": "mingw-w64-ucrt-x86_64-vulkan-headers-1~1.4.357.0-1-any.pkg.tar.zst",
-      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-vulkan-headers-1~1.4.357.0-1-any.pkg.tar.zst",
-      "sha256": "96749e9c3c10bd7dd6624530006b4ed5c165c0f1bc37125522e046c63aed649c"
+      "version": "1~1.4.363.0-1",
+      "filename": "mingw-w64-ucrt-x86_64-vulkan-headers-1~1.4.363.0-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-vulkan-headers-1~1.4.363.0-1-any.pkg.tar.zst",
+      "sha256": "be602b2657cace531316e78b1eda4087e8f7f84ebb877f08fba198a2db06406a"
     },
     {
       "name": "vulkan-loader",
-      "version": "1~1.4.357.0-1",
-      "filename": "mingw-w64-ucrt-x86_64-vulkan-loader-1~1.4.357.0-1-any.pkg.tar.zst",
-      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-vulkan-loader-1~1.4.357.0-1-any.pkg.tar.zst",
-      "sha256": "4d34983aea34116582700b285279df21cd0ee8519025330e7ac0650bb02f138f"
+      "version": "1~1.4.363.0-1",
+      "filename": "mingw-w64-ucrt-x86_64-vulkan-loader-1~1.4.363.0-1-any.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64-vulkan-loader-1~1.4.363.0-1-any.pkg.tar.zst",
+      "sha256": "065076fe13d39ab97eea4740596426d5ae741b5044e48e1c9495d04835c92dbe"
     }
   ]
 }

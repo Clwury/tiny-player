@@ -126,6 +126,7 @@ jobs:
         run: |
           mkdir -p target/linux-x86_64-glibc2.39
           docker run --rm --user "$(id -u):$(id -g)" \
+            --workdir /build \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/src,readonly" \
             --mount "type=bind,src=$GITHUB_WORKSPACE/target/linux-x86_64-glibc2.39,dst=/build" \
             --env CARGO_BUILD_JOBS --env CARGO_INCREMENTAL \
@@ -134,9 +135,9 @@ jobs:
             --env 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64' \
             "$TINY_LINUX_IMAGE" bash -c '
               set -euo pipefail
-              python3 -B -m unittest discover -s packaging/linux -p "test_*.py" -v
-              cargo test --workspace --locked --target x86_64-unknown-linux-gnu
-              cargo clippy --workspace --locked --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
+              python3 -B -m unittest discover -s /src/packaging/linux -p "test_*.py" -v
+              cargo test --manifest-path /src/Cargo.toml --workspace --locked --target x86_64-unknown-linux-gnu
+              cargo clippy --manifest-path /src/Cargo.toml --workspace --locked --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
             '
       - name: Assemble and audit Linux package
         run: ./scripts/package-linux.sh --skip-image-build
