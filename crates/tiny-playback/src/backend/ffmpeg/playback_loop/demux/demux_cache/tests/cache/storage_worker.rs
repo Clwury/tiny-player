@@ -68,6 +68,33 @@ fn settle(shared: &DemuxPacketCacheShared) {
     panic!("storage worker must settle without cycling reads and writes");
 }
 
+fn assert_worker_supplies_packet(cache: &DemuxPacketCache, expected: u8) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let (result, stream_offset, timing) = cache.poll_packet_round_robin_with_timing(&[0]);
+        assert_eq!(timing.disk_reads, 0, "the reader must not perform disk I/O");
+        match result {
+            DemuxReadResult::Packet(packet) => {
+                assert_eq!(stream_offset, Some(0));
+                assert_eq!(packet.data().unwrap(), vec![expected; PACKET_BYTES]);
+                return;
+            }
+            DemuxReadResult::WouldBlock => {
+                // A poll can race with storage work holding the cache mutex,
+                // or with an outstanding cold read. Neither is a read error.
+                assert!(
+                    Instant::now() < deadline,
+                    "storage worker did not supply packet {expected}: {timing:?}"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            DemuxReadResult::Error(error) => panic!("storage worker read failed: {error}"),
+            DemuxReadResult::Eof => panic!("unexpected EOF before packet {expected}"),
+            DemuxReadResult::Interrupted => panic!("reader interrupted before packet {expected}"),
+        }
+    }
+}
+
 fn assert_accounting(state: &DemuxPacketCacheState) {
     assert_eq!(
         state.resident_bytes,
@@ -532,11 +559,48 @@ fn real_storage_worker_wakes_readers_and_releases_the_session_on_shutdown() {
         shared: Arc::clone(&shared),
         handle: None,
     };
-    let (result, _, timing) = cache.poll_packet_round_robin_with_timing(&[0]);
-    assert!(matches!(result, DemuxReadResult::Packet(_)));
+    // Reproduce the legitimate lock-contention result deterministically.
+    let (tx, rx) = mpsc::channel();
+    let (result, _, timing) = thread::scope(|scope| {
+        let guard = shared.state.lock().unwrap();
+        let reader = scope.spawn(|| {
+            tx.send(cache.poll_packet_round_robin_with_timing(&[0]))
+                .unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        // Release the mutex even if a regression makes the poll block.
+        drop(guard);
+        reader.join().unwrap();
+        result.expect("a nonblocking poll must return while storage holds the cache lock")
+    });
+    assert!(matches!(result, DemuxReadResult::WouldBlock));
+    assert!(timing.lock_timed_out);
     assert_eq!(timing.disk_reads, 0);
+    assert_worker_supplies_packet(&cache, 0);
+
+    // The first spill is the most distant packet. Seek to that cold payload
+    // and require the real worker to restore it and wake the reader.
+    let observed_generation = {
+        let mut state = shared.state.lock().unwrap();
+        assert!(state.packets[&19].memory_packet().is_none());
+        assert!(
+            state
+                .seek_cached(19_000_000_000, PlaybackSessionId(2))
+                .is_some()
+        );
+        shared.control.wake_generation()
+    };
+    assert!(
+        shared
+            .control
+            .wait_for_wake_change(observed_generation, Duration::from_secs(2)),
+        "disk worker did not wake the cold reader"
+    );
+    assert_worker_supplies_packet(&cache, 19);
+    assert_accounting(&shared.state.lock().unwrap());
     drop(cache);
     drop(shared);
+    let deadline = Instant::now() + Duration::from_secs(2);
     while weak.upgrade().is_some() {
         assert!(
             Instant::now() < deadline,
