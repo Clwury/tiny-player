@@ -1,6 +1,8 @@
 use std::{
+    cell::Cell,
     env, fs,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 const LIBPLACEBO_MIN_VERSION: &str = "7";
@@ -23,6 +25,7 @@ fn main() {
         .expect(
             "supported libplacebo range is >= 7 and < 8; install libplacebo 7.x for HDR tone mapping",
         );
+    let placebo_queue_flags = StructFieldProbe::new("pl_vulkan_queue", "flags");
     let builder = bindgen::Builder::default()
         .header_contents(
             "libplacebo_wrapper.h",
@@ -32,12 +35,15 @@ fn main() {
         .allowlist_type("pl_.*")
         .allowlist_var("pl_.*")
         .allowlist_var("PL_.*")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .parse_callbacks(Box::new(placebo_queue_flags.clone()))
         .generate_comments(false)
         .derive_debug(false)
         .layout_tests(false);
     let bindings = add_pkg_config_include_args(builder, &libplacebo)
         .generate()
         .expect("failed to generate libplacebo bindings");
+    placebo_queue_flags.emit_cfg("libplacebo_vulkan_queue_flags");
     let out_path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set"));
     write_bindings_file(&out_path, "libplacebo_bindings.rs", &bindings);
 
@@ -48,6 +54,7 @@ fn main() {
         .expect(
             "supported libavutil range is >= 60.26.100 and < 62 (FFmpeg >= 8.1 and < 10); install FFmpeg 8.1+ or 9.x",
         );
+    let ffmpeg_queue_flags = StructFieldProbe::new("AVVulkanDeviceContext", "queue_flags");
     let ffmpeg_vulkan_builder = bindgen::Builder::default()
         .header_contents(
             "ffmpeg_vulkan_wrapper.h",
@@ -58,12 +65,15 @@ fn main() {
         .allowlist_type("AVDRM.*")
         .allowlist_type("Vk.*")
         .allowlist_type("PFN_vkGetPhysicalDeviceProperties2")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .parse_callbacks(Box::new(ffmpeg_queue_flags.clone()))
         .generate_comments(false)
         .derive_debug(false)
         .layout_tests(false);
     let ffmpeg_vulkan_bindings = add_pkg_config_include_args(ffmpeg_vulkan_builder, &libavutil)
         .generate()
         .expect("failed to generate FFmpeg Vulkan bindings");
+    ffmpeg_queue_flags.emit_cfg("ffmpeg_vulkan_queue_flags");
     let ffmpeg_vulkan_text = bindings_text(&ffmpeg_vulkan_bindings, "FFmpeg Vulkan");
     assert_generated_types(
         &ffmpeg_vulkan_text,
@@ -81,6 +91,44 @@ fn main() {
         ffmpeg_vulkan_text,
     )
     .expect("failed to write FFmpeg Vulkan bindings");
+}
+
+// Probe the generated fields rather than package versions: distributions may
+// backport Vulkan interop changes without changing the upstream version.
+#[derive(Clone, Debug)]
+struct StructFieldProbe {
+    type_name: &'static str,
+    field_name: &'static str,
+    present: Rc<Cell<bool>>,
+}
+
+impl StructFieldProbe {
+    fn new(type_name: &'static str, field_name: &'static str) -> Self {
+        Self {
+            type_name,
+            field_name,
+            present: Rc::new(Cell::new(false)),
+        }
+    }
+
+    fn emit_cfg(&self, name: &str) {
+        println!("cargo:rustc-check-cfg=cfg({name})");
+        if self.present.get() {
+            println!("cargo:rustc-cfg={name}");
+        }
+    }
+}
+
+impl bindgen::callbacks::ParseCallbacks for StructFieldProbe {
+    fn field_visibility(
+        &self,
+        info: bindgen::callbacks::FieldInfo<'_>,
+    ) -> Option<bindgen::FieldVisibilityKind> {
+        if info.type_name == self.type_name && info.field_name == self.field_name {
+            self.present.set(true);
+        }
+        None
+    }
 }
 
 fn add_pkg_config_include_args(

@@ -223,6 +223,7 @@ fn mapped_images_use_import_extent_and_read_usage_instead_of_decode_pool_default
             0,
             0,
             0,
+            0,
             VulkanDecodeQueues {
                 graphics: VulkanDecodeQueue { index: 0, count: 1 },
                 compute: None,

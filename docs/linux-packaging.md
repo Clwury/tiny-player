@@ -20,7 +20,12 @@ glibc 2.39 是发布基线，包内所有 ELF 的实际版本需求均不得高�
 打包入口只执行 release 构建、依赖收集、ELF 检查和打包；开发检查单独运行。
 默认复用同一已审计 payload，同时输出 tar.gz 与 AppImage，不重复构建应用或改变宿主库排除策略。
 本地构建的依赖版本由 `Cargo.lock`、`packaging/linux/build-native.sh` 和 `build-ffmpeg.sh` 固定：
-FFmpeg 9.0.2、libplacebo 7.360.1、Vulkan-Headers 1.4.357；Rust 为 1.97.0。
+FFmpeg 9.0.2、libplacebo API 365 开发快照
+`8c5b8d2fe001336f807a662394d90af396755f20`、Vulkan-Headers 1.4.357；Rust 为 1.97.0。
+该 libplacebo 提交包含 `vkGetDeviceQueue2` 及外部设备队列创建 flags 导入修复，
+用于避免 FFmpeg 9 与 RADV 内部同步队列组合在首次渲染时提交空 `VkQueue`。
+它是固定源码快照，不是稳定发布标签；包内 `build-info/libplacebo.commit` 和
+`libplacebo.version` 分别记录实际提交与构建版本。
 Ubuntu 安全更新随构建时的仓库更新，镜像不承诺逐字节可复现。
 
 播放页手柄输入使用 gilrs。构建镜像安装 `libudev-dev`，`bundle.py` 自动收集
@@ -195,6 +200,10 @@ tar -xzf "tiny-player-<version>-linux-x86_64.tar.gz"
 - 将 AppImage 或完整解压目录移动到含中文和空格的路径，确认启动、图标及资源加载正常。
 - 在 Wayland 与 X11 会话分别检查窗口、全屏、键盘和鼠标交互。
 - 测试软件解码、Vulkan 硬解，以及显式 VA-API 回传和 GPU 映射的 H.264、HEVC 10 位、暂停、seek 和 EOF；各路径仍需 Vulkan 渲染。GPU 映射还要求外部内存、DRM modifier 和同步导入能力，测试命令见播放引擎文档。
+- 在支持 `VK_KHR_internally_synchronized_queues` 的 RADV 环境验证非零队列创建 flags，
+  分别检查 tar.gz、安装后目录及 AppImage，
+  确认加载捆绑的新 libplacebo；运行播放引擎文档中的显式队列回归测试。
+  此项需要真实 GPU，不由普通 CI 或无 GPU 测试替代。
 - 验证音频设备/音轨、字幕/字体、HDR 色调映射，以及 portal 播放抑制和释放。
 - 测试手柄设备权限、快捷操作、失焦与断连行为。
 - 关闭应用后替换新版本，在 AppImage 与 tar.gz 之间切换，确认跨版本配置和缓存仍共用原路径。

@@ -407,8 +407,22 @@ fn vulkan_decode_device_from_ref(
         vulkan.enabled_dev_extensions as usize,
         vulkan.nb_enabled_dev_extensions,
         (&vulkan.device_features as *const vulkan_ffi::VkPhysicalDeviceFeatures2) as usize,
+        vulkan_queue_flags(vulkan),
         queues,
     ))
+}
+
+fn vulkan_queue_flags(vulkan: &vulkan_ffi::AVVulkanDeviceContext) -> u32 {
+    #[cfg(ffmpeg_vulkan_queue_flags)]
+    {
+        vulkan.queue_flags
+    }
+    #[cfg(not(ffmpeg_vulkan_queue_flags))]
+    {
+        // FFmpeg 8.1 predates internally synchronized queue creation.
+        let _ = vulkan;
+        0
+    }
 }
 
 fn select_decode_queues(
@@ -548,7 +562,7 @@ mod tests {
         HardwareDecodeMode, TINY_VULKAN_EXTRA_HW_FRAMES, VK_QUEUE_GRAPHICS_BIT,
         VK_QUEUE_TRANSFER_BIT, VULKAN_DECODED_VIDEO_QUEUE_LIMIT_FRAMES, VulkanDecodeQueue,
         find_queue, parse_vulkan_extra_hw_frames, vulkan_ffi, vulkan_frame_planes,
-        vulkan_hwaccel_flags,
+        vulkan_hwaccel_flags, vulkan_queue_flags,
     };
     use crate::render_host::{RawVideoFormat, RenderSize};
 
@@ -720,5 +734,19 @@ mod tests {
             find_queue(&queues, VK_QUEUE_GRAPHICS_BIT),
             Some(VulkanDecodeQueue { index: 4, count: 2 })
         );
+    }
+
+    #[test]
+    fn queue_creation_flags_are_independent_of_queue_capabilities() {
+        let mut vulkan: vulkan_ffi::AVVulkanDeviceContext = unsafe { mem::zeroed() };
+        vulkan.qf[0].flags = VK_QUEUE_GRAPHICS_BIT as _;
+        assert_eq!(vulkan_queue_flags(&vulkan), 0);
+
+        #[cfg(ffmpeg_vulkan_queue_flags)]
+        {
+            // VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR
+            vulkan.queue_flags = 0x4;
+            assert_eq!(vulkan_queue_flags(&vulkan), 0x4);
+        }
     }
 }

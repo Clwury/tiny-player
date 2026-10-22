@@ -18,7 +18,14 @@ cmake --install vulkan-build
 git -C Vulkan-Headers rev-parse HEAD > "$prefix/share/build-info/vulkan-headers.commit"
 cp -a Vulkan-Headers/LICENSE* "$prefix/share/licenses/"
 
-git clone --depth 1 --branch v7.360.1 https://github.com/haasn/libplacebo.git
+# Includes vkGetDeviceQueue2 (0d1bded) and imported queue flags (8c5b8d2).
+# A fixed API 365 snapshot is required until these fixes have a stable release.
+libplacebo_commit=8c5b8d2fe001336f807a662394d90af396755f20
+git init libplacebo
+git -C libplacebo remote add origin https://github.com/haasn/libplacebo.git
+git -C libplacebo fetch --depth 1 origin "$libplacebo_commit"
+git -C libplacebo checkout --detach FETCH_HEAD
+[[ $(git -C libplacebo rev-parse HEAD) == "$libplacebo_commit" ]]
 git -C libplacebo submodule update --init --depth 1 3rdparty/fast_float
 meson setup placebo-build libplacebo --prefix="$prefix" --libdir=lib \
     --buildtype=release --default-library=shared --wrap-mode=nofallback \
@@ -29,6 +36,7 @@ meson setup placebo-build libplacebo --prefix="$prefix" --libdir=lib \
 meson compile -C placebo-build -j "$jobs"
 meson install -C placebo-build
 git -C libplacebo rev-parse HEAD > "$prefix/share/build-info/libplacebo.commit"
+pkg-config --modversion libplacebo > "$prefix/share/build-info/libplacebo.version"
 mkdir -p "$prefix/share/licenses/libplacebo"
 cp libplacebo/LICENSE "$prefix/share/licenses/libplacebo/"
 cp libplacebo/3rdparty/fast_float/LICENSE* "$prefix/share/licenses/libplacebo/"

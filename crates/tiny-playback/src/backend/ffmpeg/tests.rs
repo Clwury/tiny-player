@@ -281,6 +281,7 @@ fn test_vulkan_device() -> Arc<VulkanDecodeDevice> {
         0,
         0,
         0,
+        0,
         VulkanDecodeQueues {
             graphics: VulkanDecodeQueue { index: 0, count: 1 },
             compute: None,

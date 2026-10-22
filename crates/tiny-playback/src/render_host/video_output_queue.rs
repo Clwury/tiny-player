@@ -1216,6 +1216,7 @@ mod tests {
             extensions: 0,
             num_extensions: 0,
             features: 0,
+            queue_flags: 0,
             queues: VulkanDecodeQueues {
                 graphics: VulkanDecodeQueue { index: 0, count: 1 },
                 compute: None,

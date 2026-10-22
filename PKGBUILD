@@ -15,7 +15,7 @@ if [[ -n ${startdir:-} && -n ${BUILDDIR:-} && \
 fi
 
 pkgname=tiny-player-git
-pkgver=0.1.7.r148.g150bd98
+pkgver=0.1.8rc.1.r153.gef030c3
 pkgrel=1
 pkgdesc='Native Emby desktop client with FFmpeg and Vulkan playback'
 arch=('x86_64')
@@ -58,6 +58,8 @@ pkgver() {
 
     local upstream_version
     upstream_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+    # Arch pkgver forbids hyphens used by SemVer prerelease versions.
+    upstream_version=${upstream_version//-/}
     printf '%s.r%s.g%s' \
         "$upstream_version" \
         "$(git rev-list --count HEAD)" \

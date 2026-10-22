@@ -8,14 +8,14 @@
   },
   "runtime": {
     "release": "continuous",
-    "source_commit": "8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa",
+    "source_commit": "fedfad51acc2860b2916a1eef32ba4a500ff31ef",
     "url": "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64",
-    "sha256": "156f4bdbde9c52d01814600013e0a273f0118dc2de98975f3c8c63427ec79074",
-    "source_url": "https://github.com/AppImage/type2-runtime/tree/8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa",
-    "build_recipe_url": "https://github.com/AppImage/type2-runtime/blob/8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa/scripts/docker/Dockerfile"
+    "sha256": "617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46",
+    "source_url": "https://github.com/AppImage/type2-runtime/tree/fedfad51acc2860b2916a1eef32ba4a500ff31ef",
+    "build_recipe_url": "https://github.com/AppImage/type2-runtime/blob/fedfad51acc2860b2916a1eef32ba4a500ff31ef/scripts/docker/Dockerfile"
   },
   "runtime_license": {
-    "url": "https://raw.githubusercontent.com/AppImage/type2-runtime/8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa/LICENSE",
+    "url": "https://raw.githubusercontent.com/AppImage/type2-runtime/fedfad51acc2860b2916a1eef32ba4a500ff31ef/LICENSE",
     "sha256": "aa154fc9070614bbe7921f89db11efd1dba7a1f3a41685958110e2230f9c0ca1"
   },
   "third_party_licenses": [

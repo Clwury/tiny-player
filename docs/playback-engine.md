@@ -127,6 +127,30 @@ TINY_VAAPI_DEVICE=/dev/dri/renderD128 \
 `initialized direct VA-API to Vulkan frame mapping` 以及颜色转换日志的 `path: "vaapi-vulkan"`。
 无 GPU 的默认测试覆盖直接映射标志、HDR/时间属性、排队帧持有源 surface 的引用、映射失败清理及帧池切换。
 
+## Vulkan 共享队列兼容
+
+FFmpeg 创建的 Vulkan 设备通过 `VulkanDecodeDevice` 保留 `queue_flags`，导入 libplacebo
+时将其传给 graphics、compute、transfer 队列；回退到 graphics 的队列使用同一创建 flags。
+这些是 `VkDeviceQueueCreateFlags`，与队列的 graphics/compute/transfer 能力位不同。
+内部同步队列必须通过 `vkGetDeviceQueue2` 使用原始创建 flags 获取，否则可能得到空队列，
+在首次 `vkQueueSubmit2` 时崩溃。
+
+构建按头文件字段探测能力，兼容发行版回移补丁：FFmpeg 8.1 没有 `queue_flags`，使用零值；
+libplacebo API 365 开始提供 `pl_vulkan_queue.flags`。旧 libplacebo 遇到非零创建 flags 时，
+在调用设备导入前返回明确错误，由现有播放流程回退或报错，不进入不安全的队列提交。
+Linux 预编译包使用同时包含取队列及导入 flags 修复的固定源码快照，Windows 旧库仍可编译。
+
+无 GPU 的默认测试检查创建 flags 与能力位的区别、全部队列与 graphics 回退的 flags 保留，
+以及旧 libplacebo 的导入前拒绝。以下显式测试需要 FFmpeg 9、支持内部同步队列的 GPU/驱动
+和 libplacebo API 365+，实际创建 flags 必须包含内部同步位；零值会使测试失败：
+
+```sh
+cargo test -p tiny-playback --locked vulkan_import_renders_internally_synchronized_queues -- --ignored --nocapture
+```
+
+该测试上传 NV12/P010 图像、导入 FFmpeg 设备并渲染读回，无需实际视频解码；
+它不能替代真实 GPU 上的桌面播放验收。
+
 ## 图像与应用适配
 
 `VideoPresenter::render_if_needed` 返回 `Option<BgraImage>`。图像拥有紧密排列、

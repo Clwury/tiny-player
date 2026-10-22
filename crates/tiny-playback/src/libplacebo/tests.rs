@@ -42,6 +42,88 @@ fn vulkan_import_queues_fall_back_to_graphics_without_compute() {
     assert!(import.no_compute);
 }
 
+fn import_test_device(queue_flags: u32, queues: VulkanDecodeQueues) -> VulkanDecodeDevice {
+    // Only the AVBufferRef is real. Invalid Vulkan handles ensure tests cannot
+    // accidentally rely on a GPU or reach libplacebo's device import.
+    let mut buffer = unsafe { ffmpeg_ffi::av_buffer_alloc(1) };
+    let device_ref = FfmpegAvBufferRef::new_ref(buffer).unwrap();
+    unsafe { ffmpeg_ffi::av_buffer_unref(&mut buffer) };
+    VulkanDecodeDevice::new(device_ref, 0, 0, 0, 0, 0, 0, 0, queue_flags, queues)
+}
+
+#[test]
+fn vulkan_import_params_preserve_zero_flag_queues() {
+    let queues = VulkanDecodeQueues {
+        graphics: VulkanDecodeQueue { index: 1, count: 2 },
+        compute: Some(VulkanDecodeQueue { index: 3, count: 1 }),
+        transfer: Some(VulkanDecodeQueue { index: 4, count: 2 }),
+    };
+    let device = import_test_device(0, queues);
+
+    let params = vulkan_import_params(&device).unwrap();
+
+    for (actual, expected) in [
+        (params.queue_graphics, queues.graphics),
+        (params.queue_compute, queues.compute.unwrap()),
+        (params.queue_transfer, queues.transfer.unwrap()),
+    ] {
+        assert_eq!(actual.index, expected.index);
+        assert_eq!(actual.count, expected.count);
+        #[cfg(libplacebo_vulkan_queue_flags)]
+        assert_eq!(actual.flags, 0);
+    }
+    assert!(!params.no_compute);
+}
+
+#[cfg(libplacebo_vulkan_queue_flags)]
+#[test]
+fn vulkan_import_params_preserve_creation_flags_for_all_queues_and_fallbacks() {
+    let graphics = VulkanDecodeQueue { index: 2, count: 1 };
+    for dedicated in [false, true] {
+        let queues = VulkanDecodeQueues {
+            graphics,
+            compute: dedicated.then_some(VulkanDecodeQueue { index: 3, count: 2 }),
+            transfer: dedicated.then_some(VulkanDecodeQueue { index: 4, count: 1 }),
+        };
+        let device = import_test_device(0x4, queues);
+
+        let params = vulkan_import_params(&device).unwrap();
+
+        for (actual, expected) in [
+            (params.queue_graphics, graphics),
+            (params.queue_compute, queues.compute.unwrap_or(graphics)),
+            (params.queue_transfer, queues.transfer.unwrap_or(graphics)),
+        ] {
+            assert_eq!(actual.flags, 0x4);
+            assert_eq!(actual.index, expected.index);
+            assert_eq!(actual.count, expected.count);
+        }
+        assert_eq!(params.no_compute, !dedicated);
+    }
+}
+
+#[cfg(not(libplacebo_vulkan_queue_flags))]
+#[test]
+fn legacy_libplacebo_rejects_flagged_queues_before_importing_device() {
+    let device = import_test_device(
+        0x4,
+        VulkanDecodeQueues {
+            graphics: VulkanDecodeQueue { index: 0, count: 1 },
+            compute: None,
+            transfer: None,
+        },
+    );
+
+    let error = match LibplaceboToneMapper::new_for_vulkan_decode(Arc::new(device)) {
+        Ok(_) => panic!("legacy libplacebo must reject flagged queues before Vulkan calls"),
+        Err(error) => error,
+    };
+
+    let message = error.to_string();
+    assert!(message.contains("0x4"));
+    assert!(message.contains("libplacebo API 365"));
+}
+
 #[test]
 fn dolby_vision_profile5_uses_raw_frame_range_input() {
     let full = unsafe {

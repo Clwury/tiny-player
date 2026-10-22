@@ -29,6 +29,33 @@ fn vulkan_wrapping_uses_allocated_extent_and_visible_crop_when_enabled() {
     }
 }
 
+#[test]
+#[ignore = "requires internally synchronized Vulkan queues and libplacebo API 365+"]
+fn vulkan_import_renders_internally_synchronized_queues() {
+    let codec = unsafe { ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_H264) };
+    let hardware = VideoHwDecodeContext::try_create(codec).unwrap();
+    let device = hardware.device().unwrap();
+    // Require the actual triggering flag; a zero-flag device cannot exercise
+    // the RADV NULL VkQueue regression even if it renders successfully.
+    assert_ne!(
+        device.queue_flags & 0x4,
+        0,
+        "requires VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR"
+    );
+    let mut renderer = LibplaceboToneMapper::new_for_vulkan_decode(Arc::clone(&device)).unwrap();
+    for format in [RawVideoFormat::Nv12, RawVideoFormat::P010Le] {
+        check_vulkan_crop(
+            &mut renderer,
+            &device,
+            format,
+            RenderSize {
+                width: 64,
+                height: 64,
+            },
+        );
+    }
+}
+
 fn check_vulkan_crop(
     renderer: &mut LibplaceboToneMapper,
     device: &Arc<VulkanDecodeDevice>,

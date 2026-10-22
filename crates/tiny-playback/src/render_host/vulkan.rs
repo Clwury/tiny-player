@@ -60,6 +60,8 @@ pub struct VulkanDecodeDevice {
     pub extensions: usize,
     pub num_extensions: i32,
     pub features: usize,
+    /// VkDeviceQueueCreateFlags, distinct from queue capability flags.
+    pub queue_flags: u32,
     pub queues: VulkanDecodeQueues,
 }
 
@@ -74,6 +76,7 @@ impl VulkanDecodeDevice {
         extensions: usize,
         num_extensions: i32,
         features: usize,
+        queue_flags: u32,
         queues: VulkanDecodeQueues,
     ) -> Self {
         Self {
@@ -85,6 +88,7 @@ impl VulkanDecodeDevice {
             extensions,
             num_extensions,
             features,
+            queue_flags,
             queues,
         }
     }

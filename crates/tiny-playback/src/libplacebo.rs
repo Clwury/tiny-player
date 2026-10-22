@@ -106,24 +106,10 @@ impl LibplaceboToneMapper {
     }
 
     pub fn new_for_vulkan_decode(device: Arc<VulkanDecodeDevice>) -> Result<Self> {
+        // Validate queue flags before entering libplacebo. Older libraries can
+        // return NULL VkQueues for flagged FFmpeg queues and crash on submit.
+        let params = vulkan_import_params(&device)?;
         unsafe {
-            let mut params = mem::zeroed::<ffi::pl_vulkan_import_params>();
-            params.instance = device.instance as ffi::VkInstance;
-            params.get_proc_addr = get_proc_addr_from_usize(device.get_proc_addr);
-            params.phys_device = device.physical_device as ffi::VkPhysicalDevice;
-            params.device = device.device as ffi::VkDevice;
-            params.extensions = device.extensions as *const *const i8;
-            params.num_extensions = device.num_extensions;
-            params.features = device.features as *const ffi::VkPhysicalDeviceFeatures2;
-            let import_queues = vulkan_import_queues(device.queues);
-            params.queue_graphics = pl_queue(import_queues.graphics);
-            params.queue_compute = pl_queue(import_queues.compute);
-            params.queue_transfer = pl_queue(import_queues.transfer);
-            params.no_compute = import_queues.no_compute;
-            params.lock_queue = Some(lock_ffmpeg_vulkan_queue);
-            params.unlock_queue = Some(unlock_ffmpeg_vulkan_queue);
-            params.queue_ctx = vulkan_device_context_from_ref(device.device_ref()).cast();
-
             let vulkan = ffi::pl_vulkan_import(ptr::null(), &params);
             if vulkan.is_null() {
                 return Err(anyhow!("libplacebo 导入 FFmpeg Vulkan 设备失败"));
@@ -307,10 +293,50 @@ fn vulkan_import_queues(queues: VulkanDecodeQueues) -> VulkanImportQueues {
     }
 }
 
-fn pl_queue(queue: VulkanDecodeQueue) -> ffi::pl_vulkan_queue {
-    ffi::pl_vulkan_queue {
+fn pl_queue(queue: VulkanDecodeQueue, queue_flags: u32) -> Result<ffi::pl_vulkan_queue> {
+    #[cfg(not(libplacebo_vulkan_queue_flags))]
+    if queue_flags != 0 {
+        return Err(anyhow!(
+            "libplacebo 不支持 Vulkan 队列创建标志 {queue_flags:#x}；导入 FFmpeg 设备需要 libplacebo API 365 或包含 pl_vulkan_queue.flags 的修复版本"
+        ));
+    }
+    Ok(ffi::pl_vulkan_queue {
         index: queue.index,
         count: queue.count,
+        #[cfg(libplacebo_vulkan_queue_flags)]
+        flags: queue_flags,
+    })
+}
+
+fn vulkan_import_params(device: &VulkanDecodeDevice) -> Result<ffi::pl_vulkan_import_params> {
+    let queues = vulkan_import_queues(device.queues);
+    let graphics = pl_queue(queues.graphics, device.queue_flags)?;
+    let compute = pl_queue(queues.compute, device.queue_flags)?;
+    let transfer = pl_queue(queues.transfer, device.queue_flags)?;
+    tracing::debug!(
+        queue_flags = device.queue_flags,
+        graphics = ?queues.graphics,
+        compute = ?queues.compute,
+        transfer = ?queues.transfer,
+        "importing FFmpeg Vulkan queues into libplacebo"
+    );
+    unsafe {
+        let mut params = mem::zeroed::<ffi::pl_vulkan_import_params>();
+        params.instance = device.instance as ffi::VkInstance;
+        params.get_proc_addr = get_proc_addr_from_usize(device.get_proc_addr);
+        params.phys_device = device.physical_device as ffi::VkPhysicalDevice;
+        params.device = device.device as ffi::VkDevice;
+        params.extensions = device.extensions as *const *const i8;
+        params.num_extensions = device.num_extensions;
+        params.features = device.features as *const ffi::VkPhysicalDeviceFeatures2;
+        params.queue_graphics = graphics;
+        params.queue_compute = compute;
+        params.queue_transfer = transfer;
+        params.no_compute = queues.no_compute;
+        params.lock_queue = Some(lock_ffmpeg_vulkan_queue);
+        params.unlock_queue = Some(unlock_ffmpeg_vulkan_queue);
+        params.queue_ctx = vulkan_device_context_from_ref(device.device_ref()).cast();
+        Ok(params)
     }
 }
 

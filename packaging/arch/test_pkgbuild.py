@@ -90,6 +90,20 @@ class MakepkgSourceTests(unittest.TestCase):
         self.assertFalse((self.checkout / ".makepkg/sources").exists())
         self.assert_checkout_preserved()
 
+    def test_prerelease_version_is_valid_when_makepkg_updates_pkgver(self):
+        (self.upstream / "Cargo.toml").write_text(
+            '[package]\nname = "tiny-player"\nversion = "0.1.8-rc.1"\n',
+        )
+        self.git("-c", "user.name=Packaging Test", "-c", "user.email=test@example.invalid",
+                 "-c", "commit.gpgsign=false", "commit", "-am", "Use prerelease version")
+        commit = self.git("rev-parse", "--short=7", "HEAD").stdout.strip()
+
+        self.makepkg("--nobuild", "--noprepare", "--nodeps")
+
+        pkgbuild = (self.checkout / "PKGBUILD").read_text()
+        self.assertIn(f"pkgver=0.1.8rc.1.r2.g{commit}\n", pkgbuild)
+        self.assert_checkout_preserved()
+
 
 if __name__ == "__main__":
     unittest.main()
