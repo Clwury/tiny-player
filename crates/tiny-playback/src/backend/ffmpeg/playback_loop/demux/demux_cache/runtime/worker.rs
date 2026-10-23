@@ -106,6 +106,9 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
             .as_ref()
             .map(|cache| cache.input_progress_generation()),
     );
+    // Only an accepted packet ends warmup. Retryable reads, deselected streams,
+    // and discarded overlap must not extend the first-packet warning grace.
+    let mut first_packet_wait_started_at = Some(Instant::now());
     timeline.reset(start_position_seconds, session_id, &shared.event_tx);
     let mut packet = match AvPacket::new() {
         Ok(packet) => packet,
@@ -141,6 +144,7 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
                 continue;
             }
             let seek_generation = request.seek_generation;
+            first_packet_wait_started_at = Some(Instant::now());
             let seek_position_seconds = paused_seek_preroll_position_seconds(
                 video_stream.codec_id,
                 request.position_seconds,
@@ -219,7 +223,12 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
         let read_elapsed = read_started_at.elapsed();
         shared.mark_demux_read_finished();
         if read_elapsed >= DEMUX_READ_SLOW_LOG_AFTER {
-            shared.log_slow_demux_read(read_elapsed, read);
+            shared.log_slow_demux_read(
+                read_elapsed,
+                read,
+                demux_input_generation,
+                first_packet_wait_started_at.map(|started| started.elapsed()),
+            );
         }
         if shared.should_stop() {
             packet.unref();
@@ -272,8 +281,8 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
                             current_seek_generation = shared.control.seek_generation(),
                             "discarding FFmpeg demux packet before append after demux input moved"
                         );
-                    } else {
-                        shared.append_packet_for_generation(cached, demux_input_generation);
+                    } else if shared.append_packet_for_generation(cached, demux_input_generation) {
+                        first_packet_wait_started_at = None;
                     }
                 }
                 Ok(None) => {}

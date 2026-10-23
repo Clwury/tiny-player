@@ -45,11 +45,12 @@ impl DemuxPacketCacheShared {
         self.append_packet_for_generation(packet, self.demux_input_generation());
     }
 
+    /// Report actual admission so diagnostics only finish warmup on input progress.
     pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn append_packet_for_generation(
         &self,
         packet: CachedDemuxPacket,
         demux_input_generation: u64,
-    ) {
+    ) -> bool {
         let packet_stream_index = packet.stream_index;
         let packet_bytes = packet.byte_len;
         let lock_wait_started_at = Instant::now();
@@ -58,12 +59,12 @@ impl DemuxPacketCacheShared {
             .lock()
             .expect("FFmpeg demux packet cache poisoned");
         if guard.demux_input_generation != demux_input_generation {
-            return;
+            return false;
         }
         // Stream selection can change while av_read_frame is in flight. Do
         // not recreate a deselected queue from the producer's older snapshot.
         if !guard.stream_kinds.contains_key(&packet_stream_index) {
-            return;
+            return false;
         }
         let append_lock_wait = lock_wait_started_at.elapsed();
         let append_lock_hold_started_at = Instant::now();
@@ -161,6 +162,7 @@ impl DemuxPacketCacheShared {
             append_outcome,
             cache_pause_changed,
         );
+        append_outcome.appended
     }
 
     pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn mark_eof(

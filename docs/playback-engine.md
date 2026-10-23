@@ -38,6 +38,24 @@ cargo run -p tiny-playback --locked --example headless -- /path/to/video.avi
 示例仅使用公开接口，在最多 30 秒内消费视频帧，不创建窗口。YUV/HDR 视频仍可能使用
 Vulkan/libplacebo；没有 GPU 的环境可使用 BGRA 等走软件转换路径的测试素材。
 
+## Demux 慢读日志
+
+`av_read_frame` 单次耗时达到 200 ms 时记录慢读事件。`read_phase` 区分 `startup`、
+`seek_preroll` 与 `steady`；启动或低层 seek 后，只有首个有效数据包被当前输入代次的缓存
+接纳，才结束首包等待。重试、被取消的流和重复包不会重置等待时间，也不会提前结束该阶段。
+
+首包等待累计不足 2 秒且读取成功时，以 DEBUG 记录 `startup_read` 或 `seek_preroll_read`。
+累计等待达到 2 秒后，若未处于缓存暂停且前向缓存不超过 250 ms，仍以 WARN 记录
+`first_packet_delayed`；正常读取阶段同样保留 `low_water_stall` 告警。
+已有超过 250 ms 的前向缓存或处于缓存暂停时，沿用原有 DEBUG 分类。读取错误不享有
+成功首包的宽限，实际错误继续由现有重试及错误处理流程上报。
+
+日志同时包含 `first_packet_wait_ms`、本次读取的 `demux_input_generation` 和当前缓存的
+`current_demux_input_generation`。
+跨 seek 后已失效的旧读取归为 `superseded_input`，以 DEBUG 记录，避免将新位置的空缓存
+归因于旧读取。慢读事件在本次包入队之前记录；缓存为空或读取成功均不能单独证明画面卡顿
+或渲染成功，仍需结合解码、输出缓冲和渲染日志判断。
+
 ## 视频解码策略
 
 默认使用 `Auto` 模式，按当前选择的 GPU 和平台依次尝试：

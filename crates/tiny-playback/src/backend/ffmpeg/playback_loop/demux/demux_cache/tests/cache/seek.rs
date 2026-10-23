@@ -492,7 +492,7 @@ fn packet_from_previous_read_does_not_enter_a_new_seek_range() {
         1_200_000_000,
     );
     control.finish_seek(seek_generation);
-    shared.append_packet_for_generation(packet, demux_input_generation);
+    assert!(!shared.append_packet_for_generation(packet, demux_input_generation));
     {
         let state = shared.state.lock().unwrap();
         assert!(state.read_range().global_order.is_empty());
@@ -500,13 +500,26 @@ fn packet_from_previous_read_does_not_enter_a_new_seek_range() {
         assert!(!state.read_range_eof());
     }
 
-    shared.append_packet_for_generation(
+    assert!(shared.append_packet_for_generation(
         cached_anchor(1_200_000_000, 1_300_000_000),
         shared.demux_input_generation(),
-    );
+    ));
     let state = shared.state.lock().unwrap();
     assert_eq!(state.read_range().global_order.len(), 1);
     assert!(!state.seeking);
+}
+
+#[test]
+fn deselected_packet_does_not_report_demux_input_progress() {
+    let control = Arc::new(FfmpegControl::new(PlaybackSessionId(1)));
+    let shared = shared_for_test(control);
+    let generation = shared.demux_input_generation();
+    assert!(!shared.append_packet_for_generation(
+        cached_packet(99, false, Some(0), Some(100_000_000)),
+        generation,
+    ));
+    assert!(shared.state.lock().unwrap().packets.is_empty());
+    assert!(shared.append_packet_for_generation(cached_anchor(0, 100_000_000), generation));
 }
 
 #[test]
