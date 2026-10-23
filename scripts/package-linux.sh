@@ -5,9 +5,11 @@ if [[ ${1:-} == --help ]]; then
     cat <<'EOF'
 Usage: scripts/package-linux.sh [--skip-image-build]
 Build x86_64 Linux tar.gz and AppImage packages with a glibc 2.39 baseline using Docker.
-Outputs: dist/*.tar.gz, dist/*.AppImage, their *.sha256 and dist/*.manifest.json
+Outputs: dist/*.tar.gz, dist/*.AppImage, dist/*.AppImage.zsync, their tar/AppImage *.sha256,
+         and dist/*.manifest.json
 Environment: CONTAINER_ENGINE (docker), BUILD_JOBS (4),
-             TINY_LINUX_IMAGE (tiny-player-builder:glibc2.39)
+             TINY_LINUX_IMAGE (tiny-player-builder:glibc2.39),
+             TINY_APPIMAGE_REPOSITORY (GitHub owner/repository; defaults to Cargo.toml)
 --skip-image-build uses an already built image (for CI's cached Buildx build).
 EOF
     exit 0
@@ -36,6 +38,7 @@ fi
     --mount "type=bind,src=$repo_dir/target/linux-x86_64-glibc2.39,dst=/build" \
     --mount "type=bind,src=$repo_dir/dist,dst=/out" \
     --env "CARGO_BUILD_JOBS=$build_jobs" \
+    --env TINY_APPIMAGE_REPOSITORY \
     "$builder_image" bash -s <<'BUILD'
 set -euo pipefail
 [[ $(uname -m) == x86_64 && $(getconf GNU_LIBC_VERSION) == 'glibc 2.39' ]]

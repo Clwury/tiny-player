@@ -15,6 +15,8 @@ glibc 2.39 是发布基线，包内所有 ELF 的实际版本需求均不得高�
 
 默认并发数为 4，可用 `BUILD_JOBS=8 ./scripts/package-linux.sh` 调整 Cargo 并发。
 `CONTAINER_ENGINE` 可指定兼容 Docker 命令行的引擎，`TINY_LINUX_IMAGE` 可修改镜像名。
+`TINY_APPIMAGE_REPOSITORY=owner/repository` 可覆盖 AppImage 的 GitHub 更新仓库；
+默认取根 `Cargo.toml` 的 `repository`。GitHub Actions 自动使用当前仓库。
 构建缓存保存在 `target/linux-x86_64-glibc2.39/`，源码以只读方式挂入容器。
 容器以 `/build` 为工作目录，通过 `--manifest-path /src/Cargo.toml` 构建，确保 Cargo
 使用镜像内的原生依赖路径。本机开发准备脚本生成的 `.cargo/config.toml` 中的强制环境
@@ -70,6 +72,7 @@ tiny-player-<version>-linux-x86_64.tar.gz.sha256
 tiny-player-<version>-linux-x86_64.manifest.json
 tiny-player-<version>-linux-x86_64.AppImage
 tiny-player-<version>-linux-x86_64.AppImage.sha256
+tiny-player-<version>-linux-x86_64.AppImage.zsync
 ```
 
 归档根目录为 `tiny-player/`，包含 `bin/`、`lib/`、`share/`、`licenses/`、
@@ -89,6 +92,24 @@ runtime，也不需要容器 FUSE 或 privileged 模式。
 静态 runtime 不降低应用的 glibc 2.39 基线。工具准备在 root 下执行后仍允许普通
 用户读取和执行；`--skip-image-build` 会先核对已缓存镜像中的工具及锁定信息，不匹配时
 需重新构建镜像。
+
+构建镜像安装 `zsync`，提供 `zsyncmake` 和验证用客户端。appimagetool 显式嵌入更新信息并
+为最终 AppImage 生成同名 `.zsync`，默认更新信息为：
+
+```text
+gh-releases-zsync|Clwury|tiny-player|latest|tiny-player-*-linux-x86_64.AppImage.zsync
+```
+
+外部 AppImageUpdate 工具据此查找 GitHub Latest Release 的匹配附件；`latest` 不包含
+被 GitHub 标记为 prerelease 的发布。`.zsync` 内的 URL 固定到本次 `v<version>` 标签的
+AppImage 下载地址，避免依赖临时构建路径或跨版本文件名。清单的 `appimage_update`
+记录更新信息和下载 URL。本地生成的文件需与对应 AppImage 一起上传到该版本的 Release。
+构建与发布步骤均验证 `.zsync` 的文件名、大小、SHA-1、下载 URL 和校验表长度；
+人工下载校验继续使用 AppImage 的 `.sha256` 文件。也可手动验证已生成的控制文件：
+
+```sh
+python3 -B packaging/linux/appimage.py --verify-zsync dist/tiny-player-<version>-linux-x86_64.AppImage
+```
 
 随包 `licenses/appimage-runtime/` 保留 runtime 许可证、libfuse LGPL 文本和静态依赖的
 许可参考文本。锁文件记录 runtime 源码与构建配方；上游没有固定部分 Alpine 依赖的
@@ -111,10 +132,10 @@ AppImage 封装后使用固定 runtime 的 `--appimage-extract` 解包，不执�
 或解包后 ELF 不一致时，不输出本次发布产物。tar.gz 独有 `install.sh` 与 `README.txt`，
 AppImage 不携带或调用目录安装脚本。
 
-五个产物全部准备完成后，先复制到 `dist/` 同一文件系统的临时目录，再替换正式文件；
+六个产物全部准备完成后，先复制到 `dist/` 同一文件系统的临时目录，再替换正式文件；
 复制或替换失败时恢复原有产物，避免同版本的新旧归档、校验文件和清单混用。
 恢复失败时保留 `.tiny-player-publish-*` 恢复目录并报告路径。不要向同一 `dist/` 并发打包；
-这不是跨五个文件的原子事务，也不保证强制杀进程或掉电时自动恢复。
+这不是跨六个文件的原子事务，也不保证强制杀进程或掉电时自动恢复。
 
 以下由目标系统提供，以匹配系统配置、插件和驱动：
 
@@ -145,7 +166,8 @@ python3 -B -m unittest discover -s packaging/linux -p 'test_*.py' -v
 ```
 
 Linux 构建镜像内的测试还用小型 C 程序和共享库执行真实 AppImage 封装、解包审计、
-中文/空格路径移动及无 FUSE 启动，检查相对 RUNPATH、资源与参数传递；不启动 Tiny Player。
+更新信息检查、zsync 本地种子重建、中文/空格路径移动及无 FUSE 启动，检查相对 RUNPATH、
+资源与参数传递；不启动 Tiny Player。
 宿主环境没有 `/opt/appimage` 时此 smoke test 会跳过，可用 `TINY_TEST_APPIMAGE_TOOLS`
 指定已准备的工具目录。完整播放器编译、真实 FUSE 挂载和桌面播放仍需分别验证。
 
@@ -169,7 +191,8 @@ chmod +x "tiny-player-<version>-linux-x86_64.AppImage"
 ```
 
 也可在干净目录手动 `--appimage-extract`，然后运行 `./squashfs-root/AppRun`。
-AppImage 不保证双击启动、自动菜单安装或自动更新。更新时关闭应用后替换文件。
+AppImage 提供内嵌更新信息和 `.zsync`，可使用外部 AppImageUpdate 工具执行差量更新，
+或关闭应用后手动替换文件。双击启动和自动菜单安装仍取决于桌面环境。
 与 tar.gz 共用原有用户配置和缓存路径；不改变宿主 Vulkan、音频、字体或 portal 边界。
 
 ### tar.gz

@@ -234,6 +234,10 @@ def build_bundle(binary, output):
     package = tomllib.loads((repo / "Cargo.toml").read_text())["package"]
     version = package["version"]
     artifact_name = f"tiny-player-{version}-linux-x86_64"
+    update_metadata = appimage.github_update_metadata(
+        os.environ.get("TINY_APPIMAGE_REPOSITORY") or package["repository"],
+        f"v{version}", f"{artifact_name}.AppImage",
+    )
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="tiny-player-bundle-") as staging:
         staging = Path(staging)
@@ -252,12 +256,16 @@ def build_bundle(binary, output):
             "runtime_host_libraries": RUNTIME_HOST_LIBRARIES,
             "elf_files": audit_bundle(root),
             "appimage_tools": tool_lock,
+            "appimage_update": update_metadata,
         }
         manifest_text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         (root / "manifest.json").write_text(manifest_text)
         appdir = appimage.create_appdir(root, staging / "TinyPlayer.AppDir")
         image = staging / f"{artifact_name}.AppImage"
-        appimage.build_appimage(appdir, image, tools)
+        control = appimage.build_appimage(
+            appdir, image, tools, update_information=update_metadata["information"],
+            file_url=update_metadata["file_url"],
+        )
         extracted = appimage.extract_appimage(image, staging / "extracted")
         if audit_bundle(extracted) != manifest["elf_files"]:
             raise ValueError("AppImage payload differs from the audited Linux bundle")
@@ -271,12 +279,13 @@ def build_bundle(binary, output):
             tar.add(root, arcname="tiny-player")
         manifest_file = staging / f"{artifact_name}.manifest.json"
         manifest_file.write_text(manifest_text)
-        artifacts = [archive, write_checksum(archive), image, write_checksum(image), manifest_file]
+        artifacts = [archive, write_checksum(archive), image, write_checksum(image), control, manifest_file]
         # Complete both formats and the extraction audit before publishing files.
         publish_artifacts(artifacts, output)
         for name in (archive.name, image.name):
             path = output / name
             print(f"Created {path} ({path.stat().st_size / 1024**2:.1f} MiB)")
+        print(f"Created {output / control.name}")
         print(f"Audited {len(manifest['elf_files'])} x86_64 ELF files in both formats: glibc <= 2.39")
 
 

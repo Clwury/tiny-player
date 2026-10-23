@@ -28,8 +28,10 @@ AppImage (alternative to tar.gz)
   Or use --appimage-extract in a fresh directory, then ./squashfs-root/AppRun.
   The static musl runtime needs no libfuse2, but normal mounting still needs FUSE.
   The application still requires glibc 2.39 and the host dependencies above.
-  Double-click launching, automatic menu installation and updates are not guaranteed.
-  To update, close Tiny Player and replace the AppImage file. AppImage and tar.gz
+  Embedded GitHub Release update information and the matching .zsync file support
+  external AppImageUpdate tools. Close Tiny Player before updating or replacing
+  the AppImage. Double-click launching and menu installation depend on the desktop.
+  AppImage and tar.gz
   share the existing user settings/cache paths; no portable configuration is created.
 
 Install tar.gz (optional, no sudo)
@@ -65,7 +67,7 @@ VA-API to Vulkan GPU mapping (Linux)
   Stats show HW: vaapi-vulkan. Final BGRA output still returns to GPUI memory.
 
 Packaging
-  package-linux.sh outputs tar.gz, AppImage, both SHA256 files and manifest.json
+  package-linux.sh outputs tar.gz, AppImage, AppImage.zsync, both SHA256 files and manifest.json
   by default. AppDir has flat bin/, lib/, share/ directories; AppRun points to
   bin/tiny-player and root desktop/icon links use relative targets in share/.
   packaging/linux/appimage-tools.json pins appimagetool and static musl type2-runtime

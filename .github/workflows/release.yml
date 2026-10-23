@@ -80,6 +80,7 @@ jobs:
     timeout-minutes: 120
     env:
       TINY_LINUX_IMAGE: tiny-player-builder:glibc2.39
+      TINY_APPIMAGE_REPOSITORY: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -147,6 +148,8 @@ jobs:
           RELEASE_VERSION: ${{ needs.checks.outputs.version }}
         run: |
           test -s "tiny-player-$RELEASE_VERSION-linux-x86_64.manifest.json"
+          python3 -B ../packaging/linux/appimage.py --verify-zsync \
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.AppImage"
           sha256sum --check --strict \
             "tiny-player-$RELEASE_VERSION-linux-x86_64.tar.gz.sha256" \
             "tiny-player-$RELEASE_VERSION-linux-x86_64.AppImage.sha256"
@@ -160,6 +163,7 @@ jobs:
             dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.manifest.json
             dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.AppImage
             dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.AppImage.sha256
+            dist/tiny-player-${{ needs.checks.outputs.version }}-linux-x86_64.AppImage.zsync
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -248,6 +252,9 @@ jobs:
       RELEASE_TAG: ${{ needs.checks.outputs.tag }}
       RELEASE_VERSION: ${{ needs.checks.outputs.version }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           pattern: release-*
@@ -262,10 +269,13 @@ jobs:
             "tiny-player-$RELEASE_VERSION-linux-x86_64.manifest.json"
             "tiny-player-$RELEASE_VERSION-linux-x86_64.AppImage"
             "tiny-player-$RELEASE_VERSION-linux-x86_64.AppImage.sha256"
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.AppImage.zsync"
             "tiny-player-$RELEASE_VERSION-windows-x86_64.zip"
             "tiny-player-$RELEASE_VERSION-windows-x86_64.zip.sha256"
           )
           for asset in "${assets[@]}"; do test -s "$asset"; done
+          python3 -B ../packaging/linux/appimage.py --verify-zsync \
+            "tiny-player-$RELEASE_VERSION-linux-x86_64.AppImage"
           sha256sum --check --strict \
             "tiny-player-$RELEASE_VERSION-linux-x86_64.tar.gz.sha256" \
             "tiny-player-$RELEASE_VERSION-linux-x86_64.AppImage.sha256" \
@@ -275,6 +285,7 @@ jobs:
           Without FUSE, run the AppImage with --appimage-extract-and-run. The static runtime needs no libfuse2, but normal mounting still needs FUSE.
           Both Linux formats use the same audited payload; host Vulkan drivers, audio/font configuration and desktop portals are still required as applicable.
           AppImage updates: close the app and replace the file; settings and caches are shared with the tar.gz package. No automatic menu installation or updates, or double-click support, are guaranteed.
+          AppImage update information and the matching .zsync file are included for external AppImageUpdate tools.
           Windows: Windows 10 22H2 / Windows 11 x64; extract the entire ZIP and run tiny-player.exe.
 
           Built from commit $GITHUB_SHA. Linux and Windows packages include their native dependencies, assets and build metadata.

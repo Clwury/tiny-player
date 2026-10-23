@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from urllib.parse import quote, unquote, urlsplit
 
 
 LOCK_FILE = Path(__file__).with_name("appimage-tools.json")
@@ -118,7 +119,59 @@ def loader_environment():
     return env
 
 
-def build_appimage(appdir, output, tools=TOOLS_DIR):
+def github_update_metadata(repository, tag, filename):
+    repository = repository.removeprefix("https://github.com/").rstrip("/").removesuffix(".git")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repository):
+        raise ValueError("AppImage update repository must be a GitHub owner/repository or HTTPS repository URL")
+    owner, name = repository.split("/")
+    return {
+        "information": f"gh-releases-zsync|{owner}|{name}|latest|tiny-player-*-linux-x86_64.AppImage.zsync",
+        "file_url": f"https://github.com/{repository}/releases/download/{quote(tag, safe='')}/{quote(filename, safe='')}",
+    }
+
+
+def verify_zsync(image, expected_url=None):
+    control = image.with_name(image.name + ".zsync")
+    if not control.is_file() or control.stat().st_size == 0:
+        raise ValueError("appimagetool did not produce a zsync file; install zsyncmake or rebuild the builder image")
+    with control.open("rb") as stream:
+        header, separator, _ = stream.read(64 * 1024).partition(b"\n\n")
+    if not separator:
+        raise ValueError("Invalid zsync header")
+    headers = {}
+    for line in header.decode("ascii").splitlines():
+        name, separator, value = line.partition(": ")
+        if not separator or name in headers:
+            raise ValueError("Invalid or duplicate zsync header")
+        headers[name] = value
+    if not headers.get("zsync") or headers.get("Filename") != image.name:
+        raise ValueError("zsync filename does not match the AppImage")
+    url = headers.get("URL", "")
+    parsed_url = urlsplit(url)
+    if (parsed_url.scheme != "https" or not parsed_url.netloc
+            or unquote(parsed_url.path.rsplit("/", 1)[-1]) != image.name
+            or (expected_url is not None and url != expected_url)):
+        raise ValueError("zsync URL does not match the AppImage release URL")
+    length = int(headers.get("Length", "-1"))
+    if length != image.stat().st_size:
+        raise ValueError("zsync length does not match the AppImage")
+    with image.open("rb") as stream:
+        digest = hashlib.file_digest(stream, lambda: hashlib.sha1(usedforsecurity=False)).hexdigest()
+    if headers.get("SHA-1") != digest:
+        raise ValueError("zsync SHA-1 does not match the AppImage")
+    blocksize = int(headers.get("Blocksize", "0"))
+    hash_lengths = [int(value) for value in headers.get("Hash-Lengths", "").split(",")]
+    if (blocksize <= 0 or blocksize & (blocksize - 1) or len(hash_lengths) != 3
+            or hash_lengths[0] < 1 or not 1 <= hash_lengths[1] <= 4 or not 1 <= hash_lengths[2] <= 16):
+        raise ValueError("Invalid zsync checksum parameters")
+    expected_bytes = ((length + blocksize - 1) // blocksize) * sum(hash_lengths[1:])
+    if control.stat().st_size - len(header) - 2 != expected_bytes:
+        raise ValueError("Truncated or invalid zsync checksum table")
+    return control
+
+
+def build_appimage(appdir, output, tools=TOOLS_DIR, *, update_information, file_url):
+    appdir, output, tools = appdir.resolve(), output.resolve(), tools.resolve()
     env = dict(loader_environment(), ARCH="x86_64")
     # VERSION makes appimagetool replace the root desktop symlink with a file.
     # The explicit artifact name and manifest already carry our application version.
@@ -126,11 +179,13 @@ def build_appimage(appdir, output, tools=TOOLS_DIR):
     subprocess.run([
         str(tools / "appimagetool-x86_64.AppImage"), "--appimage-extract-and-run",
         "--runtime-file", str(tools / "runtime-x86_64"), "--no-appstream",
+        "--updateinformation", update_information, "--file-url", file_url,
         str(appdir), str(output),
-    ], check=True, env=env)
+    ], check=True, env=env, cwd=output.parent)
     if not output.is_file() or output.stat().st_size == 0:
         raise ValueError("appimagetool did not produce an AppImage")
     output.chmod(0o755)
+    return verify_zsync(output, expected_url=file_url)
 
 
 def extract_appimage(image, destination):
@@ -154,8 +209,12 @@ if __name__ == "__main__":
     operation = parser.add_mutually_exclusive_group(required=True)
     operation.add_argument("--prepare-tools", type=Path)
     operation.add_argument("--verify-tools", type=Path)
+    operation.add_argument("--verify-zsync", type=Path, metavar="APPIMAGE")
     arguments = parser.parse_args()
     if arguments.prepare_tools is not None:
         prepare_tools(arguments.prepare_tools.resolve())
-    else:
+    elif arguments.verify_tools is not None:
         verify_tools(arguments.verify_tools.resolve())
+    else:
+        control = verify_zsync(arguments.verify_zsync.resolve())
+        print(f"Verified {control}")

@@ -30,6 +30,20 @@ def make_payload(root):
     (root / "share/tiny-player/assets/icons/probe.txt").write_text("portable asset")
 
 
+def make_zsync_fixture(image, url):
+    # Metadata/publication fixtures only; the smoke test uses real zsyncmake
+    # checksums and reconstructs the image with the zsync client.
+    data = image.read_bytes()
+    header = (
+        f"zsync: 0.6.2\nFilename: {image.name}\nBlocksize: 2048\nLength: {len(data)}\n"
+        f"Hash-Lengths: 2,2,4\nURL: {url}\n"
+        f"SHA-1: {hashlib.sha1(data, usedforsecurity=False).hexdigest()}\n\n"
+    ).encode("ascii")
+    control = image.with_name(image.name + ".zsync")
+    control.write_bytes(header + b"\x00" * (((len(data) + 2047) // 2048) * 6))
+    return control
+
+
 class AppImageTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -37,6 +51,7 @@ class AppImageTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.payload = self.root / "payload"
         make_payload(self.payload)
+        self.update = appimage.github_update_metadata("Example/tiny-player", "v1.2.3", "player.AppImage")
 
     def test_relative_links_preserve_payload_and_arguments_after_moving(self):
         source_hash = appimage.sha256(self.payload / "bin/tiny-player")
@@ -72,32 +87,83 @@ class AppImageTests(unittest.TestCase):
             self.assertEqual(command, [
                 str(tools / "appimagetool-x86_64.AppImage"), "--appimage-extract-and-run",
                 "--runtime-file", str(tools / "runtime-x86_64"), "--no-appstream",
+                "--updateinformation", self.update["information"], "--file-url", self.update["file_url"],
                 str(appdir), str(output),
             ])
             self.assertTrue(kwargs["check"])
+            self.assertEqual(kwargs["cwd"], output.parent)
             self.assertEqual(kwargs["env"]["ARCH"], "x86_64")
             self.assertNotIn("VERSION", kwargs["env"])
             for name in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT", "TARGET_APPIMAGE",
                          "APPIMAGE_EXTRACT_AND_RUN", "NO_CLEANUP"):
                 self.assertNotIn(name, kwargs["env"])
             output.write_bytes(b"fixture AppImage")
+            make_zsync_fixture(output, self.update["file_url"])
 
         with patch.dict(os.environ, LD_LIBRARY_PATH="/builder/lib", LD_PRELOAD="builder.so",
                         LD_AUDIT="audit.so", VERSION="unrelated", TARGET_APPIMAGE="/other.AppImage",
                         APPIMAGE_EXTRACT_AND_RUN="1", NO_CLEANUP="1"), \
                 patch.object(appimage.subprocess, "run", side_effect=pack):
-            appimage.build_appimage(appdir, output, tools)
+            control = appimage.build_appimage(
+                appdir, output, tools, update_information=self.update["information"],
+                file_url=self.update["file_url"],
+            )
         self.assertEqual(output.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(control, output.with_name(output.name + ".zsync"))
 
     def test_packaging_failure_or_missing_output_is_not_accepted(self):
         output = self.root / "player.AppImage"
         with patch.object(appimage.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "tool")):
             with self.assertRaises(subprocess.CalledProcessError):
-                appimage.build_appimage(self.payload, output)
+                appimage.build_appimage(self.payload, output, update_information=self.update["information"],
+                                       file_url=self.update["file_url"])
         self.assertFalse(output.exists())
         with patch.object(appimage.subprocess, "run"):
             with self.assertRaisesRegex(ValueError, "did not produce"):
-                appimage.build_appimage(self.payload, output)
+                appimage.build_appimage(self.payload, output, update_information=self.update["information"],
+                                       file_url=self.update["file_url"])
+
+    def test_successful_tool_without_zsync_output_is_rejected(self):
+        image = self.root / "player.AppImage"
+        with patch.object(appimage.subprocess, "run", side_effect=lambda *args, **kwargs: image.write_bytes(b"image")):
+            with self.assertRaisesRegex(ValueError, "did not produce a zsync file"):
+                appimage.build_appimage(self.payload, image, update_information=self.update["information"],
+                                       file_url=self.update["file_url"])
+
+    def test_zsync_metadata_matches_the_final_image_and_release_url(self):
+        image = self.root / "player.AppImage"
+        image.write_bytes(b"fixture AppImage")
+        control = make_zsync_fixture(image, self.update["file_url"])
+        original = control.read_bytes()
+        self.assertEqual(appimage.verify_zsync(image, self.update["file_url"]), control)
+        for old, new, message in (
+            (b"Filename: player.AppImage", b"Filename: other.AppImage", "filename"),
+            (b"Length: 16", b"Length: 17", "length"),
+            (self.update["file_url"].encode(), b"https://example.invalid/player.AppImage", "URL"),
+        ):
+            with self.subTest(message=message):
+                self.assertIn(old, original)
+                control.write_bytes(original.replace(old, new))
+                with self.assertRaisesRegex(ValueError, message):
+                    appimage.verify_zsync(image, self.update["file_url"])
+        control.write_bytes(original[:-1])
+        with self.assertRaisesRegex(ValueError, "checksum table"):
+            appimage.verify_zsync(image)
+        control.write_bytes(original)
+        image.write_bytes(b"changed AppImage")  # Same size; must detect a stale control file.
+        with self.assertRaisesRegex(ValueError, "SHA-1"):
+            appimage.verify_zsync(image)
+
+    def test_update_metadata_uses_latest_feed_and_versioned_download_url(self):
+        for repository in ("Clwury/tiny-player", "https://github.com/Clwury/tiny-player.git"):
+            metadata = appimage.github_update_metadata(repository, "v1.2.3+build", "player.AppImage")
+            self.assertEqual(metadata["information"],
+                             "gh-releases-zsync|Clwury|tiny-player|latest|tiny-player-*-linux-x86_64.AppImage.zsync")
+            self.assertEqual(metadata["file_url"],
+                             "https://github.com/Clwury/tiny-player/releases/download/v1.2.3%2Bbuild/player.AppImage")
+        for repository in ("invalid", "https://example.invalid/owner/repo", "owner/repo|other", "../repo"):
+            with self.subTest(repository=repository), self.assertRaises(ValueError):
+                appimage.github_update_metadata(repository, "v1.2.3", "player.AppImage")
 
     def test_extraction_checks_links_without_running_the_player(self):
         appdir = appimage.create_appdir(self.payload, self.root / "TinyPlayer.AppDir")
@@ -238,7 +304,13 @@ class BundleFormatsTests(ToolFixture, unittest.TestCase):
     def test_failed_extraction_audit_leaves_existing_outputs_untouched(self):
         self.check_formats(mismatch=True)
 
-    def check_formats(self, mismatch=False):
+    def test_missing_zsync_leaves_existing_outputs_untouched(self):
+        self.check_formats(missing_zsync=True)
+
+    def test_update_repository_override_is_used_in_both_formats(self):
+        self.check_formats(repository="Example/player-fork")
+
+    def check_formats(self, mismatch=False, missing_zsync=False, repository=None):
         self.prepare()
         output = self.root / "dist"
         output.mkdir()
@@ -249,13 +321,23 @@ class BundleFormatsTests(ToolFixture, unittest.TestCase):
         def assemble(binary, repo, root, package):
             make_payload(root)
 
-        def pack(appdir, image, tools):
+        def pack(appdir, image, tools, *, update_information, file_url):
             self.assertFalse((appdir / "install.sh").exists())
             self.assertFalse((appdir / "README.txt").exists())
             self.assertEqual(json.loads((appdir / "manifest.json").read_text())["elf_files"], elf_manifest)
             self.assertEqual(json.loads((appdir / "build-info/appimage-tools.json").read_text()), self.lock)
+            metadata = json.loads((appdir / "manifest.json").read_text())["appimage_update"]
+            self.assertEqual(metadata, {"information": update_information, "file_url": file_url})
+            owner, name = (repository or "Clwury/tiny-player").split("/")
+            self.assertEqual(update_information,
+                             f"gh-releases-zsync|{owner}|{name}|latest|tiny-player-*-linux-x86_64.AppImage.zsync")
+            self.assertIn(f"https://github.com/{owner}/{name}/releases/download/v", file_url)
+            self.assertTrue(file_url.endswith("/" + image.name))
             image.write_bytes(b"fixture AppImage")
             image.chmod(0o755)
+            if not missing_zsync:
+                make_zsync_fixture(image, file_url)
+            return appimage.verify_zsync(image, file_url)
 
         def extract(image, destination):
             root = destination / "squashfs-root"
@@ -264,7 +346,8 @@ class BundleFormatsTests(ToolFixture, unittest.TestCase):
 
         runtime_info = {"needed": [], "glibc_required": "0.0"}
         audit_results = [elf_manifest, {} if mismatch else elf_manifest]
-        with patch.object(bundle, "run", side_effect=["glibc 2.39", "no interpreter"]), \
+        with patch.dict(os.environ, TINY_APPIMAGE_REPOSITORY=repository or ""), \
+                patch.object(bundle, "run", side_effect=["glibc 2.39", "no interpreter"]), \
                 patch.object(bundle, "inspect_elf", return_value=runtime_info), \
                 patch.object(appimage, "TOOLS_DIR", self.directory), \
                 patch.object(appimage, "verify_tools", return_value=self.lock), \
@@ -272,22 +355,25 @@ class BundleFormatsTests(ToolFixture, unittest.TestCase):
                 patch.object(bundle, "audit_bundle", side_effect=audit_results) as audit, \
                 patch.object(appimage, "build_appimage", side_effect=pack), \
                 patch.object(appimage, "extract_appimage", side_effect=extract):
-            if mismatch:
+            if missing_zsync:
+                with self.assertRaisesRegex(ValueError, "did not produce a zsync file"):
+                    bundle.build_bundle(self.root / "binary", output)
+            elif mismatch:
                 with self.assertRaisesRegex(ValueError, "payload differs"):
                     bundle.build_bundle(self.root / "binary", output)
             else:
                 bundle.build_bundle(self.root / "binary", output)
             assembly.assert_called_once()
-            self.assertEqual(audit.call_count, 2)
+            self.assertEqual(audit.call_count, 1 if missing_zsync else 2)
         self.assertEqual(sentinel.read_bytes(), b"keep")
-        if mismatch:
+        if mismatch or missing_zsync:
             self.assertEqual(list(output.iterdir()), [sentinel])
             return
         version = json.loads(next(output.glob("*.manifest.json")).read_text())["version"]
         stem = f"tiny-player-{version}-linux-x86_64"
         self.assertEqual({p.name for p in output.iterdir()}, {
             "existing-package", stem + ".tar.gz", stem + ".tar.gz.sha256",
-            stem + ".AppImage", stem + ".AppImage.sha256", stem + ".manifest.json",
+            stem + ".AppImage", stem + ".AppImage.sha256", stem + ".AppImage.zsync", stem + ".manifest.json",
         })
         with tarfile.open(output / (stem + ".tar.gz")) as archive:
             self.assertEqual(json.load(archive.extractfile("tiny-player/manifest.json"))["elf_files"], elf_manifest)
@@ -298,6 +384,7 @@ class BundleFormatsTests(ToolFixture, unittest.TestCase):
         subprocess.run([
             "sha256sum", "--check", "--strict", stem + ".tar.gz.sha256", stem + ".AppImage.sha256",
         ], cwd=output, check=True)
+        self.assertEqual(appimage.verify_zsync(output / (stem + ".AppImage")), output / (stem + ".AppImage.zsync"))
 
 
 class PublicationTests(unittest.TestCase):
@@ -310,7 +397,7 @@ class PublicationTests(unittest.TestCase):
         source = self.root / "source"
         source.mkdir()
         self.artifacts = []
-        for suffix in (".tar.gz", ".tar.gz.sha256", ".AppImage", ".AppImage.sha256", ".manifest.json"):
+        for suffix in (".tar.gz", ".tar.gz.sha256", ".AppImage", ".AppImage.sha256", ".AppImage.zsync", ".manifest.json"):
             artifact = source / ("package" + suffix)
             artifact.write_bytes(b"new " + suffix.encode())
             self.artifacts.append(artifact)
@@ -343,6 +430,20 @@ class PublicationTests(unittest.TestCase):
         original = self.old_outputs()
         with patch.object(bundle.os, "replace", side_effect=self.fail_activation):
             with self.assertRaisesRegex(OSError, "activation failed"):
+                bundle.publish_artifacts(self.artifacts, self.output)
+        self.assertEqual(self.snapshot(), original)
+        self.assertEqual(list(self.output.glob(".tiny-player-publish-*")), [])
+
+    def test_zsync_activation_failure_restores_the_matching_appimage_and_control(self):
+        original = self.old_outputs()
+
+        def fail_control(source, destination):
+            if Path(source).parent.name == "new" and str(destination).endswith(".AppImage.zsync"):
+                raise OSError("zsync activation failed")
+            self.original_replace(source, destination)
+
+        with patch.object(bundle.os, "replace", side_effect=fail_control):
+            with self.assertRaisesRegex(OSError, "zsync activation failed"):
                 bundle.publish_artifacts(self.artifacts, self.output)
         self.assertEqual(self.snapshot(), original)
         self.assertEqual(list(self.output.glob(".tiny-player-publish-*")), [])
@@ -409,7 +510,7 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), original)
 
 
-@unittest.skipUnless(SMOKE_TOOLS.is_dir() and shutil.which("cc") and shutil.which("patchelf"),
+@unittest.skipUnless(SMOKE_TOOLS.is_dir() and shutil.which("cc") and shutil.which("patchelf") and shutil.which("zsync"),
                      "needs pinned AppImage tools and ELF build tools (included in the builder)")
 class AppImageSmokeTests(unittest.TestCase):
     def test_real_appimage_round_trip_and_no_fuse_run_after_moving(self):
@@ -455,7 +556,22 @@ int main(int argc, char **argv) {
             manifest = bundle.audit_bundle(payload)
             appdir = appimage.create_appdir(payload, root / "TinyPlayer.AppDir")
             image = root / "fixture.AppImage"
-            appimage.build_appimage(appdir, image, SMOKE_TOOLS)
+            update = appimage.github_update_metadata("Example/tiny-player", "v1.2.3", image.name)
+            control = appimage.build_appimage(
+                appdir, image, SMOKE_TOOLS, update_information=update["information"],
+                file_url=update["file_url"],
+            )
+            embedded = subprocess.check_output(
+                [str(image), "--appimage-updateinformation"], text=True, env=appimage.loader_environment(),
+            ).strip()
+            self.assertEqual(embedded, update["information"])
+            self.assertEqual(appimage.verify_zsync(image, update["file_url"]), control)
+            reconstructed = root / "reconstructed.AppImage"
+            # A complete local seed must reconstruct without downloading data.
+            subprocess.run([
+                "zsync", "-i", str(image), "-o", str(reconstructed), str(control),
+            ], check=True, cwd=root, env=appimage.loader_environment(), capture_output=True, timeout=20)
+            self.assertEqual(appimage.sha256(reconstructed), appimage.sha256(image))
             extracted = appimage.extract_appimage(image, root / "extracted")
             self.assertEqual(bundle.audit_bundle(extracted), manifest)
             self.assertEqual((extracted / "share/tiny-player/assets/icons/probe.txt").read_text(), "portable asset")
