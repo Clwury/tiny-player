@@ -138,6 +138,7 @@ pub(super) struct FfmpegControl {
     wake_generation: AtomicU64,
     wake_guard: Mutex<()>,
     wake_ready: Condvar,
+    event_tx: Option<Sender<BackendEvent>>,
 }
 
 impl FfmpegControl {
@@ -160,7 +161,13 @@ impl FfmpegControl {
             wake_generation: AtomicU64::new(0),
             wake_guard: Mutex::new(()),
             wake_ready: Condvar::new(),
+            event_tx: None,
         }
+    }
+
+    pub(super) fn with_events(mut self, event_tx: Sender<BackendEvent>) -> Self {
+        self.event_tx = Some(event_tx);
+        self
     }
 
     pub(super) fn shutdown(&self) {
@@ -255,7 +262,24 @@ impl FfmpegControl {
     }
 
     pub(super) fn set_output_rebuffer_paused(&self, paused: bool) -> bool {
-        self.set_audio_output_pause_reason(AUDIO_OUTPUT_PAUSED_BY_REBUFFER, paused)
+        let changed = self.set_audio_output_pause_reason(AUDIO_OUTPUT_PAUSED_BY_REBUFFER, paused);
+        // The pause reason remains active through Primed while audio prefill
+        // completes. Input cache and first-frame events must not clear this wait.
+        if changed {
+            self.report_output_rebuffering();
+        }
+        changed
+    }
+
+    fn report_output_rebuffering(&self) {
+        if let Some(event_tx) = &self.event_tx {
+            let _ = event_tx.send(BackendEvent::new(
+                self.session_id(),
+                BackendEventKind::OutputRebufferingChanged(
+                    self.audio_output_control_snapshot().paused_by_rebuffer(),
+                ),
+            ));
+        }
     }
 
     #[cfg(test)]
@@ -387,7 +411,13 @@ impl FfmpegControl {
     }
 
     pub(super) fn set_session_id(&self, session_id: PlaybackSessionId) {
-        self.session_id.store(session_id.0, Ordering::Release);
+        let previous = self.session_id.swap(session_id.0, Ordering::AcqRel);
+        if previous != session_id.0 {
+            // request_seek clears the old pause reason before the coordinator
+            // adopts the new session. Publish its state in the new generation
+            // so filtering old events cannot leave the page waiting forever.
+            self.report_output_rebuffering();
+        }
     }
 
     pub(super) fn request_seek(&self) -> u64 {
@@ -600,7 +630,8 @@ impl FfmpegWorker {
         playback_rate: f64,
     ) -> Result<Self> {
         let session_id = input.session_id;
-        let control = Arc::new(FfmpegControl::with_volume(session_id, volume));
+        let control =
+            Arc::new(FfmpegControl::with_volume(session_id, volume).with_events(event_tx.clone()));
         control.set_playback_rate(playback_rate);
         let (command_tx, command_rx) = mpsc::channel();
         let frame_presented = Arc::new(AtomicBool::new(false));

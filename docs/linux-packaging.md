@@ -148,7 +148,7 @@ AppImage 不携带或调用目录安装脚本。
 - Fontconfig、FreeType、字体及 XKB 键盘数据。
 - Wayland 或 X11 会话；Wayland 客户端库。
 - HTTPS 所需的系统 CA 证书。
-- 播放抑制所需的 `xdg-desktop-portal` 和实现 Inhibit 接口的桌面后端；请求失败不阻止播放。
+- 播放抑制使用 Wayland idle-inhibit 及独立的 portal Idle/Suspend 请求；会话空闲与睡眠请求失败时分别尝试 `org.freedesktop.ScreenSaver` 和 logind。可用机制取决于宿主桌面；单项请求失败不撤销其他已成功的抑制，也不阻止播放。
 - Ubuntu 24.04 的 GCC 13 或更新版本提供的 GCC/C++ 运行库。使用宿主的
   `libstdc++.so.6` 和 `libgcc_s.so.1`，避免包内较旧运行库覆盖新显卡驱动所需的版本。
 
@@ -230,7 +230,12 @@ tar -xzf "tiny-player-<version>-linux-x86_64.tar.gz"
   分别检查 tar.gz、安装后目录及 AppImage，
   确认加载捆绑的新 libplacebo；运行播放引擎文档中的显式队列回归测试。
   此项需要真实 GPU，不由普通 CI 或无 GPU 测试替代。
-- 验证音频设备/音轨、字幕/字体、HDR 色调映射，以及 portal 播放抑制和释放。
+- 验证音频设备/音轨、字幕/字体和 HDR 色调映射。
+- 在 niri + GTK portal 等仅接受 Idle 的环境中，持续播放超过桌面锁屏时限，
+  再切换工作区并继续等待；确认播放时不自动锁屏，Suspend 请求失败不撤销 idle 抑制。
+  暂停、缓冲暂停、播放结束及关闭窗口后，确认桌面空闲策略恢复。
+- 在只有 Wayland idle-inhibit、没有可用 portal/ScreenSaver 的环境中，
+  确认播放窗口可见时不自动锁屏；窗口不可见时按合成器策略处理。
 - 测试手柄设备权限、快捷操作、失焦与断连行为。
 - 关闭应用后替换新版本，在 AppImage 与 tar.gz 之间切换，确认跨版本配置和缓存仍共用原路径。
   记录系统、会话、GPU/驱动和测试媒体；不将一次机器验收视为所有发行版兼容保证。

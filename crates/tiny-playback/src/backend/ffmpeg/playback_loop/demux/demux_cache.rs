@@ -99,6 +99,8 @@ struct DemuxPacketCacheShared {
     event_tx: Sender<BackendEvent>,
     clock_start: Instant,
     demux_read_started_nanos: AtomicU64,
+    // AVIO bytes_read is a nonnegative i64, so u64::MAX means unavailable.
+    native_http_bytes_read: AtomicU64,
     last_would_block_diag_nanos: AtomicU64,
     last_recovery_demand_diag_nanos: AtomicU64,
     consumer_waiting_readers: AtomicUsize,

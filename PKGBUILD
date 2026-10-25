@@ -15,7 +15,7 @@ if [[ -n ${startdir:-} && -n ${BUILDDIR:-} && \
 fi
 
 pkgname=tiny-player-git
-pkgver=0.1.8rc.2.r157.g489b594
+pkgver=0.1.8rc.3.r158.g00dfa80
 pkgrel=1
 pkgdesc='Native Emby desktop client with FFmpeg and Vulkan playback'
 arch=('x86_64')
@@ -48,6 +48,7 @@ makedepends=(
     'pkgconf'
     'vulkan-headers'
 )
+checkdepends=('dbus')
 provides=("tiny-player=${pkgver}")
 conflicts=('tiny-player')
 source=('tiny-player::git+https://github.com/Clwury/tiny-player.git')

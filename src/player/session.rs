@@ -79,6 +79,7 @@ impl PlaybackSessionController {
             && self.timeline.loaded
             && !self.timeline.paused
             && !self.timeline.user_paused
+            && !self.timeline.output_rebuffering
             && !self.timeline.ended
             && !self.reporting.is_closed()
     }
@@ -178,6 +179,11 @@ impl PlaybackSessionController {
             }
             BackendEventKind::Buffering(buffering) => {
                 self.timeline.apply_buffering(buffering, context.has_frame);
+                BackendAction::None
+            }
+            BackendEventKind::OutputRebufferingChanged(rebuffering) => {
+                self.timeline.output_rebuffering =
+                    rebuffering && !self.timeline.ended && !self.reporting.is_closed();
                 BackendAction::None
             }
             BackendEventKind::PositionChanged(position) => {

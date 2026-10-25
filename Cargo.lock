@@ -6109,7 +6109,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-playback"
-version = "0.1.8-rc.2"
+version = "0.1.8-rc.3"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -6127,7 +6127,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-player"
-version = "0.1.8-rc.2"
+version = "0.1.8-rc.3"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -6154,6 +6154,8 @@ dependencies = [
  "unicode-segmentation",
  "url",
  "uuid",
+ "wayland-client",
+ "wayland-protocols",
  "windows 0.61.3",
  "zbus",
 ]

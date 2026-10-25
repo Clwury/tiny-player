@@ -136,6 +136,7 @@ impl DemuxPacketCacheState {
                 forward_bytes: u64::try_from(forward_bytes).unwrap_or(u64::MAX),
                 file_cache_bytes: self.disk_cache.as_ref().map(|cache| cache.file_bytes()),
                 raw_input_rate: self.raw_input_rate(),
+                native_http_bytes_read: None,
                 ts_last: self.demux_ts_nsecs.map(nsecs_to_seconds),
                 cached_seeks: self.cached_seeks,
                 low_level_seeks: self.low_level_seeks,

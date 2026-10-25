@@ -36,7 +36,7 @@ Linux 预编译包包含 FFmpeg、libplacebo 及部分依赖，系统还需提�
 
 Windows 便携包包含多媒体依赖与 Vulkan loader，显卡的 Vulkan 驱动由系统提供。运行便携包无需安装 Rust、Python、Visual Studio 或 FFmpeg。
 
-Linux 的播放抑制功能需要 `xdg-desktop-portal` 及实现 Inhibit 接口的桌面门户后端。桌面拒绝请求时会记录日志，播放仍继续。手动锁屏与用户主动触发的睡眠由系统控制。
+Linux 播放时会在支持 idle-inhibit 协议的 Wayland 窗口上建立空闲抑制，并单独向 `xdg-desktop-portal` 申请会话空闲与睡眠抑制。会话空闲请求失败时尝试 `org.freedesktop.ScreenSaver`，睡眠请求失败时尝试 logind；睡眠抑制失败不影响已成功的空闲抑制。会话级抑制可在切换工作区后继续生效，仅有 Wayland 窗口级抑制时则取决于窗口可见性。各机制均不可用时会记录日志，播放仍继续。手动锁屏与用户主动触发的睡眠由系统控制。
 
 ## 安装
 
@@ -125,6 +125,7 @@ AppImage 内嵌 GitHub Release 更新信息，并提供同名 `.zsync`，供外�
 播放页面与 Emby 集成保留在应用中，模块归属与构建细节见[播放引擎边界](docs/playback-engine.md)。
 运行 `cargo test --workspace --locked` 测试两个 crate，或使用
 `cargo test -p tiny-playback --locked` 单独测试引擎。
+Linux 的完整测试需要 `dbus-daemon`；播放抑制测试会启动隔离的测试总线和模拟 Wayland 服务，无需真实桌面会话。
 
 应用 UI 的职责划分和可重复执行的边界检查见[应用 UI 模块边界](docs/application-ui-boundaries.md)。
 原始规范、交付审计和迁移记录保存在 `docs/refactors/application-ui-business/`。

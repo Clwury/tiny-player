@@ -10,9 +10,70 @@ const DOWNLOAD_SPEED_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 pub(in super::super) struct DownloadSpeedDisplay {
     label: Option<String>,
     updated_at: Option<Instant>,
+    native_input: Option<NativeInputSample>,
+}
+
+struct NativeInputSample {
+    bytes: u64,
+    at: Instant,
+    rate: u64,
 }
 
 impl DownloadSpeedDisplay {
+    fn update_for_source(
+        &mut self,
+        protocol: Option<&str>,
+        cache_state: Option<&PlaybackCacheState>,
+        now: Instant,
+    ) -> Option<Duration> {
+        let bytes = matches!(protocol, Some("http" | "https"))
+            .then(|| cache_state.and_then(|state| state.demux.native_http_bytes_read))
+            .flatten();
+        let native_rate = self.sample_native_input(bytes, now);
+        let label = match native_rate {
+            Some((rate, _)) => Some(format!("{}/s", format_cache_bytes(rate))),
+            None => http_download_speed_label(protocol, cache_state),
+        };
+        let label_deadline = self.update(label, now);
+        // Native AVIO reports cumulative bytes. Sample once a second even
+        // without new cache events, so a stopped/full download settles to 0.
+        // The existing visibility-scoped timer stops when controls are hidden.
+        label_deadline
+            .into_iter()
+            .chain(native_rate.map(|(_, remaining)| remaining))
+            .min()
+    }
+
+    fn sample_native_input(&mut self, bytes: Option<u64>, now: Instant) -> Option<(u64, Duration)> {
+        let Some(bytes) = bytes else {
+            self.native_input = None;
+            return None;
+        };
+        let sample = self.native_input.get_or_insert(NativeInputSample {
+            bytes,
+            at: now,
+            rate: 0,
+        });
+        let elapsed = now.saturating_duration_since(sample.at);
+        if bytes < sample.bytes || elapsed > DOWNLOAD_SPEED_UPDATE_INTERVAL * 2 {
+            // A recreated AVIO context resets its counter. Reappearing controls
+            // also need a fresh interval rather than an average of hidden time.
+            *sample = NativeInputSample {
+                bytes,
+                at: now,
+                rate: 0,
+            };
+        } else if elapsed >= DOWNLOAD_SPEED_UPDATE_INTERVAL {
+            sample.rate = ((bytes - sample.bytes) as f64 / elapsed.as_secs_f64()).round() as u64;
+            sample.bytes = bytes;
+            sample.at = now;
+        }
+        Some((
+            sample.rate,
+            DOWNLOAD_SPEED_UPDATE_INTERVAL.saturating_sub(now.saturating_duration_since(sample.at)),
+        ))
+    }
+
     fn update(&mut self, label: Option<String>, now: Instant) -> Option<Duration> {
         if self.label == label {
             return None;
@@ -33,14 +94,11 @@ impl DownloadSpeedDisplay {
 
 impl PlaybackPage {
     pub(in super::super) fn update_download_speed(&mut self, cx: &mut Context<Self>) {
-        let label = http_download_speed_label(
+        let remaining = self.presentation.download_speed.update_for_source(
             self.session.source_view().source_protocol.as_deref(),
             self.session.timeline().cache_state.as_ref(),
+            cx.background_executor().now(),
         );
-        let remaining = self
-            .presentation
-            .download_speed
-            .update(label, cx.background_executor().now());
         if let Some(remaining) = remaining {
             self.schedule_presentation_timer(PresentationTimer::DownloadSpeed, remaining, cx);
         }
@@ -147,6 +205,109 @@ mod tests {
             None
         );
         assert_eq!(display.label.as_deref(), Some("2.0 MiB/s"));
+    }
+
+    #[test]
+    fn native_http_without_byte_cache_uses_downloaded_bytes_and_settles_to_zero() {
+        let start = Instant::now();
+        let mut display = DownloadSpeedDisplay::default();
+        let mut state = PlaybackCacheState::default();
+        state.demux.native_http_bytes_read = Some(64 * 1024);
+        state.demux.raw_input_rate = Some(99 * 1024 * 1024);
+        assert_eq!(
+            display.update_for_source(Some("https"), Some(&state), start),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(display.label.as_deref(), Some("0 B/s"));
+        state.demux.native_http_bytes_read = Some(128 * 1024);
+        display.update_for_source(Some("https"), Some(&state), start + Duration::from_secs(1));
+        assert_eq!(display.label.as_deref(), Some("64.0 KiB/s"));
+        display.update_for_source(Some("https"), Some(&state), start + Duration::from_secs(2));
+        assert_eq!(display.label.as_deref(), Some("0 B/s"));
+    }
+
+    #[test]
+    fn native_http_fallback_overrides_stopped_startup_cache_and_resets_on_counter_restart() {
+        let start = Instant::now();
+        let mut display = DownloadSpeedDisplay::default();
+        let mut state = PlaybackCacheState {
+            byte: Some(ByteCacheState {
+                idle: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.demux.native_http_bytes_read = Some(100);
+        display.update_for_source(Some("http"), Some(&state), start);
+        state.demux.native_http_bytes_read = Some(100 + 1024);
+        display.update_for_source(Some("http"), Some(&state), start + Duration::from_secs(1));
+        assert_eq!(display.label.as_deref(), Some("1.0 KiB/s"));
+        state.demux.native_http_bytes_read = Some(50);
+        display.update_for_source(Some("http"), Some(&state), start + Duration::from_secs(2));
+        assert_eq!(display.label.as_deref(), Some("0 B/s"));
+        state.demux.native_http_bytes_read = Some(50 + 2048);
+        display.update_for_source(Some("http"), Some(&state), start + Duration::from_secs(3));
+        assert_eq!(display.label.as_deref(), Some("2.0 KiB/s"));
+    }
+
+    #[test]
+    fn reappearing_native_speed_starts_a_fresh_sample_and_switching_to_cache_clears_it() {
+        let start = Instant::now();
+        let mut display = DownloadSpeedDisplay::default();
+        let mut state = PlaybackCacheState::default();
+        state.demux.native_http_bytes_read = Some(100);
+        display.update_for_source(Some("https"), Some(&state), start);
+        state.demux.native_http_bytes_read = Some(1024 * 1024);
+        display.update_for_source(Some("https"), Some(&state), start + Duration::from_secs(10));
+        assert_eq!(display.label.as_deref(), Some("0 B/s"));
+        state.demux.native_http_bytes_read = None;
+        state.byte = Some(ByteCacheState {
+            raw_input_rate: Some(2048),
+            ..Default::default()
+        });
+        display.update_for_source(Some("https"), Some(&state), start + Duration::from_secs(11));
+        assert_eq!(display.label.as_deref(), Some("2.0 KiB/s"));
+        assert!(display.native_input.is_none());
+    }
+
+    #[gpui::test]
+    fn native_download_refreshes_then_shows_zero_without_another_backend_event(
+        cx: &mut TestAppContext,
+    ) {
+        let (page, cx) = test_support::playback_window(cx);
+        page.update(cx, |page, cx| {
+            page.session.source_mut().source_protocol = Some("https".into());
+            let mut state = PlaybackCacheState::default();
+            state.demux.native_http_bytes_read = Some(1024);
+            page.session.timeline_mut().cache_state = Some(state);
+            page.update_download_speed(cx);
+        });
+        cx.run_until_parked();
+        page.update(cx, |page, _| {
+            page.session
+                .timeline_mut()
+                .cache_state
+                .as_mut()
+                .unwrap()
+                .demux
+                .native_http_bytes_read = Some(2048);
+        });
+        cx.executor().advance_clock(Duration::from_millis(1100));
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert_eq!(
+                page.presentation.download_speed.label.as_deref(),
+                Some("1.0 KiB/s")
+            );
+        });
+        cx.executor().advance_clock(Duration::from_millis(1100));
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert_eq!(
+                page.presentation.download_speed.label.as_deref(),
+                Some("0 B/s")
+            );
+        });
     }
 
     #[gpui::test]

@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn output_rebuffer_notifications_filter_stale_sessions_and_preserve_input_cache_state() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(2);
+    backend.user_paused = false;
+    for (session, rebuffering) in [(1, true), (2, true), (2, false)] {
+        backend
+            .event_tx
+            .send(BackendEvent::new(
+                PlaybackSessionId(session),
+                BackendEventKind::OutputRebufferingChanged(rebuffering),
+            ))
+            .unwrap();
+    }
+    let events = backend.poll_events();
+    let states: Vec<_> = events
+        .into_iter()
+        .map(|event| {
+            assert_eq!(event.session_id, PlaybackSessionId(2));
+            match event.kind {
+                BackendEventKind::OutputRebufferingChanged(state) => state,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        })
+        .collect();
+    assert_eq!(states, [true, false]);
+    assert!(!backend.cache_state.paused_for_cache);
+    assert!(!backend.user_paused);
+}
+
+#[test]
 fn disabling_subtitles_keeps_audio_video_session_pause_and_pending_events() {
     use crate::backend::{BackendControl, BackendLoadRequest};
     for paused in [false, true] {

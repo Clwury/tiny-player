@@ -97,6 +97,35 @@ fn ffmpeg_backend_maps_http_raw_input_rate_into_unified_cache_state() {
 }
 
 #[test]
+fn native_http_download_counter_survives_timeline_updates_without_synthesizing_byte_cache() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    backend.current_session_id = PlaybackSessionId(1);
+    for counter in [Some(4096), None, Some(8192)] {
+        backend
+            .event_tx
+            .send(BackendEvent::new(
+                PlaybackSessionId(1),
+                BackendEventKind::CacheStateChanged(PlaybackCacheState {
+                    demux: DemuxCacheState {
+                        native_http_bytes_read: counter,
+                        cache_end: Some(20.0),
+                        reader_pts: Some(5.0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            ))
+            .unwrap();
+        backend.poll_events();
+        assert_eq!(
+            backend.cache_state.demux.native_http_bytes_read,
+            Some(counter.unwrap_or(4096))
+        );
+        assert!(backend.cache_state.byte.is_none());
+    }
+}
+
+#[test]
 fn ffmpeg_backend_byte_cache_update_does_not_replace_authoritative_demux_state() {
     let mut backend = FfmpegBackend::new().unwrap();
     backend.current_session_id = PlaybackSessionId(1);

@@ -36,7 +36,7 @@ The Windows portable bundle includes multimedia dependencies and a Vulkan loader
 The Linux bundle also requires host `libva.so.2`, `libva-drm.so.2`, and `libdrm.so.2` compatible with Ubuntu 24.04 or later. VA-API needs a compatible host driver and device access; optionally set `TINY_VAAPI_DEVICE=/dev/dri/renderD128`. User Auto tries Vulkan first on Linux NVIDIA GPUs and VA-API mapping first on other Linux GPUs, followed by the other GPU path and software decoding. Development settings retain **Force VA-API (copyback)** and include copyback before software in their Auto policy; `TINY_HWDEC=vaapi` and `auto-copy` select these development modes. Windows retains Vulkan followed by software. See [decoder settings](docs/settings.md) and [hardware verification](docs/playback-engine.md).
 For the GPU performance path, select **Force VA-API (map to Vulkan)** or use `TINY_HWDEC=vaapi-vulkan`. This imports NV12/P010 through DMA-BUF without downloading the decoded YUV frame. It requires Vulkan external memory, DRM modifiers and synchronization support; forced-mode failures are reported, and copyback remains selectable in development settings. Final BGRA output still returns to CPU memory for GPUI.
 
-On Linux, playback idle inhibition requires `xdg-desktop-portal` and a desktop portal backend that implements the Inhibit interface. If the desktop rejects the request, playback continues and the failure is logged. Manual locking and user-initiated sleep remain controlled by the system.
+On Linux, playback inhibits idle on Wayland windows whose compositor supports idle-inhibit, and independently requests session idle and sleep inhibition through `xdg-desktop-portal`. Failed session idle requests fall back to `org.freedesktop.ScreenSaver`; failed sleep requests fall back to logind. Sleep inhibition failures preserve successful idle inhibition. Session inhibition can remain effective across workspace switches; Wayland window inhibition alone depends on window visibility. If no mechanism is available, playback continues and the failure is logged. Manual locking and user-initiated sleep remain controlled by the system.
 
 ## Installation
 
@@ -126,6 +126,7 @@ stay in the application. See [the engine boundary](docs/playback-engine.md) for
 module ownership and build details. The engine has no GPUI dependency; the application
 adapts its video and subtitle pixels for display. Run `cargo test --workspace --locked` to test
 both crates, or `cargo test -p tiny-playback --locked` for engine tests.
+The full Linux test suite also requires `dbus-daemon`; inhibition tests use a private bus and a headless Wayland test server without a desktop session.
 
 Application UI ownership and repeatable boundary checks are documented in
 [Application UI boundaries](docs/application-ui-boundaries.md). The original spec,

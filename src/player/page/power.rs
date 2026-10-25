@@ -3,7 +3,7 @@ use gpui::{ActivityGuard, App, Task};
 
 use super::*;
 
-type AcquirePower = fn(&Window, &App) -> Task<Result<ActivityGuard>>;
+type AcquirePower = fn(&Window, &mut App) -> Task<Result<ActivityGuard>>;
 
 pub(super) struct PlaybackPower {
     requested: bool,

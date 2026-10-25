@@ -26,7 +26,8 @@ RUN bash /opt/packaging/build-ffmpeg.sh
 
 # Keep tool/runtime downloads in their own cached layer. Both are pinned by
 # SHA256, and appimagetool is run in extraction mode rather than using FUSE.
-RUN apt-get update && apt-get install -y --no-install-recommends file zsync \
+# dbus-daemon runs isolated inhibition integration tests; no host session is used.
+RUN apt-get update && apt-get install -y --no-install-recommends dbus-daemon file zsync \
     && rm -rf /var/lib/apt/lists/*
 COPY appimage.py appimage-tools.json /opt/packaging/
 RUN python3 /opt/packaging/appimage.py --prepare-tools /opt/appimage

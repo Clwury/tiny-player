@@ -13,6 +13,7 @@ pub(crate) struct PlaybackTimelineState {
     pub(crate) user_paused: bool,
     pub(crate) paused: bool,
     pub(crate) buffering: bool,
+    pub(crate) output_rebuffering: bool,
     pub(crate) position: Option<f64>,
     pub(crate) duration: Option<f64>,
     pub(crate) buffered_until: Option<f64>,
@@ -32,6 +33,7 @@ impl Default for PlaybackTimelineState {
             user_paused: true,
             paused: true,
             buffering: false,
+            output_rebuffering: false,
             position: None,
             duration: None,
             buffered_until: None,
@@ -79,6 +81,7 @@ impl PlaybackTimelineState {
         self.user_paused = true;
         self.paused = true;
         self.buffering = false;
+        self.output_rebuffering = false;
         self.cache_state = None;
         self.paused_for_cache = false;
         self.cache_buffering_percent = None;

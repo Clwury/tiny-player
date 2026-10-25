@@ -1,52 +1,99 @@
-use std::time::Duration;
+//! Independent window idle, session idle, and system sleep inhibitors.
+use std::{future::Future, time::Duration};
 
-use anyhow::{Context as _, Result, anyhow};
-use ashpd::desktop::inhibit::{InhibitFlags, InhibitOptions, InhibitProxy};
-use gpui::{ActivityGuard, BackgroundExecutor, Task};
+use anyhow::{Result, anyhow};
+use ashpd::desktop::inhibit::InhibitFlags;
+use gpui::{ActivityGuard, App, BackgroundExecutor, Task, Window};
+
+mod bus;
+mod wayland;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(super) fn request(executor: BackgroundExecutor) -> Task<Result<ActivityGuard>> {
-    executor.clone().spawn(async move {
-        futures_lite::future::or(acquire(executor.clone()), async move {
-            executor.timer(REQUEST_TIMEOUT).await;
-            Err(anyhow!(
-                "Playback idle inhibition timed out after 10 seconds"
-            ))
-        })
-        .await
+pub(super) fn request(window: &Window, cx: &mut App) -> Task<Result<ActivityGuard>> {
+    let wayland = wayland::request(window, cx);
+    let bus = bus::Inhibitors::new(cx.background_executor().clone());
+    cx.spawn(async move |_| {
+        let window_idle = async move {
+            match wayland {
+                Some(request) => request.await.map(Some),
+                None => Ok(None),
+            }
+        };
+        acquire(&bus, window_idle).await
     })
 }
 
-async fn acquire(executor: BackgroundExecutor) -> Result<ActivityGuard> {
-    // Use a private connection: cancellation while awaiting the portal response
-    // must also remove any inhibition the desktop has already accepted.
-    let connection = zbus::connection::Builder::session()?
-        .method_timeout(REQUEST_TIMEOUT)
-        .build()
-        .await
-        .context("Could not connect to the desktop session bus")?;
-    let proxy = InhibitProxy::with_connection(connection)
-        .await
-        .context("The desktop idle inhibition portal is unavailable")?;
-    let request = proxy
-        .inhibit(
-            None,
-            InhibitFlags::Idle | InhibitFlags::Suspend,
-            InhibitOptions::default().set_reason(super::PLAYBACK_POWER_REASON),
-        )
-        .await
-        .context("Could not request playback idle inhibition")?;
-    let response = request.response();
-    let guard = ActivityGuard::new(move || {
-        executor
-            .spawn(async move {
-                if let Err(error) = request.close().await {
-                    tracing::warn!(%error, "Could not release playback idle inhibition");
-                }
-            })
-            .detach();
-    });
-    response.context("The desktop rejected playback idle inhibition")?;
-    Ok(guard)
+trait InhibitionBackend {
+    fn portal(&self, flags: InhibitFlags) -> impl Future<Output = Result<ActivityGuard>>;
+    fn screensaver(&self) -> impl Future<Output = Result<ActivityGuard>>;
+    fn logind(&self) -> impl Future<Output = Result<ActivityGuard>>;
 }
+
+async fn session_idle(backend: &impl InhibitionBackend) -> Result<ActivityGuard> {
+    match backend.portal(InhibitFlags::Idle).await {
+        Ok(guard) => Ok(guard),
+        Err(error) => {
+            tracing::debug!(%error, "Idle portal failed; trying the session ScreenSaver service");
+            backend.screensaver().await
+        }
+    }
+}
+
+async fn system_sleep(backend: &impl InhibitionBackend) -> Result<ActivityGuard> {
+    match backend.portal(InhibitFlags::Suspend).await {
+        Ok(guard) => Ok(guard),
+        Err(error) => {
+            tracing::debug!(%error, "Suspend portal failed; trying logind sleep inhibition");
+            backend.logind().await
+        }
+    }
+}
+
+async fn acquire(
+    backend: &impl InhibitionBackend,
+    window_idle: impl Future<Output = Result<Option<ActivityGuard>>>,
+) -> Result<ActivityGuard> {
+    // zip retains completed guards while the other independent requests finish.
+    // Cancelling this future drops both completed guards and pending requests.
+    let (window, (idle, sleep)) = futures_lite::future::zip(
+        window_idle,
+        futures_lite::future::zip(session_idle(backend), system_sleep(backend)),
+    )
+    .await;
+    let mut guards = Vec::new();
+    match window {
+        Ok(Some(guard)) => guards.push(guard),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "Could not inhibit Wayland window idle"),
+    }
+    for (kind, result) in [("session idle", idle), ("system sleep", sleep)] {
+        match result {
+            Ok(guard) => guards.push(guard),
+            Err(error) => {
+                tracing::warn!(%error, kind, "Could not acquire playback power inhibition")
+            }
+        }
+    }
+    if guards.is_empty() {
+        return Err(anyhow!(
+            "No playback power inhibition mechanism is available"
+        ));
+    }
+    Ok(ActivityGuard::new(move || drop(guards)))
+}
+
+async fn with_timeout<T>(
+    executor: &BackgroundExecutor,
+    operation: &'static str,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    futures_lite::future::or(future, async {
+        executor.timer(REQUEST_TIMEOUT).await;
+        Err(anyhow!("{operation} timed out after 10 seconds"))
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests;

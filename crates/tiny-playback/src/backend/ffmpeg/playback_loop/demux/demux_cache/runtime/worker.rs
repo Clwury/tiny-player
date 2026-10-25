@@ -220,6 +220,12 @@ pub(in crate::backend::ffmpeg::playback_loop::demux_cache) fn run_demux_packet_c
         shared.mark_demux_read_started();
         let read_started_at = Instant::now();
         let read = unsafe { ffi::av_read_frame(input.as_mut_ptr(), packet.as_mut_ptr()) };
+        if let Some(bytes) = input.native_http_bytes_read() {
+            // Publish without taking the packet-cache mutex on each read.
+            shared
+                .native_http_bytes_read
+                .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
         let read_elapsed = read_started_at.elapsed();
         shared.mark_demux_read_finished();
         if read_elapsed >= DEMUX_READ_SLOW_LOG_AFTER {

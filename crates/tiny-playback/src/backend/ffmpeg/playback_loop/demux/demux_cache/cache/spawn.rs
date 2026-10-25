@@ -52,6 +52,9 @@ impl DemuxPacketCache {
             event_tx,
             clock_start: Instant::now(),
             demux_read_started_nanos: AtomicU64::new(0),
+            native_http_bytes_read: AtomicU64::new(
+                input.native_http_bytes_read().unwrap_or(u64::MAX),
+            ),
             last_would_block_diag_nanos: AtomicU64::new(0),
             last_recovery_demand_diag_nanos: AtomicU64::new(0),
             consumer_waiting_readers: AtomicUsize::new(0),

@@ -86,12 +86,34 @@ fn idle_inhibition_requires_a_live_loaded_video_session() {
     assert!(!session.should_inhibit_idle(true, true));
     session.reduce_backend(BackendEventKind::PausedForCacheChanged(false), context());
     assert!(session.should_inhibit_idle(true, true));
+    session.reduce_backend(BackendEventKind::OutputRebufferingChanged(true), context());
+    assert!(!session.should_inhibit_idle(true, true));
+    session.reduce_backend(BackendEventKind::OutputRebufferingChanged(false), context());
+    assert!(session.should_inhibit_idle(true, true));
     session.reduce_backend(BackendEventKind::Pause(true), context());
     assert!(!session.should_inhibit_idle(true, true));
     session.reduce_backend(BackendEventKind::Pause(false), context());
     assert!(session.should_inhibit_idle(true, true));
     session.reduce_backend(BackendEventKind::PlaybackEnded, context());
     assert!(!session.should_inhibit_idle(true, true));
+}
+
+#[test]
+fn terminal_events_clear_output_rebuffering_and_late_output_events_cannot_reopen_it() {
+    for terminal in [
+        BackendEventKind::PlaybackEnded,
+        BackendEventKind::LoadFailed("offline".into()),
+        BackendEventKind::Fatal("decoder failed".into()),
+    ] {
+        let mut session = controller();
+        session.reduce_backend(BackendEventKind::PlaybackRestart, context());
+        session.reduce_backend(BackendEventKind::OutputRebufferingChanged(true), context());
+        assert!(session.timeline().output_rebuffering);
+        session.reduce_backend(terminal, context());
+        assert!(!session.timeline().output_rebuffering);
+        session.reduce_backend(BackendEventKind::OutputRebufferingChanged(true), context());
+        assert!(!session.timeline().output_rebuffering);
+    }
 }
 
 #[test]

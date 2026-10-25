@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "rebuffer/tests.rs"]
+mod tests;
+
 impl PlaybackOutputScheduler {
     pub(in crate::backend::ffmpeg::playback_loop) fn disable_audio(
         &mut self,

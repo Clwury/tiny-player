@@ -7,11 +7,10 @@ mod linux;
 
 pub(super) const PLAYBACK_POWER_REASON: &str = "Tiny Player 正在播放视频";
 
-pub(super) fn request(window: &Window, cx: &App) -> Task<Result<ActivityGuard>> {
+pub(super) fn request(window: &Window, cx: &mut App) -> Task<Result<ActivityGuard>> {
     #[cfg(target_os = "linux")]
     {
-        let _ = window;
-        linux::request(cx.background_executor().clone())
+        linux::request(window, cx)
     }
     #[cfg(target_os = "windows")]
     {

@@ -107,11 +107,15 @@ impl DemuxPacketCacheShared {
     fn prepare_cache_state_emit_from_snapshot(
         &self,
         guard: &mut DemuxPacketCacheState,
-        snapshot: DemuxCacheReportSnapshot,
+        mut snapshot: DemuxCacheReportSnapshot,
         emit_thread: &'static str,
         force_notify: bool,
         prepare_started_at: Instant,
     ) -> PreparedCacheStateEmit {
+        let native_bytes = self
+            .native_http_bytes_read
+            .load(std::sync::atomic::Ordering::Relaxed);
+        snapshot.demux.native_http_bytes_read = (native_bytes != u64::MAX).then_some(native_bytes);
         let buffered_changed = guard.take_buffered_changed_for_cache_end(snapshot.cache_end());
         let normalized_ranges_changed =
             guard.normalized_seekable_ranges_changed(snapshot.seekable_ranges());

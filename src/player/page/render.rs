@@ -21,9 +21,14 @@ pub(super) fn playback_status(
     let waiting_for_seek =
         timeline.pending_seek_position.is_some() && !timeline.pending_seek_keeps_frame;
     let waiting_for_cache = timeline.paused_for_cache && !timeline.user_paused;
+    let waiting_for_output = timeline.output_rebuffering && !timeline.user_paused;
     (switching_episode
         || (!timeline.ended
-            && (timeline.buffering || waiting_for_seek || waiting_for_cache || !has_visible_frame)))
+            && (timeline.buffering
+                || waiting_for_seek
+                || waiting_for_cache
+                || waiting_for_output
+                || !has_visible_frame)))
         .then_some(PlaybackStatus::Loading)
 }
 
@@ -151,6 +156,9 @@ pub(super) fn should_request_animation_frame(state: AnimationFrameRequestState) 
                     || !state.playback_paused
                     || !state.has_visible_frame)))
 }
+
+#[cfg(test)]
+mod rebuffer_tests;
 
 #[cfg(test)]
 mod tests {

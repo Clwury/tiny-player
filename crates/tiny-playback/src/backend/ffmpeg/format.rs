@@ -1,4 +1,4 @@
-use super::avio::{CachedAvio, CachedInputSource, input_format_options};
+use super::avio::{CachedAvio, CachedInputSource, input_format_options, should_cache_http_url};
 use std::{
     ffi::{CStr, CString},
     os::raw::{c_int, c_void},
@@ -18,6 +18,7 @@ use super::{
 pub(super) struct FormatContext {
     ptr: *mut ffi::AVFormatContext,
     _cached_io: Option<CachedAvio>,
+    native_http: bool,
 }
 
 impl FormatContext {
@@ -26,6 +27,7 @@ impl FormatContext {
         let input = Self {
             ptr: unsafe { ffi::avformat_alloc_context() },
             _cached_io: None,
+            native_http: false,
         };
         assert!(!input.ptr.is_null(), "test format context allocates");
         for &(kind, codec_id) in streams {
@@ -96,6 +98,7 @@ impl FormatContext {
 
         Ok(Self {
             ptr: context,
+            native_http: cached_io.is_none() && should_cache_http_url(url),
             _cached_io: cached_io,
         })
     }
@@ -246,6 +249,21 @@ impl FormatContext {
         self._cached_io.as_ref().map(CachedAvio::cache)
     }
 
+    pub(super) fn native_http_bytes_read(&self) -> Option<u64> {
+        if !self.native_http {
+            return None;
+        }
+        // SAFETY: The demux/input owner calls this on the same thread that
+        // reads this live format context. AVIO owns its monotonic bytes_read
+        // counter; using packet sizes or the seek position would count cached
+        // reads and seeks as network downloads.
+        let io = unsafe { (*self.ptr).pb };
+        if io.is_null() {
+            return None;
+        }
+        u64::try_from(unsafe { (*io).bytes_read }).ok()
+    }
+
     pub(super) fn shutdown_cached_io_on_drop(&mut self) {
         if let Some(cached_io) = self._cached_io.as_mut() {
             cached_io.shutdown_cache_on_drop();
@@ -302,6 +320,9 @@ impl Drop for FormatContext {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Copy)]
 pub(super) struct StreamInfo {

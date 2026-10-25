@@ -480,6 +480,10 @@ impl FfmpegBackend {
                 }
 
                 let mut state = state.clone();
+                if state.demux.native_http_bytes_read.is_none() {
+                    state.demux.native_http_bytes_read =
+                        self.cache_state.demux.native_http_bytes_read;
+                }
                 if state.byte.is_none() {
                     state.byte = self.cache_state.byte.clone();
                 }

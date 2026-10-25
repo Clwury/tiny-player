@@ -1,6 +1,6 @@
 [package]
 name = "tiny-player"
-version = "0.1.8-rc.2"
+version = "0.1.8-rc.3"
 edition = "2024"
 description = "Native Emby desktop client with FFmpeg and Vulkan playback"
 license = "GPL-3.0-or-later"
@@ -51,6 +51,9 @@ tempfile.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "inhibit"] }
 futures-lite = "2"
+raw-window-handle = "0.6"
+wayland-client = { version = "0.31", features = ["system", "dlopen"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 zbus = { version = "5", default-features = false, features = ["async-io"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]

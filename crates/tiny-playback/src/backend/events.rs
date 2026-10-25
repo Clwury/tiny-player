@@ -459,6 +459,10 @@ pub struct DemuxCacheState {
     pub forward_bytes: u64,
     pub file_cache_bytes: Option<u64>,
     pub raw_input_rate: Option<u64>,
+    /// Cumulative HTTP AVIO body bytes when FFmpeg reads the input directly.
+    /// This remains available after custom HTTP cache startup falls back to
+    /// native input. Packet-cache throughput is a separate metric.
+    pub native_http_bytes_read: Option<u64>,
     pub ts_last: Option<f64>,
     pub cached_seeks: u64,
     pub low_level_seeks: u64,
@@ -543,6 +547,9 @@ pub enum BackendEventKind {
     },
     VideoSizeChanged(Option<RenderSize>),
     Buffering(bool),
+    /// Output is waiting for its resume waterline, independently of input
+    /// cache pause and startup/seek buffering. Ends after output can resume.
+    OutputRebufferingChanged(bool),
     PositionChanged(f64),
     DurationChanged(f64),
     BufferedChanged(Option<f64>),

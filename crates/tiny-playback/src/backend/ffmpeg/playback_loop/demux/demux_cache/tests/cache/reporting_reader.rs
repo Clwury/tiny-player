@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn native_http_byte_counter_is_published_without_byte_cache_or_packet_rate_substitution() {
+    let shared = shared_for_test(Arc::new(FfmpegControl::new(PlaybackSessionId(1))));
+    for counter in [u64::MAX, 0, 4096, 8192] {
+        shared
+            .native_http_bytes_read
+            .store(counter, Ordering::Relaxed);
+        let mut guard = shared.state.lock().unwrap();
+        let emit = shared.prepare_cache_state_emit(&mut guard).into_emit();
+        assert_eq!(
+            emit.cache_state.demux.native_http_bytes_read,
+            (counter != u64::MAX).then_some(counter)
+        );
+        assert!(emit.cache_state.byte.is_none());
+    }
+}
+
+#[test]
 fn reader_head_probe_and_packet_retry_return_while_storage_holds_cache_lock() {
     let control = Arc::new(FfmpegControl::new(PlaybackSessionId::default()));
     let (shared, _event_rx) = shared_with_config_for_test(control, cache_config_for_test());
