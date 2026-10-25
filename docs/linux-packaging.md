@@ -171,6 +171,9 @@ Linux 构建镜像内的测试还用小型 C 程序和共享库执行真实 AppI
 宿主环境没有 `/opt/appimage` 时此 smoke test 会跳过，可用 `TINY_TEST_APPIMAGE_TOOLS`
 指定已准备的工具目录。完整播放器编译、真实 FUSE 挂载和桌面播放仍需分别验证。
 
+CI 容器测试使用宿主 UID/GID，并只读挂载宿主 `/etc/passwd` 和 `/etc/group`，
+让 `dbus-daemon` 能解析当前用户并启动隔离的测试总线。
+
 ## 运行与安装
 
 ### AppImage

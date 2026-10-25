@@ -126,8 +126,11 @@ jobs:
       - name: Run Linux tests and Clippy
         run: |
           mkdir -p target/linux-x86_64-glibc2.39
+          # dbus-daemon resolves its UID through NSS before starting the test bus.
           docker run --rm --user "$(id -u):$(id -g)" \
             --workdir /build \
+            --mount "type=bind,src=/etc/passwd,dst=/etc/passwd,readonly" \
+            --mount "type=bind,src=/etc/group,dst=/etc/group,readonly" \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/src,readonly" \
             --mount "type=bind,src=$GITHUB_WORKSPACE/target/linux-x86_64-glibc2.39,dst=/build" \
             --env CARGO_BUILD_JOBS --env CARGO_INCREMENTAL \

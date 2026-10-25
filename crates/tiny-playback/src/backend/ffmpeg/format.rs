@@ -19,6 +19,9 @@ pub(super) struct FormatContext {
     ptr: *mut ffi::AVFormatContext,
     _cached_io: Option<CachedAvio>,
     native_http: bool,
+    // FFmpeg borrows this allocation through interrupt_callback.opaque until
+    // avformat_close_input completes, including after the opening call returns.
+    _control: Option<Arc<FfmpegControl>>,
 }
 
 impl FormatContext {
@@ -28,6 +31,7 @@ impl FormatContext {
             ptr: unsafe { ffi::avformat_alloc_context() },
             _cached_io: None,
             native_http: false,
+            _control: None,
         };
         assert!(!input.ptr.is_null(), "test format context allocates");
         for &(kind, codec_id) in streams {
@@ -100,6 +104,7 @@ impl FormatContext {
             ptr: context,
             native_http: cached_io.is_none() && should_cache_http_url(url),
             _cached_io: cached_io,
+            _control: Some(control),
         })
     }
 

@@ -45,13 +45,21 @@ impl Bus {
                 &format!("--address=unix:path={}/bus", directory.path().display()),
             ])
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("D-Bus integration tests require dbus-daemon");
         let mut address = String::new();
         BufReader::new(daemon.stdout.take().unwrap())
             .read_line(&mut address)
             .unwrap();
-        assert!(!address.is_empty(), "Private D-Bus daemon did not start");
+        if address.is_empty() {
+            let output = daemon.wait_with_output().unwrap();
+            panic!(
+                "Private D-Bus daemon did not start ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         Self {
             daemon,
             address: address.trim().into(),
