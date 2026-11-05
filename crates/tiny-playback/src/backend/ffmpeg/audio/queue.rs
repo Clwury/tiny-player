@@ -278,14 +278,17 @@ impl AudioQueueState {
 
     pub(in crate::backend::ffmpeg::audio) fn pending_duration(&self) -> Duration {
         Duration::from_nanos(
-            self.queued_duration_nsecs.saturating_add(
-                self.tempo
-                    .as_ref()
-                    .and_then(|tempo| tempo.pending_range_nsecs())
-                    .map(|(start, end)| end.saturating_sub(start))
-                    .unwrap_or_default(),
-            ),
+            self.queued_duration_nsecs
+                .saturating_add(self.tempo_pending_nsecs()),
         )
+    }
+
+    fn tempo_pending_nsecs(&self) -> u64 {
+        self.tempo
+            .as_ref()
+            .and_then(|tempo| tempo.pending_range_nsecs())
+            .map(|(start, end)| end.saturating_sub(start))
+            .unwrap_or_default()
     }
 }
 
@@ -348,6 +351,7 @@ impl AudioQueueShared {
     fn snapshot_for_locked_state(&self, state: &AudioQueueState) -> AudioQueueSnapshot {
         AudioQueueSnapshot {
             pending_nsecs: duration_nsecs(state.pending_duration()),
+            tempo_pending_nsecs: state.tempo_pending_nsecs(),
             queued_nsecs: duration_nsecs(state.pending_duration()).saturating_sub(
                 state
                     .in_flight

@@ -573,6 +573,7 @@ impl PlaybackOutputScheduler {
                 .total_pending_nsecs
                 .saturating_sub(audio_snapshot.driver_delay_nsecs),
             audio_snapshot.buffered_until_timeline_nsecs,
+            audio_snapshot.tempo_pending_nsecs,
             queued_video_range_nsecs.map(|(start, _)| start),
             queued_video_range_nsecs.map(|(_, end)| end),
         )

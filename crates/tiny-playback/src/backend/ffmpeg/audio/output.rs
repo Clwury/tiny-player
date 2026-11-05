@@ -1201,6 +1201,7 @@ fn compose_audio_output_snapshot(
         driver_delay_nsecs: shared.output_delay_nsecs,
         shared_pending_nsecs: shared.pending_nsecs,
         queue_pending_nsecs: queue.queued_nsecs,
+        tempo_pending_nsecs: queue.tempo_pending_nsecs,
         worker_in_flight_nsecs: queue.in_flight_nsecs,
         total_pending_nsecs,
         queue_frames: queue.frames,

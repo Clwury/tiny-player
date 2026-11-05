@@ -211,7 +211,15 @@ fn pending_audio_underrun_recovery_waits_for_video_window() {
     );
 
     assert_eq!(
-        pending_audio_underrun_recovery_plan(&pending, 1_000_000_000, 0, 1_000_000_000, None, None),
+        pending_audio_underrun_recovery_plan(
+            &pending,
+            1_000_000_000,
+            0,
+            1_000_000_000,
+            0,
+            None,
+            None
+        ),
         None
     );
 }
@@ -234,6 +242,7 @@ fn pending_audio_underrun_recovery_resets_to_next_audio_with_video_window() {
             1_000_000_000,
             0,
             1_000_000_000,
+            0,
             Some(1_400_000_000),
             Some(1_900_000_000)
         ),
@@ -263,6 +272,7 @@ fn pending_audio_underrun_recovery_waits_for_existing_audio_before_clock_reset()
             1_000_000_000,
             50_000_000,
             1_050_000_000,
+            0,
             Some(1_400_000_000),
             Some(1_900_000_000)
         ),
@@ -291,6 +301,7 @@ fn pending_audio_underrun_recovery_uses_video_lead_when_available() {
             1_000_000_000,
             0,
             1_000_000_000,
+            0,
             Some(1_000_000_000),
             Some(1_300_000_000),
         ),
@@ -323,6 +334,7 @@ fn pending_audio_underrun_prefill_counts_payload_instead_of_pts_span() {
             PLAYED,
             PREFIX_NSECS,
             AUDIO_END,
+            0,
             Some(PLAYED + 40_000_000),
             Some(PLAYED + 1_000_000_000),
         );
@@ -332,6 +344,85 @@ fn pending_audio_underrun_prefill_counts_payload_instead_of_pts_span() {
             assert_eq!(plan.reset_audio_to_timeline_nsecs, None);
         }
     }
+}
+
+#[test]
+fn retained_audio_underrun_prefill_feeds_tempo_within_video_lead() {
+    const PLAYED: u64 = 1_000_000_000;
+    const AUDIO_END: u64 = PLAYED + 577_000_000;
+    for (tempo_pending, frames, video_end, ready) in [
+        (113_000_000, 1, PLAYED + 480_000_000, true),
+        (113_000_000, 2, PLAYED + 480_000_000, true),
+        (113_000_000, 1, PLAYED + 109_000_000, true),
+        (113_000_000, 1, PLAYED + 108_000_000, false),
+        (113_000_000, 2, PLAYED + 100_000_000, false),
+        (0, 1, PLAYED + 480_000_000, false),
+        (0, 2, PLAYED + 480_000_000, true),
+    ] {
+        let mut pending = PendingStartAudio::default();
+        for index in 0..frames {
+            let start = AUDIO_END + index * 32_000_000;
+            pending.push(
+                DecodedAudio {
+                    samples: vec![0.25; 4],
+                    duration_nsecs: 32_000_000,
+                },
+                start,
+                start + 32_000_000,
+            );
+        }
+        // 192 ms of PCM still needs prefill. A live tempo graph may release
+        // retained media after just one more frame, within the video limit.
+        let plan = pending_audio_underrun_recovery_plan(
+            &pending,
+            PLAYED,
+            192_000_000 + tempo_pending,
+            AUDIO_END,
+            tempo_pending,
+            Some(PLAYED),
+            Some(video_end),
+        );
+        assert_eq!(
+            plan.is_some(),
+            ready,
+            "{frames} frames, video end {video_end}, tempo pending {tempo_pending}"
+        );
+        if let Some(plan) = plan {
+            assert_eq!(plan.audio_start_timeline_nsecs, AUDIO_END);
+            assert_eq!(plan.reset_audio_to_timeline_nsecs, None);
+            assert!(plan.audio_flush_until_timeline_nsecs <= video_end + 500_000_000);
+        }
+    }
+}
+
+#[test]
+fn retained_audio_underrun_prefill_preserves_filter_only_tail() {
+    const PLAYED: u64 = 1_000_000_000;
+    const AUDIO_END: u64 = PLAYED + 113_000_000;
+    let mut pending = PendingStartAudio::default();
+    for index in 0..9 {
+        let start = AUDIO_END + index * 32_000_000;
+        pending.push(
+            DecodedAudio {
+                samples: vec![0.25; 4],
+                duration_nsecs: 32_000_000,
+            },
+            start,
+            start + 32_000_000,
+        );
+    }
+    let plan = pending_audio_underrun_recovery_plan(
+        &pending,
+        PLAYED,
+        113_000_000,
+        AUDIO_END,
+        113_000_000,
+        Some(PLAYED),
+        Some(PLAYED + 100_000_000),
+    )
+    .expect("filter-owned media must be appended without resetting its history");
+    assert_eq!(plan.audio_start_timeline_nsecs, AUDIO_END);
+    assert_eq!(plan.reset_audio_to_timeline_nsecs, None);
 }
 
 #[test]
@@ -351,6 +442,7 @@ fn pending_audio_underrun_prefill_waits_for_a_frame_to_fit_the_video_limit() {
             1_000_000_000,
             0,
             1_000_000_000,
+            0,
             Some(1_000_000_000),
             Some(1_300_000_000),
         ),
@@ -376,6 +468,7 @@ fn pending_audio_underrun_recovery_resets_to_video_start_when_audio_leads_video(
             1_000_000_000,
             0,
             1_000_000_000,
+            0,
             Some(1_400_000_000),
             Some(1_900_000_000),
         ),
@@ -405,6 +498,7 @@ fn pending_audio_underrun_recovery_waits_for_actual_video_window() {
             1_000_000_000,
             0,
             1_000_000_000,
+            0,
             Some(1_000_000_000),
             Some(1_040_000_000),
         ),

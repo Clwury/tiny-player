@@ -250,3 +250,230 @@ fn accelerated_playback_refills_underrun_when_audio_tail_is_in_video_pts_gap() {
     assert!(output.activity_snapshot().unwrap().consumed_callback_count > 0);
     assert!(output.snapshot().unwrap().played_timeline_nsecs > PLAYED);
 }
+
+#[test]
+fn tempo_underrun_refills_past_video_tail_and_frozen_clock_budget() {
+    for (final_rate, reset_before_refill) in [(1.4641, false), (1.0, false), (1.0, true)] {
+        let session_id = PlaybackSessionId(7);
+        let control = Arc::new(FfmpegControl::new(session_id));
+        control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing);
+        let output = AudioOutput::stopped_for_test(Arc::clone(&control), 88_200, 44_100, 2);
+        output.reset_clock(1_000_000_000);
+        output.activate_current_audio_output(&control);
+        let enqueue = |start, rate| {
+            control.set_playback_rate(rate);
+            assert!(matches!(
+                output
+                    .try_push_timed(vec![0.25; 2822], start, start + 32_000_000, &control)
+                    .unwrap(),
+                crate::backend::ffmpeg::AudioOutputPushResult::Queued
+            ));
+            while output.transfer_next_queued_frame_for_test().unwrap() {}
+        };
+
+        enqueue(1_000_000_000, 1.0);
+        output.invoke_callback_for_test(&mut [0.0; 2822]);
+        let played = output.snapshot().unwrap().played_timeline_nsecs;
+        // Retain a timestamp offset as in the reported frozen-clock snapshot:
+        // the accepted audio ends 577 ms ahead, leaving less than one 32 ms
+        // frame in the ordinary 600 ms admission budget.
+        let audio_start = played + 257_000_000;
+        for index in 0..10 {
+            enqueue(
+                audio_start + index * 32_000_000,
+                if index < 6 { 1.4641 } else { final_rate },
+            );
+        }
+        if reset_before_refill {
+            // The watchdog discards the filter graph. A plain 1x tail must
+            // also recover if it meets the same video/clock admission limits.
+            output.reset_clock(played);
+            output.activate_current_audio_output(&control);
+            for index in 0..6 {
+                enqueue(played + 385_000_000 + index * 32_000_000, 1.0);
+            }
+        }
+        output.mark_underrun_for_test(played);
+        let initial = output.snapshot().unwrap();
+        assert!(initial.shared_payload_nsecs < 250_000_000, "{initial:?}");
+        if reset_before_refill {
+            assert_eq!(initial.tempo_pending_nsecs, 0);
+        } else {
+            assert!(initial.total_pending_nsecs > 250_000_000, "{initial:?}");
+            assert!(initial.tempo_pending_nsecs > 0);
+        }
+        assert_eq!(
+            initial.total_pending_nsecs - initial.driver_delay_nsecs,
+            initial.shared_payload_nsecs + initial.tempo_pending_nsecs
+        );
+        assert_eq!(initial.buffered_until_timeline_nsecs, played + 577_000_000);
+        let epoch = output.audio_epoch();
+
+        let mut scheduler = PlaybackOutputScheduler::new();
+        scheduler.set_state(PlaybackOutputState::Playing);
+        scheduler.mark_first_frame_presented();
+        for index in 0..12 {
+            let mut frame = test_queued_video_frame(played + index * 40_000_000);
+            frame.duration_nsecs = 40_000_000;
+            frame.source_duration_nsecs = 40_000_000;
+            scheduler.push_decoded_video_for_test(frame);
+        }
+        let video_range = scheduler.scheduled_video_queue.range_nsecs();
+        assert!(initial.buffered_until_timeline_nsecs > video_range.unwrap().1);
+        for index in 0..40 {
+            let start = initial.buffered_until_timeline_nsecs + index * 32_000_000;
+            scheduler.push_pending_start_audio_for_test(
+                DecodedAudio {
+                    samples: vec![0.25; 2822],
+                    duration_nsecs: 32_000_000,
+                },
+                start,
+                start + 32_000_000,
+            );
+        }
+        assert!(
+            scheduler.pending_start_audio_can_recover_output(Some(initial)),
+            "tempo latency must not leave prefill dependent on the frozen video clock"
+        );
+
+        let (event_tx, _event_rx) = mpsc::channel();
+        let vo_queue = VideoOutputQueue::default();
+        vo_queue.begin_session(session_id);
+        let frame_presented = AtomicBool::new(true);
+        let mut position = PositionReporter::default();
+        let mut subtitles = SubtitlePipeline::empty_for_test();
+        let mut buffered = BufferedReporter::new_with_events(true, false);
+        let mut callback = [0.0; 1024];
+        for _ in 0..100 {
+            scheduler
+                .flush_pending_start_audio_if_ready(
+                    &output,
+                    &control,
+                    session_id,
+                    &vo_queue,
+                    &frame_presented,
+                    &mut position,
+                    &event_tx,
+                    &mut subtitles,
+                    &mut buffered,
+                )
+                .unwrap();
+            while output.transfer_next_queued_frame_for_test().unwrap() {}
+            output.invoke_callback_for_test(&mut callback);
+            if !output.underrun_active() {
+                break;
+            }
+            assert!(callback.iter().all(|sample| *sample == 0.0));
+            assert_eq!(output.snapshot().unwrap().played_timeline_nsecs, played);
+        }
+        assert!(!output.underrun_active(), "rate {final_rate}");
+        assert!(callback.iter().all(|sample| (*sample - 0.25).abs() < 0.001));
+        assert_eq!(
+            output.audio_epoch(),
+            epoch,
+            "prefill must preserve tempo history"
+        );
+        assert_eq!(scheduler.scheduled_video_queue.range_nsecs(), video_range);
+        assert!(output.snapshot().unwrap().played_timeline_nsecs > played);
+    }
+}
+
+#[test]
+fn tempo_underrun_recovers_from_one_frame_smaller_than_pcm_deficit() {
+    const FRAME_NSECS: u64 = 32_000_000;
+    const PREFILL_NSECS: u64 = 250_000_000;
+
+    let session_id = PlaybackSessionId(7);
+    let control = Arc::new(FfmpegControl::new(session_id));
+    control.set_audio_output_lifecycle(AudioOutputLifecycle::Playing);
+    let output = AudioOutput::stopped_for_test(Arc::clone(&control), 88_200, 44_100, 2);
+    output.reset_clock(1_000_000_000);
+    output.activate_current_audio_output(&control);
+    let enqueue = |start| {
+        assert!(matches!(
+            output
+                .try_push_timed(vec![0.25; 2822], start, start + FRAME_NSECS, &control)
+                .unwrap(),
+            crate::backend::ffmpeg::AudioOutputPushResult::Queued
+        ));
+        while output.transfer_next_queued_frame_for_test().unwrap() {}
+    };
+    enqueue(1_000_000_000);
+    output.invoke_callback_for_test(&mut [0.0; 2822]);
+    let played = output.snapshot().unwrap().played_timeline_nsecs;
+
+    control.set_playback_rate(3.0);
+    for index in 0..12 {
+        enqueue(played + 193_000_000 + index * FRAME_NSECS);
+    }
+    output.mark_underrun_for_test(played);
+    let initial = output.snapshot().unwrap();
+    // atempo retains about 192 ms and has produced about 192 ms of PCM.
+    // The next 32 ms frame releases a burst large enough to finish prefill.
+    assert!(initial.tempo_pending_nsecs > 0);
+    assert!(initial.shared_payload_nsecs + FRAME_NSECS < PREFILL_NSECS);
+    assert_eq!(initial.buffered_until_timeline_nsecs, played + 577_000_000);
+    let epoch = output.audio_epoch();
+
+    let mut scheduler = PlaybackOutputScheduler::new();
+    scheduler.set_state(PlaybackOutputState::Playing);
+    scheduler.mark_first_frame_presented();
+    for index in 0..15 {
+        let mut frame = test_queued_video_frame(played + index * 40_000_000);
+        frame.duration_nsecs = 40_000_000;
+        frame.source_duration_nsecs = 40_000_000;
+        scheduler.push_decoded_video_for_test(frame);
+    }
+    let video_range = scheduler.scheduled_video_queue.range_nsecs();
+    scheduler.push_pending_start_audio_for_test(
+        DecodedAudio {
+            samples: vec![0.25; 2822],
+            duration_nsecs: FRAME_NSECS,
+        },
+        initial.buffered_until_timeline_nsecs,
+        initial.buffered_until_timeline_nsecs + FRAME_NSECS,
+    );
+    assert!(scheduler.pending_start_audio_can_recover_output(Some(initial)));
+
+    let (event_tx, _event_rx) = mpsc::channel();
+    let vo_queue = VideoOutputQueue::default();
+    vo_queue.begin_session(session_id);
+    let frame_presented = AtomicBool::new(true);
+    let mut position = PositionReporter::default();
+    let mut subtitles = SubtitlePipeline::empty_for_test();
+    let mut buffered = BufferedReporter::new_with_events(true, false);
+    let mut callback = [0.0; 1024];
+    output.invoke_callback_for_test(&mut callback);
+    assert!(output.underrun_active());
+    assert!(callback.iter().all(|sample| *sample == 0.0));
+    for _ in 0..100 {
+        scheduler
+            .flush_pending_start_audio_if_ready(
+                &output,
+                &control,
+                session_id,
+                &vo_queue,
+                &frame_presented,
+                &mut position,
+                &event_tx,
+                &mut subtitles,
+                &mut buffered,
+            )
+            .unwrap();
+        while output.transfer_next_queued_frame_for_test().unwrap() {}
+        let ready_payload_nsecs = output.snapshot().unwrap().shared_payload_nsecs;
+        output.invoke_callback_for_test(&mut callback);
+        if !output.underrun_active() {
+            assert!(ready_payload_nsecs >= PREFILL_NSECS);
+            break;
+        }
+        assert!(callback.iter().all(|sample| *sample == 0.0));
+        assert_eq!(output.snapshot().unwrap().played_timeline_nsecs, played);
+    }
+    assert!(!output.underrun_active());
+    assert!(scheduler.pending_start_audio.is_empty());
+    assert!(callback.iter().all(|sample| (*sample - 0.25).abs() < 0.001));
+    assert_eq!(output.audio_epoch(), epoch);
+    assert_eq!(scheduler.scheduled_video_queue.range_nsecs(), video_range);
+    assert!(output.snapshot().unwrap().played_timeline_nsecs > played);
+}

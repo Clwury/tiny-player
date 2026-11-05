@@ -121,6 +121,8 @@ pub(in crate::backend::ffmpeg) struct AudioOutputSnapshot {
     pub(in crate::backend::ffmpeg) driver_delay_nsecs: u64,
     pub(in crate::backend::ffmpeg) shared_pending_nsecs: u64,
     pub(in crate::backend::ffmpeg) queue_pending_nsecs: u64,
+    /// Media held inside atempo, already included in queue_pending_nsecs.
+    pub(in crate::backend::ffmpeg) tempo_pending_nsecs: u64,
     pub(in crate::backend::ffmpeg) worker_in_flight_nsecs: u64,
     pub(in crate::backend::ffmpeg) total_pending_nsecs: u64,
     pub(in crate::backend::ffmpeg) queue_frames: usize,
@@ -160,6 +162,7 @@ pub(in crate::backend::ffmpeg) struct AudioOutputActivitySnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::backend::ffmpeg::audio) struct AudioQueueSnapshot {
     pub(in crate::backend::ffmpeg::audio) pending_nsecs: u64,
+    pub(in crate::backend::ffmpeg::audio) tempo_pending_nsecs: u64,
     pub(in crate::backend::ffmpeg::audio) queued_nsecs: u64,
     pub(in crate::backend::ffmpeg::audio) in_flight_nsecs: u64,
     pub(in crate::backend::ffmpeg::audio) frames: usize,

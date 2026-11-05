@@ -85,6 +85,7 @@ pub(in crate::backend::ffmpeg) fn pending_audio_underrun_recovery_plan(
     played_timeline_nsecs: u64,
     output_payload_nsecs: u64,
     output_buffered_until_nsecs: u64,
+    output_tempo_pending_nsecs: u64,
     video_start_timeline_nsecs: Option<u64>,
     video_buffered_until_nsecs: Option<u64>,
 ) -> Option<PendingAudioUnderrunRecoveryPlan> {
@@ -123,21 +124,33 @@ pub(in crate::backend::ffmpeg) fn pending_audio_underrun_recovery_plan(
     if pending_buffered_until_nsecs <= audio_start_timeline_nsecs {
         return None;
     }
+    let video_lead_until_nsecs =
+        video_buffered_until_nsecs.saturating_add(duration_nsecs(AUDIO_OUTPUT_VIDEO_LEAD_DURATION));
+    // A retained tail may already lead the last scheduled video frame. Audio
+    // has to finish prefilling before that frozen video clock can advance.
+    // Keep the usual bounded lead for appends, while a new audio anchor still
+    // requires actual video coverage before resetting the clock.
+    let recovery_covered_until_nsecs = if output_payload_nsecs > 0 {
+        video_lead_until_nsecs
+    } else {
+        video_buffered_until_nsecs
+    };
     if audio_start_timeline_nsecs < video_start_timeline_nsecs
-        || audio_start_timeline_nsecs >= video_buffered_until_nsecs
+        || audio_start_timeline_nsecs >= recovery_covered_until_nsecs
     {
         return None;
     }
 
-    let remaining_prefill_nsecs = recovery_nsecs.saturating_sub(output_payload_nsecs);
-    let minimum_flush_until_nsecs =
-        audio_start_timeline_nsecs.saturating_add(remaining_prefill_nsecs);
-    if video_buffered_until_nsecs < minimum_flush_until_nsecs {
-        return None;
-    }
-    let video_lead_until_nsecs =
-        video_buffered_until_nsecs.saturating_add(duration_nsecs(AUDIO_OUTPUT_VIDEO_LEAD_DURATION));
-    if video_lead_until_nsecs < minimum_flush_until_nsecs {
+    // A live tempo graph can release retained media in bursts. Permit bounded
+    // feeding even when the new input alone cannot complete prefill; only the
+    // callback can release the underrun clock after enough real PCM arrives.
+    let minimum_input_nsecs = if output_payload_nsecs > 0 && output_tempo_pending_nsecs > 0 {
+        0
+    } else {
+        recovery_nsecs.saturating_sub(output_payload_nsecs)
+    };
+    let minimum_flush_until_nsecs = audio_start_timeline_nsecs.saturating_add(minimum_input_nsecs);
+    if recovery_covered_until_nsecs < minimum_flush_until_nsecs {
         return None;
     }
     let audio_flush_until_timeline_nsecs = video_lead_until_nsecs.min(pending_buffered_until_nsecs);
@@ -145,7 +158,7 @@ pub(in crate::backend::ffmpeg) fn pending_audio_underrun_recovery_plan(
     let staged_payload_nsecs = pending_audio
         .stageable_coverage_between(audio_start_timeline_nsecs, audio_flush_until_timeline_nsecs)?
         .payload_nsecs;
-    (staged_payload_nsecs >= remaining_prefill_nsecs).then_some(PendingAudioUnderrunRecoveryPlan {
+    (staged_payload_nsecs >= minimum_input_nsecs).then_some(PendingAudioUnderrunRecoveryPlan {
         audio_start_timeline_nsecs,
         audio_flush_until_timeline_nsecs,
         reset_audio_to_timeline_nsecs,
@@ -599,6 +612,7 @@ pub(in crate::backend::ffmpeg) fn recover_pending_start_audio_after_underrun(
             .total_pending_nsecs
             .saturating_sub(audio_snapshot.driver_delay_nsecs),
         audio_snapshot.buffered_until_timeline_nsecs,
+        audio_snapshot.tempo_pending_nsecs,
         queued_video_range_nsecs.map(|(start, _)| start),
         queued_video_range_nsecs.map(|(_, end)| end),
     ) else {
@@ -662,6 +676,10 @@ pub(in crate::backend::ffmpeg) fn recover_pending_start_audio_after_underrun(
             pending_audio_frames = pending_audio.len(),
             pending_audio_ms = pending_audio.buffered_duration().as_secs_f64() * 1000.0,
             audio_output_pending_ms = recovered_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
+            audio_output_callback_pending_ms =
+                recovered_snapshot.shared_payload_nsecs as f64 / 1_000_000.0,
+            audio_output_tempo_pending_ms =
+                recovered_snapshot.tempo_pending_nsecs as f64 / 1_000_000.0,
             "staged pending FFmpeg audio for native output underrun prefill"
         );
     }
