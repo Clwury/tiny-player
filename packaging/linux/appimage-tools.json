@@ -2,9 +2,9 @@
   "architecture": "x86_64",
   "appimagetool": {
     "release": "continuous",
-    "source_commit": "854e19e951900cf141245b384d45735942521abe",
+    "source_commit": "11d54c9acc7f246df1398050a4b880314ac76862",
     "url": "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage",
-    "sha256": "95cbe7cce9717fce90c484e34052ee7c7f1d7635b33c12525b4776826a7d29b6"
+    "sha256": "e8c1169c4af66c3184d7ee110713d4be04befe671fa358e2c1591ee840553b03"
   },
   "runtime": {
     "release": "continuous",
