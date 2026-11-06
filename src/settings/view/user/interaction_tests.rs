@@ -72,6 +72,28 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
 }
 
 #[gpui::test]
+fn playback_logging_switch_emits_saved_changes_and_displays_the_file_location(
+    cx: &mut TestAppContext,
+) {
+    let (root, cx) = settings_window(cx, PlaybackCacheConfig::default());
+    let dialog = root.read_with(cx, |root, _| root.dialog.clone());
+    assert!(cx.debug_bounds("playback-debug-log-path").is_some());
+    let original = dialog.read_with(cx, |dialog, _| dialog.snapshot());
+    assert!(!original.playback_debug_log);
+    click(cx, "settings-toggle-播放调试日志");
+    let snapshot = dialog.read_with(cx, |dialog, _| dialog.snapshot());
+    assert!(snapshot.playback_debug_log);
+    assert_eq!(snapshot.playback, original.playback);
+    assert_eq!(root.read_with(cx, |root, _| root.changes), 1);
+    click(cx, "settings-toggle-播放调试日志");
+    assert_eq!(
+        dialog.read_with(cx, |dialog, _| dialog.snapshot()),
+        original
+    );
+    assert_eq!(root.read_with(cx, |root, _| root.changes), 2);
+}
+
+#[gpui::test]
 fn user_settings_keep_the_sidebar_and_titlebar_fixed_while_switching_pages(
     cx: &mut TestAppContext,
 ) {

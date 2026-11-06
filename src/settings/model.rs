@@ -125,6 +125,7 @@ pub(crate) enum SettingValidation {
 }
 
 pub(crate) enum SettingsIntent {
+    PlaybackDebugLog(bool),
     AppLanguage(AppLanguage),
     Theme(ColorTheme),
     Language {
@@ -148,6 +149,7 @@ pub(crate) enum SettingsIntent {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SettingsSnapshot {
+    pub(crate) playback_debug_log: bool,
     pub(crate) playback: PlaybackCacheConfig,
     pub(crate) color_theme: ColorTheme,
     pub(crate) app_language: AppLanguage,

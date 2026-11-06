@@ -11,6 +11,7 @@ pub(crate) fn settings_snapshot(
     cx: &gpui::App,
 ) -> SettingsSnapshot {
     SettingsSnapshot {
+        playback_debug_log: false,
         playback: config.clone(),
         color_theme: theme::get(cx).selection,
         app_language: AppLanguage::default(),

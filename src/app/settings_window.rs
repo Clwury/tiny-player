@@ -43,6 +43,7 @@ impl TinyApp {
         self.clear_server_menu();
         self.clear_app_notifications();
         let snapshot = crate::settings::SettingsSnapshot {
+            playback_debug_log: self.cache.playback_debug_log,
             playback: self.cache.playback.clone(),
             color_theme: theme::get(cx).selection,
             app_language: self.cache.app_language,
@@ -51,12 +52,20 @@ impl TinyApp {
         let settings = cx.new(|cx| SettingsDialogState::new(snapshot, mode, cx));
         cx.subscribe(&settings, |app, settings, _: &SettingsChanged, cx| {
             let trace = crate::observability::TraceId::start("settings.changed");
-            let settings = settings.read(cx);
-            crate::settings::SettingsPersistenceAdapter::apply(
-                settings.snapshot(cx),
-                &mut app.cache,
-            );
-            if let super::Page::Playback { page, .. } = app.shell.page() {
+            let snapshot = settings.read(cx).snapshot(cx);
+            if snapshot.playback_debug_log != app.cache.playback_debug_log
+                && let Err(error) =
+                    crate::logging::set_playback_file_logging(snapshot.playback_debug_log)
+            {
+                settings.update(cx, |settings, cx| {
+                    settings.restore_playback_debug_log(app.cache.playback_debug_log, cx)
+                });
+                app.push_app_error_notification(format!("开启播放调试日志失败：{error}"), cx);
+                return;
+            }
+            let playback_changed = snapshot.playback != app.cache.playback;
+            crate::settings::SettingsPersistenceAdapter::apply(snapshot, &mut app.cache);
+            if playback_changed && let super::Page::Playback { page, .. } = app.shell.page() {
                 let config = app.cache.playback.clone();
                 if let Err(error) = page.update(cx, |page, _| page.apply_playback_config(config)) {
                     app.push_app_error_notification(format!("应用播放设置失败：{error}"), cx);

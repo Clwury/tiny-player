@@ -23,12 +23,16 @@ use super::{
 const AUDIO_STAGE_SERVICE_BUDGET: Duration = Duration::from_millis(2);
 const AUDIO_STAGE_SERVICE_MAX_FRAMES: usize = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::backend::ffmpeg) struct PendingAudioUnderrunRecoveryPlan {
-    pub(in crate::backend::ffmpeg) audio_start_timeline_nsecs: u64,
-    pub(in crate::backend::ffmpeg) audio_flush_until_timeline_nsecs: u64,
-    pub(in crate::backend::ffmpeg) reset_audio_to_timeline_nsecs: Option<u64>,
-}
+#[path = "audio_output_gate/diagnostics.rs"]
+mod diagnostics;
+#[path = "audio_output_gate/recovery.rs"]
+mod recovery;
+
+use diagnostics::report_underrun_recovery_blocked;
+pub(in crate::backend::ffmpeg) use recovery::{
+    PendingAudioUnderrunRecoveryPlan, pending_audio_underrun_recovery_plan,
+};
+use recovery::{UnderrunRecoveryBlocked, pending_audio_underrun_recovery_decision};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DelayedAudioStartSilenceStatus {
@@ -78,91 +82,6 @@ impl AudioStageResult {
             None => (start_timeline_nsecs, end_timeline_nsecs),
         });
     }
-}
-
-pub(in crate::backend::ffmpeg) fn pending_audio_underrun_recovery_plan(
-    pending_audio: &PendingStartAudio,
-    played_timeline_nsecs: u64,
-    output_payload_nsecs: u64,
-    output_buffered_until_nsecs: u64,
-    output_tempo_pending_nsecs: u64,
-    video_start_timeline_nsecs: Option<u64>,
-    video_buffered_until_nsecs: Option<u64>,
-) -> Option<PendingAudioUnderrunRecoveryPlan> {
-    if pending_audio.is_empty() {
-        return None;
-    }
-
-    let video_start_timeline_nsecs = video_start_timeline_nsecs?;
-    let video_buffered_until_nsecs = video_buffered_until_nsecs?;
-    let recovery_nsecs = duration_nsecs(AUDIO_OUTPUT_UNDERRUN_RESUME_DURATION);
-    // During underrun the callback retains its short tail instead of consuming
-    // it. Append from that tail; waiting for it to drain would deadlock prefill.
-    let mut audio_start_timeline_nsecs = if output_payload_nsecs > 0 {
-        output_buffered_until_nsecs.max(played_timeline_nsecs)
-    } else {
-        played_timeline_nsecs.max(video_start_timeline_nsecs)
-    };
-    let mut reset_audio_to_timeline_nsecs = (output_payload_nsecs == 0
-        && audio_start_timeline_nsecs != played_timeline_nsecs)
-        .then_some(audio_start_timeline_nsecs);
-    let mut coverage =
-        pending_audio.stageable_coverage_between(audio_start_timeline_nsecs, u64::MAX);
-
-    if coverage.is_none() {
-        if output_payload_nsecs > 0 {
-            return None;
-        }
-        let next_audio_start_nsecs =
-            pending_audio.first_start_at_or_after(audio_start_timeline_nsecs)?;
-        audio_start_timeline_nsecs = next_audio_start_nsecs;
-        reset_audio_to_timeline_nsecs = Some(next_audio_start_nsecs);
-        coverage = pending_audio.stageable_coverage_between(audio_start_timeline_nsecs, u64::MAX);
-    }
-
-    let pending_buffered_until_nsecs = coverage?.until_nsecs;
-    if pending_buffered_until_nsecs <= audio_start_timeline_nsecs {
-        return None;
-    }
-    let video_lead_until_nsecs =
-        video_buffered_until_nsecs.saturating_add(duration_nsecs(AUDIO_OUTPUT_VIDEO_LEAD_DURATION));
-    // A retained tail may already lead the last scheduled video frame. Audio
-    // has to finish prefilling before that frozen video clock can advance.
-    // Keep the usual bounded lead for appends, while a new audio anchor still
-    // requires actual video coverage before resetting the clock.
-    let recovery_covered_until_nsecs = if output_payload_nsecs > 0 {
-        video_lead_until_nsecs
-    } else {
-        video_buffered_until_nsecs
-    };
-    if audio_start_timeline_nsecs < video_start_timeline_nsecs
-        || audio_start_timeline_nsecs >= recovery_covered_until_nsecs
-    {
-        return None;
-    }
-
-    // A live tempo graph can release retained media in bursts. Permit bounded
-    // feeding even when the new input alone cannot complete prefill; only the
-    // callback can release the underrun clock after enough real PCM arrives.
-    let minimum_input_nsecs = if output_payload_nsecs > 0 && output_tempo_pending_nsecs > 0 {
-        0
-    } else {
-        recovery_nsecs.saturating_sub(output_payload_nsecs)
-    };
-    let minimum_flush_until_nsecs = audio_start_timeline_nsecs.saturating_add(minimum_input_nsecs);
-    if recovery_covered_until_nsecs < minimum_flush_until_nsecs {
-        return None;
-    }
-    let audio_flush_until_timeline_nsecs = video_lead_until_nsecs.min(pending_buffered_until_nsecs);
-
-    let staged_payload_nsecs = pending_audio
-        .stageable_coverage_between(audio_start_timeline_nsecs, audio_flush_until_timeline_nsecs)?
-        .payload_nsecs;
-    (staged_payload_nsecs >= minimum_input_nsecs).then_some(PendingAudioUnderrunRecoveryPlan {
-        audio_start_timeline_nsecs,
-        audio_flush_until_timeline_nsecs,
-        reset_audio_to_timeline_nsecs,
-    })
 }
 
 pub(in crate::backend::ffmpeg) fn discard_stale_pending_audio_before_recovery_start(
@@ -594,6 +513,23 @@ pub(in crate::backend::ffmpeg) fn recover_pending_start_audio_after_underrun(
     buffered_reporter: &mut BufferedReporter,
 ) -> std::result::Result<bool, String> {
     if pending_audio.is_empty() {
+        if output.underrun_active()
+            && tracing::enabled!(tracing::Level::DEBUG)
+            && let Ok(Some(snapshot)) = output.try_snapshot()
+        {
+            report_underrun_recovery_blocked(
+                pending_audio,
+                output,
+                snapshot,
+                UnderrunRecoveryBlocked::PendingAudioEmpty,
+                control,
+                queued_video_frames.range_nsecs(),
+                session_id,
+                None,
+            );
+        } else {
+            pending_audio.clear_recovery_log_state();
+        }
         return Ok(false);
     }
 
@@ -601,11 +537,12 @@ pub(in crate::backend::ffmpeg) fn recover_pending_start_audio_after_underrun(
     let output_starved = audio_snapshot.total_pending_nsecs == 0;
     let recovering_underrun = output.underrun_active();
     if !output_starved && !recovering_underrun {
+        pending_audio.clear_recovery_log_state();
         return Ok(false);
     }
 
     let queued_video_range_nsecs = queued_video_frames.range_nsecs();
-    let Some(plan) = pending_audio_underrun_recovery_plan(
+    let decision = pending_audio_underrun_recovery_decision(
         pending_audio,
         audio_snapshot.played_timeline_nsecs,
         audio_snapshot
@@ -615,27 +552,41 @@ pub(in crate::backend::ffmpeg) fn recover_pending_start_audio_after_underrun(
         audio_snapshot.tempo_pending_nsecs,
         queued_video_range_nsecs.map(|(start, _)| start),
         queued_video_range_nsecs.map(|(_, end)| end),
-    ) else {
-        let dropped_audio_frames = discard_stale_pending_audio_before_recovery_start(
-            pending_audio,
-            audio_snapshot.played_timeline_nsecs,
-            audio_snapshot.total_pending_nsecs,
-            queued_video_range_nsecs.map(|(start, _)| start),
-        );
-        if dropped_audio_frames > 0 {
-            tracing::debug!(
-                session_id = ?session_id,
-                dropped_audio_frames,
-                played_timeline_nsecs = audio_snapshot.played_timeline_nsecs,
-                output_pending_ms = audio_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
-                video_start_timeline_nsecs = ?queued_video_range_nsecs.map(|(start, _)| start),
-                pending_audio_frames = pending_audio.len(),
-                pending_audio_ms = pending_audio.buffered_duration().as_secs_f64() * 1000.0,
-                "discarded stale pending FFmpeg audio before underrun recovery start"
+    );
+    let plan = match decision {
+        Ok(plan) => plan,
+        Err(reason) => {
+            report_underrun_recovery_blocked(
+                pending_audio,
+                output,
+                audio_snapshot,
+                reason,
+                control,
+                queued_video_range_nsecs,
+                session_id,
+                None,
             );
-            return Ok(true);
+            let dropped_audio_frames = discard_stale_pending_audio_before_recovery_start(
+                pending_audio,
+                audio_snapshot.played_timeline_nsecs,
+                audio_snapshot.total_pending_nsecs,
+                queued_video_range_nsecs.map(|(start, _)| start),
+            );
+            if dropped_audio_frames > 0 {
+                tracing::debug!(
+                    session_id = ?session_id,
+                    dropped_audio_frames,
+                    played_timeline_nsecs = audio_snapshot.played_timeline_nsecs,
+                    output_pending_ms = audio_snapshot.total_pending_nsecs as f64 / 1_000_000.0,
+                    video_start_timeline_nsecs = ?queued_video_range_nsecs.map(|(start, _)| start),
+                    pending_audio_frames = pending_audio.len(),
+                    pending_audio_ms = pending_audio.buffered_duration().as_secs_f64() * 1000.0,
+                    "discarded stale pending FFmpeg audio before underrun recovery start"
+                );
+                return Ok(true);
+            }
+            return Ok(false);
         }
-        return Ok(false);
     };
 
     let mut dropped_video_frames = 0usize;
@@ -666,9 +617,14 @@ pub(in crate::backend::ffmpeg) fn recover_pending_start_audio_after_underrun(
     )?;
 
     if made_progress {
+        pending_audio.clear_recovery_log_state();
         let recovered_snapshot = output.snapshot()?;
         tracing::debug!(
             session_id = ?session_id,
+            playback_rate = control.playback_rate(),
+            audio_epoch = recovered_snapshot.audio_epoch,
+            underrun_active = output.underrun_active(),
+            underrun_resume_ms = output.underrun_resume_nsecs() as f64 / 1_000_000.0,
             audio_start_timeline_nsecs = plan.audio_start_timeline_nsecs,
             audio_flush_until_timeline_nsecs = plan.audio_flush_until_timeline_nsecs,
             reset_audio_to_timeline_nsecs = ?plan.reset_audio_to_timeline_nsecs,
@@ -681,6 +637,21 @@ pub(in crate::backend::ffmpeg) fn recover_pending_start_audio_after_underrun(
             audio_output_tempo_pending_ms =
                 recovered_snapshot.tempo_pending_nsecs as f64 / 1_000_000.0,
             "staged pending FFmpeg audio for native output underrun prefill"
+        );
+    } else if tracing::enabled!(tracing::Level::DEBUG) {
+        report_underrun_recovery_blocked(
+            pending_audio,
+            output,
+            output
+                .try_snapshot()
+                .ok()
+                .flatten()
+                .unwrap_or(audio_snapshot),
+            UnderrunRecoveryBlocked::OutputStagingNoProgress,
+            control,
+            queued_video_range_nsecs,
+            session_id,
+            Some(plan),
         );
     }
 

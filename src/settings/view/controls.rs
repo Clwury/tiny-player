@@ -23,6 +23,75 @@ pub(crate) const USER_HARDWARE_DECODE_DESCRIPTION: &str =
     "自动按平台和显卡选择 GPU 硬解，失败后回退软件解码；强制模式失败时报错。";
 pub(crate) const DEVELOPMENT_HARDWARE_DECODE_DESCRIPTION: &str =
     "自动按平台和显卡选择硬解，Linux 下保留 VA-API 回传内存回退；强制模式失败时报错。";
+pub(crate) const PLAYBACK_DEBUG_LOG_LABEL: &str = "播放调试日志";
+pub(crate) const PLAYBACK_DEBUG_LOG_DESCRIPTION: &str =
+    "记录播放 DEBUG 及以上级别的原始消息、状态和错误详情。立即生效。";
+
+#[cfg(test)]
+mod tests;
+
+pub(crate) fn playback_log_location(cx: &App) -> impl IntoElement {
+    playback_log_path_field(
+        crate::logging::playback_log_path(),
+        |path, cx| cx.reveal_path(path),
+        cx,
+    )
+}
+
+fn playback_log_path_field(
+    path: Option<std::path::PathBuf>,
+    on_reveal: impl Fn(&std::path::Path, &mut App) + 'static,
+    cx: &App,
+) -> impl IntoElement {
+    let available = path.is_some();
+    let value = path
+        .as_deref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| crate::i18n::tr("日志目录不可用", cx).to_string());
+    let action = crate::i18n::tr("点击在文件管理器中显示并选中文件", cx);
+    let tooltip = if available {
+        format!("{value}\n{action}")
+    } else {
+        value.clone()
+    };
+    let theme = theme::get(cx);
+    div()
+        .id("playback-debug-log-path")
+        .debug_selector(|| "playback-debug-log-path".into())
+        .role(if available {
+            gpui::Role::Button
+        } else {
+            gpui::Role::Label
+        })
+        .aria_label(crate::i18n::tr(format!("日志文件（只读）：{value}"), cx))
+        .aria_value(value.clone())
+        .aria_description(action)
+        .flex()
+        .items_center()
+        .h(px(32.0))
+        .w(px(256.0))
+        .px_2()
+        .rounded(radius::INPUT)
+        .border_1()
+        .border_color(theme.window_border)
+        .bg(theme.editor_background)
+        .cursor_default()
+        .when(available, |this| {
+            this.cursor_pointer()
+                .hover(move |style| style.border_color(theme.accent))
+        })
+        .text_sm()
+        .line_height(gpui::relative(1.3))
+        .text_color(theme.muted_foreground)
+        .tooltip(move |_, cx| crate::ui::tooltip::text_tooltip(tooltip.clone(), cx))
+        .child(div().min_w_0().text_ellipsis().child(value))
+        .on_click(move |_, window, cx| {
+            if let Some(path) = &path {
+                window.blur(cx);
+                on_reveal(path, cx);
+            }
+        })
+}
 
 pub(crate) fn app_language_selector(
     state: Entity<DropdownState>,

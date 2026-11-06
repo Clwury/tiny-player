@@ -20,6 +20,7 @@ pub(crate) struct SettingsController {
 }
 
 pub(crate) struct SettingsVm<'a> {
+    pub(crate) playback_debug_log: bool,
     pub(crate) config: &'a PlaybackCacheConfig,
     pub(crate) color_theme: ColorTheme,
     pub(crate) app_language: AppLanguage,
@@ -71,6 +72,7 @@ impl SettingsController {
             snapshot.color_theme,
             snapshot.app_language,
             snapshot.track_languages,
+            snapshot.playback_debug_log,
         )
     }
 
@@ -80,6 +82,7 @@ impl SettingsController {
         color_theme: ColorTheme,
         app_language: AppLanguage,
         track_languages: PlaybackLanguagePreferences,
+        playback_debug_log: bool,
     ) -> Self {
         Self {
             snapshot: SettingsSnapshot {
@@ -87,6 +90,7 @@ impl SettingsController {
                 color_theme,
                 app_language,
                 track_languages,
+                playback_debug_log,
             },
             mode,
             category: SettingsCategory::default(),
@@ -98,6 +102,7 @@ impl SettingsController {
 
     pub(crate) fn view_model(&self) -> SettingsVm<'_> {
         SettingsVm {
+            playback_debug_log: self.snapshot.playback_debug_log,
             config: &self.snapshot.playback,
             color_theme: self.snapshot.color_theme,
             app_language: self.snapshot.app_language,
@@ -167,6 +172,7 @@ impl SettingsController {
         };
         let config = &mut self.snapshot.playback;
         match intent {
+            SettingsIntent::PlaybackDebugLog(enabled) => self.snapshot.playback_debug_log = enabled,
             SettingsIntent::AppLanguage(language) => self.snapshot.app_language = language,
             SettingsIntent::Theme(theme) => self.snapshot.color_theme = theme,
             SettingsIntent::Language { language, audio } => {

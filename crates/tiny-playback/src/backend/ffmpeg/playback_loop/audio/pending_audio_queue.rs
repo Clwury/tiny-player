@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, os::raw::c_int, time::Duration};
+use std::{
+    collections::VecDeque,
+    os::raw::c_int,
+    time::{Duration, Instant},
+};
 
 use super::{
     AUDIO_OUTPUT_PTS_GAP_TOLERANCE, AudioStagedFrame, DecodedAudio,
@@ -12,6 +16,22 @@ pub(in crate::backend::ffmpeg) struct PendingStartAudio {
     buffered_frames: u64,
     buffered_samples: usize,
     buffered_duration_nsecs: u64,
+    recovery_log_state: Option<PendingAudioRecoveryLogState>,
+}
+
+struct PendingAudioRecoveryLogState {
+    reason: &'static str,
+    audio_epoch: u64,
+    rate_bits: u64,
+    started_at: Instant,
+    last_logged_at: Instant,
+    suppressed_repeats: u64,
+}
+
+pub(super) struct PendingAudioRecoveryLogEmission {
+    pub(super) log_kind: &'static str,
+    pub(super) suppressed_repeats: u64,
+    pub(super) blocked_for: Duration,
 }
 
 pub(in crate::backend::ffmpeg) struct PendingStartAudioFrame {
@@ -59,6 +79,57 @@ impl PendingStartAudioFrame {
 }
 
 impl PendingStartAudio {
+    pub(super) fn clear_recovery_log_state(&mut self) {
+        self.recovery_log_state = None;
+    }
+
+    pub(super) fn observe_recovery_blocked(
+        &mut self,
+        reason: &'static str,
+        audio_epoch: u64,
+        rate: f64,
+        now: Instant,
+    ) -> Option<PendingAudioRecoveryLogEmission> {
+        match self.recovery_log_state.as_mut() {
+            Some(state)
+                if state.reason == reason
+                    && state.audio_epoch == audio_epoch
+                    && state.rate_bits == rate.to_bits() =>
+            {
+                if now.saturating_duration_since(state.last_logged_at) < Duration::from_secs(1) {
+                    state.suppressed_repeats = state.suppressed_repeats.saturating_add(1);
+                    return None;
+                }
+                let suppressed_repeats = std::mem::take(&mut state.suppressed_repeats);
+                state.last_logged_at = now;
+                Some(PendingAudioRecoveryLogEmission {
+                    log_kind: "periodic_summary",
+                    suppressed_repeats,
+                    blocked_for: now.saturating_duration_since(state.started_at),
+                })
+            }
+            _ => {
+                let suppressed_repeats = self
+                    .recovery_log_state
+                    .as_ref()
+                    .map_or(0, |state| state.suppressed_repeats);
+                self.recovery_log_state = Some(PendingAudioRecoveryLogState {
+                    reason,
+                    audio_epoch,
+                    rate_bits: rate.to_bits(),
+                    started_at: now,
+                    last_logged_at: now,
+                    suppressed_repeats: 0,
+                });
+                Some(PendingAudioRecoveryLogEmission {
+                    log_kind: "state_changed",
+                    suppressed_repeats,
+                    blocked_for: Duration::ZERO,
+                })
+            }
+        }
+    }
+
     pub(in crate::backend::ffmpeg) fn push(
         &mut self,
         audio: DecodedAudio,
@@ -100,6 +171,7 @@ impl PendingStartAudio {
         self.buffered_frames = 0;
         self.buffered_samples = 0;
         self.buffered_duration_nsecs = 0;
+        self.clear_recovery_log_state();
     }
 
     pub(in crate::backend::ffmpeg) fn discard_before(&mut self, timeline_nsecs: u64) -> usize {
@@ -223,7 +295,7 @@ impl PendingStartAudio {
         )
     }
 
-    fn first_end_timeline_nsecs(&self) -> Option<u64> {
+    pub(super) fn first_end_timeline_nsecs(&self) -> Option<u64> {
         self.frames.front().map(|frame| frame.end_timeline_nsecs)
     }
 
@@ -404,6 +476,58 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_block_logs_changes_and_one_second_summaries() {
+        use std::time::{Duration, Instant};
+        let mut pending = super::PendingStartAudio::default();
+        let now = Instant::now();
+        let first = pending
+            .observe_recovery_blocked("missing_video_window", 7, 1.46, now)
+            .unwrap();
+        assert_eq!(first.log_kind, "state_changed");
+        assert_eq!(first.blocked_for, Duration::ZERO);
+        for ms in 1..100 {
+            assert!(
+                pending
+                    .observe_recovery_blocked(
+                        "missing_video_window",
+                        7,
+                        1.46,
+                        now + Duration::from_millis(ms)
+                    )
+                    .is_none()
+            );
+        }
+        let summary = pending
+            .observe_recovery_blocked(
+                "missing_video_window",
+                7,
+                1.46,
+                now + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(summary.log_kind, "periodic_summary");
+        assert_eq!(summary.suppressed_repeats, 99);
+        assert_eq!(summary.blocked_for, Duration::from_secs(1));
+
+        for (reason, epoch, rate) in [
+            ("pending_audio_gap", 7, 1.46),
+            ("pending_audio_gap", 8, 1.46),
+            ("pending_audio_gap", 8, 1.0),
+        ] {
+            let changed = pending
+                .observe_recovery_blocked(reason, epoch, rate, now)
+                .unwrap();
+            assert_eq!(changed.log_kind, "state_changed");
+        }
+        pending.clear();
+        assert!(
+            pending
+                .observe_recovery_blocked("pending_audio_gap", 8, 1.0, now)
+                .is_some()
+        );
+    }
+
     use super::{DecodedAudio, PendingStartAudio, matching_audio_timeline_gap};
 
     fn decoded_audio(duration_nsecs: u64) -> DecodedAudio {

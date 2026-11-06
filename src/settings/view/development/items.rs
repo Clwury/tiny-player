@@ -8,7 +8,7 @@ mod playback;
 
 impl PlaybackSettingsDialogState {
     pub(super) fn setting_items(&self, dialog: Entity<Self>, cx: &App) -> Vec<SettingItem> {
-        self.general_items(dialog.clone())
+        self.general_items(dialog.clone(), cx)
             .into_iter()
             .chain(self.playback_items(dialog.clone(), cx))
             .chain(self.cache_items(dialog, cx))

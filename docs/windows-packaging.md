@@ -122,8 +122,10 @@ $env:TINY_TEST_LIBPLACEBO = '1' # 可选：在有 Vulkan 驱动的机器启用�
 
 验收时将完整目录复制到带空格或中文的其他路径，从无关工作目录启动，清除开发库
 搜索路径，验证界面资源和日志，再测试播放及磁盘缓存。PE 检查不代替显卡实测。
-日志默认写入 `%LOCALAPPDATA%\tiny-player\logs\tiny-player.log`，可通过
-`TINY_LOG_FILE` 修改；设为空字符串可关闭文件日志。
+文件日志默认关闭。在“常规 → 播放诊断”开启“播放调试日志”后，播放 `DEBUG` 及以上级别（`DEBUG`、`INFO`、`WARN`、`ERROR`）的原始消息、
+状态和错误详情写入 `%LOCALAPPDATA%\tiny-player\logs\playback-debug.log`，每次新播放覆盖主日志文件。
+`TINY_LOG_FILE` 仅覆盖路径，设为空字符串可禁止文件日志；不会绕过开关或模块／级别过滤。
+详见[播放调试日志](settings.md#播放调试日志)。
 
 校验已搬移的目录（包括 manifest 内每个文件的 SHA256），请将 `<version>` 替换为实际包版本号：
 

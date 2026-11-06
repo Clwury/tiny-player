@@ -94,6 +94,7 @@ pub(super) fn service_playback_commands(
             .output_scheduler
             .note_output_housekeeping_change();
         tracing::debug!(
+            session_id = ?context.session.id(),
             rate,
             "updated FFmpeg playback rate without resetting playback"
         );

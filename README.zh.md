@@ -38,6 +38,8 @@ Windows 便携包包含多媒体依赖与 Vulkan loader，显卡的 Vulkan 驱�
 
 Linux 播放时会在支持 idle-inhibit 协议的 Wayland 窗口上建立空闲抑制，并单独向 `xdg-desktop-portal` 申请会话空闲与睡眠抑制。会话空闲请求失败时尝试 `org.freedesktop.ScreenSaver`，睡眠请求失败时尝试 logind；睡眠抑制失败不影响已成功的空闲抑制。会话级抑制可在切换工作区后继续生效，仅有 Wayland 窗口级抑制时则取决于窗口可见性。各机制均不可用时会记录日志，播放仍继续。手动锁屏与用户主动触发的睡眠由系统控制。
 
+文件日志默认关闭。在两种设置窗口的“常规 → 播放诊断”开启“播放调试日志”，即可立即记录播放 DEBUG 及以上级别（DEBUG、INFO、WARN、ERROR）的原始消息、状态和错误详情，界面显示保存位置。每次开始新播放时覆盖主日志文件，暂停、继续和跳转进度保留当前记录。不收集其他模块的浏览和服务器 API 日志。详见[日志设置](docs/settings.md#播放调试日志)。
+
 ## 安装
 
 ### Arch Linux

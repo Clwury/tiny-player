@@ -1,8 +1,9 @@
 //! User-facing preferences. Advanced cache tuning stays in the development dialog.
 use super::controls::{
-    USER_HARDWARE_DECODE_DESCRIPTION, app_language_selector, disk_cache_capacity_control,
-    disk_cache_capacity_input, hardware_decode_selector, settings_category_button,
-    settings_sidebar, track_language_selector,
+    PLAYBACK_DEBUG_LOG_DESCRIPTION, PLAYBACK_DEBUG_LOG_LABEL, USER_HARDWARE_DECODE_DESCRIPTION,
+    app_language_selector, disk_cache_capacity_control, disk_cache_capacity_input,
+    hardware_decode_selector, playback_log_location, settings_category_button, settings_sidebar,
+    track_language_selector,
 };
 use super::dialog::SettingsChanged;
 use crate::ui::{
@@ -86,6 +87,12 @@ impl UserSettingsDialogState {
         self.controller.snapshot()
     }
 
+    pub(crate) fn restore_playback_debug_log(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.controller
+            .dispatch(SettingsIntent::PlaybackDebugLog(enabled));
+        cx.notify();
+    }
+
     fn dispatch(&mut self, intent: SettingsIntent, cx: &mut Context<Self>) {
         let change = self.controller.dispatch(intent);
         if let Some(language) = change.app_language {
@@ -153,6 +160,8 @@ impl UserSettingsDialogState {
         let budget_dialog = cx.entity();
         let disk_dialog = cx.entity();
         let decode_dialog = cx.entity();
+        let logging_dialog = cx.entity();
+        let logging_enabled = self.controller.view_model().playback_debug_log;
         let content = div().flex().flex_col().min_w_0().pb_6().child(
             div()
                 .mt_2()
@@ -178,7 +187,24 @@ impl UserSettingsDialogState {
                     },
                 ),
                 cx,
-            ))),
+            ))
+            .child(section("播放诊断", cx).mt_5()
+                .child(setting_row(
+                    "user-setting-playback-debug-log",
+                    PLAYBACK_DEBUG_LOG_LABEL,
+                    PLAYBACK_DEBUG_LOG_DESCRIPTION,
+                    toggle_switch(PLAYBACK_DEBUG_LOG_LABEL, logging_enabled, move |cx| {
+                        logging_dialog.update(cx, |dialog, cx| dialog.dispatch(SettingsIntent::PlaybackDebugLog(!logging_enabled), cx))
+                    }, cx),
+                    cx,
+                ))
+                .child(setting_row(
+                    "user-setting-playback-debug-log-path",
+                    "日志文件",
+                    "每次播放开始时覆盖重写，关闭开关后保留日志。",
+                    playback_log_location(cx),
+                    cx,
+                )))),
             SettingsCategory::About => super::about::render_about(cx),
             SettingsCategory::Appearance => content.child(section("主题", cx).child(setting_row(
                 "user-setting-theme",

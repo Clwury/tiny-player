@@ -50,6 +50,11 @@ pub(super) struct PlaybackPipelineSnapshot {
     output_snapshot: PlaybackOutputSnapshot,
     vo_snapshot: VideoOutputQueueSnapshot,
     audio_output_snapshot: Option<AudioOutputSnapshot>,
+    audio_output_underrun_active: Option<bool>,
+    audio_output_resume_nsecs: Option<u64>,
+    requested_playback_rate: Option<f64>,
+    audio_output_steady_target: Option<Duration>,
+    pending_audio_next_frame_nsecs: Option<u64>,
     prestart_audio_single_ledger_invariant_holds: bool,
     prestart_audio_ownership: PrestartAudioOwnership,
     owned_vulkan_frames: usize,
@@ -193,6 +198,27 @@ impl PlaybackPipelineSnapshot {
             output_snapshot,
             vo_snapshot,
             audio_output_snapshot,
+            audio_output_underrun_active: context.audio_output.map(AudioOutput::underrun_active),
+            audio_output_resume_nsecs: context.audio_output.map(AudioOutput::underrun_resume_nsecs),
+            requested_playback_rate: context
+                .audio_output
+                .map(AudioOutput::requested_playback_rate),
+            audio_output_steady_target: audio_output_snapshot.map(|snapshot| {
+                context
+                    .output_scheduler
+                    .audio_output_steady_target_duration(snapshot)
+            }),
+            pending_audio_next_frame_nsecs: context
+                .output_scheduler
+                .pending_start_audio
+                .first_start_timeline_nsecs()
+                .zip(
+                    context
+                        .output_scheduler
+                        .pending_start_audio
+                        .first_end_timeline_nsecs(),
+                )
+                .map(|(start, end)| end.saturating_sub(start)),
             prestart_audio_single_ledger_invariant_holds,
             prestart_audio_ownership,
             owned_vulkan_frames: context
@@ -522,7 +548,27 @@ impl PlaybackPipelineSnapshot {
             output_rebuffer_anchor = ?self.output_snapshot.video_output_rebuffer_anchor,
             pending_start_audio_frames = self.output_snapshot.pending_start_audio_frames,
             pending_start_audio_ms = self.output_snapshot.pending_start_audio_nsecs as f64 / 1_000_000.0,
+            pending_start_audio_next_frame_ms =
+                ?self.pending_audio_next_frame_nsecs.map(|nsecs| nsecs as f64 / 1_000_000.0),
             audio_output_pending_ms = ?audio_output_pending_ms,
+            playback_rate = ?self.requested_playback_rate,
+            audio_output_underrun_active = ?self.audio_output_underrun_active,
+            audio_output_resume_threshold_ms =
+                ?self.audio_output_resume_nsecs.map(|nsecs| nsecs as f64 / 1_000_000.0),
+            audio_output_callback_prefill_deficit_ms = ?self.audio_output_snapshot.zip(self.audio_output_resume_nsecs)
+                .map(|(snapshot, resume)| resume.saturating_sub(snapshot.shared_payload_nsecs) as f64 / 1_000_000.0),
+            audio_output_played_timeline_nsecs =
+                ?self.audio_output_snapshot.map(|snapshot| snapshot.played_timeline_nsecs),
+            audio_output_buffered_until_timeline_nsecs =
+                ?self.audio_output_snapshot.map(|snapshot| snapshot.buffered_until_timeline_nsecs),
+            audio_output_tempo_pending_ms =
+                ?self.audio_output_snapshot.map(|snapshot| snapshot.tempo_pending_nsecs as f64 / 1_000_000.0),
+            audio_output_steady_clock_target_ms =
+                ?self.audio_output_steady_target.map(|duration| duration.as_secs_f64() * 1000.0),
+            audio_output_steady_clock_headroom_ms = ?self.audio_output_snapshot.zip(self.audio_output_steady_target)
+                .map(|(snapshot, target)| snapshot.played_timeline_nsecs
+                    .saturating_add(duration_to_nsecs(target))
+                    .saturating_sub(snapshot.buffered_until_timeline_nsecs) as f64 / 1_000_000.0),
             audio_output_shared_ms = ?audio_output_shared_ms,
             audio_output_driver_delay_ms = ?audio_output_driver_delay_ms,
             audio_output_queue_ms = ?audio_output_queue_ms,
@@ -693,6 +739,72 @@ mod tests {
         PlaybackOutputState, PlaybackPipelineSnapshot, VideoOutputQueueSnapshot, duration_to_nsecs,
         playback_stall_reason_class, playback_stall_state_changed,
     };
+
+    #[test]
+    fn stall_log_separates_callback_pcm_from_tempo_media_and_prefill_threshold() {
+        let snapshot = PlaybackPipelineSnapshot {
+            blocked_on: PlaybackBlockReason::AudioOutput,
+            blocked_reasons: vec![PlaybackBlockReason::AudioOutput],
+            output_state: PlaybackOutputState::Playing,
+            demux_packet_snapshot: Default::default(),
+            demux_reader_watermark: Default::default(),
+            video_decode_snapshot: Default::default(),
+            video_decode_blocked_on: None,
+            video_frame_prepare_snapshot: None,
+            video_frame_prepare_blocked_on: None,
+            audio_decode_snapshot: None,
+            audio_decode_blocked_on: None,
+            subtitle_decode_snapshot: None,
+            subtitle_decode_blocked_on: None,
+            output_snapshot: super::PlaybackOutputScheduler::new().snapshot(),
+            vo_snapshot: Default::default(),
+            audio_output_snapshot: Some(AudioOutputSnapshot {
+                played_timeline_nsecs: 1_000_000_000,
+                buffered_until_timeline_nsecs: 1_577_000_000,
+                shared_payload_nsecs: 192_000_000,
+                tempo_pending_nsecs: 113_000_000,
+                queue_pending_nsecs: 113_000_000,
+                total_pending_nsecs: 305_000_000,
+                ..Default::default()
+            }),
+            audio_output_underrun_active: Some(true),
+            audio_output_resume_nsecs: Some(250_000_000),
+            requested_playback_rate: Some(1.0),
+            audio_output_steady_target: Some(std::time::Duration::from_millis(600)),
+            pending_audio_next_frame_nsecs: Some(32_000_000),
+            prestart_audio_single_ledger_invariant_holds: true,
+            prestart_audio_ownership: super::PrestartAudioOwnership::CollectingEmpty,
+            owned_vulkan_frames: 0,
+            demux_snapshot_unavailable: false,
+            demux_read_blocked_for: None,
+        };
+        let events = crate::test_logging::capture_events(|| {
+            snapshot.log(
+                PlaybackSessionId(7),
+                "audio_output",
+                "audio_output",
+                None,
+                0,
+            );
+        });
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.level, tracing::Level::DEBUG);
+        for (key, value) in [
+            ("audio_output_pending_ms", "Some(305.0)"),
+            ("audio_output_shared_ms", "Some(192.0)"),
+            ("audio_output_tempo_pending_ms", "Some(113.0)"),
+            ("audio_output_callback_prefill_deficit_ms", "Some(58.0)"),
+            ("audio_output_resume_threshold_ms", "Some(250.0)"),
+            ("audio_output_underrun_active", "Some(true)"),
+            ("playback_rate", "Some(1.0)"),
+            ("audio_output_steady_clock_target_ms", "Some(600.0)"),
+            ("audio_output_steady_clock_headroom_ms", "Some(23.0)"),
+            ("pending_start_audio_next_frame_ms", "Some(32.0)"),
+        ] {
+            assert_eq!(event.fields[key], value, "{key}");
+        }
+    }
 
     #[test]
     fn coordinator_stall_wait_suffix_does_not_create_a_new_state_class() {

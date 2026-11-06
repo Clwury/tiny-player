@@ -48,6 +48,7 @@ impl PlaybackBackendAdapter {
         mut request: BackendLoadRequest,
         volume: f32,
     ) -> (Self, Option<String>) {
+        crate::logging::begin_playback_file_log();
         let mut backend = match factory() {
             Ok(backend) => backend,
             Err(error) => {
@@ -102,9 +103,12 @@ impl PlaybackBackendAdapter {
             }
             command => command,
         };
-        self.resources
-            .owner_mut()
-            .map(|backend| backend.command(command))
+        self.resources.owner_mut().map(|backend| {
+            if matches!(&command, BackendCommand::Load(_)) {
+                crate::logging::begin_playback_file_log();
+            }
+            backend.command(command)
+        })
     }
     pub(super) fn poll_events(&mut self) -> Vec<BackendEvent> {
         self.resources

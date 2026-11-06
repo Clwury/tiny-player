@@ -65,12 +65,19 @@ impl PlaybackPipelineState {
         ) else {
             return Ok(());
         };
+        let diagnostic_snapshot = output.try_snapshot().ok().flatten();
 
         match event.action {
             AudioOutputActivityWatchdogAction::ReleaseSeekTransition => {
                 let released = control.finish_seek_audio_pause();
                 tracing::warn!(
                     session_id = ?session_id,
+                    playback_rate = control.playback_rate(),
+                    audio_epoch = ?diagnostic_snapshot.map(|snapshot| snapshot.audio_epoch),
+                    underrun_active,
+                    underrun_resume_ms = output.underrun_resume_nsecs() as f64 / 1_000_000.0,
+                    tempo_pending_ms = ?diagnostic_snapshot
+                        .map(|snapshot| snapshot.tempo_pending_nsecs as f64 / 1_000_000.0),
                     stalled_ms = event.stalled_for.as_secs_f64() * 1000.0,
                     released_seek_transition = released,
                     played_timeline_nsecs = activity.played_timeline_nsecs,
@@ -90,6 +97,12 @@ impl PlaybackPipelineState {
             AudioOutputActivityWatchdogAction::WarnFrozenClock => {
                 tracing::warn!(
                     session_id = ?session_id,
+                    playback_rate = control.playback_rate(),
+                    audio_epoch = ?diagnostic_snapshot.map(|snapshot| snapshot.audio_epoch),
+                    underrun_active,
+                    underrun_resume_ms = output.underrun_resume_nsecs() as f64 / 1_000_000.0,
+                    tempo_pending_ms = ?diagnostic_snapshot
+                        .map(|snapshot| snapshot.tempo_pending_nsecs as f64 / 1_000_000.0),
                     stalled_ms = event.stalled_for.as_secs_f64() * 1000.0,
                     played_timeline_nsecs = activity.played_timeline_nsecs,
                     shared_buffer_pending_ms =
@@ -131,6 +144,15 @@ impl PlaybackPipelineState {
                 }
                 tracing::warn!(
                     session_id = ?session_id,
+                    playback_rate = control.playback_rate(),
+                    previous_audio_epoch = ?diagnostic_snapshot.map(|snapshot| snapshot.audio_epoch),
+                    audio_epoch = output.audio_epoch(),
+                    previous_underrun_active = underrun_active,
+                    underrun_active = output.underrun_active(),
+                    previous_shared_buffer_pending_ms =
+                        activity.shared_buffer_pending_nsecs as f64 / 1_000_000.0,
+                    previous_tempo_pending_ms = ?diagnostic_snapshot
+                        .map(|snapshot| snapshot.tempo_pending_nsecs as f64 / 1_000_000.0),
                     stalled_ms = event.stalled_for.as_secs_f64() * 1000.0,
                     previous_played_timeline_nsecs = activity.played_timeline_nsecs,
                     reanchor_timeline_nsecs,

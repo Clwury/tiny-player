@@ -68,10 +68,16 @@ type AppShell = shell::ShellController<Entity<HomePage>, Entity<PlaybackPage>, g
 
 impl TinyApp {
     pub fn new(
-        cache: ServerCache,
+        mut cache: ServerCache,
         startup_error: Option<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let log_error = crate::logging::set_playback_file_logging(cache.playback_debug_log)
+            .err()
+            .map(|error| {
+                cache.playback_debug_log = false;
+                gpui::SharedString::from(format!("开启播放调试日志失败：{error}"))
+            });
         let persistence = crate::persistence::PersistenceService::get(cx);
         cache.app_language.apply(cx);
         cache.track_languages.apply(cx);
@@ -139,6 +145,9 @@ impl TinyApp {
             app.push_app_error_notification(error, cx);
         } else if let Some(server) = app.server_feature.auto_start_server().cloned() {
             app.begin_select_server(&server, cx);
+        }
+        if let Some(error) = log_error {
+            app.push_app_error_notification(error, cx);
         }
         app
     }

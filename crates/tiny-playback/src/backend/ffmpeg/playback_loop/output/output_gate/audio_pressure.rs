@@ -293,7 +293,7 @@ impl PlaybackOutputScheduler {
         self.restart_pending() || self.playback_output_state.rebuffering()
     }
 
-    pub(in crate::backend::ffmpeg::playback_loop::output_gate) fn audio_output_steady_target_duration(
+    pub(in crate::backend::ffmpeg::playback_loop) fn audio_output_steady_target_duration(
         &self,
         _audio_snapshot: AudioOutputSnapshot,
     ) -> Duration {

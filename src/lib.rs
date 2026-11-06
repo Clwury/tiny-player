@@ -7,6 +7,7 @@ pub mod emby;
 mod home;
 mod i18n;
 mod images;
+mod logging;
 mod media;
 mod observability;
 mod persistence;
@@ -45,6 +46,7 @@ pub(crate) fn hide_cursor_until_mouse_moves(cx: &App) {
 }
 
 pub fn run() {
+    let _log_guard = logging::init();
     let platform = gpui_platform::current_platform(false);
     Application::with_platform(platform.clone())
         .with_assets(ProjectAssets::new())

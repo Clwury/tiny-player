@@ -38,6 +38,8 @@ For the GPU performance path, select **Force VA-API (map to Vulkan)** or use `TI
 
 On Linux, playback inhibits idle on Wayland windows whose compositor supports idle-inhibit, and independently requests session idle and sleep inhibition through `xdg-desktop-portal`. Failed session idle requests fall back to `org.freedesktop.ScreenSaver`; failed sleep requests fall back to logind. Sleep inhibition failures preserve successful idle inhibition. Session inhibition can remain effective across workspace switches; Wayland window inhibition alone depends on window visibility. If no mechanism is available, playback continues and the failure is logged. Manual locking and user-initiated sleep remain controlled by the system.
 
+Playback file logging is off by default. Enable **General → Playback diagnostics → Playback debug log** in either settings dialog to record original playback messages, states, and error details at DEBUG level and above (DEBUG, INFO, WARN, ERROR) immediately. Each new playback overwrites the main log file; pausing, resuming, and seeking keep the current recording. The file location is shown beside the switch. Browsing and server API logs from other modules are excluded. See [logging settings](docs/settings.md#播放调试日志).
+
 ## Installation
 
 ### Arch Linux

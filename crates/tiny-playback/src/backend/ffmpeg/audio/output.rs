@@ -708,6 +708,14 @@ impl AudioOutput {
         self.shared.underrun_active.load(Ordering::Acquire)
     }
 
+    pub(in crate::backend::ffmpeg) fn underrun_resume_nsecs(&self) -> u64 {
+        self.shared.underrun_resume_nsecs.load(Ordering::Acquire)
+    }
+
+    pub(in crate::backend::ffmpeg) fn requested_playback_rate(&self) -> f64 {
+        self.shared.control.playback_rate()
+    }
+
     pub(in crate::backend::ffmpeg) fn hold_for_underrun_prefill(&self, timeline_nsecs: u64) {
         self.shared.mark_underrun(timeline_nsecs);
     }

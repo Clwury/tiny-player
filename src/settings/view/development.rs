@@ -3,9 +3,10 @@ mod controls;
 mod items;
 mod layout;
 use super::controls::{
-    DEVELOPMENT_HARDWARE_DECODE_DESCRIPTION, app_language_selector, disk_cache_capacity_control,
-    disk_cache_capacity_input, hardware_decode_selector, settings_category_button,
-    settings_sidebar, track_language_selector,
+    DEVELOPMENT_HARDWARE_DECODE_DESCRIPTION, PLAYBACK_DEBUG_LOG_DESCRIPTION,
+    PLAYBACK_DEBUG_LOG_LABEL, app_language_selector, disk_cache_capacity_control,
+    disk_cache_capacity_input, hardware_decode_selector, playback_log_location,
+    settings_category_button, settings_sidebar, track_language_selector,
 };
 use super::dialog::SettingsChanged;
 use crate::ui::number_input::{NumberControl, NumberRange};
@@ -216,6 +217,12 @@ impl PlaybackSettingsDialogState {
     }
     pub(crate) fn snapshot(&self) -> SettingsSnapshot {
         self.controller.snapshot()
+    }
+
+    pub(crate) fn restore_playback_debug_log(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.controller
+            .dispatch(SettingsIntent::PlaybackDebugLog(enabled));
+        cx.notify();
     }
 
     fn dispatch(&mut self, intent: SettingsIntent, cx: &mut Context<Self>) {

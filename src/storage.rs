@@ -41,6 +41,8 @@ pub struct ServerCache {
     pub search_history: SearchHistory,
     #[serde(default)]
     pub items_sort: ItemSortPreferences,
+    #[serde(default)]
+    pub playback_debug_log: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +66,7 @@ impl ServerCache {
             playback_volume: PlaybackVolumeSettings::default(),
             search_history: SearchHistory::default(),
             items_sort: ItemSortPreferences::default(),
+            playback_debug_log: false,
         }
     }
 
@@ -243,6 +246,27 @@ mod tests {
         assert!(!cache.device_id.is_empty());
         assert!(cache.servers.is_empty());
         assert_eq!(cache.items_sort, ItemSortPreferences::default());
+        assert!(!cache.playback_debug_log);
+    }
+
+    #[test]
+    fn playback_debug_logging_defaults_off_in_old_settings_and_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let mut json = serde_json::to_value(ServerCache::empty()).unwrap();
+        json.as_object_mut().unwrap().remove("playback_debug_log");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut cache = load_or_init_from(&path).unwrap();
+        assert!(!cache.playback_debug_log);
+        cache.playback.cache_secs = 42.125;
+        for enabled in [true, false] {
+            cache.playback_debug_log = enabled;
+            save_to(&cache, &path).unwrap();
+            let loaded = load_or_init_from(&path).unwrap();
+            assert_eq!(loaded.playback_debug_log, enabled);
+            assert_eq!(loaded.playback, cache.playback);
+            assert_eq!(loaded.device_id, cache.device_id);
+        }
     }
 
     #[test]

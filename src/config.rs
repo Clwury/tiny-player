@@ -22,6 +22,7 @@ pub(crate) struct GlobalConfig {
     pub(crate) playback_volume: PlaybackVolumeSettings,
     pub(crate) search_history: SearchHistory,
     pub(crate) items_sort: ItemSortPreferences,
+    pub(crate) playback_debug_log: bool,
 }
 
 impl GlobalConfig {
@@ -37,6 +38,7 @@ impl GlobalConfig {
             playback_volume,
             search_history,
             items_sort,
+            playback_debug_log,
             servers,
             auto_start_server_id,
         } = cache;
@@ -52,6 +54,7 @@ impl GlobalConfig {
                 playback_volume,
                 search_history,
                 items_sort,
+                playback_debug_log,
             },
             ServerCatalog {
                 servers,
@@ -72,6 +75,7 @@ impl GlobalConfig {
             playback_volume: self.playback_volume,
             search_history: self.search_history.clone(),
             items_sort: self.items_sort,
+            playback_debug_log: self.playback_debug_log,
             servers: catalog.servers.clone(),
             auto_start_server_id: catalog.auto_start_server_id.clone(),
         }
@@ -100,6 +104,7 @@ mod tests {
         cache.auto_start_server_id = Some("local".into());
         cache.playback.cache_secs = 42.125;
         cache.playback_volume.level = 0.47;
+        cache.playback_debug_log = true;
         cache.app_language = AppLanguage::English;
         cache.items_sort = ItemSortPreferences {
             sort_by: crate::emby::UserItemsSort::PremiereDate,

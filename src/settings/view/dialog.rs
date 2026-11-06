@@ -66,6 +66,17 @@ impl SettingsDialogState {
         }
     }
 
+    pub(crate) fn restore_playback_debug_log(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        match &self.view {
+            SettingsView::Development(dialog) => dialog.update(cx, |dialog, cx| {
+                dialog.restore_playback_debug_log(enabled, cx)
+            }),
+            SettingsView::User(dialog) => dialog.update(cx, |dialog, cx| {
+                dialog.restore_playback_debug_log(enabled, cx)
+            }),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn playback_config(&self, cx: &gpui::App) -> PlaybackCacheConfig {
         match &self.view {
@@ -116,6 +127,7 @@ mod tests {
             .find(|theme| *theme != current_theme)
             .unwrap();
         let snapshot = crate::settings::SettingsSnapshot {
+            playback_debug_log: true,
             playback: crate::player::PlaybackCacheConfig::default(),
             color_theme,
             app_language: crate::settings::AppLanguage::English,

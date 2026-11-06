@@ -572,5 +572,14 @@
   "{}% (Muted)": "{}% (Muted)",
   "Off": "Off",
   "off": "off",
-  "Default": "Default"
+  "Default": "Default",
+  "播放调试日志": "Playback debug log",
+  "播放诊断": "Playback diagnostics",
+  "记录播放 DEBUG 及以上级别的原始消息、状态和错误详情。立即生效。": "Record original playback messages, states, and error details at DEBUG level and above. Takes effect immediately.",
+  "日志文件": "Log file",
+  "每次播放开始时覆盖重写，关闭开关后保留日志。": "Overwrite the log for each new playback; keep it when logging is turned off.",
+  "日志目录不可用": "Log directory unavailable",
+  "开启播放调试日志失败": "Failed to enable playback debug logging",
+  "点击在文件管理器中显示并选中文件": "Show and select this file in the file manager",
+  "日志文件（只读）：{value}": "Log file (read-only): {value}"
 }

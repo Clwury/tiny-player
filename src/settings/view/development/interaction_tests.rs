@@ -101,6 +101,28 @@ fn settle_menu_frames(cx: &mut VisualTestContext) {
 }
 
 #[gpui::test]
+fn playback_logging_switch_is_searchable_and_emits_saved_changes(cx: &mut TestAppContext) {
+    let (root, cx) = settings_window(cx);
+    cx.simulate_resize(size(px(960.0), px(680.0)));
+    cx.run_until_parked();
+    let dialog = root.read_with(cx, |root, _| root.dialog.clone());
+    let original = dialog.read_with(cx, |dialog, _| dialog.snapshot());
+    assert!(cx.debug_bounds("playback-debug-log-path").is_some());
+    let search = dialog.read_with(cx, |dialog, _| dialog.search.clone());
+    search.update(cx, |search, cx| search.set_value("debug logging", cx));
+    cx.run_until_parked();
+    click(cx, "settings-toggle-播放调试日志");
+    assert!(dialog.read_with(cx, |dialog, _| dialog.snapshot().playback_debug_log));
+    assert_eq!(root.read_with(cx, |root, _| root.change_count), 1);
+    click(cx, "settings-toggle-播放调试日志");
+    assert_eq!(
+        dialog.read_with(cx, |dialog, _| dialog.snapshot()),
+        original
+    );
+    assert_eq!(root.read_with(cx, |root, _| root.change_count), 2);
+}
+
+#[gpui::test]
 fn about_clears_settings_search_and_opens_the_project_link_without_saving(cx: &mut TestAppContext) {
     let (root, cx) = settings_window(cx);
     cx.simulate_resize(size(px(900.0), px(600.0)));

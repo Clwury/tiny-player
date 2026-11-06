@@ -17,6 +17,7 @@ fn controller(mode: SettingsMode) -> SettingsController {
         ColorTheme::ALL[0],
         AppLanguage::default(),
         PlaybackLanguagePreferences::default(),
+        false,
     )
 }
 
@@ -25,6 +26,48 @@ fn edit(controller: &mut SettingsController, field: NumericSetting, input: &str)
         field,
         input: input.into(),
     })
+}
+
+#[test]
+fn playback_debug_logging_persists_in_both_modes_without_changing_other_preferences() {
+    for mode in [SettingsMode::Development, SettingsMode::User] {
+        let mut controller = controller(mode);
+        let original = controller.snapshot();
+        assert!(!original.playback_debug_log);
+        let change = controller.dispatch(SettingsIntent::PlaybackDebugLog(true));
+        assert!(change.persist && change.view_changed);
+        assert!(controller.view_model().playback_debug_log);
+        assert_eq!(
+            controller.snapshot(),
+            SettingsSnapshot {
+                playback_debug_log: true,
+                ..original.clone()
+            }
+        );
+        assert!(
+            !controller
+                .dispatch(SettingsIntent::PlaybackDebugLog(true))
+                .persist
+        );
+        let mut config = crate::config::GlobalConfig::split(crate::storage::ServerCache::empty()).0;
+        SettingsPersistenceAdapter::apply(controller.snapshot(), &mut config);
+        assert!(config.playback_debug_log);
+        let reopened = SettingsController::from_snapshot(controller.snapshot(), mode);
+        assert!(reopened.view_model().playback_debug_log);
+        assert!(
+            controller
+                .dispatch(SettingsIntent::PlaybackDebugLog(false))
+                .persist
+        );
+        assert_eq!(controller.snapshot(), original);
+        controller.dispatch(SettingsIntent::Close);
+        assert!(
+            !controller
+                .dispatch(SettingsIntent::PlaybackDebugLog(true))
+                .persist
+        );
+        assert!(!controller.view_model().playback_debug_log);
+    }
 }
 
 #[test]
@@ -292,6 +335,7 @@ fn integer_edit_normalizes_dependencies_without_changing_the_requested_value() {
         ColorTheme::ALL[0],
         AppLanguage::default(),
         PlaybackLanguagePreferences::default(),
+        false,
     );
     assert!(edit(&mut controller, NumericSetting::HttpCacheChunkMib, "16").persist);
     let config = controller.view_model().config;

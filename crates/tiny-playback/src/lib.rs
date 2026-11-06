@@ -25,6 +25,8 @@ mod hardware_decode;
 mod libplacebo;
 mod rate;
 mod render_host;
+#[cfg(test)]
+mod test_logging;
 mod tracks;
 mod video_presenter;
 mod volume;
