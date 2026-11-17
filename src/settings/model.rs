@@ -137,6 +137,7 @@ pub(crate) enum SettingsIntent {
     Mode(PlaybackCacheMode),
     SeekableCache(PlaybackSeekableCacheMode),
     UnlinkFiles(CacheUnlinkPolicy),
+    SubtitleScale(f32),
     Toggle(ToggleSetting),
     EditNumber {
         field: NumericSetting,

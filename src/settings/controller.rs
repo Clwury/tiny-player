@@ -198,6 +198,7 @@ impl SettingsController {
             SettingsIntent::Mode(mode) => config.mode = mode,
             SettingsIntent::SeekableCache(mode) => config.seekable_cache = mode,
             SettingsIntent::UnlinkFiles(policy) => config.unlink_files = policy,
+            SettingsIntent::SubtitleScale(scale) => config.subtitle_scale = scale.clamp(0.5, 3.0),
             SettingsIntent::Toggle(setting) => {
                 let value = match setting {
                     ToggleSetting::DecoderFramedrop => &mut config.decoder_framedrop,
