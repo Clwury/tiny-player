@@ -31,6 +31,40 @@ fn output_rebuffer_notifications_filter_stale_sessions_and_preserve_input_cache_
 }
 
 #[test]
+fn seek_republishes_cleared_output_wait_after_old_session_notification_is_filtered() {
+    let mut backend = FfmpegBackend::new().unwrap();
+    let previous_session = PlaybackSessionId(1);
+    let next_session = PlaybackSessionId(2);
+    backend.current_session_id = previous_session;
+    let control = FfmpegControl::new(previous_session).with_events(backend.event_tx.clone());
+    control.set_output_rebuffer_paused(true);
+    let events = backend.poll_events();
+    assert!(matches!(
+        events.as_slice(),
+        [BackendEvent {
+            session_id,
+            kind: BackendEventKind::OutputRebufferingChanged(true),
+        }] if *session_id == previous_session
+    ));
+
+    // The UI advances its session before the worker adopts the seek command.
+    backend.current_session_id = next_session;
+    control.request_seek();
+    assert!(backend.poll_events().is_empty());
+    control.set_session_id(next_session);
+    let events = backend.poll_events();
+    assert!(matches!(
+        events.as_slice(),
+        [BackendEvent {
+            session_id,
+            kind: BackendEventKind::OutputRebufferingChanged(false),
+        }] if *session_id == next_session
+    ));
+    control.set_session_id(next_session);
+    assert!(backend.poll_events().is_empty());
+}
+
+#[test]
 fn disabling_subtitles_keeps_audio_video_session_pause_and_pending_events() {
     use crate::backend::{BackendControl, BackendLoadRequest};
     for paused in [false, true] {

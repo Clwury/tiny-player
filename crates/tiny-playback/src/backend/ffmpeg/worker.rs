@@ -413,9 +413,8 @@ impl FfmpegControl {
     pub(super) fn set_session_id(&self, session_id: PlaybackSessionId) {
         let previous = self.session_id.swap(session_id.0, Ordering::AcqRel);
         if previous != session_id.0 {
-            // request_seek clears the old pause reason before the coordinator
-            // adopts the new session. Publish its state in the new generation
-            // so filtering old events cannot leave the page waiting forever.
+            // request_seek reports the cleared wait in the old session. Republish
+            // in the new one so filtering old events cannot leave the page waiting.
             self.report_output_rebuffering();
         }
     }
@@ -424,20 +423,28 @@ impl FfmpegControl {
         // Serialize generation publication with transition completion so the
         // callback-visible seek-silence bit can be raised before the new seek
         // becomes interruptible, without a completion racing to clear it.
-        let generation = {
+        let (generation, cleared_rebuffer) = {
             let _guard = self
                 .seek_transition_guard
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.update_audio_output_state(|state| {
+            let (previous, _) = self.update_audio_output_state(|state| {
                 (state & !(AUDIO_OUTPUT_LIFECYCLE_MASK | AUDIO_OUTPUT_PAUSED_BY_REBUFFER))
                     | AudioOutputLifecycle::Syncing as u32
                     | AUDIO_OUTPUT_PAUSED_BY_SEEK_TRANSITION
             });
             self.output_underrun_for_cache_pause
                 .store(false, Ordering::Release);
-            self.seek_generation.fetch_add(1, Ordering::AcqRel) + 1
+            (
+                self.seek_generation.fetch_add(1, Ordering::AcqRel) + 1,
+                previous & AUDIO_OUTPUT_PAUSED_BY_REBUFFER != 0,
+            )
         };
+        // Internal recovery keeps the session, so no later session change can
+        // report this cancellation to the UI. Preserve the independent seek pause.
+        if cleared_rebuffer {
+            self.report_output_rebuffering();
+        }
         // Publish the interrupt only after releasing the seek transition
         // guard, so a woken coordinator can immediately enter command service.
         self.wake();

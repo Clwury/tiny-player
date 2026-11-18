@@ -57,6 +57,47 @@ fn output_underflow_and_reset_report_once_without_entering_input_cache_pause() {
 }
 
 #[test]
+fn same_session_seek_clears_output_wait_once_and_preserves_seek_silence() {
+    let (tx, rx) = mpsc::channel();
+    let session = PlaybackSessionId(1);
+    let control = FfmpegControl::new(session).with_events(tx);
+    let mut output = PlaybackOutputScheduler::new();
+    output.set_state(PlaybackOutputState::Playing);
+    assert!(enter_underflow(&mut output, &control));
+    assert!(matches!(
+        rx.try_recv().unwrap().kind,
+        BackendEventKind::OutputRebufferingChanged(true)
+    ));
+
+    // Audio realignment and decoder recovery seek without changing sessions.
+    control.request_seek();
+    assert!(!control.is_output_rebuffer_paused());
+    assert!(control.is_seek_audio_paused());
+    let event = rx.try_recv().expect("internal seek must clear the UI wait");
+    assert_eq!(event.session_id, session);
+    assert!(matches!(
+        event.kind,
+        BackendEventKind::OutputRebufferingChanged(false)
+    ));
+
+    let generation = control.request_seek();
+    control.set_session_id(session);
+    output.reset_for_session(&control, session);
+    assert!(rx.try_recv().is_err(), "cleared waits must not be repeated");
+    control.finish_seek(generation);
+    assert!(control.compare_and_commit_audio_output_start(generation, || true));
+    output.set_state(PlaybackOutputState::Playing);
+    assert!(!output.rebuffering());
+    assert!(!control.is_output_rebuffer_paused());
+    assert!(!control.is_seek_audio_paused());
+    assert_eq!(
+        control.audio_output_control_snapshot().decision(),
+        crate::backend::ffmpeg::worker::AudioOutputDecision::Consume
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn seek_cancel_reports_cleared_output_wait_in_the_new_session() {
     let (tx, rx) = mpsc::channel();
     let control = FfmpegControl::new(PlaybackSessionId(1)).with_events(tx);
@@ -70,6 +111,12 @@ fn seek_cancel_reports_cleared_output_wait_in_the_new_session() {
 
     control.request_seek();
     assert!(!control.is_output_rebuffer_paused());
+    let event = rx.try_recv().unwrap();
+    assert_eq!(event.session_id, PlaybackSessionId(1));
+    assert!(matches!(
+        event.kind,
+        BackendEventKind::OutputRebufferingChanged(false)
+    ));
     control.set_session_id(PlaybackSessionId(2));
     let event = rx.try_recv().unwrap();
     assert_eq!(event.session_id, PlaybackSessionId(2));
