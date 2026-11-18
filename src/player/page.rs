@@ -126,6 +126,7 @@ pub struct PlaybackPage {
     report_effects: reporting::ReportingEffects,
     queue_effects: queue::QueueEffects,
     gamepad: gamepad::PlaybackGamepad,
+    subtitle_scale: f32,
 }
 
 impl EventEmitter<PlaybackEvent> for PlaybackPage {}

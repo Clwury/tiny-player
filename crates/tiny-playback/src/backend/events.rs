@@ -176,6 +176,8 @@ pub struct PlaybackCacheConfig {
     /// Decoder selection for newly opened playback inputs. Updating the cache
     /// configuration does not reopen an active decoder. `TINY_HWDEC` overrides it.
     pub hardware_decode: HardwareDecodeMode,
+    /// Overlay scale applied when drawing subtitle text and bitmaps.
+    pub subtitle_scale: f32,
 }
 
 impl Default for PlaybackCacheConfig {
@@ -208,6 +210,7 @@ impl Default for PlaybackCacheConfig {
             automatic_hysteresis: true,
             decoder_framedrop: false,
             hardware_decode: HardwareDecodeMode::default(),
+            subtitle_scale: 1.0,
         }
     }
 }
@@ -225,6 +228,11 @@ impl PlaybackCacheConfig {
     }
 
     pub fn normalized(mut self) -> Self {
+        self.subtitle_scale = if self.subtitle_scale.is_finite() {
+            self.subtitle_scale.clamp(0.5, 3.0)
+        } else {
+            1.0
+        };
         self.cache_secs = valid_non_negative_or(self.cache_secs, Self::default().cache_secs);
         self.demuxer_readahead_secs = valid_non_negative_or(
             self.demuxer_readahead_secs,

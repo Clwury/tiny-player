@@ -44,6 +44,7 @@ impl PlaybackPage {
         Self::register_image_cleanup(cx);
         let volume = volume_settings.normalized();
         let source_protocol = playback_protocol(&request.url);
+        let subtitle_scale = cache_config.subtitle_scale;
         let content_length = request.content_length;
         let (report_effects, queue_effects) = bind_ports(&request.emby, ports, cx);
 
@@ -100,6 +101,7 @@ impl PlaybackPage {
             report_effects,
             queue_effects,
             gamepad: Default::default(),
+            subtitle_scale,
         };
         if page.session.controls_view().error.is_some() {
             let _ = page.close_playback_reporting(true, false);

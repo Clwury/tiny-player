@@ -35,6 +35,22 @@ use crate::settings::{
 };
 use crate::ui::{editor::Editor, scrollbar::Scrollbar};
 
+const SUBTITLE_SCALE_OPTIONS: [(&str, &str, f32); 5] = [
+    ("subtitle-scale-08", "0.8×", 0.8),
+    ("subtitle-scale-10", "1.0×", 1.0),
+    ("subtitle-scale-12", "1.2×", 1.2),
+    ("subtitle-scale-15", "1.5×", 1.5),
+    ("subtitle-scale-20", "2.0×", 2.0),
+];
+
+fn nearest_subtitle_scale(value: f32) -> f32 {
+    SUBTITLE_SCALE_OPTIONS
+        .iter()
+        .map(|(_, _, scale)| *scale)
+        .min_by(|left, right| (*left - value).abs().total_cmp(&(*right - value).abs()))
+        .unwrap_or(1.0)
+}
+
 pub(crate) struct UserSettingsDialogState {
     controller: SettingsController,
     dropdown: Entity<DropdownState>,
@@ -128,6 +144,10 @@ impl UserSettingsDialogState {
     fn select_hardware_decode(&mut self, mode: HardwareDecodeMode, cx: &mut Context<Self>) {
         self.dispatch(SettingsIntent::HardwareDecode(mode), cx);
     }
+
+    fn select_subtitle_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
+        self.dispatch(SettingsIntent::SubtitleScale(scale), cx);
+    }
     fn toggle_disk_cache(&mut self, cx: &mut Context<Self>) {
         self.dispatch(SettingsIntent::Toggle(ToggleSetting::DiskCache), cx);
     }
@@ -160,6 +180,7 @@ impl UserSettingsDialogState {
         let budget_dialog = cx.entity();
         let disk_dialog = cx.entity();
         let decode_dialog = cx.entity();
+        let scale_dialog = cx.entity();
         let logging_dialog = cx.entity();
         let logging_enabled = self.controller.view_model().playback_debug_log;
         let content = div().flex().flex_col().min_w_0().pb_6().child(
@@ -235,6 +256,24 @@ impl UserSettingsDialogState {
                         "字幕语言",
                         "播放时优先选择此语言；Default 或无匹配时使用默认字幕，可在详情页手动选择。",
                         self.language_control(false, cx),
+                        cx,
+                    ))
+                    .child(setting_row(
+                        "user-setting-subtitle-scale",
+                        "字幕大小",
+                        "按比例缩放字幕的显示尺寸，同时作用于文字字幕与位图字幕。",
+                        selector_row(
+                            ("subtitle-scale-dropdown", "字幕大小"),
+                            self.dropdown.clone(),
+                            SUBTITLE_SCALE_OPTIONS.iter().copied(),
+                            nearest_subtitle_scale(
+                                self.controller.view_model().config.subtitle_scale,
+                            ),
+                            move |scale, cx| {
+                                scale_dialog
+                                    .update(cx, |dialog, cx| dialog.select_subtitle_scale(scale, cx))
+                            },
+                        ),
                         cx,
                     )),
             ).child(section("视频解码", cx).mt_5().child(setting_row(

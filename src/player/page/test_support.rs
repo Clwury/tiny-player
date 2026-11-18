@@ -110,6 +110,7 @@ impl PlaybackPage {
             queue_effects,
             emby,
             gamepad: gamepad::PlaybackGamepad::disabled(),
+            subtitle_scale: 1.0,
         }
     }
 }
