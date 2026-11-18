@@ -4,7 +4,6 @@ version = "0.1.8-rc.4"
 edition = "2024"
 description = "Native Emby desktop client with FFmpeg and Vulkan playback"
 license = "GPL-3.0-or-later"
-homepage = "https://github.com/Clwury/tiny-player"
 repository = "https://github.com/Clwury/tiny-player"
 
 [workspace]

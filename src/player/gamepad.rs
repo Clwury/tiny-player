@@ -38,7 +38,7 @@ impl InputGate {
     fn set_active(&self, active: bool) {
         let _ = self
             .epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
                 ((epoch & 1 != 0) != active)
                     .then_some((epoch.wrapping_add(2) & !1) | u64::from(active))
             });
