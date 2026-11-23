@@ -202,33 +202,41 @@ fn left_stick_click_resets_rate_without_modifying_volume_repeat() {
 }
 
 #[test]
-fn right_stick_click_modifies_subtitle_position_without_adjusting_volume() {
+fn right_stick_click_changes_the_direction_pad_to_single_press_subtitle_adjustments() {
     let mut controls = enabled_controls();
     let now = Instant::now();
     assert_eq!(
         controls.button_value(0, GamepadButton::RightThumb, 1.0, now),
         None
     );
-    assert_eq!(
-        controls.button_value(0, GamepadButton::Up, 1.0, now),
-        Some(PlaybackShortcut::RaiseSubtitle)
-    );
-    assert_eq!(
-        controls.button_value(0, GamepadButton::Down, 1.0, now),
-        Some(PlaybackShortcut::LowerSubtitle)
-    );
-    assert!(controls.repeats(now + Duration::from_secs(10)).is_empty());
-    controls.button_value(0, GamepadButton::RightThumb, 0.0, now);
-    assert!(controls.repeats(now + Duration::from_secs(20)).is_empty());
+    for (button, shortcut) in [
+        (GamepadButton::Up, PlaybackShortcut::RaiseSubtitle),
+        (GamepadButton::Down, PlaybackShortcut::LowerSubtitle),
+        (GamepadButton::Left, PlaybackShortcut::DecreaseSubtitleScale),
+        (
+            GamepadButton::Right,
+            PlaybackShortcut::IncreaseSubtitleScale,
+        ),
+    ] {
+        assert_eq!(controls.button_value(0, button, 1.0, now), Some(shortcut));
+    }
+    let later = now + REPEAT_DELAY;
+    assert!(controls.repeats(later).is_empty());
+    controls.button_value(0, GamepadButton::RightThumb, 0.0, later);
+    assert!(controls.repeats(later + REPEAT_DELAY).is_empty());
 }
 
 #[test]
-fn pressing_subtitle_modifier_cancels_existing_volume_repeat() {
+fn pressing_subtitle_modifier_cancels_existing_direction_pad_repeats() {
     let mut controls = enabled_controls();
     let now = Instant::now();
     controls.button_value(0, GamepadButton::Up, 1.0, now);
+    controls.button_value(0, GamepadButton::Right, 1.0, now);
+    controls.button_value(0, GamepadButton::LeftShoulder, 1.0, now);
     controls.button_value(0, GamepadButton::RightThumb, 1.0, now);
-    assert!(controls.repeats(now + REPEAT_DELAY).is_empty());
     controls.button_value(0, GamepadButton::RightThumb, 0.0, now);
-    assert!(controls.repeats(now + Duration::from_secs(10)).is_empty());
+    assert_eq!(
+        controls.repeats(now + REPEAT_DELAY),
+        vec![PlaybackShortcut::SeekRelative(-60)]
+    );
 }

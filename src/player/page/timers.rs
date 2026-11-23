@@ -74,11 +74,8 @@ impl PlaybackPage {
             PresentationTimer::Volume => {
                 std::mem::take(&mut self.presentation.volume_indicator_visible)
             }
-            PresentationTimer::Rate => {
-                std::mem::take(&mut self.presentation.rate_indicator_visible)
-            }
             PresentationTimer::DownloadSpeed => self.overlay_toolbar_visible(),
-            PresentationTimer::TrackSwitch => self.presentation.track_switch_label.take().is_some(),
+            PresentationTimer::Feedback => self.presentation.feedback.take().is_some(),
         };
         if changed {
             cx.notify();

@@ -1,8 +1,9 @@
 //! User-facing preferences. Advanced cache tuning stays in the development dialog.
 use super::controls::{
-    PLAYBACK_DEBUG_LOG_DESCRIPTION, PLAYBACK_DEBUG_LOG_LABEL, USER_HARDWARE_DECODE_DESCRIPTION,
-    app_language_selector, disk_cache_capacity_control, disk_cache_capacity_input,
-    hardware_decode_selector, playback_log_location, settings_category_button, settings_sidebar,
+    PLAYBACK_DEBUG_LOG_DESCRIPTION, PLAYBACK_DEBUG_LOG_LABEL, SUBTITLE_SCALE_DESCRIPTION,
+    SUBTITLE_SCALE_LABEL, USER_HARDWARE_DECODE_DESCRIPTION, app_language_selector,
+    disk_cache_capacity_control, disk_cache_capacity_input, hardware_decode_selector,
+    playback_log_location, settings_category_button, settings_sidebar, subtitle_scale_selector,
     track_language_selector,
 };
 use super::dialog::SettingsChanged;
@@ -34,22 +35,6 @@ use crate::settings::{
     SettingsMode, SettingsSnapshot, ToggleSetting, memory_budget::MemoryBudget,
 };
 use crate::ui::{editor::Editor, scrollbar::Scrollbar};
-
-const SUBTITLE_SCALE_OPTIONS: [(&str, &str, f32); 5] = [
-    ("subtitle-scale-08", "0.8×", 0.8),
-    ("subtitle-scale-10", "1.0×", 1.0),
-    ("subtitle-scale-12", "1.2×", 1.2),
-    ("subtitle-scale-15", "1.5×", 1.5),
-    ("subtitle-scale-20", "2.0×", 2.0),
-];
-
-fn nearest_subtitle_scale(value: f32) -> f32 {
-    SUBTITLE_SCALE_OPTIONS
-        .iter()
-        .map(|(_, _, scale)| *scale)
-        .min_by(|left, right| (*left - value).abs().total_cmp(&(*right - value).abs()))
-        .unwrap_or(1.0)
-}
 
 pub(crate) struct UserSettingsDialogState {
     controller: SettingsController,
@@ -145,9 +130,6 @@ impl UserSettingsDialogState {
         self.dispatch(SettingsIntent::HardwareDecode(mode), cx);
     }
 
-    fn select_subtitle_scale(&mut self, scale: f32, cx: &mut Context<Self>) {
-        self.dispatch(SettingsIntent::SubtitleScale(scale), cx);
-    }
     fn toggle_disk_cache(&mut self, cx: &mut Context<Self>) {
         self.dispatch(SettingsIntent::Toggle(ToggleSetting::DiskCache), cx);
     }
@@ -260,18 +242,15 @@ impl UserSettingsDialogState {
                     ))
                     .child(setting_row(
                         "user-setting-subtitle-scale",
-                        "字幕大小",
-                        "按比例缩放字幕的显示尺寸，同时作用于文字字幕与位图字幕。",
-                        selector_row(
-                            ("subtitle-scale-dropdown", "字幕大小"),
+                        SUBTITLE_SCALE_LABEL,
+                        SUBTITLE_SCALE_DESCRIPTION,
+                        subtitle_scale_selector(
                             self.dropdown.clone(),
-                            SUBTITLE_SCALE_OPTIONS.iter().copied(),
-                            nearest_subtitle_scale(
-                                self.controller.view_model().config.subtitle_scale,
-                            ),
+                            self.controller.view_model().config.subtitle_scale,
                             move |scale, cx| {
-                                scale_dialog
-                                    .update(cx, |dialog, cx| dialog.select_subtitle_scale(scale, cx))
+                                scale_dialog.update(cx, |dialog, cx| {
+                                    dialog.dispatch(SettingsIntent::SubtitleScale(scale), cx)
+                                })
                             },
                         ),
                         cx,

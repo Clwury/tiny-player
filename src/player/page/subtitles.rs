@@ -1,6 +1,7 @@
 use super::*;
 
 const SUBTITLE_VERTICAL_ADJUST_STEP_FRACTION: f32 = 0.01;
+pub(super) const SUBTITLE_SCALE_STEP: f32 = 0.1;
 
 impl PlaybackPage {
     pub(super) fn toggle_subtitle_visibility(&mut self, cx: &mut Context<Self>) {
@@ -22,6 +23,13 @@ impl PlaybackPage {
             subtitle_vertical_offset_after_adjustment(current_offset_fraction, delta),
         );
         cx.notify();
+    }
+
+    pub(super) fn adjust_subtitle_scale(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let current = normalized_subtitle_scale(self.subtitle_scale);
+        self.subtitle_scale = normalized_subtitle_scale(current + delta);
+        let label = crate::i18n::tr(format!("字幕大小：{:.2}×", self.subtitle_scale), cx);
+        self.show_playback_feedback(PlaybackFeedback::SubtitleScale(label), cx);
     }
 
     pub(super) fn render_subtitle_overlay(&self) -> impl IntoElement {
@@ -148,6 +156,7 @@ impl PlaybackPage {
                     .px_6()
                     .child(
                         div()
+                            .debug_selector(|| "playback-subtitle-text".to_string())
                             .max_w(relative(0.86))
                             .px_3()
                             .text_center()

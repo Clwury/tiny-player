@@ -4,6 +4,8 @@
 //! old scenes have completed their two frame callbacks.
 use super::*;
 
+const PLAYBACK_FEEDBACK_HIDE_DELAY: Duration = Duration::from_secs(2);
+
 pub(super) struct PlaybackPresentationState {
     pub(super) focus_handle: FocusHandle,
     pub(super) frame: PlaybackFrameState,
@@ -19,10 +21,9 @@ pub(super) struct PlaybackPresentationState {
     pub(super) episode_list: episodes::PlaybackEpisodeListState,
     pub(super) track_select_open: Option<PlaybackTrackKind>,
     pub(super) track_select_scroll_handle: gpui::ScrollHandle,
-    pub(super) track_switch_label: Option<SharedString>,
+    pub(super) feedback: Option<PlaybackFeedback>,
     pub(super) subtitle: SubtitleOverlayState,
     pub(super) volume_indicator_visible: bool,
-    pub(super) rate_indicator_visible: bool,
 }
 
 impl PlaybackPresentationState {
@@ -46,10 +47,9 @@ impl PlaybackPresentationState {
             episode_list,
             track_select_open: None,
             track_select_scroll_handle: Default::default(),
-            track_switch_label: None,
+            feedback: None,
             subtitle: Default::default(),
             volume_indicator_visible: false,
-            rate_indicator_visible: false,
         }
     }
 
@@ -60,6 +60,12 @@ impl PlaybackPresentationState {
         images.extend(self.frame.current.take());
         images
     }
+}
+
+pub(super) enum PlaybackFeedback {
+    TrackSwitch(SharedString),
+    SubtitleScale(SharedString),
+    Rate(SharedString),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +116,20 @@ pub(super) struct SubtitleOverlayState {
 }
 
 impl PlaybackPage {
+    pub(super) fn show_playback_feedback(
+        &mut self,
+        feedback: PlaybackFeedback,
+        cx: &mut Context<Self>,
+    ) {
+        self.presentation.feedback = Some(feedback);
+        self.schedule_presentation_timer(
+            PresentationTimer::Feedback,
+            PLAYBACK_FEEDBACK_HIDE_DELAY,
+            cx,
+        );
+        cx.notify();
+    }
+
     pub(super) fn replace_visible_frame(
         &mut self,
         frame: Arc<RenderImage>,

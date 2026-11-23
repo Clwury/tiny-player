@@ -4,6 +4,7 @@ use std::{
     cell::{Cell, RefCell},
     rc::Rc,
 };
+use tiny_playback::{BgraImage, SharedBgraImage};
 
 fn dispatch(
     page: &gpui::Entity<PlaybackPage>,
@@ -50,6 +51,78 @@ fn keyboard_and_gamepad_share_backend_commands_and_presentation(cx: &mut gpui::T
             < f32::EPSILON
     );
     assert!(page.read_with(cx, |page, _| page.presentation.volume_indicator_visible));
+}
+
+#[gpui::test]
+fn keyboard_and_gamepad_resize_visible_subtitles_within_the_supported_range(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (page, cx) = test_support::playback_window(cx);
+    let backend = Rc::new(RefCell::new(FakeState::default()));
+    page.update(cx, |page, cx| {
+        page.video = adapter(backend.clone(), false);
+        page.subtitle_scale = 1.2;
+        page.presentation.frame.source_size = Some(RenderSize {
+            width: 1920,
+            height: 1080,
+        });
+        page.presentation.frame.viewport_bounds = Some(Bounds::new(
+            gpui::point(px(0.0), px(0.0)),
+            gpui::size(px(1100.0), px(800.0)),
+        ));
+        let cue = BackendSubtitleCue {
+            text: "Subtitle".into(),
+            bitmaps: vec![BackendSubtitleBitmap {
+                image: SharedBgraImage::new(BgraImage::new(vec![1, 2, 3, 128], 1, 1).unwrap()),
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                canvas_width: 1920,
+                canvas_height: 1080,
+            }],
+            start_nsecs: 0,
+            end_nsecs: 1_000_000_000,
+        };
+        page.presentation.subtitle.images.update(Some(&cue));
+        page.presentation.subtitle.active = Some(cue);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let dimensions = |cx: &mut gpui::VisualTestContext| {
+        let text = cx.debug_bounds("playback-subtitle-text").unwrap();
+        let bitmap = cx.debug_bounds("playback-subtitle-bitmap-overlay").unwrap();
+        (text.size.height, bitmap.size.width)
+    };
+    let (initial_text_height, initial_bitmap_width) = dimensions(cx);
+
+    cx.simulate_keystrokes("shift-g");
+    cx.run_until_parked();
+    let (larger_text_height, larger_bitmap_width) = dimensions(cx);
+    assert!(larger_text_height > initial_text_height);
+    assert!(larger_bitmap_width > initial_bitmap_width);
+    assert!((page.read_with(cx, |page, _| page.subtitle_scale) - 1.3).abs() <= f32::EPSILON);
+
+    dispatch(&page, cx, PlaybackShortcut::DecreaseSubtitleScale);
+    let (smaller_text_height, smaller_bitmap_width) = dimensions(cx);
+    assert!(smaller_text_height < larger_text_height);
+    assert!(smaller_bitmap_width < larger_bitmap_width);
+    assert!((page.read_with(cx, |page, _| page.subtitle_scale) - 1.2).abs() <= f32::EPSILON);
+    page.read_with(cx, |page, _| {
+        assert!(matches!(
+            &page.presentation.feedback,
+            Some(PlaybackFeedback::SubtitleScale(label)) if label.as_ref() == "字幕大小：1.20×"
+        ));
+    });
+
+    page.update(cx, |page, _| page.subtitle_scale = 2.95);
+    dispatch(&page, cx, PlaybackShortcut::IncreaseSubtitleScale);
+    assert_eq!(page.read_with(cx, |page, _| page.subtitle_scale), 3.0);
+    page.update(cx, |page, _| page.subtitle_scale = 0.55);
+    cx.simulate_keystrokes("shift-f");
+    assert_eq!(page.read_with(cx, |page, _| page.subtitle_scale), 0.5);
+    assert!(!cx.update(|window, _| window.is_fullscreen()));
+    assert!(backend.borrow().commands.is_empty());
 }
 
 #[gpui::test]

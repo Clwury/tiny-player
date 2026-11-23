@@ -21,6 +21,8 @@ pub(in crate::player) enum PlaybackShortcut {
     NextEpisode,
     RaiseSubtitle,
     LowerSubtitle,
+    DecreaseSubtitleScale,
+    IncreaseSubtitleScale,
     DecreaseVolume,
     IncreaseVolume,
     ToggleMute,

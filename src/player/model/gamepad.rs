@@ -86,6 +86,18 @@ impl GamepadControls {
         if *active_device != device_id {
             return None;
         }
+        if button == GamepadButton::RightThumb {
+            // Cancel held directions even if R3 is released before the next repeat tick.
+            device.repeats.retain(|button, _| {
+                !matches!(
+                    button,
+                    GamepadButton::Left
+                        | GamepadButton::Right
+                        | GamepadButton::Up
+                        | GamepadButton::Down
+                )
+            });
+        }
         let shortcut =
             shortcut_for_button(button, device.pressed.contains(&GamepadButton::RightThumb));
         if shortcut.is_some_and(|shortcut| shortcut.gamepad_repeat_interval().is_some()) {
@@ -135,6 +147,8 @@ fn shortcut_for_button(button: GamepadButton, subtitle_modifier: bool) -> Option
         East => PlaybackShortcut::Back,
         West => PlaybackShortcut::ToggleMute,
         North => PlaybackShortcut::ToggleInfoOverlay,
+        Left if subtitle_modifier => PlaybackShortcut::DecreaseSubtitleScale,
+        Right if subtitle_modifier => PlaybackShortcut::IncreaseSubtitleScale,
         Left => PlaybackShortcut::SeekRelative(-SEEK_STEP_SECONDS),
         Right => PlaybackShortcut::SeekRelative(SEEK_STEP_SECONDS),
         Up if subtitle_modifier => PlaybackShortcut::RaiseSubtitle,

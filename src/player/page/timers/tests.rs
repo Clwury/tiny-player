@@ -1,10 +1,12 @@
 use super::*;
 use crate::player::backend::test_support::{FakeState, adapter};
+use crate::player::model::shortcuts::PlaybackShortcut;
 use std::{
     cell::RefCell,
     rc::Rc,
     sync::atomic::{AtomicBool, Ordering},
 };
+use tiny_playback::PlaybackRateChange;
 
 fn advance(cx: &mut gpui::VisualTestContext, milliseconds: u64) {
     cx.executor()
@@ -20,26 +22,86 @@ fn volume_and_rate_hide_independently_and_repeated_volume_restarts_its_delay(
     page.update(cx, |page, cx| {
         page.video = adapter(Rc::new(RefCell::new(FakeState::default())), false);
         page.show_volume_indicator(cx);
-        page.change_playback_rate(tiny_playback::PlaybackRateChange::Double, cx);
+        page.change_playback_rate(PlaybackRateChange::Double, cx);
     });
     cx.run_until_parked();
     advance(cx, 600);
     page.update(cx, |page, cx| page.show_volume_indicator(cx));
     cx.run_until_parked();
-    advance(cx, 600);
+    advance(cx, 1199);
     page.read_with(cx, |page, _| {
         assert!(page.presentation.volume_indicator_visible);
-        assert!(!page.presentation.rate_indicator_visible);
+        assert!(matches!(
+            page.presentation.feedback,
+            Some(PlaybackFeedback::Rate(_))
+        ));
         assert_eq!(page.session.controls_view().rate, 2.0);
-    });
-    advance(cx, 599);
-    page.read_with(cx, |page, _| {
-        assert!(page.presentation.volume_indicator_visible)
     });
     advance(cx, 1);
     page.read_with(cx, |page, _| {
-        assert!(!page.presentation.volume_indicator_visible)
+        assert!(!page.presentation.volume_indicator_visible);
+        assert!(matches!(
+            page.presentation.feedback,
+            Some(PlaybackFeedback::Rate(_))
+        ));
     });
+    advance(cx, 200);
+    page.read_with(cx, |page, _| {
+        assert!(page.presentation.feedback.is_none());
+    });
+}
+
+#[gpui::test]
+fn keyboard_and_gamepad_rate_changes_show_the_latest_value_until_the_deadline(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (page, cx) = test_support::playback_window(cx);
+    page.update(cx, |page, _| {
+        page.video = adapter(Rc::new(RefCell::new(FakeState::default())), false);
+    });
+    cx.simulate_keystrokes("f shift-g");
+    let scale_indicator = "playback-subtitle-scale-indicator";
+    let rate_indicator = "playback-rate-indicator";
+    let scale_bounds = cx.debug_bounds(scale_indicator).unwrap();
+    assert!(cx.debug_bounds(rate_indicator).is_none());
+
+    advance(cx, 1000);
+    cx.simulate_keystrokes("]");
+    assert!(cx.update(|window, _| window.is_fullscreen()));
+    assert!(cx.debug_bounds(scale_indicator).is_none());
+    let rate_bounds = cx.debug_bounds(rate_indicator).unwrap();
+    assert_eq!(rate_bounds.origin, scale_bounds.origin);
+    page.read_with(cx, |page, _| {
+        assert!(matches!(
+            &page.presentation.feedback,
+            Some(PlaybackFeedback::Rate(label)) if label.as_ref() == "播放速度：1.10×"
+        ));
+    });
+
+    advance(cx, 1000);
+    assert!(cx.debug_bounds(rate_indicator).is_some());
+    cx.update(|window, cx| {
+        crate::settings::AppLanguage::English.apply(cx);
+        page.update(cx, |page, cx| {
+            page.handle_gamepad_shortcut(
+                PlaybackShortcut::ChangeRate(PlaybackRateChange::Reset),
+                window,
+                cx,
+            )
+        });
+    });
+    cx.run_until_parked();
+    page.read_with(cx, |page, _| {
+        assert!(matches!(
+            &page.presentation.feedback,
+            Some(PlaybackFeedback::Rate(label)) if label.as_ref() == "Playback speed: 1.00×"
+        ));
+    });
+    advance(cx, 1999);
+    assert!(cx.debug_bounds(rate_indicator).is_some());
+    advance(cx, 1);
+    assert!(cx.debug_bounds(rate_indicator).is_none());
+    assert!(cx.debug_bounds(scale_indicator).is_none());
 }
 
 #[gpui::test]
@@ -132,9 +194,8 @@ fn stale_callbacks_keep_current_task_and_back_release_cancel_all_tasks(
         assert!(page.presentation.volume_indicator_visible);
         for kind in [
             PresentationTimer::Controls,
-            PresentationTimer::Rate,
             PresentationTimer::DownloadSpeed,
-            PresentationTimer::TrackSwitch,
+            PresentationTimer::Feedback,
         ] {
             page.presentation
                 .presentation_timers

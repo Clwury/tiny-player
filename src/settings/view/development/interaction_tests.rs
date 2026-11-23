@@ -403,6 +403,46 @@ fn theme_can_be_found_by_search_and_saved_without_changing_playback_settings(
 }
 
 #[gpui::test]
+fn subtitle_size_uses_the_saved_preset_and_autosaves_edits_from_search(cx: &mut TestAppContext) {
+    let mut config = PlaybackCacheConfig {
+        subtitle_scale: 1.2,
+        cache_secs: 42.56789,
+        ..PlaybackCacheConfig::default()
+    };
+    let (root, cx) = settings_window_with_config(cx, config.clone());
+    cx.simulate_resize(size(px(900.0), px(600.0)));
+    cx.run_until_parked();
+    click(cx, "settings-category-播放");
+    click(cx, "subtitle-scale-dropdown");
+    for selector in [
+        "subtitle-scale-08",
+        "subtitle-scale-10",
+        "subtitle-scale-12",
+        "subtitle-scale-15",
+        "subtitle-scale-20",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector}");
+    }
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("subtitle-scale-dropdown-menu").is_none());
+    assert_eq!(root.read_with(cx, |root, _| root.change_count), 0);
+
+    click(cx, "settings-category-常规");
+    let search = root.read_with(cx, |root, cx| root.dialog.read(cx).search.clone());
+    search.update(cx, |search, cx| search.set_value("subtitle size", cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("字幕大小").is_some());
+    click(cx, "subtitle-scale-dropdown");
+    click(cx, "subtitle-scale-20");
+    config.subtitle_scale = 2.0;
+    root.read_with(cx, |root, _| {
+        assert_eq!(root.saved.as_ref(), Some(&config));
+        assert_eq!(root.change_count, 1);
+    });
+}
+
+#[gpui::test]
 fn hardware_decode_can_be_found_by_search_and_saved_without_changing_cache_settings(
     cx: &mut TestAppContext,
 ) {

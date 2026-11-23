@@ -1,7 +1,5 @@
 use super::*;
 
-const TRACK_SWITCH_INDICATOR_HIDE_DELAY: Duration = Duration::from_secs(2);
-
 #[cfg(test)]
 mod indicator_tests;
 #[cfg(test)]
@@ -116,14 +114,8 @@ impl PlaybackPage {
                 }
             }
         };
-        self.presentation.track_switch_label =
-            Some(crate::i18n::tr(format!("{prefix}：{name}"), cx));
-        self.schedule_presentation_timer(
-            PresentationTimer::TrackSwitch,
-            TRACK_SWITCH_INDICATOR_HIDE_DELAY,
-            cx,
-        );
-        cx.notify();
+        let label = crate::i18n::tr(format!("{prefix}：{name}"), cx);
+        self.show_playback_feedback(PlaybackFeedback::TrackSwitch(label), cx);
     }
 
     pub(in crate::player::page) fn remember_track_choice(

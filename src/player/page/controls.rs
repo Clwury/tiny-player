@@ -29,7 +29,9 @@ pub(super) use download_speed::DownloadSpeedDisplay;
 mod components;
 mod overlays;
 mod progress;
-pub(super) use components::{playback_control_button, track_switch_indicator, volume_indicator};
+pub(super) use components::{
+    playback_control_button, playback_feedback_indicator, volume_indicator,
+};
 mod render;
 mod stats;
 use stats::*;
@@ -62,16 +64,12 @@ impl PlaybackPage {
         if update.report_progress {
             self.report_playback_progress(true);
         }
-        if update.show_rate {
-            self.presentation.rate_indicator_visible = true;
-            self.schedule_presentation_timer(
-                PresentationTimer::Rate,
-                Duration::from_millis(1200),
-                cx,
-            );
-        }
         if update.show_volume {
             self.show_volume_indicator(cx);
+        } else if update.show_rate {
+            let rate = self.session.controls_view().rate;
+            let label = crate::i18n::tr(format!("播放速度：{rate:.2}×"), cx);
+            self.show_playback_feedback(PlaybackFeedback::Rate(label), cx);
         } else if update.notify {
             cx.notify();
         }

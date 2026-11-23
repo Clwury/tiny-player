@@ -1,8 +1,11 @@
 //! Development settings playback rows in their original display order.
 use super::*;
+use crate::settings::view::controls::{
+    SUBTITLE_SCALE_DESCRIPTION, SUBTITLE_SCALE_LABEL, subtitle_scale_selector,
+};
 
 impl PlaybackSettingsDialogState {
-    pub(super) fn playback_items(&self, dialog: Entity<Self>, cx: &App) -> [SettingItem; 5] {
+    pub(super) fn playback_items(&self, dialog: Entity<Self>, cx: &App) -> [SettingItem; 6] {
         use SettingsCategory::*;
         [
             SettingItem::new(
@@ -59,6 +62,25 @@ impl PlaybackSettingsDialogState {
                         move |language, cx| {
                             dialog.update(cx, |dialog, cx| {
                                 dialog.select_track_language(language, false, cx)
+                            })
+                        }
+                    },
+                ),
+            ),
+            SettingItem::new(
+                Playback,
+                "首选语言",
+                SUBTITLE_SCALE_LABEL,
+                SUBTITLE_SCALE_DESCRIPTION,
+                "subtitle_scale subtitle size",
+                subtitle_scale_selector(
+                    self.dropdown.clone(),
+                    self.controller.view_model().config.subtitle_scale,
+                    {
+                        let dialog = dialog.clone();
+                        move |scale, cx| {
+                            dialog.update(cx, |dialog, cx| {
+                                dialog.dispatch(SettingsIntent::SubtitleScale(scale), cx)
                             })
                         }
                     },

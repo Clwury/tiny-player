@@ -151,14 +151,15 @@ pub(super) fn track_select_menu(
         .child(content)
 }
 
-pub(in crate::player::page) fn track_switch_indicator(
+pub(in crate::player::page) fn playback_feedback_indicator(
+    id: &'static str,
     label: SharedString,
     cx: &App,
 ) -> impl IntoElement {
     let theme = theme::get(cx);
     div()
-        .id("playback-track-switch-indicator")
-        .debug_selector(|| "playback-track-switch-indicator".to_string())
+        .id(id)
+        .debug_selector(move || id.to_string())
         .absolute()
         .left(px(PLAYBACK_BACK_BUTTON_OFFSET_PX
             + PLAYBACK_BACK_BUTTON_SIZE_PX

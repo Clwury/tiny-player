@@ -29,11 +29,9 @@ fn install_tracks(
 }
 
 fn label(page: &Entity<PlaybackPage>, cx: &VisualTestContext) -> Option<String> {
-    page.read_with(cx, |page, _| {
-        page.presentation
-            .track_switch_label
-            .as_ref()
-            .map(ToString::to_string)
+    page.read_with(cx, |page, _| match &page.presentation.feedback {
+        Some(PlaybackFeedback::TrackSwitch(label)) => Some(label.to_string()),
+        _ => None,
     })
 }
 
@@ -83,9 +81,7 @@ fn shortcuts_and_menus_show_track_names_and_off_beside_back(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-fn latest_track_change_restarts_its_timer_without_extending_volume_or_rate(
-    cx: &mut TestAppContext,
-) {
+fn latest_track_change_restarts_its_timer_without_extending_volume(cx: &mut TestAppContext) {
     let (page, cx) = test_support::playback_window(cx);
     install_tracks(&page, cx);
     page.update(cx, |page, cx| {
@@ -94,6 +90,7 @@ fn latest_track_change_restarts_its_timer_without_extending_volume_or_rate(
         page.change_playback_rate(tiny_playback::PlaybackRateChange::Double, cx);
     });
     cx.simulate_keystrokes("#");
+    assert!(cx.debug_bounds("playback-rate-indicator").is_none());
     advance(cx, 1000);
     cx.simulate_keystrokes("j");
     advance(cx, 1000);
@@ -105,13 +102,54 @@ fn latest_track_change_restarts_its_timer_without_extending_volume_or_rate(
     page.read_with(cx, |page, _| {
         assert!(!page.presentation.fullscreen.controls_visible);
         assert!(!page.presentation.volume_indicator_visible);
-        assert!(!page.presentation.rate_indicator_visible);
     });
     advance(cx, 999);
     assert!(label(&page, cx).is_some());
     advance(cx, 1);
     assert!(label(&page, cx).is_none());
     assert!(cx.debug_bounds("playback-track-switch-indicator").is_none());
+}
+
+#[gpui::test]
+fn subtitle_scale_replaces_track_feedback_and_refreshes_at_the_limit(cx: &mut TestAppContext) {
+    let (page, cx) = test_support::playback_window(cx);
+    install_tracks(&page, cx);
+    let scale_indicator = "playback-subtitle-scale-indicator";
+    assert!(cx.debug_bounds(scale_indicator).is_none());
+
+    cx.simulate_keystrokes("j");
+    let track_indicator = "playback-track-switch-indicator";
+    let track_bounds = cx.debug_bounds(track_indicator).unwrap();
+    advance(cx, 1000);
+    cx.simulate_keystrokes("f shift-g");
+    assert!(cx.update(|window, _| window.is_fullscreen()));
+    assert!(cx.debug_bounds(track_indicator).is_none());
+    let scale_bounds = cx.debug_bounds(scale_indicator).unwrap();
+    assert_eq!(scale_bounds.origin, track_bounds.origin);
+    assert_eq!(scale_bounds.size.height, track_bounds.size.height);
+    page.read_with(cx, |page, _| {
+        assert!(matches!(
+            &page.presentation.feedback,
+            Some(PlaybackFeedback::SubtitleScale(label)) if label.as_ref() == "字幕大小：1.10×"
+        ));
+    });
+
+    advance(cx, 1000);
+    assert!(cx.debug_bounds(scale_indicator).is_some());
+    cx.update(|_, cx| crate::settings::AppLanguage::English.apply(cx));
+    page.update(cx, |page, _| page.subtitle_scale = 3.0);
+    cx.simulate_keystrokes("shift-g");
+    page.read_with(cx, |page, _| {
+        assert!(matches!(
+            &page.presentation.feedback,
+            Some(PlaybackFeedback::SubtitleScale(label)) if label.as_ref() == "Subtitle size: 3.00×"
+        ));
+    });
+    advance(cx, 1999);
+    assert!(cx.debug_bounds(scale_indicator).is_some());
+    advance(cx, 1);
+    assert!(cx.debug_bounds(scale_indicator).is_none());
+    assert!(cx.debug_bounds(track_indicator).is_none());
 }
 
 #[gpui::test]

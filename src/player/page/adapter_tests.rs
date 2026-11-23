@@ -52,6 +52,7 @@ fn command_failures_preserve_pause_seek_volume_and_rate(cx: &mut gpui::TestAppCo
             );
             page.change_playback_rate(PlaybackRateChange::Double, cx);
             assert_eq!(page.session.controls_view().rate, 1.0);
+            assert!(page.presentation.feedback.is_none());
             assert!(
                 page.session
                     .controls_view()

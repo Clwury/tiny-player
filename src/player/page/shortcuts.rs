@@ -1,4 +1,4 @@
-use super::subtitles::subtitle_vertical_adjust_step;
+use super::subtitles::{SUBTITLE_SCALE_STEP, subtitle_vertical_adjust_step};
 use super::*;
 use crate::player::model::shortcuts::{
     LONG_SEEK_STEP_SECONDS, PlaybackShortcut, SEEK_STEP_SECONDS,
@@ -100,6 +100,12 @@ impl PlaybackPage {
             PlaybackShortcut::LowerSubtitle => {
                 self.adjust_subtitle_vertical_offset_fraction(-subtitle_vertical_adjust_step(), cx);
             }
+            PlaybackShortcut::DecreaseSubtitleScale => {
+                self.adjust_subtitle_scale(-SUBTITLE_SCALE_STEP, cx);
+            }
+            PlaybackShortcut::IncreaseSubtitleScale => {
+                self.adjust_subtitle_scale(SUBTITLE_SCALE_STEP, cx);
+            }
             PlaybackShortcut::DecreaseVolume => {
                 self.adjust_playback_volume(-PLAYBACK_VOLUME_STEP, cx);
             }
@@ -128,6 +134,8 @@ fn playback_shortcut_for_event(event: &KeyDownEvent) -> Option<PlaybackShortcut>
             .or(match keystroke.key.as_str() {
                 "[" => Some("{"),
                 "]" => Some("}"),
+                "f" | "F" => Some("F"),
+                "g" | "G" => Some("G"),
                 "j" | "J" => Some("J"),
                 "3" => Some("#"),
                 "," => Some("<"),
@@ -139,20 +147,23 @@ fn playback_shortcut_for_event(event: &KeyDownEvent) -> Option<PlaybackShortcut>
         &keystroke.key
     };
     let shortcut = playback_shortcut_for_key(key)?;
-    let adjusts_volume = matches!(
+    let adjusts_volume_or_subtitle_scale = matches!(
         shortcut,
-        PlaybackShortcut::DecreaseVolume | PlaybackShortcut::IncreaseVolume
+        PlaybackShortcut::DecreaseVolume
+            | PlaybackShortcut::IncreaseVolume
+            | PlaybackShortcut::DecreaseSubtitleScale
+            | PlaybackShortcut::IncreaseSubtitleScale
     );
     let adjusts_rate = matches!(shortcut, PlaybackShortcut::ChangeRate(_));
     if modifiers.shift
-        && !adjusts_volume
+        && !adjusts_volume_or_subtitle_scale
         && !(adjusts_rate && matches!(key, "[" | "]" | "{" | "}"))
         && !matches!(key, "J" | "#" | "<" | ">")
     {
         return None;
     }
     if event.is_held
-        && !adjusts_volume
+        && !adjusts_volume_or_subtitle_scale
         && !matches!(
             shortcut,
             PlaybackShortcut::SeekRelative(_)
@@ -176,8 +187,12 @@ pub(super) fn playback_shortcut_for_key(key: &str) -> Option<PlaybackShortcut> {
 
     if key.eq_ignore_ascii_case("p") {
         Some(PlaybackShortcut::TogglePlayback)
-    } else if key.eq_ignore_ascii_case("f") {
+    } else if key == "f" {
         Some(PlaybackShortcut::ToggleFullscreen)
+    } else if key == "F" {
+        Some(PlaybackShortcut::DecreaseSubtitleScale)
+    } else if key == "G" {
+        Some(PlaybackShortcut::IncreaseSubtitleScale)
     } else if key.eq_ignore_ascii_case("escape") {
         Some(PlaybackShortcut::Escape)
     } else if key.eq_ignore_ascii_case("left") {
@@ -385,6 +400,30 @@ mod tests {
     }
 
     #[test]
+    fn mpv_subtitle_size_shortcuts_use_shifted_letters_and_repeat() {
+        for (keys, shortcut) in [
+            (
+                ["F", "shift-f", "shift-f->F", "shift-F->F"],
+                PlaybackShortcut::DecreaseSubtitleScale,
+            ),
+            (
+                ["G", "shift-g", "shift-g->G", "shift-G->G"],
+                PlaybackShortcut::IncreaseSubtitleScale,
+            ),
+        ] {
+            for key in keys {
+                assert_eq!(shortcut_for_keystroke(key, false), Some(shortcut), "{key}");
+                assert_eq!(shortcut_for_keystroke(key, true), Some(shortcut), "{key}");
+            }
+        }
+        assert_eq!(
+            shortcut_for_keystroke("f", false),
+            Some(PlaybackShortcut::ToggleFullscreen)
+        );
+        assert_eq!(shortcut_for_keystroke("g", false), None);
+    }
+
+    #[test]
     fn playback_shortcuts_ignore_control_alt_platform_and_function_modifiers() {
         for modifier in ["ctrl", "alt", "super", "fn"] {
             for key in [
@@ -400,6 +439,8 @@ mod tests {
                 "down",
                 "j",
                 "shift-j->J",
+                "shift-f->F",
+                "shift-g->G",
                 "v",
                 "#",
                 "shift-3->#",

@@ -364,6 +364,8 @@ mod tests {
         click(cx, "language-japanese");
         click(cx, "subtitle-language-dropdown");
         click(cx, "language-chinese-simplified");
+        click(cx, "subtitle-scale-dropdown");
+        click(cx, "subtitle-scale-15");
         click(cx, "hardware-decode-dropdown");
         click(cx, "hardware-decode-off");
         click(cx, "settings-category-内存缓存");
@@ -394,6 +396,7 @@ mod tests {
             cache_secs: 42.5,
             decoder_framedrop: true,
             hardware_decode: HardwareDecodeMode::Off,
+            subtitle_scale: 1.5,
             ..PlaybackCacheConfig::default()
         };
         let saved = storage::load_or_init_from(&path).unwrap();

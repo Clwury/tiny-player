@@ -251,6 +251,8 @@ fn shortcut_help_translations_wrap_and_scroll_without_adjusting_volume(cx: &mut 
                 "playback-shortcut-key-P",
                 "playback-shortcut-key-F8",
                 "playback-shortcut-key-Shift-J",
+                "playback-shortcut-key-Shift-F",
+                "playback-shortcut-key-Shift-G",
                 "playback-shortcut-key-Backspace",
             ] {
                 if let Some(tag) = cx.debug_bounds(selector) {
@@ -278,11 +280,13 @@ fn shortcut_help_translations_wrap_and_scroll_without_adjusting_volume(cx: &mut 
                 page.read_with(cx, |page, _| page.session.controls_view().volume.level),
                 volume
             );
-            let last = cx.debug_bounds("playback-gamepad-key-R3-↓").unwrap();
+            let last = cx.debug_bounds("playback-gamepad-key-R3-→").unwrap();
             assert!(overlay.contains(&last.center()));
             for selector in [
                 "playback-gamepad-key-L3",
                 "playback-gamepad-key-R3-↑",
+                "playback-gamepad-key-R3-↓",
+                "playback-gamepad-key-R3-←",
                 "playback-gamepad-key-X",
             ] {
                 let tag = cx.debug_bounds(selector).unwrap();

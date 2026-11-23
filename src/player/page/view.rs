@@ -100,11 +100,6 @@ impl Render for PlaybackPage {
                     cx,
                 ))
             })
-            .when(
-                self.presentation.rate_indicator_visible
-                    && self.presentation.track_switch_label.is_none(),
-                |this| this.child(self.render_playback_rate_indicator(cx)),
-            )
             .child(self.render_queue_switch_error(cx))
             .when(self.presentation.episode_list.open, |this| {
                 this.child(self.render_episode_list_backdrop(cx))
@@ -139,13 +134,20 @@ impl Render for PlaybackPage {
                     .with_priority(3),
                 )
             })
-            .when_some(
-                self.presentation.track_switch_label.clone(),
-                |this, label| {
-                    this.child(
-                        deferred(controls::track_switch_indicator(label, cx)).with_priority(4),
-                    )
-                },
-            )
+            .when_some(self.presentation.feedback.as_ref(), |this, feedback| {
+                let (id, label) = match feedback {
+                    PlaybackFeedback::TrackSwitch(label) => {
+                        ("playback-track-switch-indicator", label)
+                    }
+                    PlaybackFeedback::SubtitleScale(label) => {
+                        ("playback-subtitle-scale-indicator", label)
+                    }
+                    PlaybackFeedback::Rate(label) => ("playback-rate-indicator", label),
+                };
+                this.child(
+                    deferred(controls::playback_feedback_indicator(id, label.clone(), cx))
+                        .with_priority(4),
+                )
+            })
     }
 }

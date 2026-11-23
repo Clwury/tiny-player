@@ -26,6 +26,17 @@ pub(crate) const DEVELOPMENT_HARDWARE_DECODE_DESCRIPTION: &str =
 pub(crate) const PLAYBACK_DEBUG_LOG_LABEL: &str = "播放调试日志";
 pub(crate) const PLAYBACK_DEBUG_LOG_DESCRIPTION: &str =
     "记录播放 DEBUG 及以上级别的原始消息、状态和错误详情。立即生效。";
+pub(crate) const SUBTITLE_SCALE_LABEL: &str = "字幕大小";
+pub(crate) const SUBTITLE_SCALE_DESCRIPTION: &str =
+    "按比例缩放字幕的显示尺寸，同时作用于文字字幕与位图字幕。";
+
+const SUBTITLE_SCALE_OPTIONS: [(&str, &str, f32); 5] = [
+    ("subtitle-scale-08", "0.8×", 0.8),
+    ("subtitle-scale-10", "1.0×", 1.0),
+    ("subtitle-scale-12", "1.2×", 1.2),
+    ("subtitle-scale-15", "1.5×", 1.5),
+    ("subtitle-scale-20", "2.0×", 2.0),
+];
 
 #[cfg(test)]
 mod tests;
@@ -106,6 +117,25 @@ pub(crate) fn app_language_selector(
         on_select,
     )
     .localize_options(false)
+}
+
+pub(crate) fn subtitle_scale_selector(
+    state: Entity<DropdownState>,
+    scale: f32,
+    on_select: impl Fn(f32, &mut App) + 'static,
+) -> impl IntoElement {
+    let selected = SUBTITLE_SCALE_OPTIONS
+        .iter()
+        .map(|(_, _, preset)| *preset)
+        .min_by(|left, right| (*left - scale).abs().total_cmp(&(*right - scale).abs()))
+        .unwrap_or(1.0);
+    selector_row(
+        ("subtitle-scale-dropdown", SUBTITLE_SCALE_LABEL),
+        state,
+        SUBTITLE_SCALE_OPTIONS,
+        selected,
+        on_select,
+    )
 }
 
 pub(crate) fn hardware_decode_selector(

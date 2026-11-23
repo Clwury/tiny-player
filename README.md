@@ -11,8 +11,8 @@ Tiny Player is a native Emby desktop client for Linux and Windows, built with Ru
 - **Media details**: View title logos, overviews, ratings, runtime, release dates, resolution, and dynamic range information.
 - **Playback and track selection**: Choose video versions, audio tracks, and subtitles, set language preferences, and sync playback progress.
 - **Video processing**: Software decoding, Vulkan hardware decoding, VA-API copyback or direct Vulkan mapping on Linux, and HDR tone mapping. Hardware decoding support depends on the GPU, driver, and video codec.
-- **Playback controls**: Fullscreen, playback speed adjustment, subtitle positioning, a playback information overlay, and configurable memory and disk caches.
-- **Gamepad playback shortcuts**: Standard gamepad buttons control playback, seeking, volume, speed, subtitle position, and returning to media details.
+- **Playback controls**: Fullscreen, playback speed adjustment, subtitle size and position, a playback information overlay, and configurable memory and disk caches.
+- **Gamepad playback shortcuts**: Standard gamepad buttons control playback, seeking, volume, speed, subtitle size and position, and returning to media details.
 - **Keep awake during video playback**: Request inhibition of automatic screen locking, display power saving, and sleep; release the request when paused, buffering pauses playback, playback ends, or the player closes.
 
 ## Screenshots
@@ -193,7 +193,7 @@ The wheel adjusts volume over the top-right icons and overlays whose content fit
 | Key | Action |
 | --- | --- |
 | `Space` / `P` | Play / pause |
-| `F` | Toggle fullscreen |
+| `f` | Toggle fullscreen |
 | `Esc` | Close the episode list if open; otherwise exit fullscreen, or return to media details when windowed |
 | `←` / `→` | Seek backward / forward 5 seconds |
 | `↓` / `↑` | Seek backward / forward 60 seconds |
@@ -211,9 +211,14 @@ The wheel adjusts volume over the top-right icons and overlays whose content fit
 | `{` / `}` | Halve / double playback speed (usually `Shift` + `[` / `]`) |
 | `Backspace` | Reset playback speed to 1× |
 | `R` / `T` | Move subtitles up / down by 1% of the displayed video height |
+| `Shift` + `F` / `Shift` + `G` | Decrease / increase subtitle scale by 0.1× |
 | `I` | Show / hide playback information |
 
-Playback speed ranges from **0.25× to 4×**. Volume shortcuts also support the numeric keypad's divide and multiply keys. Holding a volume or speed adjustment key repeats the adjustment. Holding an arrow key repeats seeking: left and right seek 5 seconds per repeat, while up and down seek 60 seconds per repeat. Playback, fullscreen, mute, subtitle and playlist visibility, track switching, and episode switching run once per press. Episode switching stops at the first and last playlist entries without wrapping.
+Playback speed ranges from **0.25× to 4×**. Volume shortcuts also support the numeric keypad's divide and multiply keys. Holding a volume, speed, or subtitle size adjustment key repeats the adjustment. Holding an arrow key repeats seeking: left and right seek 5 seconds per repeat, while up and down seek 60 seconds per repeat. Playback, fullscreen, mute, subtitle and playlist visibility, track switching, and episode switching run once per press. Episode switching stops at the first and last playlist entries without wrapping.
+
+The current playback speed appears in the upper-left corner for two seconds after each adjustment.
+
+Subtitle size starts at the value in Playback settings. The shortcuts scale text and bitmap subtitles on the current playback page within **0.5× to 3×**. The current scale appears in the upper-left corner for two seconds after each shortcut press.
 
 After a successful subtitle or audio track change through a shortcut or menu, “Subtitles: track name” or “Audio: track name” appears beside the Back button in the theme accent color for two seconds. Further changes update the name and restart the timer. Disabling a track displays Off.
 
@@ -248,6 +253,7 @@ Gamepads are detected automatically on the playback page. The active playback wi
 | LT / RT | Decrease / increase playback speed |
 | L3 | Reset playback speed to 1× |
 | R3-↑ / R3-↓ | Hold R3 to raise / lower subtitle position |
+| R3-← / R3-→ | Hold R3 to decrease / increase subtitle scale by 0.1× |
 
 L3 / R3 refer to clicking the left / right stick, and arrows refer to the D-pad. The playback shortcut overlay also includes the full gamepad button reference. After gamepad button input, gamepad help appears above keyboard help for the current playback page.
 

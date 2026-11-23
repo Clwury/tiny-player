@@ -5,27 +5,24 @@ use crate::effects::{RequestScope, RequestSlot, RequestToken, WorkspaceIdentity}
 pub(in crate::player) enum PresentationTimer {
     Controls,
     Volume,
-    Rate,
     DownloadSpeed,
-    TrackSwitch,
+    Feedback,
 }
 
 impl PresentationTimer {
-    pub(in crate::player) const ALL: [Self; 5] = [
+    pub(in crate::player) const ALL: [Self; 4] = [
         Self::Controls,
         Self::Volume,
-        Self::Rate,
         Self::DownloadSpeed,
-        Self::TrackSwitch,
+        Self::Feedback,
     ];
 
     pub(in crate::player) fn index(self) -> usize {
         match self {
             Self::Controls => 0,
             Self::Volume => 1,
-            Self::Rate => 2,
-            Self::DownloadSpeed => 3,
-            Self::TrackSwitch => 4,
+            Self::DownloadSpeed => 2,
+            Self::Feedback => 3,
         }
     }
 
@@ -33,9 +30,8 @@ impl PresentationTimer {
         match self {
             Self::Controls => RequestScope::PlaybackControlsHide,
             Self::Volume => RequestScope::PlaybackVolumeHide,
-            Self::Rate => RequestScope::PlaybackRateHide,
             Self::DownloadSpeed => RequestScope::PlaybackSpeedRefresh,
-            Self::TrackSwitch => RequestScope::PlaybackTrackSwitchHide,
+            Self::Feedback => RequestScope::PlaybackFeedbackHide,
         }
     }
 }
@@ -97,8 +93,7 @@ mod tests {
         for kind in [
             PresentationTimer::Controls,
             PresentationTimer::Volume,
-            PresentationTimer::Rate,
-            PresentationTimer::TrackSwitch,
+            PresentationTimer::Feedback,
         ] {
             let first = timers.begin(kind).unwrap();
             let mut last = first.clone();
@@ -139,10 +134,10 @@ mod tests {
         let mut other = PresentationTimers::new(identity.clone());
         let other_token = other.begin(PresentationTimer::Volume).unwrap();
         assert!(!timers.complete(PresentationTimer::Volume, &other_token, &identity));
-        let rate = timers.begin(PresentationTimer::Rate).unwrap();
-        assert!(!timers.complete(PresentationTimer::Rate, &token, &identity));
+        let feedback = timers.begin(PresentationTimer::Feedback).unwrap();
+        assert!(!timers.complete(PresentationTimer::Feedback, &token, &identity));
         assert!(timers.complete(PresentationTimer::Volume, &token, &identity));
-        assert!(timers.complete(PresentationTimer::Rate, &rate, &identity));
+        assert!(timers.complete(PresentationTimer::Feedback, &feedback, &identity));
     }
 
     #[test]
