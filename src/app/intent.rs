@@ -57,6 +57,9 @@ impl TinyApp {
                     PlaybackEvent::VolumeChanged { settings } => {
                         self.update_playback_volume(settings, cx)
                     }
+                    PlaybackEvent::SubtitleVerticalPositionChanged { fraction } => {
+                        self.update_subtitle_vertical_position(fraction, cx)
+                    }
                     PlaybackEvent::Update { update } => self.update_playback_origin(update, cx),
                     PlaybackEvent::Back { update } => self.return_to_playback_origin(update, cx),
                     PlaybackEvent::Replace { request, update } => {

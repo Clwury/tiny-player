@@ -81,6 +81,7 @@ impl TinyApp {
         let persistence = crate::persistence::PersistenceService::get(cx);
         cache.app_language.apply(cx);
         cache.track_languages.apply(cx);
+        cache.subtitle_style.apply(cx);
         cache.items_sort.apply(cx);
         cx.observe_global::<crate::media::ItemSortPreferences>(|app, cx| {
             app.update_items_sort(crate::media::ItemSortPreferences::get(cx), cx);

@@ -106,6 +106,8 @@ impl PlaybackPage {
         if page.session.controls_view().error.is_some() {
             let _ = page.close_playback_reporting(true, false);
         }
+        page.presentation.subtitle.vertical_offset_fraction =
+            crate::media::SubtitleStyle::get(cx).vertical_offset_fraction;
         page
     }
 

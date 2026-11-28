@@ -1,11 +1,14 @@
 //! Development settings playback rows in their original display order.
 use super::*;
 use crate::settings::view::controls::{
-    SUBTITLE_SCALE_DESCRIPTION, SUBTITLE_SCALE_LABEL, subtitle_scale_selector,
+    SUBTITLE_BACKGROUND_DESCRIPTION, SUBTITLE_BACKGROUND_LABEL, SUBTITLE_OUTLINE_DESCRIPTION,
+    SUBTITLE_OUTLINE_LABEL, SUBTITLE_SCALE_DESCRIPTION, SUBTITLE_SCALE_LABEL,
+    SUBTITLE_TEXT_COLOR_DESCRIPTION, SUBTITLE_TEXT_COLOR_LABEL, subtitle_background_selector,
+    subtitle_outline_selector, subtitle_scale_selector, subtitle_text_color_selector,
 };
 
 impl PlaybackSettingsDialogState {
-    pub(super) fn playback_items(&self, dialog: Entity<Self>, cx: &App) -> [SettingItem; 6] {
+    pub(super) fn playback_items(&self, dialog: Entity<Self>, cx: &App) -> [SettingItem; 9] {
         use SettingsCategory::*;
         [
             SettingItem::new(
@@ -69,25 +72,6 @@ impl PlaybackSettingsDialogState {
             ),
             SettingItem::new(
                 Playback,
-                "首选语言",
-                SUBTITLE_SCALE_LABEL,
-                SUBTITLE_SCALE_DESCRIPTION,
-                "subtitle_scale subtitle size",
-                subtitle_scale_selector(
-                    self.dropdown.clone(),
-                    self.controller.view_model().config.subtitle_scale,
-                    {
-                        let dialog = dialog.clone();
-                        move |scale, cx| {
-                            dialog.update(cx, |dialog, cx| {
-                                dialog.dispatch(SettingsIntent::SubtitleScale(scale), cx)
-                            })
-                        }
-                    },
-                ),
-            ),
-            SettingItem::new(
-                Playback,
                 "视频解码",
                 "硬件解码",
                 DEVELOPMENT_HARDWARE_DECODE_DESCRIPTION,
@@ -116,6 +100,82 @@ impl PlaybackSettingsDialogState {
                     ToggleSetting::DecoderFramedrop,
                     "解码器追赶丢帧",
                     self.controller.view_model().config.decoder_framedrop,
+                ),
+            ),
+            SettingItem::new(
+                Playback,
+                "字幕样式",
+                SUBTITLE_SCALE_LABEL,
+                SUBTITLE_SCALE_DESCRIPTION,
+                "subtitle_scale subtitle size",
+                subtitle_scale_selector(
+                    self.dropdown.clone(),
+                    self.controller.view_model().config.subtitle_scale,
+                    {
+                        let dialog = dialog.clone();
+                        move |scale, cx| {
+                            dialog.update(cx, |dialog, cx| {
+                                dialog.dispatch(SettingsIntent::SubtitleScale(scale), cx)
+                            })
+                        }
+                    },
+                ),
+            ),
+            SettingItem::new(
+                Playback,
+                "字幕样式",
+                SUBTITLE_TEXT_COLOR_LABEL,
+                SUBTITLE_TEXT_COLOR_DESCRIPTION,
+                "subtitle color text 字幕 颜色",
+                subtitle_text_color_selector(
+                    self.dropdown.clone(),
+                    self.controller.view_model().subtitle_appearance.text_color,
+                    {
+                        let dialog = dialog.clone();
+                        move |color, cx| {
+                            dialog.update(cx, |dialog, cx| {
+                                dialog.select_subtitle_text_color(color, cx)
+                            })
+                        }
+                    },
+                ),
+            ),
+            SettingItem::new(
+                Playback,
+                "字幕样式",
+                SUBTITLE_OUTLINE_LABEL,
+                SUBTITLE_OUTLINE_DESCRIPTION,
+                "subtitle outline edge 字幕 描边",
+                subtitle_outline_selector(
+                    self.dropdown.clone(),
+                    self.controller.view_model().subtitle_appearance.outline,
+                    {
+                        let dialog = dialog.clone();
+                        move |outline, cx| {
+                            dialog.update(cx, |dialog, cx| {
+                                dialog.select_subtitle_outline(outline, cx)
+                            })
+                        }
+                    },
+                ),
+            ),
+            SettingItem::new(
+                Playback,
+                "字幕样式",
+                SUBTITLE_BACKGROUND_LABEL,
+                SUBTITLE_BACKGROUND_DESCRIPTION,
+                "subtitle background box 字幕 背景",
+                subtitle_background_selector(
+                    self.dropdown.clone(),
+                    self.controller.view_model().subtitle_appearance.background,
+                    {
+                        let dialog = dialog.clone();
+                        move |background, cx| {
+                            dialog.update(cx, |dialog, cx| {
+                                dialog.select_subtitle_background(background, cx)
+                            })
+                        }
+                    },
                 ),
             ),
         ]

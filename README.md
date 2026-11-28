@@ -12,6 +12,7 @@ Tiny Player is a native Emby desktop client for Linux and Windows, built with Ru
 - **Playback and track selection**: Choose video versions, audio tracks, and subtitles, set language preferences, and sync playback progress.
 - **Video processing**: Software decoding, Vulkan hardware decoding, VA-API copyback or direct Vulkan mapping on Linux, and HDR tone mapping. Hardware decoding support depends on the GPU, driver, and video codec.
 - **Playback controls**: Fullscreen, playback speed adjustment, subtitle size and position, a playback information overlay, and configurable memory and disk caches.
+- **Subtitle appearance**: Text subtitle color, outline toggle and background presets, plus subtitle size and remembered vertical position. Bitmap subtitles keep their original styling and follow size, position and timing only.
 - **Gamepad playback shortcuts**: Standard gamepad buttons control playback, seeking, volume, speed, subtitle size and position, and returning to media details.
 - **Keep awake during video playback**: Request inhibition of automatic screen locking, display power saving, and sleep; release the request when paused, buffering pauses playback, playback ends, or the player closes.
 

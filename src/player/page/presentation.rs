@@ -112,6 +112,7 @@ pub(super) struct SubtitleOverlayState {
     pub(super) active: Option<BackendSubtitleCue>,
     pub(super) images: SubtitleImages,
     pub(super) vertical_offset_fraction: Option<f32>,
+    pub(super) visible_offset_limit: std::rc::Rc<std::cell::Cell<Option<f32>>>,
     pub(super) hidden: bool,
 }
 
@@ -165,6 +166,7 @@ impl PlaybackPage {
         }
 
         self.presentation.frame.viewport_bounds = Some(bounds);
+        self.presentation.subtitle.visible_offset_limit.set(None);
         cx.notify();
     }
 

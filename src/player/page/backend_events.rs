@@ -80,10 +80,12 @@ impl PlaybackPage {
                     defer_drop_frame(image, window);
                 }
                 self.presentation.subtitle.active = cue;
+                self.presentation.subtitle.visible_offset_limit.set(None);
             }
             BackendAction::VideoSize(size) => {
                 if self.presentation.frame.source_size != size {
                     self.presentation.frame.source_size = size;
+                    self.presentation.subtitle.visible_offset_limit.set(None);
                     self.clear_visible_frame(window, cx);
                 }
             }

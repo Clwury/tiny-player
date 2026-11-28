@@ -1,6 +1,9 @@
 use super::{AppLanguage, memory_budget::MemoryBudget};
 use crate::{
-    media::{PlaybackLanguagePreferences, TrackLanguage},
+    media::{
+        PlaybackLanguagePreferences, SubtitleAppearance, SubtitleBackground, SubtitleOutline,
+        SubtitleTextColor, TrackLanguage,
+    },
     theme::ColorTheme,
 };
 use tiny_playback::{
@@ -138,6 +141,9 @@ pub(crate) enum SettingsIntent {
     SeekableCache(PlaybackSeekableCacheMode),
     UnlinkFiles(CacheUnlinkPolicy),
     SubtitleScale(f32),
+    SubtitleTextColor(SubtitleTextColor),
+    SubtitleOutline(SubtitleOutline),
+    SubtitleBackground(SubtitleBackground),
     Toggle(ToggleSetting),
     EditNumber {
         field: NumericSetting,
@@ -155,6 +161,7 @@ pub(crate) struct SettingsSnapshot {
     pub(crate) color_theme: ColorTheme,
     pub(crate) app_language: AppLanguage,
     pub(crate) track_languages: PlaybackLanguagePreferences,
+    pub(crate) subtitle_appearance: SubtitleAppearance,
 }
 
 #[derive(Default)]
@@ -164,6 +171,7 @@ pub(crate) struct SettingsChange {
     pub(crate) theme: Option<ColorTheme>,
     pub(crate) app_language: Option<AppLanguage>,
     pub(crate) languages: Option<PlaybackLanguagePreferences>,
+    pub(crate) subtitle_appearance: Option<SubtitleAppearance>,
 }
 
 /// Search/category metadata is independent of the concrete GPUI control.

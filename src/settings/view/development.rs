@@ -32,7 +32,7 @@ use gpui::{
 use crate::ui::radius;
 use crate::{
     app::window_corner_radii,
-    media::TrackLanguage,
+    media::{SubtitleBackground, SubtitleOutline, SubtitleTextColor, TrackLanguage},
     theme::{self, ColorTheme},
 };
 use tiny_playback::{
@@ -238,6 +238,9 @@ impl PlaybackSettingsDialogState {
         if let Some(languages) = change.languages {
             languages.apply(cx);
         }
+        if let Some(appearance) = change.subtitle_appearance {
+            appearance.apply_appearance(cx);
+        }
         if change.persist {
             cx.emit(SettingsChanged);
         }
@@ -258,6 +261,19 @@ impl PlaybackSettingsDialogState {
     }
     fn select_app_language(&mut self, language: AppLanguage, cx: &mut Context<Self>) {
         self.dispatch(SettingsIntent::AppLanguage(language), cx);
+    }
+    fn select_subtitle_text_color(&mut self, color: SubtitleTextColor, cx: &mut Context<Self>) {
+        self.dispatch(SettingsIntent::SubtitleTextColor(color), cx);
+    }
+    fn select_subtitle_outline(&mut self, outline: SubtitleOutline, cx: &mut Context<Self>) {
+        self.dispatch(SettingsIntent::SubtitleOutline(outline), cx);
+    }
+    fn select_subtitle_background(
+        &mut self,
+        background: SubtitleBackground,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(SettingsIntent::SubtitleBackground(background), cx);
     }
     fn select_hardware_decode(&mut self, mode: HardwareDecodeMode, cx: &mut Context<Self>) {
         self.dispatch(SettingsIntent::HardwareDecode(mode), cx);
