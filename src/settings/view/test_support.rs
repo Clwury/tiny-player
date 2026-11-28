@@ -16,6 +16,7 @@ pub(crate) fn settings_snapshot(
         color_theme: theme::get(cx).selection,
         app_language: AppLanguage::default(),
         track_languages: PlaybackLanguagePreferences::get(cx),
+        subtitle_appearance: Default::default(),
     }
 }
 

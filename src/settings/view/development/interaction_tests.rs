@@ -423,7 +423,9 @@ fn subtitle_size_uses_the_saved_preset_and_autosaves_edits_from_search(cx: &mut 
     ] {
         assert!(cx.debug_bounds(selector).is_some(), "{selector}");
     }
-    cx.simulate_keystrokes("enter");
+    // The style group is near the bottom, so the menu can open upward under
+    // the pointer. Select the saved preset by its stable debug selector.
+    click(cx, "subtitle-scale-12");
     cx.run_until_parked();
     assert!(cx.debug_bounds("subtitle-scale-dropdown-menu").is_none());
     assert_eq!(root.read_with(cx, |root, _| root.change_count), 0);

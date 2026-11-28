@@ -35,6 +35,20 @@ impl TinyApp {
         self.schedule_cache_save("保存音量失败", cx);
     }
 
+    pub(super) fn update_subtitle_vertical_position(
+        &mut self,
+        fraction: Option<f32>,
+        cx: &mut Context<Self>,
+    ) {
+        let style = self.cache.subtitle_style.with_vertical_offset(fraction);
+        if self.cache.subtitle_style == style {
+            return;
+        }
+        self.cache.subtitle_style = style;
+        style.store(cx);
+        self.schedule_cache_save("保存字幕位置失败", cx);
+    }
+
     pub(super) fn schedule_cache_save(
         &mut self,
         error_prefix: &'static str,
@@ -545,6 +559,62 @@ mod tests {
                 .playback
                 .cache_secs,
             75.0
+        );
+    }
+
+    #[gpui::test]
+    fn subtitle_vertical_position_is_coalesced_saved_and_restored(cx: &mut TestAppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        let app = cx.new(|cx| {
+            let mut app = TinyApp::new(ServerCache::empty(), None, cx);
+            app.cache_save_path = Some(path.clone());
+            app
+        });
+        app.update(cx, |app, cx| {
+            app.update_subtitle_vertical_position(Some(0.02), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| crate::media::SubtitleStyle::get(cx).vertical_offset_fraction),
+            Some(0.02)
+        );
+        cx.executor().advance_clock(CACHE_SAVE_DEBOUNCE);
+        cx.run_until_parked();
+        let saved = storage::load_or_init_from(&path).unwrap();
+        assert_eq!(saved.subtitle_style.vertical_offset_fraction, Some(0.02));
+
+        app.update(cx, |app, cx| {
+            app.update_subtitle_vertical_position(Some(0.03), cx)
+        });
+        // Closing before the debounce expires must still save the final position.
+        drop(app);
+        cx.update(|_| {});
+        cx.run_until_parked();
+        let saved = storage::load_or_init_from(&path).unwrap();
+        assert_eq!(saved.subtitle_style.vertical_offset_fraction, Some(0.03));
+
+        let reopened = cx.new(|cx| {
+            let mut app = TinyApp::new(saved, None, cx);
+            app.cache_save_path = Some(path.clone());
+            app
+        });
+        assert_eq!(
+            reopened.read_with(cx, |app, _| {
+                app.cache.subtitle_style.vertical_offset_fraction
+            }),
+            Some(0.03)
+        );
+
+        reopened.update(cx, |app, cx| {
+            app.update_subtitle_vertical_position(Some(0.0), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            reopened.read_with(cx, |app, _| {
+                app.cache.subtitle_style.vertical_offset_fraction
+            }),
+            None
         );
     }
 

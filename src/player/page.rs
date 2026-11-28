@@ -90,6 +90,9 @@ pub enum PlaybackEvent {
     VolumeChanged {
         settings: PlaybackVolumeSettings,
     },
+    SubtitleVerticalPositionChanged {
+        fraction: Option<f32>,
+    },
     Update {
         update: PlaybackStateUpdate,
     },
@@ -106,6 +109,9 @@ impl PlaybackEvent {
     pub(crate) fn trace(&self) {
         let operation = match self {
             Self::VolumeChanged { .. } => "playback.volume_changed",
+            Self::SubtitleVerticalPositionChanged { .. } => {
+                "playback.subtitle_vertical_position_changed"
+            }
             Self::Update { .. } => "playback.update",
             Self::Back { .. } => "playback.back",
             Self::Replace { .. } => "playback.replace",

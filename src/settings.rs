@@ -29,6 +29,9 @@ impl SettingsPersistenceAdapter {
         config.color_theme = snapshot.color_theme;
         config.app_language = snapshot.app_language;
         config.track_languages = snapshot.track_languages;
+        config.subtitle_style = config
+            .subtitle_style
+            .with_appearance(snapshot.subtitle_appearance);
         config.playback_debug_log = snapshot.playback_debug_log;
     }
 }

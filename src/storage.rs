@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     app_metadata,
-    media::{ItemSortPreferences, PlaybackLanguagePreferences},
+    media::{ItemSortPreferences, PlaybackLanguagePreferences, SubtitleStyle},
     search_history::SearchHistory,
     server::CachedServer,
     settings::AppLanguage,
@@ -42,6 +42,8 @@ pub struct ServerCache {
     #[serde(default)]
     pub items_sort: ItemSortPreferences,
     #[serde(default)]
+    pub subtitle_style: SubtitleStyle,
+    #[serde(default)]
     pub playback_debug_log: bool,
 }
 
@@ -66,6 +68,7 @@ impl ServerCache {
             playback_volume: PlaybackVolumeSettings::default(),
             search_history: SearchHistory::default(),
             items_sort: ItemSortPreferences::default(),
+            subtitle_style: SubtitleStyle::default(),
             playback_debug_log: false,
         }
     }
@@ -159,6 +162,7 @@ pub(crate) fn load_or_init_from(path: &Path) -> Result<ServerCache> {
     // `playback` field) behave exactly like a fresh configuration.
     cache.playback = cache.playback.clone().normalized();
     cache.playback_volume = cache.playback_volume.normalized();
+    cache.subtitle_style = cache.subtitle_style.normalized();
     cache.search_history.normalize();
 
     Ok(cache)
@@ -354,6 +358,36 @@ mod tests {
         assert_eq!(loaded.device_id, cache.device_id);
         assert_eq!(loaded.servers.len(), 1);
         assert_eq!(loaded.servers[0].access_token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn loaded_subtitle_style_is_normalized() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("servers.json");
+        for (stored, expected) in [(12.0, Some(1.0)), (0.005, None), (-0.29, None)] {
+            let mut cache = ServerCache::empty();
+            cache.subtitle_style.vertical_offset_fraction = Some(stored);
+            save_to(&cache, &path).unwrap();
+            let loaded = load_or_init_from(&path).unwrap();
+            assert_eq!(
+                loaded.subtitle_style.vertical_offset_fraction, expected,
+                "{stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_cache_without_subtitle_style_uses_defaults() {
+        let mut cache = ServerCache::empty();
+        cache.subtitle_style.appearance.text_color = crate::media::SubtitleTextColor::Yellow;
+        cache.subtitle_style.vertical_offset_fraction = Some(0.02);
+        let mut json = serde_json::to_value(&cache).unwrap();
+        json.as_object_mut().unwrap().remove("subtitle_style");
+        let loaded: ServerCache = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            loaded.subtitle_style,
+            crate::media::SubtitleStyle::default()
+        );
     }
 
     #[test]

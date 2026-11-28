@@ -1,7 +1,7 @@
 //! Shell-owned global configuration. Server records have a single feature owner;
 //! persistence composes both into the unchanged ServerCache document.
 use crate::{
-    media::{ItemSortPreferences, PlaybackLanguagePreferences},
+    media::{ItemSortPreferences, PlaybackLanguagePreferences, SubtitleStyle},
     search_history::SearchHistory,
     server::feature::ServerCatalog,
     settings::AppLanguage,
@@ -22,6 +22,7 @@ pub(crate) struct GlobalConfig {
     pub(crate) playback_volume: PlaybackVolumeSettings,
     pub(crate) search_history: SearchHistory,
     pub(crate) items_sort: ItemSortPreferences,
+    pub(crate) subtitle_style: SubtitleStyle,
     pub(crate) playback_debug_log: bool,
 }
 
@@ -38,6 +39,7 @@ impl GlobalConfig {
             playback_volume,
             search_history,
             items_sort,
+            subtitle_style,
             playback_debug_log,
             servers,
             auto_start_server_id,
@@ -54,6 +56,7 @@ impl GlobalConfig {
                 playback_volume,
                 search_history,
                 items_sort,
+                subtitle_style,
                 playback_debug_log,
             },
             ServerCatalog {
@@ -75,6 +78,7 @@ impl GlobalConfig {
             playback_volume: self.playback_volume,
             search_history: self.search_history.clone(),
             items_sort: self.items_sort,
+            subtitle_style: self.subtitle_style,
             playback_debug_log: self.playback_debug_log,
             servers: catalog.servers.clone(),
             auto_start_server_id: catalog.auto_start_server_id.clone(),

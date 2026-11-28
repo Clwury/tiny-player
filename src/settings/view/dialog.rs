@@ -135,6 +135,7 @@ mod tests {
                 audio: crate::media::TrackLanguage::Japanese,
                 subtitle: crate::media::TrackLanguage::ChineseTraditional,
             },
+            subtitle_appearance: Default::default(),
         };
         for mode in [Development, User] {
             let dialog = cx.new(|cx| super::SettingsDialogState::new(snapshot.clone(), mode, cx));

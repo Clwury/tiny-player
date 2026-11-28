@@ -88,7 +88,7 @@ impl Render for PlaybackPage {
                 div()
                     .when_some(current_video_frame, |this, frame| this.child(frame))
                     .child(viewport_observer)
-                    .child(self.render_subtitle_overlay()),
+                    .child(self.render_subtitle_overlay(cx)),
             ))
             .when_some(status, |this, status| {
                 this.child(render_playback_status(status, cx))
